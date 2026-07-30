@@ -13,12 +13,27 @@ publish.workspace = true
 # winit, kira, egui, or any other windowing/render/input/audio crate, directly
 # or transitively. Enforced by scripts/check-dep-firewall.sh in CI.
 [dependencies]
+mlua = { workspace = true, optional = true }
 postcard.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 zstd.workspace = true
+
+[features]
+default = ["script", "vm-lua54"]
+
+# The scripting runtime. Optional so a build that only needs the voxel data
+# model does not compile a Lua interpreter.
+script = ["dep:mlua"]
+
+# Backend selection. EXACTLY ONE, and they are mutually exclusive — mlua cannot
+# link two Lua implementations into one binary. `docs/scripting-vm.md` records
+# which is default and why.
+vm-lua54 = ["script", "mlua/lua54"]
+vm-luajit = ["script", "mlua/luajit"]
+vm-luau = ["script", "mlua/luau"]
 
 [dev-dependencies]
 criterion.workspace = true

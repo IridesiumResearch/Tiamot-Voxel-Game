@@ -67,6 +67,8 @@ pub mod detgen;
 pub mod inventory;
 pub mod material;
 pub mod persist;
+#[cfg(feature = "script")]
+pub mod script;
 
 pub use block::{BlockContent, BlockValue, BlockView, Cells, SlotIndex};
 pub use chunk::Chunk;
