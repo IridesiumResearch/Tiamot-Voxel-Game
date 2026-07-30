@@ -30,7 +30,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Honours rust-toolchain.toml, so the pinned version is the one used.
       - name: Install Rust
@@ -81,7 +81,7 @@ jobs:
     name: policy checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # check-dco.sh walks the commits under review, so it needs more than
           # a shallow clone.
