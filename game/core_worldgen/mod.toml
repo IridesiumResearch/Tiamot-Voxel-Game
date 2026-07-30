@@ -1,0 +1,7 @@
+# The reference world generator.
+id = "core_worldgen"
+name = "Core Worldgen"
+version = "0.1.0"
+depends = ["core >=0.1"]
+description = "Reference generator: solid below y=0, air above. A test fixture."
+license = "GPL-3.0-only"

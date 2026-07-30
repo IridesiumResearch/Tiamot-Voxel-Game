@@ -140,6 +140,12 @@ jobs:
       - name: SPDX headers (charter rule 17)
         run: ./scripts/check-spdx.sh
 
+      # Every game.* the engine registers must be in api/stubs/game.lua. The
+      # stubs are what a mod author's editor reads; drift in either direction is
+      # invisible to a build but very visible to them.
+      - name: API stub coverage
+        run: ./scripts/check-stubs.sh
+
       - name: DCO sign-off (charter rule 17)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then

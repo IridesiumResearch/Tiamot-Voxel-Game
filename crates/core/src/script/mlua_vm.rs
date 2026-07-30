@@ -407,14 +407,20 @@ impl ScriptVm for MluaVm {
                 detail: err.to_string(),
             })?;
 
-        Ok(Self {
+        let mut vm = Self {
             lua,
             limits,
             frozen: false,
             faulted: BTreeSet::new(),
             environments: BTreeMap::new(),
             next_material: 2,
-        })
+        };
+        // Installed here rather than in a second constructor the caller has to
+        // remember. `ModHost` called `create` and got a VM with no registry
+        // tables, so every registration failed — the exact failure a two-step
+        // constructor invites.
+        vm.install_registry()?;
+        Ok(vm)
     }
 
     fn load_mod(&mut self, mod_id: &str, source: &str, dir: &Path) -> Result<(), ScriptError> {
@@ -799,15 +805,15 @@ impl MluaVm {
         Ok(())
     }
 
-    /// Creates a VM with the registry installed, ready for `load_mod`.
+    /// Creates a VM ready for `load_mod`.
+    ///
+    /// An alias for [`ScriptVm::create`], kept so call sites read naturally.
     ///
     /// # Errors
     ///
     /// As [`ScriptVm::create`].
     pub fn new(limits: VmLimits) -> Result<Self, ScriptError> {
-        let mut vm = <Self as ScriptVm>::create(limits)?;
-        vm.install_registry()?;
-        Ok(vm)
+        <Self as ScriptVm>::create(limits)
     }
 
     /// Blocks registered so far, string id → numeric id.

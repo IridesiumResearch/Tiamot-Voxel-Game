@@ -33,8 +33,10 @@
 //! exposed way to loop over samples in Lua. Making the wrong thing awkward is
 //! more reliable than documenting that it is wrong.
 
+mod host;
 mod vm;
 
+pub use host::{HostError, ModHost, Phase, read_manifest};
 pub use vm::{Backend, ScriptError, ScriptVm, VmLimits};
 
 #[cfg(feature = "script")]
@@ -48,3 +50,7 @@ pub use mlua_vm::MluaVm;
 /// One alias so callers name a concrete type without naming a backend.
 #[cfg(feature = "script")]
 pub type EngineVm = MluaVm;
+
+/// The engine's mod host, over the chosen VM.
+#[cfg(feature = "script")]
+pub type EngineHost = ModHost<MluaVm>;

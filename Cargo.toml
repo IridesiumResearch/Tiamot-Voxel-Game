@@ -67,6 +67,8 @@ serde = { version = "1.0", features = ["derive"] }
 # three-way benchmark possible at all. Exactly ONE backend feature may be
 # enabled at a time; they are mutually exclusive at the C level.
 mlua = { version = "0.11", features = ["vendored"] }
+# Version ranges for mod dependencies. The resolver is the only user.
+semver = "1.0"
 
 # --- server / bot ---------------------------------------------------------
 clap = { version = "4.5", features = ["derive"] }

@@ -1,0 +1,12 @@
+# The engine's reference block set.
+#
+# NOTE: the directory is `core_blocks` but the mod id is `core`. Directory name
+# and mod id are deliberately independent — the id is what forms the
+# registration namespace, and `core:white` is the string id this mod exists to
+# provide. Only the mod whose id is `core` may register into the `core`
+# namespace, which is what stops a third-party mod shadowing engine blocks.
+id = "core"
+name = "Core Blocks"
+version = "0.1.0"
+description = "Reference block registrations. A test fixture, not a game."
+license = "GPL-3.0-only"
