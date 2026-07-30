@@ -19,21 +19,33 @@ The machine the game must run **well** on, not merely launch on:
 |---|---|
 | CPU | ~6-core Intel i5 |
 | RAM | 16 GiB |
-| GPU | **Integrated graphics** |
+| GPU | A modest **discrete** card. Integrated is best-effort, not a requirement. |
 
-Anything better is headroom. Anything worse is unsupported.
+Anything better is headroom.
 
-**The GPU line is the demanding one.** Integrated graphics share system memory
-and have a small fraction of a discrete card's fill rate and memory bandwidth.
-Two consequences that shape Task 08 and everything after it:
+**Priority order, set explicitly by Iridesium on 2026-07-30, because these
+conflict and later tasks need to know which way to resolve them:**
 
-- **Fill rate and bandwidth bind before VRAM does.** Task 02b measured that a
-  fully chiselled view-distance-12 world is 172 MiB of geometry — comfortable.
-  That is not the constraint. Overdraw, shading cost, and the bandwidth to feed
-  them are, and none of them existed to measure at 02b.
-- **Frame time must be measured on a real integrated GPU.** Not projected from a
-  discrete card, not extrapolated from geometry counts. This is a human gate on
-  Task 08.
+> **A detailed, smooth sub-node world beats reach onto low-end hardware.**
+> *"If integrated graphics is not possible to achieve that is fine. Most people
+> now have a card. I want the node/block system to work well and be smooth more
+> than I want speed on low end devices."*
+
+So when a rendering decision trades fidelity or frame pacing against running on
+weaker hardware, **fidelity and smoothness win.** Do not spend design budget
+degrading the sub-node system to fit an iGPU. Do not add a low-detail path
+because integrated graphics might struggle — that is what Task 15b's LOD is
+for, and LOD is a distance mechanism, not a hardware tier.
+
+This is a priority, not permission to be wasteful. Speed still matters
+everywhere it is free, and the server targets below are hard.
+
+**What this changes for Task 08.** Frame time on integrated graphics becomes a
+*nice-to-know*, not a gate. The gate is smooth frame pacing on a modest discrete
+card at full sub-node detail. Fill rate and memory bandwidth are still the
+binding client constraints — Task 02b measured geometry, and geometry is not
+what makes a rasteriser struggle; overdraw and shading are, and neither existed
+to measure at 02b.
 
 ## Server targets
 
@@ -76,7 +88,8 @@ At 50 players all chiselling continuously, the delta stream is roughly
 
 - **Benchmarks report against the tick budget**, not in isolation. "0.4 ms" says
   nothing; "0.4 ms, 0.8% of a tick" says something.
-- **Client work is measured on integrated graphics** or it is not measured.
+- **Client work is measured on a real GPU** at full sub-node detail — frame
+  *pacing*, not just average frame rate. A smooth 60 beats a stuttering 90.
 - **A regression gate needs a stable baseline.** CI runners do not provide one
   (see `crates/core/benches/`); real numbers come from dev hardware.
 - **Determinism is not negotiable for speed** (charter rule 4). If an
@@ -85,7 +98,8 @@ At 50 players all chiselling continuously, the delta stream is roughly
 
 ## Open
 
-- **Frame time on integrated graphics** — Task 08 human gate.
+- **Frame pacing at full sub-node detail** — Task 08 human gate, on a discrete
+  card.
 - **Whether view distance 12 is the shipping target.** Raising it to 32 scales
-  geometry roughly 7×; 172 MiB would become ~1.2 GiB, which is where an iGPU
-  sharing system RAM starts to matter. Decide before Task 15b's LOD design.
+  geometry roughly 7×; 172 MiB becomes ~1.2 GiB. Comfortable on a discrete card,
+  which is now the target. Decide before Task 15b's LOD design.

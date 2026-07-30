@@ -174,10 +174,12 @@ X," the answer is that a future mod needs X, and the engine's job is to make X e
     **50 players per server**; 20 Hz tick, so **a 50 ms budget shared by all simulation for
     all players**. Report benchmarks as a share of that budget, never in isolation — "0.4 ms"
     says nothing, "0.4 ms, 0.8% of a tick" says something.
-    Integrated graphics is the binding constraint on the client, and it binds on **fill rate
-    and memory bandwidth, not VRAM** — client work is measured on a real integrated GPU or it
-    is not measured. Speed never buys its way out of charter rule 4: an optimisation that
-    leaves the Deterministic Float Subset is not available to this project.
+    **Priority order when these conflict: a detailed, smooth sub-node world beats reach onto
+    low-end hardware.** The client targets a modest discrete card; integrated graphics is
+    best-effort and is NOT a reason to degrade sub-node fidelity. Client work is measured on a
+    real GPU at full detail, and frame *pacing* is the metric, not average frame rate.
+    Speed never buys its way out of charter rule 4: an optimisation that leaves the
+    Deterministic Float Subset is not available to this project.
 
 19. **Sub-node verdict: KEEP** (Iridesium, 2026-07-30). Full sub-node resolution for collision
     and meshing, no cap, no degradation path — see
