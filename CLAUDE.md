@@ -168,6 +168,23 @@ X," the answer is that a future mod needs X, and the engine's job is to make X e
     needs either contributor sign-off or a CLA. Decide that before accepting outside PRs, not
     after.
 
+18. **Performance targets are set, and speed is the stated priority.**
+    [`docs/performance-targets.md`](docs/performance-targets.md) is authoritative. The
+    headlines: **minimum spec is a ~6-core i5, 16 GiB RAM, and INTEGRATED GRAPHICS**;
+    **50 players per server**; 20 Hz tick, so **a 50 ms budget shared by all simulation for
+    all players**. Report benchmarks as a share of that budget, never in isolation — "0.4 ms"
+    says nothing, "0.4 ms, 0.8% of a tick" says something.
+    Integrated graphics is the binding constraint on the client, and it binds on **fill rate
+    and memory bandwidth, not VRAM** — client work is measured on a real integrated GPU or it
+    is not measured. Speed never buys its way out of charter rule 4: an optimisation that
+    leaves the Deterministic Float Subset is not available to this project.
+
+19. **Sub-node verdict: KEEP** (Iridesium, 2026-07-30). Full sub-node resolution for collision
+    and meshing, no cap, no degradation path — see
+    [`docs/subnode-verdict.md`](docs/subnode-verdict.md). Two conditions ride with it: Task 10
+    **must** cache a per-block permeability byte (measured requirement, not a preference), and
+    the geometry-inflation ratio gate is retired in favour of the absolute VRAM bound.
+
 ## Style
 - Rust **edition 2024**, stable toolchain (pinned in `rust-toolchain.toml`).
   `thiserror` for errors. No `unwrap()` outside tests.

@@ -15,7 +15,10 @@ means, and if those decisions are made independently they will not agree.
 Disagreements between them are not cosmetic — they produce blocks you can see
 through but not walk through, or mine for material that does not exist.
 
-Created by Task 02b. Verdict recorded in [`subnode-verdict.md`](subnode-verdict.md).
+Created by Task 02b. **Verdict: KEEP** — full sub-node resolution, no cap, no
+degradation path (Iridesium, 2026-07-30). Measurements and reasoning in
+[`subnode-verdict.md`](subnode-verdict.md); performance budgets every system
+here is held to in [`performance-targets.md`](performance-targets.md).
 
 ---
 

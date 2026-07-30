@@ -13,11 +13,33 @@
 | **Reproduce** | `cargo run -p subnode-spike --release --features gpu -- all` |
 | **Raw output** | [`../spikes/subnode/out/measurements.txt`](../spikes/subnode/out/measurements.txt) |
 
-> **DECISION: _______________ (KEEP / KEEP-WITH-LIMITS / FALLBACK)**
-> **Decided by: _______________  Date: _______________**
+> ## DECISION: **KEEP**
 >
-> This is an `[H]` criterion. It is not filled in, because it is not mine to
-> fill in. **Task 08 must not start until it is.**
+> **Decided by: Iridesium — 2026-07-30**
+>
+> Full sub-node resolution everywhere: collision, meshing, and the permeability
+> rule as specified in the [Sub-Node Contract](subnode-contract.md). No cap, no
+> degradation path.
+>
+> **Rationale, in the decider's words:** *"I need the world to look and feel
+> detailed and beautiful; we can fix light spill problems by being clever
+> later."* The measured margins support it — collision for 100 players uses
+> 0.03% of a 50 ms tick, and every carved surface in view distance 12 fits in
+> 172 MiB of a 1,536 MiB budget.
+>
+> **Conditions recorded with the decision:**
+>
+> 1. **Gate 4 (geometry inflation, < 8×) is retired.** Its flat-slab denominator
+>    greedy-merges to one quad, making the ratio unbounded for any surface with
+>    detail. The absolute VRAM bound in gate 5 replaces it, measured at 100%
+>    chiselled surfaces.
+> 2. **Task 10 must cache a per-block permeability byte.** Not optional — see
+>    §3 and Sub-Node Contract §3. This is the "be clever later" the rationale
+>    refers to, and it is now a written requirement rather than an intention.
+> 3. **No Mixed-slot cap.** Scene (c) degrades gracefully and the observed
+>    failures are in `Partial`-heavy content, which such a cap would not touch.
+>
+> **Tasks 08 and 09 are unblocked.**
 
 ---
 
@@ -192,14 +214,29 @@ Units are yards. A player is 1.8 yards tall, so one sub-node is a sixth of body
 height.
 
 **Measured behaviour:** the body clears the 1-sub-node platform and stops at
-x = 10.32 yards, immediately short of the 2-sub-node platform at 10.67. That is
-the design intent — clear one sub-node, stop at two. **Whether one sub-node is
-the right ceiling is your call.**
+x = 10.32 yards, immediately short of the 2-sub-node platform at 10.67.
 
-### [H] Real-hardware VRAM
+**✅ PASSED — Iridesium, 2026-07-30.** Artefacts inspected; a one-sub-node
+step-up ceiling is the intended behaviour. Task 09 implements it as specified in
+Sub-Node Contract §2.
 
-Re-run `--features gpu -- vram --chiselled-percent 100` on a machine with a
-discrete GPU and compare against 171.7 MiB.
+### [H] Real-hardware VRAM — still open
+
+Re-run `--features gpu -- vram --chiselled-percent 100` on real hardware and
+compare against 171.7 MiB.
+
+**Lower risk than it was**, now that minimum spec is settled at integrated
+graphics (see [`performance-targets.md`](performance-targets.md)). An iGPU
+shares system RAM rather than carrying a fixed VRAM pool, so the 1.5 GB budget
+was never the binding constraint on the target machine. 172 MiB of geometry on a
+16 GiB system is not a memory problem.
+
+**The real integrated-graphics risk is not measured here, and this spike cannot
+measure it.** Geometry size is not what makes an iGPU struggle — fill rate and
+memory bandwidth are, and those depend on rasterisation, overdraw, and shading,
+none of which exist yet. Task 08 must measure frame time on a real integrated
+GPU before its own gates can be called. Recorded so it is not mistaken for
+having been answered here.
 
 ---
 
