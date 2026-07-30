@@ -78,7 +78,22 @@ impl std::fmt::Display for CoordKind {
 macro_rules! coord_type {
     ($name:ident, $kind:expr, $bound:expr, $doc:expr) => {
         #[doc = $doc]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+        // Serialisable because coordinates cross the wire (Task 06) and go into
+        // chunk blobs. Three i32 fields, so postcard encodes them positionally
+        // and there are no variants to reorder.
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Default,
+            serde::Serialize,
+            serde::Deserialize,
+        )]
         pub struct $name {
             /// East-west axis.
             pub x: i32,

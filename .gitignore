@@ -7,11 +7,15 @@
 # and reproducible builds of a binary need a pinned dependency graph — doubly so
 # for a project whose CI gate is a cross-platform determinism hash.
 
-# Fuzzing (cargo-fuzz, from Task 06 onward)
+# Fuzzing (cargo-fuzz, from Task 06 onward).
+#
+# The CORPUS IS COMMITTED — it is the seed set of real encoded messages, and a
+# fuzzer starting from valid framing finds far more than one starting from
+# noise. Build output and crash artefacts are not.
 /fuzz/target/
-/fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
+/fuzz/Cargo.lock
 
 # Criterion benchmark output
 /target/criterion/

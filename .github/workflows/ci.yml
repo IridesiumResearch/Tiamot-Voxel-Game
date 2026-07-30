@@ -146,6 +146,19 @@ jobs:
       - name: API stub coverage
         run: ./scripts/check-stubs.sh
 
+      # Charter rule 14: the protocol decoder is the engine's front door, and
+      # every byte through it came from a peer. A bounded smoke run on every
+      # push, not a long campaign — the point is that the target still builds
+      # and that an obvious regression fails fast, not to find deep bugs on CI
+      # time. Deep runs happen off CI, seeded from the committed corpus.
+      - name: Fuzz the protocol decoder (smoke)
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --locked
+          cargo +nightly fuzz run proto_decode \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=60 -rss_limit_mb=2048
+
       - name: DCO sign-off (charter rule 17)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then

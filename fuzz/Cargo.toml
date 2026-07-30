@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Iridesium
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Fuzz targets. Charter rule 14: every parser that touches bytes from an
+# untrusted peer ships its fuzz target IN THE SAME TASK, not in a later
+# hardening pass.
+#
+# Deliberately NOT a workspace member — cargo-fuzz needs nightly and its own
+# profile, and pulling it into the workspace would make every ordinary
+# `cargo build` depend on a nightly toolchain.
+[package]
+name = "tiamot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tiamot-core = { path = "../crates/core", default-features = false }
+
+[[bin]]
+name = "proto_decode"
+path = "fuzz_targets/proto_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

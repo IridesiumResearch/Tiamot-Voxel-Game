@@ -50,6 +50,25 @@ cargo test --workspace
 cargo deny check
 ```
 
+## Changing the wire protocol
+
+`postcard` encodes an enum variant as its **ordinal**. Inserting a variant
+anywhere but the end silently reinterprets every later message on every existing
+peer — no error, no checksum, just wrong messages. The same applies to the chunk
+blob format.
+
+Before changing anything in `crates/core/src/proto/`:
+
+1. **Append. Never insert, remove, or reorder a variant.** Deprecate in place.
+2. **Bump `PROTOCOL_VERSION`.** Peers exchange it first thing so a mismatch is a
+   clean rejection rather than a mysterious decode failure.
+3. **Update `variant_ordinals_are_pinned`**, the test that pins every ordinal.
+   If it fails and you did not mean to move anything, something moved.
+4. **Re-seed the fuzz corpus** if you added a message shape, so the fuzzer
+   starts from valid framing for it.
+5. For chunk blobs specifically, add a migration step — see
+   `crates/core/src/persist/migrate.rs`.
+
 ## House rules
 
 These come from [`CLAUDE.md`](CLAUDE.md), the project charter. Read it before

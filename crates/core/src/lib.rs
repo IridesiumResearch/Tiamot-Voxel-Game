@@ -64,10 +64,12 @@ pub mod block;
 pub mod chunk;
 pub mod coords;
 pub mod detgen;
+pub mod identity;
 pub mod inventory;
 pub mod material;
 pub mod modload;
 pub mod persist;
+pub mod proto;
 #[cfg(feature = "script")]
 pub mod script;
 
@@ -75,6 +77,7 @@ pub use block::{BlockContent, BlockValue, BlockView, Cells, SlotIndex};
 pub use chunk::Chunk;
 pub use coords::{BlockPos, ChunkPos, CoordError, SubNodePos};
 pub use detgen::{ChunkBuffer, StreamRng, assert_ieee_mode, fingerprint};
+pub use identity::{Identity, PlayerUuid};
 pub use inventory::Stack;
 pub use material::{MaterialId, MaterialRegistry, Registry};
 pub use persist::{WorldDb, WorldError};

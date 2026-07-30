@@ -70,6 +70,20 @@ mlua = { version = "0.11", features = ["vendored"] }
 # Version ranges for mod dependencies. The resolver is the only user.
 semver = "1.0"
 
+# --- identity and protocol (Task 06) --------------------------------------
+# Charter rule 13. An Ed25519 secret key IS 32 bytes of entropy, so the BIP-39
+# seed is the key directly — no derivation path, and no ambiguity about which
+# key a recovery phrase produces.
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }
+# 24-word checksummed recovery phrases. The checksum is the point: a mistyped
+# word fails instead of silently producing a stranger's identity.
+bip39 = "2.2"
+# Canonical player UUID = BLAKE3(root pubkey), and content addressing.
+blake3 = "1.8"
+# Handshake nonces and first-run seed generation.
+rand = "0.9"
+getrandom = "0.3"
+
 # --- server / bot ---------------------------------------------------------
 clap = { version = "4.5", features = ["derive"] }
 toml = "0.9"
