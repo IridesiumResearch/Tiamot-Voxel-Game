@@ -1,0 +1,17 @@
+[package]
+name = "tiamot-core"
+description = "Voxel data, simulation, Lua runtime, physics, persistence, and protocol types."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# DEPENDENCY FIREWALL (charter rule 3): this crate MUST NOT depend on wgpu,
+# winit, kira, egui, or any other windowing/render/input/audio crate, directly
+# or transitively. Enforced by scripts/check-dep-firewall.sh in CI.
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "bot"
+description = "Scripted headless client for integration tests, benchmarks, and load testing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Headless by construction: this crate drives a real loopback server the same
+# way a player would, so integration tests exercise the actual network path
+# rather than a mock (charter rule 15). No GUI dependencies.
+[dependencies]
+tiamot-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

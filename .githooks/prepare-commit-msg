@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Iridesium
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Appends the DCO Signed-off-by trailer required by CONTRIBUTING.md, matching
+# the commit author exactly so scripts/check-dco.sh accepts it.
+#
+# Enable once after cloning:
+#
+#     git config core.hooksPath .githooks
+#
+# Git has no built-in config for this. `format.signOff` looks like it should do
+# the job but only applies to `git format-patch`, not `git commit`.
+
+set -euo pipefail
+
+message_file="$1"
+message_source="${2-}"
+
+# Leave amends, squashes, and merges alone: their trailer is already settled and
+# appending a second one would break the exact-match check.
+case "$message_source" in
+    merge|squash) exit 0 ;;
+esac
+if [ -n "${3-}" ] && [ "$message_source" = "commit" ]; then
+    exit 0
+fi
+
+name=$(git config user.name || true)
+email=$(git config user.email || true)
+
+if [ -z "$name" ] || [ -z "$email" ]; then
+    echo "prepare-commit-msg: git user.name and user.email must be set for DCO sign-off" >&2
+    exit 1
+fi
+
+trailer="Signed-off-by: ${name} <${email}>"
+
+if ! grep -qiF "$trailer" "$message_file"; then
+    printf '\n%s\n' "$trailer" >> "$message_file"
+fi

@@ -1,0 +1,14 @@
+# Pinned so every developer and every CI leg compiles with the same rustc.
+#
+# This is load-bearing for determinism (charter rule 4), not just hygiene: the
+# Deterministic Float Subset relies on the compiler never contracting `a*b + c`
+# into an FMA and never reassociating float expressions. That is a guarantee of
+# the Rust language, not of a particular release, but pinning removes codegen
+# drift as a variable when a cross-platform hash gate fails.
+#
+# Bumping this is a deliberate change: run the determinism hash gate on all
+# three OS legs before merging the bump.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

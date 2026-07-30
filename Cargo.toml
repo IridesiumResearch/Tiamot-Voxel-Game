@@ -1,0 +1,60 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/server",
+    "crates/client",
+    "crates/bot",
+]
+
+# Shared metadata. Individual crates inherit with `field.workspace = true` so
+# the version and licence live in exactly one place.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "GPL-3.0-only"
+repository = "https://github.com/IridesiumResearch/Tiamot-Voxel-Game"
+authors = ["Iridesium"]
+# This is an engine distributed as a whole, not a set of crates.io libraries.
+# Saying so keeps an accidental `cargo publish` from happening and lets
+# cargo-deny treat the internal path dependencies as private.
+publish = false
+
+# Single source of truth for dependency versions across the workspace.
+#
+# THE DEPENDENCY FIREWALL (charter rule 3) IS NOT NEGOTIABLE: `core` and
+# `server` must never gain wgpu, winit, kira, or egui, directly or
+# transitively. `scripts/check-dep-firewall.sh` enforces this in CI across all
+# target platforms. Render, window, audio, and UI crates belong to `client`
+# alone; add them under the "client-only" heading below.
+[workspace.dependencies]
+# --- shared ---------------------------------------------------------------
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+
+# --- server / bot ---------------------------------------------------------
+clap = { version = "4.5", features = ["derive"] }
+toml = "0.9"
+ctrlc = { version = "3.4", features = ["termination"] }
+
+# --- client-only (render / window / audio / UI) ---------------------------
+# Nothing yet; wgpu, winit, kira, and egui arrive in Tasks 08, 13, and 14.
+# Anything listed here is forbidden to `core` and `server` by the firewall.
+
+# --- internal -------------------------------------------------------------
+# The package is `tiamot-core`, not `core`, even though it lives in
+# `crates/core` per charter rule 3. A package named `core` shadows the sysroot
+# `core` crate in the extern prelude, making every `use core::...` in a
+# dependent crate an E0659 ambiguity error. The directory layout the charter
+# specifies is preserved; only the package name is qualified.
+tiamot-core = { path = "crates/core" }
+
+[profile.release]
+# Simulation is the hot path and it is single-crate-inlineable; the extra link
+# time is worth it. `panic = "abort"` is deliberately NOT set: charter rule 14
+# requires panic isolation on asset-decode workers.
+lto = "thin"
+codegen-units = 1

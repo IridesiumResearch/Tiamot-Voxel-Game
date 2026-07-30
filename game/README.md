@@ -1,0 +1,38 @@
+<!-- SPDX-FileCopyrightText: Iridesium -->
+<!-- SPDX-License-Identifier: GPL-3.0-only -->
+
+# `game/` — reference mods and test fixtures
+
+**This directory is not the game.** It is empty for now, and what eventually
+lands here is reference implementations and test fixtures, not shipped content.
+
+The distinction matters enough that the charter opens with it. Every mod in this
+directory exists to prove that a specific engine mechanism works *through the
+public mod API* — that is its whole job. If a mechanism can only be exercised by
+reaching past the API, that is an engine bug (charter rule 1), and these mods are
+how it gets caught.
+
+A real default game is a later phase, built as mods on top of a finished engine.
+It is not part of the 18-task build plan in [`../voxel-prompts/`](../voxel-prompts/).
+
+## What that means in practice
+
+**Do not** add content here, tune game feel, or design progression. If a task
+tempts you toward "the game needs X", the answer is that a *future mod* needs X,
+and the engine's job is to make X expressible.
+
+A mod belongs here when it is the smallest thing that demonstrates a mechanism
+and can be asserted against in a test. It does not belong here because it would
+be fun.
+
+## Licensing
+
+Mods in this directory are part of the engine distribution and carry the
+engine's licence, **GPL-3.0-only**.
+
+That is not the situation for *your* mods. Anything interacting with the engine
+solely through the Lua scripting API or the network protocol is an independent
+work under the GPLv3 §7 Additional Permission in
+[`../LICENSE.EXCEPTION`](../LICENSE.EXCEPTION) — license it however you like,
+including commercially and closed-source. See
+[`../MOD-LICENSING.md`](../MOD-LICENSING.md).

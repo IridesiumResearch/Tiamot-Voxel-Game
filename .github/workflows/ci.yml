@@ -1,0 +1,114 @@
+# SPDX-FileCopyrightText: Iridesium
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Platform-dependent work. Runs on every supported OS because that is the
+  # whole point: the determinism gate (Task 04) compares hashes ACROSS these
+  # legs, so a leg that does not run is a leg that cannot disagree.
+  build:
+    name: build / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Honours rust-toolchain.toml, so the pinned version is the one used.
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        # --all-targets covers tests and benches, not just the library.
+        # Includes the determinism disallowed-methods lint from Task 04 onward.
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Charter rule 3: the server must run where there is no display server.
+      # ubuntu-latest runners have no X11 or Wayland session, so simply starting
+      # it here is a real check rather than a symbolic one.
+      - name: Server starts headless and exits 0 on signal
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          unset DISPLAY WAYLAND_DISPLAY
+          cargo run -p server -- --config server.example.toml &
+          server_pid=$!
+          sleep 5
+          kill -TERM "$server_pid"
+          wait "$server_pid"
+          echo "server exited 0 on SIGTERM with no display server"
+
+  # Platform-independent policy gates. Deliberately NOT in the OS matrix.
+  #
+  # Every check here inspects the dependency graph, the source text, or the git
+  # history — none of which change per runner OS. The firewall and cargo-deny
+  # both evaluate ALL supported targets from a single machine, so running them
+  # three times would triple the wall clock and prove nothing extra. The
+  # CHANGELOG flags CI wall-clock as a live concern; this is where that starts.
+  checks:
+    name: policy checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # check-dco.sh walks the commits under review, so it needs more than
+          # a shallow clone.
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: policy-checks
+
+      - name: Dependency firewall (charter rule 3)
+        run: ./scripts/check-dep-firewall.sh
+
+      - name: SPDX headers (charter rule 17)
+        run: ./scripts/check-spdx.sh
+
+      - name: DCO sign-off (charter rule 17)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            ./scripts/check-dco.sh "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          else
+            ./scripts/check-dco.sh "${{ github.event.before }}..${{ github.sha }}"
+          fi
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        name: Licence and advisory audit (charter rule 17)
+        with:
+          command: check

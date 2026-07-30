@@ -1,0 +1,207 @@
+// SPDX-FileCopyrightText: Iridesium
+// SPDX-License-Identifier: GPL-3.0-only
+
+//! Server configuration, loaded from a TOML file.
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Anything that can go wrong loading a config file.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The file could not be read.
+    #[error("could not read config file `{path}`")]
+    Read {
+        /// Path we tried to read.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The file was read but is not valid TOML, or does not match the schema.
+    #[error("could not parse config file `{path}`")]
+    Parse {
+        /// Path we tried to parse.
+        path: PathBuf,
+        /// Underlying deserialisation error.
+        #[source]
+        source: toml::de::Error,
+    },
+
+    /// A field held a syntactically valid but unusable value.
+    #[error("invalid config in `{path}`: {message}")]
+    Invalid {
+        /// Path the bad value came from.
+        path: PathBuf,
+        /// What was wrong with it.
+        message: String,
+    },
+}
+
+/// Server configuration.
+///
+/// Unknown fields are rejected rather than ignored: a typo in a config key is
+/// far more often a mistake than an intention, and silently running with a
+/// default the operator did not choose is worse than refusing to start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// Address and port the server listens on.
+    #[serde(default = "Config::default_bind_addr")]
+    pub bind_addr: SocketAddr,
+
+    /// Directory holding the world database.
+    #[serde(default = "Config::default_world_path")]
+    pub world_path: PathBuf,
+
+    /// Maximum simultaneously connected players.
+    #[serde(default = "Config::default_max_players")]
+    pub max_players: u32,
+}
+
+impl Config {
+    fn default_bind_addr() -> SocketAddr {
+        // IPv4 wildcard; operators who want IPv6 or loopback-only say so.
+        SocketAddr::from(([0, 0, 0, 0], 47_811))
+    }
+
+    fn default_world_path() -> PathBuf {
+        PathBuf::from("world")
+    }
+
+    fn default_max_players() -> u32 {
+        16
+    }
+
+    /// Reads and validates a config file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] if the file cannot be read, is not valid TOML,
+    /// contains unknown keys, or holds an unusable value.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        let config: Self = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        config.validate(path)?;
+        Ok(config)
+    }
+
+    fn validate(&self, path: &Path) -> Result<(), ConfigError> {
+        if self.max_players == 0 {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: "max_players must be at least 1".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bind_addr: Self::default_bind_addr(),
+            world_path: Self::default_world_path(),
+            max_players: Self::default_max_players(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Writes `text` to a uniquely named temp file and returns its path.
+    ///
+    /// Named after the test so parallel test threads cannot collide.
+    fn temp_config(name: &str, text: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("tiamot-test-{name}.toml"));
+        let mut file = std::fs::File::create(&path).expect("create temp config");
+        file.write_all(text.as_bytes()).expect("write temp config");
+        path
+    }
+
+    #[test]
+    fn parses_a_full_config() {
+        let path = temp_config(
+            "full",
+            r#"
+bind_addr = "127.0.0.1:1234"
+world_path = "/srv/worlds/alpha"
+max_players = 64
+"#,
+        );
+
+        let config = Config::load(&path).expect("valid config should load");
+        assert_eq!(config.bind_addr, "127.0.0.1:1234".parse().expect("addr"));
+        assert_eq!(config.world_path, PathBuf::from("/srv/worlds/alpha"));
+        assert_eq!(config.max_players, 64);
+    }
+
+    #[test]
+    fn omitted_fields_fall_back_to_defaults() {
+        let path = temp_config("partial", "max_players = 2\n");
+
+        let config = Config::load(&path).expect("partial config should load");
+        assert_eq!(config.max_players, 2);
+        assert_eq!(config.bind_addr, Config::default_bind_addr());
+        assert_eq!(config.world_path, Config::default_world_path());
+    }
+
+    #[test]
+    fn round_trips_through_toml() {
+        let original = Config::default();
+        let text = toml::to_string(&original).expect("serialise");
+        let parsed: Config = toml::from_str(&text).expect("deserialise");
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn rejects_unknown_keys() {
+        let path = temp_config("unknown", "max_playerz = 4\n");
+
+        let err = Config::load(&path).expect_err("typo should be rejected");
+        assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_zero_max_players() {
+        let path = temp_config("zero", "max_players = 0\n");
+
+        let err = Config::load(&path).expect_err("zero players should be rejected");
+        assert!(matches!(err, ConfigError::Invalid { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn reports_a_missing_file_as_a_read_error() {
+        let path = std::env::temp_dir().join("tiamot-test-definitely-absent.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let err = Config::load(&path).expect_err("missing file should be an error");
+        assert!(matches!(err, ConfigError::Read { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn the_shipped_example_config_is_valid() {
+        // Guards against the example drifting out of sync with the schema —
+        // it is the first thing a new operator copies.
+        let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../server.example.toml")
+            .canonicalize()
+            .expect("server.example.toml should exist at the repo root");
+
+        Config::load(&example).expect("shipped example config should be valid");
+    }
+}

@@ -1,0 +1,104 @@
+                    ADDITIONAL PERMISSION FOR THE TIAMOT VOXEL ENGINE
+                  Granted under GNU General Public License version 3,
+                                   section 7
+
+Copyright (C) 2026 Iridesium
+
+
+0. STATUS OF THIS DOCUMENT
+
+   The Tiamot voxel engine ("the Engine") is licensed under the GNU General
+   Public License, version 3 only ("the GPL"), a copy of which is distributed
+   with the Engine as the file LICENSE.
+
+   This document is an Additional Permission within the meaning of GPL section
+   7.  It grants permissions in addition to those of the GPL.  It removes no
+   condition and imposes no further restriction.  It forms part of the
+   licensing terms under which the Engine is distributed.
+
+   This grant is made by Iridesium, the copyright holder of the Engine.  Only
+   Iridesium may grant or amend it.
+
+
+1. DEFINITIONS
+
+   "the Engine" means the Tiamot voxel engine, including the contents of the
+   crates/ directory and any other portion of this distribution carrying the
+   SPDX identifier GPL-3.0-only.
+
+   "the Scripting API" means the Lua-callable interface the Engine exposes to
+   mods, together with the Lua stubs, type definitions, and documentation
+   distributed under the api/ directory.
+
+   "the Network Protocol" means the wire protocol spoken between an Engine
+   server and an Engine client.
+
+   "an Independent Work" means a work that interacts with the Engine solely
+   through the Scripting API, the Network Protocol, or both.
+
+
+2. GRANT
+
+   Iridesium hereby grants permission to develop, use, reproduce, distribute,
+   sell, and license Independent Works under terms of the author's own
+   choosing, including terms that are proprietary or otherwise incompatible
+   with the GPL.
+
+   For the avoidance of doubt, an Independent Work is not a derivative work of
+   the Engine, is not a "modified version" or "work based on the Program" as
+   those terms are used in the GPL, and carries no obligation under the GPL by
+   reason of its interaction with the Engine.  This holds regardless of whether
+   the interaction occurs in a shared address space, whether the Independent
+   Work is loaded into a process running Engine code, and whether the Engine
+   and the Independent Work are distributed together.
+
+   This permission extends to the output of an Independent Work and to any
+   data, assets, or world content it produces.
+
+
+3. WHAT THIS GRANT DOES NOT COVER
+
+   This permission applies only to interaction through the Scripting API and
+   the Network Protocol.  It does not apply to a work that:
+
+   (a) incorporates, links against, or embeds any part of the Engine's source
+       or object code otherwise than through the Scripting API or the Network
+       Protocol;
+
+   (b) is a modified version of the Engine, or contains a modified copy of any
+       part of the Engine; or
+
+   (c) extends the Engine through any private, internal, or unpublished
+       interface, or through a Rust plugin, native shared library, or other
+       mechanism that is not the Scripting API or the Network Protocol.
+
+   A work of that kind remains subject to the GPL in full.  Modifications to
+   the Engine itself must be released under the GPL, whether or not they are
+   made in order to support an Independent Work.
+
+
+4. NO EFFECT ON THE ENGINE'S OWN TERMS
+
+   Nothing in this document alters the terms under which the Engine itself is
+   licensed.  If you convey the Engine, with or without modification, you must
+   do so under the GPL.
+
+   Under GPL section 7 a recipient may remove this Additional Permission from
+   any copy of the Engine they convey, or from any part of it.  Doing so
+   removes only the extra permission granted here; it does not affect anyone
+   else's copy, and it does not affect Independent Works already developed in
+   reliance on this grant.
+
+
+5. IF THIS DOCUMENT IS MISSING
+
+   This Additional Permission is intended to accompany every distribution of
+   the Engine.  The authoritative copy is the one published by Iridesium with
+   the Engine's source.
+
+
+                                  * * *
+
+   A plain-language explanation of what this means for mod authors is in
+   MOD-LICENSING.md.  That file is a summary and has no legal effect; this
+   document and LICENSE are the operative terms.

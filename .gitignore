@@ -1,0 +1,37 @@
+# Rust build artefacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock IS committed. This workspace ships binaries (server, client, bot),
+# and reproducible builds of a binary need a pinned dependency graph — doubly so
+# for a project whose CI gate is a cross-platform determinism hash.
+
+# Fuzzing (cargo-fuzz, from Task 06 onward)
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# Criterion benchmark output
+/target/criterion/
+
+# Local server state
+/server.toml
+/world/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Editors and OS
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# VS Code: keep shared settings, ignore per-developer ones
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json

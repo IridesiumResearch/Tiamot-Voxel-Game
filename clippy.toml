@@ -1,0 +1,29 @@
+# Clippy configuration.
+#
+# The `disallowed-methods` list below is the ENFORCEMENT MECHANISM for the
+# Deterministic Float Subset (charter rule 4). It is deliberately empty right
+# now: Task 04 populates it with the determinism ban list, and creating the file
+# here means the CI wiring is already in place when the rules arrive.
+#
+# When Task 04 fills this in, the entries are the operations that break
+# bit-identical cross-platform simulation:
+#
+#   - libm transcendentals (sin, cos, tan, asin, acos, atan, atan2, exp, exp2,
+#     ln, log, log2, log10, powf, powi, cbrt, hypot, exp_m1, ln_1p, sin_cos).
+#     These call platform libm and differ across OS, libc version, and CPU.
+#     No Rust guarantee covers them.
+#   - `f32::mul_add` / `f64::mul_add`, which use a hardware FMA where available
+#     and a software fallback elsewhere; the two round differently. Write
+#     `a * b + c` explicitly.
+#
+# Two things to keep in mind when Task 04 lands:
+#
+#   1. NEVER silence this lint to make a hash match. A cross-platform hash
+#      mismatch is a real bug in the simulation, not a lint problem.
+#   2. `docs/float-determinism.md` is authoritative. Any change to the allowed
+#      or banned set requires editing that document FIRST, then this file.
+#
+# The lint is scoped to simulation code. Presentation code — rendering, audio,
+# UI layout, camera smoothing, client-side interpolation — is explicitly exempt
+# (charter rule 4, "Scope"), and must not be taxed with these rules.
+disallowed-methods = []

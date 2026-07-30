@@ -1,0 +1,21 @@
+# Example Tiamot server configuration.
+#
+# Copy this to server.toml and edit. Every key below is optional; the value
+# shown is the default the server uses when the key is absent.
+#
+# Unknown keys are a hard error rather than a warning. A typo in a config key
+# should stop the server, not silently leave you running a default you did not
+# choose.
+
+# Address and port to listen on.
+#   "0.0.0.0:47811" — all IPv4 interfaces (public server)
+#   "127.0.0.1:47811" — loopback only (singleplayer, or behind a proxy)
+#   "[::]:47811" — all IPv6 interfaces
+bind_addr = "0.0.0.0:47811"
+
+# Directory holding the world database. Relative paths resolve against the
+# server's working directory.
+world_path = "world"
+
+# Maximum simultaneously connected players. Must be at least 1.
+max_players = 16

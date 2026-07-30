@@ -1,0 +1,101 @@
+# cargo-deny configuration (charter rule 17).
+#
+# The engine is GPLv3-only, and GPLv3 compatibility is one-directional: we can
+# absorb a permissively licensed dependency, but a dependency under a licence
+# GPLv3 cannot absorb makes the whole binary undistributable. That is not a
+# problem to discover at release time, so it is gated in CI from Task 01.
+
+[graph]
+# Determinism (charter rule 4) restricts us to x86_64 and aarch64; i686 is
+# unsupported and deliberately absent. Checking all supported targets means a
+# platform-specific dependency cannot slip past a Linux-only CI run.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "aarch64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Add advisory IDs here only with a comment explaining why the project is not
+# affected, and a note on what would have to change to drop the exception.
+ignore = []
+
+[licenses]
+version = 2
+# Confidence below this and cargo-deny reports the licence as unclear rather
+# than guessing. Guessing is exactly what we cannot afford here.
+confidence-threshold = 0.93
+# The allow-list below is deliberately forward-looking — it covers licences the
+# dependency tree will encounter as later tasks add TLS, decoders, and a
+# renderer. Warning about entries not yet in use would be noise on every run.
+unused-allowed-license = "allow"
+
+# GPLv3-compatible licences only.
+#
+# Apache-2.0 deserves a note: it is one-way compatible with GPLv3 (fine to
+# depend on, and the combined work is GPLv3) but NOT with GPLv2. That is part of
+# why the engine is GPL-3.0-only rather than "-or-later" — under "or later" a
+# downstream recipient could elect GPLv2 and find the Apache-licensed half of
+# the dependency tree incompatible.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # Our own crates.
+    "GPL-3.0-only",
+]
+
+# Per-crate exceptions go here, each with a comment justifying it. Empty is the
+# correct state; every entry is a small ongoing liability.
+exceptions = []
+
+[[licenses.clarify]]
+# ring's licence file bundles several notices and machine detection is not
+# reliable on it. The terms are ISC/MIT/OpenSSL, all GPLv3-compatible.
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# A path dependency with no version reads as a wildcard. That is a real hazard
+# for a crates.io dependency and a non-issue for a workspace-internal one, which
+# resolves to a file on disk and carries no supply-chain risk. This relaxation
+# applies only to path dependencies of crates marked `publish = false`, so the
+# strict rule still covers everything that comes from a registry.
+allow-wildcard-paths = true
+# Crates that must never appear anywhere in the graph, with the reason.
+deny = [
+    # Charter rule 14: server-pushed assets are hostile input, and the client
+    # asset path uses pure-Rust decoders only. C codec bindings are a remote
+    # attack surface in a process that renders untrusted content.
+    { name = "openssl-sys", reason = "use rustls; no C TLS in the client asset or network path" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Everything comes from crates.io. A git dependency is an unpinned, unaudited,
+# unreviewable supply-chain entry; adding one is a deliberate decision that
+# belongs in review, not a silent default.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

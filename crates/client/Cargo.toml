@@ -1,0 +1,23 @@
+[package]
+name = "client"
+description = "Viewer onto a Tiamot server: rendering, windowing, audio, and UI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# This is the ONLY crate permitted render, window, input, audio, and UI
+# dependencies (charter rule 3). wgpu and winit arrive in Task 08, kira in
+# Task 13, egui in Task 14.
+#
+# Everything a server pushes to this crate — PNG, OGG, glTF, scripts — is
+# hostile input (charter rule 14): pure-Rust decoders only, hard pre-decode
+# caps checked before allocation, decoding on a panic-isolated worker, and a
+# fuzz target landing in the same task as any parser.
+[dependencies]
+tiamot-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
