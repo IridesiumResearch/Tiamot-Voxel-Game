@@ -60,6 +60,47 @@ light, entity stepping, mod scripts, and networking, for all 50 players at
 once.** A subsystem that takes 5 ms/tick has consumed a tenth of the whole
 simulation on its own.
 
+### What Task 04 measured (worldgen)
+
+Single-threaded, release, on the reference machine. Worldgen runs off the tick
+on a worker pool, so these are throughput numbers rather than tick-budget ones —
+but the ratio is what matters.
+
+| Path | Target | Measured | |
+|---|---|---|---|
+| Block-resolution chunk, end to end | < 200 µs | **53.5 µs** | ✅ 3.7× |
+| `fill_3d` over 48³, 1 octave | < 2 ms | **2.65 ms** | ❌ 1.3× over |
+| `fill_3d` over 48³, 2 octaves | — | 5.04 ms | |
+| `fill_3d` over 48³, 4 octaves | — | 11.24 ms | |
+| Buffer expansion to 48³ | — | 88 µs | |
+| Determinism fingerprint | — | 408 µs | |
+
+**The default path is 50× cheaper than the opt-in one**, which is exactly what
+Sub-Node Contract §5's lazy expansion exists to preserve. A generator that never
+touches a sub-node pays 53 µs; one that fills the whole 48³ grid with 3D noise
+pays milliseconds. That gap is the mechanism working.
+
+**The 2 ms `fill_3d` target is not met, at any octave count.** Recorded as a
+miss rather than explained away. Notes:
+
+- The cost is linear in octaves, so the target is only ever within reach at one.
+- A tried and rejected optimisation is documented in `detgen::noise`: a cheaper
+  lattice hash gained 1% and broke seed sensitivity. **The hash is not the
+  bottleneck.**
+- The fills do **not** auto-vectorise — verified from the emitted assembly by
+  `scripts/check-vectorisation.sh`, which found zero packed float instructions.
+  The cause is inherent: data-dependent gradient lookups are gathers, and the
+  simplex radial falloff branches per lane.
+- Explicit SIMD is the remaining option and was not attempted. It needs its own
+  determinism argument first: a vector path that disagrees with the scalar path
+  by one bit breaks the cross-platform hash gate on any machine that dispatches
+  differently.
+
+Open question for whoever needs 3D worldgen: whether 2 ms was ever the right
+number for 110,592 samples of 3D gradient noise, or whether the opt-in path
+should simply be understood as costing milliseconds and be scheduled
+accordingly.
+
 ### What Task 02b already spent
 
 Measured on a Ryzen 7 7800X3D — faster than minimum spec, so treat these as

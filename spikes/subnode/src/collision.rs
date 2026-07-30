@@ -21,9 +21,19 @@
 //!
 //! This prototype uses `f32` freely. Task 09's real implementation is
 //! simulation code and must stay inside the Deterministic Float Subset (charter
-//! rule 4) — no transcendentals, no `mul_add`. Nothing here needs any of them:
-//! the arithmetic is add, multiply, compare, and floor, which are all in the
-//! allowed subset already. That is a useful finding in itself.
+//! rule 4) — no transcendentals, no `mul_add`.
+//!
+//! An earlier version of this comment claimed the arithmetic here was already
+//! inside the subset because it is "add, multiply, compare, and floor". **That
+//! was wrong, and Task 04's lint caught it.** `f32::floor` is banned: the
+//! instruction implementing it in one step is SSE4.1, and on the SSE2 x86_64
+//! baseline it lowers to a libm call — platform-dependent, exactly what the
+//! subset exists to exclude. It now uses `detgen::floor_to_i32`.
+//!
+//! The useful finding stands, with the correction: collision needs no
+//! transcendental, so Task 09 can stay inside the subset without contortion.
+
+use tiamot_core::detgen::floor_to_i32;
 
 use crate::mesher::{N, SubNodeGrid};
 use crate::scenes::Rng;
@@ -101,12 +111,12 @@ impl<'a> Solid<'a> {
     /// against 1×2×1 at block resolution.
     #[must_use]
     pub fn overlaps(&self, aabb: &Aabb) -> bool {
-        let min_x = aabb.min[0].floor() as i32;
-        let max_x = (aabb.max[0] - f32::EPSILON).floor() as i32;
-        let min_y = aabb.min[1].floor() as i32;
-        let max_y = (aabb.max[1] - f32::EPSILON).floor() as i32;
-        let min_z = aabb.min[2].floor() as i32;
-        let max_z = (aabb.max[2] - f32::EPSILON).floor() as i32;
+        let min_x = floor_to_i32(aabb.min[0]);
+        let max_x = floor_to_i32(aabb.max[0] - f32::EPSILON);
+        let min_y = floor_to_i32(aabb.min[1]);
+        let max_y = floor_to_i32(aabb.max[1] - f32::EPSILON);
+        let min_z = floor_to_i32(aabb.min[2]);
+        let max_z = floor_to_i32(aabb.max[2] - f32::EPSILON);
 
         for y in min_y..=max_y {
             for z in min_z..=max_z {

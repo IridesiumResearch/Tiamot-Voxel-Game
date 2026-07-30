@@ -1,29 +1,108 @@
 # Clippy configuration.
 #
 # The `disallowed-methods` list below is the ENFORCEMENT MECHANISM for the
-# Deterministic Float Subset (charter rule 4). It is deliberately empty right
-# now: Task 04 populates it with the determinism ban list, and creating the file
-# here means the CI wiring is already in place when the rules arrive.
+# Deterministic Float Subset (charter rule 4). `docs/float-determinism.md` is
+# the authoritative reasoning; this file is only the teeth.
 #
-# When Task 04 fills this in, the entries are the operations that break
-# bit-identical cross-platform simulation:
+# TWO RULES, BOTH ABSOLUTE:
 #
-#   - libm transcendentals (sin, cos, tan, asin, acos, atan, atan2, exp, exp2,
-#     ln, log, log2, log10, powf, powi, cbrt, hypot, exp_m1, ln_1p, sin_cos).
-#     These call platform libm and differ across OS, libc version, and CPU.
-#     No Rust guarantee covers them.
-#   - `f32::mul_add` / `f64::mul_add`, which use a hardware FMA where available
-#     and a software fallback elsewhere; the two round differently. Write
-#     `a * b + c` explicitly.
+#   1. NEVER silence an entry here to make a hash match. A cross-platform hash
+#      mismatch is a real bug in the simulation, and this lint is how it gets
+#      found. Suppressing it turns a build failure into a bug report from a
+#      player whose world generated differently from their friend's.
+#   2. Edit docs/float-determinism.md FIRST, then this file. A lint entry with
+#      no entry in the doc is an unexplained rule, and unexplained rules get
+#      removed by whoever hits one at an inconvenient moment.
 #
-# Two things to keep in mind when Task 04 lands:
-#
-#   1. NEVER silence this lint to make a hash match. A cross-platform hash
-#      mismatch is a real bug in the simulation, not a lint problem.
-#   2. `docs/float-determinism.md` is authoritative. Any change to the allowed
-#      or banned set requires editing that document FIRST, then this file.
-#
-# The lint is scoped to simulation code. Presentation code — rendering, audio,
-# UI layout, camera smoothing, client-side interpolation — is explicitly exempt
-# (charter rule 4, "Scope"), and must not be taxed with these rules.
-disallowed-methods = []
+# Presentation code — rendering, audio, UI layout, camera smoothing,
+# interpolation — is EXEMPT (charter rule 4, "Scope"). These lints are workspace
+# scoped because clippy.toml cannot be scoped per crate; when `client` lands in
+# Task 08 and legitimately needs trigonometry, it carries a documented
+# `#[allow]` at the use site naming the exemption.
+
+disallowed-methods = [
+    # -- libm transcendentals -------------------------------------------------
+    # Not IEEE 754 operations. Library functions with no correctly-rounded
+    # requirement, differing between OS, libc version, and CPU generation. No
+    # Rust guarantee covers them. Replacement: gradient-table lookups and dot
+    # products need none; if a trig value is genuinely required, use a committed
+    # lookup table with linear interpolation.
+    { path = "f32::sin", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::sin", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::cos", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::cos", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::tan", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::tan", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::asin", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::asin", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::acos", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::acos", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::atan", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::atan", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::atan2", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::atan2", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::sin_cos", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::sin_cos", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::exp", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::exp", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::exp2", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::exp2", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::exp_m1", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::exp_m1", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::ln", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::ln", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::ln_1p", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::ln_1p", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::log", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::log", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::log2", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::log2", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::log10", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::log10", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::cbrt", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::cbrt", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::hypot", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::hypot", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f32::powf", reason = "libm: differs across platforms (float-determinism.md §1)" },
+    { path = "f64::powf", reason = "libm: differs across platforms (float-determinism.md §1)" },
+
+    # powi looks integral but lowers to repeated multiplication whose
+    # ASSOCIATION ORDER is LLVM's choice. Write the multiplication out.
+    { path = "f32::powi", reason = "association order is LLVM's choice; write the multiply out (float-determinism.md §1)" },
+    { path = "f64::powi", reason = "association order is LLVM's choice; write the multiply out (float-determinism.md §1)" },
+
+    # -- FMA ------------------------------------------------------------------
+    # Uses a hardware FMA where one exists and a software fallback where one
+    # does not, and the two ROUND DIFFERENTLY: FMA rounds once, `a * b + c`
+    # rounds twice. Write `a * b + c`; Rust forbids contracting it back.
+    { path = "f32::mul_add", reason = "FMA rounds once, a*b+c rounds twice; write it out (float-determinism.md §2)" },
+    { path = "f64::mul_add", reason = "FMA rounds once, a*b+c rounds twice; write it out (float-determinism.md §2)" },
+
+    # -- rounding to integral -------------------------------------------------
+    # These ARE exactly-specified IEEE operations. The problem is codegen: the
+    # single instruction that implements them, `roundss`, is SSE4.1, and the
+    # supported x86_64 baseline is SSE2. On an SSE2-only target LLVM cannot emit
+    # it and `floor` becomes a LIBM CALL — back to §1, silently, with nothing in
+    # the source to suggest anything changed.
+    # Replacement: `detgen::floor_to_i32`, which is casts and a comparison.
+    { path = "f32::floor", reason = "lowers to libm without SSE4.1; use detgen::floor_to_i32 (float-determinism.md §5)" },
+    { path = "f64::floor", reason = "lowers to libm without SSE4.1; use detgen::floor_to_i32 (float-determinism.md §5)" },
+    { path = "f32::ceil", reason = "lowers to libm without SSE4.1 (float-determinism.md §5)" },
+    { path = "f64::ceil", reason = "lowers to libm without SSE4.1 (float-determinism.md §5)" },
+    { path = "f32::round", reason = "lowers to libm without SSE4.1 (float-determinism.md §5)" },
+    { path = "f64::round", reason = "lowers to libm without SSE4.1 (float-determinism.md §5)" },
+    { path = "f32::trunc", reason = "lowers to libm without SSE4.1; use an `as` cast (float-determinism.md §5)" },
+    { path = "f64::trunc", reason = "lowers to libm without SSE4.1; use an `as` cast (float-determinism.md §5)" },
+    { path = "f32::fract", reason = "implemented via trunc; subtract the truncation instead (float-determinism.md §5)" },
+    { path = "f64::fract", reason = "implemented via trunc; subtract the truncation instead (float-determinism.md §5)" },
+
+    # -- unordered reduction --------------------------------------------------
+    # Float addition is not associative, so a sum's result depends on the order
+    # terms arrive. Rust's default hasher is randomly seeded PER PROCESS, so
+    # HashMap order is not stable even between two runs on one machine.
+    # Replacement: BTreeMap, IndexMap, or a sorted Vec, summed in a fixed order.
+    { path = "std::collections::HashMap::iter", reason = "iteration order is per-process random; use BTreeMap (float-determinism.md §4)" },
+    { path = "std::collections::HashMap::values", reason = "iteration order is per-process random; use BTreeMap (float-determinism.md §4)" },
+    { path = "std::collections::HashMap::keys", reason = "iteration order is per-process random; use BTreeMap (float-determinism.md §4)" },
+    { path = "std::collections::HashSet::iter", reason = "iteration order is per-process random; use BTreeSet (float-determinism.md §4)" },
+]

@@ -48,9 +48,14 @@
 // guard is the world-bound check in `coords`, not a cast annotation. Marking
 // each site individually would add hundreds of attributes and make the genuine
 // ones invisible.
+// `cast_precision_loss` joins them for the same reason with one extra
+// guarantee: every `i32 as f32` in the noise path is on a lattice coordinate
+// already clamped to 2^22, which f32 represents exactly. The conversion is
+// provably lossless there, and the lint cannot see the clamp.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
 
@@ -58,6 +63,7 @@ pub mod bitpack;
 pub mod block;
 pub mod chunk;
 pub mod coords;
+pub mod detgen;
 pub mod inventory;
 pub mod material;
 pub mod persist;
@@ -65,6 +71,7 @@ pub mod persist;
 pub use block::{BlockContent, BlockValue, BlockView, Cells, SlotIndex};
 pub use chunk::Chunk;
 pub use coords::{BlockPos, ChunkPos, CoordError, SubNodePos};
+pub use detgen::{ChunkBuffer, StreamRng, assert_ieee_mode, fingerprint};
 pub use inventory::Stack;
 pub use material::{MaterialId, MaterialRegistry, Registry};
 pub use persist::{WorldDb, WorldError};
