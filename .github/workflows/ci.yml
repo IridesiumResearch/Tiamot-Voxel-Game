@@ -47,7 +47,13 @@ jobs:
       - name: Clippy
         # --all-targets covers tests and benches, not just the library.
         # Includes the determinism disallowed-methods lint from Task 04 onward.
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        #
+        # NOT --all-features, deliberately. The scripting backends
+        # (vm-lua54 / vm-luajit / vm-luau) are MUTUALLY EXCLUSIVE — mlua cannot
+        # link two Lua implementations into one binary — so --all-features is
+        # not a stricter check here, it is an impossible configuration. The
+        # non-default backends are checked explicitly in the policy job.
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --workspace --all-targets
@@ -112,6 +118,24 @@ jobs:
       # still has to keep compiling — so it is type-checked once, here.
       - name: Type-check the spike's GPU feature
         run: cargo check -p subnode-spike --features gpu --all-targets
+
+      # The two scripting backends that are not the default still have to
+      # compile and lint — they exist so the VM benchmark stays re-runnable and
+      # the verdict re-verifiable (docs/scripting-vm.md). Checked once here
+      # rather than on all three OS legs: they are the same code.
+      #
+      # Their TESTS are not run in CI. Under vm-luajit the instruction-budget
+      # test is compiled out because LuaJIT cannot honour it, and running the
+      # rest would mean a third and fourth vendored Lua build on every push for
+      # backends nothing ships.
+      - name: Type-check the non-default scripting backends
+        run: |
+          for backend in vm-luajit vm-luau; do
+            echo "::group::$backend"
+            cargo clippy -p tiamot-core --lib \
+              --no-default-features --features "$backend" -- -D warnings
+            echo "::endgroup::"
+          done
 
       - name: SPDX headers (charter rule 17)
         run: ./scripts/check-spdx.sh
