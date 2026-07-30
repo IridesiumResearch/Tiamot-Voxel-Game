@@ -89,7 +89,9 @@ pub const fn subnode_offset(index: usize) -> (u32, u32, u32) {
 /// Only meaningful alongside the chunk that issued it. Chunks intern their
 /// mixed cell arrays, so equal contents share one slot and a
 /// [`BlockContent::Mixed`] comparison by slot is also a comparison by content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SlotIndex(pub u16);
 
 impl SlotIndex {
@@ -105,7 +107,13 @@ impl SlotIndex {
 /// This is the *storage* form and it is 12 bytes; [`BlockValue`] is the owned
 /// form callers pass in, and [`BlockView`] is the borrowed form they read back.
 /// Only canonical values are ever stored — see [`BlockValue::canonical`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// SERIALISED ON DISK. postcard encodes enum variants by POSITION, so adding a
+// variant anywhere but the end silently reinterprets every existing world file.
+// New variants go at the bottom, and the change bumps
+// `persist::codec::CHUNK_FORMAT_VERSION`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum BlockContent {
     /// Every sub-node is the same material. Includes a block of pure air.
     Uniform(MaterialId),

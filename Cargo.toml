@@ -43,6 +43,21 @@ publish = false
 [workspace.dependencies]
 # --- shared ---------------------------------------------------------------
 thiserror = "2.0"
+
+# --- persistence (Task 03) ------------------------------------------------
+# rusqlite `bundled` compiles SQLite from source rather than linking whatever
+# the host happens to ship. A world database is the player's save file; its
+# behaviour must not depend on the distro's SQLite version.
+rusqlite = { version = "0.37", features = ["bundled", "blob"] }
+# postcard enum variants are POSITION-encoded. Adding a variant anywhere but
+# the end silently reinterprets existing data. See `persist::codec`.
+postcard = { version = "1.1", features = ["alloc"] }
+# zstd for chunk blobs. This is a C binding, which charter rule 14 forbids in
+# the CLIENT ASSET path — decoding untrusted PNG/OGG/glTF from a server. A world
+# database is the server's own file, not hostile input, so the rule does not
+# reach here. If a world file ever becomes shareable, that changes and this
+# needs revisiting.
+zstd = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -71,7 +86,6 @@ proptest = "1.8"
 # does not enter the normal build or the CI matrix.
 wgpu = "27"
 pollster = "0.4"
-zstd = "0.13"
 
 # --- internal -------------------------------------------------------------
 # The package is `tiamot-core`, not `core`, even though it lives in

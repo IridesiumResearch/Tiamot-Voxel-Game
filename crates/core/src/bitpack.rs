@@ -18,6 +18,26 @@
 //! A width of zero is a real and common case: a chunk of one material needs no
 //! index storage at all, and [`BitArray::new`] allocates nothing for it.
 
+/// A [`BitArray`] could not be rebuilt from raw words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BitArrayError {
+    /// The entry width exceeds [`BitArray::MAX_BITS`].
+    #[error("entry width {bits} exceeds the maximum of 16 bits")]
+    TooWide {
+        /// The offending width.
+        bits: u8,
+    },
+
+    /// The word count does not match the length and width.
+    #[error("expected {expected} packed words, found {found}")]
+    WrongWordCount {
+        /// Words the length and width require.
+        expected: usize,
+        /// Words actually supplied.
+        found: usize,
+    },
+}
+
 /// A fixed-length array of `len` unsigned integers of `bits_per_entry` bits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitArray {
@@ -204,6 +224,44 @@ impl BitArray {
     /// Iterates every entry in order.
     pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         (0..self.len).map(|index| self.get(index))
+    }
+
+    /// The raw packed words, for serialisation.
+    #[must_use]
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// Rebuilds from raw packed words.
+    ///
+    /// # Errors
+    ///
+    /// [`BitArrayError`] if `bits_per_entry` is too wide or `words` is not
+    /// exactly the length that `len` entries at that width require. Both are
+    /// reachable from a corrupt or hand-edited world file, so neither may
+    /// panic.
+    pub fn from_words(
+        len: usize,
+        bits_per_entry: u8,
+        words: Vec<u64>,
+    ) -> Result<Self, BitArrayError> {
+        if bits_per_entry > Self::MAX_BITS {
+            return Err(BitArrayError::TooWide {
+                bits: bits_per_entry,
+            });
+        }
+        let expected = Self::words_needed(len, bits_per_entry);
+        if words.len() != expected {
+            return Err(BitArrayError::WrongWordCount {
+                expected,
+                found: words.len(),
+            });
+        }
+        Ok(Self {
+            words,
+            bits_per_entry,
+            len,
+        })
     }
 
     const fn entry_mask(bits_per_entry: u8) -> u64 {

@@ -29,7 +29,19 @@ use std::collections::BTreeMap;
 /// Ordering is by numeric id. That is an arbitrary but *stable within a
 /// session* order, which is what deterministic output ordering needs — see
 /// [`crate::inventory::break_block`].
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct MaterialId(pub u16);
 
 impl MaterialId {
@@ -62,6 +74,19 @@ impl MaterialId {
     #[must_use]
     pub const fn get(self) -> u16 {
         self.0
+    }
+}
+
+impl From<u16> for MaterialId {
+    /// Wraps a raw numeric value.
+    ///
+    /// Deliberately cheap and deliberately unchecked: an id is only meaningful
+    /// against the registry that issued it, and this conversion cannot know
+    /// which registry the caller means. The persistence layer uses it after
+    /// translating through the world's id table, which is where the checking
+    /// actually belongs.
+    fn from(raw: u16) -> Self {
+        Self(raw)
     }
 }
 

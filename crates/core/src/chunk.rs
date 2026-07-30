@@ -154,6 +154,105 @@ impl MixedTable {
     }
 }
 
+/// A chunk's serialised parts: exactly its internal state, nothing derived.
+///
+/// The mixed table's lookup index is deliberately absent — it is derived from
+/// the cells and is rebuilt on load. Serialising derived data invites it to
+/// disagree with what it was derived from.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ChunkParts {
+    pub palette: Vec<(BlockContent, u32)>,
+    pub bits_per_index: u8,
+    pub index_words: Vec<u64>,
+    pub mixed_cells: Vec<Cells>,
+    pub mixed_free: Vec<u16>,
+}
+
+/// A serialised chunk failed validation.
+///
+/// Every variant is reachable from a corrupt, truncated, or hand-edited world
+/// file. None of them is a bug in the engine, and none may panic.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CorruptChunk {
+    /// The palette holds no entries at all.
+    #[error("chunk palette is empty")]
+    EmptyPalette,
+
+    /// The palette claims more entries than a chunk has blocks.
+    #[error("chunk palette has {len} entries, more than the 4096 blocks that could use them")]
+    PaletteTooLarge {
+        /// Entries claimed.
+        len: usize,
+    },
+
+    /// The mixed table claims more slots than `u16` can address.
+    #[error("mixed table has {len} slots, more than a u16 slot index can address")]
+    MixedTableTooLarge {
+        /// Slots claimed.
+        len: usize,
+    },
+
+    /// The index width is too narrow for the palette.
+    #[error("index width {bits} cannot address a palette of {palette} entries")]
+    IndexTooNarrow {
+        /// Stored width.
+        bits: u8,
+        /// Palette length.
+        palette: usize,
+    },
+
+    /// The packed index array is malformed.
+    #[error("packed block indices are malformed")]
+    Indices(#[source] crate::bitpack::BitArrayError),
+
+    /// A block index points past the end of the palette.
+    #[error("block {block} indexes palette slot {slot}, but the palette has {palette} entries")]
+    IndexOutOfRange {
+        /// Offending block.
+        block: usize,
+        /// Slot it referenced.
+        slot: usize,
+        /// Palette length.
+        palette: usize,
+    },
+
+    /// A block index points at a reclaimed palette slot.
+    #[error("block {block} indexes palette slot {slot}, which has no references")]
+    IndexToFreeSlot {
+        /// Offending block.
+        block: usize,
+        /// Slot it referenced.
+        slot: usize,
+    },
+
+    /// A palette entry's refcount disagrees with the indices.
+    #[error("palette slot {slot} claims {stored} references but {counted} blocks use it")]
+    RefcountMismatch {
+        /// Offending slot.
+        slot: usize,
+        /// Refcount as stored.
+        stored: u32,
+        /// Refcount as counted from the indices.
+        counted: u32,
+    },
+
+    /// A `Mixed` entry points at a missing or freed side-table slot.
+    #[error("palette slot {slot} references mixed slot {mixed}, which is absent or freed")]
+    DanglingMixedSlot {
+        /// Offending palette slot.
+        slot: usize,
+        /// Mixed slot it referenced.
+        mixed: u16,
+    },
+
+    /// A stored `Partial` is not in canonical form.
+    #[error("palette slot {slot} holds a non-canonical Partial")]
+    NonCanonicalPartial {
+        /// Offending slot.
+        slot: usize,
+    },
+}
+
 /// A palette-compressed 16³-block chunk.
 ///
 /// See the [module documentation](self) for the storage design.
@@ -519,6 +618,198 @@ impl Chunk {
             + self.free.capacity() * size_of::<u16>()
             + self.indices.memory_usage()
             + self.mixed.memory_usage()
+    }
+
+    // -- serialisation ----------------------------------------------------
+
+    /// Exposes the exact internal state for serialisation.
+    ///
+    /// Crate-private: this is the persistence layer's business and nobody
+    /// else's. Callers outside the crate work through the public block API.
+    pub(crate) fn to_parts(&self) -> ChunkParts {
+        ChunkParts {
+            palette: self
+                .palette
+                .iter()
+                .map(|entry| (entry.content, entry.refs))
+                .collect(),
+            bits_per_index: self.indices.bits_per_entry(),
+            index_words: self.indices.words().to_vec(),
+            mixed_cells: self.mixed.cells.clone(),
+            mixed_free: self.mixed.free.clone(),
+        }
+    }
+
+    /// Rebuilds a chunk from serialised parts, validating every invariant.
+    ///
+    /// **Everything here is reachable from a corrupt or hand-edited world file,
+    /// so nothing may panic and nothing may be trusted.** A palette index
+    /// pointing past the palette, a mixed slot pointing past the table, or
+    /// refcounts that do not match the indices would each produce a chunk that
+    /// panics on the next read — long after the bad data was loaded, and
+    /// nowhere near it.
+    ///
+    /// # Errors
+    ///
+    /// [`CorruptChunk`] describing the first inconsistency found.
+    pub(crate) fn from_parts(pos: ChunkPos, parts: ChunkParts) -> Result<Self, CorruptChunk> {
+        let ChunkParts {
+            palette,
+            bits_per_index,
+            index_words,
+            mixed_cells,
+            mixed_free,
+        } = parts;
+
+        if palette.is_empty() {
+            return Err(CorruptChunk::EmptyPalette);
+        }
+        if palette.len() > BLOCKS_PER_CHUNK {
+            return Err(CorruptChunk::PaletteTooLarge { len: palette.len() });
+        }
+
+        let needed = BitArray::bits_for(palette.len());
+        if bits_per_index < needed {
+            return Err(CorruptChunk::IndexTooNarrow {
+                bits: bits_per_index,
+                palette: palette.len(),
+            });
+        }
+
+        let indices = BitArray::from_words(BLOCKS_PER_CHUNK, bits_per_index, index_words)
+            .map_err(CorruptChunk::Indices)?;
+
+        let (mixed, free) = Self::rebuild_mixed_table(mixed_cells, mixed_free)?;
+        let live_entries = Self::validate_palette(&palette, &mixed, &free)?;
+        Self::validate_indices(&palette, &indices)?;
+
+        let free_palette = palette
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, refs))| *refs == 0)
+            .map(|(slot, _)| slot as u16)
+            .collect();
+
+        Ok(Self {
+            pos,
+            palette: palette
+                .into_iter()
+                .map(|(content, refs)| PaletteEntry { content, refs })
+                .collect(),
+            free: free_palette,
+            live_entries,
+            indices,
+            mixed,
+        })
+    }
+
+    /// Rebuilds the mixed table's derived lookup, returning it and its free set.
+    fn rebuild_mixed_table(
+        cells: Vec<Cells>,
+        free_list: Vec<u16>,
+    ) -> Result<(MixedTable, std::collections::BTreeSet<u16>), CorruptChunk> {
+        // Derived from the cells rather than trusted from the file: a
+        // serialised lookup could disagree with what it was derived from, and
+        // interning would silently stop working.
+        let mut mixed = MixedTable {
+            cells,
+            free: free_list,
+            lookup: BTreeMap::new(),
+            live: 0,
+        };
+        let free: std::collections::BTreeSet<u16> = mixed.free.iter().copied().collect();
+
+        for slot in 0..mixed.cells.len() {
+            let slot = u16::try_from(slot).map_err(|_| CorruptChunk::MixedTableTooLarge {
+                len: mixed.cells.len(),
+            })?;
+            if free.contains(&slot) {
+                continue;
+            }
+            mixed
+                .lookup
+                .insert(MixedTable::hash(&mixed.cells[slot as usize]), slot);
+            mixed.live += 1;
+        }
+
+        Ok((mixed, free))
+    }
+
+    /// Checks every live palette entry, returning how many there are.
+    fn validate_palette(
+        palette: &[(BlockContent, u32)],
+        mixed: &MixedTable,
+        free: &std::collections::BTreeSet<u16>,
+    ) -> Result<u32, CorruptChunk> {
+        let mut live_entries = 0;
+        for (slot, (content, refs)) in palette.iter().enumerate() {
+            if *refs == 0 {
+                continue;
+            }
+            live_entries += 1;
+            match content {
+                BlockContent::Uniform(_) => {}
+                BlockContent::Partial {
+                    material,
+                    occupancy,
+                } => {
+                    // Non-canonical content on disk would give one world state
+                    // two representations, which is exactly what canonical form
+                    // exists to prevent (see the module docs).
+                    if material.is_air()
+                        || *occupancy == 0
+                        || *occupancy == block::OCCUPANCY_FULL
+                        || *occupancy & !block::OCCUPANCY_FULL != 0
+                    {
+                        return Err(CorruptChunk::NonCanonicalPartial { slot });
+                    }
+                }
+                BlockContent::Mixed(mixed_slot) => {
+                    if mixed_slot.get() >= mixed.cells.len() || free.contains(&mixed_slot.0) {
+                        return Err(CorruptChunk::DanglingMixedSlot {
+                            slot,
+                            mixed: mixed_slot.0,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(live_entries)
+    }
+
+    /// Checks that every index addresses a live entry and that the stored
+    /// refcounts are exactly what the indices imply.
+    fn validate_indices(
+        palette: &[(BlockContent, u32)],
+        indices: &BitArray,
+    ) -> Result<(), CorruptChunk> {
+        let mut counted_refs = vec![0u32; palette.len()];
+
+        for index in 0..BLOCKS_PER_CHUNK {
+            let slot = indices.get(index) as usize;
+            if slot >= palette.len() {
+                return Err(CorruptChunk::IndexOutOfRange {
+                    block: index,
+                    slot,
+                    palette: palette.len(),
+                });
+            }
+            if palette[slot].1 == 0 {
+                return Err(CorruptChunk::IndexToFreeSlot { block: index, slot });
+            }
+            counted_refs[slot] += 1;
+        }
+
+        for (slot, ((_, refs), counted)) in palette.iter().zip(&counted_refs).enumerate() {
+            if *refs != *counted {
+                return Err(CorruptChunk::RefcountMismatch {
+                    slot,
+                    stored: *refs,
+                    counted: *counted,
+                });
+            }
+        }
+        Ok(())
     }
 
     // -- internals --------------------------------------------------------

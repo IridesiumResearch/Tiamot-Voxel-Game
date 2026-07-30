@@ -60,12 +60,14 @@ pub mod chunk;
 pub mod coords;
 pub mod inventory;
 pub mod material;
+pub mod persist;
 
 pub use block::{BlockContent, BlockValue, BlockView, Cells, SlotIndex};
 pub use chunk::Chunk;
 pub use coords::{BlockPos, ChunkPos, CoordError, SubNodePos};
 pub use inventory::Stack;
 pub use material::{MaterialId, MaterialRegistry, Registry};
+pub use persist::{WorldDb, WorldError};
 
 /// Sub-node subdivisions along each axis of a block.
 ///

@@ -13,8 +13,12 @@ publish.workspace = true
 # winit, kira, egui, or any other windowing/render/input/audio crate, directly
 # or transitively. Enforced by scripts/check-dep-firewall.sh in CI.
 [dependencies]
+postcard.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
@@ -22,4 +26,8 @@ proptest.workspace = true
 
 [[bench]]
 name = "voxel"
+harness = false
+
+[[bench]]
+name = "persist"
 harness = false
