@@ -15,3 +15,11 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "voxel"
+harness = false

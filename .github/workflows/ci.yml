@@ -55,6 +55,15 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Smoke mode only: `--test` runs each benchmark once to prove it still
+      # compiles and executes, and records no timings. There is deliberately no
+      # regression gate — shared CI runners have too much variance to make one
+      # meaningful, and a flaky perf gate teaches people to ignore red builds.
+      # Task 02b takes the real measurements, on real hardware.
+      - name: Benchmarks (smoke)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo bench --workspace -- --test
+
       # Charter rule 3: the server must run where there is no display server.
       # ubuntu-latest runners have no X11 or Wayland session, so simply starting
       # it here is a real check rather than a symbolic one.

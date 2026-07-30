@@ -40,6 +40,14 @@ clap = { version = "4.5", features = ["derive"] }
 toml = "0.9"
 ctrlc = { version = "3.4", features = ["termination"] }
 
+# --- test and benchmark (dev-dependencies only) ---------------------------
+# Charter rule 15: simulation invariants are property-tested, benchmarks use
+# criterion. These are dev-dependencies, so they are outside the dependency
+# firewall's `--edges normal,build` scope by design — a test harness may
+# legitimately pull in more than the shipped binary does.
+criterion = "0.7"
+proptest = "1.8"
+
 # --- client-only (render / window / audio / UI) ---------------------------
 # Nothing yet; wgpu, winit, kira, and egui arrive in Tasks 08, 13, and 14.
 # Anything listed here is forbidden to `core` and `server` by the firewall.

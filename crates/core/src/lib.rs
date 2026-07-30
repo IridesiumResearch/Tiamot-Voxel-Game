@@ -20,7 +20,9 @@
 //!
 //! One block is one yard cubed, subdivided 3×3×3 into 27 sub-node units
 //! (charter rule 5). Quantities are stored in units as `u32` throughout; there
-//! are no special cases for partial blocks anywhere in the engine.
+//! are no special cases for partial blocks anywhere in the engine. See
+//! [`inventory`] for the arithmetic and [`block::subnode_index`] for the
+//! canonical sub-node addressing convention.
 //!
 //! # Determinism
 //!
@@ -31,6 +33,39 @@
 //! iteration order are banned. Task 04 populates the `clippy.toml`
 //! `disallowed-methods` list that enforces this and writes
 //! `docs/float-determinism.md`, the authoritative reference.
+//!
+//! Nothing in the voxel data model uses floats at all, and no map in it is a
+//! `HashMap`: ordered containers are used throughout so iteration order is a
+//! property of the data rather than of the process's hash seed.
+
+#![warn(missing_docs)]
+#![warn(clippy::pedantic)]
+// Voxel code converts between unsigned counts and signed coordinates on almost
+// every line: array indices and sizes are `usize`/`u32`, world coordinates are
+// `i32`, and sub-node offsets are 0..3. Every such conversion in this crate is
+// bounded by values that fit comfortably — the widest is the world extent at
+// ±180,000 sub-nodes, five orders of magnitude inside `i32` — and the real
+// guard is the world-bound check in `coords`, not a cast annotation. Marking
+// each site individually would add hundreds of attributes and make the genuine
+// ones invisible.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+
+pub mod bitpack;
+pub mod block;
+pub mod chunk;
+pub mod coords;
+pub mod inventory;
+pub mod material;
+
+pub use block::{BlockContent, BlockValue, BlockView, Cells, SlotIndex};
+pub use chunk::Chunk;
+pub use coords::{BlockPos, ChunkPos, CoordError, SubNodePos};
+pub use inventory::Stack;
+pub use material::{MaterialId, MaterialRegistry, Registry};
 
 /// Sub-node subdivisions along each axis of a block.
 ///
@@ -40,7 +75,8 @@ pub const SUBNODES_PER_AXIS: u32 = 3;
 /// Sub-node units in one whole block.
 ///
 /// All inventory and world quantities are stored in units. Display splits them
-/// as `units / UNITS_PER_BLOCK` blocks plus `units % UNITS_PER_BLOCK` nodes.
+/// as `units / UNITS_PER_BLOCK` blocks plus `units % UNITS_PER_BLOCK` nodes —
+/// see [`inventory::display`].
 pub const UNITS_PER_BLOCK: u32 = SUBNODES_PER_AXIS * SUBNODES_PER_AXIS * SUBNODES_PER_AXIS;
 
 /// Blocks along each axis of a chunk.
@@ -55,6 +91,9 @@ pub const CHUNK_BLOCKS: u32 = 16;
 
 /// Sub-node cells along each axis of a chunk.
 pub const CHUNK_SUBNODES: u32 = CHUNK_BLOCKS * SUBNODES_PER_AXIS;
+
+/// Blocks in one chunk.
+pub const BLOCKS_PER_CHUNK: usize = (CHUNK_BLOCKS * CHUNK_BLOCKS * CHUNK_BLOCKS) as usize;
 
 /// Padding bits binary greedy meshing needs on a sub-node column for
 /// neighbour-face culling — one at each end.
@@ -81,5 +120,6 @@ mod tests {
         // asserted at compile time above; this pins the concrete number that
         // the persistence format and the mesher both encode.
         assert_eq!(CHUNK_SUBNODES, 48);
+        assert_eq!(BLOCKS_PER_CHUNK, 4096);
     }
 }
