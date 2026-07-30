@@ -5,6 +5,18 @@ members = [
     "crates/server",
     "crates/client",
     "crates/bot",
+    "spikes/subnode",
+]
+
+# Spikes are throwaway measurement code, not shippable engine. They stay
+# workspace members so `cargo test --workspace` keeps them honest, but they are
+# excluded from the default build so `cargo build` at the root never produces
+# them and a release never ships them.
+default-members = [
+    "crates/core",
+    "crates/server",
+    "crates/client",
+    "crates/bot",
 ]
 
 # Shared metadata. Individual crates inherit with `field.workspace = true` so
@@ -49,8 +61,17 @@ criterion = "0.7"
 proptest = "1.8"
 
 # --- client-only (render / window / audio / UI) ---------------------------
-# Nothing yet; wgpu, winit, kira, and egui arrive in Tasks 08, 13, and 14.
-# Anything listed here is forbidden to `core` and `server` by the firewall.
+# Nothing yet for the client itself; wgpu, winit, kira, and egui arrive in
+# Tasks 08, 13, and 14. Anything listed here is forbidden to `core` and
+# `server` by the firewall.
+#
+# wgpu appears early only because Task 02b's VRAM deliverable requires
+# allocating real GPU buffers and reading back the allocation rather than
+# projecting a number. It is behind the spike's non-default `gpu` feature so it
+# does not enter the normal build or the CI matrix.
+wgpu = "27"
+pollster = "0.4"
+zstd = "0.13"
 
 # --- internal -------------------------------------------------------------
 # The package is `tiamot-core`, not `core`, even though it lives in

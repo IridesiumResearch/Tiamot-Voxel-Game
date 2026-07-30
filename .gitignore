@@ -35,3 +35,9 @@ Thumbs.db
 !.vscode/settings.json
 !.vscode/extensions.json
 !.vscode/launch.json
+
+# Task 02b spike artefacts. `measurements.txt` IS committed — the verdict memo
+# cites it as the record of what was measured. The OBJ files are regenerated in
+# seconds by `cargo run -p subnode-spike --release -- collision` and one of them
+# is nearly a megabyte, so they stay out of history.
+/spikes/subnode/out/*.obj

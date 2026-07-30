@@ -106,6 +106,13 @@ jobs:
       - name: Dependency firewall (charter rule 3)
         run: ./scripts/check-dep-firewall.sh
 
+      # The Task 02b spike's `gpu` feature pulls wgpu in for its VRAM
+      # measurement. It is non-default so the matrix above never compiles a
+      # renderer for a throwaway crate three times over, but the code behind it
+      # still has to keep compiling — so it is type-checked once, here.
+      - name: Type-check the spike's GPU feature
+        run: cargo check -p subnode-spike --features gpu --all-targets
+
       - name: SPDX headers (charter rule 17)
         run: ./scripts/check-spdx.sh
 

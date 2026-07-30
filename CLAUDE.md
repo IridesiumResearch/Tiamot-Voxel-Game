@@ -101,10 +101,15 @@ X," the answer is that a future mod needs X, and the engine's job is to make X e
 
 11. **Input:** mods register named actions; the engine owns key bindings. Mods never read keys.
 
-12. **Sub-Node Contract.** `docs/subnode-contract.md` (created in Task 02b) is the single
-    authoritative definition of how every system treats Partial/Mixed blocks. Any PR touching
-    collision, lighting, fluid, meshing, worldgen, or pathfinding cites the contract line it
-    implements. New sub-node semantics require editing the contract first.
+12. **Sub-Node Contract.** [`docs/subnode-contract.md`](docs/subnode-contract.md) **exists as of
+    Task 02b** and is the single authoritative definition of how every system treats
+    Partial/Mixed blocks. Any PR touching collision, lighting, fluid, meshing, worldgen, or
+    pathfinding cites the contract line it implements. New sub-node semantics require editing
+    the contract first. Read it before touching any of those systems — in particular §1, the
+    `u64`-column invariant, which is why chunks are 16³ and must not be resized.
+    The spike's measurements and the keep/limits/fallback decision are in
+    [`docs/subnode-verdict.md`](docs/subnode-verdict.md); **Tasks 08 and 09 do not start until
+    that decision is recorded.**
 
 13. **Player identity is cryptographic, and recoverable.** Identity is an Ed25519 key, but a
     key you can only lose once is a design defect, not security. The full model:
