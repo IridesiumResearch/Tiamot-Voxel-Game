@@ -157,6 +157,25 @@ function game.register_block(spec) end
 ---@param callback fun(buf: Tiamot.ChunkBuffer, pos: Tiamot.ChunkPos)
 function game.register_on_generate(callback) end
 
+---Registers a per-tick callback.
+---
+---**Registration window only.**
+---
+---Runs once per simulation tick, at 20 Hz. `dt_ticks` is how many simulation
+---steps this call covers — normally 1, but more when the server has fallen
+---behind and is catching up.
+---
+---It is a **count of steps, not a duration**, and deliberately so: scaling
+---behaviour by wall-clock time would make your mod produce different results on
+---a fast machine than a slow one, and two servers running the same world would
+---drift apart.
+---
+---If your callback raises an error, your mod is disabled for the rest of the
+---session and every other mod carries on. Nothing you do here can stop the
+---server's tick.
+---@param callback fun(dt_ticks: integer)
+function game.register_on_tick(callback) end
+
 ---Registers a named input action.
 ---
 ---Mods register actions; the engine owns key bindings and mods never read keys.
