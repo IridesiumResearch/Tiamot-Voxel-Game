@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Iridesium
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# The slow checks: benchmarks and sustained load.
+#
+# Separate from `ci.yml` on purpose. These take minutes and are noisy on shared
+# runners, and a gate that makes every push slow is a gate people route around.
+# CI stays fast and blocking; this runs nightly and on demand.
+
+name: nightly
+
+on:
+  schedule:
+    # 04:00 UTC, when GitHub's shared runners are least contended. Benchmark
+    # numbers from a busy runner are noise wearing a number's clothes.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  macro-bench:
+    name: macro benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The gate. `bot bench` exits non-zero if p99 is more than 2x the
+      # committed baseline, and refuses outright if the workload does not match
+      # the baseline's — comparing a different workload measures the parameters
+      # rather than the server.
+      - name: Macro benchmark, gated against the baseline
+        run: ./scripts/bench.sh gate
+
+      # Uploaded whether or not the gate passed: a regression is exactly when
+      # the numbers are worth reading.
+      - name: Upload the benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macro-bench-${{ github.sha }}
+          path: target/bench/macro.json
+          if-no-files-found: error
+
+  swarm-load:
+    name: swarm load (20 bots)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Release, because a debug build measures rustc's inlining decisions
+      # rather than the engine. `--ignored` because the test opts out of the
+      # fast loop a developer runs twenty times an hour.
+      - name: Twenty bots for sixty seconds
+        run: cargo test -p bot --test swarm_load --release -- --ignored --nocapture
+
+  micro-bench:
+    name: criterion micro-benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Not gated. Criterion's own noise threshold is tuned for a quiet machine,
+      # and a shared runner is not one; these are for reading a trend, not for
+      # blocking a merge.
+      - name: Run the micro-benchmarks
+        run: cargo bench --workspace 2>&1 | tee target/criterion-output.txt
+
+      - name: Upload the criterion output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ github.sha }}
+          path: target/criterion-output.txt
+          if-no-files-found: warn

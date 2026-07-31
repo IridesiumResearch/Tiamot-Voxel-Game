@@ -72,6 +72,24 @@ enum Mode {
         #[arg(long, default_value_t = 1)]
         seed: u64,
     },
+    /// Run the macro benchmark: fixed workload, tick-time distribution.
+    ///
+    /// Starts its own server, so there is nothing to point it at — the whole
+    /// value is that the workload and the world are identical every run.
+    Bench {
+        /// Where to write the machine-readable report.
+        #[arg(long, value_name = "path")]
+        json: Option<PathBuf>,
+        /// Baseline to compare against. Exits non-zero on a regression.
+        #[arg(long, value_name = "path")]
+        baseline: Option<PathBuf>,
+        /// How many bots replay the session.
+        #[arg(long, default_value_t = 4)]
+        bots: u32,
+        /// How many rounds of the standard session.
+        #[arg(long, default_value_t = 200)]
+        rounds: u64,
+    },
     /// Replay a recorded session.
     Replay {
         /// The recording.
@@ -125,6 +143,12 @@ fn main() -> ExitCode {
             seed,
         ),
         Mode::Replay { session, server } => replay_mode(&runtime, &session, server),
+        Mode::Bench {
+            json,
+            baseline,
+            bots,
+            rounds,
+        } => bench_mode(&runtime, json.as_deref(), baseline.as_deref(), bots, rounds),
     };
 
     if code == 0 {
@@ -327,7 +351,7 @@ fn replay_mode(runtime: &tokio::runtime::Runtime, session: &PathBuf, server: Soc
 
     let outcome = runtime.block_on(async {
         let client = bot::Bot::connect_trusting(server, identity).await?;
-        bot::replay::run(client, &commands).await
+        bot::replay::run(client, &commands, "replay").await
     });
 
     match outcome {
@@ -339,6 +363,147 @@ fn replay_mode(runtime: &tokio::runtime::Runtime, session: &PathBuf, server: Soc
             eprintln!("FAILED: {err}");
             1
         }
+    }
+}
+
+/// Runs the macro benchmark against a server it starts itself.
+fn bench_mode(
+    runtime: &tokio::runtime::Runtime,
+    json: Option<&std::path::Path>,
+    baseline: Option<&std::path::Path>,
+    bots: u32,
+    rounds: u64,
+) -> u8 {
+    use tiamot_core::identity::Allowlist;
+    use tiamot_core::interest::ViewDistance;
+    use tiamot_server::{ServerHandle, Settings};
+
+    let world = std::env::temp_dir().join("tiamot-macro-bench");
+    let _ = std::fs::remove_dir_all(&world);
+    if let Err(err) = std::fs::create_dir_all(&world) {
+        eprintln!("could not create the benchmark world: {err}");
+        return 1;
+    }
+
+    // A FIXED seed and a fresh world. The point of the benchmark is that the
+    // only thing changing between runs is the server.
+    let server = match ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: world,
+        max_players: 64,
+        allowlist: Allowlist::open(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: None,
+        seed: Some(0x7149_7231),
+        rcon: None,
+        materials: vec!["bench:stone".to_owned()],
+    }) {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("could not start the benchmark server: {err}");
+            return 1;
+        }
+    };
+
+    let addr = server.local_addr();
+    let session = bot::bench::standard_session(bots, rounds);
+    println!(
+        "macro bench: {bots} bots, {rounds} rounds, {} commands",
+        session.len()
+    );
+
+    // Let startup settle, then throw away the samples it produced: the first
+    // ticks include mod loading and first-visit chunk generation, which are
+    // real but are not what a steady-state benchmark is measuring.
+    std::thread::sleep(bot::bench::WARMUP);
+    let _ = server.control().take_tick_samples();
+
+    let outcome = runtime.block_on(async {
+        let mut handles = Vec::new();
+        for index in 0..bots {
+            let session = session.clone();
+            handles.push(tokio::spawn(async move {
+                let identity = Identity::generate().map_err(|err| err.to_string())?;
+                let client = bot::Bot::connect_trusting(addr, identity)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                bot::replay::run(client, &session, &format!("bench{index}"))
+                    .await
+                    .map_err(|err| err.to_string())
+            }));
+        }
+        let mut failures = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => failures.push(err),
+                Err(err) => failures.push(format!("bot task panicked: {err}")),
+            }
+        }
+        failures
+    });
+
+    let samples = server.control().take_tick_samples();
+    let report = bot::bench::TickReport::from_samples(
+        &samples,
+        server.control().over_budget_ticks(),
+        server.control().dropped(),
+        bots,
+        rounds,
+    );
+    server.stop();
+
+    for failure in &outcome {
+        eprintln!("  bot failed: {failure}");
+    }
+
+    print!("{}", report.to_table());
+
+    if let Some(path) = json {
+        match std::fs::write(path, report.to_json()) {
+            Ok(()) => println!("wrote {}", path.display()),
+            Err(err) => {
+                eprintln!("could not write `{}`: {err}", path.display());
+                return 1;
+            }
+        }
+    }
+
+    if !outcome.is_empty() {
+        eprintln!("FAILED: {} bot(s) did not finish", outcome.len());
+        return 1;
+    }
+
+    let Some(baseline_path) = baseline else {
+        println!("OK (no baseline given, so nothing was gated)");
+        return 0;
+    };
+
+    let baseline_text = match std::fs::read_to_string(baseline_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!(
+                "could not read the baseline `{}`: {err}",
+                baseline_path.display()
+            );
+            return 1;
+        }
+    };
+    let baseline_report = match bot::bench::TickReport::from_json(&baseline_text) {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("could not parse the baseline: {err}");
+            return 1;
+        }
+    };
+
+    let comparison = bot::bench::compare(&baseline_report, &report);
+    if comparison.within_tolerance {
+        println!("OK: {}", comparison.message);
+        0
+    } else {
+        eprintln!("REGRESSION: {}", comparison.message);
+        1
     }
 }
 

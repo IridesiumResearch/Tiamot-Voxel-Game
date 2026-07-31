@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "Macro benchmark baseline: bots replaying the standard session.",
+    "Regenerate: bot bench --rounds 120 --json benches/macro-baseline.json",
+    "Gate: CI fails if p99 exceeds 2x this value (bot::bench::REGRESSION_FACTOR).",
+    "The workload fields are checked, not decorative: comparing a run at a",
+    "different --rounds measures the parameters rather than the server.",
+    "HARDWARE MATTERS. These came from the machine named below; a CI runner is",
+    "different silicon and will not reproduce them exactly. The 2x threshold",
+    "absorbs that, which is also why it cannot be tightened without a",
+    "dedicated benchmark machine."
+  ],
+  "_machine": "dev container, AMD Ryzen 7 7800X3D, release build",
+  "_recorded": "2026-07-31",
+  "bots": 4,
+  "rounds": 120,
+  "ticks": 135,
+  "mean_us": 433,
+  "p50_us": 272,
+  "p95_us": 1063,
+  "p99_us": 1267,
+  "max_us": 3556,
+  "over_budget": 0,
+  "dropped": 0
+}

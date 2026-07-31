@@ -95,7 +95,20 @@ struct ControlInner {
     over_budget: AtomicU64,
     /// Set when an operator asks for a save; cleared when the tick performs it.
     save_requested: AtomicBool,
+    /// Per-tick durations in microseconds, for the macro benchmark.
+    ///
+    /// A bounded buffer: a server running for a week must not accumulate a
+    /// sample per tick forever. Once full it stops recording rather than
+    /// evicting, because a benchmark wants the first N ticks of a fixed
+    /// workload and a ring buffer would silently measure only the tail.
+    samples: std::sync::Mutex<Vec<u32>>,
 }
+
+/// How many tick samples are retained.
+///
+/// 20 Hz for an hour is 72,000, so this holds a benchmark run several times
+/// over while costing a few hundred kilobytes.
+pub const MAX_TICK_SAMPLES: usize = 100_000;
 
 impl Control {
     /// A fresh, running control handle.
@@ -130,6 +143,29 @@ impl Control {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Every recorded tick duration, in microseconds, clearing the buffer.
+    ///
+    /// Taken rather than borrowed so a benchmark can sample a phase and then
+    /// start a fresh one.
+    #[must_use]
+    pub fn take_tick_samples(&self) -> Vec<u32> {
+        self.inner
+            .samples
+            .lock()
+            .map(|mut samples| std::mem::take(&mut *samples))
+            .unwrap_or_default()
+    }
+
+    /// How many tick samples are currently held.
+    #[must_use]
+    pub fn sample_count(&self) -> usize {
+        self.inner
+            .samples
+            .lock()
+            .map(|samples| samples.len())
+            .unwrap_or(0)
     }
 
     /// The longest single tick observed, in microseconds.
@@ -239,6 +275,11 @@ pub fn run<C: Clock, F: FnMut(u64)>(clock: &mut C, control: &Control, mut step: 
                 .inner
                 .slowest_micros
                 .fetch_max(micros, Ordering::Relaxed);
+            if let Ok(mut samples) = control.inner.samples.lock()
+                && samples.len() < MAX_TICK_SAMPLES
+            {
+                samples.push(u32::try_from(micros).unwrap_or(u32::MAX));
+            }
             if elapsed > TICK_DURATION {
                 control.inner.over_budget.fetch_add(1, Ordering::Relaxed);
             }

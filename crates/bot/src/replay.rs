@@ -152,8 +152,12 @@ pub fn render(recorded: &[Recorded]) -> String {
 /// # Errors
 ///
 /// [`BotError`] if the connection fails partway.
-pub async fn run(mut bot: Bot, recorded: &[Recorded]) -> Result<usize, BotError> {
-    bot.join("replay").await?;
+pub async fn run(mut bot: Bot, recorded: &[Recorded], name: &str) -> Result<usize, BotError> {
+    // The name is a parameter because display names are first-come and unique
+    // (charter rule 13). Every replay bot joining as "replay" meant the first
+    // one worked and the rest were refused — correct server behaviour, and a
+    // benchmark that silently measured one bot instead of four.
+    bot.join(name).await?;
 
     let mut applied = 0;
     let mut previous_tick = recorded.first().map_or(0, |entry| entry.tick);

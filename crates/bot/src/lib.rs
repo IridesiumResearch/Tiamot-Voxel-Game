@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bench;
 pub mod client;
 pub mod replay;
 pub mod runner;
