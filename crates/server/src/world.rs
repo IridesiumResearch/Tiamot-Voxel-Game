@@ -35,6 +35,8 @@
 
 use std::collections::HashMap;
 
+use tiamot_core::block::{BlockView, Cells, EMPTY_CELLS};
+use tiamot_core::inventory::{self, Stack};
 use tiamot_core::proto::Edit;
 use tiamot_core::script::ScriptVm as _;
 use tiamot_core::{
@@ -270,7 +272,13 @@ impl World {
             .expect("just inserted if it was absent"))
     }
 
-    /// Applies one edit and returns the chunk it touched.
+    /// Applies one edit, returning the chunk it touched and what it removed.
+    ///
+    /// The removed stacks are whatever the edit took out of the world, in
+    /// units — 27 for a whole block, 1 for a single sub-node. Computed by
+    /// diffing the block's cells before and after, so digging, chiselling, and
+    /// replacing are all the same operation and none can be got wrong
+    /// separately.
     ///
     /// # Errors
     ///
@@ -279,7 +287,7 @@ impl World {
         &mut self,
         edit: &Edit,
         source: &mut dyn ChunkSource,
-    ) -> Result<ChunkPos, EditError> {
+    ) -> Result<(ChunkPos, Vec<Stack>), EditError> {
         let (chunk_pos, material) = match edit {
             Edit::Block { pos, material } => (pos.chunk(), *material),
             Edit::SubNode { pos, material } => (pos.chunk(), *material),
@@ -308,6 +316,17 @@ impl World {
                 source: Box::new(err),
             })?;
 
+        // Snapshot the affected block's cells BEFORE the edit. A `BlockView`
+        // borrows the chunk, so it cannot outlive the mutation — the 27 cells
+        // are copied out instead.
+        let block_pos = match edit {
+            Edit::Block { pos, .. } => *pos,
+            Edit::SubNode { pos, .. } => pos.block(),
+        };
+        let before: Cells = chunk
+            .get_block(block_pos)
+            .map_or(EMPTY_CELLS, |view| std::array::from_fn(|i| view.subnode(i)));
+
         match edit {
             Edit::Block { pos, .. } => {
                 chunk
@@ -321,10 +340,15 @@ impl World {
             }
         }
 
+        let after: Cells = chunk
+            .get_block(block_pos)
+            .map_or(EMPTY_CELLS, |view| std::array::from_fn(|i| view.subnode(i)));
+        let removed = inventory::removed_units(BlockView::Mixed(&before), BlockView::Mixed(&after));
+
         if !self.dirty.contains(&chunk_pos) {
             self.dirty.push(chunk_pos);
         }
-        Ok(chunk_pos)
+        Ok((chunk_pos, removed))
     }
 
     /// The material filling a block, if it is uniform.

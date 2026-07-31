@@ -69,6 +69,11 @@ Before changing anything in `crates/core/src/proto/`:
 5. For chunk blobs specifically, add a migration step — see
    `crates/core/src/persist/migrate.rs`.
 
+This checklist has already earned its keep. Protocol v2 appended
+`ServerMessage::InventoryUpdate`; the first attempt wrote it above
+`Disconnect`, which reads like the natural end of the enum, and
+`server_variant_ordinals_are_pinned` caught the shifted ordinal immediately.
+
 ## House rules
 
 These come from [`CLAUDE.md`](CLAUDE.md), the project charter. Read it before

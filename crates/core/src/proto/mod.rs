@@ -44,7 +44,9 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+// v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
+// inserted — see the module docs and CONTRIBUTING's protocol checklist.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -353,6 +355,22 @@ pub enum ServerMessage {
     Disconnect {
         /// Why.
         reason: DisconnectReason,
+    },
+    /// The player's inventory changed.
+    ///
+    /// **Appended at the end** (protocol v2). Inserting it above `Disconnect`
+    /// would have shifted that variant's ordinal and silently reinterpreted
+    /// every disconnect on every existing peer — which is exactly what
+    /// `server_variant_ordinals_are_pinned` caught when I tried it.
+    ///
+    /// Sent whole rather than as a delta. An inventory is small — tens of
+    /// stacks — and a delta stream that ever dropped a message would leave the
+    /// client permanently wrong with no way to notice. Charter rule 5: amounts
+    /// are in **units**, and the client displays `units / 27` blocks plus
+    /// `units % 27` nodes.
+    InventoryUpdate {
+        /// Material id and unit count, in ascending material order.
+        stacks: Vec<(u16, u32)>,
     },
 }
 
@@ -875,12 +893,23 @@ mod tests {
             );
         }
 
-        // Disconnect is last on the server side.
+        // Disconnect's ordinal is pinned separately because it is the one an
+        // appended variant is most likely to displace: it reads like the
+        // natural end of the enum, so a new variant gets written above it.
+        // Doing exactly that is what this caught during the protocol v2 change.
         let disconnect = encode(&ServerMessage::Disconnect {
             reason: DisconnectReason::ServerStopping,
         })
         .expect("encode");
-        assert_eq!(disconnect[0], 10);
+        assert_eq!(
+            disconnect[0], 10,
+            "Disconnect must stay at ordinal 10; a variant was inserted above it"
+        );
+
+        // Protocol v2, appended after Disconnect.
+        let inventory =
+            encode(&ServerMessage::InventoryUpdate { stacks: Vec::new() }).expect("encode");
+        assert_eq!(inventory[0], 11);
     }
 
     #[test]

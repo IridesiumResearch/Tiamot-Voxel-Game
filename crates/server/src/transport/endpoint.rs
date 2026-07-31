@@ -137,6 +137,22 @@ pub struct Shared {
     /// How far each player can see.
     pub view_distance: tiamot_core::interest::ViewDistance,
 
+    /// What each player is carrying, in units (charter rule 5).
+    ///
+    /// Server-authoritative. The client is told what it has; it never asserts
+    /// it, because an inventory a client could edit is not an inventory.
+    ///
+    /// Task 09 owns the rest of the player-interaction loop — placement does
+    /// not yet consume from this. What is here is the half `mine_3x3.lua`
+    /// needs to be a real proof of the 27-unit design rather than a vacuous
+    /// one.
+    pub inventories: std::sync::Mutex<
+        std::collections::BTreeMap<PlayerUuid, Vec<tiamot_core::inventory::Stack>>,
+    >,
+
+    /// Players whose inventory changed and have not been told yet.
+    pub inventory_dirty: std::sync::Mutex<std::collections::BTreeSet<PlayerUuid>>,
+
     /// Every distributable file the loaded mods supply, by hash.
     ///
     /// Built once at startup and immutable thereafter. Rebuilding it while the
@@ -246,6 +262,39 @@ impl Shared {
                 queue.drain(..take).collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Credits stacks to a player and marks them for an update.
+    pub fn credit(&self, uuid: PlayerUuid, stacks: Vec<tiamot_core::inventory::Stack>) {
+        if stacks.is_empty() {
+            return;
+        }
+        if let Ok(mut inventories) = self.inventories.lock() {
+            let held = inventories.entry(uuid).or_default();
+            let merged = tiamot_core::inventory::consolidate(held.drain(..).chain(stacks));
+            *held = merged;
+        }
+        if let Ok(mut dirty) = self.inventory_dirty.lock() {
+            dirty.insert(uuid);
+        }
+    }
+
+    /// What a player is carrying.
+    #[must_use]
+    pub fn inventory_of(&self, uuid: &PlayerUuid) -> Vec<tiamot_core::inventory::Stack> {
+        self.inventories
+            .lock()
+            .map(|inventories| inventories.get(uuid).cloned().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Takes and clears the dirty flag for one player.
+    #[must_use]
+    pub fn take_inventory_dirty(&self, uuid: &PlayerUuid) -> bool {
+        self.inventory_dirty
+            .lock()
+            .map(|mut dirty| dirty.remove(uuid))
+            .unwrap_or(false)
     }
 
     /// Fans a message out to every connected player.
@@ -440,6 +489,16 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 // terrain ahead of the assets for it just fills a buffer.
                 for message in transfers.next_slices(&shared.content) {
                     frame::write(&mut send, &message).await?;
+                }
+                if let Some(uuid) = session.uuid()
+                    && shared.take_inventory_dirty(&uuid)
+                {
+                    let stacks = shared
+                        .inventory_of(&uuid)
+                        .into_iter()
+                        .map(|stack| (stack.material.0, stack.units))
+                        .collect();
+                    frame::write(&mut send, &ServerMessage::InventoryUpdate { stacks }).await?;
                 }
                 if let Some(streamer) = streamer.as_mut()
                     && let Err(err) = pump_chunks(streamer, &mut pending, shared, &mut send).await
@@ -731,6 +790,8 @@ mod tests {
             chunk_requests: std::sync::Mutex::new(std::collections::VecDeque::new()),
             view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
             content: tiamot_core::content::ContentIndex::new(),
+            inventories: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            inventory_dirty: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             kicks: tokio::sync::broadcast::channel(4).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }

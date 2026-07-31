@@ -581,6 +581,198 @@ impl Bot {
         }
     }
 
+    /// Digs a whole block: replaces it with air.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn dig_block(&mut self, pos: tiamot_core::BlockPos) -> Result<(), BotError> {
+        self.edit(tiamot_core::proto::Edit::Block {
+            pos,
+            material: tiamot_core::MaterialId::AIR.0,
+        })
+        .await
+    }
+
+    /// Digs one sub-node: replaces a single cell with air.
+    ///
+    /// One of 27, which is the whole point of the engine. A client that could
+    /// only dig whole blocks would make the sub-node design unreachable.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn dig_subnode(&mut self, pos: tiamot_core::SubNodePos) -> Result<(), BotError> {
+        self.edit(tiamot_core::proto::Edit::SubNode {
+            pos,
+            material: tiamot_core::MaterialId::AIR.0,
+        })
+        .await
+    }
+
+    /// Places a material at a block position.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn place(
+        &mut self,
+        pos: tiamot_core::BlockPos,
+        material: u16,
+    ) -> Result<(), BotError> {
+        self.edit(tiamot_core::proto::Edit::Block { pos, material })
+            .await
+    }
+
+    /// Waits until the server confirms `pos` holds `material`.
+    ///
+    /// Watches the `BlockDelta` broadcast rather than asking, because there is
+    /// no "read a block" message and there should not be one: a client that
+    /// could query arbitrary world positions is a client that can map the
+    /// server without walking it.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Unexpected`] if the timeout expires without the edit
+    /// arriving.
+    pub async fn expect_block(
+        &mut self,
+        pos: tiamot_core::BlockPos,
+        material: u16,
+        timeout: std::time::Duration,
+    ) -> Result<(), BotError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // Anything already received counts: the confirmation may have arrived
+        // while the caller was doing something else.
+        if self.saw_block(pos, material) {
+            return Ok(());
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(BotError::Unexpected {
+                    expected: "a block delta confirming the edit",
+                    got: format!("nothing for {pos:?} = {material} within the timeout"),
+                });
+            }
+            match tokio::time::timeout(remaining, self.recv()).await {
+                Ok(Ok(_)) => {
+                    if self.saw_block(pos, material) {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_elapsed) => {
+                    return Err(BotError::Unexpected {
+                        expected: "a block delta confirming the edit",
+                        got: format!("nothing for {pos:?} = {material} within the timeout"),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Whether a matching block delta has been seen.
+    fn saw_block(&self, pos: tiamot_core::BlockPos, material: u16) -> bool {
+        self.received.iter().rev().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockDelta {
+                    edit: tiamot_core::proto::Edit::Block { pos: got, material: got_material },
+                    ..
+                } if *got == pos && *got_material == material
+            )
+        })
+    }
+
+    /// The most recent inventory the server sent, in units.
+    ///
+    /// Empty until the server has sent one. Charter rule 5: these are **units**,
+    /// so 27 is one block — use [`tiamot_core::inventory::display`] to split
+    /// them into blocks and spare nodes.
+    #[must_use]
+    pub fn inventory(&self) -> Vec<(u16, u32)> {
+        self.received
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ServerMessage::InventoryUpdate { stacks } => Some(stacks.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Reads until an inventory update arrives, or the timeout expires.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError`] on a transport failure.
+    pub async fn await_inventory(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<(u16, u32)>, BotError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(self.inventory());
+            }
+            match tokio::time::timeout(remaining, self.recv()).await {
+                Ok(Ok(ServerMessage::InventoryUpdate { stacks })) => return Ok(stacks),
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_elapsed) => return Ok(self.inventory()),
+            }
+        }
+    }
+
+    /// Total units of one material currently held.
+    #[must_use]
+    pub fn units_of(&self, material: u16) -> u32 {
+        self.inventory()
+            .iter()
+            .filter(|(id, _)| *id == material)
+            .map(|(_, units)| *units)
+            .sum()
+    }
+
+    /// Sends a chat line.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn chat(&mut self, text: &str) -> Result<(), BotError> {
+        self.send(&ClientMessage::Chat {
+            text: text.to_owned(),
+        })
+        .await
+    }
+
+    /// Sends a movement input toward a position.
+    ///
+    /// Teleport-shaped for now: there is no server-side physics until Task 09,
+    /// so this reports intent and the server records it. The signature is the
+    /// one real movement will use, so scripts written today keep working when
+    /// the backend changes — which is the point of specifying it now.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn move_to(&mut self, x: f32, y: f32, z: f32) -> Result<(), BotError> {
+        self.send(&ClientMessage::PlayerInput {
+            tick: 0,
+            movement: [x, y, z],
+            look: [0.0, 0.0],
+            actions: 0,
+        })
+        .await
+    }
+
+    /// Waits roughly `ticks` server ticks.
+    pub async fn sleep_ticks(&mut self, ticks: u32) {
+        tokio::time::sleep(tiamot_core::tick::TICK_DURATION * ticks).await;
+    }
+
     /// Closes the connection cleanly.
     pub async fn disconnect(mut self) {
         let _ = self.send(&ClientMessage::Disconnect).await;

@@ -348,6 +348,8 @@ impl ServerHandle {
             // 20 Hz is roughly fifty seconds behind before a client starts
             // losing them, which is far longer than a connection worth keeping.
             outbound: tokio::sync::broadcast::channel(1024).0,
+            inventories: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            inventory_dirty: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             chunk_requests: std::sync::Mutex::new(std::collections::VecDeque::new()),
             view_distance: settings.view_distance,
             kicks: tokio::sync::broadcast::channel(64).0,
@@ -482,7 +484,11 @@ impl ServerHandle {
                         // depend on which connection won a lock.
                         for (actor, edit) in shared.drain_edits() {
                             match world.apply(&edit, &mut source) {
-                                Ok(_) => {
+                                Ok((_, removed)) => {
+                                    // Charter rule 5: what the edit took out,
+                                    // in units. 27 for a block, 1 for a
+                                    // sub-node.
+                                    shared.credit(actor, removed);
                                     // Broadcast only AFTER it applied. Telling
                                     // clients about an edit the server then
                                     // rejected would leave every one of them

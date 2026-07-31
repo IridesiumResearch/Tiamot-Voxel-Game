@@ -15,7 +15,7 @@
 //! `units_conserved` asserts it against arbitrary block contents.
 
 use crate::UNITS_PER_BLOCK;
-use crate::block::BlockView;
+use crate::block::{BlockView, SUBNODES_PER_BLOCK};
 use crate::material::MaterialId;
 
 /// A quantity of one material, measured in sub-node units.
@@ -190,6 +190,41 @@ pub fn break_block(block: BlockView<'_>) -> Vec<Stack> {
             stacks
         }
     }
+}
+
+/// What an edit removed from a block, as stacks.
+///
+/// Diffs the block's 27 cells before and after, and yields whatever went away.
+/// General by construction rather than by case analysis: digging a whole block,
+/// chiselling one sub-node, and replacing stone with wood are all the same
+/// operation to this function, and none of them can be got wrong separately.
+///
+/// A cell whose material *changed* counts as removed, because the material that
+/// was there is gone. Air is never yielded — there is nothing to pick up.
+///
+/// **Output order is ascending [`MaterialId`]**, for the same reason
+/// [`break_block`] guarantees it: drop order is observable, so it must not
+/// depend on anything that could differ between machines (charter rule 4).
+#[must_use]
+pub fn removed_units(before: BlockView<'_>, after: BlockView<'_>) -> Vec<Stack> {
+    let mut stacks: Vec<Stack> = Vec::new();
+    for index in 0..SUBNODES_PER_BLOCK {
+        let was = before.subnode(index);
+        if was.is_air() || was == after.subnode(index) {
+            continue;
+        }
+        match stacks.binary_search_by_key(&was, |stack| stack.material) {
+            Ok(found) => stacks[found].units += 1,
+            Err(insert_at) => stacks.insert(
+                insert_at,
+                Stack {
+                    material: was,
+                    units: 1,
+                },
+            ),
+        }
+    }
+    stacks
 }
 
 /// Merges stacks of like materials, returning them in ascending
@@ -507,5 +542,109 @@ mod tests {
                 units: 3
             }]
         );
+    }
+
+    #[test]
+    fn digging_a_whole_block_yields_exactly_one_block_of_units() {
+        // Charter rule 5: 27 units is one block, and the display is
+        // `units / 27` blocks + `units % 27` nodes. Nine of these is what
+        // `mine_3x3.lua` asserts.
+        let stone = MaterialId(2);
+        let before = BlockView::Uniform(stone);
+        let after = BlockView::Uniform(MaterialId::AIR);
+
+        let yielded = removed_units(before, after);
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].material, stone);
+        assert_eq!(yielded[0].units, UNITS_PER_BLOCK);
+        assert_eq!(yielded[0].display(), (1, 0), "one block, no spare nodes");
+    }
+
+    #[test]
+    fn digging_one_subnode_yields_one_unit_not_one_block() {
+        // The sub-node half of the 27-unit design. A yield that rounded up to a
+        // whole block would let a player mine 27 blocks' worth of material by
+        // chiselling 27 corners.
+        let stone = MaterialId(2);
+        let before_cells: Cells = [stone; SUBNODES_PER_BLOCK];
+        let mut after_cells = before_cells;
+        after_cells[13] = MaterialId::AIR;
+
+        let yielded = removed_units(
+            BlockView::Mixed(&before_cells),
+            BlockView::Mixed(&after_cells),
+        );
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].units, 1, "one cell is one unit");
+        assert_eq!(yielded[0].display(), (0, 1), "no blocks, one spare node");
+    }
+
+    #[test]
+    fn twenty_seven_chiselled_nodes_make_exactly_one_block() {
+        // The arithmetic that makes sub-node mining fair: chiselling a block
+        // away one cell at a time must yield the same total as breaking it.
+        let stone = MaterialId(2);
+        let mut cells: Cells = [stone; SUBNODES_PER_BLOCK];
+        let mut total = 0u32;
+
+        for index in 0..SUBNODES_PER_BLOCK {
+            let before_cells = cells;
+            cells[index] = MaterialId::AIR;
+            let yielded = removed_units(BlockView::Mixed(&before_cells), BlockView::Mixed(&cells));
+            total += yielded.iter().map(|stack| stack.units).sum::<u32>();
+        }
+
+        assert_eq!(total, UNITS_PER_BLOCK);
+        assert_eq!(
+            display(total),
+            (1, 0),
+            "27 nodes is one block and no spares"
+        );
+    }
+
+    #[test]
+    fn replacing_a_material_yields_the_one_that_was_there() {
+        // Not just digging: putting wood where stone was removes the stone.
+        let stone = MaterialId(2);
+        let wood = MaterialId(3);
+        let yielded = removed_units(BlockView::Uniform(stone), BlockView::Uniform(wood));
+
+        assert_eq!(yielded.len(), 1);
+        assert_eq!(yielded[0].material, stone);
+        assert_eq!(yielded[0].units, UNITS_PER_BLOCK);
+    }
+
+    #[test]
+    fn an_unchanged_block_yields_nothing() {
+        let stone = MaterialId(2);
+        assert!(removed_units(BlockView::Uniform(stone), BlockView::Uniform(stone)).is_empty());
+    }
+
+    #[test]
+    fn digging_air_yields_nothing() {
+        // There is nothing to pick up, and a stack of air would be a bug that
+        // propagated into every inventory that touched it.
+        let air = BlockView::Uniform(MaterialId::AIR);
+        assert!(removed_units(air, air).is_empty());
+        assert!(removed_units(air, BlockView::Uniform(MaterialId(2))).is_empty());
+    }
+
+    #[test]
+    fn a_mixed_block_yields_each_material_in_id_order() {
+        // Drop order is observable — it decides which stack an almost-full
+        // inventory keeps — so it must not depend on cell iteration order.
+        let mut cells: Cells = EMPTY_CELLS;
+        cells[0] = MaterialId(5);
+        cells[1] = MaterialId(3);
+        cells[2] = MaterialId(5);
+        cells[3] = MaterialId(4);
+
+        let yielded = removed_units(
+            BlockView::Mixed(&cells),
+            BlockView::Uniform(MaterialId::AIR),
+        );
+        let ids: Vec<u16> = yielded.iter().map(|stack| stack.material.0).collect();
+        assert_eq!(ids, vec![3, 4, 5], "ascending material id");
+        assert_eq!(yielded[2].units, 2, "two cells of material 5");
     }
 }
