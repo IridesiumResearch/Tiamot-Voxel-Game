@@ -283,6 +283,43 @@ impl Bot {
         Ok(())
     }
 
+    /// Sends a block or sub-node edit.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn edit(&mut self, edit: tiamot_core::proto::Edit) -> Result<(), BotError> {
+        self.send(&ClientMessage::BlockDelta { edit }).await
+    }
+
+    /// Waits for a `BlockDelta` to arrive, or gives up after `attempts` reads.
+    ///
+    /// Returns `None` on timeout rather than an error: "nothing arrived" is a
+    /// legitimate outcome a test may be asserting, and forcing it through an
+    /// error type would make the negative case read like a failure.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError`] if the connection fails while waiting.
+    pub async fn next_block_delta(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<tiamot_core::proto::Edit>, BotError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            match tokio::time::timeout(remaining, self.recv()).await {
+                Ok(Ok(ServerMessage::BlockDelta { edit, .. })) => return Ok(Some(edit)),
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_elapsed) => return Ok(None),
+            }
+        }
+    }
+
     /// Closes the connection cleanly.
     pub async fn disconnect(mut self) {
         let _ = self.send(&ClientMessage::Disconnect).await;

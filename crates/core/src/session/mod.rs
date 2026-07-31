@@ -58,6 +58,39 @@ pub enum Phase {
     Closed,
 }
 
+/// Gameplay the transport should carry out on the session's behalf.
+///
+/// The session decides **whether** a peer may do something; this says **what**
+/// was asked for. Keeping the two apart is what lets every access rule be
+/// tested without a socket: the state machine returns an `Action` and a test
+/// asserts on it, while the transport's only job is to carry it out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// Nothing beyond the messages in the response.
+    None,
+
+    /// Apply and broadcast a block or sub-node edit.
+    Edit(crate::proto::Edit),
+
+    /// Broadcast a chat line.
+    Chat {
+        /// What was said.
+        text: String,
+    },
+
+    /// Record a movement/look input for the next tick.
+    Input {
+        /// The tick the client believes it is on.
+        tick: u64,
+        /// Movement axes.
+        movement: [f32; 3],
+        /// Look angles.
+        look: [f32; 2],
+        /// Action bitfield.
+        actions: u32,
+    },
+}
+
 /// What the transport should do after [`Session::handle`].
 #[derive(Debug)]
 pub struct Response {
@@ -65,6 +98,8 @@ pub struct Response {
     pub send: Vec<ServerMessage>,
     /// Whether to close the connection after sending.
     pub close: bool,
+    /// Gameplay to carry out. See [`Action`].
+    pub action: Action,
 }
 
 impl Response {
@@ -74,6 +109,17 @@ impl Response {
         Self {
             send: Vec::new(),
             close: false,
+            action: Action::None,
+        }
+    }
+
+    /// Send nothing, but carry out an action.
+    #[must_use]
+    pub const fn act(action: Action) -> Self {
+        Self {
+            send: Vec::new(),
+            close: false,
+            action,
         }
     }
 
@@ -83,6 +129,7 @@ impl Response {
         Self {
             send: vec![message],
             close: false,
+            action: Action::None,
         }
     }
 
@@ -92,6 +139,7 @@ impl Response {
         Self {
             send: vec![ServerMessage::Disconnect { reason }],
             close: true,
+            action: Action::None,
         }
     }
 }
@@ -208,11 +256,36 @@ impl Session {
                 // place.
                 Response::none()
             }
+            // Gameplay, accepted ONLY in world. The phase is the access
+            // control: there is no flag to forget to check, because reaching
+            // these arms at all requires having got through the handshake.
+            (Phase::InWorld, ClientMessage::BlockDelta { edit }) => {
+                Response::act(Action::Edit(edit.clone()))
+            }
+            (Phase::InWorld, ClientMessage::Chat { text }) => {
+                Response::act(Action::Chat { text: text.clone() })
+            }
+            (
+                Phase::InWorld,
+                ClientMessage::PlayerInput {
+                    tick,
+                    movement,
+                    look,
+                    actions,
+                },
+            ) => Response::act(Action::Input {
+                tick: *tick,
+                movement: *movement,
+                look: *look,
+                actions: *actions,
+            }),
+
             (_, ClientMessage::Disconnect) => {
                 self.phase = Phase::Closed;
                 Response {
                     send: Vec::new(),
                     close: true,
+                    action: Action::None,
                 }
             }
 
@@ -292,6 +365,7 @@ impl Session {
                 ServerMessage::AuthChallenge { nonce },
             ],
             close: false,
+            action: Action::None,
         }
     }
 
@@ -994,6 +1068,88 @@ mod tests {
             "different failures must not be distinguishable"
         );
         assert_eq!(details[0], "authentication failed");
+    }
+
+    #[test]
+    fn gameplay_in_world_becomes_an_action_rather_than_being_applied_here() {
+        // The session decides WHETHER; the transport does WHAT. If this module
+        // applied edits itself, every access rule would need a socket to test.
+        let alice = Identity::generate().expect("generate");
+        let mut registry = registry_with(&alice);
+        let allowlist = Allowlist::open();
+        let mods = Vec::new();
+        let context = context(&allowlist, &mods);
+        let auth = SelfSovereign;
+
+        let (mut session, _) = join(&alice, "Alice", &mut registry, &allowlist);
+        assert_eq!(session.phase(), Phase::InWorld);
+
+        let edit = crate::proto::Edit::Block {
+            pos: BlockPos::new(1, 2, 3),
+            material: 4,
+        };
+        let response = session.handle(
+            &ClientMessage::BlockDelta { edit: edit.clone() },
+            &context,
+            &auth,
+            &mut registry,
+        );
+        assert!(
+            !response.close,
+            "an in-world edit must not close the session"
+        );
+        assert_eq!(response.action, Action::Edit(edit));
+
+        let response = session.handle(
+            &ClientMessage::Chat {
+                text: "hello".to_owned(),
+            },
+            &context,
+            &auth,
+            &mut registry,
+        );
+        assert_eq!(
+            response.action,
+            Action::Chat {
+                text: "hello".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn gameplay_before_the_world_yields_no_action_at_all() {
+        // The other half: the same messages, one phase earlier, must produce
+        // nothing for the transport to act on. A transport that trusted the
+        // action alone would still be safe.
+        let alice = Identity::generate().expect("generate");
+        let mut registry = registry_with(&alice);
+        let allowlist = Allowlist::open();
+        let mods = Vec::new();
+        let context = context(&allowlist, &mods);
+        let auth = SelfSovereign;
+
+        let mut session = Session::new();
+        let response = session.handle(
+            &ClientMessage::BlockDelta {
+                edit: crate::proto::Edit::Block {
+                    pos: BlockPos::new(1, 2, 3),
+                    material: 4,
+                },
+            },
+            &context,
+            &auth,
+            &mut registry,
+        );
+
+        assert!(
+            response.close,
+            "an edit before the world must close the session"
+        );
+        assert_eq!(
+            response.action,
+            Action::None,
+            "and must NOT reach the world"
+        );
     }
 
     #[test]

@@ -25,9 +25,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use quinn::{Endpoint, ServerConfig};
-use tiamot_core::identity::{Allowlist, SelfSovereign};
+use tiamot_core::identity::{Allowlist, PlayerUuid, SelfSovereign};
+use tiamot_core::proto::Edit;
 use tiamot_core::proto::{ClientMessage, ModEntry, ServerMessage};
-use tiamot_core::session::{IdentityRegistry, JoinContext, Session};
+use tiamot_core::session::{Action, IdentityRegistry, JoinContext, Session};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -92,12 +93,75 @@ pub struct Shared {
     pub players: AtomicU32,
     /// The simulation, for the authoritative tick number.
     pub control: Control,
+
+    /// Edits waiting to be applied, oldest first.
+    ///
+    /// A plain queue rather than a channel: the simulation drains it once per
+    /// tick from a synchronous thread, and a channel's async receive would need
+    /// an executor there — which is exactly what the simulation must not have.
+    ///
+    /// Bounded by [`MAX_QUEUED_EDITS`]. Unbounded, a client could send edits
+    /// faster than 20 Hz can apply them and grow this until the server died.
+    pub edits: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, Edit)>>,
+
+    /// Messages to fan out to every connected player.
+    ///
+    /// A `broadcast` channel: each connection holds a receiver and forwards
+    /// what arrives. A slow client falls behind and its receiver lags, which
+    /// costs that client messages rather than stalling the simulation — the
+    /// right trade, because the alternative is one bad connection pausing the
+    /// world for everyone.
+    pub outbound: tokio::sync::broadcast::Sender<ServerMessage>,
 }
+
+/// How many unapplied edits may be queued before new ones are dropped.
+///
+/// At 20 Hz with 50 players this is several seconds of backlog — far more than
+/// a healthy server ever holds, and small enough that a client flooding edits
+/// cannot grow it into a memory problem.
+pub const MAX_QUEUED_EDITS: usize = 4096;
 
 impl Shared {
     /// The current tick, for stamping outbound messages.
     fn tick(&self) -> u64 {
         self.control.tick()
+    }
+
+    /// Queues an edit for the simulation to apply.
+    ///
+    /// Returns `false` if the queue is full, in which case the edit is dropped.
+    /// Dropping is deliberate: blocking here would let one client's flood stall
+    /// the connection task, and growing without bound would let it exhaust
+    /// memory.
+    pub fn queue_edit(&self, actor: PlayerUuid, edit: Edit) -> bool {
+        let Ok(mut queue) = self.edits.lock() else {
+            // The mutex is poisoned, which means a previous holder panicked
+            // while editing. Refusing new work is the honest response.
+            return false;
+        };
+        if queue.len() >= MAX_QUEUED_EDITS {
+            return false;
+        }
+        queue.push_back((actor, edit));
+        true
+    }
+
+    /// Takes everything queued, leaving the queue empty.
+    ///
+    /// Called once per tick by the simulation.
+    #[must_use]
+    pub fn drain_edits(&self) -> Vec<(PlayerUuid, Edit)> {
+        self.edits
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Fans a message out to every connected player.
+    ///
+    /// A send with no receivers is not an error — it means nobody is connected.
+    pub fn broadcast(&self, message: ServerMessage) {
+        let _ = self.outbound.send(message);
     }
 }
 
@@ -223,19 +287,48 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
     let mut slot: Option<PlayerSlot<'_>> = None;
     let auth = SelfSovereign;
 
+    // Subscribed from the start, not on reaching the world. A receiver created
+    // later would miss everything sent between the join completing and the
+    // subscription — a narrow window, but the messages lost in it are exactly
+    // the edits made while a player was loading in.
+    let mut broadcasts = shared.outbound.subscribe();
+
     loop {
-        let message: ClientMessage = match frame::read(&mut recv).await {
-            Ok(message) => message,
-            Err(err) if err.is_clean_close() => return Ok(()),
-            Err(err) => {
-                // Tell the peer why before dropping them. A silent disconnect
-                // is indistinguishable from a network fault, and a client that
-                // cannot tell the difference cannot show the player anything
-                // useful.
-                let reason = frame_error_reason(&err);
-                let _ = frame::write(&mut send, &ServerMessage::Disconnect { reason }).await;
-                flush_and_close(&mut send, &connection).await;
-                return Err(err);
+        // Read from the client and forward broadcasts on the same task. A
+        // connection that only read would never deliver another player's edits;
+        // a second task writing to the same stream would interleave two
+        // messages' bytes and corrupt the framing.
+        let message: ClientMessage = tokio::select! {
+            incoming = frame::read(&mut recv) => match incoming {
+                Ok(message) => message,
+                Err(err) if err.is_clean_close() => return Ok(()),
+                Err(err) => {
+                    let reason = frame_error_reason(&err);
+                    let _ = frame::write(&mut send, &ServerMessage::Disconnect { reason }).await;
+                    flush_and_close(&mut send, &connection).await;
+                    return Err(err);
+                }
+            },
+            broadcast = broadcasts.recv() => {
+                match broadcast {
+                    Ok(outbound) => {
+                        // Only in-world players receive world state. A peer
+                        // mid-handshake must not learn what anyone is building.
+                        if session.phase() == tiamot_core::session::Phase::InWorld {
+                            frame::write(&mut send, &outbound).await?;
+                        }
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                        // This client could not keep up and lost messages. It
+                        // sees a stale world until it next receives a chunk.
+                        // Logged rather than fatal: dropping the connection
+                        // would punish a slow link harder than the desync does.
+                        warn!(missed, "client fell behind the broadcast stream");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
             }
         };
 
@@ -270,6 +363,29 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
 
         for outbound in &response.send {
             frame::write(&mut send, outbound).await?;
+        }
+
+        // The session decided this was allowed; carrying it out is this
+        // layer's job. See `session::Action`.
+        match &response.action {
+            Action::Edit(edit) => {
+                if let Some(uuid) = session.uuid()
+                    && !shared.queue_edit(uuid, edit.clone())
+                {
+                    warn!("edit queue is full; dropping an edit");
+                }
+            }
+            Action::Chat { text } => {
+                if let Some(uuid) = session.uuid() {
+                    shared.broadcast(ServerMessage::Chat {
+                        from: Some(*uuid.as_bytes()),
+                        text: text.clone(),
+                    });
+                }
+            }
+            // Movement is applied by the simulation from the input queue, which
+            // Task 09 adds along with the physics that consume it.
+            Action::Input { .. } | Action::None => {}
         }
 
         if response.close {
@@ -344,6 +460,8 @@ mod tests {
             spawn: tiamot_core::BlockPos::new(0, 1, 0),
             players: AtomicU32::new(0),
             control: Control::new(),
+            edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            outbound: tokio::sync::broadcast::channel(16).0,
         }
     }
 

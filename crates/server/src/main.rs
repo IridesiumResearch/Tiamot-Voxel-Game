@@ -96,6 +96,9 @@ fn run(cli: &Cli) -> Result<(), ServerError> {
         world_path: config.world_path.clone(),
         max_players: config.max_players,
         allowlist: Allowlist::open(),
+        // Task 05's resolved mod set supplies these once mod loading is wired
+        // into startup.
+        materials: Vec::new(),
     })?;
 
     info!(

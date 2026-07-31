@@ -23,10 +23,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use tiamot_core::identity::Allowlist;
+use tiamot_core::proto::ServerMessage;
 use tiamot_core::session::store;
 use tiamot_core::{Registry, WorldDb};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::cert::{CertError, ServerCert};
 use crate::sim::{self, Control};
@@ -34,6 +35,13 @@ use crate::transport::{self, Shared, TransportError};
 
 /// The world database file inside the world directory.
 pub const WORLD_FILE: &str = "world.sqlite";
+
+/// How often dirty chunks are written out, in ticks.
+///
+/// 40 ticks is two seconds. Short enough that a crash loses very little, long
+/// enough that a player chiselling one block does not cause twenty writes a
+/// second of the same chunk.
+const SAVE_INTERVAL_TICKS: u64 = 40;
 
 /// Anything that stops a server starting.
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +94,14 @@ pub struct Settings {
     pub max_players: u32,
     /// Who is permitted to join.
     pub allowlist: Allowlist,
+
+    /// Material ids to register before the world is opened.
+    ///
+    /// Charter rule 9's lifecycle is register → FREEZE → world load, so these
+    /// go in before `WorldDb::open` builds the id map. Task 05's mod loader
+    /// fills this from the resolved mod set; a server with none can still run,
+    /// it just has nothing to place.
+    pub materials: Vec<String>,
 }
 
 /// A running server.
@@ -118,7 +134,17 @@ impl ServerHandle {
     /// [`StartError`] if the world, certificate, identities, or listener could
     /// not be brought up.
     pub fn start(settings: &Settings) -> Result<Self, StartError> {
+        // Register BEFORE opening the world. The id map is built from the
+        // registry at open time, and a material registered afterwards would
+        // have no world id — edits using it would be accepted and then fail
+        // silently at save time.
         let mut registry = Registry::new();
+        for name in &settings.materials {
+            if let Err(err) = registry.register(name) {
+                error!("could not register material `{name}`: {err}");
+            }
+        }
+
         let world_file = settings.world_path.join(WORLD_FILE);
         let world =
             WorldDb::open(&world_file, &mut registry).map_err(|source| StartError::World {
@@ -154,6 +180,11 @@ impl ServerHandle {
             spawn: tiamot_core::BlockPos::new(0, 1, 0),
             players: AtomicU32::new(0),
             control: control.clone(),
+            edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            // Capacity is per-receiver backlog, not a total. 1024 messages at
+            // 20 Hz is roughly fifty seconds behind before a client starts
+            // losing them, which is far longer than a connection worth keeping.
+            outbound: tokio::sync::broadcast::channel(1024).0,
         });
 
         // The runtime is built here rather than inside the network thread, and
@@ -209,8 +240,9 @@ impl ServerHandle {
             std::thread::Builder::new()
                 .name("simulation".to_owned())
                 .spawn(move || {
+                    let mut world = crate::world::World::new(world);
                     let mut clock = sim::MonotonicClock::new();
-                    sim::run(&mut clock, &control, |_tick| {
+                    sim::run(&mut clock, &control, |tick| {
                         // ALL database access happens on this thread. The
                         // network side mutates the in-memory registry and this
                         // side writes it out, so a slow disk cannot stall a
@@ -224,13 +256,45 @@ impl ServerHandle {
                         // later.
                         if let Ok(mut identities) = shared.identities.try_lock()
                             && identities.is_dirty()
-                            && let Err(err) = store::flush(&world, &mut identities)
+                            && let Err(err) = store::flush(world.db(), &mut identities)
                         {
                             error!("could not persist identity changes: {err}");
                         }
 
-                        // World stepping hangs here: mod `on_tick` callbacks,
-                        // then queued edits, then chunk streaming.
+                        // Edits, in tick order, on one thread. Applying them
+                        // from the network tasks instead would make the result
+                        // depend on which connection won a lock.
+                        for (actor, edit) in shared.drain_edits() {
+                            match world.apply(&edit) {
+                                Ok(_) => {
+                                    // Broadcast only AFTER it applied. Telling
+                                    // clients about an edit the server then
+                                    // rejected would leave every one of them
+                                    // showing a block the world does not have.
+                                    shared.broadcast(ServerMessage::BlockDelta {
+                                        edit,
+                                        actor: Some(*actor.as_bytes()),
+                                    });
+                                }
+                                Err(err) => {
+                                    // The peer asked for something impossible.
+                                    // Not fatal to the connection: a client
+                                    // racing a mod unload can do this without
+                                    // being hostile.
+                                    debug!(actor = %actor.short(), "rejected an edit: {err}");
+                                }
+                            }
+                        }
+
+                        // Debounced saves. Writing every dirty chunk every tick
+                        // would turn a player chiselling one block into 20
+                        // writes a second of the same chunk; waiting for
+                        // shutdown would lose everything on a crash.
+                        if tick % SAVE_INTERVAL_TICKS == 0
+                            && let Err(err) = world.save_dirty()
+                        {
+                            error!("could not save dirty chunks: {err}");
+                        }
                     });
 
                     // The network thread is already stopped by the time this
@@ -240,7 +304,7 @@ impl ServerHandle {
                     // taken.
                     {
                         let mut identities = shared.identities.blocking_lock();
-                        if let Err(err) = store::flush(&world, &mut identities) {
+                        if let Err(err) = store::flush(world.db(), &mut identities) {
                             error!("could not persist identity changes on shutdown: {err}");
                         }
                     }
@@ -286,6 +350,7 @@ impl ServerHandle {
             world_path: world_path.to_path_buf(),
             max_players,
             allowlist: Allowlist::open(),
+            materials: Vec::new(),
         })
     }
 

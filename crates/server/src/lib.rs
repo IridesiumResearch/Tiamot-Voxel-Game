@@ -24,6 +24,7 @@ pub mod handle;
 pub mod shutdown;
 pub mod sim;
 pub mod transport;
+pub mod world;
 
 pub use cert::{CertError, ServerCert};
 pub use config::{Config, ConfigError};
