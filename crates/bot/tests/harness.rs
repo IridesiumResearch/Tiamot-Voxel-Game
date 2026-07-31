@@ -214,6 +214,36 @@ fn churn_passes_and_leaves_the_world_as_it_found_it() {
 }
 
 #[test]
+fn a_long_write_burst_does_not_stall_the_connection() {
+    // The failure churn.lua hit on Windows CI: a bot that only writes lets the
+    // server's broadcast back up until QUIC flow control stops the server
+    // writing, at which point the server stops draining its side and both ends
+    // wait for each other.
+    //
+    // Linux socket buffers absorb a few hundred edits and Windows does not, so
+    // this burst is deliberately far larger than churn.lua's -- big enough that
+    // no reasonable buffer hides the bug.
+    let server = start("write-burst");
+    let dir = scratch("write-burst-script");
+    let script = dir.join("burst.lua");
+    std::fs::write(
+        &script,
+        "bot.join('burst')\n\
+         for i = 0, 2000 do\n\
+           bot.place(100 + (i % 32), 6, 100 + ((i // 32) % 32), 2)\n\
+         end\n\
+         bot.expect_block(100, 6, 100, 2, 15000)\n\
+         bot.disconnect()",
+    )
+    .expect("write");
+
+    let (code, output) = run_script(&server, &script);
+    assert_eq!(code, 0, "a long write burst must not stall:\n{output}");
+
+    server.stop();
+}
+
+#[test]
 fn a_small_swarm_runs_and_reports_latency() {
     // Swarm mode from the CLI, as documented in the README. Four bots for two
     // seconds: enough to exercise the path, fast enough for `cargo test`.

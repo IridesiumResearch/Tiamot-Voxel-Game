@@ -185,12 +185,39 @@ impl Bot {
 
     /// Sends one message.
     ///
+    /// Drains anything already waiting first. A bot that only ever wrote would
+    /// let the server's broadcast back up until QUIC flow control stopped the
+    /// server writing — at which point the server stops draining ITS side and
+    /// both ends stall until the connection times out.
+    ///
+    /// `churn.lua` hit exactly this: 160 edits with no reads. Linux socket
+    /// buffers happened to absorb it and Windows CI did not, which is the worst
+    /// way to find a bug of this shape.
+    ///
     /// # Errors
     ///
     /// [`BotError::Frame`] if the write fails.
     pub async fn send(&mut self, message: &ClientMessage) -> Result<(), BotError> {
+        self.drain_pending().await;
         frame::write(&mut self.send, message).await?;
         Ok(())
+    }
+
+    /// Reads whatever has already arrived, without waiting for more.
+    ///
+    /// A zero timeout still polls the read once, so a message sitting in the
+    /// buffer is taken while one that has not arrived is not waited for.
+    /// Transport errors are swallowed: the caller is about to write, and that
+    /// write will report the same failure with better context.
+    pub async fn drain_pending(&mut self) {
+        // Bounded, so a server flooding broadcasts cannot turn a send into an
+        // unbounded read loop.
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::ZERO, self.recv()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => return,
+            }
+        }
     }
 
     /// Reads one message, recording it.
