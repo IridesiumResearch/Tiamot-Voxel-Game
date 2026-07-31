@@ -23,6 +23,22 @@ use tiamot_server::transport::frame;
 /// The ALPN the server requires. Must match `transport::endpoint`.
 const ALPN: &[u8] = b"tiamot/1";
 
+/// Writes between back-pressure drains.
+///
+/// A bot that only writes lets the server's broadcast back up until QUIC flow
+/// control stops the server writing — at which point the server stops draining
+/// its own side and both ends wait for each other.
+///
+/// Draining on *every* send would cost [`DRAIN_SLICE`] per message in the
+/// common case where nothing is waiting. Every 32 keeps that overhead off the
+/// hot path while still bounding how far behind the reader can fall.
+const DRAIN_EVERY: u32 = 32;
+
+/// How long one drain read waits before concluding nothing is there.
+///
+/// Small, but deliberately non-zero — see [`Bot::drain_pending`].
+const DRAIN_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// Something went wrong driving a connection.
 #[derive(Debug, thiserror::Error)]
 pub enum BotError {
@@ -78,6 +94,8 @@ pub struct Bot {
     recv: quinn::RecvStream,
     /// Everything the server has sent, in order.
     received: Vec<ServerMessage>,
+    /// Writes since the last read, for the back-pressure drain in [`send`].
+    sent_since_read: u32,
     /// The fingerprint the server actually presented.
     cert_fingerprint: [u8; 32],
 }
@@ -161,6 +179,7 @@ impl Bot {
             send,
             recv,
             received: Vec::new(),
+            sent_since_read: 0,
             cert_fingerprint,
         })
     }
@@ -198,23 +217,32 @@ impl Bot {
     ///
     /// [`BotError::Frame`] if the write fails.
     pub async fn send(&mut self, message: &ClientMessage) -> Result<(), BotError> {
-        self.drain_pending().await;
+        self.sent_since_read += 1;
+        if self.sent_since_read >= DRAIN_EVERY {
+            self.drain_pending().await;
+        }
         frame::write(&mut self.send, message).await?;
         Ok(())
     }
 
-    /// Reads whatever has already arrived, without waiting for more.
+    /// Reads whatever has arrived, giving each read a real chance to complete.
     ///
-    /// A zero timeout still polls the read once, so a message sitting in the
-    /// buffer is taken while one that has not arrived is not waited for.
+    /// The timeout is **not zero**. A zero-duration `tokio::time::timeout`
+    /// races: the deadline can expire before the inner future is polled, so the
+    /// drain silently does nothing. That is what the first version did, and it
+    /// passed on Linux — where the socket buffers were large enough to hide
+    /// the problem — while Windows CI still stalled at edit ~126.
+    ///
     /// Transport errors are swallowed: the caller is about to write, and that
-    /// write will report the same failure with better context.
+    /// write reports the same failure with better context.
     pub async fn drain_pending(&mut self) {
-        // Bounded, so a server flooding broadcasts cannot turn a send into an
+        self.sent_since_read = 0;
+        // Bounded, so a server flooding broadcasts cannot turn one send into an
         // unbounded read loop.
-        for _ in 0..64 {
-            match tokio::time::timeout(std::time::Duration::ZERO, self.recv()).await {
+        for _ in 0..256 {
+            match tokio::time::timeout(DRAIN_SLICE, self.recv()).await {
                 Ok(Ok(_)) => {}
+                // Nothing waiting, or the connection failed. Either way, stop.
                 Ok(Err(_)) | Err(_) => return,
             }
         }
