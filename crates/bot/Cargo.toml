@@ -26,3 +26,4 @@ rustls-pki-types.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zstd.workspace = true

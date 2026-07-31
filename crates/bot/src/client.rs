@@ -398,6 +398,98 @@ impl Bot {
         })
     }
 
+    /// Asks the server for content by hash.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn request_content(
+        &mut self,
+        hashes: Vec<tiamot_core::proto::ContentHash>,
+    ) -> Result<(), BotError> {
+        self.send(&ClientMessage::ContentRequest { hashes }).await
+    }
+
+    /// Collects and reassembles content until `wanted` items are complete.
+    ///
+    /// Verifies each item's hash against the bytes received. A server that sent
+    /// something other than what was asked for is not trusted to say so
+    /// itself — charter rule 14: server-pushed assets are hostile input, and
+    /// the hash is the only part of the claim a client can check.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Unexpected`] if a reassembled item does not match its hash.
+    pub async fn collect_content(
+        &mut self,
+        wanted: usize,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<(tiamot_core::proto::ContentHash, Vec<u8>)>, BotError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut partial: std::collections::BTreeMap<tiamot_core::proto::ContentHash, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        let mut complete = Vec::new();
+
+        while complete.len() < wanted {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let message = match tokio::time::timeout(remaining, self.recv()).await {
+                Ok(Ok(message)) => message,
+                Ok(Err(err)) => return Err(err),
+                Err(_elapsed) => break,
+            };
+            let ServerMessage::ContentChunk {
+                hash,
+                offset,
+                total_len,
+                data,
+            } = message
+            else {
+                continue;
+            };
+
+            let plain = zstd::decode_all(data.as_slice()).map_err(|err| BotError::Unexpected {
+                expected: "a zstd-compressed content slice",
+                got: err.to_string(),
+            })?;
+
+            let buffer = partial.entry(hash).or_default();
+            if buffer.len() as u64 != offset {
+                return Err(BotError::Unexpected {
+                    expected: "content slices in order",
+                    got: format!("slice at {offset} but {} bytes held", buffer.len()),
+                });
+            }
+            buffer.extend_from_slice(&plain);
+
+            if buffer.len() as u64 >= total_len {
+                let bytes = partial.remove(&hash).unwrap_or_default();
+                // The hash is the whole point. A server that sent different
+                // bytes than were asked for is caught here rather than by the
+                // decoder it was aimed at.
+                if tiamot_core::content::hash_bytes(&bytes) != hash {
+                    return Err(BotError::Unexpected {
+                        expected: "content matching the hash it was requested by",
+                        got: "bytes that hash to something else".to_owned(),
+                    });
+                }
+                complete.push((hash, bytes));
+            }
+        }
+        Ok(complete)
+    }
+
+    /// The mod manifest the server sent, if it has arrived.
+    #[must_use]
+    pub fn manifest(&self) -> Option<&[tiamot_core::proto::ModEntry]> {
+        self.received.iter().find_map(|message| match message {
+            ServerMessage::ModManifest { mods, .. } => Some(mods.as_slice()),
+            _ => None,
+        })
+    }
+
     /// Closes the connection cleanly.
     pub async fn disconnect(mut self) {
         let _ = self.send(&ClientMessage::Disconnect).await;

@@ -62,6 +62,7 @@
 pub mod bitpack;
 pub mod block;
 pub mod chunk;
+pub mod content;
 pub mod coords;
 pub mod detgen;
 pub mod identity;

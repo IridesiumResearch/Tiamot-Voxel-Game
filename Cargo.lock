@@ -264,6 +264,7 @@ dependencies = [
  "tiamot-core",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -2305,6 +2306,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

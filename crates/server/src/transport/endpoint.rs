@@ -136,6 +136,13 @@ pub struct Shared {
 
     /// How far each player can see.
     pub view_distance: tiamot_core::interest::ViewDistance,
+
+    /// Every distributable file the loaded mods supply, by hash.
+    ///
+    /// Built once at startup and immutable thereafter. Rebuilding it while the
+    /// server runs would mean a file edited mid-session is served under its old
+    /// hash — the one thing content addressing exists to make impossible.
+    pub content: tiamot_core::content::ContentIndex,
 }
 
 /// A connection asking the simulation for a chunk.
@@ -409,6 +416,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
     let mut broadcasts = shared.outbound.subscribe();
     let mut kicks = shared.kicks.subscribe();
     let mut streamer: Option<Streamer> = None;
+    let mut transfers = crate::content::Transfers::new();
     // Chunk deliveries the simulation has answered, waiting to be written.
     let mut pending: Vec<(
         tiamot_core::ChunkPos,
@@ -424,7 +432,15 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
             // Streaming runs on its own beat rather than piggybacking on client
             // traffic. A player standing still sends nothing, and their world
             // must still finish loading.
-            () = tokio::time::sleep(tiamot_core::tick::TICK_DURATION), if streamer.is_some() => {
+            () = tokio::time::sleep(tiamot_core::tick::TICK_DURATION),
+                if streamer.is_some() || transfers.queued() > 0 =>
+            {
+                // Content before terrain: a client still waiting on textures
+                // cannot render the chunks it is about to receive, so sending
+                // terrain ahead of the assets for it just fills a buffer.
+                for message in transfers.next_slices(&shared.content) {
+                    frame::write(&mut send, &message).await?;
+                }
                 if let Some(streamer) = streamer.as_mut()
                     && let Err(err) = pump_chunks(streamer, &mut pending, shared, &mut send).await
                 {
@@ -532,6 +548,20 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
 
         for outbound in &response.send {
             frame::write(&mut send, outbound).await?;
+        }
+
+        // Content requests are served here rather than in the session, which
+        // has no business knowing about files. The session has already refused
+        // this message if the peer had not authenticated — reaching here means
+        // the phase check passed.
+        if let ClientMessage::ContentRequest { hashes } = &message
+            && matches!(
+                session.phase(),
+                tiamot_core::session::Phase::Authenticated | tiamot_core::session::Phase::InWorld
+            )
+        {
+            let accepted = transfers.request(hashes, &shared.content);
+            debug!(asked = hashes.len(), accepted, "content requested");
         }
 
         // The session decided this was allowed; carrying it out is this
@@ -700,6 +730,7 @@ mod tests {
             outbound: tokio::sync::broadcast::channel(16).0,
             chunk_requests: std::sync::Mutex::new(std::collections::VecDeque::new()),
             view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
+            content: tiamot_core::content::ContentIndex::new(),
             kicks: tokio::sync::broadcast::channel(4).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }

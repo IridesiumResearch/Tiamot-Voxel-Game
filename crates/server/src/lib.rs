@@ -20,6 +20,7 @@
 
 pub mod cert;
 pub mod config;
+pub mod content;
 pub mod handle;
 pub mod rcon;
 pub mod shutdown;

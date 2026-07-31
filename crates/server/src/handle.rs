@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use tiamot_core::identity::Allowlist;
-use tiamot_core::proto::ServerMessage;
+use tiamot_core::proto::{ModEntry, ServerMessage};
 use tiamot_core::script::{HostError, MluaVm, ModHost, ScriptVm as _, VmLimits};
 use tiamot_core::session::store;
 use tiamot_core::{Registry, WorldDb};
@@ -36,6 +36,28 @@ use crate::transport::{self, Shared, TransportError};
 
 /// The world database file inside the world directory.
 pub const WORLD_FILE: &str = "world.sqlite";
+
+/// A stable fingerprint over the resolved mod set.
+///
+/// Lets a client tell in one comparison whether it has seen this exact set
+/// before, without walking every entry. Order matters: two servers running the
+/// same mods in a different load order are genuinely different, because load
+/// order decides material ids.
+fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tiamot:mod-set:v1");
+    for entry in mods {
+        hasher.update(entry.id.as_bytes());
+        hasher.update(entry.version.as_bytes());
+        hasher.update(&entry.content_hash);
+    }
+    let bytes = hasher.finalize();
+    u64::from_le_bytes(
+        bytes.as_bytes()[..8]
+            .try_into()
+            .expect("BLAKE3 output is 32 bytes"),
+    )
+}
 
 /// How often dirty chunks are written out, in ticks.
 ///
@@ -195,6 +217,8 @@ impl ServerHandle {
         // then fail silently at save time.
         let mut registry = Registry::new();
         let mut host = None;
+        let mut content_index = tiamot_core::content::ContentIndex::new();
+        let mut mods: Vec<ModEntry> = Vec::new();
 
         if let Some(mods_path) = &settings.mods_path {
             match ModHost::<MluaVm>::load_from(mods_path, VmLimits::default()) {
@@ -234,10 +258,41 @@ impl ServerHandle {
                         }
                     }
 
+                    // Index every mod's client-relevant files. Done once at
+                    // startup and then frozen: hashing on demand would mean a
+                    // file edited while the server runs is served under its old
+                    // hash, which is the one thing content addressing exists to
+                    // make impossible.
+                    for entry in &loaded.resolved().order {
+                        match content_index.add_mod(&entry.id, &entry.dir) {
+                            Ok(fingerprint) => mods.push(ModEntry {
+                                id: entry.id.clone(),
+                                version: entry.version.to_string(),
+                                content_hash: fingerprint,
+                            }),
+                            Err(err) => {
+                                // The mod still runs; its assets just are not
+                                // pushed. Refusing to start over an oversized
+                                // texture would be worse than a missing one.
+                                error!(
+                                    mod_id = %entry.id,
+                                    "could not index mod content, assets will not be pushed: {err}"
+                                );
+                                mods.push(ModEntry {
+                                    id: entry.id.clone(),
+                                    version: entry.version.to_string(),
+                                    content_hash: [0u8; 32],
+                                });
+                            }
+                        }
+                    }
+
                     info!(
                         mods = loaded.resolved().order.len(),
                         disabled = loaded.failed().len(),
                         blocks = loaded.vm().registered_blocks().len(),
+                        content_items = content_index.len(),
+                        content_bytes = content_index.total_bytes(),
                         "mods loaded and registries frozen"
                     );
                     host = Some(loaded);
@@ -280,8 +335,9 @@ impl ServerHandle {
         let shared = Arc::new(Shared {
             identities: Mutex::new(identities),
             cert_fingerprint,
-            mods: Vec::new(),
-            mod_set_fingerprint: 0,
+            mod_set_fingerprint: mod_set_fingerprint(&mods),
+            mods,
+            content: content_index,
             allowlist: std::sync::RwLock::new(settings.allowlist.clone()),
             max_players: settings.max_players,
             spawn: tiamot_core::BlockPos::new(0, 1, 0),
