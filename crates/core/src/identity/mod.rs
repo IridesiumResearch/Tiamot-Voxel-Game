@@ -479,7 +479,39 @@ pub trait AuthProvider {
         server_cert_fingerprint: &[u8],
         protocol_version: u32,
         signature: &Signature,
-    ) -> Result<PlayerUuid, IdentityError>;
+    ) -> Result<Verified, IdentityError>;
+}
+
+/// Who a proven key turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verified {
+    /// The key belongs to an identity the server already knows.
+    Existing(PlayerUuid),
+
+    /// The key is unknown, so it is the root of a new identity.
+    ///
+    /// The caller registers it. Kept distinct from
+    /// [`Existing`](Self::Existing) because "first join" is a decision with
+    /// consequences — it writes to the database and it is the one moment an
+    /// allowlist can turn someone away for good — and a caller that could not
+    /// tell the two apart would silently create identities.
+    New(PlayerUuid),
+}
+
+impl Verified {
+    /// The identity, however it was resolved.
+    #[must_use]
+    pub const fn uuid(&self) -> PlayerUuid {
+        match self {
+            Self::Existing(uuid) | Self::New(uuid) => *uuid,
+        }
+    }
+
+    /// Whether this is a first join.
+    #[must_use]
+    pub const fn is_new(&self) -> bool {
+        matches!(self, Self::New(_))
+    }
 }
 
 /// The built-in self-sovereign provider.
@@ -506,7 +538,7 @@ impl AuthProvider for SelfSovereign {
         server_cert_fingerprint: &[u8],
         protocol_version: u32,
         signature: &Signature,
-    ) -> Result<PlayerUuid, IdentityError> {
+    ) -> Result<Verified, IdentityError> {
         // Signature FIRST, then lookup. Checking membership before proof would
         // let an attacker probe which keys a server knows about.
         verify_challenge(
@@ -516,8 +548,21 @@ impl AuthProvider for SelfSovereign {
             protocol_version,
             signature,
         )?;
-        keys.identity_of(claimed_key)
-            .ok_or(IdentityError::VerificationFailed)
+        Ok(match keys.identity_of(claimed_key) {
+            Some(uuid) => Verified::Existing(uuid),
+            // An unknown key is a NEW identity, not a rejection. That is what
+            // "self-sovereign" means: nobody issues you an account, you bring
+            // your own key and the UUID falls out of it. A server that refused
+            // unknown keys would be one nobody could ever join for the first
+            // time.
+            //
+            // Restricting who may join is the allowlist's job, checked by the
+            // caller against the resolved UUID. Keeping the two separate means
+            // an allowlisted server still derives the same UUID for a player as
+            // an open one, so moving a world between the two does not change
+            // anybody's identity.
+            None => Verified::New(PlayerUuid::from_root_key(claimed_key)),
+        })
     }
 }
 

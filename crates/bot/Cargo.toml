@@ -12,7 +12,17 @@ publish.workspace = true
 # Headless by construction: this crate drives a real loopback server the same
 # way a player would, so integration tests exercise the actual network path
 # rather than a mock (charter rule 15). No GUI dependencies.
+# Depends on the SERVER crate, deliberately. The bot must speak exactly the
+# framing the server speaks, and a second implementation of it here could drift
+# — producing tests that pass against a codec no real client uses. Sharing one
+# codec means a framing bug fails the integration suite instead of hiding in it.
 [dependencies]
 tiamot-core.workspace = true
+server.workspace = true
+blake3.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true

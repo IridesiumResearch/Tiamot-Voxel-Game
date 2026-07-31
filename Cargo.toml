@@ -84,6 +84,24 @@ blake3 = "1.8"
 rand = "0.9"
 getrandom = "0.3"
 
+# --- transport (Task 06) --------------------------------------------------
+# QUIC gives us reliability, encryption, congestion control and stream
+# multiplexing for free. The alternative is writing a UDP reliability layer,
+# which is a year of subtle bugs to arrive somewhere worse.
+quinn = "0.11"
+# quinn's TLS. `ring` rather than aws-lc-rs: it builds without cmake or a C++
+# toolchain, which keeps the from-source build working on a bare Windows box.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.12"
+# Self-signed server certificates. There is no CA in this model — clients pin
+# the fingerprint on first connection (TOFU), so a certificate's only job is to
+# carry a public key that stays the same between sessions.
+rcgen = "0.14"
+# quinn is async and has no sync API. Confined to the transport layer: the
+# simulation thread is emphatically not async, because a tick that can yield
+# in the middle is a tick whose result depends on scheduling.
+tokio = { version = "1.47", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util"] }
+
 # --- server / bot ---------------------------------------------------------
 clap = { version = "4.5", features = ["derive"] }
 toml = "0.9"
@@ -116,6 +134,7 @@ pollster = "0.4"
 # dependent crate an E0659 ambiguity error. The directory layout the charter
 # specifies is preserved; only the package name is qualified.
 tiamot-core = { path = "crates/core" }
+server = { path = "crates/server" }
 
 [profile.release]
 # Simulation is the hot path and it is single-crate-inlineable; the extra link

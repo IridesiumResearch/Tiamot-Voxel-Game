@@ -33,8 +33,8 @@ pub use registry::{IdentityRegistry, NameBinding, RegistryError};
 pub use store::{LoadReport, StoreError};
 
 use crate::identity::{
-    Allowlist, AuthProvider, NONCE_BYTES, PlayerUuid, generate_nonce, public_key_from_bytes,
-    signature_from_bytes,
+    Allowlist, AuthProvider, KeySet, NONCE_BYTES, PlayerUuid, generate_nonce,
+    public_key_from_bytes, signature_from_bytes,
 };
 use crate::proto::{
     ClientMessage, DisconnectReason, ModEntry, PROTOCOL_VERSION, ServerMessage,
@@ -117,6 +117,12 @@ pub struct JoinContext<'a> {
     pub spawn: crate::coords::BlockPos,
     /// The server's current tick.
     pub tick: u64,
+    /// Unix timestamp, for stamping `added_at` on a first join.
+    ///
+    /// Passed in rather than read here so this module stays a pure function of
+    /// its inputs — a state machine that called `SystemTime::now` could not be
+    /// tested for the same result twice.
+    pub now: i64,
 }
 
 /// One peer's connection state.
@@ -320,7 +326,7 @@ impl Session {
         // would make this an oracle for probing which identities a server
         // knows, and discarding means a new error variant cannot accidentally
         // acquire a distinguishable message later.
-        let Ok(uuid) = auth.verify(
+        let Ok(verified) = auth.verify(
             registry,
             &key,
             &nonce,
@@ -332,9 +338,29 @@ impl Session {
                 detail: "authentication failed".to_owned(),
             });
         };
+        let uuid = verified.uuid();
 
+        // Allowlist BEFORE registration. On a restricted server a stranger must
+        // be turned away without leaving a row behind, or the allowlist would
+        // quietly populate the identity table with everyone who ever tried.
         if !context.allowlist.permits(&uuid) {
             return self.close_with(DisconnectReason::NotAllowlisted);
+        }
+
+        if verified.is_new() {
+            // A key the server has never seen, whose derived UUID it HAS seen,
+            // is a key that was revoked from that identity — rotation and
+            // admin rebind both leave the old root's UUID in place while
+            // dropping the key itself. Re-registering would hand the identity
+            // straight back to the key its owner deliberately retired, which is
+            // the precise failure that pre-committed rotation exists to
+            // prevent.
+            if registry.contains(&uuid) {
+                return self.close_with(DisconnectReason::AuthFailed {
+                    detail: "authentication failed".to_owned(),
+                });
+            }
+            registry.insert(KeySet::new(key, None, context.now));
         }
 
         // Re-check the name against the PROVEN identity. The pre-check in
@@ -419,6 +445,7 @@ mod tests {
             current_players: 0,
             spawn: BlockPos::new(0, 1, 0),
             tick: 7,
+            now: 1_700_000_000,
         }
     }
 
@@ -819,16 +846,93 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_identity_is_refused_without_saying_why() {
-        // The error must not distinguish "unknown key" from "bad signature", or
-        // it becomes an oracle for probing which identities a server knows.
+    fn an_unknown_key_joins_as_a_new_identity() {
+        // Self-sovereign identity: nobody issues an account, you bring a key
+        // and the UUID falls out of it. An earlier version of this refused
+        // unknown keys, which meant a fresh server was one nobody could ever
+        // join for the first time — the bug only surfaced when the integration
+        // test tried to connect to an empty world.
         let stranger = Identity::generate().expect("generate");
         let mut registry = IdentityRegistry::default();
         let allowlist = Allowlist::open();
 
-        let (session, sent) = join(&stranger, "Nobody", &mut registry, &allowlist);
-        assert_eq!(session.phase(), Phase::Closed);
+        let (session, _) = join(&stranger, "Nobody", &mut registry, &allowlist);
 
+        assert_eq!(session.phase(), Phase::InWorld);
+        assert_eq!(session.uuid(), Some(stranger.uuid_as_root()));
+        assert!(
+            registry.contains(&stranger.uuid_as_root()),
+            "a first join must register the identity"
+        );
+        assert_eq!(
+            registry.identity_of_key(&stranger.public_key()),
+            Some(stranger.uuid_as_root()),
+            "and the key must resolve afterwards"
+        );
+    }
+
+    #[test]
+    fn a_first_join_is_refused_by_a_restricted_allowlist_without_registering() {
+        // The allowlist has to be checked BEFORE registration, or a restricted
+        // server quietly accumulates a row for everyone who ever tried the
+        // door.
+        let stranger = Identity::generate().expect("generate");
+        let mut registry = IdentityRegistry::default();
+        let allowlist = Allowlist::restricted([]);
+
+        let (session, sent) = join(&stranger, "Nobody", &mut registry, &allowlist);
+
+        assert_eq!(session.phase(), Phase::Closed);
+        assert!(sent.iter().any(|m| matches!(
+            m,
+            ServerMessage::Disconnect {
+                reason: DisconnectReason::NotAllowlisted
+            }
+        )));
+        assert!(
+            registry.is_empty(),
+            "a refused stranger must not leave an identity behind"
+        );
+    }
+
+    #[test]
+    fn a_rotated_away_key_cannot_re_register_its_own_uuid() {
+        // The subtle consequence of first-join registration. Alice rotates to a
+        // new key, which revokes the old one but leaves the identity's UUID
+        // alone — the UUID is BLAKE3 of the ORIGINAL root key and never moves.
+        // So the retired key is now "unknown", and a naive first-join path
+        // would register it as new and hand the identity straight back to the
+        // key Alice deliberately retired. That is exactly what pre-committed
+        // rotation exists to prevent.
+        let alice = Identity::generate().expect("generate");
+        let successor = Identity::generate().expect("generate");
+        let uuid = alice.uuid_as_root();
+
+        let commitment = crate::identity::keyset::commit_to(&successor.public_key());
+        let mut registry = IdentityRegistry::default();
+        registry.insert(KeySet::new(alice.public_key(), Some(commitment), 0));
+
+        let payload =
+            crate::identity::keyset::rotate_key_payload(&uuid, &successor.public_key(), None);
+        registry
+            .rotate_key(
+                &uuid,
+                &alice.public_key(),
+                successor.public_key(),
+                None,
+                &alice.sign(&payload),
+                1,
+            )
+            .expect("rotate");
+
+        let allowlist = Allowlist::open();
+        let (thief, sent) = join(&alice, "Alice", &mut registry, &allowlist);
+
+        assert_eq!(
+            thief.phase(),
+            Phase::Closed,
+            "a retired key must not be able to re-register its own identity"
+        );
         let Some(ServerMessage::Disconnect {
             reason: DisconnectReason::AuthFailed { detail },
         }) = sent.last()
@@ -837,8 +941,59 @@ mod tests {
         };
         assert_eq!(
             detail, "authentication failed",
-            "the reason must not distinguish unknown-key from bad-signature"
+            "the reason must not distinguish a revoked key from a bad signature"
         );
+
+        // And the successor still works.
+        let (heir, _) = join(&successor, "Alice", &mut registry, &allowlist);
+        assert_eq!(heir.phase(), Phase::InWorld);
+        assert_eq!(heir.uuid(), Some(uuid));
+    }
+
+    #[test]
+    fn every_authentication_failure_gives_the_same_reason() {
+        // The error must not distinguish one failure from another, or it
+        // becomes an oracle for probing which identities a server knows.
+        let alice = Identity::generate().expect("generate");
+        let mut registry = registry_with(&alice);
+        let allowlist = Allowlist::open();
+        let mods = Vec::new();
+        let context = context(&allowlist, &mods);
+        let auth = SelfSovereign;
+
+        let mut details = Vec::new();
+        for signature in [WireSignature([0u8; 64]), WireSignature([0xFFu8; 64])] {
+            let mut session = Session::new();
+            let _ = session.handle(
+                &ClientMessage::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    public_key: *alice.public_key().as_bytes(),
+                    display_name: "Alice".to_owned(),
+                },
+                &context,
+                &auth,
+                &mut registry,
+            );
+            let response = session.handle(
+                &ClientMessage::AuthResponse { signature },
+                &context,
+                &auth,
+                &mut registry,
+            );
+            if let Some(ServerMessage::Disconnect {
+                reason: DisconnectReason::AuthFailed { detail },
+            }) = response.send.first()
+            {
+                details.push(detail.clone());
+            }
+        }
+
+        assert_eq!(details.len(), 2, "both attempts should have failed");
+        assert_eq!(
+            details[0], details[1],
+            "different failures must not be distinguishable"
+        );
+        assert_eq!(details[0], "authentication failed");
     }
 
     #[test]

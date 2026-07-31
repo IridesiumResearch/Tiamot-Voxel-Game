@@ -11,10 +11,6 @@
 //! must build and run on a machine with no display server, and CI proves that
 //! by building it on runners that have none.
 
-mod config;
-mod shutdown;
-mod sim;
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -22,7 +18,8 @@ use clap::Parser;
 use tiamot_core::{Registry, WorldDb, session};
 use tracing::{error, info};
 
-use crate::config::Config;
+use tiamot_server::config::Config;
+use tiamot_server::{config, shutdown, sim};
 
 /// Command-line arguments.
 #[derive(Debug, Parser)]
