@@ -256,7 +256,9 @@ name = "bot"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "clap",
  "ed25519-dalek",
+ "mlua",
  "quinn",
  "rustls",
  "rustls-pki-types",
@@ -265,6 +267,7 @@ dependencies = [
  "tiamot-core",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "zstd",
 ]
 

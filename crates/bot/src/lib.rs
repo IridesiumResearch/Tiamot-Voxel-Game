@@ -22,8 +22,13 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod replay;
+pub mod runner;
+pub mod script;
 
 pub use client::{Bot, BotError};
+pub use runner::{SwarmStats, drive, wander};
+pub use script::{Channel, Command, Reply, ScriptOutcome, run_script};
 
 /// The engine's chunk size, for tests that assert against it.
 #[must_use]

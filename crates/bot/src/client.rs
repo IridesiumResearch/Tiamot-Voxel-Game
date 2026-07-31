@@ -97,6 +97,23 @@ impl Bot {
         identity: Identity,
         expected_fingerprint: [u8; 32],
     ) -> Result<Self, BotError> {
+        Self::connect_with_verifier(
+            addr,
+            identity,
+            Arc::new(PinnedFingerprint {
+                expected: expected_fingerprint,
+            }),
+            expected_fingerprint,
+        )
+        .await
+    }
+
+    async fn connect_with_verifier(
+        addr: SocketAddr,
+        identity: Identity,
+        verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+        expected_fingerprint: [u8; 32],
+    ) -> Result<Self, BotError> {
         let mut endpoint =
             Endpoint::client("127.0.0.1:0".parse().map_err(|_| BotError::Connect {
                 addr,
@@ -106,7 +123,7 @@ impl Bot {
                 addr,
                 reason: err.to_string(),
             })?;
-        endpoint.set_default_client_config(client_config(expected_fingerprint));
+        endpoint.set_default_client_config(client_config(verifier));
 
         let connection = endpoint
             .connect(addr, "tiamot-server")
@@ -791,15 +808,91 @@ impl Bot {
     }
 }
 
+impl Bot {
+    /// Connects without knowing the fingerprint in advance, reporting what the
+    /// server presented.
+    ///
+    /// This is **trust-on-first-use in its weakest form**: the first connection
+    /// is trusted blindly and nothing is remembered afterwards. Fine for a
+    /// command-line tool pointed at a server the operator chose, and wrong for
+    /// anything that needs to notice an interception — which is why the tests
+    /// use [`Bot::connect`] with an expected fingerprint instead.
+    ///
+    /// The fingerprint it saw is available from
+    /// [`cert_fingerprint`](Bot::cert_fingerprint), so a caller can print it
+    /// and pin it next time.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Connect`] if the transport fails.
+    pub async fn connect_trusting(addr: SocketAddr, identity: Identity) -> Result<Self, BotError> {
+        Self::connect_with_verifier(addr, identity, Arc::new(AcceptAny), [0u8; 32]).await
+    }
+}
+
+/// Accepts any certificate, recording nothing.
+///
+/// Used only by [`Bot::connect_trusting`]. Kept as a separate type rather than
+/// a flag on the pinning verifier so that "accept anything" can never be the
+/// result of a mis-set field.
+#[derive(Debug)]
+struct AcceptAny;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General(
+            "TLS 1.2 is not supported by this engine".to_owned(),
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // Still checked: the peer must hold the key for the certificate it
+        // presented. Skipping this would let anyone replay a copied one.
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// A quinn client config that pins one certificate fingerprint.
-fn client_config(expected: [u8; 32]) -> ClientConfig {
+fn client_config(verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>) -> ClientConfig {
     let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_protocol_versions(&[&rustls::version::TLS13])
     .expect("TLS 1.3 is supported by the ring provider")
     .dangerous()
-    .with_custom_certificate_verifier(Arc::new(PinnedFingerprint { expected }))
+    .with_custom_certificate_verifier(verifier)
     .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
