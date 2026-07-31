@@ -490,6 +490,97 @@ impl Bot {
         })
     }
 
+    /// Authorises another key for this bot's identity.
+    ///
+    /// Signed by this bot's key, which must already be authorised.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn add_key(
+        &mut self,
+        new_key: &ed25519_dalek::VerifyingKey,
+        next_key_hash: Option<[u8; 32]>,
+    ) -> Result<(), BotError> {
+        let uuid = self.identity.uuid_as_root();
+        let payload =
+            tiamot_core::identity::keyset::add_key_payload(&uuid, new_key, next_key_hash.as_ref());
+        self.send(&ClientMessage::AddKey {
+            new_public_key: *new_key.as_bytes(),
+            next_key_hash,
+            signature: WireSignature(self.identity.sign(&payload).to_bytes()),
+            signer_public_key: *self.identity.public_key().as_bytes(),
+        })
+        .await
+    }
+
+    /// Authorises another key, signing with a *different* identity.
+    ///
+    /// For the negative case: an addition signed by an unauthorised key must be
+    /// refused. A helper that always signed correctly could not test that.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn add_key_signed_by(
+        &mut self,
+        signer: &Identity,
+        target_uuid: &tiamot_core::PlayerUuid,
+        new_key: &ed25519_dalek::VerifyingKey,
+    ) -> Result<(), BotError> {
+        let payload = tiamot_core::identity::keyset::add_key_payload(target_uuid, new_key, None);
+        self.send(&ClientMessage::AddKey {
+            new_public_key: *new_key.as_bytes(),
+            next_key_hash: None,
+            signature: WireSignature(signer.sign(&payload).to_bytes()),
+            signer_public_key: *signer.public_key().as_bytes(),
+        })
+        .await
+    }
+
+    /// Rotates this bot's key to a successor.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn rotate_key(
+        &mut self,
+        new_key: &ed25519_dalek::VerifyingKey,
+        new_next_key_hash: Option<[u8; 32]>,
+    ) -> Result<(), BotError> {
+        let uuid = self.identity.uuid_as_root();
+        let payload = tiamot_core::identity::keyset::rotate_key_payload(
+            &uuid,
+            new_key,
+            new_next_key_hash.as_ref(),
+        );
+        self.send(&ClientMessage::RotateKey {
+            new_public_key: *new_key.as_bytes(),
+            new_next_key_hash,
+            signature: WireSignature(self.identity.sign(&payload).to_bytes()),
+        })
+        .await
+    }
+
+    /// Whether the server has disconnected, and why.
+    ///
+    /// Reads with a short timeout: "nothing arrived" means the operation was
+    /// accepted, since the server answers a refusal and stays silent on success.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError`] on a transport failure other than a timeout.
+    pub async fn refusal(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Option<DisconnectReason>, BotError> {
+        match tokio::time::timeout(timeout, self.recv()).await {
+            Ok(Ok(ServerMessage::Disconnect { reason })) => Ok(Some(reason)),
+            Ok(Ok(_)) => Ok(None),
+            Ok(Err(_)) | Err(_) => Ok(None),
+        }
+    }
+
     /// Closes the connection cleanly.
     pub async fn disconnect(mut self) {
         let _ = self.send(&ClientMessage::Disconnect).await;

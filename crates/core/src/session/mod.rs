@@ -280,6 +280,40 @@ impl Session {
                 actions: *actions,
             }),
 
+            // Key management, in world only. These change who can act as this
+            // identity forever, so they sit behind the same proof of possession
+            // as everything else rather than being a side channel around it.
+            (
+                Phase::InWorld,
+                ClientMessage::AddKey {
+                    new_public_key,
+                    next_key_hash,
+                    signature,
+                    signer_public_key,
+                },
+            ) => self.handle_add_key(
+                new_public_key,
+                next_key_hash.as_ref(),
+                signature,
+                signer_public_key,
+                context,
+                registry,
+            ),
+            (
+                Phase::InWorld,
+                ClientMessage::RotateKey {
+                    new_public_key,
+                    new_next_key_hash,
+                    signature,
+                },
+            ) => self.handle_rotate_key(
+                new_public_key,
+                new_next_key_hash.as_ref(),
+                signature,
+                context,
+                registry,
+            ),
+
             (_, ClientMessage::Disconnect) => {
                 self.phase = Phase::Closed;
                 Response {
@@ -476,6 +510,109 @@ impl Session {
     }
 
     /// Refuses a message that arrived in the wrong phase.
+    /// Authorises an additional key for this identity (charter rule 13).
+    ///
+    /// The signature must come from a key **already authorised** for this
+    /// identity. Accepting a self-signed addition would make the whole key-set
+    /// model decorative: anyone could add themselves to any account.
+    fn handle_add_key(
+        &mut self,
+        new_public_key: &[u8; 32],
+        next_key_hash: Option<&[u8; 32]>,
+        signature: &crate::proto::WireSignature,
+        signer_public_key: &[u8; 32],
+        context: &JoinContext<'_>,
+        registry: &mut IdentityRegistry,
+    ) -> Response {
+        let Some(uuid) = self.uuid else {
+            return self.close_with(DisconnectReason::AuthFailed {
+                detail: "not authenticated".to_owned(),
+            });
+        };
+
+        let (Ok(new_key), Ok(signer), Ok(signature)) = (
+            public_key_from_bytes(new_public_key),
+            public_key_from_bytes(signer_public_key),
+            signature_from_bytes(&signature.0),
+        ) else {
+            return Response::reply(ServerMessage::Disconnect {
+                reason: DisconnectReason::AuthFailed {
+                    detail: "malformed key or signature".to_owned(),
+                },
+            });
+        };
+
+        match registry.add_key(
+            &uuid,
+            &signer,
+            new_key,
+            next_key_hash.copied(),
+            &signature,
+            context.now,
+        ) {
+            Ok(()) => Response::none(),
+            Err(err) => {
+                // Refused, but the session continues. A rejected key addition
+                // is a mistake or an attack on ONE operation; disconnecting
+                // would let anyone knock a player offline by sending a bad one
+                // on their behalf — except they cannot, because it has to be
+                // signed. Either way, staying connected is the right response.
+                Response::reply(ServerMessage::Disconnect {
+                    reason: DisconnectReason::AuthFailed {
+                        detail: format!("key addition refused: {err}"),
+                    },
+                })
+            }
+        }
+    }
+
+    /// Rotates a key to its pre-committed successor (charter rule 13).
+    ///
+    /// The new key must match the commitment the current key registered. That
+    /// is what stops a stolen key rotating an identity away from its owner: the
+    /// thief holds the current key but not the successor it was committed to.
+    fn handle_rotate_key(
+        &mut self,
+        new_public_key: &[u8; 32],
+        new_next_key_hash: Option<&[u8; 32]>,
+        signature: &crate::proto::WireSignature,
+        context: &JoinContext<'_>,
+        registry: &mut IdentityRegistry,
+    ) -> Response {
+        let (Some(uuid), Some(current)) = (self.uuid, self.claimed_key) else {
+            return self.close_with(DisconnectReason::AuthFailed {
+                detail: "not authenticated".to_owned(),
+            });
+        };
+
+        let (Ok(new_key), Ok(signature)) = (
+            public_key_from_bytes(new_public_key),
+            signature_from_bytes(&signature.0),
+        ) else {
+            return Response::reply(ServerMessage::Disconnect {
+                reason: DisconnectReason::AuthFailed {
+                    detail: "malformed key or signature".to_owned(),
+                },
+            });
+        };
+
+        match registry.rotate_key(
+            &uuid,
+            &current,
+            new_key,
+            new_next_key_hash.copied(),
+            &signature,
+            context.now,
+        ) {
+            Ok(_proof) => Response::none(),
+            Err(err) => Response::reply(ServerMessage::Disconnect {
+                reason: DisconnectReason::AuthFailed {
+                    detail: format!("rotation refused: {err}"),
+                },
+            }),
+        }
+    }
+
     fn refuse_out_of_phase(&mut self, message: &ClientMessage) -> Response {
         let what = match message {
             ClientMessage::Hello { .. } => "Hello",

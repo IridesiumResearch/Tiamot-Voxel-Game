@@ -20,6 +20,7 @@ publish.workspace = true
 tiamot-core.workspace = true
 server.workspace = true
 blake3.workspace = true
+ed25519-dalek.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
