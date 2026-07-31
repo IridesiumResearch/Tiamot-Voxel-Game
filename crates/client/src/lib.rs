@@ -31,4 +31,6 @@ mod tests {
     }
 }
 
+pub mod camera;
 pub mod mesher;
+pub mod texture;

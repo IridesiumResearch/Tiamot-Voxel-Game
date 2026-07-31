@@ -20,10 +20,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 tiamot-core = { path = "../crates/core", default-features = false }
+client = { path = "../crates/client" }
 
 [[bin]]
 name = "proto_decode"
 path = "fuzz_targets/proto_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "texture_ingest"
+path = "fuzz_targets/texture_ingest.rs"
 test = false
 doc = false
 bench = false

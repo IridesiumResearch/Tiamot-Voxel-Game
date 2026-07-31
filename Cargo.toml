@@ -124,6 +124,15 @@ proptest = "1.8"
 # proof that a type has no padding and no invalid bit patterns, which is what
 # makes the cast safe without `unsafe`.
 bytemuck = { version = "1.23", features = ["derive"] }
+# Vector and matrix maths for the renderer. Presentation only — charter rule 4's
+# float subset does not reach here, and glam's SIMD paths would violate it if it
+# did.
+glam = "0.33"
+# PNG decoding for server-pushed textures. THE image-rs decoder: no `unsafe`,
+# fuzzed on OSS-Fuzz, and Chromium's PNG decoder since M139. Charter rule 14
+# forbids C codec bindings anywhere in the client asset path, so this is not a
+# preference — a `libpng` binding would be a rule violation.
+png = "0.18"
 # Nothing yet for the client itself; wgpu, winit, kira, and egui arrive in
 # Tasks 08, 13, and 14. Anything listed here is forbidden to `core` and
 # `server` by the firewall.

@@ -181,6 +181,16 @@ jobs:
             --target x86_64-unknown-linux-gnu \
             -- -max_total_time=60 -rss_limit_mb=2048
 
+      # Charter rule 14: server-pushed PNGs are hostile input, and the fuzz
+      # target ships in the same task as the decoder rather than in a later
+      # hardening pass. Covers the whole path — bytes, limits, resample, atlas —
+      # because the interesting failures are at the seams between them.
+      - name: Fuzz the texture ingest path (smoke)
+        run: |
+          cargo +nightly fuzz run texture_ingest \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=60 -rss_limit_mb=2048
+
       # From Task 07 onward this is how every task's `game/` mods are validated.
       # It boots no world and binds no socket: a mod API that cannot be checked
       # without a running server is an API with a usability bug.

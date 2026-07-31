@@ -20,6 +20,8 @@ publish.workspace = true
 [dependencies]
 tiamot-core.workspace = true
 bytemuck.workspace = true
+glam.workspace = true
+png.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
