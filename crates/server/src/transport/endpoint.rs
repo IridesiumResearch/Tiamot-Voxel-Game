@@ -454,6 +454,36 @@ pub async fn accept_loop(endpoint: Endpoint, shared: Arc<Shared>) {
 async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), frame::FrameError> {
     let (mut send, mut recv) = connection.accept_bi().await.map_err(to_io)?;
 
+    // Reading happens in its own task, feeding a channel.
+    //
+    // `frame::read` is NOT cancellation-safe: it reads a 4-byte length prefix
+    // and then the body as two sequential awaits. `tokio::select!` cancels the
+    // branches that do not win, so a timer or a broadcast firing between those
+    // two reads discards the partially-read frame and leaves the stream
+    // mid-message. The next read then interprets body bytes as a length
+    // prefix, the decode fails, and the client is disconnected for a protocol
+    // error it did not commit.
+    //
+    // That is what "connection stream failed" was: not flow control, and not
+    // the client failing to read. It appeared under load and in debug builds
+    // because both widen the window between the two awaits.
+    //
+    // A channel receive IS cancellation-safe, so selecting on one is correct.
+    let (incoming_tx, mut incoming) =
+        tokio::sync::mpsc::channel::<Result<ClientMessage, frame::FrameError>>(64);
+    let reader = tokio::spawn(async move {
+        loop {
+            let message = frame::read::<_, ClientMessage>(&mut recv).await;
+            let failed = message.is_err();
+            if incoming_tx.send(message).await.is_err() || failed {
+                return;
+            }
+        }
+    });
+    // Aborted on every exit path below, so a departing connection does not
+    // leave a task holding the stream.
+    let _reader = AbortOnDrop(reader);
+
     let mut session = Session::new();
     let mut slot: Option<PlayerSlot<'_>> = None;
     let auth = SelfSovereign;
@@ -507,10 +537,12 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 }
                 continue;
             }
-            incoming = frame::read(&mut recv) => match incoming {
-                Ok(message) => message,
-                Err(err) if err.is_clean_close() => return Ok(()),
-                Err(err) => {
+            received = incoming.recv() => match received {
+                Some(Ok(message)) => message,
+                // The reader ended: the peer went away.
+                None => return Ok(()),
+                Some(Err(err)) if err.is_clean_close() => return Ok(()),
+                Some(Err(err)) => {
                     let reason = frame_error_reason(&err);
                     let _ = frame::write(&mut send, &ServerMessage::Disconnect { reason }).await;
                     flush_and_close(&mut send, &connection).await;
@@ -724,6 +756,18 @@ async fn pump_chunks(
     }
 
     Ok(())
+}
+
+/// Aborts a task when dropped.
+///
+/// The reader task owns the receive stream, so letting it outlive the
+/// connection handler would keep the stream — and the connection — alive.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Waits for the peer to actually receive what was written, then closes.

@@ -214,38 +214,24 @@ fn churn_passes_and_leaves_the_world_as_it_found_it() {
 }
 
 #[test]
-#[ignore = "exposes an unresolved back-pressure bug; see the comment"]
 fn a_long_write_burst_does_not_stall_the_connection() {
-    // UNRESOLVED. This test currently fails under parallel load, roughly one
-    // run in three, and it is marked ignored because it is finding a REAL
-    // problem I have not finished diagnosing — not because it is a bad test.
+    // A regression test for a cancellation-safety bug in the SERVER, which
+    // this test found and which took three wrong diagnoses to pin down.
     //
-    // What is known:
-    //   * A bot writing 2000 edits with no reads had its connection fail after
-    //     ~120 of them, on Windows CI first and then reproducibly on Linux.
-    //   * Giving the bot a dedicated reader task (which it now has, and which
-    //     is correct regardless) reduced the failure rate but did not remove
-    //     it. So "the client stopped reading" was at most part of the cause.
-    //   * The failure surfaces on the client's WRITE as a stream error rather
-    //     than as a stall, which points at the server closing the connection
-    //     rather than at flow control alone.
+    // `frame::read` reads a 4-byte length prefix and then the body: two
+    // sequential awaits. The server's connection loop had it directly inside a
+    // `tokio::select!`, which cancels the branches that do not win — so a timer
+    // or a broadcast firing between those two reads discarded the partial frame
+    // and left the stream mid-message. The next read treated body bytes as a
+    // length prefix, the decode failed, and the client was disconnected for a
+    // protocol error it had not committed.
     //
-    // What it means for the engine: a client that edits far faster than a human
-    // can may lose its connection. That is worth fixing before Task 09 gives
-    // players a real interaction loop, and it is captured here rather than in
-    // a note nobody reads.
+    // It surfaced as "connection stream failed" on the CLIENT's write, which is
+    // why the first two fixes went after client back-pressure instead. The
+    // giveaway was that it failed in debug builds and passed in release: both
+    // load and debug widen the window between the two awaits.
     //
-    // Run it with:
-    //   cargo test -p bot --test harness -- --ignored a_long_write_burst
-
-    // The failure churn.lua hit on Windows CI: a bot that only writes lets the
-    // server's broadcast back up until QUIC flow control stops the server
-    // writing, at which point the server stops draining its side and both ends
-    // wait for each other.
-    //
-    // Linux socket buffers absorb a few hundred edits and Windows does not, so
-    // this burst is deliberately far larger than churn.lua's -- big enough that
-    // no reasonable buffer hides the bug.
+    // The burst is deliberately large so the window is hit reliably.
     let server = start("write-burst");
     let dir = scratch("write-burst-script");
     let script = dir.join("burst.lua");
