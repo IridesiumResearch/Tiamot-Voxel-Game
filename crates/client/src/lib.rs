@@ -30,3 +30,5 @@ mod tests {
         assert_eq!(super::units_per_block(), tiamot_core::UNITS_PER_BLOCK);
     }
 }
+
+pub mod mesher;

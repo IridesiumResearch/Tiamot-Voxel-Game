@@ -184,6 +184,12 @@ jobs:
       # From Task 07 onward this is how every task's `game/` mods are validated.
       # It boots no world and binds no socket: a mod API that cannot be checked
       # without a running server is an API with a usability bug.
+      # In RELEASE. These skip in a debug build, because a debug timing measures
+      # rustc's settings rather than the mesher — so running them in the normal
+      # test job would leave the Task 02b gate permanently green and useless.
+      - name: Mesh timings against the Task 02b baseline
+        run: cargo test -p client --release --test mesh_perf -- --nocapture
+
       - name: Reference mods check clean
         run: cargo run -p server -- --check-mods game
 

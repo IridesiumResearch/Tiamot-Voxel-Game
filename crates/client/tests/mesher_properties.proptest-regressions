@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 382e8753d33afcf2029cf2529836957015ca28c8668dc52b70d5642f914eba2c # shrinks to blocks = [(15, 11, 14, 2)], cells = [(47, 32, 42, 2)]
+cc edf5ba92c3252223db5b746d8dfedb01c9301130d5759f5b9054950331d725bf # shrinks to blocks = [(2, 13, 9, 2)], cells = [(6, 39, 30, 2)]
+cc 1ba7250ab150477a89ed6bea4aa0bd5591d9c1ed1a1fd3ac309004239c8831aa # shrinks to blocks = [(1, 1, 10, 2)], cells = [(6, 3, 30, 2)], neighbour_blocks = []
+cc dc2c88350b6a640be1fcf4188522cc5d05d00136c9b0055c7383b54b5b2a009c # shrinks to blocks = [], cells = [(21, 47, 24, 2)], neighbour_blocks = [(7, 0, 8, 2)]

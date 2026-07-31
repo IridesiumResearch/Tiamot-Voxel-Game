@@ -19,5 +19,9 @@ publish.workspace = true
 # fuzz target landing in the same task as any parser.
 [dependencies]
 tiamot-core.workspace = true
+bytemuck.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

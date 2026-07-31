@@ -120,6 +120,10 @@ criterion = "0.7"
 proptest = "1.8"
 
 # --- client-only (render / window / audio / UI) ---------------------------
+# Casting vertex structs to bytes for GPU upload. `derive` gives compile-time
+# proof that a type has no padding and no invalid bit patterns, which is what
+# makes the cast safe without `unsafe`.
+bytemuck = { version = "1.23", features = ["derive"] }
 # Nothing yet for the client itself; wgpu, winit, kira, and egui arrive in
 # Tasks 08, 13, and 14. Anything listed here is forbidden to `core` and
 # `server` by the firewall.
