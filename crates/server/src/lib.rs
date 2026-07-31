@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cert;
+pub mod checkmods;
 pub mod config;
 pub mod content;
 pub mod handle;

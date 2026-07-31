@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use tiamot_core::identity::Allowlist;
 use tiamot_server::config::{Config, ConfigError};
-use tiamot_server::{ServerHandle, Settings, StartError, shutdown};
+use tiamot_server::{ServerHandle, Settings, StartError, checkmods, shutdown};
 use tracing::{error, info};
 
 /// Command-line arguments.
@@ -29,8 +29,17 @@ use tracing::{error, info};
 )]
 struct Cli {
     /// Path to the server configuration file (TOML).
-    #[arg(long, value_name = "path")]
-    config: PathBuf,
+    ///
+    /// Required unless `--check-mods` is given.
+    #[arg(long, value_name = "path", required_unless_present = "check_mods")]
+    config: Option<PathBuf>,
+
+    /// Validate a mod directory and exit, without touching a world.
+    ///
+    /// Loads, resolves, and runs the registration window in a dry-run sandbox.
+    /// Exits 0 if every mod is usable and 1 otherwise, so CI can gate on it.
+    #[arg(long, value_name = "dir", conflicts_with = "config")]
+    check_mods: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -43,6 +52,26 @@ fn main() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
+
+    // Handled before `run`, because it deliberately does none of what starting
+    // a server does: no world, no socket, no certificate.
+    if let Some(dir) = &cli.check_mods {
+        return match checkmods::check(dir) {
+            Ok(report) => {
+                if checkmods::report_and_code(dir, &report) == 0 {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+            Err(message) => {
+                eprintln!("checking mods in `{}`", dir.display());
+                eprintln!("  {message}");
+                eprintln!("FAILED");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -77,11 +106,15 @@ enum ServerError {
 }
 
 fn run(cli: &Cli) -> Result<(), ServerError> {
-    let config = Config::load(&cli.config)?;
+    let config_path = cli
+        .config
+        .as_ref()
+        .expect("clap requires --config unless --check-mods is given");
+    let config = Config::load(config_path)?;
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        config = %cli.config.display(),
+        config = %config_path.display(),
         bind_addr = %config.bind_addr,
         world_path = %config.world_path.display(),
         max_players = config.max_players,
