@@ -271,7 +271,7 @@ fn the_manifest_carries_a_content_fingerprint_per_mod() {
         let ids: Vec<&str> = manifest.iter().map(|entry| entry.id.as_str()).collect();
         assert!(ids.contains(&"alpha") && ids.contains(&"beta"), "{ids:?}");
 
-        for entry in manifest {
+        for entry in &manifest {
             assert_ne!(
                 entry.content_hash, [0u8; 32],
                 "mod `{}` should have a real content fingerprint",

@@ -23,22 +23,6 @@ use tiamot_server::transport::frame;
 /// The ALPN the server requires. Must match `transport::endpoint`.
 const ALPN: &[u8] = b"tiamot/1";
 
-/// Writes between back-pressure drains.
-///
-/// A bot that only writes lets the server's broadcast back up until QUIC flow
-/// control stops the server writing — at which point the server stops draining
-/// its own side and both ends wait for each other.
-///
-/// Draining on *every* send would cost [`DRAIN_SLICE`] per message in the
-/// common case where nothing is waiting. Every 32 keeps that overhead off the
-/// hot path while still bounding how far behind the reader can fall.
-const DRAIN_EVERY: u32 = 32;
-
-/// How long one drain read waits before concluding nothing is there.
-///
-/// Small, but deliberately non-zero — see [`Bot::drain_pending`].
-const DRAIN_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
-
 /// Something went wrong driving a connection.
 #[derive(Debug, thiserror::Error)]
 pub enum BotError {
@@ -91,13 +75,27 @@ pub struct Bot {
     endpoint: Endpoint,
     connection: quinn::Connection,
     send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    /// Messages the reader task has taken off the wire but the script has not
+    /// consumed yet.
+    inbox: tokio::sync::mpsc::UnboundedReceiver<ServerMessage>,
     /// Everything the server has sent, in order.
-    received: Vec<ServerMessage>,
-    /// Writes since the last read, for the back-pressure drain in [`send`].
-    sent_since_read: u32,
+    ///
+    /// Shared with the reader task, which appends as messages arrive — so
+    /// `inventory()` and `expect_block` see a message the moment it lands
+    /// rather than when the script next calls `recv`.
+    history: Arc<std::sync::Mutex<Vec<ServerMessage>>>,
+    /// The reader task, aborted when the bot goes away.
+    reader: tokio::task::JoinHandle<()>,
     /// The fingerprint the server actually presented.
     cert_fingerprint: [u8; 32],
+}
+
+impl Drop for Bot {
+    fn drop(&mut self) {
+        // The reader borrows nothing from the bot, so it would otherwise
+        // outlive it and hold the connection open.
+        self.reader.abort();
+    }
 }
 
 impl Bot {
@@ -164,7 +162,7 @@ impl Bot {
             .and_then(|chain| chain.first().map(tiamot_server::cert::fingerprint_of))
             .unwrap_or(expected_fingerprint);
 
-        let (send, recv) = connection
+        let (send, mut recv) = connection
             .open_bi()
             .await
             .map_err(|err| BotError::Connect {
@@ -172,14 +170,47 @@ impl Bot {
                 reason: err.to_string(),
             })?;
 
+        // A dedicated reader, running whatever the script is doing.
+        //
+        // This is the fix for a class of bug rather than one instance of it: a
+        // bot that only read when the script asked let the server's broadcast
+        // back up until QUIC flow control stopped the server writing, at which
+        // point the server stopped draining ITS side and both ends waited for
+        // each other. Draining periodically from `send` only moved the
+        // threshold — under parallel test load the server still outpaced it.
+        //
+        // Every real network client has a read loop independent of its
+        // application logic. This is that.
+        let history: Arc<std::sync::Mutex<Vec<ServerMessage>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (inbox_tx, inbox) = tokio::sync::mpsc::unbounded_channel();
+        let reader_history = Arc::clone(&history);
+        let reader = tokio::spawn(async move {
+            loop {
+                match frame::read::<_, ServerMessage>(&mut recv).await {
+                    Ok(message) => {
+                        if let Ok(mut history) = reader_history.lock() {
+                            history.push(message.clone());
+                        }
+                        if inbox_tx.send(message).is_err() {
+                            return;
+                        }
+                    }
+                    // The connection ended, cleanly or otherwise. The script
+                    // finds out when its next read returns nothing.
+                    Err(_) => return,
+                }
+            }
+        });
+
         Ok(Self {
             identity,
             endpoint,
             connection,
             send,
-            recv,
-            received: Vec::new(),
-            sent_since_read: 0,
+            inbox,
+            history,
+            reader,
             cert_fingerprint,
         })
     }
@@ -197,9 +228,15 @@ impl Bot {
     }
 
     /// Everything the server has sent, in order.
+    ///
+    /// A snapshot: the reader task appends concurrently, so this is what had
+    /// arrived when it was called.
     #[must_use]
-    pub fn received(&self) -> &[ServerMessage] {
-        &self.received
+    pub fn received(&self) -> Vec<ServerMessage> {
+        self.history
+            .lock()
+            .map(|history| history.clone())
+            .unwrap_or_default()
     }
 
     /// Sends one message.
@@ -217,46 +254,22 @@ impl Bot {
     ///
     /// [`BotError::Frame`] if the write fails.
     pub async fn send(&mut self, message: &ClientMessage) -> Result<(), BotError> {
-        self.sent_since_read += 1;
-        if self.sent_since_read >= DRAIN_EVERY {
-            self.drain_pending().await;
-        }
         frame::write(&mut self.send, message).await?;
         Ok(())
     }
 
-    /// Reads whatever has arrived, giving each read a real chance to complete.
-    ///
-    /// The timeout is **not zero**. A zero-duration `tokio::time::timeout`
-    /// races: the deadline can expire before the inner future is polled, so the
-    /// drain silently does nothing. That is what the first version did, and it
-    /// passed on Linux — where the socket buffers were large enough to hide
-    /// the problem — while Windows CI still stalled at edit ~126.
-    ///
-    /// Transport errors are swallowed: the caller is about to write, and that
-    /// write reports the same failure with better context.
-    pub async fn drain_pending(&mut self) {
-        self.sent_since_read = 0;
-        // Bounded, so a server flooding broadcasts cannot turn one send into an
-        // unbounded read loop.
-        for _ in 0..256 {
-            match tokio::time::timeout(DRAIN_SLICE, self.recv()).await {
-                Ok(Ok(_)) => {}
-                // Nothing waiting, or the connection failed. Either way, stop.
-                Ok(Err(_)) | Err(_) => return,
-            }
-        }
-    }
-
-    /// Reads one message, recording it.
+    /// Takes the next message the reader task has queued.
     ///
     /// # Errors
     ///
-    /// [`BotError::Frame`] if the read fails.
+    /// [`BotError::Frame`] if the connection has ended.
     pub async fn recv(&mut self) -> Result<ServerMessage, BotError> {
-        let message: ServerMessage = frame::read(&mut self.recv).await?;
-        self.received.push(message.clone());
-        Ok(message)
+        self.inbox.recv().await.ok_or_else(|| {
+            BotError::Frame(frame::FrameError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the connection ended",
+            )))
+        })
     }
 
     /// Reads until a message matching `want` arrives, or the server disconnects.
@@ -425,10 +438,10 @@ impl Bot {
     /// Every chunk received so far, in arrival order.
     #[must_use]
     pub fn chunks_received(&self) -> Vec<tiamot_core::ChunkPos> {
-        self.received
-            .iter()
+        self.received()
+            .into_iter()
             .filter_map(|message| match message {
-                ServerMessage::ChunkData { pos, .. } => Some(*pos),
+                ServerMessage::ChunkData { pos, .. } => Some(pos),
                 _ => None,
             })
             .collect()
@@ -449,8 +462,8 @@ impl Bot {
         pos: tiamot_core::ChunkPos,
         materials: &tiamot_core::persist::idmap::MaterialMap,
     ) -> Result<tiamot_core::Chunk, BotError> {
-        let blob = self
-            .received
+        let history = self.received();
+        let blob = history
             .iter()
             .rev()
             .find_map(|message| match message {
@@ -555,11 +568,13 @@ impl Bot {
 
     /// The mod manifest the server sent, if it has arrived.
     #[must_use]
-    pub fn manifest(&self) -> Option<&[tiamot_core::proto::ModEntry]> {
-        self.received.iter().find_map(|message| match message {
-            ServerMessage::ModManifest { mods, .. } => Some(mods.as_slice()),
-            _ => None,
-        })
+    pub fn manifest(&self) -> Option<Vec<tiamot_core::proto::ModEntry>> {
+        self.received()
+            .into_iter()
+            .find_map(|message| match message {
+                ServerMessage::ModManifest { mods, .. } => Some(mods),
+                _ => None,
+            })
     }
 
     /// Authorises another key for this bot's identity.
@@ -746,7 +761,7 @@ impl Bot {
 
     /// Whether a matching block delta has been seen.
     fn saw_block(&self, pos: tiamot_core::BlockPos, material: u16) -> bool {
-        self.received.iter().rev().any(|message| {
+        self.received().iter().rev().any(|message| {
             matches!(
                 message,
                 ServerMessage::BlockDelta {
@@ -764,7 +779,7 @@ impl Bot {
     /// them into blocks and spare nodes.
     #[must_use]
     pub fn inventory(&self) -> Vec<(u16, u32)> {
-        self.received
+        self.received()
             .iter()
             .rev()
             .find_map(|message| match message {
