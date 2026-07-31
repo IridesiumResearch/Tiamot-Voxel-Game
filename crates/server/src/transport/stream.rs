@@ -41,8 +41,15 @@ pub struct Streamer {
     /// reproducible unload ordering in tests, and at ~1800 entries the lookup
     /// difference is not measurable next to encoding a chunk.
     sent: BTreeSet<ChunkPos>,
-    /// Chunks requested from the simulation but not yet delivered.
-    in_flight: usize,
+    /// Chunks requested from the simulation but not yet answered.
+    ///
+    /// A **set of positions**, not a count. A count is not enough: `next_needed`
+    /// filters against what has been *delivered*, so a chunk still in flight
+    /// looks un-requested and gets asked for a second time. On a fast machine
+    /// the reply usually lands before the next pass and it never shows; on a
+    /// slower one the client receives the same chunk twice. CI on macOS caught
+    /// exactly that.
+    in_flight: BTreeSet<ChunkPos>,
 }
 
 impl Streamer {
@@ -53,7 +60,7 @@ impl Streamer {
             centre,
             view,
             sent: BTreeSet::new(),
-            in_flight: 0,
+            in_flight: BTreeSet::new(),
         }
     }
 
@@ -71,14 +78,14 @@ impl Streamer {
 
     /// How many requests are outstanding.
     #[must_use]
-    pub const fn in_flight(&self) -> usize {
-        self.in_flight
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
     }
 
     /// Whether every chunk in range has been sent.
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.in_flight == 0 && self.next_needed(usize::MAX).is_empty()
+        self.in_flight.is_empty() && self.next_needed(usize::MAX).is_empty()
     }
 
     /// Moves the interest centre, returning chunks that left range.
@@ -91,6 +98,11 @@ impl Streamer {
             return Vec::new();
         }
         self.centre = centre;
+        // Requests for chunks that just left range are abandoned. Keeping them
+        // would deliver a chunk the client was told to unload, and hold budget
+        // that the new neighbourhood needs.
+        self.in_flight
+            .retain(|pos| interest::contains(centre, self.view, *pos));
 
         let departed: Vec<ChunkPos> = self
             .sent
@@ -104,7 +116,8 @@ impl Streamer {
         departed
     }
 
-    /// Up to `limit` chunks in range that have not been sent, nearest first.
+    /// Up to `limit` chunks in range that are neither sent nor in flight,
+    /// nearest first.
     ///
     /// Does not mark them sent — the caller does that once the send succeeds,
     /// so a failure leaves them to be retried.
@@ -115,7 +128,7 @@ impl Streamer {
         }
         interest::chunks_around(self.centre, self.view)
             .into_iter()
-            .filter(|pos| !self.sent.contains(pos))
+            .filter(|pos| !self.sent.contains(pos) && !self.in_flight.contains(pos))
             .take(limit)
             .collect()
     }
@@ -123,25 +136,27 @@ impl Streamer {
     /// How many more requests this connection may have outstanding.
     #[must_use]
     pub fn budget(&self, in_flight_cap: usize) -> usize {
-        in_flight_cap.saturating_sub(self.in_flight)
+        in_flight_cap.saturating_sub(self.in_flight.len())
     }
 
     /// Records that a chunk has been asked for.
-    pub const fn requested(&mut self) {
-        self.in_flight += 1;
+    pub fn requested(&mut self, pos: ChunkPos) {
+        self.in_flight.insert(pos);
     }
 
     /// Records that a request came back, whether or not it produced a chunk.
     ///
     /// Called on **every** outcome — delivered, empty, failed. An in-flight
-    /// count only decremented on success would drift up until the connection
-    /// stopped asking for anything and the player's world stopped filling in.
-    pub const fn completed(&mut self) {
-        self.in_flight = self.in_flight.saturating_sub(1);
+    /// entry only cleared on success would hold its slot forever, until the
+    /// connection stopped asking for anything and the player's world stopped
+    /// filling in.
+    pub fn completed(&mut self, pos: ChunkPos) {
+        self.in_flight.remove(&pos);
     }
 
     /// Records that a chunk reached the client.
     pub fn delivered(&mut self, pos: ChunkPos) {
+        self.in_flight.remove(&pos);
         self.sent.insert(pos);
     }
 
@@ -292,35 +307,88 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_in_flight_is_not_requested_again() {
+        // The bug macOS CI caught. `next_needed` used to filter only against
+        // what had been DELIVERED, so a chunk still in flight looked
+        // un-requested and was asked for a second time — and the client
+        // received it twice. On a fast machine the reply landed before the next
+        // pass and it never showed.
+        let mut streamer = streamer();
+
+        let first = streamer.next_needed(2);
+        assert_eq!(first.len(), 2);
+        for pos in &first {
+            streamer.requested(*pos);
+        }
+
+        let second = streamer.next_needed(usize::MAX);
+        for pos in &first {
+            assert!(
+                !second.contains(pos),
+                "{pos:?} is in flight and must not be requested again"
+            );
+        }
+    }
+
+    #[test]
     fn in_flight_accounting_survives_a_failed_request() {
-        // The subtle one. If `completed` were only called on success, a few
-        // dropped requests would exhaust the budget permanently and the
-        // player's world would simply stop filling in — with nothing logged.
+        // If `completed` were only called on success, dropped requests would
+        // hold their slots permanently and the player's world would simply stop
+        // filling in — with nothing logged.
         let mut streamer = streamer();
         assert_eq!(streamer.budget(4), 4);
 
-        streamer.requested();
-        streamer.requested();
+        let targets = streamer.next_needed(2);
+        for pos in &targets {
+            streamer.requested(*pos);
+        }
         assert_eq!(streamer.budget(4), 2);
 
         // One delivered, one failed.
-        streamer.completed();
-        streamer.delivered(ORIGIN);
-        streamer.completed();
+        streamer.delivered(targets[0]);
+        streamer.completed(targets[1]);
 
         assert_eq!(
             streamer.budget(4),
             4,
-            "a failed request must return its budget too"
+            "a failed request must return its slot too"
+        );
+        assert!(
+            streamer.next_needed(usize::MAX).contains(&targets[1]),
+            "the failed chunk must be retried"
+        );
+        assert!(
+            !streamer.next_needed(usize::MAX).contains(&targets[0]),
+            "the delivered chunk must not be"
         );
     }
 
     #[test]
-    fn in_flight_never_goes_negative() {
+    fn completing_something_never_requested_is_harmless() {
         let mut streamer = streamer();
-        streamer.completed();
-        streamer.completed();
+        streamer.completed(ORIGIN);
+        streamer.completed(ORIGIN);
         assert_eq!(streamer.in_flight(), 0);
+        assert_eq!(streamer.budget(4), 4);
+    }
+
+    #[test]
+    fn moving_away_abandons_requests_for_chunks_that_left_range() {
+        // Otherwise the reply arrives for a chunk the client was told to
+        // unload, and the slot it holds is one the new neighbourhood needs.
+        let mut streamer = streamer();
+        let targets = streamer.next_needed(3);
+        for pos in &targets {
+            streamer.requested(*pos);
+        }
+        assert_eq!(streamer.in_flight(), 3);
+
+        streamer.recentre(ChunkPos::new(20, 0, 0));
+        assert_eq!(
+            streamer.in_flight(),
+            0,
+            "requests for chunks now out of range must be abandoned"
+        );
         assert_eq!(streamer.budget(4), 4);
     }
 
@@ -346,9 +414,9 @@ mod tests {
         for pos in streamer.next_needed(usize::MAX) {
             streamer.delivered(pos);
         }
-        streamer.requested();
+        streamer.requested(ORIGIN);
         assert!(!streamer.is_complete());
-        streamer.completed();
+        streamer.completed(ORIGIN);
         assert!(streamer.is_complete());
     }
 }

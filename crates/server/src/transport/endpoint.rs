@@ -598,24 +598,26 @@ async fn pump_chunks(
     for (pos, mut receiver) in pending.drain(..) {
         match receiver.try_recv() {
             Ok(Some(blob)) => {
-                streamer.completed();
                 frame::write(send, &ServerMessage::ChunkData { pos, blob }).await?;
+                // `delivered` clears the in-flight entry too, so the chunk goes
+                // straight from "requested" to "held" with no window in which
+                // it looks un-requested and gets asked for again.
                 streamer.delivered(pos);
             }
             Ok(None) => {
-                // The simulation could not produce it. Accounted for exactly
-                // like a success, and NOT marked delivered, so the next pass
-                // asks again.
-                streamer.completed();
+                // The simulation could not produce it. Cleared exactly like a
+                // success, and NOT marked delivered, so the next pass asks
+                // again.
+                streamer.completed(pos);
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                 still_waiting.push((pos, receiver));
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                 // The simulation dropped the request without answering. Same
-                // accounting: the budget must come back or this connection
+                // accounting: the slot must come back or this connection
                 // slowly stops asking for anything.
-                streamer.completed();
+                streamer.completed(pos);
             }
         }
     }
@@ -628,7 +630,7 @@ async fn pump_chunks(
             // Queue full. Nothing is marked, so the next pass retries.
             break;
         };
-        streamer.requested();
+        streamer.requested(pos);
         pending.push((pos, receiver));
     }
 
