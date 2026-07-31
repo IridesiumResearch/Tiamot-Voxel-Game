@@ -78,11 +78,33 @@ jobs:
         shell: bash
         run: |
           unset DISPLAY WAYLAND_DISPLAY
-          cargo run -p server -- --config server.example.toml &
+          # Build FIRST. `cargo run` compiles before it runs, so a fixed sleep
+          # was really racing the compiler: a build that took longer than the
+          # sleep meant SIGTERM landed on rustc and the step failed with 143.
+          # Enabling a new mlua feature was enough to trigger it.
+          cargo build -p server
+          ./target/debug/server --config server.example.toml > server.log 2>&1 &
           server_pid=$!
-          sleep 5
+
+          # Wait for the server to say it is listening, rather than guessing.
+          # A readiness signal cannot be outrun by a slow runner.
+          for _ in $(seq 1 60); do
+            if grep -q "server listening" server.log; then break; fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo "server exited during startup:"; cat server.log; exit 1
+            fi
+            sleep 1
+          done
+          if ! grep -q "server listening" server.log; then
+            echo "server never reported listening:"; cat server.log
+            kill -TERM "$server_pid" 2>/dev/null || true
+            exit 1
+          fi
+
           kill -TERM "$server_pid"
           wait "$server_pid"
+          grep -q "world flushed and closed" server.log \
+            || { echo "server did not flush on shutdown:"; cat server.log; exit 1; }
           echo "server exited 0 on SIGTERM with no display server"
 
   # Platform-independent policy gates. Deliberately NOT in the OS matrix.

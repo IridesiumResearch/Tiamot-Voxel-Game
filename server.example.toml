@@ -19,3 +19,34 @@ world_path = "world"
 
 # Maximum simultaneously connected players. Must be at least 1.
 max_players = 16
+
+# Directory to load mods from. Absent means no mods, which is a legitimate
+# configuration: the engine is mechanisms and the content is mods, so a server
+# with none is empty rather than broken.
+#mods_path = "game"
+
+# How far players can see, in chunks. One chunk is 16 blocks.
+#
+# Interest volume grows with the SQUARE of the horizontal radius, so 16 is four
+# times the streaming work of 8. Values outside 1..=32 are clamped rather than
+# obeyed — a server that accepted 200 would appear to start and then fail to
+# keep up in a way that looked like an engine bug.
+view_distance = 8
+
+# How far players can see vertically, in chunks. Clamped to 1..=16.
+#
+# Smaller than the horizontal radius on purpose: players move horizontally far
+# more than vertically, and the interesting content is a thin shell around the
+# surface.
+vertical_view_distance = 4
+
+# Remote administration over loopback TCP. Absent means NO admin port is open,
+# which is the right default for something carrying `stop` and `rebind`.
+#
+# The bind address must be loopback — the server refuses to start otherwise,
+# because this protocol has no transport encryption. Tunnel over SSH for remote
+# access. The token must be at least 16 characters and has no default: a default
+# admin token is a published admin token.
+#[rcon]
+#bind_addr = "127.0.0.1:47812"
+#token = "change-me-to-something-long-and-random"
