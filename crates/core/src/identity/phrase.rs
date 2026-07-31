@@ -226,15 +226,27 @@ mod tests {
 
     #[test]
     fn debug_never_prints_the_phrase() {
-        let phrase = Identity::generate()
-            .expect("generate")
+        // Deterministic seed, not a generated one. An earlier version of this
+        // test generated a random phrase and asserted no individual word
+        // appeared in the Debug output — which is flaky, because the BIP-39
+        // wordlist contains `act` and `cover`, both substrings of
+        // "RecoveryPhrase(<redacted>)". It failed roughly one run in fifty and
+        // passed everywhere until CI drew an unlucky phrase.
+        //
+        // The property that actually matters is that the output is the fixed
+        // redacted literal and contains none of the phrase, so that is what is
+        // asserted — no per-word substring search, which was never the right
+        // test.
+        let phrase = Identity::from_seed(&[0x42; SEED_BYTES])
             .recovery_phrase()
             .expect("phrase");
         let printed = format!("{phrase:?}");
+
         assert_eq!(printed, "RecoveryPhrase(<redacted>)");
-        for word in phrase.words() {
-            assert!(!printed.contains(word), "the phrase leaked into Debug");
-        }
+        assert!(
+            !printed.contains(&phrase.to_words()),
+            "the phrase leaked into Debug"
+        );
     }
 
     #[test]
