@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use tiamot_core::{Registry, WorldDb};
+use tiamot_core::{Registry, WorldDb, session};
 use tracing::{error, info};
 
 use crate::config::Config;
@@ -91,6 +91,10 @@ enum ServerError {
     /// The simulation thread could not be spawned.
     #[error("could not start the simulation thread")]
     SimulationThread(#[source] std::io::Error),
+
+    /// The identity registry could not be read.
+    #[error("could not load the identity registry")]
+    Identities(#[source] session::StoreError),
 }
 
 fn run(cli: &Cli) -> Result<(), ServerError> {
@@ -134,6 +138,26 @@ fn run(cli: &Cli) -> Result<(), ServerError> {
              preserved and will render as unknown until the mod returns"
         );
     }
+
+    // Who exists, and what they are called. Loaded before the simulation starts
+    // so a join arriving on the first tick is answered from the real registry
+    // rather than an empty one — which would hand out names that are already
+    // taken.
+    let (identities, report) = session::store::load(&world).map_err(ServerError::Identities)?;
+    info!(
+        identities = report.identities,
+        names = report.names,
+        "identity registry loaded"
+    );
+    for skipped in &report.skipped {
+        // Not fatal, but an operator has to hear about it: one player cannot
+        // log in, and silently starting anyway is how that becomes a support
+        // ticket instead of a log line.
+        error!("skipped a stored identity: {skipped}");
+    }
+    // The transport (next in Task 06) takes ownership of this to answer joins,
+    // and calls `session::store::flush` after each binding change.
+    let _ = identities;
 
     // The simulation runs on its own thread so that a signal arriving mid-tick
     // is noticed at the tick boundary rather than interrupting one. Nothing

@@ -14,7 +14,7 @@
 //! all UUID. A name can be released, reassigned by an admin, or changed, and
 //! nothing else in the engine notices.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
@@ -64,11 +64,34 @@ pub struct IdentityRegistry {
     /// never edited independently — the key sets are the source of truth.
     by_key: BTreeMap<[u8; 32], PlayerUuid>,
     names: BTreeMap<String, PlayerUuid>,
+
+    /// Identities whose key sets have changed since the last flush.
+    ///
+    /// Tracked so a save writes what moved rather than every identity. On a
+    /// long-lived server the registry holds every player who has ever joined,
+    /// while a tick typically changes none of them.
+    dirty_identities: BTreeSet<PlayerUuid>,
+    /// Names whose binding changed since the last flush.
+    ///
+    /// A name in here may have been bound, rebound, or released — the flush
+    /// resolves which by looking it up, so a bind-then-release between flushes
+    /// collapses to one write instead of two.
+    dirty_names: BTreeSet<String>,
 }
 
 impl IdentityRegistry {
-    /// Adds or replaces an identity.
+    /// Adds or replaces an identity, marking it for the next flush.
     pub fn insert(&mut self, keys: KeySet) {
+        let uuid = keys.uuid();
+        self.dirty_identities.insert(uuid);
+        self.insert_clean(keys);
+    }
+
+    /// Adds or replaces an identity **without** marking it dirty.
+    ///
+    /// For loading from the database, where writing back what was just read
+    /// would be pointless work on every startup.
+    fn insert_clean(&mut self, keys: KeySet) {
         let uuid = keys.uuid();
         // Drop any stale key mappings for this identity before reindexing, so a
         // revoked key cannot linger in the lookup after a reload.
@@ -83,12 +106,47 @@ impl IdentityRegistry {
 
     /// Rebuilds an identity from persisted key rows.
     ///
+    /// Does not mark the identity dirty — these rows came *from* the database.
+    ///
     /// # Errors
     ///
     /// [`RegistryError::KeySet`] if the rows do not describe a valid set.
     pub fn insert_stored(&mut self, keys: Vec<AuthorisedKey>) -> Result<(), RegistryError> {
-        self.insert(KeySet::from_stored(keys)?);
+        self.insert_clean(KeySet::from_stored(keys)?);
         Ok(())
+    }
+
+    /// Binds a name **without** marking it dirty, for loading.
+    pub fn bind_name_clean(&mut self, name: &str, uuid: PlayerUuid) {
+        self.names.insert(name.to_owned(), uuid);
+    }
+
+    /// Identities changed since the last [`clear_dirty`](Self::clear_dirty).
+    #[must_use]
+    pub fn dirty_identities(&self) -> Vec<PlayerUuid> {
+        self.dirty_identities.iter().copied().collect()
+    }
+
+    /// Names changed since the last [`clear_dirty`](Self::clear_dirty).
+    #[must_use]
+    pub fn dirty_names(&self) -> Vec<String> {
+        self.dirty_names.iter().cloned().collect()
+    }
+
+    /// Whether anything is waiting to be written.
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        !self.dirty_identities.is_empty() || !self.dirty_names.is_empty()
+    }
+
+    /// Marks everything flushed.
+    ///
+    /// Call only after the write has actually succeeded. Clearing first and
+    /// then failing to write would lose the change silently — the registry
+    /// would believe the database already had it.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_identities.clear();
+        self.dirty_names.clear();
     }
 
     /// The identity a key belongs to, if it is currently authorised.
@@ -155,8 +213,14 @@ impl IdentityRegistry {
                 // otherwise a player could hoard names by reconnecting.
                 if let Some(previous) = self.name_of(&uuid).map(ToOwned::to_owned) {
                     self.names.remove(&previous);
+                    // The release is a change too. Without this the old name
+                    // would stay bound in the database after a rename, and a
+                    // restart would hand the player back a name they no longer
+                    // hold — while also blocking anyone else from taking it.
+                    self.dirty_names.insert(previous);
                 }
                 self.names.insert(name.to_owned(), uuid);
+                self.dirty_names.insert(name.to_owned());
                 Ok(())
             }
         }
@@ -164,7 +228,9 @@ impl IdentityRegistry {
 
     /// Releases a name. **Admin operation** (RCON `rename`).
     pub fn release_name(&mut self, name: &str) {
-        self.names.remove(name);
+        if self.names.remove(name).is_some() {
+            self.dirty_names.insert(name.to_owned());
+        }
     }
 
     /// Every binding, in a stable order.

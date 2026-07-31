@@ -503,6 +503,93 @@ impl WorldDb {
             .optional()?)
     }
 
+    /// Releases a display name so another identity may claim it.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn release_name(&self, server_name: &str) -> Result<(), WorldError> {
+        self.conn.execute(
+            "DELETE FROM player_names WHERE server_name = ?1",
+            params![server_name],
+        )?;
+        Ok(())
+    }
+
+    /// Binds a name, taking it from whoever holds it.
+    ///
+    /// Unlike [`claim_name`](Self::claim_name) this does not fail on a
+    /// conflict. First-come is enforced in the registry, which knows whether
+    /// the claimant is the existing holder reconnecting; by the time a binding
+    /// reaches the database that decision has already been made, and failing
+    /// here would only turn an accepted join into a save error.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn set_name(&self, server_name: &str, uuid: &str) -> Result<(), WorldError> {
+        self.conn.execute(
+            "INSERT INTO player_names (server_name, uuid) VALUES (?1, ?2)
+             ON CONFLICT(server_name) DO UPDATE SET uuid = excluded.uuid",
+            params![server_name, uuid],
+        )?;
+        Ok(())
+    }
+
+    /// Every display-name binding, in a stable order.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn all_name_bindings(&self) -> Result<Vec<(String, String)>, WorldError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT server_name, uuid FROM player_names ORDER BY server_name")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every identity with at least one key on record, in a stable order.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn all_player_uuids(&self) -> Result<Vec<String>, WorldError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT DISTINCT uuid FROM player_keys ORDER BY uuid")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Every key on record for an identity, **including revoked ones**.
+    ///
+    /// [`player_keys`](Self::player_keys) filters revocations out, which is
+    /// right for "may this key be used" but wrong for reloading a key set: the
+    /// tombstones are what make the rotation chain replayable, and a set
+    /// rebuilt without them has quietly lost its history.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn all_player_keys(&self, uuid: &str) -> Result<Vec<StoredPlayerKey>, WorldError> {
+        let mut statement = self.conn.prepare(
+            "SELECT pubkey, next_key_hash, added_at, added_by_pubkey, revoked_at
+             FROM player_keys WHERE uuid = ?1
+             ORDER BY added_at, pubkey",
+        )?;
+        let rows = statement.query_map(params![uuid], |row| {
+            Ok(StoredPlayerKey {
+                pubkey: row.get(0)?,
+                next_key_hash: row.get(1)?,
+                added_at: row.get(2)?,
+                added_by: row.get(3)?,
+                revoked_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     // -- meta -------------------------------------------------------------
 
     /// Reads a meta value.

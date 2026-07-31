@@ -27,8 +27,10 @@
 //! rather than a flag someone can forget to test.
 
 mod registry;
+pub mod store;
 
 pub use registry::{IdentityRegistry, NameBinding, RegistryError};
+pub use store::{LoadReport, StoreError};
 
 use crate::identity::{
     Allowlist, AuthProvider, NONCE_BYTES, PlayerUuid, generate_nonce, public_key_from_bytes,
