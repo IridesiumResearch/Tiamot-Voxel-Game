@@ -316,6 +316,16 @@ impl std::fmt::Debug for Identity {
 }
 
 /// Makes a key file readable only by its owner.
+///
+/// The `Result` is load-bearing on Unix and vestigial on Windows, where the
+/// file inherits the user profile's ACL and there is nothing to do. The
+/// signature stays uniform so the caller does not branch on platform — which is
+/// exactly the shape clippy objects to on the Windows build only, and the
+/// reason this allow is here rather than a `cfg`-split function.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "infallible on Windows, fallible on Unix; one signature for both callers"
+)]
 fn restrict_permissions(path: &std::path::Path) -> Result<(), IdentityError> {
     #[cfg(unix)]
     {
