@@ -48,6 +48,7 @@ fn start(world: &Path, mods: Option<PathBuf>) -> ServerHandle {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: mods,
+        seed: Some(1),
         rcon: None,
         materials: Vec::new(),
     })
@@ -244,6 +245,7 @@ fn an_unresolvable_mod_set_refuses_to_start() {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(mods),
+        seed: Some(1),
         rcon: None,
         materials: Vec::new(),
     });

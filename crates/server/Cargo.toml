@@ -27,6 +27,7 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 blake3.workspace = true
+getrandom.workspace = true
 
 # The crate is a LIBRARY with a thin binary on top. Task 06 asks for a reusable
 # `ServerHandle` so singleplayer can embed the server in-process; the plan

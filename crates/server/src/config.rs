@@ -67,6 +67,13 @@ pub struct Config {
     #[serde(default = "Config::default_max_players")]
     pub max_players: u32,
 
+    /// Seed for a new world. Ignored once a world exists.
+    ///
+    /// Absent draws one from system entropy. Set it to share a world's terrain
+    /// with someone else, or to reproduce a bug report.
+    #[serde(default)]
+    pub seed: Option<u64>,
+
     /// Directory to load mods from.
     ///
     /// Absent means no mods. That is a legitimate configuration — the engine is
@@ -208,6 +215,7 @@ impl Default for Config {
             bind_addr: Self::default_bind_addr(),
             world_path: Self::default_world_path(),
             max_players: Self::default_max_players(),
+            seed: None,
             mods_path: None,
             view_distance: Self::default_view_distance(),
             vertical_view_distance: Self::default_vertical_view_distance(),

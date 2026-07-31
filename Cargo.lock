@@ -2293,6 +2293,7 @@ dependencies = [
  "blake3",
  "clap",
  "ctrlc",
+ "getrandom 0.3.4",
  "quinn",
  "rcgen",
  "rustls",

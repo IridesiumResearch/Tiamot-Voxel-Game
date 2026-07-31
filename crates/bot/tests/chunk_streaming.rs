@@ -33,6 +33,7 @@ fn start(name: &str, view: ViewDistance) -> ServerHandle {
         allowlist: Allowlist::open(),
         view_distance: view,
         mods_path: None,
+        seed: Some(1),
         rcon: None,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     })
@@ -362,6 +363,145 @@ fn two_players_both_get_a_full_world() {
         bob.disconnect().await;
     });
 
+    server.stop();
+}
+
+#[test]
+fn a_streamed_chunk_carries_generated_terrain() {
+    // The whole point of worldgen reaching the client. Before this was wired,
+    // a joining player received chunks that decoded fine and contained nothing
+    // — a working transport delivering an empty world.
+    //
+    // The reference generator is solid below y=0 and air above, so the chunk
+    // under spawn must be solid and the one above it must not.
+    let view = ViewDistance::MINIMUM;
+    let dir = world_dir("generated-terrain");
+    let repo_mods = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../game")
+        .canonicalize()
+        .expect("the game/ directory should exist");
+
+    let server = ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: dir,
+        max_players: 8,
+        allowlist: Allowlist::open(),
+        view_distance: view,
+        mods_path: Some(repo_mods),
+        seed: Some(7),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("start");
+
+    block_on(async {
+        let mut alice = join(&server, "Alice").await;
+        let spawn_chunk = BlockPos::new(0, 1, 0).chunk();
+        let expected = interest::chunks_around(spawn_chunk, view).len();
+        let received = alice
+            .collect_chunks(expected, Duration::from_secs(30))
+            .await
+            .expect("collect");
+        assert_eq!(received.len(), expected, "the neighbourhood should arrive");
+
+        // `core:white` is the only block the reference mods register.
+        let mut registry = tiamot_core::Registry::new();
+        let white = registry.register("core:white").expect("register");
+        let db = tiamot_core::WorldDb::open_in_memory(&mut registry).expect("id map");
+
+        // Below the surface: solid.
+        let underground = BlockPos::new(0, -4, 0);
+        let chunk = alice
+            .decode_chunk(underground.chunk(), db.materials())
+            .expect("the underground chunk should decode");
+        assert_eq!(
+            chunk.get_block(underground).expect("in chunk").subnode(0),
+            white,
+            "the generator fills everything below y=0; the client received air instead"
+        );
+
+        // Above the surface: air.
+        let sky = BlockPos::new(0, 20, 0);
+        let chunk = alice
+            .decode_chunk(sky.chunk(), db.materials())
+            .expect("the sky chunk should decode");
+        assert_eq!(
+            chunk.get_block(sky).expect("in chunk").subnode(0),
+            MaterialId::AIR,
+            "everything above y=0 should be air"
+        );
+
+        alice.disconnect().await;
+    });
+
+    assert!(server.stop(), "clean shutdown");
+}
+
+#[test]
+fn generated_terrain_is_the_same_after_a_restart() {
+    // Generated chunks are persisted rather than regenerated, so that a mod or
+    // engine change cannot silently rewrite land a player has already built
+    // next to. This is that guarantee, end to end.
+    let view = ViewDistance::MINIMUM;
+    let dir = world_dir("terrain-restart");
+    let repo_mods = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../game")
+        .canonicalize()
+        .expect("game/ should exist");
+
+    let settings = |mods: Option<PathBuf>| Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: dir.clone(),
+        max_players: 8,
+        allowlist: Allowlist::open(),
+        view_distance: view,
+        mods_path: mods,
+        seed: Some(7),
+        rcon: None,
+        materials: Vec::new(),
+    };
+
+    // First run: generate and store the neighbourhood.
+    let server = ServerHandle::start(&settings(Some(repo_mods))).expect("start");
+    block_on(async {
+        let mut alice = join(&server, "Alice").await;
+        let expected = interest::chunks_around(BlockPos::new(0, 1, 0).chunk(), view).len();
+        let received = alice
+            .collect_chunks(expected, Duration::from_secs(30))
+            .await
+            .expect("collect");
+        assert_eq!(received.len(), expected);
+        alice.disconnect().await;
+    });
+    assert!(server.stop(), "clean shutdown");
+
+    // Second run with NO mods at all. If the terrain were regenerated rather
+    // than loaded, everything would come back as air.
+    let server = ServerHandle::start(&settings(None)).expect("restart");
+    block_on(async {
+        let mut bob = join(&server, "Bob").await;
+        let expected = interest::chunks_around(BlockPos::new(0, 1, 0).chunk(), view).len();
+        let _ = bob
+            .collect_chunks(expected, Duration::from_secs(30))
+            .await
+            .expect("collect");
+
+        let mut registry = tiamot_core::Registry::new();
+        let white = registry.register("core:white").expect("register");
+        let db = tiamot_core::WorldDb::open_in_memory(&mut registry).expect("id map");
+
+        let underground = BlockPos::new(0, -4, 0);
+        let chunk = bob
+            .decode_chunk(underground.chunk(), db.materials())
+            .expect("decode");
+        assert_eq!(
+            chunk.get_block(underground).expect("in chunk").subnode(0),
+            white,
+            "stored terrain must survive a restart, even with the generator gone"
+        );
+
+        bob.disconnect().await;
+    });
     server.stop();
 }
 

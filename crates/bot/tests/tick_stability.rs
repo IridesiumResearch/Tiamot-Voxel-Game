@@ -58,6 +58,7 @@ fn two_hundred_ticks_under_four_bots_stays_within_budget() {
         rcon: None,
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         mods_path: None,
+        seed: Some(1),
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     })
     .expect("start");
@@ -173,6 +174,93 @@ fn two_hundred_ticks_under_four_bots_stays_within_budget() {
 }
 
 #[test]
+fn worldgen_under_a_joining_player_stays_inside_the_tick_budget() {
+    // Chunk generation runs on the simulation thread and is now the most
+    // expensive thing on it. A player joining at full view distance asks for
+    // ~1800 chunks, which is the heaviest burst the server sees in normal play.
+    //
+    // Reports the numbers as a share of the 50 ms budget, per charter rule 18:
+    // "0.4 ms" says nothing, "0.4 ms, 0.8% of a tick" says something.
+    let dir = std::env::temp_dir().join("tiamot-worldgen-load");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let repo_mods = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../game")
+        .canonicalize()
+        .expect("game/ should exist");
+
+    let view = tiamot_core::interest::ViewDistance::DEFAULT;
+    let server = ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: dir,
+        max_players: 16,
+        allowlist: Allowlist::open(),
+        view_distance: view,
+        mods_path: Some(repo_mods),
+        seed: Some(7),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("start");
+
+    let control = server.control().clone();
+    let addr = server.local_addr();
+    let fingerprint = server.cert_fingerprint();
+    let wanted =
+        tiamot_core::interest::chunks_around(tiamot_core::BlockPos::new(0, 1, 0).chunk(), view)
+            .len();
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            let mut alice =
+                Bot::connect(addr, Identity::generate().expect("identity"), fingerprint)
+                    .await
+                    .expect("connect");
+            alice.join("Alice").await.expect("join");
+
+            // Take a decent bite of the interest set — enough to be a real
+            // generation burst without making the test slow.
+            let target = wanted.min(400);
+            let received = alice
+                .collect_chunks(target, Duration::from_secs(60))
+                .await
+                .expect("collect");
+
+            let slowest = Duration::from_micros(control.slowest_tick_micros());
+            let share = slowest.as_secs_f64() / TICK_DURATION.as_secs_f64() * 100.0;
+            println!(
+                "worldgen load: {} chunks streamed, slowest tick {slowest:?} \
+                 ({share:.1}% of the {TICK_DURATION:?} budget), \
+                 over_budget={} dropped={}",
+                received.len(),
+                control.over_budget_ticks(),
+                control.dropped(),
+            );
+
+            assert!(
+                received.len() >= target,
+                "expected {target} chunks, got {}",
+                received.len()
+            );
+            assert!(
+                slowest < TICK_DURATION * 5,
+                "a tick took {slowest:?} ({share:.1}% of budget) generating terrain — \
+                 over 5x is the server's own fault, not scheduling noise"
+            );
+            if slowest > TICK_DURATION * 2 {
+                println!("NOTE: slowest tick {slowest:?} exceeded 2x budget under generation load");
+            }
+
+            alice.disconnect().await;
+        });
+
+    assert!(server.stop(), "clean shutdown");
+}
+
+#[test]
 fn four_bots_all_see_a_fourth_bots_edit() {
     // Broadcast fan-out, rather than the two-party case. A per-connection
     // subscription bug would show up here and not in the two-bot test.
@@ -188,6 +276,7 @@ fn four_bots_all_see_a_fourth_bots_edit() {
         rcon: None,
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         mods_path: None,
+        seed: Some(1),
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     })
     .expect("start");

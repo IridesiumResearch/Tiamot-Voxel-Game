@@ -132,6 +132,15 @@ pub struct Settings {
     /// to forget: absence is off.
     pub rcon: Option<(SocketAddr, String)>,
 
+    /// Seed for a **new** world.
+    ///
+    /// Ignored if the world already has one — a world's seed is fixed at
+    /// creation, because re-rolling it later would change terrain beyond the
+    /// explored edge and leave a visible seam through the map.
+    ///
+    /// `None` draws one from system entropy.
+    pub seed: Option<u64>,
+
     /// Directory to load mods from.
     ///
     /// `None` runs with no mods, which is a legitimate configuration — the
@@ -354,14 +363,44 @@ impl ServerHandle {
                 })?
         };
 
+        // Drawn here rather than in the thread so a caller passing `None` still
+        // gets a reproducible run if they log what was chosen.
+        let new_seed = settings.seed.unwrap_or_else(|| {
+            let mut bytes = [0u8; 8];
+            // A failed entropy read is not worth refusing to start over: any
+            // seed generates a valid world, and this one only matters for a
+            // world that does not exist yet.
+            let _ = getrandom::fill(&mut bytes);
+            u64::from_le_bytes(bytes)
+        });
+
         let simulation = {
             let control = control.clone();
             let shared = Arc::clone(&shared);
-            let mut host = host;
             std::thread::Builder::new()
                 .name("simulation".to_owned())
                 .spawn(move || {
-                    let mut world = crate::world::World::new(world);
+                    // The seed is only used if the world has none yet — an
+                    // existing world keeps the seed it was created with, or
+                    // terrain beyond the explored edge would change shape.
+                    let mut world = match crate::world::World::open(world, new_seed) {
+                        Ok(world) => world,
+                        Err(err) => {
+                            error!("could not read the world seed: {err}");
+                            return;
+                        }
+                    };
+                    info!(seed = world.seed(), "world seed");
+
+                    // Either the mods generate terrain, or there are no mods
+                    // and the world is air. Both are legitimate.
+                    let mut source = match host {
+                        Some(host) => crate::world::Generator::Mods(Box::new(
+                            crate::world::ModGenerator::new(host),
+                        )),
+                        None => crate::world::Generator::Air(crate::world::Air),
+                    };
+
                     let mut clock = sim::MonotonicClock::new();
                     sim::run(&mut clock, &control, |tick| {
                         // ALL database access happens on this thread. The
@@ -386,7 +425,7 @@ impl ServerHandle {
                         // from the network tasks instead would make the result
                         // depend on which connection won a lock.
                         for (actor, edit) in shared.drain_edits() {
-                            match world.apply(&edit) {
+                            match world.apply(&edit, &mut source) {
                                 Ok(_) => {
                                     // Broadcast only AFTER it applied. Telling
                                     // clients about an edit the server then
@@ -414,24 +453,8 @@ impl ServerHandle {
                         // `dt_ticks` is 1 here because the loop calls `step`
                         // once per tick even when catching up — the catch-up
                         // is several calls, not one call with a bigger number.
-                        if let Some(host) = host.as_mut() {
-                            match host.vm_mut().tick(1) {
-                                Ok(faults) => {
-                                    for (mod_id, err) in faults {
-                                        error!(
-                                            mod_id = %mod_id,
-                                            "mod disabled after a tick failure: {err}"
-                                        );
-                                    }
-                                }
-                                Err(err) => {
-                                    // A VM-level failure, not a mod fault.
-                                    // Logged rather than fatal: the world is
-                                    // still coherent and players are still
-                                    // connected.
-                                    error!("script VM failed during tick: {err}");
-                                }
-                            }
+                        for (mod_id, err) in source.tick(1) {
+                            error!(mod_id = %mod_id, "mod disabled after a tick failure: {err}");
                         }
 
                         // Serve chunk requests. Bounded per tick by
@@ -439,7 +462,7 @@ impl ServerHandle {
                         // thread, and an unbounded drain would let one player
                         // joining stall the world for everyone.
                         for request in shared.take_chunk_requests() {
-                            let blob = match world.chunk(request.pos) {
+                            let blob = match world.chunk(request.pos, &mut source) {
                                 Ok(chunk) => {
                                     let chunk = chunk.clone();
                                     world.db().chunk_blob(request.pos, &chunk).ok()
@@ -520,6 +543,7 @@ impl ServerHandle {
             max_players,
             allowlist: Allowlist::open(),
             view_distance: tiamot_core::interest::ViewDistance::DEFAULT,
+            seed: None,
             mods_path: None,
             // Singleplayer has no admin port. The player already has full
             // control of the process.

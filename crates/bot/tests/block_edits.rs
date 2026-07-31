@@ -36,6 +36,7 @@ fn settings(dir: &std::path::Path) -> Settings {
         rcon: None,
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         mods_path: None,
+        seed: Some(1),
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     }
 }
