@@ -41,7 +41,8 @@ for dx = 0, 2 do
     end
 end
 
-bot.sleep_ticks(4)
+-- Wait for the yields rather than sleeping and hoping.
+bot.expect_units(STONE, before + 9 * bot.UNITS_PER_BLOCK, 15000)
 local gained = (bot.inventory()[STONE] or 0) - before
 
 bot.assert(

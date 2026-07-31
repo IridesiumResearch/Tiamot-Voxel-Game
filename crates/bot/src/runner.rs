@@ -94,6 +94,25 @@ async fn execute(bot: &mut Bot, command: &Command) -> Result<Reply, BotError> {
             bot.sleep_ticks(*ticks).await;
             Ok(Reply::Done)
         }
+        Command::ExpectUnits(material, units, timeout_ms) => {
+            // Poll rather than sleep. A fixed sleep is a guess about how fast
+            // the server is, and macOS CI proved the guess wrong: five digs,
+            // sleep 200 ms, and only one had been applied.
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(*timeout_ms);
+            loop {
+                if bot.units_of(*material) >= *units {
+                    return Ok(Reply::Done);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(Reply::Failed(format!(
+                        "expected at least {units} units of material {material} within \
+                         {timeout_ms} ms, saw {}",
+                        bot.units_of(*material)
+                    )));
+                }
+                bot.await_inventory(Duration::from_millis(50)).await?;
+            }
+        }
         Command::Inventory => {
             // Drain anything already queued so the answer is current. A short
             // window rather than none: an inventory read straight after a dig

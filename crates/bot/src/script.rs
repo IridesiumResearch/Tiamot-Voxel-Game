@@ -61,6 +61,8 @@ pub enum Command {
     SleepTicks(u32),
     /// Ask for the current inventory.
     Inventory,
+    /// Wait until the inventory holds at least this many units of a material.
+    ExpectUnits(u16, u32, u64),
     /// Close the connection.
     Disconnect,
 }
@@ -235,6 +237,9 @@ pub fn run_script(source: &str, name: &str, channel: Channel) -> Result<ScriptOu
     ));
     bind!("expect_block", (i32, i32, i32, u16, u64), |_lua, p| {
         Command::ExpectBlock(BlockPos::new(p.0, p.1, p.2), p.3, p.4)
+    });
+    bind!("expect_units", (u16, u32, u64), |_lua, p| {
+        Command::ExpectUnits(p.0, p.1, p.2)
     });
 
     // `disconnect` takes no arguments, so it does not fit the macro's shape.

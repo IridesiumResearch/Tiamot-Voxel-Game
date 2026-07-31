@@ -100,6 +100,7 @@ measures the replayer rather than the server.
 | `bot.move_to(x, y, z)` | Report movement intent |
 | `bot.chat(text)` | Send a chat line |
 | `bot.inventory()` | `{[material] = units}` — see below |
+| `bot.expect_units(material, units, timeout_ms)` | Block until the inventory holds at least that many units |
 | `bot.sleep_ticks(n)` | Wait roughly n server ticks |
 | `bot.assert(cond, message)` | Assert, and count it |
 | `bot.disconnect()` | Close cleanly |

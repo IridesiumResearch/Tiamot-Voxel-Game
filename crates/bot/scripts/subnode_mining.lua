@@ -27,7 +27,10 @@ for _, cell in ipairs(cells) do
     bot.dig_subnode(sx + cell[1], sy + cell[2], sz + cell[3])
 end
 
-bot.sleep_ticks(4)
+-- Wait for the yields rather than sleeping and hoping. A fixed sleep is a
+-- guess about how fast the server is, and macOS CI proved the guess wrong:
+-- five digs, sleep 200ms, and only one had landed.
+bot.expect_units(STONE, before + #cells, 15000)
 local gained = (bot.inventory()[STONE] or 0) - before
 
 bot.assert(gained == #cells, "five cells should be five units, got " .. gained)
