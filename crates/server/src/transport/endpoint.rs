@@ -33,6 +33,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::frame;
+use super::stream::Streamer;
 use crate::cert::ServerCert;
 use crate::sim::Control;
 
@@ -126,7 +127,46 @@ pub struct Shared {
 
     /// Display names of everyone currently in world, for `status`.
     pub online: std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, String>>,
+
+    /// Chunks connections have asked the simulation to encode.
+    ///
+    /// The simulation owns the world, so it is the only thing that may read a
+    /// chunk. A connection asks; the next tick answers on the reply channel.
+    pub chunk_requests: std::sync::Mutex<std::collections::VecDeque<ChunkRequest>>,
+
+    /// How far each player can see.
+    pub view_distance: tiamot_core::interest::ViewDistance,
 }
+
+/// A connection asking the simulation for a chunk.
+pub struct ChunkRequest {
+    /// Which chunk.
+    pub pos: tiamot_core::ChunkPos,
+    /// Where to send the encoded blob.
+    ///
+    /// A oneshot, so a connection that goes away between asking and being
+    /// answered simply drops the receiver and the simulation's send fails
+    /// harmlessly. A shared queue of replies would need the simulation to know
+    /// which connections still exist.
+    pub reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+}
+
+/// How many chunk requests the simulation serves per tick, across all players.
+///
+/// This is the shared budget, not a per-client one: the work is encoding, it
+/// happens on the single simulation thread, and it comes out of the same 50 ms
+/// every other system spends. Serving requests oldest-first shares it fairly
+/// without needing per-client accounting.
+pub const CHUNKS_PER_TICK: usize = 16;
+
+/// How many chunks one connection may have outstanding at once.
+///
+/// Caps a single player's share of the queue so one client joining cannot
+/// starve everyone else's updates while its 1800-chunk interest set drains.
+pub const CHUNKS_IN_FLIGHT_PER_CLIENT: usize = 4;
+
+/// Most chunk requests that may be queued before new ones are refused.
+pub const MAX_QUEUED_CHUNK_REQUESTS: usize = 512;
 
 /// How many unapplied edits may be queued before new ones are dropped.
 ///
@@ -168,6 +208,36 @@ impl Shared {
         self.edits
             .lock()
             .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Asks the simulation to encode a chunk.
+    ///
+    /// Returns `None` if the queue is full, in which case the caller retries
+    /// later — a dropped chunk request costs a moment of missing terrain, not
+    /// correctness, because the interest set is recomputed every pass.
+    pub fn request_chunk(
+        &self,
+        pos: tiamot_core::ChunkPos,
+    ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+        let mut queue = self.chunk_requests.lock().ok()?;
+        if queue.len() >= MAX_QUEUED_CHUNK_REQUESTS {
+            return None;
+        }
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        queue.push_back(ChunkRequest { pos, reply });
+        Some(receiver)
+    }
+
+    /// Takes up to [`CHUNKS_PER_TICK`] requests for the simulation to serve.
+    #[must_use]
+    pub fn take_chunk_requests(&self) -> Vec<ChunkRequest> {
+        self.chunk_requests
+            .lock()
+            .map(|mut queue| {
+                let take = queue.len().min(CHUNKS_PER_TICK);
+                queue.drain(..take).collect()
+            })
             .unwrap_or_default()
     }
 
@@ -338,6 +408,12 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
     // the edits made while a player was loading in.
     let mut broadcasts = shared.outbound.subscribe();
     let mut kicks = shared.kicks.subscribe();
+    let mut streamer: Option<Streamer> = None;
+    // Chunk deliveries the simulation has answered, waiting to be written.
+    let mut pending: Vec<(
+        tiamot_core::ChunkPos,
+        tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
+    )> = Vec::new();
 
     loop {
         // Read from the client and forward broadcasts on the same task. A
@@ -345,6 +421,17 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
         // a second task writing to the same stream would interleave two
         // messages' bytes and corrupt the framing.
         let message: ClientMessage = tokio::select! {
+            // Streaming runs on its own beat rather than piggybacking on client
+            // traffic. A player standing still sends nothing, and their world
+            // must still finish loading.
+            () = tokio::time::sleep(tiamot_core::tick::TICK_DURATION), if streamer.is_some() => {
+                if let Some(streamer) = streamer.as_mut()
+                    && let Err(err) = pump_chunks(streamer, &mut pending, shared, &mut send).await
+                {
+                    return Err(err);
+                }
+                continue;
+            }
             incoming = frame::read(&mut recv) => match incoming {
                 Ok(message) => message,
                 Err(err) if err.is_clean_close() => return Ok(()),
@@ -432,6 +519,10 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     session.display_name().unwrap_or("<unnamed>").to_owned(),
                 )
             });
+            // Interest starts at spawn. Task 09's physics will call
+            // `recentre` as the player moves; see `stream.rs` on why the
+            // client is not asked where it is.
+            streamer = Some(Streamer::new(shared.spawn.chunk(), shared.view_distance));
             info!(
                 player = session.display_name().unwrap_or("<unnamed>"),
                 uuid = session.uuid().map(|id| id.short()).unwrap_or_default(),
@@ -485,6 +576,63 @@ fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
+}
+
+/// Requests, collects, and sends chunks for one connection.
+///
+/// Split out of the connection loop because it is the only part with an
+/// interesting failure mode: a request that is answered but never accounted
+/// for leaks the client's budget, and the leak is silent — the player's world
+/// simply stops filling in.
+async fn pump_chunks(
+    streamer: &mut Streamer,
+    pending: &mut Vec<(
+        tiamot_core::ChunkPos,
+        tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
+    )>,
+    shared: &Shared,
+    send: &mut quinn::SendStream,
+) -> Result<(), frame::FrameError> {
+    // Deliveries first, so budget freed this pass can be spent this pass.
+    let mut still_waiting = Vec::with_capacity(pending.len());
+    for (pos, mut receiver) in pending.drain(..) {
+        match receiver.try_recv() {
+            Ok(Some(blob)) => {
+                streamer.completed();
+                frame::write(send, &ServerMessage::ChunkData { pos, blob }).await?;
+                streamer.delivered(pos);
+            }
+            Ok(None) => {
+                // The simulation could not produce it. Accounted for exactly
+                // like a success, and NOT marked delivered, so the next pass
+                // asks again.
+                streamer.completed();
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                still_waiting.push((pos, receiver));
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                // The simulation dropped the request without answering. Same
+                // accounting: the budget must come back or this connection
+                // slowly stops asking for anything.
+                streamer.completed();
+            }
+        }
+    }
+    *pending = still_waiting;
+
+    // Then new requests, up to this client's share.
+    let budget = streamer.budget(CHUNKS_IN_FLIGHT_PER_CLIENT);
+    for pos in streamer.next_needed(budget) {
+        let Some(receiver) = shared.request_chunk(pos) else {
+            // Queue full. Nothing is marked, so the next pass retries.
+            break;
+        };
+        streamer.requested();
+        pending.push((pos, receiver));
+    }
+
+    Ok(())
 }
 
 /// Waits for the peer to actually receive what was written, then closes.
@@ -548,6 +696,8 @@ mod tests {
             control: Control::new(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             outbound: tokio::sync::broadcast::channel(16).0,
+            chunk_requests: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
             kicks: tokio::sync::broadcast::channel(4).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }

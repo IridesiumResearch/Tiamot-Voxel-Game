@@ -338,6 +338,21 @@ impl WorldDb {
         Ok(encoded.len())
     }
 
+    /// Encodes a chunk into the wire/disk blob format.
+    ///
+    /// The **same** bytes that go to disk are what a client is sent, so a
+    /// blob a client can decode is a blob the world can store. Two encodings
+    /// would be two formats to keep in step, and the one exercised less would
+    /// be the one that broke.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the chunk references a material the world has no id
+    /// for.
+    pub fn chunk_blob(&self, pos: ChunkPos, chunk: &Chunk) -> Result<Vec<u8>, WorldError> {
+        self.encode(DEFAULT_DOMAIN, pos, chunk)
+    }
+
     fn encode(&self, domain: &str, pos: ChunkPos, chunk: &Chunk) -> Result<Vec<u8>, WorldError> {
         codec::encode_chunk(chunk, &self.materials, self.dictionaries.first()).map_err(|source| {
             WorldError::Chunk {

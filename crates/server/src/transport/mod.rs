@@ -8,6 +8,8 @@
 
 pub mod endpoint;
 pub mod frame;
+pub mod stream;
 
 pub use endpoint::{Shared, TransportError, accept_loop, bind, server_config};
 pub use frame::FrameError;
+pub use stream::Streamer;

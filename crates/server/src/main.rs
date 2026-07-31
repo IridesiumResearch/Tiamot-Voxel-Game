@@ -96,6 +96,10 @@ fn run(cli: &Cli) -> Result<(), ServerError> {
         world_path: config.world_path.clone(),
         max_players: config.max_players,
         allowlist: Allowlist::open(),
+        view_distance: tiamot_core::interest::ViewDistance::clamped(
+            config.view_distance,
+            config.vertical_view_distance,
+        ),
         rcon: config
             .rcon
             .as_ref()

@@ -30,6 +30,7 @@ fn start(name: &str) -> (ServerHandle, std::net::SocketAddr) {
         max_players: 8,
         allowlist: Allowlist::open(),
         rcon: Some((rcon_addr, TOKEN.to_owned())),
+        view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         materials: vec!["test:stone".to_owned()],
     })
     .expect("start");

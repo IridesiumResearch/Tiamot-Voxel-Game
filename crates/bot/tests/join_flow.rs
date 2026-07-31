@@ -49,6 +49,7 @@ fn settings(dir: &std::path::Path, allowlist: Allowlist) -> Settings {
         max_players: 8,
         allowlist,
         rcon: None,
+        view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         materials: Vec::new(),
     }
 }

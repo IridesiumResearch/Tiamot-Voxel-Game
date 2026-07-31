@@ -65,6 +65,7 @@ pub mod chunk;
 pub mod coords;
 pub mod detgen;
 pub mod identity;
+pub mod interest;
 pub mod inventory;
 pub mod material;
 pub mod modload;

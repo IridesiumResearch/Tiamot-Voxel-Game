@@ -95,6 +95,9 @@ pub struct Settings {
     /// Who is permitted to join.
     pub allowlist: Allowlist,
 
+    /// How far players can see, in chunks.
+    pub view_distance: tiamot_core::interest::ViewDistance,
+
     /// Remote administration, if enabled.
     ///
     /// `None` means no admin port is open. There is no "enabled = false" flag
@@ -191,6 +194,8 @@ impl ServerHandle {
             // 20 Hz is roughly fifty seconds behind before a client starts
             // losing them, which is far longer than a connection worth keeping.
             outbound: tokio::sync::broadcast::channel(1024).0,
+            chunk_requests: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            view_distance: settings.view_distance,
             kicks: tokio::sync::broadcast::channel(64).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         });
@@ -312,6 +317,27 @@ impl ServerHandle {
                             }
                         }
 
+                        // Serve chunk requests. Bounded per tick by
+                        // CHUNKS_PER_TICK: encoding is real work on this
+                        // thread, and an unbounded drain would let one player
+                        // joining stall the world for everyone.
+                        for request in shared.take_chunk_requests() {
+                            let blob = match world.chunk(request.pos) {
+                                Ok(chunk) => {
+                                    let chunk = chunk.clone();
+                                    world.db().chunk_blob(request.pos, &chunk).ok()
+                                }
+                                Err(err) => {
+                                    debug!(pos = ?request.pos, "could not load chunk: {err}");
+                                    None
+                                }
+                            };
+                            // A failed send means the connection went away
+                            // between asking and being answered, which is
+                            // ordinary rather than an error.
+                            let _ = request.reply.send(blob);
+                        }
+
                         // Debounced saves. Writing every dirty chunk every tick
                         // would turn a player chiselling one block into 20
                         // writes a second of the same chunk; waiting for
@@ -376,6 +402,7 @@ impl ServerHandle {
             world_path: world_path.to_path_buf(),
             max_players,
             allowlist: Allowlist::open(),
+            view_distance: tiamot_core::interest::ViewDistance::DEFAULT,
             // Singleplayer has no admin port. The player already has full
             // control of the process.
             rcon: None,

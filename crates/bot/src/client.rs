@@ -320,6 +320,84 @@ impl Bot {
         }
     }
 
+    /// Collects chunks until `count` have arrived or the timeout expires.
+    ///
+    /// Returns them in arrival order, which is what a test asserting
+    /// "nearest first" needs.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError`] if the connection fails while waiting.
+    pub async fn collect_chunks(
+        &mut self,
+        count: usize,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<tiamot_core::ChunkPos>, BotError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut chunks = Vec::new();
+        while chunks.len() < count {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.recv()).await {
+                Ok(Ok(ServerMessage::ChunkData { pos, .. })) => chunks.push(pos),
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_elapsed) => break,
+            }
+        }
+        Ok(chunks)
+    }
+
+    /// Every chunk received so far, in arrival order.
+    #[must_use]
+    pub fn chunks_received(&self) -> Vec<tiamot_core::ChunkPos> {
+        self.received
+            .iter()
+            .filter_map(|message| match message {
+                ServerMessage::ChunkData { pos, .. } => Some(*pos),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Decodes a received chunk blob.
+    ///
+    /// The blob is the **same** format the world stores, so a client that can
+    /// decode this can read a world file — which is the point: one format,
+    /// exercised by both paths.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Unexpected`] if no such chunk was received or it does not
+    /// decode.
+    pub fn decode_chunk(
+        &self,
+        pos: tiamot_core::ChunkPos,
+        materials: &tiamot_core::persist::idmap::MaterialMap,
+    ) -> Result<tiamot_core::Chunk, BotError> {
+        let blob = self
+            .received
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ServerMessage::ChunkData { pos: got, blob } if *got == pos => Some(blob),
+                _ => None,
+            })
+            .ok_or_else(|| BotError::Unexpected {
+                expected: "a ChunkData for the requested position",
+                got: format!("no chunk at {pos:?}"),
+            })?;
+
+        tiamot_core::persist::codec::decode_chunk(pos, blob, materials, &[]).map_err(|err| {
+            BotError::Unexpected {
+                expected: "a decodable chunk blob",
+                got: err.to_string(),
+            }
+        })
+    }
+
     /// Closes the connection cleanly.
     pub async fn disconnect(mut self) {
         let _ = self.send(&ClientMessage::Disconnect).await;

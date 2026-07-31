@@ -34,6 +34,7 @@ fn settings(dir: &std::path::Path) -> Settings {
         max_players: 8,
         allowlist: Allowlist::open(),
         rcon: None,
+        view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     }
 }

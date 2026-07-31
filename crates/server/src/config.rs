@@ -67,6 +67,19 @@ pub struct Config {
     #[serde(default = "Config::default_max_players")]
     pub max_players: u32,
 
+    /// How far players can see, in chunks (horizontal radius).
+    ///
+    /// Clamped into the supported range rather than obeyed literally —
+    /// interest volume grows with the square of this, so an operator typing
+    /// 200 would get a server that appeared to start and then could not keep
+    /// up.
+    #[serde(default = "Config::default_view_distance")]
+    pub view_distance: u8,
+
+    /// How far players can see vertically, in chunks.
+    #[serde(default = "Config::default_vertical_view_distance")]
+    pub vertical_view_distance: u8,
+
     /// Remote administration. Off unless configured.
     #[serde(default)]
     pub rcon: Option<RconConfig>,
@@ -105,6 +118,14 @@ impl Config {
 
     fn default_world_path() -> PathBuf {
         PathBuf::from("world")
+    }
+
+    fn default_view_distance() -> u8 {
+        tiamot_core::interest::ViewDistance::DEFAULT.horizontal
+    }
+
+    fn default_vertical_view_distance() -> u8 {
+        tiamot_core::interest::ViewDistance::DEFAULT.vertical
     }
 
     fn default_max_players() -> u32 {
@@ -179,6 +200,8 @@ impl Default for Config {
             bind_addr: Self::default_bind_addr(),
             world_path: Self::default_world_path(),
             max_players: Self::default_max_players(),
+            view_distance: Self::default_view_distance(),
+            vertical_view_distance: Self::default_vertical_view_distance(),
             rcon: None,
         }
     }

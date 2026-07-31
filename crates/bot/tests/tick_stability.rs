@@ -56,6 +56,7 @@ fn two_hundred_ticks_under_four_bots_stays_within_budget() {
         max_players: 16,
         allowlist: Allowlist::open(),
         rcon: None,
+        view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     })
     .expect("start");
@@ -184,6 +185,7 @@ fn four_bots_all_see_a_fourth_bots_edit() {
         max_players: 16,
         allowlist: Allowlist::open(),
         rcon: None,
+        view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     })
     .expect("start");
