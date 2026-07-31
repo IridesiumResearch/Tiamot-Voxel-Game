@@ -21,6 +21,7 @@
 pub mod cert;
 pub mod config;
 pub mod handle;
+pub mod rcon;
 pub mod shutdown;
 pub mod sim;
 pub mod transport;

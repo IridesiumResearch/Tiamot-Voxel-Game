@@ -95,6 +95,12 @@ pub struct Settings {
     /// Who is permitted to join.
     pub allowlist: Allowlist,
 
+    /// Remote administration, if enabled.
+    ///
+    /// `None` means no admin port is open. There is no "enabled = false" flag
+    /// to forget: absence is off.
+    pub rcon: Option<(SocketAddr, String)>,
+
     /// Material ids to register before the world is opened.
     ///
     /// Charter rule 9's lifecycle is register → FREEZE → world load, so these
@@ -175,7 +181,7 @@ impl ServerHandle {
             cert_fingerprint,
             mods: Vec::new(),
             mod_set_fingerprint: 0,
-            allowlist: settings.allowlist.clone(),
+            allowlist: std::sync::RwLock::new(settings.allowlist.clone()),
             max_players: settings.max_players,
             spawn: tiamot_core::BlockPos::new(0, 1, 0),
             players: AtomicU32::new(0),
@@ -185,6 +191,8 @@ impl ServerHandle {
             // 20 Hz is roughly fifty seconds behind before a client starts
             // losing them, which is far longer than a connection worth keeping.
             outbound: tokio::sync::broadcast::channel(1024).0,
+            kicks: tokio::sync::broadcast::channel(64).0,
+            online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         });
 
         // The runtime is built here rather than inside the network thread, and
@@ -213,6 +221,24 @@ impl ServerHandle {
             what: "network",
             source,
         })?;
+
+        // RCON shares the network runtime rather than getting its own. It is
+        // one socket carrying a handful of commands; a second multi-threaded
+        // runtime for that would cost more threads than the feature is worth.
+        if let Some((rcon_addr, token)) = settings.rcon.clone() {
+            let context = Arc::new(crate::rcon::RconContext {
+                shared: Arc::clone(&shared),
+                token,
+                mods: Vec::new(),
+            });
+            let guard = runtime.enter();
+            runtime.spawn(async move {
+                if let Err(err) = crate::rcon::serve(rcon_addr, context).await {
+                    error!("RCON listener stopped: {err}");
+                }
+            });
+            drop(guard);
+        }
 
         let network = {
             let endpoint = endpoint.clone();
@@ -290,7 +316,7 @@ impl ServerHandle {
                         // would turn a player chiselling one block into 20
                         // writes a second of the same chunk; waiting for
                         // shutdown would lose everything on a crash.
-                        if tick % SAVE_INTERVAL_TICKS == 0
+                        if (tick % SAVE_INTERVAL_TICKS == 0 || control.take_save_request())
                             && let Err(err) = world.save_dirty()
                         {
                             error!("could not save dirty chunks: {err}");
@@ -350,6 +376,9 @@ impl ServerHandle {
             world_path: world_path.to_path_buf(),
             max_players,
             allowlist: Allowlist::open(),
+            // Singleplayer has no admin port. The player already has full
+            // control of the process.
+            rcon: None,
             materials: Vec::new(),
         })
     }

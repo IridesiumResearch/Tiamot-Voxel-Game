@@ -89,6 +89,12 @@ struct ControlInner {
     stop: AtomicBool,
     tick: AtomicU64,
     dropped: AtomicU64,
+    /// Longest single tick observed, in microseconds.
+    slowest_micros: AtomicU64,
+    /// Ticks that took longer than the 50 ms budget.
+    over_budget: AtomicU64,
+    /// Set when an operator asks for a save; cleared when the tick performs it.
+    save_requested: AtomicBool,
 }
 
 impl Control {
@@ -124,6 +130,44 @@ impl Control {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
+    }
+
+    /// The longest single tick observed, in microseconds.
+    ///
+    /// Measured around the simulation step alone, not the sleep — this is how
+    /// long the server spent *working*, which is the number that says whether
+    /// there is headroom left.
+    #[must_use]
+    pub fn slowest_tick_micros(&self) -> u64 {
+        self.inner.slowest_micros.load(Ordering::Relaxed)
+    }
+
+    /// Asks the simulation to write dirty chunks on its next tick.
+    ///
+    /// A request rather than a call: the simulation owns the database, and a
+    /// save performed from an RCON task would mean two threads writing chunks
+    /// — the exact thing `world.rs` exists to prevent.
+    pub fn request_save(&self) {
+        self.inner.save_requested.store(true, Ordering::Release);
+    }
+
+    /// Takes the save request, if there is one.
+    ///
+    /// Clears the flag, so a request is honoured once rather than every tick
+    /// thereafter.
+    #[must_use]
+    pub fn take_save_request(&self) -> bool {
+        self.inner.save_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// How many ticks ran over the 50 ms budget.
+    ///
+    /// A tick over budget has not necessarily hurt anyone — the accumulator
+    /// absorbs a single slow tick — but a rising count means the server is
+    /// living on the catch-up allowance rather than inside its budget.
+    #[must_use]
+    pub fn over_budget_ticks(&self) -> u64 {
+        self.inner.over_budget.load(Ordering::Relaxed)
     }
 }
 
@@ -181,8 +225,23 @@ pub fn run<C: Clock, F: FnMut(u64)>(clock: &mut C, control: &Control, mut step: 
         // Numbering by real time instead would leave holes, and a mod computing
         // an interval from tick numbers would silently get it wrong.
         for _ in 0..advance.ticks {
+            // Measured with a real `Instant` rather than through the `Clock`.
+            // The clock exists so PACING can be tested without sleeping; how
+            // long the work took is a fact about the machine, and faking it
+            // would make this number meaningless.
+            let started = Instant::now();
             step(ran);
+            let elapsed = started.elapsed();
             ran += 1;
+
+            let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+            control
+                .inner
+                .slowest_micros
+                .fetch_max(micros, Ordering::Relaxed);
+            if elapsed > TICK_DURATION {
+                control.inner.over_budget.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         control.inner.tick.store(ran, Ordering::Relaxed);

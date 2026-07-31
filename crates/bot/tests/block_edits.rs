@@ -33,6 +33,7 @@ fn settings(dir: &std::path::Path) -> Settings {
         world_path: dir.to_path_buf(),
         max_players: 8,
         allowlist: Allowlist::open(),
+        rcon: None,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     }
 }

@@ -41,6 +41,12 @@ pub enum ConfigError {
     },
 }
 
+/// Shortest RCON token accepted.
+///
+/// 16 characters of anything reasonable is far beyond guessing over a socket
+/// that logs every failure, and short enough not to be a nuisance.
+const MIN_RCON_TOKEN_BYTES: usize = 16;
+
 /// Server configuration.
 ///
 /// Unknown fields are rejected rather than ignored: a typo in a config key is
@@ -60,6 +66,35 @@ pub struct Config {
     /// Maximum simultaneously connected players.
     #[serde(default = "Config::default_max_players")]
     pub max_players: u32,
+
+    /// Remote administration. Off unless configured.
+    #[serde(default)]
+    pub rcon: Option<RconConfig>,
+}
+
+/// Remote administration settings.
+///
+/// Absent from the config means **off**. There is no "enabled = false" to
+/// forget to set: an operator who has not written this section has no admin
+/// port open, which is the right default for something with `stop` and
+/// `rebind` on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RconConfig {
+    /// Address to bind. Must be loopback; the server refuses anything else.
+    #[serde(default = "RconConfig::default_bind_addr")]
+    pub bind_addr: SocketAddr,
+
+    /// The token an admin must present.
+    ///
+    /// No default. A default admin token is a published admin token.
+    pub token: String,
+}
+
+impl RconConfig {
+    fn default_bind_addr() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 47_812))
+    }
 }
 
 impl Config {
@@ -104,6 +139,36 @@ impl Config {
                 message: "max_players must be at least 1".to_owned(),
             });
         }
+        if let Some(rcon) = &self.rcon {
+            // Refused at load, not at bind. An operator who typed 0.0.0.0
+            // should learn about it from a startup error rather than from
+            // someone else running `stop`.
+            if !rcon.bind_addr.ip().is_loopback() {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "rcon.bind_addr must be a loopback address, not {}. This protocol has no                          transport encryption; tunnel over SSH for remote access.",
+                        rcon.bind_addr
+                    ),
+                });
+            }
+            // An empty token is not authentication. Refusing is kinder than
+            // starting a server whose admin port anyone can drive.
+            if rcon.token.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: "rcon.token must not be empty".to_owned(),
+                });
+            }
+            if rcon.token.len() < MIN_RCON_TOKEN_BYTES {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "rcon.token must be at least {MIN_RCON_TOKEN_BYTES} characters; a short                          token on a port with `stop` and `rebind` on it is worth guessing"
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -114,6 +179,7 @@ impl Default for Config {
             bind_addr: Self::default_bind_addr(),
             world_path: Self::default_world_path(),
             max_players: Self::default_max_players(),
+            rcon: None,
         }
     }
 }

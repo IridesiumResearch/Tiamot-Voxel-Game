@@ -81,7 +81,11 @@ pub struct Shared {
     /// The mod set's fingerprint.
     pub mod_set_fingerprint: u64,
     /// Who is permitted to join.
-    pub allowlist: Allowlist,
+    ///
+    /// Behind a lock because RCON changes it at runtime: an operator adding
+    /// someone to the allowlist should not have to restart the server, which
+    /// would disconnect everyone already playing.
+    pub allowlist: std::sync::RwLock<Allowlist>,
     /// Maximum simultaneous players.
     pub max_players: u32,
     /// Where a new player starts.
@@ -112,6 +116,16 @@ pub struct Shared {
     /// right trade, because the alternative is one bad connection pausing the
     /// world for everyone.
     pub outbound: tokio::sync::broadcast::Sender<ServerMessage>,
+
+    /// Identities an admin has asked to disconnect.
+    ///
+    /// Separate from [`outbound`](Self::outbound) so a kick cannot be lost
+    /// behind a backlog of world updates, and so a lagging receiver — which
+    /// silently drops messages — cannot drop the one message that matters most.
+    pub kicks: tokio::sync::broadcast::Sender<(PlayerUuid, String)>,
+
+    /// Display names of everyone currently in world, for `status`.
+    pub online: std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, String>>,
 }
 
 /// How many unapplied edits may be queued before new ones are dropped.
@@ -163,6 +177,27 @@ impl Shared {
     pub fn broadcast(&self, message: ServerMessage) {
         let _ = self.outbound.send(message);
     }
+
+    /// Asks an identity's connections to disconnect.
+    ///
+    /// Returns `false` only if nothing is listening at all.
+    pub fn kick(&self, uuid: PlayerUuid, reason: String) -> bool {
+        self.kicks.send((uuid, reason)).is_ok()
+    }
+
+    /// Everyone currently in world, name and identity.
+    #[must_use]
+    pub fn online_players(&self) -> Vec<(PlayerUuid, String)> {
+        self.online
+            .lock()
+            .map(|online| {
+                online
+                    .iter()
+                    .map(|(uuid, name)| (*uuid, name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Holds a player slot for as long as it exists.
@@ -176,18 +211,28 @@ impl Shared {
 /// reports itself full is a genuinely hard bug to find.
 struct PlayerSlot<'a> {
     shared: &'a Shared,
+    uuid: PlayerUuid,
 }
 
 impl<'a> PlayerSlot<'a> {
-    fn claim(shared: &'a Shared) -> Self {
+    fn claim(shared: &'a Shared, uuid: PlayerUuid, name: String) -> Self {
         shared.players.fetch_add(1, Ordering::AcqRel);
-        Self { shared }
+        if let Ok(mut online) = shared.online.lock() {
+            online.insert(uuid, name);
+        }
+        Self { shared, uuid }
     }
 }
 
 impl Drop for PlayerSlot<'_> {
     fn drop(&mut self) {
         self.shared.players.fetch_sub(1, Ordering::AcqRel);
+        // The roster and the count are released together, by the same guard.
+        // Two separate cleanups would eventually disagree, and `status` would
+        // list players who left.
+        if let Ok(mut online) = self.shared.online.lock() {
+            online.remove(&self.uuid);
+        }
     }
 }
 
@@ -292,6 +337,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
     // subscription — a narrow window, but the messages lost in it are exactly
     // the edits made while a player was loading in.
     let mut broadcasts = shared.outbound.subscribe();
+    let mut kicks = shared.kicks.subscribe();
 
     loop {
         // Read from the client and forward broadcasts on the same task. A
@@ -309,6 +355,25 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     return Err(err);
                 }
             },
+            kick = kicks.recv() => {
+                match kick {
+                    Ok((target, reason)) if session.uuid() == Some(target) => {
+                        let _ = frame::write(
+                            &mut send,
+                            &ServerMessage::Disconnect {
+                                reason: tiamot_core::proto::DisconnectReason::Kicked { reason },
+                            },
+                        )
+                        .await;
+                        flush_and_close(&mut send, &connection).await;
+                        return Ok(());
+                    }
+                    // Somebody else's kick, or a lagged/closed channel. A
+                    // missed kick for another player is not this connection's
+                    // problem.
+                    _ => continue,
+                }
+            }
             broadcast = broadcasts.recv() => {
                 match broadcast {
                     Ok(outbound) => {
@@ -336,11 +401,18 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
 
         let response = {
             let mut identities = shared.identities.lock().await;
+            // A read guard, taken and released within this block. Holding it
+            // across the await above would block an RCON allowlist change
+            // behind a client mid-handshake.
+            let allowlist = shared
+                .allowlist
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let context = JoinContext {
                 cert_fingerprint: &shared.cert_fingerprint,
                 mods: &shared.mods,
                 mod_set_fingerprint: shared.mod_set_fingerprint,
-                allowlist: &shared.allowlist,
+                allowlist: &allowlist,
                 max_players: shared.max_players,
                 current_players: shared.players.load(Ordering::Acquire),
                 spawn: shared.spawn,
@@ -353,7 +425,13 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
         // Claim the slot the moment the session reaches the world, so the
         // "server full" check counts players rather than connections.
         if !was_in_world && session.phase() == tiamot_core::session::Phase::InWorld {
-            slot = Some(PlayerSlot::claim(shared));
+            slot = session.uuid().map(|uuid| {
+                PlayerSlot::claim(
+                    shared,
+                    uuid,
+                    session.display_name().unwrap_or("<unnamed>").to_owned(),
+                )
+            });
             info!(
                 player = session.display_name().unwrap_or("<unnamed>"),
                 uuid = session.uuid().map(|id| id.short()).unwrap_or_default(),
@@ -449,19 +527,29 @@ fn to_io(err: quinn::ConnectionError) -> frame::FrameError {
 mod tests {
     use super::*;
 
+    /// A distinct identity per index, so roster entries do not collide.
+    fn player(index: u8) -> (PlayerUuid, String) {
+        (
+            PlayerUuid::from_bytes([index; 32]),
+            format!("Player{index}"),
+        )
+    }
+
     fn shared() -> Shared {
         Shared {
             identities: Mutex::new(IdentityRegistry::default()),
             cert_fingerprint: [0xAB; 32],
             mods: Vec::new(),
             mod_set_fingerprint: 0,
-            allowlist: Allowlist::open(),
+            allowlist: std::sync::RwLock::new(Allowlist::open()),
             max_players: 2,
             spawn: tiamot_core::BlockPos::new(0, 1, 0),
             players: AtomicU32::new(0),
             control: Control::new(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             outbound: tokio::sync::broadcast::channel(16).0,
+            kicks: tokio::sync::broadcast::channel(4).0,
+            online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -469,10 +557,16 @@ mod tests {
     fn a_player_slot_is_released_when_dropped() {
         let shared = shared();
         {
-            let _slot = PlayerSlot::claim(&shared);
+            let (uuid, name) = player(1);
+            let _slot = PlayerSlot::claim(&shared, uuid, name);
             assert_eq!(shared.players.load(Ordering::Acquire), 1);
+            assert_eq!(shared.online_players().len(), 1);
         }
         assert_eq!(shared.players.load(Ordering::Acquire), 0);
+        assert!(
+            shared.online_players().is_empty(),
+            "the roster and the count must be released together"
+        );
     }
 
     #[test]
@@ -482,7 +576,8 @@ mod tests {
         // fill with ghosts until it reported itself full.
         let shared = shared();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _slot = PlayerSlot::claim(&shared);
+            let (uuid, name) = player(2);
+            let _slot = PlayerSlot::claim(&shared, uuid, name);
             assert_eq!(shared.players.load(Ordering::Acquire), 1);
             panic!("connection handler blew up");
         }));
@@ -493,17 +588,26 @@ mod tests {
             0,
             "a panicking handler must not leak a player slot"
         );
+        assert!(
+            shared.online_players().is_empty(),
+            "nor leave a ghost on the roster"
+        );
     }
 
     #[test]
     fn slots_count_independently() {
         let shared = shared();
-        let first = PlayerSlot::claim(&shared);
-        let second = PlayerSlot::claim(&shared);
+        let (uuid_a, name_a) = player(3);
+        let (uuid_b, name_b) = player(4);
+        let first = PlayerSlot::claim(&shared, uuid_a, name_a);
+        let second = PlayerSlot::claim(&shared, uuid_b, name_b);
         assert_eq!(shared.players.load(Ordering::Acquire), 2);
+        assert_eq!(shared.online_players().len(), 2);
         drop(first);
         assert_eq!(shared.players.load(Ordering::Acquire), 1);
+        assert_eq!(shared.online_players().len(), 1);
         drop(second);
         assert_eq!(shared.players.load(Ordering::Acquire), 0);
+        assert!(shared.online_players().is_empty());
     }
 }
