@@ -32,6 +32,7 @@ fn start(name: &str, view: ViewDistance) -> ServerHandle {
         max_players: 8,
         allowlist: Allowlist::open(),
         view_distance: view,
+        mods_path: None,
         rcon: None,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     })

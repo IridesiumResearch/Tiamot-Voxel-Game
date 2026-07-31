@@ -522,6 +522,60 @@ impl ScriptVm for MluaVm {
         Ok(buffer.buffer.to_chunk())
     }
 
+    fn tick(&mut self, dt_ticks: u32) -> Result<Vec<(String, ScriptError)>, ScriptError> {
+        let tickers: Vec<String> = self
+            .lua
+            .named_registry_value::<Table>("tiamot.tickers")
+            .map_err(|err| self.vm_error(&err))?
+            .sequence_values::<String>()
+            .filter_map(Result::ok)
+            .collect();
+
+        let mut faults = Vec::new();
+        for mod_id in tickers {
+            if self.faulted.contains(&mod_id) {
+                continue;
+            }
+
+            let callback: mlua::Function = self
+                .lua
+                .named_registry_value(&Self::tick_key(&mod_id))
+                .map_err(|err| self.vm_error(&err))?;
+
+            self.arm_budget(self.limits.instructions_per_call)?;
+            let result = callback.call::<()>(dt_ticks);
+            self.disarm_budget();
+
+            if let Err(err) = result {
+                // Charter rule 10: this mod is disabled, the tick continues.
+                // Continue rather than return, or one bad mod would starve
+                // every mod registered after it — and the symptom would be
+                // "my mod stopped working" with nothing pointing at the cause.
+                let error = Self::classify(&err, &mod_id, "on_tick");
+                self.faulted.insert(mod_id.clone());
+                tracing::error!(mod_id = %mod_id, error = %error, "disabling mod after tick failure");
+                faults.push((mod_id, error));
+            }
+        }
+        Ok(faults)
+    }
+
+    fn registered_blocks(&self) -> Vec<(String, MaterialId)> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.blocks") else {
+            return Vec::new();
+        };
+        let mut blocks: Vec<(String, MaterialId)> = registry
+            .pairs::<String, u16>()
+            .filter_map(Result::ok)
+            .map(|(name, id)| (name, MaterialId(id)))
+            .collect();
+        // By id, not by name. See the trait docs: the host replays these into a
+        // registry that assigns sequentially, so any other order gives blocks
+        // different ids than their mods were told.
+        blocks.sort_by_key(|(_, id)| id.0);
+        blocks
+    }
+
     fn call_void(&mut self, mod_id: &str, name: &str) -> Result<(), ScriptError> {
         let env = self.environment(mod_id)?;
         let function: mlua::Function = env
@@ -659,6 +713,29 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
 
         let owner = mod_id.to_owned();
+        let key = Self::tick_key(mod_id);
+        let register_on_tick = self
+            .lua
+            .create_function(move |lua, callback: mlua::Function| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                lua.set_named_registry_value(&key, callback)?;
+                // Registration order is the call order, and it is stable
+                // because it is the order mods loaded in — which the resolver
+                // already made deterministic.
+                let tickers: Table = lua.named_registry_value("tiamot.tickers")?;
+                tickers.push(owner.clone())?;
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_on_tick", register_on_tick)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
         let register_action = self
             .lua
             .create_function(move |lua, spec: Table| {
@@ -790,6 +867,10 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.blocks", blocks)
             .map_err(|err| self.vm_error(&err))?;
+        let tickers = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.tickers", tickers)
+            .map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.generators", generators)
             .map_err(|err| self.vm_error(&err))?;
@@ -816,9 +897,24 @@ impl MluaVm {
         <Self as ScriptVm>::create(limits)
     }
 
-    /// Blocks registered so far, string id → numeric id.
+    /// Registry key holding a mod's `on_tick` callback.
+    fn tick_key(mod_id: &str) -> String {
+        format!("tiamot.on_tick.{mod_id}")
+    }
+
+    /// Blocks registered so far, keyed by string id.
+    ///
+    /// **Deliberately not called `registered_blocks`.** That name belongs to
+    /// the [`ScriptVm`] trait method, which returns them ordered by numeric id
+    /// because the host replays them into a registry that assigns
+    /// sequentially. An inherent method of the same name silently won method
+    /// resolution and handed callers alphabetical order instead — which would
+    /// have given every mod block a different id than its mod was told, and the
+    /// only symptom would have been blocks turning into the wrong material.
+    ///
+    /// This one exists for lookups, where order does not matter.
     #[must_use]
-    pub fn registered_blocks(&self) -> BTreeMap<String, MaterialId> {
+    pub fn block_ids(&self) -> BTreeMap<String, MaterialId> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.blocks") else {
             return BTreeMap::new();
         };
@@ -860,6 +956,150 @@ mod tests {
 
     fn load(vm: &mut MluaVm, id: &str, source: &str) -> Result<(), ScriptError> {
         vm.load_mod(id, source, Path::new("."))
+    }
+
+    #[test]
+    fn a_registered_on_tick_callback_runs_every_tick() {
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "counter",
+            "count = 0\ngame.register_on_tick(function(dt) count = count + dt end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(vm.tick(1).expect("tick").is_empty());
+        assert!(vm.tick(1).expect("tick").is_empty());
+        vm.eval_in("counter", "assert(count == 2, 'count is ' .. count)")
+            .expect("the callback should have run twice");
+    }
+
+    #[test]
+    fn the_tick_callback_receives_the_step_count_not_a_duration() {
+        // Mods get a count of simulation steps, never wall-clock time: a
+        // duration would let a mod scale behaviour by how fast the machine is,
+        // and two servers would then produce different worlds.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "counter",
+            "seen = nil\ngame.register_on_tick(function(dt) seen = dt end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        vm.tick(3).expect("tick");
+        vm.eval_in("counter", "assert(seen == 3, 'got ' .. tostring(seen))")
+            .expect("the callback should see the catch-up count");
+        vm.eval_in("counter", "assert(math.type(seen) == 'integer')")
+            .expect("a step count is an integer, not a float duration");
+    }
+
+    #[test]
+    fn a_failing_mod_is_disabled_without_stopping_the_others() {
+        // Charter rule 10, and the precise shape of it: the mods registered
+        // AFTER the failing one must still run. Returning at the first error
+        // would starve them, and the symptom would be "my mod stopped working"
+        // with nothing pointing at the real cause.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "first",
+            "ran = 0\ngame.register_on_tick(function() ran = ran + 1 end)",
+        )
+        .expect("load");
+        load(
+            &mut vm,
+            "bad",
+            "game.register_on_tick(function() error('boom') end)",
+        )
+        .expect("load");
+        load(
+            &mut vm,
+            "last",
+            "ran = 0\ngame.register_on_tick(function() ran = ran + 1 end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let faults = vm.tick(1).expect("the tick itself must not fail");
+        assert_eq!(faults.len(), 1, "exactly one mod should have faulted");
+        assert_eq!(faults[0].0, "bad");
+
+        vm.eval_in("first", "assert(ran == 1)").expect("first ran");
+        vm.eval_in(
+            "last",
+            "assert(ran == 1, 'the mod after the failing one was starved')",
+        )
+        .expect("last ran");
+
+        // And the faulted mod stays disabled rather than erroring every tick.
+        let faults = vm.tick(1).expect("tick");
+        assert!(faults.is_empty(), "a disabled mod must not re-report");
+        assert!(vm.faulted_mods().contains(&"bad".to_owned()));
+        vm.eval_in("last", "assert(ran == 2)")
+            .expect("still ticking");
+    }
+
+    #[test]
+    fn registering_a_tick_callback_after_freeze_is_refused() {
+        // Charter rule 9: the registration window closes.
+        let mut vm = vm();
+        load(&mut vm, "late", "").expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(
+            vm.eval_in("late", "game.register_on_tick(function() end)")
+                .is_err(),
+            "registration after freeze must be a hard error"
+        );
+    }
+
+    #[test]
+    fn a_tick_with_no_registered_callbacks_is_harmless() {
+        let mut vm = vm();
+        load(&mut vm, "quiet", "").expect("load");
+        vm.freeze().expect("freeze");
+        assert!(vm.tick(1).expect("tick").is_empty());
+    }
+
+    #[test]
+    fn registered_blocks_come_back_ordered_by_id_not_by_name() {
+        // The order IS the contract. The host replays these into a registry
+        // that assigns ids sequentially, so alphabetical order would give every
+        // block a different id than its mod was handed — and every block that
+        // mod placed would silently be the wrong material.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "zeta",
+            "game.register_block{ id = 'zzz' }\ngame.register_block{ id = 'aaa' }",
+        )
+        .expect("load");
+        load(&mut vm, "alpha", "game.register_block{ id = 'mmm' }").expect("load");
+
+        let blocks = vm.registered_blocks();
+        let names: Vec<&str> = blocks.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["zeta:zzz", "zeta:aaa", "alpha:mmm"],
+            "blocks must come back in registration order, not alphabetical"
+        );
+
+        // The ids must be contiguous from the first mod id, so replaying them
+        // into a fresh Registry reproduces exactly these numbers.
+        let ids: Vec<u16> = blocks.iter().map(|(_, id)| id.0).collect();
+        assert_eq!(ids, vec![2, 3, 4]);
+
+        let mut registry = crate::material::Registry::new();
+        for (name, expected) in &blocks {
+            assert_eq!(
+                registry.register(name).expect("register"),
+                *expected,
+                "replaying `{name}` gave it a different id than the VM did"
+            );
+        }
     }
 
     #[test]
@@ -1007,7 +1247,7 @@ mod tests {
             "game.register_block{ id = 'white', name = 'White' }",
         )
         .expect("load");
-        let blocks = vm.registered_blocks();
+        let blocks = vm.block_ids();
         assert!(blocks.contains_key("mymod:white"), "{blocks:?}");
         assert!(blocks["mymod:white"].get() >= 2, "reserved ids are 0 and 1");
     }

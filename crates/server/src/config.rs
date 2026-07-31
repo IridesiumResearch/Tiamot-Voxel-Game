@@ -67,6 +67,14 @@ pub struct Config {
     #[serde(default = "Config::default_max_players")]
     pub max_players: u32,
 
+    /// Directory to load mods from.
+    ///
+    /// Absent means no mods. That is a legitimate configuration — the engine is
+    /// mechanisms and the content is mods, so a server with none is empty
+    /// rather than broken.
+    #[serde(default)]
+    pub mods_path: Option<PathBuf>,
+
     /// How far players can see, in chunks (horizontal radius).
     ///
     /// Clamped into the supported range rather than obeyed literally —
@@ -200,6 +208,7 @@ impl Default for Config {
             bind_addr: Self::default_bind_addr(),
             world_path: Self::default_world_path(),
             max_players: Self::default_max_players(),
+            mods_path: None,
             view_distance: Self::default_view_distance(),
             vertical_view_distance: Self::default_vertical_view_distance(),
             rcon: None,

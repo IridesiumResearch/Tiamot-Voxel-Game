@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicU32;
 
 use tiamot_core::identity::Allowlist;
 use tiamot_core::proto::ServerMessage;
+use tiamot_core::script::{HostError, MluaVm, ModHost, ScriptVm as _, VmLimits};
 use tiamot_core::session::store;
 use tiamot_core::{Registry, WorldDb};
 use tokio::sync::Mutex;
@@ -72,6 +73,33 @@ pub enum StartError {
     #[error(transparent)]
     Transport(#[from] TransportError),
 
+    /// Mods could not be scanned, resolved, or loaded.
+    ///
+    /// A mod that fails to *load* is disabled and the server still starts
+    /// (charter rule 10). This is for a set that fails to *resolve* — a missing
+    /// dependency or a cycle — where there is no correct subset to fall back
+    /// to.
+    #[error("could not load mods")]
+    Mods(#[source] Box<HostError>),
+
+    /// A block's engine id did not match the one the VM gave its mod.
+    ///
+    /// Refuses to start rather than carrying on: the world would be written
+    /// with ids that mean something different from what the mod placed, and
+    /// nothing downstream could tell.
+    #[error(
+        "material `{name}` was assigned id {assigned} by the engine but {expected} by the \
+         script VM — every block this mod places would be the wrong material"
+    )]
+    MaterialIdMismatch {
+        /// The material.
+        name: String,
+        /// What the VM told the mod.
+        expected: u16,
+        /// What the engine registry assigned.
+        assigned: u16,
+    },
+
     /// A thread could not be spawned.
     #[error("could not start the {what} thread")]
     Thread {
@@ -104,12 +132,19 @@ pub struct Settings {
     /// to forget: absence is off.
     pub rcon: Option<(SocketAddr, String)>,
 
-    /// Material ids to register before the world is opened.
+    /// Directory to load mods from.
+    ///
+    /// `None` runs with no mods, which is a legitimate configuration — the
+    /// engine is mechanisms, and a server with no content is empty rather than
+    /// broken.
+    pub mods_path: Option<PathBuf>,
+
+    /// Extra material ids to register, on top of whatever mods register.
     ///
     /// Charter rule 9's lifecycle is register → FREEZE → world load, so these
-    /// go in before `WorldDb::open` builds the id map. Task 05's mod loader
-    /// fills this from the resolved mod set; a server with none can still run,
-    /// it just has nothing to place.
+    /// go in before `WorldDb::open` builds the id map. Tests use this to get a
+    /// material without shipping a mod; real servers get theirs from
+    /// [`mods_path`](Self::mods_path).
     pub materials: Vec<String>,
 }
 
@@ -143,11 +178,65 @@ impl ServerHandle {
     /// [`StartError`] if the world, certificate, identities, or listener could
     /// not be brought up.
     pub fn start(settings: &Settings) -> Result<Self, StartError> {
-        // Register BEFORE opening the world. The id map is built from the
-        // registry at open time, and a material registered afterwards would
-        // have no world id — edits using it would be accepted and then fail
-        // silently at save time.
+        // Charter rule 9's lifecycle, in order: scan → resolve → load →
+        // registration window → FREEZE → world load → play. Every step below is
+        // in that sequence, and the world is opened last on purpose — its id
+        // map is built from the registry, so a material registered after the
+        // open would have no world id, and edits using it would be accepted and
+        // then fail silently at save time.
         let mut registry = Registry::new();
+        let mut host = None;
+
+        if let Some(mods_path) = &settings.mods_path {
+            match ModHost::<MluaVm>::load_from(mods_path, VmLimits::default()) {
+                Ok(mut loaded) => {
+                    // FREEZE. After this `register_*` is a hard error.
+                    if let Err(err) = loaded.freeze() {
+                        return Err(StartError::Mods(Box::new(HostError::Script(err))));
+                    }
+                    for (mod_id, err) in loaded.failed() {
+                        // A mod that fails to load is disabled, not fatal
+                        // (charter rule 10) — but an operator has to hear
+                        // about it, or the first sign is a player reporting
+                        // that something is missing.
+                        error!(mod_id = %mod_id, "mod failed to load and is disabled: {err}");
+                    }
+
+                    // Replay the VM's block registrations in ID ORDER, so the
+                    // engine registry assigns exactly the numbers the VM handed
+                    // its mods. Any other order and every block a mod places is
+                    // a different material than it asked for.
+                    for (name, expected) in loaded.vm().registered_blocks() {
+                        match registry.register(&name) {
+                            Ok(assigned) if assigned == expected => {}
+                            Ok(assigned) => {
+                                // Not recoverable by carrying on: the world
+                                // would be written with ids that mean something
+                                // else. Better to refuse to start.
+                                return Err(StartError::MaterialIdMismatch {
+                                    name,
+                                    expected: expected.0,
+                                    assigned: assigned.0,
+                                });
+                            }
+                            Err(err) => {
+                                error!("could not register material `{name}`: {err}");
+                            }
+                        }
+                    }
+
+                    info!(
+                        mods = loaded.resolved().order.len(),
+                        disabled = loaded.failed().len(),
+                        blocks = loaded.vm().registered_blocks().len(),
+                        "mods loaded and registries frozen"
+                    );
+                    host = Some(loaded);
+                }
+                Err(err) => return Err(StartError::Mods(Box::new(err))),
+            }
+        }
+
         for name in &settings.materials {
             if let Err(err) = registry.register(name) {
                 error!("could not register material `{name}`: {err}");
@@ -268,6 +357,7 @@ impl ServerHandle {
         let simulation = {
             let control = control.clone();
             let shared = Arc::clone(&shared);
+            let mut host = host;
             std::thread::Builder::new()
                 .name("simulation".to_owned())
                 .spawn(move || {
@@ -313,6 +403,33 @@ impl ServerHandle {
                                     // racing a mod unload can do this without
                                     // being hostile.
                                     debug!(actor = %actor.short(), "rejected an edit: {err}");
+                                }
+                            }
+                        }
+
+                        // Mod tick hooks, before edits are applied: a mod
+                        // that queues an edit this tick should see it land
+                        // this tick, not next.
+                        //
+                        // `dt_ticks` is 1 here because the loop calls `step`
+                        // once per tick even when catching up — the catch-up
+                        // is several calls, not one call with a bigger number.
+                        if let Some(host) = host.as_mut() {
+                            match host.vm_mut().tick(1) {
+                                Ok(faults) => {
+                                    for (mod_id, err) in faults {
+                                        error!(
+                                            mod_id = %mod_id,
+                                            "mod disabled after a tick failure: {err}"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    // A VM-level failure, not a mod fault.
+                                    // Logged rather than fatal: the world is
+                                    // still coherent and players are still
+                                    // connected.
+                                    error!("script VM failed during tick: {err}");
                                 }
                             }
                         }
@@ -403,6 +520,7 @@ impl ServerHandle {
             max_players,
             allowlist: Allowlist::open(),
             view_distance: tiamot_core::interest::ViewDistance::DEFAULT,
+            mods_path: None,
             // Singleplayer has no admin port. The player already has full
             // control of the process.
             rcon: None,

@@ -66,7 +66,11 @@ serde = { version = "1.0", features = ["derive"] }
 # mlua binds Lua 5.4, LuaJIT and Luau behind one API, which is what makes the
 # three-way benchmark possible at all. Exactly ONE backend feature may be
 # enabled at a time; they are mutually exclusive at the C level.
-mlua = { version = "0.11", features = ["vendored"] }
+# `send` makes `Lua` movable between threads. It is needed, not optional: the
+# simulation owns the VM and runs on its own thread, and the VM is created
+# during startup on another. The feature wraps Lua access in a reentrant mutex,
+# which is uncontended here because exactly one thread ever touches it.
+mlua = { version = "0.11", features = ["vendored", "send"] }
 # Version ranges for mod dependencies. The resolver is the only user.
 semver = "1.0"
 

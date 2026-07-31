@@ -177,3 +177,42 @@ JIT that was the entire reason to consider it.
 4. **Scripts must not perform simulation-relevant float maths.** Enforced by API
    shape rather than documentation: there is no per-sample entry point and no
    float accessor on a random stream. See `crates/core/src/script/`.
+
+---
+
+## Addendum — the `send` feature (Task 06, 2026-07-31)
+
+`mlua`'s `send` feature is now enabled. It is a requirement, not a preference:
+the simulation owns the VM and runs on its own thread, while the VM is created
+during startup on another, and without `send` a `Lua` is `Rc`-based and cannot
+be moved between threads at all.
+
+The feature wraps every Lua access in a reentrant mutex. It is uncontended here,
+because exactly one thread ever touches the VM.
+
+**Measured cost** (AMD Ryzen 7 7800X3D, `--release`, Lua 5.4):
+
+| Path | Without `send` | With `send` | Delta |
+|---|---|---|---|
+| `on_tick` dispatch, empty callback | 480 ns | 500 ns | +20 ns (+4%) |
+| `generate_chunk`, empty callback | 3.4 µs | 4.2 µs | +0.8 µs (+24%) |
+
+Read those in context before reacting to the 24%. Both figures use an **empty**
+callback, so they measure dispatch overhead and nothing else. Against the 50 ms
+tick budget:
+
+- `on_tick` runs 20 times a second: **20 ns × 20 = 0.4 µs per second**, or
+  0.0008% of one tick.
+- `generate_chunk`'s real cost is dominated by the callback body — §1 above
+  measured a real worldgen callback at 57.4 µs, against which +0.8 µs is 1.4%.
+
+The alternative was restructuring startup so the simulation thread creates the
+VM itself: the world must be opened after block registration (its id map is
+built from the registry), so avoiding `send` means two channel handoffs between
+the startup thread and the simulation thread, with mod-loading failures
+propagating back across one of them. That complexity was not worth 0.8 µs per
+chunk.
+
+**If worldgen ever becomes dispatch-bound, that restructure is the escape
+hatch** — reach for it with a measurement in hand, not on the strength of the
+24% figure above.

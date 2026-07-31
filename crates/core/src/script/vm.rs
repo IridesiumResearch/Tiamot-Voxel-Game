@@ -260,6 +260,34 @@ pub trait ScriptVm: Sized {
         fill: MaterialId,
     ) -> Result<Chunk, ScriptError>;
 
+    /// Runs every registered `on_tick` callback once.
+    ///
+    /// `dt_ticks` is how many simulation steps this call covers — normally 1,
+    /// but more when the server has fallen behind and is catching up. Mods get
+    /// a count of steps rather than a duration on purpose: a duration would
+    /// tempt a mod to scale behaviour by wall-clock time, and two servers
+    /// running at different speeds would then produce different worlds.
+    ///
+    /// **A failing mod is disabled, not fatal** (charter rule 10). This runs
+    /// every non-faulted mod even if an earlier one errored, and reports the
+    /// failures afterwards, because stopping at the first would let one bad mod
+    /// silently starve every mod registered after it.
+    ///
+    /// # Errors
+    ///
+    /// Never returns `Err` for a mod fault — those are in the returned list.
+    /// The `Result` is for a VM-level failure that affects everything.
+    fn tick(&mut self, dt_ticks: u32) -> Result<Vec<(String, ScriptError)>, ScriptError>;
+
+    /// Blocks registered during the loading window, **ordered by numeric id**.
+    ///
+    /// The order is the contract, not a convenience. The host replays these
+    /// into [`crate::material::Registry`], which assigns ids sequentially, so
+    /// replaying them in any other order would give a block a different id than
+    /// the one the VM handed its mod — and every block that mod placed would
+    /// silently be the wrong material.
+    fn registered_blocks(&self) -> Vec<(String, MaterialId)>;
+
     /// Calls a named zero-argument global, for benchmarking and tests.
     ///
     /// # Errors

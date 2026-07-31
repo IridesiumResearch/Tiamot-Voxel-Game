@@ -96,6 +96,7 @@ fn run(cli: &Cli) -> Result<(), ServerError> {
         world_path: config.world_path.clone(),
         max_players: config.max_players,
         allowlist: Allowlist::open(),
+        mods_path: config.mods_path.clone(),
         view_distance: tiamot_core::interest::ViewDistance::clamped(
             config.view_distance,
             config.vertical_view_distance,
@@ -104,8 +105,8 @@ fn run(cli: &Cli) -> Result<(), ServerError> {
             .rcon
             .as_ref()
             .map(|rcon| (rcon.bind_addr, rcon.token.clone())),
-        // Task 05's resolved mod set supplies these once mod loading is wired
-        // into startup.
+        // Mods supply materials; this is only for a server configured without
+        // any that still wants something placeable.
         materials: Vec::new(),
     })?;
 

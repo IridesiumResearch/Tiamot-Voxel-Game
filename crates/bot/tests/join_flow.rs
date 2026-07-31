@@ -50,6 +50,7 @@ fn settings(dir: &std::path::Path, allowlist: Allowlist) -> Settings {
         allowlist,
         rcon: None,
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
+        mods_path: None,
         materials: Vec::new(),
     }
 }

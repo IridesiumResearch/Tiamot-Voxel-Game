@@ -74,7 +74,7 @@ fn the_reference_generator_produces_the_half_white_world() {
 
     let white = host
         .vm()
-        .registered_blocks()
+        .block_ids()
         .get("core:white")
         .copied()
         .expect("the reference mod should register core:white");
@@ -283,9 +283,9 @@ fn a_mod_that_fails_to_load_is_disabled_while_the_rest_keep_working() {
         host.disabled()
     );
     assert!(
-        host.vm().registered_blocks().contains_key("good:fine"),
+        host.vm().block_ids().contains_key("good:fine"),
         "the healthy mod must still have registered: {:?}",
-        host.vm().registered_blocks()
+        host.vm().block_ids()
     );
 }
 
@@ -343,7 +343,7 @@ end)
         .expect("the world must keep generating once the bad mod is disabled");
     let solid = host
         .vm()
-        .registered_blocks()
+        .block_ids()
         .get("good:solid")
         .copied()
         .expect("registered");
@@ -412,7 +412,7 @@ fn registration_after_freeze_is_refused() {
         "the error should attribute the mod: {err}"
     );
     assert!(
-        !host.vm().registered_blocks().contains_key("late:too_late"),
+        !host.vm().block_ids().contains_key("late:too_late"),
         "nothing should have been registered"
     );
 }
@@ -435,7 +435,7 @@ fn a_mod_cannot_register_into_another_mods_namespace() {
         "registering into `core:` should have failed the mod"
     );
     assert!(
-        !host.vm().registered_blocks().contains_key("core:white"),
+        !host.vm().block_ids().contains_key("core:white"),
         "the impostor must not have registered core:white"
     );
 }
@@ -454,7 +454,7 @@ fn the_engine_placeholder_material_is_not_registerable_by_mods() {
 
     let host = host_for(&root);
     assert_eq!(host.failed().len(), 1, "claiming engine: should fail");
-    assert!(!host.vm().registered_blocks().contains_key("engine:unknown"));
+    assert!(!host.vm().block_ids().contains_key("engine:unknown"));
 }
 
 #[test]

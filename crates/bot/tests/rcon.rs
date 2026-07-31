@@ -31,6 +31,7 @@ fn start(name: &str) -> (ServerHandle, std::net::SocketAddr) {
         allowlist: Allowlist::open(),
         rcon: Some((rcon_addr, TOKEN.to_owned())),
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
+        mods_path: None,
         materials: vec!["test:stone".to_owned()],
     })
     .expect("start");
