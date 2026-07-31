@@ -72,6 +72,8 @@ pub mod persist;
 pub mod proto;
 #[cfg(feature = "script")]
 pub mod script;
+pub mod session;
+pub mod tick;
 
 pub use block::{BlockContent, BlockValue, BlockView, Cells, SlotIndex};
 pub use chunk::Chunk;

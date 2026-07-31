@@ -38,7 +38,7 @@
 //! [`AuthProvider`]. This is stated here, in the code, because a reader who
 //! believes otherwise will build something that depends on it being false.
 
-mod keyset;
+pub mod keyset;
 mod phrase;
 
 pub use keyset::{AuthorisedKey, KeySet, KeySetError, RotationProof};
@@ -461,12 +461,19 @@ pub fn signature_from_bytes(bytes: &[u8]) -> Result<Signature, IdentityError> {
 pub trait AuthProvider {
     /// Verifies a completed challenge and returns the identity it proves.
     ///
+    /// The key lookup is a **parameter rather than a field** so a provider is
+    /// stateless: one instance serves every session, and a caller holding
+    /// `&mut` on its identity store can still call this by reborrowing. An
+    /// earlier version captured the store by reference and made those two
+    /// things mutually exclusive.
+    ///
     /// # Errors
     ///
     /// Any verification failure, with a reason suitable for a disconnect
     /// message.
     fn verify(
         &self,
+        keys: &dyn KeyLookup,
         claimed_key: &VerifyingKey,
         nonce: &[u8; NONCE_BYTES],
         server_cert_fingerprint: &[u8],
@@ -479,10 +486,10 @@ pub trait AuthProvider {
 ///
 /// Looks the claimed key up in a [`KeySet`], so **any** authorised key of an
 /// identity can join as that identity — which is the whole point of key sets.
-pub struct SelfSovereign<'a> {
-    /// The authorised keys for every known identity.
-    pub keys: &'a dyn KeyLookup,
-}
+///
+/// Stateless: the key store is passed to [`AuthProvider::verify`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SelfSovereign;
 
 /// Finds which identity, if any, a public key belongs to.
 pub trait KeyLookup {
@@ -490,9 +497,10 @@ pub trait KeyLookup {
     fn identity_of(&self, key: &VerifyingKey) -> Option<PlayerUuid>;
 }
 
-impl AuthProvider for SelfSovereign<'_> {
+impl AuthProvider for SelfSovereign {
     fn verify(
         &self,
+        keys: &dyn KeyLookup,
         claimed_key: &VerifyingKey,
         nonce: &[u8; NONCE_BYTES],
         server_cert_fingerprint: &[u8],
@@ -508,8 +516,7 @@ impl AuthProvider for SelfSovereign<'_> {
             protocol_version,
             signature,
         )?;
-        self.keys
-            .identity_of(claimed_key)
+        keys.identity_of(claimed_key)
             .ok_or(IdentityError::VerificationFailed)
     }
 }

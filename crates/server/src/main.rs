@@ -13,6 +13,7 @@
 
 mod config;
 mod shutdown;
+mod sim;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -86,6 +87,10 @@ enum ServerError {
         #[source]
         source: Box<tiamot_core::WorldError>,
     },
+
+    /// The simulation thread could not be spawned.
+    #[error("could not start the simulation thread")]
+    SimulationThread(#[source] std::io::Error),
 }
 
 fn run(cli: &Cli) -> Result<(), ServerError> {
@@ -130,12 +135,50 @@ fn run(cli: &Cli) -> Result<(), ServerError> {
         );
     }
 
-    // Task 06 replaces this with the real listener and tick loop. Until then
-    // the server's job is to come up cleanly and go down cleanly.
-    info!("no simulation yet — waiting for shutdown signal (ctrl-c or SIGTERM)");
+    // The simulation runs on its own thread so that a signal arriving mid-tick
+    // is noticed at the tick boundary rather than interrupting one. Nothing
+    // else touches world state; charter rule 2's "the server is the game" means
+    // one simulation thread, in tick order, always.
+    let control = sim::Control::new();
+    let simulation = {
+        let control = control.clone();
+        std::thread::Builder::new()
+            .name("simulation".to_owned())
+            .spawn(move || {
+                let mut clock = sim::MonotonicClock::new();
+                sim::run(&mut clock, &control, |_tick| {
+                    // Task 06's remaining parts hang world stepping here: mod
+                    // `on_tick` callbacks, then queued edits, then chunk
+                    // streaming. The pacing is already right, so they slot in
+                    // without touching the loop.
+                });
+            })
+            .map_err(ServerError::SimulationThread)?
+    };
+
+    info!(
+        tick_rate_hz = tiamot_core::tick::TICK_RATE_HZ,
+        "simulation running — waiting for shutdown signal (ctrl-c or SIGTERM)"
+    );
 
     let signal = shutdown::listen();
     signal.wait();
+
+    info!(
+        ticks = control.tick(),
+        dropped = control.dropped(),
+        "stopping simulation"
+    );
+    control.stop();
+    // Join before saving. Writing the world while the simulation thread might
+    // still be mutating it is how a save ends up internally inconsistent — a
+    // chunk from tick N next to a player position from tick N+1.
+    if simulation.join().is_err() {
+        // The thread panicked. The world may be mid-mutation, so saying so
+        // matters more than the exit code: an operator needs to know this save
+        // is suspect.
+        error!("the simulation thread panicked; the world may be inconsistent");
+    }
 
     info!("saving and shutting down");
     world.close().map_err(|source| ServerError::World {
