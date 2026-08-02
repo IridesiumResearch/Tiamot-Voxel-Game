@@ -40,6 +40,7 @@ pub mod camera;
 pub mod config;
 pub mod mesher;
 pub mod net;
+pub mod render;
 pub mod texture;
 pub mod trust;
 pub mod world;

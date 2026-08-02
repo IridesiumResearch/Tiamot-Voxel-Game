@@ -29,7 +29,9 @@ tiamot-core.workspace = true
 server.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
+blake3.workspace = true
 png.workspace = true
+pollster.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
@@ -38,6 +40,7 @@ thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+wgpu.workspace = true
 # Content slices arrive zstd-compressed. This is a C binding, and charter
 # rule 14 forbids those in the client ASSET path — the PNG, OGG, glTF, and
 # script decoders. zstd is the transfer envelope rather than the asset: the

@@ -437,9 +437,11 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "client"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytemuck",
  "glam",
  "png",
+ "pollster",
  "proptest",
  "quinn",
  "rustls",
@@ -451,6 +453,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "wgpu",
  "zstd",
 ]
 

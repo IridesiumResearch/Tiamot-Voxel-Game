@@ -54,9 +54,27 @@ pub const TILE: u32 = 16;
 /// tile's neighbours are *other tiles* — so a block picks up the colour of
 /// whatever was packed next to it. Padding each tile with a copy of its own
 /// edge pixels means the average stays within the tile.
-pub const PADDING: u32 = 2;
+///
+/// # Why 8, when 2 would hide the bleed
+///
+/// Because the padding also has to make [`TILE_PITCH`] a **power of two**, and
+/// that is the property the mip chain actually depends on.
+///
+/// A mip level halves the whole atlas. If tiles sit on a 20-pixel grid, level 1
+/// puts them on a 10-pixel grid, level 2 on 5, and level 3 on 2.5 — at which
+/// point a texel straddles two tiles and no amount of padding helps, because
+/// the tiles are no longer aligned to the grid being averaged. With a 32-pixel
+/// pitch every level keeps tiles aligned to `32 >> level`, so a box filter
+/// never mixes two tiles at any level, all the way down to one texel per tile.
+///
+/// The cost is 4x the atlas memory for a 16-pixel tile: 64 KiB for the sixteen
+/// tiles a reference world uses, against a VRAM budget measured in hundreds of
+/// megabytes. Not a trade worth thinking about twice.
+pub const PADDING: u32 = 8;
 
 /// Full pitch of one tile including padding.
+///
+/// **Must stay a power of two** — see [`PADDING`].
 pub const TILE_PITCH: u32 = TILE + PADDING * 2;
 
 /// Why a texture could not be used.
@@ -418,6 +436,35 @@ impl Atlas {
         self.grid * TILE_PITCH
     }
 
+    /// How many mip levels of this atlas are safe to use.
+    ///
+    /// **Not the full chain.** A mip level halves the whole atlas, so once a
+    /// level is smaller than the tile grid, one texel covers more than one tile
+    /// and averaging them is unavoidable — no amount of padding can prevent it,
+    /// because there is nowhere left to put the padding.
+    ///
+    /// The last safe level is the one where a tile is exactly one texel, which
+    /// is `log2(TILE_PITCH)` levels down. Uploading further levels would let a
+    /// distant white block pick up the colour of whatever was packed beside it,
+    /// which is precisely the artefact the padding exists to prevent.
+    ///
+    /// Found by `no_mip_level_ever_mixes_two_tiles`, which failed at the first
+    /// level past this bound with a texel that was a quarter of each of four
+    /// tiles.
+    #[must_use]
+    pub const fn mip_levels(&self) -> u32 {
+        TILE_PITCH.trailing_zeros() + 1
+    }
+
+    /// The mip levels the renderer uploads: box-filtered, and truncated to
+    /// [`Atlas::mip_levels`].
+    #[must_use]
+    pub fn mips(&self) -> Vec<Image> {
+        let mut levels = mip_chain(&self.image);
+        levels.truncate(self.mip_levels() as usize);
+        levels
+    }
+
     /// The UV rectangle of one tile, excluding its padding.
     ///
     /// Returned as `(u0, v0, u1, v1)` in `0.0..=1.0`.
@@ -435,6 +482,66 @@ impl Atlas {
             (origin_y + TILE as f32) / side,
         )
     }
+}
+
+/// Box-filtered mip levels of an image, largest first.
+///
+/// Level 0 is the image itself. Each level after it is a 2x2 average of the one
+/// before, down to a single pixel.
+///
+/// Generated on the CPU rather than with a GPU blit chain. Three reasons, in
+/// order: an atlas is built once per join and is tens of kilobytes, so this is
+/// not on any hot path; a blit chain needs its own pipeline, bind groups, and
+/// a render pass per level, all of which is code that can only be tested with a
+/// GPU; and the result here is *checkable* — a test can assert that a level
+/// never mixed two tiles, which is the property the whole padding scheme
+/// exists to guarantee.
+#[must_use]
+pub fn mip_chain(image: &Image) -> Vec<Image> {
+    let mut levels = vec![image.clone()];
+    loop {
+        let previous = levels.last().unwrap_or(image);
+        if previous.width <= 1 && previous.height <= 1 {
+            break;
+        }
+        let width = (previous.width / 2).max(1);
+        let height = (previous.height / 2).max(1);
+        let mut rgba = Vec::with_capacity((width as usize) * (height as usize) * 4);
+
+        for y in 0..height {
+            for x in 0..width {
+                // Averaged in u16 and divided once. Summing in u8 wraps at the
+                // fourth bright pixel, and the symptom is a mip level with dark
+                // speckles that only appear at a distance.
+                let mut total = [0u16; 4];
+                let mut samples = 0u16;
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        if let Some(pixel) = previous.pixel(x * 2 + dx, y * 2 + dy) {
+                            for channel in 0..4 {
+                                total[channel] += u16::from(pixel[channel]);
+                            }
+                            samples += 1;
+                        }
+                    }
+                }
+                let samples = samples.max(1);
+                rgba.extend_from_slice(&[
+                    (total[0] / samples) as u8,
+                    (total[1] / samples) as u8,
+                    (total[2] / samples) as u8,
+                    (total[3] / samples) as u8,
+                ]);
+            }
+        }
+
+        levels.push(Image {
+            width,
+            height,
+            rgba,
+        });
+    }
+    levels
 }
 
 /// Copies a tile into the atlas, extending its edge pixels into the padding.
@@ -681,6 +788,95 @@ mod tests {
             .pixel(PADDING + TILE + PADDING - 1, PADDING)
             .expect("in atlas");
         assert_eq!(right, [255, 0, 0, 255], "the right padding too");
+    }
+
+    #[test]
+    fn the_tile_pitch_is_a_power_of_two() {
+        // The mip chain depends on it, not on the padding width. On a pitch
+        // that is not a power of two, tiles stop being aligned to the grid a
+        // mip level averages, and a texel straddles two of them.
+        assert!(
+            TILE_PITCH.is_power_of_two(),
+            "TILE_PITCH is {TILE_PITCH}, which breaks the mip chain"
+        );
+    }
+
+    #[test]
+    fn a_raw_mip_chain_runs_all_the_way_down_to_one_pixel() {
+        let atlas = Atlas::build(&[Some(Image::white_with_border())]);
+        let levels = mip_chain(&atlas.image);
+
+        assert_eq!(levels[0].width, atlas.side());
+        let smallest = levels.last().expect("at least one level");
+        assert_eq!((smallest.width, smallest.height), (1, 1));
+        assert_eq!(levels.len(), atlas.side().trailing_zeros() as usize + 1);
+    }
+
+    #[test]
+    fn the_uploaded_chain_stops_where_a_tile_is_one_texel() {
+        // A single-tile atlas can use the whole chain, because a level smaller
+        // than one tile does not exist. A four-tile atlas is twice as wide, so
+        // its last two levels would cover more than one tile each and are
+        // dropped — the count is a property of the TILE, not of the atlas.
+        let one = Atlas::build(&[Some(Image::white_with_border())]);
+        let four = Atlas::build(&[
+            Some(Image::white_with_border()),
+            Some(Image::missing()),
+            Some(Image::missing()),
+            Some(Image::missing()),
+        ]);
+
+        assert_eq!(one.mip_levels(), four.mip_levels());
+        assert_eq!(one.mips().len() as u32, one.mip_levels());
+        assert_eq!(
+            four.mips().last().map(|level| level.width),
+            Some(four.grid),
+            "the last usable level is one texel per tile"
+        );
+    }
+
+    #[test]
+    fn no_mip_level_ever_mixes_two_tiles() {
+        // The property the whole padding scheme exists for, checked rather than
+        // asserted in a comment. Two tiles of unmistakably different colours:
+        // if any level bled, a texel of one would carry some of the other.
+        //
+        // This is what found the bound in `mip_levels`: run against the FULL
+        // chain it fails at the first level past it, with a texel that is a
+        // quarter of each of four tiles.
+        let red = Image::solid(TILE, TILE, [255, 0, 0, 255]);
+        let blue = Image::solid(TILE, TILE, [0, 0, 255, 255]);
+        let atlas = Atlas::build(&[Some(red), Some(blue)]);
+
+        for (level, image) in atlas.mips().iter().enumerate() {
+            for y in 0..image.height {
+                for x in 0..image.width {
+                    let pixel = image.pixel(x, y).expect("in bounds");
+                    // Every texel must be pure red, pure blue, or the
+                    // transparent filler between rows — never a mixture.
+                    let pure = (pixel[0] == 0 || pixel[2] == 0) || pixel[3] == 0;
+                    assert!(
+                        pure,
+                        "mip level {level} texel ({x}, {y}) is {pixel:?}: two tiles were averaged \
+                         together"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mip_averaging_does_not_wrap() {
+        // Summed in u8, four bright pixels overflow and the level comes out
+        // dark. The symptom is speckling that only appears at a distance.
+        let white = Image::solid(4, 4, [255, 255, 255, 255]);
+        let levels = mip_chain(&white);
+        for level in &levels {
+            assert!(
+                level.pixel(0, 0) == Some([255, 255, 255, 255]),
+                "a uniform white image must stay white at every mip level"
+            );
+        }
     }
 
     #[test]

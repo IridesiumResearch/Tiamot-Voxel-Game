@@ -200,6 +200,32 @@ jobs:
       - name: Mesh timings against the Task 02b baseline
         run: cargo test -p client --release --test mesh_perf -- --nocapture
 
+      # The screenshot smoke gate (Task 08). Runs on Mesa's lavapipe — a
+      # software Vulkan implementation — because the point is to notice that
+      # rendering silently broke, and that does not need a GPU.
+      #
+      # TIAMOT_REQUIRE_GPU turns "no adapter" from a skip into a failure. The
+      # tests skip loudly on a developer machine with no Vulkan, so that
+      # `cargo test` still passes there and nobody learns to ignore red; without
+      # this variable a CI image that lost its driver would quietly stop testing
+      # rendering and say nothing.
+      #
+      # The assertions are structural — sky above, world below, an edit changes
+      # the picture — plus a coarse perceptual hash. Deliberately not
+      # pixel-exact: no two drivers agree to the bit, and a gate that failed on
+      # a filtering difference would be turned off within a week.
+      - name: Screenshot smoke test (lavapipe)
+        env:
+          TIAMOT_REQUIRE_GPU: "1"
+          # Ask Vulkan for the software driver by name rather than hoping it is
+          # the only one present.
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+          vulkaninfo --summary | grep -i "deviceName" || true
+          cargo test -p client --test screenshot -- --nocapture
+
       - name: Reference mods check clean
         run: cargo run -p server -- --check-mods game
 
