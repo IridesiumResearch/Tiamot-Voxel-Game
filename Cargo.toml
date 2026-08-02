@@ -141,8 +141,17 @@ png = "0.18"
 # allocating real GPU buffers and reading back the allocation rather than
 # projecting a number. It is behind the spike's non-default `gpu` feature so it
 # does not enter the normal build or the CI matrix.
-wgpu = "27"
+wgpu = "29"
 pollster = "0.4"
+# The window and its input. `winit` is the only cross-platform option that is
+# not a whole framework, and it is what wgpu's own examples target.
+winit = "0.30"
+# HUD text. Immediate-mode, so there is no widget tree to keep in sync with the
+# world — the HUD is written out fresh each frame from what the frame already
+# knows. Task 14 builds the real UI on this.
+egui = "0.35"
+egui-wgpu = "0.35"
+egui-winit = { version = "0.35", default-features = false, features = ["links", "wayland", "x11"] }
 
 # --- internal -------------------------------------------------------------
 # The package is `tiamot-core`, not `core`, even though it lives in

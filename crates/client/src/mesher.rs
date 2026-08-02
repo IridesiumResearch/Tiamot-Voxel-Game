@@ -311,10 +311,29 @@ impl Mesh {
     /// Expands to the vertex and index buffers a renderer uploads.
     ///
     /// Winding is counter-clockwise when viewed from outside the surface, for
-    /// both face directions — so the pipeline can cull back faces and a quad
-    /// facing away is not drawn. Emitting one direction with the other's
-    /// winding makes exactly half the world invisible, which looks like a
-    /// meshing bug rather than a winding one.
+    /// every face direction — so the pipeline can cull back faces and a quad
+    /// facing away is not drawn.
+    ///
+    /// # The y axis winds the other way, and this is why
+    ///
+    /// [`SubNodeGrid::cell`] maps plane coordinates to cell coordinates
+    /// differently per axis: axis 0 is `(w, u, v)`, axis 1 is `(u, w, v)`, and
+    /// axis 2 is `(u, v, w)`. Read as permutations of `(x, y, z)`, the first
+    /// and last are **even** and the middle one is **odd** — so walking a
+    /// quad's four corners in the same `(u, v)` order traces the opposite
+    /// circulation on the y axis than it does on x and z.
+    ///
+    /// Emitting them all with one winding gives every top and bottom face in
+    /// the world a normal pointing the wrong way, and back-face culling then
+    /// removes exactly those faces. The symptom is not a missing surface but a
+    /// **surface one layer too deep**: looking down at a floor, the top is
+    /// culled and the face below it is drawn instead, which is the right
+    /// texture at the wrong brightness and reads as "the lighting looks a bit
+    /// flat" rather than as a bug.
+    ///
+    /// Found by rendering a lone top quad with nothing behind it — the only
+    /// arrangement in which the wrong answer is a blank screen instead of a
+    /// plausible one.
     #[must_use]
     pub fn to_buffers(&self) -> (Vec<PackedVertex>, Vec<u32>) {
         let mut vertices = Vec::with_capacity(self.vertex_count());
@@ -340,11 +359,14 @@ impl Mesh {
                     quad.material,
                 ));
             }
-            if quad.positive {
+            // The y axis's (u, v, w) mapping is an odd permutation, so its
+            // corners circulate the other way. See the method docs.
+            let outward = quad.positive != (quad.axis == 1);
+            if outward {
                 indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             } else {
-                // Reversed, so a negative-facing quad winds the same way when
-                // seen from its own outside.
+                // Reversed, so a quad winds the same way when seen from its own
+                // outside whichever direction it faces.
                 indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
             }
         }

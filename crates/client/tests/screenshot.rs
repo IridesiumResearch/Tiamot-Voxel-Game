@@ -493,3 +493,139 @@ fn dump_the_fixed_scene() {
         );
     }
 }
+
+/// One camera placement in the six-sided face check.
+struct View {
+    label: &'static str,
+    /// Offset from the block's centre, in blocks.
+    offset: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+}
+
+impl View {
+    const fn new(label: &'static str, offset: [f64; 3], yaw: f32, pitch: f32) -> Self {
+        Self {
+            label,
+            offset,
+            yaw,
+            pitch,
+        }
+    }
+}
+
+#[test]
+fn every_face_of_a_block_is_drawn_at_its_own_brightness() {
+    // THE test that was missing, and the bug it found: top and bottom faces
+    // were wound the wrong way and back-face culled.
+    //
+    // Counting white pixels is NOT enough, and a first version of this test
+    // passed while the bug was live. Looking down at a block whose top is
+    // culled still shows white — the BOTTOM face, drawn through where the top
+    // should have been. The picture is plausible; it is simply one layer too
+    // deep and at the wrong brightness.
+    //
+    // So this asserts the brightness ORDERING that lighting mode 1 defines:
+    // top 1.0 > z-sides 0.85 > x-sides 0.75 > bottom 0.5. A culled near face
+    // means the far face's shade is measured instead, and the ordering
+    // collapses — which is the only observation that separates "drawn" from
+    // "drawn through".
+    let Some(gpu) = gpu() else { return };
+
+    let mut chunk = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+    chunk
+        .set_block(BlockPos::new(8, 8, 8), BlockValue::Uniform(STONE))
+        .expect("in chunk");
+    let chunks = vec![chunk];
+
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // The block spans one unit at (8, 8, 8), so its centre is (8.5, 8.5, 8.5).
+    const CENTRE: f64 = 8.5;
+    const AWAY: f64 = 6.0;
+    let views = [
+        View::new("+z face", [0.0, 0.0, -AWAY], 0.0, 0.0),
+        View::new("-z face", [0.0, 0.0, AWAY], std::f32::consts::PI, 0.0),
+        View::new(
+            "+x face",
+            [-AWAY, 0.0, 0.0],
+            std::f32::consts::FRAC_PI_2,
+            0.0,
+        ),
+        View::new(
+            "-x face",
+            [AWAY, 0.0, 0.0],
+            -std::f32::consts::FRAC_PI_2,
+            0.0,
+        ),
+        View::new("top", [0.0, AWAY, 0.0], 0.0, -1.5),
+        View::new("bottom", [0.0, -AWAY, 0.0], 0.0, 1.5),
+    ];
+
+    let mut brightness = std::collections::BTreeMap::new();
+    for View {
+        label,
+        offset,
+        yaw,
+        pitch,
+    } in views
+    {
+        let camera = Camera {
+            position: Position::from_world(
+                CENTRE + offset[0],
+                CENTRE + offset[1],
+                CENTRE + offset[2],
+            ),
+            yaw,
+            pitch,
+            ..Camera::default()
+        };
+        let frame = target.capture(&mut renderer, &camera).expect("capture");
+
+        // The block is white, the sky is blue: any pixel where red has caught
+        // up with blue belongs to the block.
+        let mut total = 0.0;
+        let mut samples = 0.0;
+        for y in (0..HEIGHT).step_by(2) {
+            for x in (0..WIDTH).step_by(2) {
+                let Some(pixel) = frame.pixel(x, y) else {
+                    continue;
+                };
+                if i32::from(pixel[2]) - i32::from(pixel[0]) < 20 {
+                    total += f32::from(pixel[0]) / 255.0;
+                    samples += 1.0;
+                }
+            }
+        }
+
+        assert!(
+            samples > 20.0,
+            "{label}: the block is invisible ({samples} pixels). That face is wound the wrong \
+             way and is being back-face culled."
+        );
+        brightness.insert(label, total / samples);
+    }
+
+    let at = |name: &str| brightness[name];
+    assert!(
+        at("top") > at("+z face"),
+        "the top face should be the brightest: {brightness:?}"
+    );
+    assert!(
+        at("+z face") > at("+x face"),
+        "z sides should be brighter than x sides: {brightness:?}"
+    );
+    assert!(
+        at("+x face") > at("bottom"),
+        "sides should be brighter than the bottom: {brightness:?}"
+    );
+    // And the opposing faces of each pair agree with each other, which they
+    // cannot if one of them is really the other seen through a culled face.
+    for (a, b) in [("+z face", "-z face"), ("+x face", "-x face")] {
+        assert!(
+            (at(a) - at(b)).abs() < 0.03,
+            "{a} and {b} should be equally lit: {brightness:?}"
+        );
+    }
+}

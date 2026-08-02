@@ -73,6 +73,23 @@ cargo run -p server -- --config server.example.toml
 The toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml); rustup
 picks it up automatically.
 
+## Playing
+
+```sh
+cargo run -p client
+```
+
+With no config file at all that starts a server **in this process**, connects to
+it over loopback, and opens a window. That is what singleplayer is here — there
+is one simulation code path and it is the server's, so a bug in singleplayer is
+a bug everyone else has too. Copy
+[`client.example.toml`](client.example.toml) to `client.toml` to point it at
+someone else's server, or to change the view distance, field of view, or
+controls-adjacent settings; the file documents the controls as well.
+
+The client needs Vulkan, Metal, DX12, or GL. The **server needs no GPU and no
+display server at all**, which is checked in CI on every push.
+
 ## Licensing
 
 The engine is **GPLv3-only**. The `api/` directory is **MIT**.

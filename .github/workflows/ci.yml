@@ -226,6 +226,16 @@ jobs:
           vulkaninfo --summary | grep -i "deviceName" || true
           cargo test -p client --test screenshot -- --nocapture
 
+      # The whole client except the window: an embedded server started
+      # in-process, a real QUIC join, streamed chunks meshed onto the GPU, and a
+      # frame with a world in it. The window itself is a human gate; everything
+      # under it is not, and this is where that line is drawn.
+      - name: Client session against an embedded server (lavapipe)
+        env:
+          TIAMOT_REQUIRE_GPU: "1"
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: cargo test -p client --test session -- --nocapture
+
       - name: Reference mods check clean
         run: cargo run -p server -- --check-mods game
 

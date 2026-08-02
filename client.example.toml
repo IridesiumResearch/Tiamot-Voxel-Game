@@ -7,6 +7,18 @@
 # Unknown keys are a hard error rather than a warning, for the same reason the
 # server does it: a typo in a config key should stop the client, not silently
 # leave you playing with a setting you did not choose.
+#
+# Controls are not bindable yet — the engine owns bindings (charter rule 11) and
+# the binding UI is a later task. For now:
+#
+#   click            grab the mouse; Escape releases it
+#   W A S D          fly
+#   Space / L-Shift  up and down
+#   R-Shift          fly faster
+#   F8               teleport 50,000 blocks out (a floating-origin check: the
+#                    world does NOT follow, so anything still on screen is being
+#                    drawn at that offset and should not shimmer)
+#   F7               come back
 
 # Which server to play on.
 #   "embedded"          — start a server in this process and connect over

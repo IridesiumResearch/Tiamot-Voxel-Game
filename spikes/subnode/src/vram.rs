@@ -191,7 +191,7 @@ mod gpu {
     /// If no Vulkan/Metal/DX12/GL adapter can be found, or the device refuses
     /// to allocate.
     pub fn measure(seed: u64, chiselled_percent: u32) -> Result<VramResult, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,

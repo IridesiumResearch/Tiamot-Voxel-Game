@@ -206,7 +206,7 @@ impl Gpu {
     ///
     /// As [`Gpu::open`].
     pub fn headless() -> Result<Self, RenderError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         Self::open(&instance, None)
     }
 }
@@ -305,7 +305,7 @@ impl Renderer {
             // alternative is aliasing that shimmers as the camera moves.
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -530,6 +530,7 @@ impl Renderer {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             pass.set_pipeline(&self.pipeline);
@@ -566,8 +567,8 @@ fn build_pipeline(
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world-pipeline-layout"),
-            bind_group_layouts: &[bind_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(bind_layout)],
+            immediate_size: 0,
         });
 
     let wireframe = mode == RenderMode::Wireframe && gpu.polygon_mode_line;
@@ -649,13 +650,13 @@ fn build_pipeline(
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         })
 }
