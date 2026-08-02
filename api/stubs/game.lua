@@ -123,6 +123,18 @@ function Stream:next_bool() end
 ---@field hardness number? How long it takes to break.
 ---@field drops any? What breaking it yields.
 ---@field tags string[]? Arbitrary tags for other mods to match on.
+---@field textures Tiamot.BlockTextures? Which images clients draw this block with.
+
+---Textures for a block. Paths are relative to your mod's own directory, and the
+---files are pushed to clients through the content pipeline — an absolute path,
+---or one containing `..`, is refused.
+---
+---Only `all` exists today. Per-face keys are a natural extension and are
+---deliberately not reserved in advance: adding them later is additive, whereas
+---shipping a six-key schema nothing renders yet would freeze a guess into the
+---mod API.
+---@class Tiamot.BlockTextures
+---@field all string Required. The image every face uses, e.g. `"textures/white.png"`.
 
 ---Fields accepted by `game.register_action`.
 ---@class Tiamot.ActionSpec

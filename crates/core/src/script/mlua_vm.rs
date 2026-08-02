@@ -32,7 +32,7 @@ use crate::chunk::Chunk;
 use crate::coords::{ChunkPos, LocalBlock};
 use crate::detgen::{ChunkBuffer, FractalParams, Region2d, StreamRng, fill_2d};
 use crate::material::MaterialId;
-use crate::script::vm::{Backend, ScriptError, ScriptVm, VmLimits};
+use crate::script::vm::{Backend, BlockTexture, ScriptError, ScriptVm, VmLimits};
 
 /// Globals removed from every mod environment.
 ///
@@ -576,6 +576,42 @@ impl ScriptVm for MluaVm {
         blocks
     }
 
+    fn registered_block_textures(&self) -> Vec<BlockTexture> {
+        let Ok(registry) = self
+            .lua
+            .named_registry_value::<Table>("tiamot.block_textures")
+        else {
+            return Vec::new();
+        };
+        let ids = self.block_ids();
+
+        let mut textures: Vec<(MaterialId, BlockTexture)> = registry
+            .pairs::<String, Table>()
+            .filter_map(Result::ok)
+            .filter_map(|(block, entry)| {
+                // A block id with no material id cannot happen — the texture
+                // is only written after the registration succeeds — but a
+                // missing one here would be a silent mis-ordering, and this
+                // whole list is ordered.
+                let id = *ids.get(&block)?;
+                Some((
+                    id,
+                    BlockTexture {
+                        mod_id: entry.get("mod").ok()?,
+                        path: entry.get("path").ok()?,
+                        block,
+                    },
+                ))
+            })
+            .collect();
+
+        // Lua table iteration order is unspecified. Sorting by material id
+        // rather than leaving it to the table gives the server a stable list,
+        // which matters because it goes on the wire.
+        textures.sort_by_key(|(id, _)| id.0);
+        textures.into_iter().map(|(_, texture)| texture).collect()
+    }
+
     fn call_void(&mut self, mod_id: &str, name: &str) -> Result<(), ScriptError> {
         let env = self.environment(mod_id)?;
         let function: mlua::Function = env
@@ -649,45 +685,7 @@ impl MluaVm {
         let owner = mod_id.to_owned();
         let register_block = self
             .lua
-            .create_function(move |lua, spec: Table| {
-                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
-                if frozen {
-                    return Err(mlua::Error::external(format!(
-                        "mod `{owner}`: registration is closed"
-                    )));
-                }
-
-                let id: String = spec.get("id").map_err(|_| {
-                    mlua::Error::external("register_block: missing required field `id`")
-                })?;
-
-                // Unknown fields are an error naming the field: a typo in
-                // `hardness` should say so, not silently take the default.
-                for pair in spec.pairs::<Value, Value>() {
-                    let (key, _) = pair?;
-                    if let Value::String(name) = key {
-                        let name = name.to_string_lossy();
-                        if !BLOCK_FIELDS.contains(&name.as_ref()) {
-                            return Err(mlua::Error::external(format!(
-                                "register_block(\"{id}\"): unknown field `{name}`"
-                            )));
-                        }
-                    }
-                }
-
-                let qualified = qualify_id(&owner, &id).map_err(mlua::Error::external)?;
-
-                let registry: Table = lua.named_registry_value("tiamot.blocks")?;
-                if registry.contains_key(qualified.clone())? {
-                    return Err(mlua::Error::external(format!(
-                        "block `{qualified}` is already registered"
-                    )));
-                }
-                let next: u16 = lua.named_registry_value("tiamot.next_material")?;
-                registry.set(qualified, next)?;
-                lua.set_named_registry_value("tiamot.next_material", next + 1)?;
-                Ok(next)
-            })
+            .create_function(move |lua, spec: Table| register_block(lua, &owner, &spec))
             .map_err(|err| self.vm_error(&err))?;
         game.set("register_block", register_block)
             .map_err(|err| self.vm_error(&err))?;
@@ -862,10 +860,14 @@ impl MluaVm {
     /// across a Lua callback that also wants it.
     fn install_registry(&mut self) -> Result<(), ScriptError> {
         let blocks = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        let block_textures = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let generators = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let actions = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.blocks", blocks)
+            .map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.block_textures", block_textures)
             .map_err(|err| self.vm_error(&err))?;
         let tickers = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
@@ -926,8 +928,143 @@ impl MluaVm {
     }
 }
 
+/// The body of `game.register_block`.
+///
+/// A free function rather than the closure it used to be, so the closure is one
+/// line and this can be read without scrolling past the rest of the
+/// registration API.
+fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
+    let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+    if frozen {
+        return Err(mlua::Error::external(format!(
+            "mod `{owner}`: registration is closed"
+        )));
+    }
+
+    let id: String = spec
+        .get("id")
+        .map_err(|_| mlua::Error::external("register_block: missing required field `id`"))?;
+
+    // Unknown fields are an error naming the field: a typo in `hardness`
+    // should say so, not silently take the default.
+    for pair in spec.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !BLOCK_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "register_block(\"{id}\"): unknown field `{name}`"
+                )));
+            }
+        }
+    }
+
+    let qualified = qualify_id(owner, &id).map_err(mlua::Error::external)?;
+
+    // Parsed before anything is registered, so a bad texture path leaves the
+    // registry exactly as it was rather than half a block behind.
+    let texture = match spec.get::<Option<Table>>("textures")? {
+        Some(textures) => Some(block_texture_path(&qualified, &textures)?),
+        None => None,
+    };
+
+    let registry: Table = lua.named_registry_value("tiamot.blocks")?;
+    if registry.contains_key(qualified.clone())? {
+        return Err(mlua::Error::external(format!(
+            "block `{qualified}` is already registered"
+        )));
+    }
+    let next: u16 = lua.named_registry_value("tiamot.next_material")?;
+    registry.set(qualified.clone(), next)?;
+    lua.set_named_registry_value("tiamot.next_material", next + 1)?;
+
+    if let Some(path) = texture {
+        let entry = lua.create_table()?;
+        // The owning mod travels with the path because the path is relative to
+        // that mod's directory and nothing downstream can recover which one
+        // from the block id alone — `qualify_id` allows a mod to register under
+        // its own namespace, but the namespace is not guaranteed to keep
+        // matching if that ever loosens.
+        entry.set("mod", owner.to_owned())?;
+        entry.set("path", path)?;
+        let textures: Table = lua.named_registry_value("tiamot.block_textures")?;
+        textures.set(qualified, entry)?;
+    }
+    Ok(next)
+}
+
 /// Fields `register_block` accepts. Anything else is an error naming the field.
-const BLOCK_FIELDS: [&str; 6] = ["id", "name", "drops", "hardness", "description", "tags"];
+const BLOCK_FIELDS: [&str; 7] = [
+    "id",
+    "name",
+    "drops",
+    "hardness",
+    "description",
+    "tags",
+    "textures",
+];
+
+/// Keys the `textures` sub-table accepts.
+///
+/// Only `all` for now. Per-face textures (`top`, `sides`, …) are a natural
+/// extension and deliberately not guessed at here: adding them later is
+/// additive, while shipping a six-key schema nothing renders yet would freeze a
+/// guess into the mod API.
+const TEXTURE_FIELDS: [&str; 1] = ["all"];
+
+/// Reads and validates `textures = { all = "..." }`.
+fn block_texture_path(block: &str, textures: &Table) -> mlua::Result<String> {
+    for pair in textures.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !TEXTURE_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "register_block(\"{block}\"): unknown texture key `{name}`. Only `all` is \
+                     supported; per-face textures are not implemented yet."
+                )));
+            }
+        }
+    }
+
+    let path: String = textures.get("all").map_err(|_| {
+        mlua::Error::external(format!(
+            "register_block(\"{block}\"): `textures` must have an `all` key naming a file, e.g. \
+             textures = {{ all = \"white.png\" }}"
+        ))
+    })?;
+
+    validate_texture_path(block, &path).map_err(mlua::Error::external)
+}
+
+/// Checks a mod-supplied asset path and normalises its separators.
+///
+/// The path is never joined onto the filesystem — it is a key into the content
+/// index, which was built by walking the mod's own directory, so a path
+/// pointing outside simply fails to match. Refusing it here anyway turns a
+/// silent missing texture into a startup error naming the mod, and means the
+/// rule is stated somewhere rather than being an accident of how the index
+/// happens to be keyed.
+fn validate_texture_path(block: &str, path: &str) -> Result<String, String> {
+    let normalised = path.replace('\\', "/");
+    let refuse = |why: &str| {
+        Err(format!(
+            "register_block(\"{block}\"): texture path `{path}` {why}. Paths are relative to your \
+             mod's own directory."
+        ))
+    };
+
+    if normalised.trim().is_empty() {
+        return refuse("is empty");
+    }
+    if normalised.starts_with('/') || normalised.contains(':') {
+        return refuse("is absolute");
+    }
+    if normalised.split('/').any(|segment| segment == "..") {
+        return refuse("escapes the mod directory");
+    }
+    Ok(normalised)
+}
 
 /// Applies namespace rules to a registered id.
 ///
@@ -1217,6 +1354,122 @@ mod tests {
         assert!(
             err.to_string().contains('t'),
             "the error should attribute the mod: {err}"
+        );
+    }
+
+    #[test]
+    fn a_block_texture_travels_with_the_mod_that_registered_it() {
+        // The path is relative to the mod's own directory, so the mod id has to
+        // come with it — nothing downstream can recover which directory to look
+        // in from the block id alone.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "paint",
+            "game.register_block{ id = 'red', textures = { all = 'textures/red.png' } }",
+        )
+        .expect("load");
+
+        let textures = vm.registered_block_textures();
+        assert_eq!(textures.len(), 1);
+        assert_eq!(textures[0].block, "paint:red");
+        assert_eq!(textures[0].mod_id, "paint");
+        assert_eq!(textures[0].path, "textures/red.png");
+    }
+
+    #[test]
+    fn a_block_with_no_texture_has_no_entry() {
+        // Not an empty string, not a placeholder path. The engine has no
+        // opinion about what an untextured block looks like; that is the
+        // client's business, and encoding a guess here would make it the
+        // engine's.
+        let mut vm = vm();
+        load(&mut vm, "t", "game.register_block{ id = 'plain' }").expect("load");
+        assert!(vm.registered_block_textures().is_empty());
+    }
+
+    #[test]
+    fn block_textures_come_back_in_material_id_order() {
+        // Lua table iteration order is unspecified, and this list goes on the
+        // wire. An order that depended on the table would make two identical
+        // servers look different to a client.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "t",
+            "for _, id in ipairs{'zulu', 'alpha', 'mike'} do
+                 game.register_block{ id = id, textures = { all = id .. '.png' } }
+             end",
+        )
+        .expect("load");
+
+        let ids = vm.block_ids();
+        let textures = vm.registered_block_textures();
+        let numbered: Vec<u16> = textures
+            .iter()
+            .map(|texture| ids[&texture.block].0)
+            .collect();
+        let mut sorted = numbered.clone();
+        sorted.sort_unstable();
+        assert_eq!(numbered, sorted, "textures must come back ordered by id");
+    }
+
+    #[test]
+    fn a_texture_path_may_not_escape_the_mod_directory() {
+        // The index this path is looked up in is keyed by mod-relative paths,
+        // so an escaping path would simply fail to match — but refusing it here
+        // turns a silently missing texture into a startup error naming the mod.
+        for bad in ["../../etc/passwd", "/etc/passwd", "C:/windows/win.ini", ""] {
+            let mut vm = vm();
+            let err = load(
+                &mut vm,
+                "t",
+                &format!("game.register_block{{ id = 'a', textures = {{ all = '{bad}' }} }}"),
+            )
+            .expect_err("`{bad}` should be refused");
+            assert!(
+                err.to_string().contains('t'),
+                "the error should attribute the mod: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_texture_spec_leaves_the_registry_untouched() {
+        // Parsed before anything is registered. Registering the block and then
+        // failing on the texture would leave a material id assigned to a block
+        // the mod does not believe exists.
+        let mut vm = vm();
+        let _ = load(
+            &mut vm,
+            "t",
+            "game.register_block{ id = 'a', textures = { all = '../escape.png' } }",
+        );
+        assert!(
+            vm.block_ids().is_empty(),
+            "a rejected registration must not have half-happened: {:?}",
+            vm.block_ids()
+        );
+    }
+
+    #[test]
+    fn an_unknown_texture_key_says_which_keys_exist() {
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "t",
+            "game.register_block{ id = 'a', textures = { top = 'x.png' } }",
+        )
+        .expect_err("only `all` is supported");
+        // The detail rather than the Display string: a script error displays as
+        // "mod `t` errored in init.lua" and carries the backend's message
+        // separately, so a mod author sees both.
+        let (ScriptError::Load { detail, .. } | ScriptError::Runtime { detail, .. }) = &err else {
+            panic!("expected a script error carrying detail, got {err:?}");
+        };
+        assert!(
+            detail.contains("top") && detail.contains("all"),
+            "the error should name the offending key and the supported one: {detail}"
         );
     }
 

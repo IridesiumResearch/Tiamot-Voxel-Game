@@ -192,10 +192,36 @@ pub struct MaterialMap {
     runtime_to_world: Vec<u16>,
     world_to_runtime: BTreeMap<u16, MaterialId>,
     unknown: BTreeSet<MaterialId>,
+    /// Whether the two id spaces are the same space. See [`MaterialMap::passthrough`].
+    passthrough: bool,
 }
 
 impl MaterialMap {
     const UNMAPPED: u16 = u16::MAX;
+
+    /// A map for a reader that has no world database.
+    ///
+    /// World ids and runtime ids are the same number, and translation is the
+    /// identity. This is not a shortcut — it is the correct model for a
+    /// **client**, which receives chunk blobs over the wire and has no
+    /// `id_map` table to reconcile against. The names behind those numbers
+    /// arrive separately, in
+    /// [`ServerMessage::MaterialTable`](crate::proto::ServerMessage::MaterialTable),
+    /// because charter rule 8 makes the string id canonical and the number
+    /// per-session.
+    ///
+    /// Deliberately **not** usable for writing a world: a passthrough map on
+    /// the encode side would write a session's runtime ids into a database that
+    /// means something else by them.
+    #[must_use]
+    pub const fn passthrough() -> Self {
+        Self {
+            runtime_to_world: Vec::new(),
+            world_to_runtime: BTreeMap::new(),
+            unknown: BTreeSet::new(),
+            passthrough: true,
+        }
+    }
 
     fn build(table: &IdTable, registry: &Registry, unknown: BTreeSet<MaterialId>) -> Self {
         let mut runtime_to_world = vec![Self::UNMAPPED; registry.len()];
@@ -212,6 +238,7 @@ impl MaterialMap {
             runtime_to_world,
             world_to_runtime,
             unknown,
+            passthrough: false,
         }
     }
 
@@ -224,6 +251,9 @@ impl MaterialMap {
     /// That is a lifecycle bug (charter rule 9 freezes registries before world
     /// load), so it is an error rather than a silent substitution.
     pub fn to_world(&self, runtime: MaterialId) -> Result<u16, IdMapError> {
+        if self.passthrough {
+            return Ok(runtime.get());
+        }
         match self.runtime_to_world.get(runtime.get() as usize) {
             Some(&world) if world != Self::UNMAPPED => Ok(world),
             _ => Err(IdMapError::UnmappedRuntimeId { id: runtime.get() }),
@@ -237,6 +267,9 @@ impl MaterialMap {
     /// [`IdMapError::UnmappedWorldId`] if the blob references an id the world's
     /// own table does not contain — a corrupt or foreign chunk.
     pub fn to_runtime(&self, world: u16) -> Result<MaterialId, IdMapError> {
+        if self.passthrough {
+            return Ok(MaterialId(world));
+        }
         self.world_to_runtime
             .get(&world)
             .copied()
@@ -450,5 +483,20 @@ mod tests {
             map.to_runtime(9999),
             Err(IdMapError::UnmappedWorldId { .. })
         ));
+    }
+
+    #[test]
+    fn a_passthrough_map_translates_every_id_to_itself() {
+        // What a client uses: it has no `id_map` table to reconcile against,
+        // and the numbers in a chunk blob are the only numbers it has. An id
+        // it has never heard of must still decode — the names arrive in a
+        // separate message, and a chunk that refused to decode until they did
+        // would leave the world blank.
+        let map = MaterialMap::passthrough();
+        for id in [0u16, 1, 2, 9999, u16::MAX] {
+            assert_eq!(map.to_runtime(id).expect("passthrough"), MaterialId(id));
+            assert_eq!(map.to_world(MaterialId(id)).expect("passthrough"), id);
+        }
+        assert!(map.unknown().is_empty());
     }
 }

@@ -37,6 +37,61 @@ use crate::transport::{self, Shared, TransportError};
 /// The world database file inside the world directory.
 pub const WORLD_FILE: &str = "world.sqlite";
 
+/// Builds the material table a client is sent on join.
+///
+/// The ids are **world** ids, because those are the ids a chunk blob carries.
+/// Runtime ids are per-session (charter rule 8) and would name every material
+/// one number out on a world that had ever seen a different mod set.
+///
+/// A texture a mod declared but did not ship is a warning, not a failure: the
+/// client draws its missing-texture placeholder and the operator gets a line
+/// naming the mod and the path. Refusing to start would let one mislaid PNG
+/// take a server down.
+fn material_table(
+    registry: &Registry,
+    map: &tiamot_core::persist::idmap::MaterialMap,
+    content: &tiamot_core::content::ContentIndex,
+    textures: &[tiamot_core::script::BlockTexture],
+) -> Vec<tiamot_core::proto::MaterialDef> {
+    use std::collections::BTreeMap;
+
+    let by_block: BTreeMap<&str, &tiamot_core::script::BlockTexture> = textures
+        .iter()
+        .map(|texture| (texture.block.as_str(), texture))
+        .collect();
+
+    let mut table: Vec<tiamot_core::proto::MaterialDef> = registry
+        .iter()
+        .filter_map(|(runtime, name)| {
+            // A material with no world id was registered after the world was
+            // opened, which charter rule 9's freeze makes impossible. Skipping
+            // rather than unwrapping keeps a lifecycle bug from being a crash.
+            let id = map.to_world(runtime).ok()?;
+            let texture = by_block.get(name).and_then(|texture| {
+                let hash = content.hash_of(&texture.mod_id, &texture.path);
+                if hash.is_none() {
+                    error!(
+                        mod_id = %texture.mod_id,
+                        path = %texture.path,
+                        block = %name,
+                        "block declares a texture that is not in the mod directory; clients will \
+                         draw the missing-texture placeholder"
+                    );
+                }
+                hash
+            });
+            Some(tiamot_core::proto::MaterialDef {
+                id,
+                name: name.to_owned(),
+                texture,
+            })
+        })
+        .collect();
+
+    table.sort_by_key(|entry| entry.id);
+    table
+}
+
 /// A stable fingerprint over the resolved mod set.
 ///
 /// Lets a client tell in one comparison whether it has seen this exact set
@@ -314,6 +369,25 @@ impl ServerHandle {
                 source: Box::new(source),
             })?;
 
+        // Built after the world opens, because it is the WORLD's ids that go on
+        // the wire: chunk blobs carry them, and a table of this session's
+        // runtime ids would name every material one number out.
+        let block_textures = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_block_textures())
+            .unwrap_or_default();
+        let materials = material_table(
+            &registry,
+            world.materials(),
+            &content_index,
+            &block_textures,
+        );
+        info!(
+            materials = materials.len(),
+            textured = materials.iter().filter(|m| m.texture.is_some()).count(),
+            "material table built"
+        );
+
         let cert = ServerCert::load_or_create(&settings.world_path)?;
         let cert_fingerprint = cert.fingerprint;
         info!(
@@ -337,6 +411,7 @@ impl ServerHandle {
             cert_fingerprint,
             mod_set_fingerprint: mod_set_fingerprint(&mods),
             mods,
+            materials,
             content: content_index,
             allowlist: std::sync::RwLock::new(settings.allowlist.clone()),
             max_players: settings.max_players,

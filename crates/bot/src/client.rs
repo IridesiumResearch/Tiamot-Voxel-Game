@@ -566,6 +566,21 @@ impl Bot {
         Ok(complete)
     }
 
+    /// The material table the server sent, if it has arrived.
+    ///
+    /// The ids in it are **world** ids — the ones chunk blobs carry — so this
+    /// is what turns a decoded chunk's numbers into names a client can choose
+    /// textures by.
+    #[must_use]
+    pub fn material_table(&self) -> Option<Vec<tiamot_core::proto::MaterialDef>> {
+        self.received()
+            .into_iter()
+            .find_map(|message| match message {
+                ServerMessage::MaterialTable { materials } => Some(materials),
+                _ => None,
+            })
+    }
+
     /// The mod manifest the server sent, if it has arrived.
     #[must_use]
     pub fn manifest(&self) -> Option<Vec<tiamot_core::proto::ModEntry>> {

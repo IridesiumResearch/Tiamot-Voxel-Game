@@ -155,6 +155,13 @@ pub struct JoinContext<'a> {
     pub mods: &'a [ModEntry],
     /// The mod set's fingerprint.
     pub mod_set_fingerprint: u64,
+    /// The world's material table, in ascending id order.
+    ///
+    /// Sent with the manifest rather than with the world, because a client
+    /// receiving a chunk before it has this would hold a grid of numbers it
+    /// cannot name — and would have to either buffer the chunk or draw it
+    /// wrong. See [`crate::proto::MaterialDef`].
+    pub materials: &'a [crate::proto::MaterialDef],
     /// Who is permitted to join.
     pub allowlist: &'a Allowlist,
     /// Maximum simultaneous players.
@@ -489,10 +496,24 @@ impl Session {
         self.uuid = Some(uuid);
         self.phase = Phase::Authenticated;
 
-        Response::reply(ServerMessage::ModManifest {
-            mods: context.mods.to_vec(),
-            set_fingerprint: context.mod_set_fingerprint,
-        })
+        // Manifest first, then the material table. Order matters to a client
+        // that keys textures by material: the manifest tells it which content
+        // exists, and the table tells it which material wants which piece of
+        // it, so the reverse order would have it looking up hashes it has not
+        // been told about yet.
+        Response {
+            send: vec![
+                ServerMessage::ModManifest {
+                    mods: context.mods.to_vec(),
+                    set_fingerprint: context.mod_set_fingerprint,
+                },
+                ServerMessage::MaterialTable {
+                    materials: context.materials.to_vec(),
+                },
+            ],
+            close: false,
+            action: Action::None,
+        }
     }
 
     fn handle_join(&mut self, context: &JoinContext<'_>) -> Response {
@@ -651,6 +672,7 @@ mod tests {
             cert_fingerprint: &FINGERPRINT,
             mods,
             mod_set_fingerprint: 0xCAFE,
+            materials: &[],
             allowlist,
             max_players: 50,
             current_players: 0,
@@ -727,7 +749,11 @@ mod tests {
         assert!(matches!(sent[0], ServerMessage::HelloAck { .. }));
         assert!(matches!(sent[1], ServerMessage::AuthChallenge { .. }));
         assert!(matches!(sent[2], ServerMessage::ModManifest { .. }));
-        assert!(matches!(sent[3], ServerMessage::JoinWorld { .. }));
+        // The material table rides with the manifest, before the client is
+        // allowed into the world: a chunk that arrived first would be a grid of
+        // numbers the client cannot name.
+        assert!(matches!(sent[3], ServerMessage::MaterialTable { .. }));
+        assert!(matches!(sent[4], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]

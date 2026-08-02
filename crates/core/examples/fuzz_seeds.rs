@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 
 use tiamot_core::proto::{
-    ClientMessage, DisconnectReason, Edit, ModEntry, PROTOCOL_VERSION, ServerMessage,
+    ClientMessage, DisconnectReason, Edit, MaterialDef, ModEntry, PROTOCOL_VERSION, ServerMessage,
     WireSignature, encode,
 };
 use tiamot_core::{BlockPos, ChunkPos, SubNodePos};
@@ -270,6 +270,37 @@ fn server_messages() -> Vec<Vec<u8>> {
         },
         ServerMessage::Disconnect {
             reason: DisconnectReason::ServerStopping,
+        },
+        // Protocol v3. The interesting shapes for a decoder are the empty
+        // table, a name at the field limit, and the two states of the optional
+        // texture hash — an `Option` inside a `Vec` is where a length claim and
+        // a discriminant meet.
+        ServerMessage::MaterialTable {
+            materials: Vec::new(),
+        },
+        ServerMessage::MaterialTable {
+            materials: vec![
+                MaterialDef {
+                    id: 0,
+                    name: "engine:air".to_owned(),
+                    texture: None,
+                },
+                MaterialDef {
+                    id: 1,
+                    name: "engine:unknown".to_owned(),
+                    texture: None,
+                },
+                MaterialDef {
+                    id: 2,
+                    name: "core:white".to_owned(),
+                    texture: Some([0x12; 32]),
+                },
+                MaterialDef {
+                    id: u16::MAX,
+                    name: "\u{1F9F1} unicode in a material name".to_owned(),
+                    texture: Some([0x00; 32]),
+                },
+            ],
         },
     ];
     messages.iter().filter_map(|m| encode(m).ok()).collect()

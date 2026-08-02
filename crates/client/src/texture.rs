@@ -483,6 +483,28 @@ mod tests {
     }
 
     #[test]
+    fn a_shipped_reference_texture_matches_the_image_it_was_generated_from() {
+        // The PNG in `game/core_blocks/textures/` is written by the
+        // `write_reference_textures` example from `Image::white_with_border`.
+        // A checked-in binary nobody can regenerate is a file that drifts:
+        // someone opens it in an editor, saves it with a different gamma, and
+        // the faint border that made block edges readable is gone with no diff
+        // anyone can review.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../game/core_blocks/textures/white.png");
+        let bytes = std::fs::read(&path).expect("the reference mod ships this texture");
+
+        let decoded = decode_png(&bytes).expect("and it must be a decodable PNG");
+        assert_eq!(
+            decoded,
+            Image::white_with_border(),
+            "{} has drifted from its generator; re-run \
+             `cargo run -p client --example write_reference_textures -- game`",
+            path.display()
+        );
+    }
+
+    #[test]
     fn a_valid_png_decodes_to_rgba() {
         let image = decode_png(&png_bytes(16, 16)).expect("decode");
         assert_eq!((image.width, image.height), (16, 16));

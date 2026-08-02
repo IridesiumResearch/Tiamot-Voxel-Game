@@ -44,9 +44,10 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
+// v3 (Task 08): appended `ServerMessage::MaterialTable`.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -178,6 +179,34 @@ pub enum Edit {
         /// The new material's numeric id.
         material: u16,
     },
+}
+
+/// One material in the world's id table, as the client needs to see it.
+///
+/// # Why the client is told this at all
+///
+/// Chunk blobs carry **world** material ids — the numbers the world database
+/// assigned (charter rule 8) — and nothing else. A client that only had the
+/// numbers could tell two materials apart but could not tell which was stone,
+/// so it could not choose a texture for either.
+///
+/// The alternative would be for the client to derive the table by running the
+/// server's mods itself, which is both a second code path for something the
+/// server has already decided and a reason to execute mod code the client has
+/// no other need to run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterialDef {
+    /// The world id that appears in chunk blobs.
+    pub id: u16,
+    /// The canonical string id, e.g. `"core:white"`.
+    pub name: String,
+    /// Content hash of this material's texture, if it registered one.
+    ///
+    /// A hash rather than a path: the client fetches it through the same
+    /// content-addressed cache as everything else, so a texture it already has
+    /// costs nothing, and a server claiming a file it did not send is caught by
+    /// the hash rather than by the decoder.
+    pub texture: Option<ContentHash>,
 }
 
 /// One mod in the server's resolved set.
@@ -371,6 +400,19 @@ pub enum ServerMessage {
     InventoryUpdate {
         /// Material id and unit count, in ascending material order.
         stacks: Vec<(u16, u32)>,
+    },
+
+    /// The world's material table for this session.
+    ///
+    /// **Appended at the end** (protocol v3), below `InventoryUpdate`, for the
+    /// reason spelled out on that variant.
+    ///
+    /// Sent once, after the mod manifest and before the world, because a client
+    /// cannot usefully draw a chunk it has no material names for. See
+    /// [`MaterialDef`] for why the client needs it rather than deriving it.
+    MaterialTable {
+        /// Every material, in ascending id order.
+        materials: Vec<MaterialDef>,
     },
 }
 
@@ -910,6 +952,37 @@ mod tests {
         let inventory =
             encode(&ServerMessage::InventoryUpdate { stacks: Vec::new() }).expect("encode");
         assert_eq!(inventory[0], 11);
+
+        // Protocol v3, appended after InventoryUpdate.
+        let materials = encode(&ServerMessage::MaterialTable {
+            materials: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(materials[0], 12);
+    }
+
+    #[test]
+    fn a_material_table_round_trips_with_and_without_textures() {
+        // A material with no texture is normal, not exceptional: `engine:air`
+        // has none and never will. Encoding it as an absent hash rather than a
+        // sentinel value keeps "no texture" from colliding with a real one.
+        let message = ServerMessage::MaterialTable {
+            materials: vec![
+                MaterialDef {
+                    id: 0,
+                    name: "engine:air".to_owned(),
+                    texture: None,
+                },
+                MaterialDef {
+                    id: 2,
+                    name: "core:white".to_owned(),
+                    texture: Some([9u8; 32]),
+                },
+            ],
+        };
+        let bytes = encode(&message).expect("encode");
+        let decoded: ServerMessage = decode(&bytes).expect("decode");
+        assert_eq!(decoded, message);
     }
 
     #[test]

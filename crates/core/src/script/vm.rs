@@ -208,6 +208,24 @@ impl ScriptError {
     }
 }
 
+/// A texture a mod registered for one of its blocks.
+///
+/// The path is **relative to the mod's own directory** and stays that way all
+/// the way to the content index. Resolving it against the filesystem here would
+/// mean the engine handing a mod-supplied string to `std::fs`, which is exactly
+/// the shape of a path-traversal bug; instead it is a key looked up in an index
+/// built by walking that directory, so a path outside it simply does not match.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BlockTexture {
+    /// The qualified block id, e.g. `"core:white"`.
+    pub block: String,
+    /// The mod that registered it, which is also the directory the path is
+    /// relative to.
+    pub mod_id: String,
+    /// Mod-relative path, forward-slashed.
+    pub path: String,
+}
+
 /// A script VM hosting the server-mod tier.
 ///
 /// Implementors own the sandbox. Nothing above this trait may assume a
@@ -287,6 +305,16 @@ pub trait ScriptVm: Sized {
     /// the one the VM handed its mod — and every block that mod placed would
     /// silently be the wrong material.
     fn registered_blocks(&self) -> Vec<(String, MaterialId)>;
+
+    /// Textures registered alongside blocks, ordered by block id.
+    ///
+    /// Separate from [`Self::registered_blocks`] on purpose: that method's
+    /// order is a hard contract with the material registry, and widening its
+    /// tuple would put a presentation concern in the middle of it. A block with
+    /// no texture simply has no entry here — the engine has no opinion about
+    /// what an untextured block looks like, and the client's placeholder is the
+    /// client's business.
+    fn registered_block_textures(&self) -> Vec<BlockTexture>;
 
     /// Calls a named zero-argument global, for benchmarking and tests.
     ///

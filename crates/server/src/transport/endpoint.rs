@@ -81,6 +81,11 @@ pub struct Shared {
     pub mods: Vec<ModEntry>,
     /// The mod set's fingerprint.
     pub mod_set_fingerprint: u64,
+    /// The world's material table, in ascending world-id order.
+    ///
+    /// Built once at startup and never changed: registries freeze before the
+    /// world opens (charter rule 9), so there is nothing that could change it.
+    pub materials: Vec<tiamot_core::proto::MaterialDef>,
     /// Who is permitted to join.
     ///
     /// Behind a lock because RCON changes it at runtime: an operator adding
@@ -606,6 +611,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 cert_fingerprint: &shared.cert_fingerprint,
                 mods: &shared.mods,
                 mod_set_fingerprint: shared.mod_set_fingerprint,
+                materials: &shared.materials,
                 allowlist: &allowlist,
                 max_players: shared.max_players,
                 current_players: shared.players.load(Ordering::Acquire),
@@ -824,6 +830,7 @@ mod tests {
             cert_fingerprint: [0xAB; 32],
             mods: Vec::new(),
             mod_set_fingerprint: 0,
+            materials: Vec::new(),
             allowlist: std::sync::RwLock::new(Allowlist::open()),
             max_players: 2,
             spawn: tiamot_core::BlockPos::new(0, 1, 0),

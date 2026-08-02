@@ -122,6 +122,11 @@ pub struct ContentItem {
 #[derive(Debug, Default)]
 pub struct ContentIndex {
     items: BTreeMap<ContentHash, ContentItem>,
+    /// `(mod id, relative path)` → hash, for [`ContentIndex::hash_of`].
+    ///
+    /// Separate from `items` because deduplication makes `items` one-to-many in
+    /// this direction: one entry can be the file several mods shipped.
+    paths: BTreeMap<(String, String), ContentHash>,
     /// Per-mod content fingerprints, in load order.
     mod_hashes: Vec<(String, ContentHash)>,
 }
@@ -193,6 +198,9 @@ impl ContentIndex {
             fingerprint.update(relative.as_bytes());
             fingerprint.update(&hash);
 
+            self.paths
+                .insert((mod_id.to_owned(), relative.clone()), hash);
+
             // Two mods shipping a byte-identical file share one entry. That is
             // the point of content addressing, and it means the second one is
             // free.
@@ -213,6 +221,25 @@ impl ContentIndex {
     #[must_use]
     pub fn get(&self, hash: &ContentHash) -> Option<&ContentItem> {
         self.items.get(hash)
+    }
+
+    /// The hash of one mod's file, by the path the mod refers to it by.
+    ///
+    /// The reverse direction of the index, and the one a *registration* needs:
+    /// a mod names `"textures/white.png"` and the client is told a hash. Doing
+    /// it this way round is what keeps a mod-supplied string from ever reaching
+    /// the filesystem — the lookup succeeds only for paths the index found by
+    /// walking that mod's own directory, so traversal has nothing to match.
+    ///
+    /// Keyed by mod **and** path, not by path alone. Deduplication means two
+    /// mods shipping a byte-identical file share one [`ContentItem`], and that
+    /// item can only record one owner — so searching the items for a matching
+    /// `mod_id` would fail for whichever mod happened to be indexed second.
+    #[must_use]
+    pub fn hash_of(&self, mod_id: &str, relative_path: &str) -> Option<ContentHash> {
+        self.paths
+            .get(&(mod_id.to_owned(), relative_path.replace('\\', "/")))
+            .copied()
     }
 
     /// How many distinct items are indexed.
@@ -314,6 +341,51 @@ mod tests {
             std::fs::create_dir_all(parent).expect("parent");
         }
         std::fs::write(path, bytes).expect("write");
+    }
+
+    #[test]
+    fn a_path_resolves_to_a_hash_even_when_two_mods_ship_the_same_file() {
+        // The lookup a block-texture registration needs: a mod names a path and
+        // the client is told a hash. Deduplication makes the item table
+        // one-to-many in this direction -- one entry is the file BOTH mods
+        // shipped, and it can only record one owner -- so the reverse map is
+        // keyed by mod and path rather than searched for a matching owner.
+        let first = scratch("shared-first");
+        let second = scratch("shared-second");
+        write(&first, "textures/white.png", b"identical bytes");
+        write(&second, "textures/white.png", b"identical bytes");
+
+        let mut index = ContentIndex::new();
+        index.add_mod("first", &first).expect("index");
+        index.add_mod("second", &second).expect("index");
+
+        assert_eq!(index.len(), 1, "identical files must share one entry");
+        let a = index
+            .hash_of("first", "textures/white.png")
+            .expect("the first mod's path resolves");
+        let b = index
+            .hash_of("second", "textures/white.png")
+            .expect("and so must the second mod's, which was deduplicated away");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_path_outside_the_mod_directory_resolves_to_nothing() {
+        // Not because it is checked here, but because it cannot match: the map
+        // holds only paths found by walking the mod's own directory. This is
+        // what makes it safe for the key to be a mod-supplied string.
+        let dir = scratch("traversal");
+        write(&dir, "textures/white.png", b"texture");
+
+        let mut index = ContentIndex::new();
+        index.add_mod("x", &dir).expect("index");
+
+        assert!(index.hash_of("x", "../../etc/passwd").is_none());
+        assert!(index.hash_of("x", "/etc/passwd").is_none());
+        assert!(
+            index.hash_of("y", "textures/white.png").is_none(),
+            "another mod's path must not resolve"
+        );
     }
 
     #[test]

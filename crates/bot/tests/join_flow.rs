@@ -92,7 +92,16 @@ fn a_bot_completes_the_whole_join_flow() {
         let kinds: Vec<&str> = bot.received().iter().map(describe).collect();
         assert_eq!(
             kinds,
-            vec!["HelloAck", "AuthChallenge", "ModManifest", "JoinWorld"],
+            vec![
+                "HelloAck",
+                "AuthChallenge",
+                "ModManifest",
+                // Protocol v3. It rides with the manifest and before the world,
+                // because a chunk that arrived first would be a grid of numbers
+                // the client cannot name.
+                "MaterialTable",
+                "JoinWorld"
+            ],
             "the join flow must arrive in order, got {kinds:?}"
         );
         bot.disconnect().await;
@@ -475,6 +484,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::HelloAck { .. } => "HelloAck",
         ServerMessage::AuthChallenge { .. } => "AuthChallenge",
         ServerMessage::ModManifest { .. } => "ModManifest",
+        ServerMessage::MaterialTable { .. } => "MaterialTable",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",
         _ => "other",
