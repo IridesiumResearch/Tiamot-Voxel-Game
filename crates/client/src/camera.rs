@@ -163,6 +163,12 @@ impl Position {
 /// `as i32` truncates toward zero, which puts every position with a negative
 /// coordinate in the wrong chunk — and the bug looks like a one-chunk seam that
 /// only exists west and below the origin.
+#[expect(
+    clippy::float_cmp,
+    reason = "the exact comparison IS the test: it asks whether truncation changed the value, \
+              which a tolerance would answer wrongly for quotients within the tolerance of an \
+              integer"
+)]
 fn div_floor(value: f64, divisor: f64) -> i32 {
     let quotient = value / divisor;
     // No `floor`: the workspace's determinism lint bans it, and this is a

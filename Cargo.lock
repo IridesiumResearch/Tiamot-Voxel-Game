@@ -441,8 +441,10 @@ dependencies = [
  "glam",
  "png",
  "proptest",
+ "serde",
  "thiserror 2.0.19",
  "tiamot-core",
+ "toml",
  "tracing",
 ]
 

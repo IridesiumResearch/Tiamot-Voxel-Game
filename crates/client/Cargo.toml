@@ -22,7 +22,9 @@ tiamot-core.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 png.workspace = true
+serde.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

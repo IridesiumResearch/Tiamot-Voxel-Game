@@ -1,0 +1,66 @@
+# Example Tiamot client configuration.
+#
+# Copy this to client.toml and edit. Every key below is optional; the value
+# shown is the default the client uses when the key is absent — and a client
+# with no config file at all is a valid, working singleplayer client.
+#
+# Unknown keys are a hard error rather than a warning, for the same reason the
+# server does it: a typo in a config key should stop the client, not silently
+# leave you playing with a setting you did not choose.
+
+# Which server to play on.
+#   "embedded"          — start a server in this process and connect over
+#                         loopback. This is what singleplayer is: there is
+#                         exactly one simulation code path, and it is the
+#                         server's (charter rule 2).
+#   "127.0.0.1:47811"   — connect to a server already running.
+# A hostname without a port is the usual mistake and is refused.
+server = "embedded"
+
+# The name shown to other players. A display string only: identity is your
+# Ed25519 key and the UUID derived from it, and nothing — inventory, ownership,
+# bans, storage — keys on this name (charter rule 13).
+display_name = "player"
+
+# World directory for an embedded server. Ignored when connecting out.
+world_path = "singleplayer"
+
+# How far to render, in chunks. One chunk is 16 blocks.
+#
+# Work grows with the SQUARE of this. Values outside the engine's supported
+# range are clamped rather than obeyed.
+view_distance = 8
+
+# How far to render vertically, in chunks. Smaller than the horizontal radius
+# on purpose: players move horizontally far more than vertically.
+vertical_view_distance = 4
+
+# How the world is drawn.
+#   "textured"  — atlas-textured, with lighting mode 1 directional shading.
+#   "flat"      — directional shading only. If the world looks right here and
+#                 wrong in "textured", the problem is textures, not meshing.
+#   "wireframe" — quad edges only. Needs the POLYGON_MODE_LINE device feature;
+#                 adapters without it fall back to "textured" with a warning.
+render_mode = "textured"
+
+# Wait for vertical blank. On by default: frame PACING is the metric this
+# project cares about, not average frame rate (charter rule 18), and an
+# unsynchronised loop trades the former for the latter.
+vsync = true
+
+# Vertical field of view, in degrees. Must be between 1 and 179.
+fov_degrees = 70.0
+
+# Mouse look, in radians of turn per pixel of movement.
+mouse_sensitivity = 0.002
+
+# Free-fly speed, in blocks per second. The real character controller is a
+# later task; this camera flies.
+fly_speed = 12.0
+
+# Where to keep the identity key and the content cache. Absent means the
+# platform data directory:
+#   Linux    $XDG_DATA_HOME/tiamot, else ~/.local/share/tiamot
+#   macOS    ~/Library/Application Support/tiamot
+#   Windows  %APPDATA%\tiamot
+#data_path = "/home/you/tiamot-data"
