@@ -19,13 +19,32 @@ publish.workspace = true
 # fuzz target landing in the same task as any parser.
 [dependencies]
 tiamot-core.workspace = true
+# The client depends on the SERVER, and must: singleplayer is an embedded
+# server over loopback (charter rule 2), and there is exactly one simulation
+# code path. The transport framing and certificate handling live there too, so
+# a client that reimplemented them would be testing a second protocol.
+#
+# The dependency firewall runs the other way — `core` and `server` may not
+# depend on render, window, audio, or UI crates. Nothing here violates it.
+server.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 png.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+# Content slices arrive zstd-compressed. This is a C binding, and charter
+# rule 14 forbids those in the client ASSET path — the PNG, OGG, glTF, and
+# script decoders. zstd is the transfer envelope rather than the asset: the
+# bytes inside it are still checked against their hash and still decoded by a
+# pure-Rust decoder, and the server already uses this exact library on the
+# other side of the same stream.
+zstd.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

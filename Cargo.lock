@@ -441,11 +441,17 @@ dependencies = [
  "glam",
  "png",
  "proptest",
+ "quinn",
+ "rustls",
+ "rustls-pki-types",
  "serde",
+ "server",
  "thiserror 2.0.19",
  "tiamot-core",
+ "tokio",
  "toml",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

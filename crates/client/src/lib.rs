@@ -35,10 +35,13 @@
     clippy::many_single_char_names
 )]
 
+pub mod cache;
 pub mod camera;
 pub mod config;
 pub mod mesher;
+pub mod net;
 pub mod texture;
+pub mod trust;
 pub mod world;
 
 /// The engine's units-per-block constant, re-exported.
