@@ -44,10 +44,12 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
+// v4 (Task 09): appended `ServerMessage::PlayerState`, and `ServerMessage`
+// stopped deriving `Eq` because that variant carries `f32` fields.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -303,7 +305,13 @@ pub enum ClientMessage {
 /// Messages a server sends.
 ///
 /// **APPEND ONLY.** See the module docs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` but not `Eq` as of protocol v4, for the same reason as
+/// [`ClientMessage`]: [`ServerMessage::PlayerState`] carries `f32` fields and
+/// float equality is not an equivalence relation. And for the same reason,
+/// [`validate_server_message`] rejects non-finite values before a client can
+/// feed them to its own physics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
     /// Accepts a [`ClientMessage::Hello`].
     HelloAck {
@@ -413,6 +421,35 @@ pub enum ServerMessage {
     MaterialTable {
         /// Every material, in ascending id order.
         materials: Vec<MaterialDef>,
+    },
+
+    /// Where the server says the player is.
+    ///
+    /// **Appended at the end** (protocol v4), for the reason spelled out on
+    /// `InventoryUpdate`.
+    ///
+    /// This is the authoritative answer the client reconciles against, and the
+    /// whole reason it carries [`last_processed_input`](Self::PlayerState::last_processed_input):
+    /// the client rewinds to that tick, replays every input it has sent since,
+    /// and compares. Without it the client would have no way to know *which* of
+    /// its predictions this state already accounts for, and reconciliation
+    /// would fight every input still in flight.
+    ///
+    /// Position follows charter rule 7 — `(i32 chunk, f32 local)` — and the
+    /// local part is in **sub-node cells**, `0..48`, which is the unit
+    /// [`crate::phys`] works in. Sending yards instead would put a conversion
+    /// on both sides of a comparison that has to agree bit for bit.
+    PlayerState {
+        /// The last input tick the server had applied when it sent this.
+        last_processed_input: u64,
+        /// Chunk half of the position.
+        chunk: ChunkPos,
+        /// Cell offset within that chunk, `0..48` on each axis.
+        local: [f32; 3],
+        /// Cells per tick.
+        velocity: [f32; 3],
+        /// Whether the server has the player standing on something.
+        on_ground: bool,
     },
 }
 
@@ -563,6 +600,57 @@ pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolEr
         | ClientMessage::AddKey { .. }
         | ClientMessage::RotateKey { .. }
         | ClientMessage::Disconnect => {}
+    }
+    Ok(())
+}
+
+/// Checks a decoded server message before a client acts on it.
+///
+/// The mirror of [`validate_client_message`], and it exists for charter rule
+/// 14: a client decodes messages from servers it has no reason to trust, so
+/// "the server said so" is not a reason to skip a check the client would apply
+/// to anyone else.
+///
+/// The concrete hazard today is [`ServerMessage::PlayerState`]. The client
+/// replays it through the *same* [`crate::phys`] code the server runs, so a
+/// non-finite position is not a display glitch — it is a `NaN` inside the
+/// client's own simulation, which charter rule 4 forbids outright and whose
+/// payload is not even specified across platforms.
+///
+/// # Errors
+///
+/// [`ProtocolError::FieldTooLarge`] if a field breaks its cap, or if a
+/// `PlayerState` carries a non-finite coordinate or velocity.
+pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolError> {
+    match message {
+        ServerMessage::PlayerState {
+            local, velocity, ..
+        } => {
+            for value in local.iter().chain(velocity.iter()) {
+                if !value.is_finite() {
+                    return Err(ProtocolError::FieldTooLarge {
+                        field: "player_state",
+                        len: 0,
+                        limit: 0,
+                    });
+                }
+            }
+        }
+        ServerMessage::Chat { text, .. } => check_len("chat", text.len(), MAX_CHAT_BYTES)?,
+        ServerMessage::ContentChunk { data, .. } => {
+            check_len("content_chunk", data.len(), MAX_CONTENT_CHUNK_BYTES)?;
+        }
+        ServerMessage::HelloAck { .. }
+        | ServerMessage::AuthChallenge { .. }
+        | ServerMessage::ModManifest { .. }
+        | ServerMessage::JoinWorld { .. }
+        | ServerMessage::ChunkData { .. }
+        | ServerMessage::ChunkUnload { .. }
+        | ServerMessage::BlockDelta { .. }
+        | ServerMessage::EntityStateDelta { .. }
+        | ServerMessage::Disconnect { .. }
+        | ServerMessage::InventoryUpdate { .. }
+        | ServerMessage::MaterialTable { .. } => {}
     }
     Ok(())
 }
@@ -754,6 +842,47 @@ mod tests {
     }
 
     #[test]
+    fn a_non_finite_player_state_from_a_server_is_rejected_too() {
+        // The direction nobody checks. A client replays `PlayerState` through
+        // the same physics the server runs, so a hostile server sending a NaN
+        // position is not a rendering glitch — it is a NaN in the client's own
+        // simulation state, which charter rule 4 forbids. Charter rule 14 says
+        // to expect exactly this from a server you have no reason to trust.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for message in [
+                ServerMessage::PlayerState {
+                    last_processed_input: 1,
+                    chunk: ChunkPos::new(0, 0, 0),
+                    local: [bad, 0.0, 0.0],
+                    velocity: [0.0; 3],
+                    on_ground: true,
+                },
+                ServerMessage::PlayerState {
+                    last_processed_input: 1,
+                    chunk: ChunkPos::new(0, 0, 0),
+                    local: [0.0; 3],
+                    velocity: [0.0, bad, 0.0],
+                    on_ground: true,
+                },
+            ] {
+                assert!(
+                    validate_server_message(&message).is_err(),
+                    "{bad} must not reach the client's physics"
+                );
+            }
+        }
+
+        let good = ServerMessage::PlayerState {
+            last_processed_input: 7,
+            chunk: ChunkPos::new(1, 2, 3),
+            local: [24.0, 3.0, 24.0],
+            velocity: [0.1, -0.2, 0.0],
+            on_ground: true,
+        };
+        assert!(validate_server_message(&good).is_ok());
+    }
+
+    #[test]
     fn an_oversized_chat_message_is_rejected() {
         let message = ClientMessage::Chat {
             text: "x".repeat(MAX_CHAT_BYTES + 1),
@@ -934,11 +1063,18 @@ mod tests {
                 "{message:?} should be ordinal {expected}; a variant was inserted or reordered"
             );
         }
+    }
 
-        // Disconnect's ordinal is pinned separately because it is the one an
-        // appended variant is most likely to displace: it reads like the
-        // natural end of the enum, so a new variant gets written above it.
-        // Doing exactly that is what this caught during the protocol v2 change.
+    #[test]
+    fn appended_server_variants_keep_their_ordinals() {
+        // Split from `server_variant_ordinals_are_pinned` only because that
+        // test outgrew the line limit; these are the variants added after the
+        // original ten, and each is the one an *even later* append is most
+        // likely to displace.
+        //
+        // Disconnect is the perennial hazard: it reads like the natural end of
+        // the enum, so a new variant gets written above it. Doing exactly that
+        // is what this caught during the protocol v2 change.
         let disconnect = encode(&ServerMessage::Disconnect {
             reason: DisconnectReason::ServerStopping,
         })
@@ -959,6 +1095,17 @@ mod tests {
         })
         .expect("encode");
         assert_eq!(materials[0], 12);
+
+        // Protocol v4, appended after MaterialTable.
+        let state = encode(&ServerMessage::PlayerState {
+            last_processed_input: 0,
+            chunk: ChunkPos::new(0, 0, 0),
+            local: [0.0; 3],
+            velocity: [0.0; 3],
+            on_ground: false,
+        })
+        .expect("encode");
+        assert_eq!(state[0], 13);
     }
 
     #[test]

@@ -492,7 +492,17 @@ async fn session(
 
             incoming = tiamot_server::transport::frame::read::<_, ServerMessage>(&mut recv) => {
                 match incoming {
-                    Ok(message) => Some(message),
+                    // Charter rule 14 in the direction that is easy to forget:
+                    // a decoded message is not a trustworthy one. The server is
+                    // as unvalidated a peer as the client is, and a `PlayerState`
+                    // carrying a NaN would land in the client's own physics.
+                    Ok(message) => match tiamot_core::proto::validate_server_message(&message) {
+                        Ok(()) => Some(message),
+                        Err(err) => {
+                            finish(format!("the server sent a message that failed validation: {err}"));
+                            break;
+                        }
+                    },
                     Err(err) if err.is_clean_close() => {
                         finish("the server closed the connection".to_owned());
                         break;
@@ -696,10 +706,18 @@ async fn session(
             // wait for Tasks 14 and 12. All four are ignored rather than warned
             // about — a warning here would mean the client complaining about a
             // server behaving correctly.
+            //
+            // `PlayerState` is the odd one out and is only here TEMPORARILY:
+            // protocol v4 carries it and the validator above already checks it,
+            // but nothing sends one yet — the server does not simulate players
+            // until its half of Task 09 lands, and reconciling needs the
+            // prediction buffer that arrives with it. Unlike the four above,
+            // this one is a gap rather than a decision.
             ServerMessage::HelloAck { .. }
             | ServerMessage::ModManifest { .. }
             | ServerMessage::InventoryUpdate { .. }
-            | ServerMessage::EntityStateDelta { .. } => {}
+            | ServerMessage::EntityStateDelta { .. }
+            | ServerMessage::PlayerState { .. } => {}
         }
     }
 }
