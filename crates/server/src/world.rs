@@ -240,6 +240,23 @@ impl World {
         self.dirty.len()
     }
 
+    /// A chunk if it is already in memory, without generating or loading one.
+    ///
+    /// The read-only counterpart to [`chunk`](Self::chunk), and the difference
+    /// is the whole point: `chunk` takes `&mut self` and a generator because it
+    /// will *make* a chunk that has never existed. Player collision must not be
+    /// able to do that. A body walking into unexplored terrain would otherwise
+    /// generate chunks on the simulation thread at whatever rate it moves,
+    /// turning a movement input into unbounded work inside the 50 ms tick.
+    ///
+    /// Collision treats absence as solid (see [`tiamot_core::phys::Voxels`]),
+    /// so the honest failure here is a player standing still at the edge of
+    /// what is loaded rather than falling through it.
+    #[must_use]
+    pub fn resident(&self, pos: ChunkPos) -> Option<&Chunk> {
+        self.cache.get(&pos)
+    }
+
     /// Loads a chunk, generating it if the world has never seen it.
     ///
     /// # Errors
@@ -427,6 +444,17 @@ impl World {
     pub fn close(mut self) -> Result<(), WorldError> {
         self.save_dirty()?;
         self.db.close()
+    }
+}
+
+/// Lets the physics collide against the world without being able to change it.
+///
+/// Note which trait this is: [`tiamot_core::phys::ChunkLookup`] reads resident
+/// chunks, and is not the [`ChunkSource`] above, which generates them. Both
+/// exist here and they mean opposite things — see [`World::resident`].
+impl tiamot_core::phys::ChunkLookup for World {
+    fn chunk(&self, pos: ChunkPos) -> Option<&Chunk> {
+        self.resident(pos)
     }
 }
 

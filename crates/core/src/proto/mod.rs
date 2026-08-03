@@ -71,6 +71,27 @@ pub const MAX_CHAT_BYTES: usize = 512;
 /// A `BLAKE3` content hash.
 pub type ContentHash = [u8; 32];
 
+/// Bits in [`ClientMessage::PlayerInput`]'s `actions` field.
+///
+/// A bitfield rather than separate booleans because it is sent 20 times a
+/// second per player and will grow as mods register actions (charter rule 11 —
+/// mods name actions, the engine owns the keys).
+///
+/// **Append only, like the message variants.** These numbers are on the wire,
+/// so renumbering one silently turns every peer's sneak into a jump.
+pub mod actions {
+    /// Leave the ground, honoured only when standing on something.
+    pub const JUMP: u32 = 1 << 0;
+    /// Move at the sprint speed.
+    pub const SPRINT: u32 = 1 << 1;
+    /// Move slowly, and refuse to walk off an edge.
+    ///
+    /// Takes precedence over [`SPRINT`] when a client sends both: the guard
+    /// against falling is the safer answer to a contradiction, and a client
+    /// sending both is buggy rather than expressing a preference.
+    pub const SNEAK: u32 = 1 << 2;
+}
+
 /// An Ed25519 signature on the wire.
 ///
 /// A newtype because serde has no built-in impl for `[u8; 64]`, and because the
@@ -260,12 +281,26 @@ pub enum ClientMessage {
     PlayerInput {
         /// The tick this input is for.
         tick: u64,
-        /// Movement intent, in sub-node units per tick.
+        /// Desired direction of travel, in **world space**, as `[x, y, z]`.
+        ///
+        /// World space, not body-relative, and that is a determinism decision
+        /// rather than a convenience. Rotating a body-relative vector by the
+        /// player's yaw needs `sin` and `cos`, which charter rule 4 bans from
+        /// simulation outright — they are libm calls that differ between
+        /// platforms. The client already has the yaw and is exempt (rotation is
+        /// presentation), so it does the rotation once and both ends then
+        /// simulate from the identical numbers, which is what makes prediction
+        /// agree with the server bit for bit.
+        ///
+        /// Only `x` and `z` are read today; `y` is reserved for swimming and
+        /// flight. Magnitude is ignored beyond direction — how fast the player
+        /// actually moves is the gait's business, so a client cannot ask to go
+        /// faster by sending a longer vector.
         movement: [f32; 3],
         /// Yaw and pitch, in turns rather than radians so no trigonometry is
         /// needed to transmit them.
         look: [f32; 2],
-        /// Bitfield of named actions currently held.
+        /// Bitfield of named actions currently held. See [`actions`].
         actions: u32,
     },
     /// A block or sub-node edit.

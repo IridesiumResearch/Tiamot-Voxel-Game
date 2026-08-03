@@ -68,6 +68,32 @@ pub enum BotError {
     },
 }
 
+/// Where the server says a player is.
+///
+/// Charter rule 7's pair, in the units the physics uses: a chunk, and an offset
+/// inside it measured in sub-node cells.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerPosition {
+    /// Which chunk.
+    pub chunk: tiamot_core::ChunkPos,
+    /// Cell offset within it, `0..48` on each axis.
+    pub local: [f32; 3],
+}
+
+impl PlayerPosition {
+    /// The position in whole blocks, for asserting about where a bot ended up.
+    #[must_use]
+    pub fn block(&self) -> tiamot_core::BlockPos {
+        let corner = tiamot_core::BlockPos::from_chunk_corner(self.chunk);
+        let cells = tiamot_core::SUBNODES_PER_AXIS as f32;
+        tiamot_core::BlockPos::new(
+            corner.x + tiamot_core::detgen::floor_to_i32(self.local[0] / cells),
+            corner.y + tiamot_core::detgen::floor_to_i32(self.local[1] / cells),
+            corner.z + tiamot_core::detgen::floor_to_i32(self.local[2] / cells),
+        )
+    }
+}
+
 /// A connected bot.
 pub struct Bot {
     /// The identity this bot authenticates as.
@@ -694,6 +720,60 @@ impl Bot {
             material: tiamot_core::MaterialId::AIR.0,
         })
         .await
+    }
+
+    /// Walks in a world-space direction until the server has simulated
+    /// `ticks` of it, and returns where the server says the player ended up.
+    ///
+    /// Drives from the server's own [`ServerMessage::PlayerState`] rather than
+    /// from wall-clock time: it sends inputs for the ticks just after the one
+    /// the server last processed, so the queue is always fed slightly ahead
+    /// without ever running past the lookahead that would see them refused.
+    /// Sleeping and hoping instead is the Task 07 bot bug — the one where a
+    /// test passed on a fast machine and failed in CI.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if a read or write fails.
+    pub async fn walk(
+        &mut self,
+        direction: [f32; 3],
+        actions: u32,
+        ticks: u64,
+    ) -> Result<PlayerPosition, BotError> {
+        /// How far ahead of the server to keep the queue fed. Comfortably
+        /// inside `phys::input::MAX_LOOKAHEAD`, and more than a round trip.
+        const AHEAD: u64 = 8;
+
+        let mut started: Option<u64> = None;
+
+        loop {
+            let message = self.recv().await?;
+            let ServerMessage::PlayerState {
+                last_processed_input,
+                chunk,
+                local,
+                ..
+            } = message
+            else {
+                continue;
+            };
+
+            let start = *started.get_or_insert(last_processed_input);
+            if last_processed_input >= start + ticks {
+                return Ok(PlayerPosition { chunk, local });
+            }
+
+            for offset in 1..=AHEAD {
+                self.send(&ClientMessage::PlayerInput {
+                    tick: last_processed_input + offset,
+                    movement: direction,
+                    look: [0.0, 0.0],
+                    actions,
+                })
+                .await?;
+            }
+        }
     }
 
     /// Digs one sub-node: replaces a single cell with air.

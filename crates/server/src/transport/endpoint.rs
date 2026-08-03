@@ -164,6 +164,78 @@ pub struct Shared {
     /// server runs would mean a file edited mid-session is served under its old
     /// hash — the one thing content addressing exists to make impossible.
     pub content: tiamot_core::content::ContentIndex,
+
+    /// Where every player's body is, and what they have asked to do next.
+    ///
+    /// Written by the simulation thread and read by the connection tasks, the
+    /// same way edits go the other direction. The bodies live here rather than
+    /// in the connection task because charter rule 2 allows exactly one
+    /// simulation: a player's physics must run on the tick, in a fixed order,
+    /// against a world only that thread may read.
+    /// Named `bodies` rather than `players` because `players` is already the
+    /// connected *count* on this struct, and two fields whose names differ only
+    /// by what they happen to hold is how the wrong one gets locked.
+    pub bodies: std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, PlayerSim>>,
+}
+
+/// One player's simulated body and the inputs waiting to move it.
+#[derive(Debug, Clone)]
+pub struct PlayerSim {
+    /// The chunk the body's local coordinates are relative to (charter rule 7).
+    pub origin: tiamot_core::ChunkPos,
+    /// Position, velocity and ground contact, in sub-node cells.
+    pub body: tiamot_core::phys::Body,
+    /// Inputs filed under the tick that will apply them.
+    pub inputs: tiamot_core::phys::InputQueue,
+}
+
+impl PlayerSim {
+    /// A body standing at a block position, at rest.
+    #[must_use]
+    pub fn spawned_at(spawn: tiamot_core::BlockPos, tick: u64) -> Self {
+        let origin = spawn.chunk();
+        let corner = tiamot_core::BlockPos::from_chunk_corner(origin);
+        let cells = tiamot_core::SUBNODES_PER_AXIS as f32;
+        // Centred on the spawn block rather than on its corner, so a player
+        // does not start half inside the wall next to it.
+        let local = [
+            (spawn.x - corner.x) as f32 * cells + cells / 2.0,
+            (spawn.y - corner.y) as f32 * cells,
+            (spawn.z - corner.z) as f32 * cells + cells / 2.0,
+        ];
+        Self {
+            origin,
+            body: tiamot_core::phys::Body::at(local),
+            inputs: tiamot_core::phys::InputQueue::new(tick),
+        }
+    }
+}
+
+/// Turns a wire input into something the physics can step.
+///
+/// The movement vector is already world-space (see
+/// [`ClientMessage::PlayerInput`]), so there is no rotation here and therefore
+/// no trigonometry in the simulation path — charter rule 4.
+#[must_use]
+pub fn intent_from_wire(movement: [f32; 3], actions: u32) -> tiamot_core::phys::Intent {
+    use tiamot_core::phys::Gait;
+    use tiamot_core::proto::actions as bits;
+
+    // Sneak wins over sprint. A client asserting both is buggy rather than
+    // expressing a preference, and the edge guard is the safer reading.
+    let gait = if actions & bits::SNEAK != 0 {
+        Gait::Sneak
+    } else if actions & bits::SPRINT != 0 {
+        Gait::Sprint
+    } else {
+        Gait::Walk
+    };
+
+    tiamot_core::phys::Intent {
+        walk: [movement[0], movement[2]],
+        jump: actions & bits::JUMP != 0,
+        gait,
+    }
 }
 
 /// A connection asking the simulation for a chunk.
@@ -226,6 +298,59 @@ impl Shared {
         }
         queue.push_back((actor, edit));
         true
+    }
+
+    /// Starts simulating a player, at spawn.
+    pub fn add_player(&self, uuid: PlayerUuid, spawn: tiamot_core::BlockPos) {
+        if let Ok(mut bodies) = self.bodies.lock() {
+            bodies.insert(uuid, PlayerSim::spawned_at(spawn, self.tick()));
+        }
+    }
+
+    /// Stops simulating a player.
+    pub fn remove_player(&self, uuid: &PlayerUuid) {
+        if let Ok(mut bodies) = self.bodies.lock() {
+            bodies.remove(uuid);
+        }
+    }
+
+    /// Files an input against the tick it belongs to.
+    ///
+    /// Returns whether it was kept; see [`tiamot_core::phys::InputQueue::offer`]
+    /// for why a refusal is ordinary traffic rather than an error.
+    pub fn queue_input(
+        &self,
+        uuid: &PlayerUuid,
+        tick: u64,
+        intent: tiamot_core::phys::Intent,
+    ) -> bool {
+        let Ok(mut bodies) = self.bodies.lock() else {
+            return false;
+        };
+        bodies
+            .get_mut(uuid)
+            .is_some_and(|player| player.inputs.offer(tick, intent))
+    }
+
+    /// A snapshot of where the simulation has a player, for sending on.
+    #[must_use]
+    pub fn player_state(&self, uuid: &PlayerUuid) -> Option<ServerMessage> {
+        let bodies = self.bodies.lock().ok()?;
+        let player = bodies.get(uuid)?;
+        Some(ServerMessage::PlayerState {
+            last_processed_input: player.inputs.last_applied(),
+            chunk: player.origin,
+            local: player.body.position,
+            velocity: player.body.velocity,
+            on_ground: player.body.on_ground,
+        })
+    }
+
+    /// The chunk a player is standing in, for recentring their interest set.
+    #[must_use]
+    pub fn player_chunk(&self, uuid: &PlayerUuid) -> Option<tiamot_core::ChunkPos> {
+        let bodies = self.bodies.lock().ok()?;
+        bodies.get(uuid).map(|player| player.origin)
     }
 
     /// Takes everything queued, leaving the queue empty.
@@ -351,6 +476,11 @@ impl<'a> PlayerSlot<'a> {
         if let Ok(mut online) = shared.online.lock() {
             online.insert(uuid, name);
         }
+        // The simulated body is claimed and released by the same guard as the
+        // slot and the roster. Creating it at the join site instead would leak
+        // one every time a handler returned early — and the simulation would go
+        // on stepping a body whose player left.
+        shared.add_player(uuid, shared.spawn);
         Self { shared, uuid }
     }
 }
@@ -364,6 +494,7 @@ impl Drop for PlayerSlot<'_> {
         if let Ok(mut online) = self.shared.online.lock() {
             online.remove(&self.uuid);
         }
+        self.shared.remove_player(&self.uuid);
     }
 }
 
@@ -535,10 +666,34 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                         .collect();
                     frame::write(&mut send, &ServerMessage::InventoryUpdate { stacks }).await?;
                 }
+                // Follow the player before serving chunks, so a move and the
+                // terrain it needs happen on the same beat rather than a tick
+                // apart. THIS is what makes the world stream as you walk: until
+                // Task 09 the interest set was pinned to spawn, because nothing
+                // knew where the player was.
+                if let Some(uuid) = session.uuid()
+                    && let Some(chunk) = shared.player_chunk(&uuid)
+                    && let Some(streamer) = streamer.as_mut()
+                {
+                    for pos in streamer.recentre(chunk) {
+                        frame::write(&mut send, &ServerMessage::ChunkUnload { pos }).await?;
+                    }
+                }
+
                 if let Some(streamer) = streamer.as_mut()
                     && let Err(err) = pump_chunks(streamer, &mut pending, shared, &mut send).await
                 {
                     return Err(err);
+                }
+
+                // The authoritative answer the client reconciles against. Sent
+                // every tick rather than only on change: a client that missed
+                // the one state saying "you stopped" would predict straight
+                // through a wall until the next change, and states are small.
+                if let Some(uuid) = session.uuid()
+                    && let Some(state) = shared.player_state(&uuid)
+                {
+                    frame::write(&mut send, &state).await?;
                 }
                 continue;
             }
@@ -679,9 +834,24 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     });
                 }
             }
-            // Movement is applied by the simulation from the input queue, which
-            // Task 09 adds along with the physics that consume it.
-            Action::Input { .. } | Action::None => {}
+            // Filed under the tick it claims, not applied here. The simulation
+            // takes one input per tick per player, in a fixed order — see the
+            // player step in `handle.rs` for why that cannot happen on this
+            // task.
+            Action::Input {
+                tick,
+                movement,
+                actions,
+                ..
+            } => {
+                if let Some(uuid) = session.uuid() {
+                    // A refusal is ordinary traffic: a duplicate from the
+                    // three-input redundancy, or an input whose tick has
+                    // already been simulated.
+                    shared.queue_input(&uuid, *tick, intent_from_wire(*movement, *actions));
+                }
+            }
+            Action::None => {}
         }
 
         if response.close {
@@ -845,6 +1015,7 @@ mod tests {
             inventory_dirty: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             kicks: tokio::sync::broadcast::channel(4).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 

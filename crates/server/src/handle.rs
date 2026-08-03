@@ -429,6 +429,7 @@ impl ServerHandle {
             view_distance: settings.view_distance,
             kicks: tokio::sync::broadcast::channel(64).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         });
 
         // The runtime is built here rather than inside the network thread, and
@@ -580,6 +581,39 @@ impl ServerHandle {
                                     // being hostile.
                                     debug!(actor = %actor.short(), "rejected an edit: {err}");
                                 }
+                            }
+                        }
+
+                        // Players move here, on the tick thread, in a fixed
+                        // order over a `BTreeMap`. Not in the connection tasks:
+                        // charter rule 2 allows one simulation, and stepping a
+                        // body from whichever task woke first would make the
+                        // result depend on thread scheduling — which is also
+                        // the one thing charter rule 4's determinism cannot
+                        // survive.
+                        //
+                        // Collision reads only RESIDENT chunks (`World::resident`),
+                        // so walking into unloaded terrain stops a player rather
+                        // than generating a chunk inside the tick budget.
+                        if let Ok(mut bodies) = shared.bodies.lock() {
+                            for player in bodies.values_mut() {
+                                let intent = player.inputs.take(tick);
+                                let voxels = tiamot_core::phys::Voxels::new(&world, player.origin);
+                                player.body = tiamot_core::phys::step(
+                                    &voxels,
+                                    player.body,
+                                    intent,
+                                    &tiamot_core::phys::Tuning::DEFAULT,
+                                );
+                                // Charter rule 7: keep the local part inside
+                                // one chunk so it never becomes a world-space
+                                // f32 that loses precision as the player walks.
+                                let (origin, local) = tiamot_core::phys::voxels::renormalise(
+                                    player.origin,
+                                    player.body.position,
+                                );
+                                player.origin = origin;
+                                player.body.position = local;
                             }
                         }
 

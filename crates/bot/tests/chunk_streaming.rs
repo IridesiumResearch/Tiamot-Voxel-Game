@@ -25,6 +25,36 @@ fn world_dir(name: &str) -> PathBuf {
     dir
 }
 
+/// The reference mods, whose generator fills everything below y = 0.
+fn reference_mods() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../game")
+        .canonicalize()
+        .expect("the reference mods live at the repo root")
+}
+
+/// A server whose world has GROUND, so a joining player stands on it.
+///
+/// The plain [`start`] runs with no mods, which means a world of pure air —
+/// and since Task 09 gave players physics, a player in one falls forever. That
+/// is correct behaviour, not a bug: an empty world has nothing to stand on.
+/// It does mean a test about a *stationary* observer's interest set has to put
+/// something under them, or it is really a test about a falling one.
+fn start_on_ground(name: &str, view: ViewDistance) -> ServerHandle {
+    ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: world_dir(name),
+        max_players: 8,
+        allowlist: Allowlist::open(),
+        view_distance: view,
+        mods_path: Some(reference_mods()),
+        seed: Some(1),
+        rcon: None,
+        materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
+    })
+    .expect("start")
+}
+
 fn start(name: &str, view: ViewDistance) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
@@ -265,7 +295,7 @@ fn streaming_respects_the_configured_view_distance() {
         ("view-small", small, expected_small),
         ("view-large", large, expected_large),
     ] {
-        let server = start(name, view);
+        let server = start_on_ground(name, view);
         block_on(async {
             let mut alice = join(&server, "Alice").await;
             let received = alice
@@ -297,7 +327,7 @@ fn each_chunk_is_sent_only_once() {
     // set every pass and saturate the link, while still passing every test that
     // only checks the set of chunks received.
     let view = ViewDistance::MINIMUM;
-    let server = start("no-duplicates", view);
+    let server = start_on_ground("no-duplicates", view);
     let spawn_chunk = BlockPos::new(0, 1, 0).chunk();
     let expected = interest::chunks_around(spawn_chunk, view).len();
 
@@ -541,4 +571,68 @@ fn a_player_who_leaves_mid_stream_does_not_wedge_the_server() {
     });
 
     assert!(server.stop(), "the server should still shut down cleanly");
+}
+
+#[test]
+fn walking_far_enough_streams_new_chunks_and_unloads_the_ones_left_behind() {
+    // The gap Task 08 shipped with, and the reason the client's world stopped
+    // at the spawn neighbourhood however far you flew: the server pinned each
+    // player's interest set to spawn because nothing told it where they were.
+    // Now the simulation moves a body and the streamer follows it.
+    //
+    // Both halves are asserted. New chunks arriving proves the interest set
+    // moved; unloads arriving proves it MOVED rather than merely grew, which
+    // is the difference between streaming and a memory leak.
+    let view = ViewDistance::MINIMUM;
+    let server = start("walking-streams", view);
+
+    block_on(async {
+        let mut alice = join(&server, "Alice").await;
+
+        // Let the spawn neighbourhood finish arriving first, so what follows
+        // is attributable to walking rather than to the join.
+        let spawn_chunk = BlockPos::new(0, 1, 0).chunk();
+        let at_spawn = interest::chunks_around(spawn_chunk, view);
+        alice
+            .collect_chunks(at_spawn.len(), Duration::from_secs(30))
+            .await
+            .expect("the spawn neighbourhood should arrive");
+        let before: std::collections::BTreeSet<_> = alice.chunks_received().into_iter().collect();
+
+        // Two chunks' worth of walking east. A player walks 0.215 blocks a
+        // tick, so 16 blocks takes about 75 ticks.
+        let ended = alice
+            .walk([1.0, 0.0, 0.0], 0, 200)
+            .await
+            .expect("walk east");
+
+        assert!(
+            ended.chunk.x > spawn_chunk.x,
+            "the server never moved the player out of the spawn chunk: {ended:?}"
+        );
+
+        let after: std::collections::BTreeSet<_> = alice.chunks_received().into_iter().collect();
+        let fresh: Vec<_> = after.difference(&before).copied().collect();
+        assert!(
+            !fresh.is_empty(),
+            "walked {} chunks east and the world never followed",
+            ended.chunk.x - spawn_chunk.x
+        );
+        assert!(
+            fresh.iter().any(|pos| pos.x > spawn_chunk.x),
+            "new chunks arrived but none of them were east of spawn: {fresh:?}"
+        );
+
+        let unloaded = alice
+            .received()
+            .into_iter()
+            .filter(|message| matches!(message, ServerMessage::ChunkUnload { .. }))
+            .count();
+        assert!(
+            unloaded > 0,
+            "nothing was unloaded, so the interest set grew rather than moved"
+        );
+    });
+
+    assert!(server.stop());
 }
