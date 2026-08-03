@@ -374,10 +374,12 @@ impl App {
 
         self.warn(match teleport {
             Teleport::Far => format!(
-                "teleported to chunk {:?} — the world came too, so this frame should be \
+                "teleported to chunk {}, {}, {} — the world came too, so this frame should be \
                  identical to the one at spawn. Any shimmer is a world coordinate that \
                  survived {TELEPORT_DISTANCE} blocks out",
-                self.camera.position.chunk
+                self.camera.position.chunk.x,
+                self.camera.position.chunk.y,
+                self.camera.position.chunk.z
             ),
             Teleport::Home => "back at the origin".to_owned(),
         });
