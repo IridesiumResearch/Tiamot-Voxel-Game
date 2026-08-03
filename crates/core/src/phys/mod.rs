@@ -37,12 +37,14 @@
 //! also makes step-up expressible as "retry the horizontal move one cell
 //! higher" rather than as a special case inside a 3D solver.
 
+pub mod input;
 pub mod ray;
 pub mod tuning;
 pub mod voxels;
 
 use crate::detgen::floor_to_i32;
 
+pub use input::InputQueue;
 pub use ray::{Hit, REACH};
 pub use tuning::{Gait, Tuning};
 pub use voxels::{ChunkSource, Voxels};
