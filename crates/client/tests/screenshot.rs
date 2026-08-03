@@ -27,6 +27,7 @@
 //! failure. Without that, a broken CI image would quietly stop testing
 //! rendering and nothing would say so.
 
+use client::app::TELEPORT_CHUNKS;
 use client::camera::{Camera, Position};
 use client::config::RenderMode;
 use client::mesher::{self, Absent, Neighbours};
@@ -451,6 +452,57 @@ fn the_frame_is_identical_at_the_origin_and_at_the_edge_of_the_world() {
         perceptual_hash(&there),
         "the same scene looks different at the edge of the world; something in the render path \
          is accumulating a world-space f32"
+    );
+}
+
+#[test]
+fn the_debug_teleport_leaves_the_world_on_screen() {
+    // Human gate 3 is "no visible jitter at ±50,000 blocks", and the first
+    // version of the teleport could not show it: it moved the camera and left
+    // the world at the origin, 50,000 blocks behind a 1,000-block far plane.
+    // The gate ran, saw an empty sky, and passed vacuously.
+    //
+    // So this asserts in two halves and needs both. The frame must still be
+    // the same picture — that is floating origin working — AND it must still
+    // be a picture, with world in the bottom of it. Hash equality alone is
+    // satisfied by two identical empty skies, which is the bug itself.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    let here = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // What F8 does: displace every mesh and the camera by the same whole
+    // number of chunks, so nothing moves relative to anything else.
+    renderer.rebase([TELEPORT_CHUNKS, 0, TELEPORT_CHUNKS]);
+    let mut far = viewpoint();
+    far.position.chunk = ChunkPos::new(
+        far.position.chunk.x + TELEPORT_CHUNKS,
+        far.position.chunk.y,
+        far.position.chunk.z + TELEPORT_CHUNKS,
+    );
+    let there = target.capture(&mut renderer, &far).expect("capture");
+
+    assert!(
+        renderer.drawn() > 0,
+        "nothing was drawn at the edge of the world; the teleport lost the world it was \
+         supposed to carry"
+    );
+    let bottom = average(&there, 0, HEIGHT * 3 / 4, WIDTH, HEIGHT);
+    assert!(
+        !is_sky(bottom),
+        "the bottom of the frame is sky at 50,000 blocks out ({bottom:?}), so this gate would \
+         pass on an empty screen"
+    );
+    assert_eq!(
+        perceptual_hash(&here),
+        perceptual_hash(&there),
+        "the picture changed 50,000 blocks from the origin: {} here, {} there",
+        hash_hex(&here),
+        hash_hex(&there)
     );
 }
 

@@ -22,7 +22,7 @@
 
 use std::collections::BTreeMap;
 
-use tiamot_core::MaterialId;
+use tiamot_core::{ChunkPos, MaterialId};
 
 use crate::camera::{Camera, Position};
 use crate::config::Config;
@@ -42,6 +42,13 @@ pub const REMESH_BUDGET: usize = 4;
 /// sub-node, which is what makes the jitter visible if floating origin is
 /// broken.
 pub const TELEPORT_DISTANCE: f64 = 50_000.0;
+
+/// [`TELEPORT_DISTANCE`] in chunks.
+///
+/// The jump is made in whole chunks so that the camera's local offset survives
+/// it unchanged; 50,000 is 3,125 chunks exactly, which is why the acceptance
+/// criterion's round number needs no rounding here.
+pub const TELEPORT_CHUNKS: i32 = 3_125;
 
 /// How many warnings the HUD keeps.
 const WARNING_HISTORY: usize = 5;
@@ -98,6 +105,13 @@ pub struct App {
     tick: u64,
     /// What the connection reported about the server's certificate.
     server_label: String,
+    /// Whole chunks the drawn world has been displaced by, for the
+    /// floating-origin debug teleport. `[0, 0, 0]` in normal play.
+    ///
+    /// The store always holds chunks at their true positions — this is applied
+    /// on the way to the renderer, so nothing above the draw call has to know
+    /// the world has been moved.
+    displacement: [i32; 3],
 }
 
 impl App {
@@ -121,7 +135,28 @@ impl App {
             fps: 0.0,
             tick: 0,
             server_label: "connecting…".to_owned(),
+            displacement: [0, 0, 0],
         }
+    }
+
+    /// Where a chunk is drawn, which is where it is unless the debug teleport
+    /// has displaced the world.
+    const fn drawn_at(&self, pos: ChunkPos) -> ChunkPos {
+        ChunkPos::new(
+            pos.x + self.displacement[0],
+            pos.y + self.displacement[1],
+            pos.z + self.displacement[2],
+        )
+    }
+
+    /// The camera's chunk in the store's coordinates, undoing any displacement.
+    const fn camera_chunk(&self) -> ChunkPos {
+        let chunk = self.camera.position.chunk;
+        ChunkPos::new(
+            chunk.x - self.displacement[0],
+            chunk.y - self.displacement[1],
+            chunk.z - self.displacement[2],
+        )
     }
 
     /// The renderer, for drawing a frame.
@@ -234,7 +269,7 @@ impl App {
                         // The mesh has to go with the data. A renderer holding
                         // a mesh for a chunk the store has forgotten draws a
                         // ghost that nothing will ever update.
-                        self.renderer.remove_chunk(pos);
+                        self.renderer.remove_chunk(self.drawn_at(pos));
                     }
                 }
 
@@ -259,7 +294,9 @@ impl App {
     ///
     /// Returns how many were rebuilt.
     pub fn remesh(&mut self) -> usize {
-        let centre = self.camera.position.chunk;
+        // The store's coordinates, not the camera's, or a displaced camera
+        // makes "nearest first" order the queue from 50,000 blocks away.
+        let centre = self.camera_chunk();
         let due = self.store.take_dirty(centre, REMESH_BUDGET);
 
         for pos in &due {
@@ -268,7 +305,7 @@ impl App {
             };
             let neighbours = self.store.neighbours(*pos);
             let mesh = mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY);
-            self.renderer.set_chunk(*pos, &mesh);
+            self.renderer.set_chunk(self.drawn_at(*pos), &mesh);
         }
         due.len()
     }
@@ -302,23 +339,48 @@ impl App {
         }
     }
 
-    /// Jumps the camera, for the floating-origin check.
+    /// Jumps to the edge of the world, for the floating-origin check.
     ///
-    /// Does **not** touch the chunk store: the point of the exercise is to look
-    /// at geometry that has not moved from a viewpoint that has, and reloading
-    /// the world around the new position would hide exactly the artefact being
-    /// looked for.
+    /// The world moves **with** the camera, by the same whole number of chunks,
+    /// so the view is unchanged and only the coordinates it is computed from
+    /// grow. That is the whole claim of a floating origin, and it is the only
+    /// arrangement that can be looked at: leaving the world behind while the
+    /// camera jumps 50,000 blocks puts every chunk far outside the 1,000-block
+    /// far plane, and an empty sky demonstrates nothing. The chunk store is
+    /// untouched either way — displacement is applied on the way to the
+    /// renderer.
+    ///
+    /// Absolute rather than cumulative, so pressing the key twice is the same
+    /// as pressing it once.
     pub fn teleport(&mut self, teleport: Teleport) {
-        let (x, y, z) = self.camera.position.to_world();
-        self.camera.position = match teleport {
-            Teleport::Far => Position::from_world(x + TELEPORT_DISTANCE, y, z + TELEPORT_DISTANCE),
-            Teleport::Home => self.spawn.unwrap_or_default(),
+        let target = match teleport {
+            Teleport::Far => [TELEPORT_CHUNKS, 0, TELEPORT_CHUNKS],
+            Teleport::Home => [0, 0, 0],
         };
-        self.warn(format!(
-            "teleported to {:?} — the world does not follow, so anything still on screen is \
-             being drawn at a {TELEPORT_DISTANCE}-block offset",
-            self.camera.position.chunk
-        ));
+        let delta = [
+            target[0] - self.displacement[0],
+            target[1] - self.displacement[1],
+            target[2] - self.displacement[2],
+        ];
+
+        // Whole chunks, so the camera's local offset is bit-identical either
+        // side of the jump. Anything else would move the view a fraction of a
+        // block and the shimmer being hunted would have a mundane cause.
+        let chunk = self.camera.position.chunk;
+        self.camera.position.chunk =
+            ChunkPos::new(chunk.x + delta[0], chunk.y + delta[1], chunk.z + delta[2]);
+        self.renderer.rebase(delta);
+        self.displacement = target;
+
+        self.warn(match teleport {
+            Teleport::Far => format!(
+                "teleported to chunk {:?} — the world came too, so this frame should be \
+                 identical to the one at spawn. Any shimmer is a world coordinate that \
+                 survived {TELEPORT_DISTANCE} blocks out",
+                self.camera.position.chunk
+            ),
+            Teleport::Home => "back at the origin".to_owned(),
+        });
     }
 
     /// Sends the frame's input to the server.

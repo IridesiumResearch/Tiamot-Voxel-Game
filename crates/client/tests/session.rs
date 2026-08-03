@@ -208,11 +208,14 @@ fn the_hud_reports_what_the_frame_actually_contains() {
 fn teleporting_fifty_thousand_blocks_leaves_the_geometry_where_it_was() {
     // The [A]-assertable half of "no visible jitter at ±50,000 blocks".
     //
-    // The world deliberately does NOT follow the camera, so this is the exact
-    // situation the debug action creates in the real client: geometry that has
-    // not moved, viewed from a position fifty thousand blocks away. The frames
-    // must differ — the camera moved — and the round trip home must land back
-    // on the original picture, bit for bit at the hash's resolution.
+    // This test used to assert the opposite — that the frame CHANGED, because
+    // the world was left behind while the camera jumped. That is what the
+    // client did, and it was wrong: the world ended up 50,000 blocks outside a
+    // 1,000-block far plane, so "the picture changed" meant "the picture is now
+    // empty sky", and the human gate it exists to support could only ever
+    // report seeing nothing. The world now moves with the camera by the same
+    // whole number of chunks, so the frame must be UNCHANGED — that is the
+    // claim floating origin actually makes — and must still contain a world.
     let Some(gpu) = gpu() else { return };
     let server = embedded("teleport");
     let mut app = client("teleport", &server, gpu);
@@ -221,15 +224,37 @@ fn teleporting_fifty_thousand_blocks_leaves_the_geometry_where_it_was() {
 
     let target = Offscreen::new(app.renderer().gpu(), WIDTH, HEIGHT);
     let camera = *app.camera();
+    let home_chunk = camera.position.chunk;
     let before = target.capture(app.renderer(), &camera).expect("capture");
 
     app.teleport(Teleport::Far);
     let camera = *app.camera();
     let away = target.capture(app.renderer(), &camera).expect("capture");
-    assert_ne!(
+
+    assert_eq!(
+        camera.position.chunk.x - home_chunk.x,
+        client::app::TELEPORT_CHUNKS,
+        "the camera should have moved 50,000 blocks east"
+    );
+    assert!(
+        shows_a_world(&away),
+        "the frame at 50,000 blocks out is empty sky, so this proves nothing about jitter — \
+         the world did not come along"
+    );
+    assert_eq!(
         perceptual_hash(&before),
         perceptual_hash(&away),
-        "teleporting fifty thousand blocks away should not leave the world in front of you"
+        "the picture changed at the edge of the world; something in the render path is \
+         accumulating a world-space f32"
+    );
+
+    // Idempotent: the displacement is absolute, so a second press is a no-op
+    // rather than another 50,000 blocks.
+    app.teleport(Teleport::Far);
+    assert_eq!(
+        app.camera().position.chunk,
+        camera.position.chunk,
+        "a second teleport moved again; the displacement is meant to be absolute"
     );
 
     app.teleport(Teleport::Home);

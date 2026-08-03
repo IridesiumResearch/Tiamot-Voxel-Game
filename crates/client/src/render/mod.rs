@@ -425,6 +425,29 @@ impl Renderer {
         self.chunks.clear();
     }
 
+    /// Moves every resident mesh by a whole number of chunks.
+    ///
+    /// No GPU work: a mesh's vertices are in chunk-local sub-node units, so
+    /// where a chunk *is* lives entirely in its key and moving the world is
+    /// re-keying a map. Used by the floating-origin debug teleport to carry
+    /// the world along with the camera — geometry left behind at the origin
+    /// while the camera jumps 50,000 blocks is simply beyond the far plane,
+    /// which shows an empty sky rather than the artefact being looked for.
+    pub fn rebase(&mut self, delta: [i32; 3]) {
+        if delta == [0, 0, 0] {
+            return;
+        }
+        self.chunks = std::mem::take(&mut self.chunks)
+            .into_iter()
+            .map(|(pos, mesh)| {
+                (
+                    ChunkPos::new(pos.x + delta[0], pos.y + delta[1], pos.z + delta[2]),
+                    mesh,
+                )
+            })
+            .collect();
+    }
+
     /// Total VRAM the resident chunk meshes occupy, as the device reports it.
     ///
     /// Read back from the buffers rather than computed from the mesh sizes:
