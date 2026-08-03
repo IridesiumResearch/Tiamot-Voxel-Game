@@ -71,6 +71,7 @@ pub mod inventory;
 pub mod material;
 pub mod modload;
 pub mod persist;
+pub mod phys;
 pub mod proto;
 #[cfg(feature = "script")]
 pub mod script;
