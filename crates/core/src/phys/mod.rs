@@ -37,10 +37,12 @@
 //! also makes step-up expressible as "retry the horizontal move one cell
 //! higher" rather than as a special case inside a 3D solver.
 
+pub mod ray;
 pub mod tuning;
 
 use crate::detgen::floor_to_i32;
 
+pub use ray::{Hit, REACH};
 pub use tuning::{Gait, Tuning};
 
 /// Player box width, in cells. 0.6 yards.
