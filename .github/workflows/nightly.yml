@@ -72,7 +72,15 @@ jobs:
       # and a shared runner is not one; these are for reading a trend, not for
       # blocking a merge.
       - name: Run the micro-benchmarks
-        run: cargo bench --workspace 2>&1 | tee target/criterion-output.txt
+        # `mkdir -p target` is load-bearing. `tee` opens its file before cargo
+        # creates `target/`, and on a cache miss the directory is not there yet.
+        # It then reports the error, keeps copying stdin to stdout, and exits 1
+        # at the end — so the log holds a complete, healthy benchmark run, no
+        # artifact is uploaded, and the job fails with nothing in it that looks
+        # like a cause. Two nightlies were red on this before it was read.
+        run: |
+          mkdir -p target
+          cargo bench --workspace 2>&1 | tee target/criterion-output.txt
 
       - name: Upload the criterion output
         if: always()
