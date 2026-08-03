@@ -432,6 +432,9 @@ impl App {
                 self.renderer.gpu().adapter,
                 self.renderer.gpu().backend
             ),
+            // The floating-origin check is a human gate, and a gate nobody can
+            // find the key for gets reported as "nothing happened".
+            "T or F8: jump 50,000 blocks · H or F7: home".to_owned(),
         ]
     }
 

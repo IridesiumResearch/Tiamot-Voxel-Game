@@ -266,10 +266,16 @@ impl ApplicationHandler for Client {
                         // shows an identical picture from coordinates fifty
                         // thousand blocks away — the HUD's position is what
                         // moves, and the frame is what must not.
-                        KeyCode::F8 if pressed => {
+                        //
+                        // Bound on a letter as well as a function key: F7 and
+                        // F8 sit under Fn-lock or a vendor media overlay on a
+                        // lot of Windows laptops, and the failure is silent —
+                        // the key simply never arrives, which reads as "the
+                        // teleport is broken" rather than "the key was eaten".
+                        KeyCode::F8 | KeyCode::KeyT if pressed => {
                             self.pending_teleport = Some(Teleport::Far);
                         }
-                        KeyCode::F7 if pressed => {
+                        KeyCode::F7 | KeyCode::KeyH if pressed => {
                             self.pending_teleport = Some(Teleport::Home);
                         }
                         _ => {}
