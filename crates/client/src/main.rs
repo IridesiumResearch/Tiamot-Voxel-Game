@@ -261,9 +261,11 @@ impl ApplicationHandler for Client {
                             self.grabbed = !grab(&surface.window, false);
                         }
                         // The floating-origin check from Task 08's acceptance
-                        // criteria. F8 goes out, F7 comes home; the world is
-                        // deliberately not reloaded, so what stays on screen is
-                        // being drawn at a fifty-thousand-block offset.
+                        // criteria. F8 goes out, F7 comes home. The world
+                        // travels with the camera, so a working floating origin
+                        // shows an identical picture from coordinates fifty
+                        // thousand blocks away — the HUD's position is what
+                        // moves, and the frame is what must not.
                         KeyCode::F8 if pressed => {
                             self.pending_teleport = Some(Teleport::Far);
                         }
