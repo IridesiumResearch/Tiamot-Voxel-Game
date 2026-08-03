@@ -215,7 +215,10 @@ fn rem_floor_f32(value: f64, divisor: f64) -> f32 {
 pub struct Camera {
     /// Where the camera is.
     pub position: Position,
-    /// Yaw in radians, 0 looking along +z.
+    /// Yaw in radians, 0 looking along +z, increasing to turn right.
+    ///
+    /// Right is east: +z is north and +x is west, because the world is
+    /// right-handed with +y up. See [`Camera::forward`].
     pub yaw: f32,
     /// Pitch in radians, clamped away from straight up and down.
     pub pitch: f32,
@@ -263,7 +266,14 @@ impl Camera {
     pub fn forward(&self) -> Vec3 {
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
-        Vec3::new(cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw).normalize()
+        // The negated x is not a fudge, and removing it inverts mouse-look.
+        // The world is right-handed with +y up and +z north, so +x is
+        // `up × north` = WEST, and east is −x. Yaw increases north → east
+        // (`compass` names the sectors in that order), so a growing yaw must
+        // swing the forward vector toward −x. Written with +sin_yaw it swung
+        // toward +x instead: the view turned left when the mouse went right,
+        // and the HUD called west "east".
+        Vec3::new(-cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw).normalize()
     }
 
     /// The camera's right vector.
@@ -554,6 +564,61 @@ mod tests {
             "yaw grew to {}",
             camera.yaw
         );
+    }
+
+    #[test]
+    fn moving_the_mouse_right_slides_the_scene_left() {
+        // The human gate caught this and no test did: mouse-look was inverted
+        // horizontally because `forward` swung toward +x as yaw grew, and +x is
+        // west. Asserting on axes would just re-state whichever convention the
+        // code happens to hold, so this asserts what the player actually sees —
+        // a marker dead ahead must slide LEFT across the screen when the view
+        // turns right, and it goes through the real view-projection to do it.
+        let mut camera = Camera::default();
+        let marker = camera.forward() * 10.0;
+
+        let centred = clip_x(&camera, marker);
+        assert!(
+            centred.abs() < 1e-5,
+            "the marker should start dead centre, not at {centred}"
+        );
+
+        camera.look(0.3, 0.0);
+        let after_turning_right = clip_x(&camera, marker);
+        assert!(
+            after_turning_right < -0.1,
+            "turning right left the marker at {after_turning_right}; negative is left of centre, \
+             so a positive value here is the inverted mouse-look the gate reported"
+        );
+
+        camera.look(-0.6, 0.0);
+        let after_turning_left = clip_x(&camera, marker);
+        assert!(
+            after_turning_left > 0.1,
+            "turning left should have thrown the marker to the right, not to {after_turning_left}"
+        );
+    }
+
+    #[test]
+    fn turning_right_faces_east_and_east_is_negative_x() {
+        // +y up and +z north makes +x = up × north = west, so the compass in
+        // the HUD is only honest if a right turn from north points at −x.
+        let mut camera = Camera::default();
+        assert!((camera.forward() - Vec3::Z).length() < 1e-6, "north is +z");
+
+        camera.look(std::f32::consts::FRAC_PI_2, 0.0);
+        let facing = camera.forward();
+        assert!(
+            (facing - Vec3::NEG_X).length() < 1e-5,
+            "a quarter turn right should face east at −x, not {facing:?}"
+        );
+    }
+
+    /// Where a world offset lands across the screen: −1 is the left edge, +1
+    /// the right. The camera sits at the origin, so an offset is a position.
+    fn clip_x(camera: &Camera, offset: Vec3) -> f32 {
+        let clip = camera.view_projection(1.0) * glam::Vec4::new(offset.x, offset.y, offset.z, 1.0);
+        clip.x / clip.w
     }
 
     #[test]

@@ -544,18 +544,24 @@ fn every_face_of_a_block_is_drawn_at_its_own_brightness() {
     // The block spans one unit at (8, 8, 8), so its centre is (8.5, 8.5, 8.5).
     const CENTRE: f64 = 8.5;
     const AWAY: f64 = 6.0;
+    // Each view stands off one side of the block and looks back at it, so the
+    // face it measures is the one facing the camera — a camera out at −x sees
+    // the −x face. Yaw turns right from north (+z), so `forward` is
+    // `(−sin yaw, ·, cos yaw)`: looking toward +x is −π/2, not +π/2. Getting
+    // that backwards points every side view at empty sky, which is how this
+    // test caught the inverted mouse-look.
     let views = [
-        View::new("+z face", [0.0, 0.0, -AWAY], 0.0, 0.0),
-        View::new("-z face", [0.0, 0.0, AWAY], std::f32::consts::PI, 0.0),
+        View::new("-z face", [0.0, 0.0, -AWAY], 0.0, 0.0),
+        View::new("+z face", [0.0, 0.0, AWAY], std::f32::consts::PI, 0.0),
         View::new(
             "+x face",
-            [-AWAY, 0.0, 0.0],
+            [AWAY, 0.0, 0.0],
             std::f32::consts::FRAC_PI_2,
             0.0,
         ),
         View::new(
             "-x face",
-            [AWAY, 0.0, 0.0],
+            [-AWAY, 0.0, 0.0],
             -std::f32::consts::FRAC_PI_2,
             0.0,
         ),
