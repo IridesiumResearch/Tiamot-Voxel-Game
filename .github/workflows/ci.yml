@@ -214,17 +214,40 @@ jobs:
       # the picture — plus a coarse perceptual hash. Deliberately not
       # pixel-exact: no two drivers agree to the bit, and a gate that failed on
       # a filtering difference would be turned off within a week.
-      - name: Screenshot smoke test (lavapipe)
-        env:
-          TIAMOT_REQUIRE_GPU: "1"
-          # Ask Vulkan for the software driver by name rather than hoping it is
-          # the only one present.
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      # Mesa's lavapipe is a software Vulkan implementation, so the two render
+      # gates below need no GPU.
+      #
+      # The ICD is DISCOVERED rather than named. It used to be named, as
+      # `/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`, and Mesa 25 dropped the
+      # architecture suffix — so the path stopped resolving, the loader found
+      # no drivers, and every render gate failed at once. Naming a
+      # distribution's file layout in a workflow is a dependency on something
+      # nobody is versioning.
+      #
+      # A missing driver fails the job rather than skipping the gates, for the
+      # same reason TIAMOT_REQUIRE_GPU exists: a render gate that quietly stops
+      # rendering is worse than no gate, because it still reports green.
+      - name: Install a software Vulkan driver
         run: |
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
-          vulkaninfo --summary | grep -i "deviceName" || true
-          cargo test -p client --test screenshot -- --nocapture
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json \
+                   /usr/lib/*/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -n1)
+          if [ -z "$icd" ]; then
+            echo "::error::no lavapipe ICD found; the render gates cannot run"
+            exit 1
+          fi
+          echo "found the lavapipe ICD at $icd"
+          # Both names: VK_DRIVER_FILES is the current one, VK_ICD_FILENAMES the
+          # older spelling still honoured by every loader in the wild.
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          VK_DRIVER_FILES="$icd" vulkaninfo --summary | grep -i "deviceName"
+
+      - name: Screenshot smoke test (lavapipe)
+        env:
+          TIAMOT_REQUIRE_GPU: "1"
+        run: cargo test -p client --test screenshot -- --nocapture
 
       # The whole client except the window: an embedded server started
       # in-process, a real QUIC join, streamed chunks meshed onto the GPU, and a
@@ -233,7 +256,6 @@ jobs:
       - name: Client session against an embedded server (lavapipe)
         env:
           TIAMOT_REQUIRE_GPU: "1"
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: cargo test -p client --test session -- --nocapture
 
       - name: Reference mods check clean
