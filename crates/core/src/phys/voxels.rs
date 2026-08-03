@@ -109,6 +109,35 @@ impl<S: ChunkLookup> Solid for Voxels<'_, S> {
     }
 }
 
+/// Moves a body's frame so its local coordinates stay inside one chunk.
+///
+/// Returns the anchor and local position describing the same place, with every
+/// local axis in `0..48`. Call it after each step: without it a body walking
+/// east accumulates a local coordinate that grows without bound, which is
+/// precisely the world-space `f32` charter rule 7 forbids — and the precision
+/// loss would arrive gradually, as movement getting coarser the further from
+/// spawn a player walked.
+///
+/// The arithmetic is exact rather than approximately right: the shift is a
+/// whole number of chunks, and `48 × small integer` is exactly representable,
+/// so the returned position denotes the same point as the one passed in.
+#[must_use]
+pub fn renormalise(origin: ChunkPos, position: [f32; 3]) -> (ChunkPos, [f32; 3]) {
+    let span = crate::CHUNK_SUBNODES as f32;
+    let mut chunk = [origin.x, origin.y, origin.z];
+    let mut local = position;
+
+    for axis in 0..3 {
+        let shift = crate::detgen::floor_to_i32(local[axis] / span);
+        if shift != 0 {
+            chunk[axis] += shift;
+            local[axis] -= shift as f32 * span;
+        }
+    }
+
+    (ChunkPos::new(chunk[0], chunk[1], chunk[2]), local)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -287,6 +316,76 @@ mod tests {
         assert!(
             body.on_ground && (body.position[1] - 3.0).abs() < 0.01,
             "fell through the seam between chunks: {body:?}"
+        );
+    }
+
+    #[test]
+    fn renormalising_inside_a_chunk_changes_nothing() {
+        let origin = ChunkPos::new(2, 0, -3);
+        let (chunk, local) = renormalise(origin, [0.0, 24.5, 47.9]);
+        assert_eq!(chunk, origin);
+        assert_eq!(
+            local.map(f32::to_bits),
+            [0.0f32, 24.5, 47.9].map(f32::to_bits)
+        );
+    }
+
+    #[test]
+    fn renormalising_across_a_boundary_names_the_same_place() {
+        // The property that matters is not "the numbers get smaller" but "the
+        // point does not move". A frame shift that drifted by a fraction of a
+        // cell would teleport a player very slightly every time they crossed a
+        // chunk line — a rare, tiny, unreproducible jitter.
+        let origin = ChunkPos::new(0, 0, 0);
+        let span = crate::CHUNK_SUBNODES as f32;
+
+        for position in [
+            [48.5f32, 3.0, 0.0],
+            [-0.5, 3.0, 0.0],
+            [-49.0, 3.0, 96.25],
+            [144.0, -1.0, -144.0],
+        ] {
+            let (chunk, local) = renormalise(origin, position);
+            for axis in 0..3 {
+                assert!(
+                    local[axis] >= 0.0 && local[axis] < span,
+                    "local {} is outside 0..{span} for {position:?}",
+                    local[axis]
+                );
+                let chunk_axis = [chunk.x, chunk.y, chunk.z][axis];
+                let world = chunk_axis as f32 * span + local[axis];
+                assert_eq!(
+                    world.to_bits(),
+                    position[axis].to_bits(),
+                    "axis {axis} moved: {position:?} became chunk {chunk:?} local {local:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_walking_east_keeps_its_local_coordinate_small() {
+        // The reason this exists. Without renormalising, a body walking away
+        // from spawn accumulates a world-space f32 and loses precision as it
+        // goes — charter rule 7's whole concern.
+        let mut origin = ChunkPos::new(0, 0, 0);
+        let mut position = [24.0f32, 3.0, 24.0];
+
+        for _ in 0..1_000 {
+            position[0] += 0.645;
+            let (chunk, local) = renormalise(origin, position);
+            origin = chunk;
+            position = local;
+        }
+
+        assert!(
+            position[0] >= 0.0 && position[0] < crate::CHUNK_SUBNODES as f32,
+            "local x drifted to {}",
+            position[0]
+        );
+        assert!(
+            origin.x > 10,
+            "the frame never followed the body: {origin:?}"
         );
     }
 }
