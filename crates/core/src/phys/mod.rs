@@ -47,7 +47,7 @@ use crate::detgen::floor_to_i32;
 pub use input::InputQueue;
 pub use ray::{Hit, REACH};
 pub use tuning::{Gait, Tuning};
-pub use voxels::{ChunkSource, Voxels};
+pub use voxels::{ChunkLookup, Voxels};
 
 /// Player box width, in cells. 0.6 yards.
 pub const PLAYER_WIDTH: f32 = 1.8;

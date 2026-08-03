@@ -29,20 +29,29 @@ use crate::material::MaterialId;
 
 use super::Solid;
 
-/// Somewhere chunks can be looked up.
-pub trait ChunkSource {
-    /// The chunk at a position, or `None` if it is not loaded.
+/// Somewhere already-loaded chunks can be looked up.
+///
+/// Deliberately **not** named `ChunkSource` — the server already has a trait by
+/// that name and it means the opposite thing: a terrain *generator*, which takes
+/// `&mut self` and makes a chunk that did not exist. This one only reads what
+/// is already resident, which is what a `&self` collision query can use.
+///
+/// Nothing here generates. Collision that could generate terrain would make a
+/// player's movement pull chunks into memory, on the tick thread, at whatever
+/// rate they walk.
+pub trait ChunkLookup {
+    /// The chunk at a position, or `None` if it is not resident.
     fn chunk(&self, pos: ChunkPos) -> Option<&Chunk>;
 }
 
 /// A [`Solid`] view of loaded chunks, in a frame anchored to `origin`.
-pub struct Voxels<'a, S: ChunkSource> {
+pub struct Voxels<'a, S: ChunkLookup> {
     source: &'a S,
     /// The chunk whose corner is cell `[0, 0, 0]` in this frame.
     origin: ChunkPos,
 }
 
-impl<'a, S: ChunkSource> Voxels<'a, S> {
+impl<'a, S: ChunkLookup> Voxels<'a, S> {
     /// Views `source` with the frame anchored at `origin`'s corner.
     pub const fn new(source: &'a S, origin: ChunkPos) -> Self {
         Self { source, origin }
@@ -84,7 +93,7 @@ impl<'a, S: ChunkSource> Voxels<'a, S> {
     }
 }
 
-impl<S: ChunkSource> Solid for Voxels<'_, S> {
+impl<S: ChunkLookup> Solid for Voxels<'_, S> {
     /// Contract §2: solid iff the cell is occupied, whatever storage form the
     /// block uses — which is exactly what `get_subnode` answers, so `Uniform`,
     /// `Partial` and `Mixed` need no cases here.
@@ -145,7 +154,7 @@ mod tests {
         }
     }
 
-    impl ChunkSource for Loaded {
+    impl ChunkLookup for Loaded {
         fn chunk(&self, pos: ChunkPos) -> Option<&Chunk> {
             self.0.get(&pos)
         }
