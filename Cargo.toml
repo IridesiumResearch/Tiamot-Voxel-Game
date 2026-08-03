@@ -145,7 +145,30 @@ wgpu = "29"
 pollster = "0.4"
 # The window and its input. `winit` is the only cross-platform option that is
 # not a whole framework, and it is what wgpu's own examples target.
-winit = "0.30"
+#
+# NOT default features, and the omission is `wayland-csd-adwaita`. That feature
+# draws Wayland client-side decorations, and to do it it bundles the Ubuntu font
+# — which brings `sctk-adwaita -> ab_glyph -> owned_ttf_parser -> ttf-parser`
+# into the client, and with it two problems that `cargo deny` caught the day the
+# client became a real dependency:
+#
+#   * the font is licensed `OFL-1.1 AND Ubuntu-font-1.0`, neither of which is on
+#     charter rule 17's GPLv3-compatible allow-list. The Ubuntu Font Licence in
+#     particular is not an FSF-recognised GPL-compatible licence, so shipping it
+#     inside a GPL-3.0-only binary is a real question rather than a formality;
+#   * `ttf-parser` is unmaintained (RUSTSEC-2026-0192) with no upgrade
+#     available, which puts an abandoned font parser in a client that charter
+#     rule 14 already treats as handling hostile input.
+#
+# Dropping the feature answers both at once and costs only the title bar, and
+# only on Wayland compositors that do not draw one themselves. Revisit in Task
+# 14 if the client wants decorations it draws itself.
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+] }
 # HUD text. Immediate-mode, so there is no widget tree to keep in sync with the
 # world — the HUD is written out fresh each frame from what the frame already
 # knows. Task 14 builds the real UI on this.
