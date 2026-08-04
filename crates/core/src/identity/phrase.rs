@@ -168,14 +168,19 @@ mod tests {
         // The reason the checksum exists. Without it this would silently yield a
         // different valid identity — someone else's UUID, an empty account, and
         // no indication anything went wrong.
-        let phrase = Identity::generate()
-            .expect("generate")
-            .recovery_phrase()
-            .expect("phrase");
+        //
+        // A FIXED seed, not a generated one. In a 24-word phrase the last word
+        // carries 8 checksum bits alongside 3 of entropy, so swapping it for
+        // another valid word leaves a 1-in-256 chance that the new checksum
+        // happens to match — and this test used a fresh random phrase every
+        // run. It was a flake with a ~0.4% failure rate that took months to
+        // land, on macOS, in a run about something else entirely.
+        let phrase = RecoveryPhrase::from_seed(&[0x5A; SEED_BYTES]).expect("phrase");
         let mut words = phrase.words();
 
         // Swap the last word for a different valid wordlist entry, so the only
-        // thing wrong is the checksum.
+        // thing wrong is the checksum. Both are pinned, so the pair either
+        // always fails or always passes — and the assertion below proves which.
         let replacement = if words[23] == "zoo" { "zone" } else { "zoo" };
         words[23] = replacement;
 
@@ -187,6 +192,43 @@ mod tests {
         assert!(
             result.unwrap_err().to_string().contains("silently"),
             "the message should explain why this is caught"
+        );
+    }
+
+    #[test]
+    fn every_single_word_substitution_in_a_known_phrase_is_caught() {
+        // What the test above can only sample. A checksum that caught the one
+        // pinned substitution and little else would pass it, so this walks the
+        // whole phrase: for each position, swap in a different valid word and
+        // require a rejection.
+        //
+        // The 1-in-256 escape rate is real and unavoidable — that is what an
+        // 8-bit checksum means — so this asserts a RATE rather than perfection,
+        // and the bound is far tighter than a broken checksum could reach.
+        let phrase = RecoveryPhrase::from_seed(&[0x11; SEED_BYTES]).expect("phrase");
+        let words = phrase.words();
+
+        let mut attempts = 0;
+        let mut escaped = 0;
+        for position in 0..RecoveryPhrase::WORD_COUNT {
+            for candidate in ["zoo", "zone", "abandon", "ability"] {
+                if words[position] == candidate {
+                    continue;
+                }
+                let mut wrong = words.clone();
+                wrong[position] = candidate;
+                attempts += 1;
+                if RecoveryPhrase::parse(&wrong.join(" ")).is_ok() {
+                    escaped += 1;
+                }
+            }
+        }
+
+        assert!(attempts > 80, "the sweep should try most positions");
+        assert!(
+            escaped * 20 < attempts,
+            "{escaped} of {attempts} single-word substitutions were accepted; an 8-bit checksum \
+             should let through about one in 256"
         );
     }
 

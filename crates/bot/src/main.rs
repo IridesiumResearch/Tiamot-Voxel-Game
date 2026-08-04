@@ -387,13 +387,23 @@ fn bench_mode(
 
     // A FIXED seed and a fresh world. The point of the benchmark is that the
     // only thing changing between runs is the server.
+    //
+    // WITH the reference mods, so the world has ground. It used to run with no
+    // mods at all, which was harmless while nothing moved and became a
+    // pathological workload the moment Task 09 gave players physics: in a world
+    // of pure air every bot free-falls forever, its interest set follows it
+    // down, and the server generates and encodes a fresh layer of chunks every
+    // tick for the whole run. That is not a server under load, it is a server
+    // being asked to do something no real one does, and it doubled the measured
+    // p99 while the physics itself costs microseconds.
+    let mods = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../game");
     let server = match ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: world,
         max_players: 64,
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
-        mods_path: None,
+        mods_path: mods.canonicalize().ok(),
         seed: Some(0x7149_7231),
         rcon: None,
         materials: vec!["bench:stone".to_owned()],

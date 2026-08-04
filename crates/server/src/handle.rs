@@ -612,8 +612,20 @@ impl ServerHandle {
                                     player.origin,
                                     player.body.position,
                                 );
-                                player.origin = origin;
-                                player.body.position = local;
+                                if origin.in_world() {
+                                    player.origin = origin;
+                                    player.body.position = local;
+                                } else {
+                                    // The world is finite (charter rule 6), so a
+                                    // body must not leave it. Without this a
+                                    // player over a hole falls for ever, and
+                                    // their interest set follows them down —
+                                    // the server generating and encoding a
+                                    // fresh layer of chunks every tick, without
+                                    // end, for one player who is not going
+                                    // anywhere they can come back from.
+                                    player.body.velocity = [0.0; 3];
+                                }
                             }
                         }
 
