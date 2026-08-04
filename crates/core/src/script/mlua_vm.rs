@@ -32,7 +32,9 @@ use crate::chunk::Chunk;
 use crate::coords::{ChunkPos, LocalBlock};
 use crate::detgen::{ChunkBuffer, FractalParams, Region2d, StreamRng, fill_2d};
 use crate::material::MaterialId;
-use crate::script::vm::{Backend, BlockTexture, ScriptError, ScriptVm, VmLimits};
+use crate::script::vm::{
+    Backend, BlockRules, BlockTexture, Brush, ScriptError, ScriptVm, Tool, VmLimits,
+};
 
 /// Globals removed from every mod environment.
 ///
@@ -612,6 +614,78 @@ impl ScriptVm for MluaVm {
         textures.into_iter().map(|(_, texture)| texture).collect()
     }
 
+    fn registered_block_rules(&self) -> Vec<BlockRules> {
+        let ids = self.block_ids();
+        let rules = self
+            .lua
+            .named_registry_value::<Table>("tiamot.block_rules")
+            .ok();
+
+        // Driven by the block list, not by the rules table: every registered
+        // block gets an entry whether or not its mod said anything, so a caller
+        // never has to tell "no rules" apart from "default rules".
+        let mut all: Vec<(MaterialId, BlockRules)> = ids
+            .iter()
+            .map(|(block, id)| {
+                let entry = rules
+                    .as_ref()
+                    .and_then(|table| table.get::<Option<Table>>(block.as_str()).ok().flatten());
+                let hardness = entry
+                    .as_ref()
+                    .and_then(|entry| entry.get::<Option<f32>>("hardness").ok().flatten())
+                    .unwrap_or(BlockRules::DEFAULT_HARDNESS);
+                let drops = entry
+                    .as_ref()
+                    .and_then(|entry| entry.get::<Option<Table>>("drops").ok().flatten())
+                    .map(|drops| {
+                        drops
+                            .pairs::<String, u32>()
+                            .filter_map(Result::ok)
+                            .collect::<Vec<_>>()
+                    })
+                    .map(|mut drops| {
+                        // Contract §9: drop order is observable, so it must not
+                        // depend on Lua's table iteration.
+                        drops.sort();
+                        drops
+                    });
+                (
+                    *id,
+                    BlockRules {
+                        block: block.clone(),
+                        hardness,
+                        drops,
+                    },
+                )
+            })
+            .collect();
+
+        all.sort_by_key(|(id, _)| id.0);
+        all.into_iter().map(|(_, rules)| rules).collect()
+    }
+
+    fn registered_tools(&self) -> Vec<Tool> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.tools") else {
+            return Vec::new();
+        };
+
+        let mut tools: Vec<Tool> = registry
+            .pairs::<String, Table>()
+            .filter_map(Result::ok)
+            .filter_map(|(id, entry)| {
+                Some(Tool {
+                    brush: Brush::parse(&entry.get::<String>("brush").ok()?)?,
+                    speed_multiplier: entry.get("speed").ok()?,
+                    id,
+                })
+            })
+            .collect();
+
+        // Lua table order is unspecified and this list reaches the simulation.
+        tools.sort_by(|a, b| a.id.cmp(&b.id));
+        tools
+    }
+
     fn call_void(&mut self, mod_id: &str, name: &str) -> Result<(), ScriptError> {
         let env = self.environment(mod_id)?;
         let function: mlua::Function = env
@@ -708,6 +782,14 @@ impl MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("register_on_generate", register_on_generate)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
+        let register_tool = self
+            .lua
+            .create_function(move |lua, spec: Table| register_tool(lua, &owner, &spec))
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_tool", register_tool)
             .map_err(|err| self.vm_error(&err))?;
 
         let owner = mod_id.to_owned();
@@ -869,6 +951,14 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.block_textures", block_textures)
             .map_err(|err| self.vm_error(&err))?;
+        let block_rules = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.block_rules", block_rules)
+            .map_err(|err| self.vm_error(&err))?;
+        let tools = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.tools", tools)
+            .map_err(|err| self.vm_error(&err))?;
         let tickers = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.tickers", tickers)
@@ -978,6 +1068,38 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
     registry.set(qualified.clone(), next)?;
     lua.set_named_registry_value("tiamot.next_material", next + 1)?;
 
+    // Breaking rules, recorded whether or not the mod set them: an absent
+    // entry and a defaulted one must not be distinguishable downstream.
+    {
+        let hardness: Option<f32> = spec.get("hardness")?;
+        if let Some(hardness) = hardness
+            && (!hardness.is_finite() || hardness < 0.0)
+        {
+            return Err(mlua::Error::external(format!(
+                "register_block(\"{id}\"): hardness must be a non-negative number of seconds, \
+                 got {hardness}"
+            )));
+        }
+        let drops: Option<Table> = spec.get("drops")?;
+        let entry = lua.create_table()?;
+        if let Some(hardness) = hardness {
+            entry.set("hardness", hardness)?;
+        }
+        if let Some(drops) = drops {
+            let parsed = lua.create_table()?;
+            for pair in drops.pairs::<String, u32>() {
+                let (dropped, units) = pair?;
+                parsed.set(
+                    qualify_id(owner, &dropped).map_err(mlua::Error::external)?,
+                    units,
+                )?;
+            }
+            entry.set("drops", parsed)?;
+        }
+        let rules: Table = lua.named_registry_value("tiamot.block_rules")?;
+        rules.set(qualified.clone(), entry)?;
+    }
+
     if let Some(path) = texture {
         let entry = lua.create_table()?;
         // The owning mod travels with the path because the path is relative to
@@ -992,6 +1114,72 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
     }
     Ok(next)
 }
+
+/// Registers a tool: what it removes, and how fast.
+///
+/// The `brush` is the whole reason this exists as an API rather than a hard-
+/// coded rule. Sub-node resolution is only a real feature if a mod can reach
+/// it, and `brush = "subnode"` is how — `core:chisel` in the reference mods is
+/// nothing more than a mod using this.
+fn register_tool(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
+    let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+    if frozen {
+        return Err(mlua::Error::external(format!(
+            "mod `{owner}`: registration is closed"
+        )));
+    }
+
+    let id: String = spec
+        .get("id")
+        .map_err(|_| mlua::Error::external("register_tool: missing required field `id`"))?;
+
+    for pair in spec.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !TOOL_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "register_tool(\"{id}\"): unknown field `{name}`"
+                )));
+            }
+        }
+    }
+
+    let qualified = qualify_id(owner, &id).map_err(mlua::Error::external)?;
+
+    let brush: String = spec.get("brush").unwrap_or_else(|_| "block".to_owned());
+    if Brush::parse(&brush).is_none() {
+        return Err(mlua::Error::external(format!(
+            "register_tool(\"{qualified}\"): unknown brush `{brush}`. The engine implements \
+             `block` and `subnode`."
+        )));
+    }
+
+    let speed: f32 = spec.get("speed_multiplier").unwrap_or(1.0);
+    if !speed.is_finite() || speed <= 0.0 {
+        return Err(mlua::Error::external(format!(
+            "register_tool(\"{qualified}\"): speed_multiplier must be a positive number, got \
+             {speed}. A tool that digs at zero speed never finishes, which reads as a hung \
+             client rather than as a mistake in a mod."
+        )));
+    }
+
+    let registry: Table = lua.named_registry_value("tiamot.tools")?;
+    if registry.contains_key(qualified.clone())? {
+        return Err(mlua::Error::external(format!(
+            "tool `{qualified}` is already registered"
+        )));
+    }
+
+    let entry = lua.create_table()?;
+    entry.set("brush", brush)?;
+    entry.set("speed", speed)?;
+    registry.set(qualified, entry)?;
+    Ok(())
+}
+
+/// Fields `register_tool` accepts.
+const TOOL_FIELDS: [&str; 4] = ["id", "name", "brush", "speed_multiplier"];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
 const BLOCK_FIELDS: [&str; 7] = [
@@ -1503,5 +1691,187 @@ mod tests {
         let blocks = vm.block_ids();
         assert!(blocks.contains_key("mymod:white"), "{blocks:?}");
         assert!(blocks["mymod:white"].get() >= 2, "reserved ids are 0 and 1");
+    }
+}
+
+#[cfg(test)]
+mod dig_rules_tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn vm() -> MluaVm {
+        MluaVm::new(VmLimits::default()).expect("create vm")
+    }
+
+    fn load(vm: &mut MluaVm, id: &str, source: &str) -> Result<(), ScriptError> {
+        vm.load_mod(id, source, Path::new("."))
+    }
+
+    /// The backend's message, which is where a rejection explains itself.
+    ///
+    /// `ScriptError`'s `Display` deliberately says only which mod failed and
+    /// where — that line goes in a server log next to fifty others. The reason
+    /// a mod author needs is in `detail`, so that is what these assert on.
+    fn detail_of(err: &ScriptError) -> String {
+        match err {
+            ScriptError::Vm { detail, .. }
+            | ScriptError::Load { detail, .. }
+            | ScriptError::Runtime { detail, .. } => detail.clone(),
+            other => format!("{other}"),
+        }
+    }
+
+    #[test]
+    fn a_block_that_says_nothing_still_has_a_hardness() {
+        // The absent case is the common one, and it must not be special. A mod
+        // that forgot `hardness` should get a breakable block, not bedrock.
+        let mut vm = vm();
+        load(&mut vm, "core", r#"game.register_block{ id = "plain" }"#).expect("load");
+
+        let rules = vm.registered_block_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].block, "core:plain");
+        assert!(
+            (rules[0].hardness - BlockRules::DEFAULT_HARDNESS).abs() < 1e-6,
+            "got {}",
+            rules[0].hardness
+        );
+        assert!(rules[0].drops.is_none(), "no override means the usual rule");
+    }
+
+    #[test]
+    fn hardness_and_drops_reach_the_engine() {
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core",
+            r#"
+            game.register_block{ id = "stone", hardness = 2.5 }
+            game.register_block{ id = "ore", hardness = 4.0, drops = { gem = 3 } }
+            "#,
+        )
+        .expect("load");
+
+        let rules = vm.registered_block_rules();
+        assert_eq!(rules.len(), 2);
+        assert!((rules[0].hardness - 2.5).abs() < 1e-6);
+        assert_eq!(rules[0].drops, None);
+        assert!((rules[1].hardness - 4.0).abs() < 1e-6);
+        assert_eq!(
+            rules[1].drops.as_deref(),
+            Some(&[("core:gem".to_owned(), 3)][..]),
+            "a bare drop id is qualified with the registering mod's namespace"
+        );
+    }
+
+    #[test]
+    fn the_rules_come_back_in_material_id_order() {
+        // The same contract `registered_blocks` carries: this list reaches the
+        // simulation, and Lua's table iteration order is unspecified.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core",
+            r#"
+            game.register_block{ id = "zeta" }
+            game.register_block{ id = "alpha" }
+            game.register_block{ id = "mu" }
+            "#,
+        )
+        .expect("load");
+
+        let rules = vm.registered_block_rules();
+        let order: Vec<&str> = rules.iter().map(|entry| entry.block.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["core:zeta", "core:alpha", "core:mu"],
+            "registration order is id order, not alphabetical"
+        );
+    }
+
+    #[test]
+    fn a_negative_hardness_is_refused_rather_than_clamped() {
+        // Clamping would leave a mod believing it had set something.
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core",
+            r#"game.register_block{ id = "odd", hardness = -1 }"#,
+        )
+        .expect_err("should refuse");
+        assert!(
+            detail_of(&err).contains("hardness"),
+            "the error should name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_can_ask_for_a_subnode_brush() {
+        // The whole point of the tool API. Sub-node resolution is only a real
+        // feature if a mod can reach it without engine changes.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core",
+            r#"
+            game.register_tool{ id = "hand" }
+            game.register_tool{ id = "chisel", brush = "subnode", speed_multiplier = 0.5 }
+            "#,
+        )
+        .expect("load");
+
+        let tools = vm.registered_tools();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].id, "core:chisel");
+        assert_eq!(tools[0].brush, Brush::SubNode);
+        assert!((tools[0].speed_multiplier - 0.5).abs() < 1e-6);
+        assert_eq!(tools[1].id, "core:hand");
+        assert_eq!(
+            tools[1].brush,
+            Brush::Block,
+            "a tool that says nothing removes a whole block"
+        );
+    }
+
+    #[test]
+    fn an_unknown_brush_is_refused_and_says_what_exists() {
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core",
+            r#"game.register_tool{ id = "drill", brush = "sphere" }"#,
+        )
+        .expect_err("should refuse");
+        let text = detail_of(&err);
+        assert!(text.contains("sphere"), "should name the bad brush: {text}");
+        assert!(
+            text.contains("subnode"),
+            "should say which brushes exist: {text}"
+        );
+    }
+
+    #[test]
+    fn a_zero_speed_tool_is_refused_because_it_would_never_finish() {
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core",
+            r#"game.register_tool{ id = "useless", speed_multiplier = 0 }"#,
+        )
+        .expect_err("should refuse");
+        assert!(detail_of(&err).contains("speed_multiplier"), "{err:?}");
+    }
+
+    #[test]
+    fn a_typo_in_a_tool_field_names_the_field() {
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core",
+            r#"game.register_tool{ id = "chisel", brsh = "subnode" }"#,
+        )
+        .expect_err("should refuse");
+        assert!(detail_of(&err).contains("brsh"), "{err:?}");
     }
 }

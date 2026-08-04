@@ -226,6 +226,86 @@ pub struct BlockTexture {
     pub path: String,
 }
 
+/// How a tool removes material.
+///
+/// The shape a mod chooses when it registers a tool, and the reason
+/// `register_tool` takes a table rather than a string: `"block"` and
+/// `"subnode"` are the two the engine implements, and a mod that wants a 3×3
+/// column later should be able to say so without the API changing shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Brush {
+    /// Removes the whole block containing the targeted cell.
+    #[default]
+    Block,
+    /// Removes only the cell under the crosshair.
+    ///
+    /// The mechanism the whole sub-node design exists for. `core:chisel` in the
+    /// reference mods is the proof that a mod can reach it.
+    SubNode,
+}
+
+impl Brush {
+    /// Parses the wire/script spelling.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "block" => Some(Self::Block),
+            "subnode" => Some(Self::SubNode),
+            _ => None,
+        }
+    }
+
+    /// The spelling a mod writes.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::SubNode => "subnode",
+        }
+    }
+}
+
+/// What a mod said about how hard a block is to break, and what it yields.
+///
+/// Held apart from [`BlockTexture`] and [`ScriptVm::registered_blocks`] for the
+/// same reason those are apart from each other: the id order is a contract with
+/// the material registry, and widening that tuple would drag simulation rules
+/// into it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockRules {
+    /// The qualified block id.
+    pub block: String,
+    /// Seconds to break with a bare hand.
+    ///
+    /// A default rather than an absence: every block has *some* hardness, and
+    /// a mod that omits it gets [`BlockRules::DEFAULT_HARDNESS`] rather than an
+    /// unbreakable block, because "I forgot to set hardness" should not produce
+    /// bedrock.
+    pub hardness: f32,
+    /// What breaking it yields, if the mod overrode the default.
+    ///
+    /// `None` means the ordinary rule from the Sub-Node Contract §9: the block
+    /// drops itself, 27 units for a full block and one per occupied cell
+    /// otherwise. `Some` replaces that outright, in units.
+    pub drops: Option<Vec<(String, u32)>>,
+}
+
+impl BlockRules {
+    /// Seconds to break a block whose mod said nothing about hardness.
+    pub const DEFAULT_HARDNESS: f32 = 0.75;
+}
+
+/// A tool a mod registered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tool {
+    /// The qualified tool id, e.g. `"core:chisel"`.
+    pub id: String,
+    /// What shape it removes.
+    pub brush: Brush,
+    /// How much faster than a bare hand it digs.
+    pub speed_multiplier: f32,
+}
+
 /// A script VM hosting the server-mod tier.
 ///
 /// Implementors own the sandbox. Nothing above this trait may assume a
@@ -315,6 +395,16 @@ pub trait ScriptVm: Sized {
     /// what an untextured block looks like, and the client's placeholder is the
     /// client's business.
     fn registered_block_textures(&self) -> Vec<BlockTexture>;
+
+    /// Breaking rules registered alongside blocks, ordered by block id.
+    ///
+    /// Every registered block appears, including those whose mod said nothing:
+    /// the defaults are the engine's answer, and making a caller distinguish
+    /// "no entry" from "default entry" is how one of them ends up unbreakable.
+    fn registered_block_rules(&self) -> Vec<BlockRules>;
+
+    /// Tools registered during the loading window, ordered by id.
+    fn registered_tools(&self) -> Vec<Tool>;
 
     /// Calls a named zero-argument global, for benchmarking and tests.
     ///
