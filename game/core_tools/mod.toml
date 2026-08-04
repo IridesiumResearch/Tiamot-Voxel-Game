@@ -1,0 +1,12 @@
+# The engine's reference tools.
+#
+# NOTE: the mod id is `core_tools`, not `core`. A mod owns only its own id as a
+# registration namespace, and `core` belongs to `core_blocks` — that rule is
+# what stops a third-party mod shadowing engine content, so this mod follows it
+# rather than being an exception to it. The ids here are therefore
+# `core_tools:hand` and `core_tools:chisel`.
+id = "core_tools"
+name = "Core Tools"
+version = "0.1.0"
+description = "Reference tool registrations. A test fixture, not a game."
+license = "GPL-3.0-only"

@@ -38,6 +38,34 @@ fn stone() -> u16 {
     id.0
 }
 
+/// The reference mods, which define the tools and the ground.
+fn reference_mods() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../game")
+        .canonicalize()
+        .expect("the reference mods live at the repo root")
+}
+
+/// A server running the reference mods, so digging is possible at all.
+fn start_with_mods(name: &str) -> ServerHandle {
+    let dir = std::env::temp_dir().join("tiamot-mining").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: dir,
+        max_players: 8,
+        allowlist: Allowlist::open(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(reference_mods()),
+        seed: Some(5),
+        rcon: None,
+        materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
+    })
+    .expect("start")
+}
+
 fn start(name: &str) -> ServerHandle {
     let dir = std::env::temp_dir().join("tiamot-mining").join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -55,6 +83,26 @@ fn start(name: &str) -> ServerHandle {
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     })
     .expect("start")
+}
+
+/// Whether the server has broadcast a whole-block removal at `pos`.
+///
+/// Asserting that a block SURVIVED cannot use `expect_block`, and this is the
+/// mistake it exists to prevent: that helper asks "have I ever seen an edit
+/// setting this to that", so the bot's own earlier `place` satisfies it and the
+/// assertion can never fail. Two tests here were written that way and passed
+/// against a deliberately broken server; the absence of a removal is what
+/// "still there" actually means.
+fn saw_removal(bot: &Bot, pos: BlockPos) -> bool {
+    bot.received().into_iter().any(|message| {
+        matches!(
+            message,
+            tiamot_core::proto::ServerMessage::BlockDelta {
+                edit: tiamot_core::proto::Edit::Block { pos: at, material },
+                ..
+            } if at == pos && material == tiamot_core::MaterialId::AIR.0
+        )
+    })
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -375,7 +423,7 @@ fn a_dig_takes_time_and_yields_the_block_it_broke() {
     // would also let any client break every block in the world instantly —
     // which is precisely what charter rule 2 puts the decision on the server
     // to prevent.
-    let server = start("timed-dig");
+    let server = start_with_mods("timed-dig");
     let stone = stone();
 
     block_on(async {
@@ -422,7 +470,7 @@ fn a_dig_takes_time_and_yields_the_block_it_broke() {
 fn cancelling_a_dig_leaves_the_block_alone() {
     // The counter-example to the test above: without this, a server that
     // ignored `CancelDig` and broke everything eventually would still pass.
-    let server = start("cancelled-dig");
+    let server = start_with_mods("cancelled-dig");
     let stone = stone();
 
     block_on(async {
@@ -442,10 +490,133 @@ fn cancelling_a_dig_leaves_the_block_alone() {
         // over — the default hardness is 0.75 s.
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
-            bot.expect_block(pos, stone, Duration::from_millis(500))
-                .await
-                .is_ok(),
+            !saw_removal(&bot, pos),
             "the block went away after the dig was cancelled"
+        );
+    });
+
+    assert!(server.stop());
+}
+
+#[test]
+fn deleting_the_tools_mod_makes_the_world_undiggable() {
+    // Task 09's acceptance criterion, and charter rule 1 as an executable
+    // claim: the rules for breaking things live in `game/`, not in the engine.
+    //
+    // The engine knows how to COUNT a dig — ticks against hardness — and
+    // nothing about what a player digs with. `core_tools` says a bare hand
+    // exists and what it does. With no mods there is no tool, so a `StartDig`
+    // is accepted and simply never progresses.
+    //
+    // The pair is the test. Without the first half this passes on a server
+    // that cannot dig for some unrelated reason; without the second it passes
+    // on one that cannot dig at all.
+    let stone = stone();
+    let target_of =
+        |pos: BlockPos| tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
+
+    // With the tools mod: the block goes.
+    let server = start_with_mods("tools-present");
+    block_on(async {
+        let mut bot = join(&server).await;
+        let pos = BlockPos::new(6, 40, 6);
+        bot.place(pos, stone).await.expect("place");
+        bot.expect_block(pos, stone, Duration::from_secs(10))
+            .await
+            .expect("place should land");
+
+        bot.start_dig(target_of(pos)).await.expect("start dig");
+        bot.expect_block(pos, tiamot_core::MaterialId::AIR.0, Duration::from_secs(20))
+            .await
+            .expect("with a tools mod loaded, digging must work");
+    });
+    assert!(server.stop());
+
+    // Without it: the same request, and the block stays.
+    let server = start("tools-absent");
+    block_on(async {
+        let mut bot = join(&server).await;
+        let pos = BlockPos::new(6, 40, 6);
+        bot.place(pos, stone).await.expect("place");
+        bot.expect_block(pos, stone, Duration::from_secs(10))
+            .await
+            .expect("place should land");
+
+        bot.start_dig(target_of(pos)).await.expect("start dig");
+        // Far longer than the 0.75 s default hardness would need.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !saw_removal(&bot, pos),
+            "the block broke with no tools mod loaded; the engine is deciding how digging works"
+        );
+    });
+    assert!(server.stop());
+}
+
+#[test]
+fn the_chisel_takes_one_cell_where_a_hand_takes_the_block() {
+    // The claim sub-nodes exist to justify, proven through the mod API rather
+    // than asserted: `core_tools:chisel` registers `brush = "subnode"`, and
+    // nothing in the engine is special-cased for it.
+    //
+    // Contract §9 fixes the arithmetic on both sides: a whole block is 27
+    // units, one cell is 1.
+    let server = start_with_mods("chisel-vs-hand");
+    let stone = stone();
+
+    block_on(async {
+        let mut bot = join(&server).await;
+        let pos = BlockPos::new(8, 40, 8);
+        let target = tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
+
+        bot.place(pos, stone).await.expect("place");
+        bot.expect_block(pos, stone, Duration::from_secs(10))
+            .await
+            .expect("place should land");
+
+        bot.select_tool(Some("core_tools:chisel"))
+            .await
+            .expect("select chisel");
+        bot.start_dig(target).await.expect("start dig");
+
+        // One cell gone, not the block: `expect_block` reads the block's first
+        // cell, which the chisel did not touch, so the block is still stone.
+        let carried = bot
+            .await_inventory(Duration::from_secs(20))
+            .await
+            .expect("the cell should be credited");
+        assert!(
+            carried
+                .iter()
+                .any(|(id, units)| *id == stone && *units == 1),
+            "a chiselled cell should yield exactly 1 unit, got {carried:?}"
+        );
+        // Sharper than reading the block back: the broadcast says which KIND
+        // of edit happened. A sub-node edit at the target and no whole-block
+        // removal is exactly "one cell, not the cube".
+        let edits: Vec<_> = bot
+            .received()
+            .into_iter()
+            .filter_map(|message| match message {
+                tiamot_core::proto::ServerMessage::BlockDelta { edit, .. } => Some(edit),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            edits.iter().any(|edit| matches!(
+                edit,
+                tiamot_core::proto::Edit::SubNode { pos: at, material }
+                    if *at == target && *material == tiamot_core::MaterialId::AIR.0
+            )),
+            "no sub-node removal at the chiselled cell: {edits:?}"
+        );
+        assert!(
+            !edits.iter().any(|edit| matches!(
+                edit,
+                tiamot_core::proto::Edit::Block { pos: at, material }
+                    if *at == pos && *material == tiamot_core::MaterialId::AIR.0
+            )),
+            "the chisel removed the whole block instead of one cell: {edits:?}"
         );
     });
 

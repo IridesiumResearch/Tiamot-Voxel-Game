@@ -142,6 +142,7 @@ function Stream:next_bool() end
 ---@field name string? Display name.
 ---@field brush string? What shape it removes: `"block"` (default) or `"subnode"`.
 ---@field speed_multiplier number? How much faster than a bare hand. Default 1.0, must be positive.
+---@field default boolean? Whether this is what a player digs with holding nothing. The engine has no bare hand of its own, so a world whose mods register no default is one nobody can dig in. Lowest id wins if several mods mark one.
 
 ---Fields accepted by `game.register_action`.
 ---@class Tiamot.ActionSpec

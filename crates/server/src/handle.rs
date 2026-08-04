@@ -417,6 +417,12 @@ impl ServerHandle {
             .into_iter()
             .map(|tool| (tool.id.clone(), tool))
             .collect::<std::collections::BTreeMap<_, _>>();
+        // Lowest id among those marked default, so the answer does not depend
+        // on which mod loaded first.
+        let default_tool = tools
+            .values()
+            .find(|tool| tool.default)
+            .map(|tool| tool.id.clone());
         info!(
             hardness = hardness.len(),
             tools = tools.len(),
@@ -467,6 +473,7 @@ impl ServerHandle {
             bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             hardness,
             tools,
+            default_tool,
         });
 
         // The runtime is built here rather than inside the network thread, and

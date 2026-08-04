@@ -261,12 +261,23 @@ impl BlockRules {
 /// A tool a mod registered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tool {
-    /// The qualified tool id, e.g. `"core:chisel"`.
+    /// The qualified tool id, e.g. `"core_tools:chisel"`.
     pub id: String,
     /// What shape it removes.
     pub brush: Brush,
     /// How much faster than a bare hand it digs.
     pub speed_multiplier: f32,
+    /// Whether this is what a player digs with holding nothing.
+    ///
+    /// The engine has no bare hand of its own. It knows how to *count* a dig
+    /// and nothing about what breaking things should feel like, so a world
+    /// whose mods register no tools is a world nobody can dig in — which is
+    /// the shape charter rule 1 asks for, and is verified by deleting `game/`
+    /// in a test.
+    ///
+    /// Several mods may each mark one; the lowest id wins, so the result does
+    /// not depend on load order.
+    pub default: bool,
 }
 
 /// A script VM hosting the server-mod tier.

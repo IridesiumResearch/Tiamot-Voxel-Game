@@ -676,6 +676,7 @@ impl ScriptVm for MluaVm {
                 Some(Tool {
                     brush: Brush::parse(&entry.get::<String>("brush").ok()?)?,
                     speed_multiplier: entry.get("speed").ok()?,
+                    default: entry.get("default").unwrap_or(false),
                     id,
                 })
             })
@@ -1155,6 +1156,7 @@ fn register_tool(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
         )));
     }
 
+    let default: bool = spec.get("default").unwrap_or(false);
     let speed: f32 = spec.get("speed_multiplier").unwrap_or(1.0);
     if !speed.is_finite() || speed <= 0.0 {
         return Err(mlua::Error::external(format!(
@@ -1174,12 +1176,13 @@ fn register_tool(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     let entry = lua.create_table()?;
     entry.set("brush", brush)?;
     entry.set("speed", speed)?;
+    entry.set("default", default)?;
     registry.set(qualified, entry)?;
     Ok(())
 }
 
 /// Fields `register_tool` accepts.
-const TOOL_FIELDS: [&str; 4] = ["id", "name", "brush", "speed_multiplier"];
+const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "default"];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
 const BLOCK_FIELDS: [&str; 7] = [

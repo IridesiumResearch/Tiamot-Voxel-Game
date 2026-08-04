@@ -178,6 +178,12 @@ pub struct Shared {
     /// there is nothing that could change it while the server runs.
     pub tools: std::collections::BTreeMap<String, tiamot_core::script::Tool>,
 
+    /// The tool a player digs with when they have selected nothing.
+    ///
+    /// `None` when the loaded mods registered no default — and then nobody can
+    /// dig at all, which is deliberate. See [`Shared::resolve_tool`].
+    pub default_tool: Option<String>,
+
     /// Seconds to break each material with a bare hand.
     ///
     /// Keyed by WORLD material id, because that is what a chunk holds. A
@@ -365,9 +371,15 @@ impl Shared {
         match target {
             None => player.dig = None,
             Some(target) => {
-                // The brush comes from the tool, which the simulation resolves
-                // — this layer does not know what a chisel is.
-                let brush = self.brush_of(player.tool.as_deref());
+                // No tool, no dig. A mod says what a player digs with, so a
+                // world with no tools mod is one nobody can dig in.
+                let Some(brush) = self
+                    .resolve_tool(player.tool.as_deref())
+                    .map(|tool| tool.brush)
+                else {
+                    player.dig = None;
+                    return;
+                };
                 match player.dig.as_mut() {
                     Some(dig) => {
                         dig.retarget(target, brush);
@@ -395,18 +407,18 @@ impl Shared {
         }
     }
 
-    /// The brush a tool removes with, defaulting to a bare hand's whole block.
+    /// The tool a player is actually using: what they chose, or the mod's
+    /// default, or nothing.
+    ///
+    /// `None` means they cannot dig, and that is not a failure path — it is a
+    /// world whose mods registered no tools. The engine knows how to *count* a
+    /// dig and nothing about what a player breaks things with, so it has no
+    /// opinion of its own to fall back on (charter rule 1).
     #[must_use]
-    pub fn brush_of(&self, tool: Option<&str>) -> tiamot_core::dig::Brush {
-        tool.and_then(|id| self.tools.get(id))
-            .map_or(tiamot_core::dig::Brush::Block, |tool| tool.brush)
-    }
-
-    /// How fast a tool digs, defaulting to a bare hand's 1.0.
-    #[must_use]
-    pub fn speed_of(&self, tool: Option<&str>) -> f32 {
-        tool.and_then(|id| self.tools.get(id))
-            .map_or(1.0, |tool| tool.speed_multiplier)
+    pub fn resolve_tool(&self, chosen: Option<&str>) -> Option<&tiamot_core::script::Tool> {
+        chosen
+            .and_then(|id| self.tools.get(id))
+            .or_else(|| self.tools.get(self.default_tool.as_deref()?))
     }
 
     /// How long a material takes to break with a bare hand, in seconds.
@@ -447,9 +459,8 @@ impl Shared {
         let mut bodies = self.bodies.lock().ok()?;
         let player = bodies.get_mut(uuid)?;
         let speed = self
-            .tools
-            .get(player.tool.as_deref().unwrap_or(""))
-            .map_or(1.0, |tool| tool.speed_multiplier);
+            .resolve_tool(player.tool.as_deref())
+            .map(|tool| tool.speed_multiplier)?;
         Some(player.dig.as_mut()?.advance(hardness, speed))
     }
 
@@ -1181,6 +1192,7 @@ mod tests {
             bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             tools: std::collections::BTreeMap::new(),
             hardness: std::collections::BTreeMap::new(),
+            default_tool: None,
         }
     }
 
