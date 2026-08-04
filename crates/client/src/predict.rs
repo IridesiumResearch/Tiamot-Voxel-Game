@@ -89,6 +89,14 @@ pub struct Predictor {
     pending: VecDeque<(u64, Intent)>,
     /// Visual-only offset, in cells, blended out over [`SMOOTH_TICKS`].
     error: [f32; 3],
+    /// How far the body moved on the most recent tick, in cells.
+    ///
+    /// Held as a *delta* rather than as the previous position, and that is the
+    /// detail that makes it correct rather than merely convenient. A previous
+    /// position would be anchored to whichever chunk was the origin when it was
+    /// taken, so [`Predictor::settle`] re-homing the origin mid-walk would
+    /// leave it a whole chunk out; a delta is the same number in either frame.
+    last_step: [f32; 3],
     /// The last tick predicted.
     tick: u64,
 }
@@ -102,6 +110,7 @@ impl Predictor {
             body: Body::at(local),
             pending: VecDeque::new(),
             error: [0.0; 3],
+            last_step: [0.0; 3],
             tick,
         }
     }
@@ -137,8 +146,7 @@ impl Predictor {
 
     /// Advances one tick locally and records the input for replay.
     pub fn predict(&mut self, solid: &impl Solid, tick: u64, intent: Intent, tuning: &Tuning) {
-        self.body = phys::step(solid, self.body, intent, tuning);
-        self.settle();
+        self.step(solid, intent, tuning);
         self.pending.push_back((tick, intent));
         self.tick = tick;
 
@@ -170,8 +178,7 @@ impl Predictor {
         // at all — it would throw away every input still in flight.
         let replay: Vec<(u64, Intent)> = self.pending.iter().copied().collect();
         for (_, intent) in replay {
-            self.body = phys::step(solid, self.body, intent, tuning);
-            self.settle();
+            self.step(solid, intent, tuning);
         }
 
         let corrected = self.world_position();
@@ -210,11 +217,54 @@ impl Predictor {
     /// correction.
     #[must_use]
     pub fn render_local(&self) -> [f32; 3] {
+        self.render_local_at(1.0)
+    }
+
+    /// Where to draw the body `alpha` of the way through the current tick.
+    ///
+    /// **This is what stops walking looking like 20 fps on a 900 fps machine.**
+    /// The simulation is a fixed 20 Hz because charter rule 4 requires it, so
+    /// the body occupies exactly 20 positions a second however many frames are
+    /// drawn. Pinning the camera to it makes a staircase — and because
+    /// mouse-look *is* per-frame, the result is a view that turns smoothly and
+    /// walks in visible steps, which reads as a frame-rate problem rather than
+    /// a sampling one. Charter rule 18 measures pacing, and this is pacing.
+    ///
+    /// `alpha` is how much of a tick has accumulated since the last one, so
+    /// this interpolates between the previous tick and the current one rather
+    /// than extrapolating past it. That trades up to one tick of camera latency
+    /// — 50 ms, and half that on average — for never overshooting, and
+    /// overshoot is what the player would actually notice: an extrapolated
+    /// camera slides past every wall it stops at and snaps back.
+    ///
+    /// Presentation only. Charter rule 4 exempts it and nothing here re-enters
+    /// the body that gets replayed, which is why it may interpolate at all.
+    #[must_use]
+    pub fn render_local_at(&self, alpha: f32) -> [f32; 3] {
+        let behind = 1.0 - alpha.clamp(0.0, 1.0);
         [
-            self.body.position[0] + self.error[0],
-            self.body.position[1] + self.error[1],
-            self.body.position[2] + self.error[2],
+            self.body.position[0] - self.last_step[0] * behind + self.error[0],
+            self.body.position[1] - self.last_step[1] * behind + self.error[1],
+            self.body.position[2] - self.last_step[2] * behind + self.error[2],
         ]
+    }
+
+    /// One simulation tick, recording how far it moved the body.
+    ///
+    /// Prediction and the reconcile replay both go through here so they cannot
+    /// disagree about [`Predictor::last_step`]. The delta is measured *before*
+    /// [`Predictor::settle`], while both positions are still anchored to the
+    /// same origin — after it, a body that crossed a chunk boundary would
+    /// subtract two coordinates from different frames and report a 48-cell step.
+    fn step(&mut self, solid: &impl Solid, intent: Intent, tuning: &Tuning) {
+        let before = self.body.position;
+        self.body = phys::step(solid, self.body, intent, tuning);
+        self.last_step = [
+            self.body.position[0] - before[0],
+            self.body.position[1] - before[1],
+            self.body.position[2] - before[2],
+        ];
+        self.settle();
     }
 
     /// Keeps the local coordinates inside the origin chunk (charter rule 7).
@@ -282,6 +332,85 @@ mod tests {
 
     fn predictor() -> Predictor {
         Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 0)
+    }
+
+    #[test]
+    fn the_body_is_drawn_between_ticks_and_not_only_on_them() {
+        // The bug: the camera was pinned to the simulated body, which advances
+        // exactly 20 times a second, so walking looked like 20 fps on a machine
+        // drawing 900. Sampling within one tick has to produce distinct,
+        // advancing positions.
+        let ground = Ground::flat();
+        let mut client = predictor();
+        for tick in 1..=4 {
+            client.predict(&ground, tick, walking(), &Tuning::DEFAULT);
+        }
+
+        let samples: Vec<f32> = (0..=4)
+            .map(|i| client.render_local_at(i as f32 / 4.0)[0])
+            .collect();
+
+        // The counter-example that makes this non-vacuous: the OLD code
+        // returned the body position whatever the alpha, so every sample here
+        // would be identical and the walk would be a staircase.
+        assert!(
+            samples[0] < samples[4],
+            "sampling across one tick gave {samples:?}, which never moves — the camera is \
+             still pinned to the tick boundary"
+        );
+        for pair in samples.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "the interpolated position went backwards inside a tick: {samples:?}"
+            );
+        }
+
+        // And the two ends are exactly the tick's start and finish, so the
+        // camera neither lags further than one tick nor runs ahead of the
+        // simulation.
+        assert_eq!(
+            samples[4].to_bits(),
+            client.render_local()[0].to_bits(),
+            "a full alpha must land on the simulated body, not past it"
+        );
+        let step = client.last_step[0];
+        assert!(
+            (samples[0] - (samples[4] - step)).abs() < 1e-4,
+            "a zero alpha should sit one whole tick behind; it was {} rather than {}",
+            samples[0],
+            samples[4] - step
+        );
+    }
+
+    #[test]
+    fn interpolation_survives_the_body_changing_origin_chunk() {
+        // `settle` re-homes the origin when the body leaves its chunk, so a
+        // previous *position* would be measured against a different corner and
+        // the camera would fly a whole chunk sideways for one frame. Holding a
+        // delta instead is what makes this pass; the test walks far enough to
+        // guarantee at least one re-home.
+        let ground = Ground::flat();
+        let mut client = Predictor::new(ChunkPos::new(0, 0, 0), [47.0, 0.0, 24.0], 0);
+        let start = client.origin();
+
+        let mut worst = 0.0f32;
+        for tick in 1..=60 {
+            client.predict(&ground, tick, walking(), &Tuning::DEFAULT);
+            let span = client.render_local_at(1.0)[0] - client.render_local_at(0.0)[0];
+            worst = worst.max(span.abs());
+        }
+
+        assert_ne!(
+            client.origin(),
+            start,
+            "the body never left its chunk, so this never exercised the re-home it is about"
+        );
+        assert!(
+            worst < 8.0,
+            "one tick of interpolation spanned {worst} cells; a chunk is {}, so the origin \
+             re-home leaked into the drawn position",
+            tiamot_core::CHUNK_SUBNODES
+        );
     }
 
     #[test]

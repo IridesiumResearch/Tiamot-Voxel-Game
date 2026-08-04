@@ -133,6 +133,54 @@ pub struct Input {
     pub teleport: Option<Teleport>,
 }
 
+/// Rotates a frame's keys into a world-space [`Intent`].
+///
+/// The rotation by yaw happens HERE, on the client, and that is a charter rule
+/// 4 decision rather than a convenience: `sin` and `cos` are banned from
+/// simulation because they are libm calls that differ across platforms. The
+/// client is exempt — this is input handling, not the tick — so it rotates once
+/// and sends the result, and both ends then simulate from identical numbers.
+///
+/// Free-standing rather than a method so it can be tested without a GPU. That
+/// is not a stylistic preference: while it was a method on `App`, the only way
+/// to reach it was to build a renderer, so nothing tested it and it shipped
+/// with its strafe axis inverted.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "charter rule 4 exempts client input handling from the deterministic float subset; \
+              this rotates a keypress into a direction and the RESULT is what both ends simulate \
+              from, so no platform-dependent value ever reaches the tick"
+)]
+#[must_use]
+pub fn intent_at_yaw(yaw: f32, input: Input) -> Intent {
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    // Matches `Camera::forward`: yaw turns right, and east is −x.
+    let forward = [-sin_yaw, cos_yaw];
+    // Both components are negated, and dropping either negation swaps A and D.
+    // This is the horizontal half of `Camera::right()` — `forward × Y`, which at
+    // yaw 0 is −x — and it has to be derived that way rather than guessed:
+    // `[cos_yaw, sin_yaw]` points at +x, which `Camera::forward` documents as
+    // WEST. Written that way, strafing right walked left. Free-fly was
+    // unaffected because it calls `Camera::right()` directly, which is why all
+    // of Task 08's window testing went past this without noticing.
+    let right = [-cos_yaw, -sin_yaw];
+
+    Intent {
+        walk: [
+            forward[0] * input.forward + right[0] * input.right,
+            forward[1] * input.forward + right[1] * input.right,
+        ],
+        jump: input.jump,
+        gait: if input.sneak {
+            phys::Gait::Sneak
+        } else if input.sprint {
+            phys::Gait::Sprint
+        } else {
+            phys::Gait::Walk
+        },
+    }
+}
+
 /// The client, between frames.
 pub struct App {
     config: Config,
@@ -340,6 +388,17 @@ impl App {
     #[must_use]
     pub const fn joined(&self) -> bool {
         self.joined
+    }
+
+    /// Whether there is a predicted body driving the camera.
+    ///
+    /// Exposed so a test can say that it is exercising the controller rather
+    /// than free-fly. The two take different paths through [`App::advance`],
+    /// and a test that silently ran the free-fly one would assert nothing about
+    /// the controller while looking exactly as though it had.
+    #[must_use]
+    pub const fn predicting(&self) -> bool {
+        self.predictor.is_some()
     }
 
     /// Closes the connection.
@@ -555,53 +614,33 @@ impl App {
         if let Some(predictor) = self.predictor.as_mut() {
             predictor.smooth(dt / TICK_SECONDS);
         }
-        self.follow_body();
+
+        // Whatever time did not buy a whole tick is how far through the current
+        // one this frame is, and the camera is drawn there rather than at the
+        // tick boundary. Without it the camera moves 20 times a second no
+        // matter how fast the client draws.
+        self.follow_body(self.tick_carry / TICK_SECONDS);
     }
 
     /// Turns this frame's keys into a world-space intent.
-    ///
-    /// The rotation by yaw happens HERE, on the client, and that is a charter
-    /// rule 4 decision rather than a convenience: `sin` and `cos` are banned
-    /// from simulation because they are libm calls that differ across
-    /// platforms. The client is exempt — this is input handling, not the tick —
-    /// so it rotates once and sends the result, and both ends then simulate
-    /// from identical numbers.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "charter rule 4 exempts client input handling from the deterministic float \
-                  subset; this rotates a keypress into a direction and the RESULT is what both \
-                  ends simulate from, so no platform-dependent value ever reaches the tick"
-    )]
     fn intent_from(&self, input: Input) -> Intent {
-        let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
-        // Matches `Camera::forward`: yaw turns right, and east is −x.
-        let forward = [-sin_yaw, cos_yaw];
-        let right = [cos_yaw, sin_yaw];
-
-        Intent {
-            walk: [
-                forward[0] * input.forward + right[0] * input.right,
-                forward[1] * input.forward + right[1] * input.right,
-            ],
-            jump: input.jump,
-            gait: if input.sneak {
-                phys::Gait::Sneak
-            } else if input.sprint {
-                phys::Gait::Sprint
-            } else {
-                phys::Gait::Walk
-            },
-        }
+        intent_at_yaw(self.camera.yaw, input)
     }
 
     /// Puts the camera at the predicted body's eyes.
-    fn follow_body(&mut self) {
+    fn follow_body(&mut self, alpha: f32) {
         let Some(predictor) = self.predictor.as_ref() else {
             return;
         };
-        let local = predictor.render_local();
+        let local = predictor.render_local_at(alpha);
         let cells = f64::from(tiamot_core::SUBNODES_PER_AXIS);
-        let corner = tiamot_core::BlockPos::from_chunk_corner(predictor.origin());
+        // Displaced by the debug teleport, or this drags the camera straight
+        // back to the body's real position while the world stays 50,000 blocks
+        // out — an empty sky, one frame after the jump. `drawn_at` displaces
+        // the chunks, so the camera has to be displaced by the same amount or
+        // the two are drawn in different coordinate systems. Free-fly never hit
+        // this because nothing was writing the camera position every frame.
+        let corner = tiamot_core::BlockPos::from_chunk_corner(self.drawn_at(predictor.origin()));
 
         // Cells to blocks, and the eye offset on top. Presentation arithmetic:
         // the division by three is exact enough for a camera and never feeds
@@ -799,6 +838,73 @@ pub fn build_atlas(
 mod tests {
     use super::*;
     use tiamot_core::proto::MaterialDef;
+
+    /// An `Input` holding one direction, everything else neutral.
+    fn pressing(forward: f32, right: f32) -> Input {
+        Input {
+            forward,
+            right,
+            ..Input::default()
+        }
+    }
+
+    #[test]
+    fn strafing_walks_the_way_the_camera_calls_right() {
+        // The bug this pins: `intent_at_yaw` built its own strafe axis, got the
+        // sign wrong, and sent the player left when they pressed D. Free-fly
+        // asks `Camera::right()` and was always correct, so the two disagreed
+        // for a whole task without any test noticing. Deriving the expected
+        // answer FROM the camera is the point — a test that hard-codes the
+        // numbers would have been written from the same wrong reasoning as the
+        // code, and would have passed.
+        for eighth in 0..8 {
+            let yaw = std::f32::consts::TAU * eighth as f32 / 8.0;
+            let camera = Camera {
+                yaw,
+                ..Camera::default()
+            };
+
+            let strafe = intent_at_yaw(yaw, pressing(0.0, 1.0)).walk;
+            let expected = camera.right();
+            assert!(
+                (strafe[0] - expected.x).abs() < 1e-5 && (strafe[1] - expected.z).abs() < 1e-5,
+                "at yaw {yaw} pressing right walked {strafe:?}, but the camera calls right \
+                 ({}, {})",
+                expected.x,
+                expected.z
+            );
+
+            // And forward, on the same basis, so a future edit cannot fix one
+            // axis by rotating both.
+            let ahead = intent_at_yaw(yaw, pressing(1.0, 0.0)).walk;
+            let facing = camera.forward();
+            assert!(
+                (ahead[0] - facing.x).abs() < 1e-5 && (ahead[1] - facing.z).abs() < 1e-5,
+                "at yaw {yaw} pressing forward walked {ahead:?}, but the camera faces ({}, {})",
+                facing.x,
+                facing.z
+            );
+        }
+    }
+
+    #[test]
+    fn pressing_right_while_facing_north_walks_east() {
+        // The concrete case a player reports, spelled out in compass terms so
+        // the sign is readable without composing two rotations in your head.
+        // `Camera::forward` documents east as −x.
+        let strafe = intent_at_yaw(0.0, pressing(0.0, 1.0)).walk;
+        assert!(
+            strafe[0] < -0.9,
+            "facing north, pressing right should walk east at −x, not {strafe:?}"
+        );
+        // The counter-example: the inverted version walks to +x, which the
+        // camera calls west. Without this line the assertion above would still
+        // pass on an implementation that had merely scaled the axis.
+        assert!(
+            strafe[0] < 0.0,
+            "pressing right walked west; A and D are swapped"
+        );
+    }
 
     #[test]
     fn the_compass_names_every_sector_and_wraps() {

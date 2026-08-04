@@ -272,6 +272,60 @@ fn teleporting_fifty_thousand_blocks_leaves_the_geometry_where_it_was() {
 }
 
 #[test]
+fn the_teleport_survives_the_frame_after_it() {
+    // Its own test rather than another assertion on the one above, because
+    // proving this needs a frame to be ADVANCED, and advancing one lets the
+    // body settle — which moves the camera and breaks that test's
+    // pixel-for-pixel comparisons for a reason that has nothing to do with what
+    // it is checking.
+    //
+    // The regression: `advance` re-derives the camera from the predicted body
+    // every frame, and did so without the debug teleport's displacement. The
+    // world stayed 50,000 blocks out while the camera was dragged home, so one
+    // frame after the jump the screen was empty sky — the exact failure mode
+    // `e3594b1` fixed for Task 08, re-introduced by the walking controller that
+    // replaced free-fly. Nothing caught it because the teleport test captures
+    // its frames the instant it jumps and never runs another one.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("teleport-frame");
+    let mut app = client("teleport-frame", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined() && app.meshed_chunks() >= 4));
+    assert!(
+        app.predicting(),
+        "there is no predicted body, so `advance` would not re-derive the camera at all and \
+         this test could not see the bug it is about"
+    );
+
+    app.teleport(Teleport::Far);
+    let displaced = app.camera().position.chunk;
+
+    for _ in 0..5 {
+        app.pump_network();
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        assert_eq!(
+            app.camera().position.chunk.x,
+            displaced.x,
+            "the camera came back from {} to {} while the world stayed displaced",
+            displaced.x,
+            app.camera().position.chunk.x
+        );
+    }
+
+    let target = Offscreen::new(app.renderer().gpu(), WIDTH, HEIGHT);
+    let camera = *app.camera();
+    let frame = target.capture(app.renderer(), &camera).expect("capture");
+    assert!(
+        shows_a_world(&frame),
+        "five frames after the teleport the screen is empty sky"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}
+
+#[test]
 fn a_stall_does_not_leave_the_player_unable_to_move() {
     // The reported symptom — jitter with no movement — reproduced by the thing
     // a real client does and a headless test never does: STALL.
