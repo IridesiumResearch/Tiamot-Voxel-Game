@@ -52,9 +52,13 @@ fn host_for(root: &Path) -> EngineHost {
 #[test]
 fn the_reference_mods_load_in_dependency_order() {
     let host = host_for(&game_dir());
+    // Every mod in `game/`, in load order. Listed exhaustively rather than
+    // spot-checked: this is the test that notices a reference mod being added
+    // or removed, which is exactly the change most likely to be made without
+    // thinking about load order.
     assert_eq!(
         host.resolved().ids(),
-        vec!["core", "core_worldgen"],
+        vec!["core", "core_tools", "core_worldgen"],
         "core_worldgen depends on core and must load after it"
     );
     assert!(
