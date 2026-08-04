@@ -68,6 +68,22 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// Chunks remeshed per frame. See the module docs.
 pub const REMESH_BUDGET: usize = 4;
 
+/// How long a frame may spend remeshing before it stops and finishes next
+/// frame.
+///
+/// The ceiling [`REMESH_BUDGET`] cannot provide on its own. A chunk count is a
+/// budget only if you already know what a chunk costs, and that varies by
+/// almost two orders of magnitude: 0.124 ms per chunk in release on a fast
+/// desktop, 2.97 ms in a debug build of the same code on the same machine, and
+/// more again on charter rule 18's minimum spec of a six-core i5. Four chunks
+/// is comfortably sub-millisecond in the first case and twelve milliseconds in
+/// the second — a visible hitch, which is what was reported.
+///
+/// 2 ms leaves room for the rest of a 16 ms frame while still draining a
+/// streaming queue quickly. It is a *pacing* bound, which is the metric charter
+/// rule 18 names, and deliberately not an average-throughput one.
+pub const REMESH_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// How far the debug teleport jumps, in blocks.
 ///
 /// The number in Task 08's acceptance criteria. Far enough that a world-space
@@ -622,7 +638,8 @@ impl App {
         true
     }
 
-    /// Remeshes up to [`REMESH_BUDGET`] chunks, nearest to the camera first.
+    /// Remeshes chunks nearest the camera, within [`REMESH_BUDGET`] and
+    /// [`REMESH_TIME_BUDGET`].
     ///
     /// Returns how many were rebuilt.
     pub fn remesh(&mut self) -> usize {
@@ -635,15 +652,18 @@ impl App {
         }
 
         // Meshing and upload are timed SEPARATELY, because they are different
-        // problems with different fixes and the first version of this could not
-        // tell them apart. Measured on an RTX 5070 Ti, the pair cost 15.6 ms of
-        // a 17.0 ms frame for four chunks whose meshes together came to well
-        // under a megabyte — and a cost that ignores data size is allocation
-        // overhead, which is upload, not meshing. Splitting the clock is what
-        // turns "the remesh is slow" into something actionable.
+        // problems with different fixes and one number could not tell them
+        // apart. That ambiguity cost a whole round trip: a 15.6 ms remesh was
+        // read as mesh upload on the strength of how little geometry was
+        // resident, and the split then showed it was 15.1 ms of meshing and
+        // 0.1 ms of upload. Mesh cost scales with the CELLS SCANNED — all
+        // 110,592 of them, every time — and not at all with how small the
+        // resulting mesh is, which is exactly the inference that went wrong.
         let started = std::time::Instant::now();
         let mut meshing = std::time::Duration::ZERO;
-        for pos in &due {
+        let mut rebuilt = 0;
+
+        for (index, pos) in due.iter().enumerate() {
             let Some(chunk) = self.store.get(*pos) else {
                 continue;
             };
@@ -654,14 +674,28 @@ impl App {
             meshing += mesh_started.elapsed();
 
             self.renderer.set_chunk(self.drawn_at(*pos), &mesh);
+            rebuilt += 1;
+
+            // A count is not a budget on a machine you have not measured.
+            // Four chunks is half a millisecond in release on a fast desktop
+            // and twelve in a debug build; charter rule 18's minimum spec is a
+            // six-core i5, so the fixed count that is comfortable here is not
+            // comfortable everywhere. Time is the thing actually being
+            // protected, so time is what this spends. At least one chunk
+            // always goes through — a budget that can rebuild nothing would let
+            // a slow frame stop the world filling in for ever.
+            if started.elapsed() >= REMESH_TIME_BUDGET && index + 1 < due.len() {
+                self.store.requeue(&due[index + 1..]);
+                break;
+            }
         }
 
         self.pacing.remesh(
             started.elapsed().as_secs_f32() * 1000.0,
             meshing.as_secs_f32() * 1000.0,
-            due.len(),
+            rebuilt,
         );
-        due.len()
+        rebuilt
     }
 
     /// Moves the camera and records the frame time.
@@ -1183,6 +1217,22 @@ mod tests {
         assert!(
             worst_case_ms < 16.0 / 4.0,
             "a full remesh budget is {worst_case_ms} ms, too much of a 16 ms frame"
+        );
+
+        // But that arithmetic only holds while a chunk costs what the spike
+        // measured, and the reported hitch was a debug build where it cost
+        // 2.97 ms — 27x — turning this "safe" budget into 12 ms of a frame. The
+        // time budget is what holds when the per-chunk assumption does not, so
+        // it has to be the smaller of the two bounds on a slow build.
+        assert!(
+            REMESH_TIME_BUDGET < std::time::Duration::from_millis(16 / 4),
+            "the time budget is not a bound on a quarter of a 16 ms frame"
+        );
+        let slow_build_ms = REMESH_BUDGET as f64 * 2.97;
+        assert!(
+            REMESH_TIME_BUDGET.as_secs_f64() * 1000.0 < slow_build_ms,
+            "at the debug build's measured {slow_build_ms} ms for a full count budget, the \
+             time budget has to be what stops the frame, and it is not"
         );
     }
 

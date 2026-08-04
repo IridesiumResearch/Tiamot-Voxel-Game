@@ -277,6 +277,16 @@ impl ChunkStore {
         candidates
     }
 
+    /// Puts chunks a remesh did not get to back in the queue.
+    ///
+    /// The other half of a [`ChunkStore::take_dirty`] that was abandoned part
+    /// way through — without it, giving up on a frame's remaining chunks would
+    /// silently drop them and leave holes in the world that nothing ever
+    /// rebuilt.
+    pub fn requeue(&mut self, positions: &[ChunkPos]) {
+        self.dirty.extend(positions.iter().copied());
+    }
+
     /// Marks every held chunk for remeshing.
     ///
     /// For a render-mode change, where nothing about the world moved but every
@@ -439,6 +449,33 @@ mod tests {
         }
         assert_eq!(seen.len(), 6, "every chunk must eventually be remeshed");
         assert_eq!(store.dirty_len(), 0);
+    }
+
+    #[test]
+    fn a_remesh_that_runs_out_of_time_puts_the_rest_back() {
+        // `take_dirty` REMOVES what it hands out, so a caller that abandons the
+        // frame part way through owns those positions. Dropping them loses the
+        // chunks for ever — no further edit is coming to re-dirty them — and the
+        // symptom is a permanent hole in the world rather than a slow one.
+        let mut store = ChunkStore::new();
+        for x in 0..6 {
+            store.insert(chunk_at(x, 0, 0));
+        }
+
+        let due = store.take_dirty(ChunkPos::new(0, 0, 0), 6);
+        assert_eq!(due.len(), 6);
+        assert_eq!(store.dirty_len(), 0, "take_dirty must hand over ownership");
+
+        // One rebuilt, five abandoned.
+        store.requeue(&due[1..]);
+        assert_eq!(store.dirty_len(), 5);
+
+        let rest = store.take_dirty(ChunkPos::new(0, 0, 0), 8);
+        assert_eq!(
+            rest.len(),
+            5,
+            "the abandoned chunks did not come back and will never be remeshed"
+        );
     }
 
     #[test]
