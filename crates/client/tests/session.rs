@@ -270,3 +270,131 @@ fn teleporting_fifty_thousand_blocks_leaves_the_geometry_where_it_was() {
     app.shutdown();
     assert!(server.stop());
 }
+
+#[test]
+fn a_stall_does_not_leave_the_player_unable_to_move() {
+    // The reported symptom — jitter with no movement — reproduced by the thing
+    // a real client does and a headless test never does: STALL.
+    //
+    // The client's tick was a free-running counter, and `walk` discards the
+    // backlog after a long frame so the count does not fast-forward the player.
+    // That means a stall permanently LOSES ticks. The server refuses any input
+    // whose tick it has already passed, so once the client falls behind, every
+    // input it will ever send is refused — the player is frozen server-side
+    // while the client predicts and is snapped back 20 times a second.
+    //
+    // A window has stalls constantly: GPU init, chunk uploads, a dragged
+    // window, a missed vsync. This is one, made explicit.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("stall");
+    let mut app = client("stall", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined() && app.meshed_chunks() >= 4));
+
+    let forward = Input {
+        forward: 1.0,
+        ..Input::default()
+    };
+    let walk_for = |app: &mut App, seconds: f32| {
+        let deadline = Instant::now() + Duration::from_secs_f32(seconds);
+        while Instant::now() < deadline {
+            assert!(app.pump_network(), "connection ended");
+            app.remesh();
+            app.advance(forward, 1.0 / 60.0);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+    };
+
+    walk_for(&mut app, 1.0);
+    println!("before stall: client/server tick = {:?}", app.tick_pair());
+
+    // The stall: two seconds in which no frame runs at all.
+    std::thread::sleep(Duration::from_secs(2));
+
+    let before = app.server_travelled();
+    println!("after stall:  client/server tick = {:?}", app.tick_pair());
+    walk_for(&mut app, 4.0);
+    let after = app.server_travelled();
+    println!("at end:       client/server tick = {:?}", app.tick_pair());
+
+    assert!(
+        after - before > 2.0,
+        "after a two-second stall the player moved {:.2} blocks in four seconds of walking; \
+         the client's tick fell behind the server's and every input is being refused",
+        after - before
+    );
+
+    // The invariant underneath it. An input is refused outright once its tick
+    // is one the server has already passed, so this is the thing that must
+    // never stop being true — and it is measurable long before a player
+    // notices anything wrong.
+    let (client_tick, server_tick) = app.tick_pair();
+    assert!(
+        client_tick > server_tick,
+        "the client is predicting tick {client_tick} while the server has reached \
+         {server_tick}; every input it sends from here is refused"
+    );
+}
+
+#[test]
+fn holding_forward_actually_moves_the_player() {
+    // Reported from the window: "I seem to be stuck in place. There is a lot of
+    // jitter and jump when I try to move but I never leave the spawn coords."
+    //
+    // That is prediction fighting reconciliation. The client predicts forward,
+    // the server says "still at spawn", and the correction drags it back every
+    // 50 ms — which looks exactly like jitter around a fixed point.
+    //
+    // The cause is the tick number. The server refuses any input whose tick it
+    // has already passed, and the client's tick was a free-running counter
+    // seeded once at join: the join flow takes time, so it starts behind, and
+    // `walk` discards the backlog after a stall so it never catches up. Every
+    // input refused, forever.
+    //
+    // This asserts BOTH ends. Predicted movement alone would pass while the
+    // server ignored every input, which is the bug.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("walking");
+    let mut app = client("walking", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined() && app.meshed_chunks() >= 4));
+    let start = app.camera().position.to_world();
+
+    let forward = Input {
+        forward: 1.0,
+        ..Input::default()
+    };
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        assert!(app.pump_network(), "connection ended: {:?}", app.warnings());
+        app.remesh();
+        app.advance(forward, 1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    let ended = app.camera().position.to_world();
+    let (dx, dz) = (ended.0 - start.0, ended.2 - start.2);
+    let travelled = (dx * dx + dz * dz).sqrt();
+    assert!(
+        travelled > 2.0,
+        "held forward for six seconds and moved {travelled:.2} blocks, from {start:?} to {ended:?}"
+    );
+
+    // And the SERVER agrees. Without this the test passes on a client that
+    // predicts happily while every input it sends is refused.
+    assert!(
+        app.server_travelled() > 2.0,
+        "the client moved but the server still has the player at spawn: {} blocks",
+        app.server_travelled()
+    );
+
+    let (client_tick, server_tick) = app.tick_pair();
+    assert!(
+        client_tick > server_tick,
+        "the client is predicting tick {client_tick} while the server has reached \
+         {server_tick}; every input it sends from here is refused"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}

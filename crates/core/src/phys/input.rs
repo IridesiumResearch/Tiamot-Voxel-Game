@@ -18,8 +18,10 @@
 //!   else;
 //! - **reordering is absorbed**, because an input is filed under its own tick
 //!   rather than the order it arrived in;
-//! - **a gap repeats the last intent** rather than stopping the player, which
-//!   is what makes a single lost packet invisible instead of a stutter;
+//! - **a short gap repeats the last intent** rather than stopping the player,
+//!   which makes a single lost packet invisible instead of a stutter — but a
+//!   LONG gap gives up and stands still, because a client that has stopped
+//!   talking should not keep walking;
 //! - **the far future is refused**, so a peer cannot make the server hold an
 //!   unbounded map by claiming enormous tick numbers.
 //!
@@ -43,6 +45,15 @@ use super::Intent;
 /// grow the map without bound.
 pub const MAX_LOOKAHEAD: u64 = 64;
 
+/// How many consecutive ticks a missing input may be covered by repeating the
+/// last one.
+///
+/// Half a second. Repeating is what makes a dropped packet invisible; repeating
+/// *forever* is what makes a player whose client hitched keep sprinting into a
+/// hole with nobody driving. Past this the body gets a neutral intent and comes
+/// to a stop, which is both safer and easier to understand from the outside.
+pub const MAX_REPEAT_TICKS: u64 = 10;
+
 /// One player's inputs, waiting for their ticks.
 #[derive(Debug, Clone)]
 pub struct InputQueue {
@@ -56,6 +67,12 @@ pub struct InputQueue {
     last_applied: u64,
     /// What it answered, for repeating across a gap.
     last_intent: Intent,
+    /// The tick a real input was last applied on.
+    ///
+    /// A tick number rather than a count of calls: silence is a duration, and
+    /// measuring it in `take` calls would give a different answer if the
+    /// caller ever skipped one.
+    last_fresh: u64,
 }
 
 impl InputQueue {
@@ -66,6 +83,7 @@ impl InputQueue {
             pending: BTreeMap::new(),
             last_applied: start,
             last_intent: Intent::default(),
+            last_fresh: start,
         }
     }
 
@@ -95,6 +113,7 @@ impl InputQueue {
     pub fn take(&mut self, tick: u64) -> Intent {
         // Drop what is now in the past, remembering the newest of them as the
         // most recent thing the player actually asked for.
+        let mut fresh = false;
         while let Some((&first, _)) = self.pending.iter().next() {
             if first > tick {
                 break;
@@ -104,9 +123,17 @@ impl InputQueue {
                 .pop_first()
                 .unwrap_or((first, self.last_intent));
             self.last_intent = intent;
+            fresh = true;
         }
 
         self.last_applied = tick;
+        if fresh {
+            self.last_fresh = tick;
+        } else if tick.saturating_sub(self.last_fresh) > MAX_REPEAT_TICKS {
+            // Nobody is driving. Stop rather than carry on with a stale
+            // instruction — see MAX_REPEAT_TICKS.
+            self.last_intent = Intent::default();
+        }
         self.last_intent
     }
 
@@ -263,6 +290,35 @@ mod tests {
             queue.pending() <= MAX_LOOKAHEAD as usize,
             "the queue grew to {} entries",
             queue.pending()
+        );
+    }
+
+    #[test]
+    fn a_long_silence_stops_the_player_rather_than_repeating_forever() {
+        // Repeating covers a dropped packet. Repeating for ever means a player
+        // whose client hitched keeps sprinting with nobody driving — and it is
+        // what made a real client look "stuck": its last accepted input was
+        // "standing still", so the server held it there while the client
+        // predicted movement and was corrected twenty times a second.
+        let mut queue = InputQueue::new(0);
+        queue.offer(1, walking(1.0));
+        assert_eq!(tag(queue.take(1)), tag(walking(1.0)));
+
+        // Within the window, the intent holds.
+        for tick in 2..=MAX_REPEAT_TICKS {
+            assert_eq!(
+                tag(queue.take(tick)),
+                tag(walking(1.0)),
+                "gave up at tick {tick}, inside the repeat window"
+            );
+        }
+
+        // Past it, the body is given nothing to do.
+        let stopped = queue.take(MAX_REPEAT_TICKS + 2);
+        assert_eq!(
+            tag(stopped),
+            tag(walking(0.0)),
+            "still repeating a stale input after {MAX_REPEAT_TICKS} ticks of silence"
         );
     }
 

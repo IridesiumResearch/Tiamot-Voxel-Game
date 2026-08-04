@@ -83,6 +83,18 @@ pub const TELEPORT_DISTANCE: f64 = 50_000.0;
 /// criterion's round number needs no rounding here.
 pub const TELEPORT_CHUNKS: i32 = 3_125;
 
+/// How far ahead of the server the client keeps its input tick.
+///
+/// An input has to arrive before the tick it is for, so the lead has to cover
+/// the trip out plus a little slack. Four ticks is 200 ms, which is generous
+/// for loopback and enough for an ordinary internet connection; anything an
+/// input misses is covered by the server repeating the last one for a moment
+/// (`phys::input::MAX_REPEAT_TICKS`).
+///
+/// Comfortably inside `phys::input::MAX_LOOKAHEAD`, which is what the server
+/// refuses inputs *beyond*.
+const INPUT_LEAD: u64 = 4;
+
 /// How many warnings the HUD keeps.
 const WARNING_HISTORY: usize = 5;
 
@@ -148,6 +160,10 @@ pub struct App {
     /// no world to stand in yet, and a controller with nothing under it would
     /// simply fall.
     predictor: Option<Predictor>,
+    /// The last position the server confirmed, for diagnostics and the HUD.
+    confirmed: Option<(ChunkPos, [f32; 3])>,
+    /// The last input tick the server said it had applied.
+    confirmed_tick: u64,
     /// The server's answer about what is being broken and how far along.
     ///
     /// Presentation only — the crack overlay is drawn from it. Not predicted:
@@ -191,6 +207,8 @@ impl App {
             tick: 0,
             server_label: "connecting…".to_owned(),
             predictor: None,
+            confirmed: None,
+            confirmed_tick: 0,
             dig: None,
             tick_carry: 0.0,
             displacement: [0, 0, 0],
@@ -252,6 +270,64 @@ impl App {
     #[must_use]
     pub fn adapter(&self) -> &str {
         &self.renderer.gpu().adapter
+    }
+
+    /// Keeps the predicted tick ahead of the tick the server has reached.
+    ///
+    /// **Without this the client silently loses control of its player.** The
+    /// server refuses any input whose tick it has already passed, so a client
+    /// whose count falls behind has every input refused from then on — and the
+    /// server, seeing a gap, repeats the last intent it *did* accept. If that
+    /// was "standing still", the player is pinned at spawn while the client
+    /// predicts movement and is corrected twenty times a second. That is what
+    /// "stuck in place with a lot of jitter" was.
+    ///
+    /// Falling behind is not an edge case. The client's count advances once per
+    /// simulated tick and its frames are neither exactly 20 Hz nor free of
+    /// stalls, so it drifts *by construction* — measured at 37 ticks behind
+    /// after a few seconds of walking. Rather than try to make a local counter
+    /// track a remote clock, this takes the server's own number and stays a
+    /// fixed margin in front of it.
+    fn resynchronise_tick(&mut self, server_tick: u64) {
+        let want = server_tick + INPUT_LEAD;
+        if self.tick < want {
+            self.tick = want;
+        }
+    }
+
+    /// The tick the client is predicting, and the last one the server applied.
+    ///
+    /// The pair is the diagnostic: the client must stay AHEAD, because the
+    /// server refuses any input whose tick it has already passed.
+    #[must_use]
+    pub const fn tick_pair(&self) -> (u64, u64) {
+        (self.tick, self.confirmed_tick)
+    }
+
+    /// How far the SERVER has the player from where they spawned, in blocks.
+    ///
+    /// Exposed for tests that need to tell "the client predicted movement"
+    /// apart from "the player moved", which are the same picture on screen
+    /// right up until the correction arrives.
+    #[must_use]
+    pub fn server_travelled(&self) -> f64 {
+        let Some((origin, local)) = self.confirmed else {
+            return 0.0;
+        };
+        let Some(spawn) = self.spawn else {
+            return 0.0;
+        };
+        let cells = f64::from(tiamot_core::SUBNODES_PER_AXIS);
+        let corner = tiamot_core::BlockPos::from_chunk_corner(origin);
+        let (sx, _, sz) = spawn.to_world();
+        let x = f64::from(corner.x) + f64::from(local[0]) / cells;
+        let z = f64::from(corner.z) + f64::from(local[2]) / cells;
+        // Not `hypot`: it is a libm call and the determinism lint bans it
+        // workspace-wide (float-determinism.md §1). This is only a diagnostic
+        // distance, and `sqrt` is in the allowed subset anyway.
+        let dx = x - sx;
+        let dz = z - sz;
+        (dx * dx + dz * dz).sqrt()
     }
 
     /// The camera.
@@ -352,6 +428,9 @@ impl App {
                 }
 
                 Event::PlayerState(state) => {
+                    self.confirmed = Some((state.chunk, state.local));
+                    self.confirmed_tick = state.last_processed_input;
+                    self.resynchronise_tick(state.last_processed_input);
                     // Not while the debug teleport is displacing the world: the
                     // server does not know about it, so every state would drag
                     // the camera back and the floating-origin check could not
