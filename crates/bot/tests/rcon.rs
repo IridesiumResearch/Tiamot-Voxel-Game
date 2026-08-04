@@ -219,10 +219,23 @@ fn kick_disconnects_the_named_player_with_a_reason() {
         assert_eq!(reply, "ok: kicked Alice", "got `{reply}`");
 
         // Alice must receive a reason, not a silent drop.
-        let message = tokio::time::timeout(Duration::from_secs(5), alice.recv())
-            .await
-            .expect("kick should arrive promptly")
-            .expect("a message, not a connection error");
+        //
+        // Read until the disconnect rather than taking the next message: since
+        // Task 09 the server sends a `PlayerState` every tick, so "the next
+        // thing Alice hears" is almost always that.
+        let message = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let message = alice.recv().await.expect("a message, not an error");
+                if matches!(
+                    message,
+                    tiamot_core::proto::ServerMessage::Disconnect { .. }
+                ) {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("kick should arrive promptly");
         assert!(
             matches!(
                 message,

@@ -160,6 +160,12 @@ pub enum Event {
         text: String,
     },
 
+    /// Where the server says the player is.
+    ///
+    /// Forwarded rather than acted on here: reconciliation needs the chunk
+    /// store, and this task has no business touching it.
+    PlayerState(crate::predict::Authoritative),
+
     /// Something went wrong that the player should see but that is not fatal.
     ///
     /// A poisoned texture, a chunk that would not decode, a content transfer
@@ -482,6 +488,37 @@ async fn session(
     let materials = tiamot_core::persist::idmap::MaterialMap::passthrough();
     let content_deadline = tokio::time::Instant::now() + CONTENT_DEADLINE;
 
+    // Reading happens in its own task, feeding a channel — the same shape the
+    // server's connection loop uses, and for the same reason.
+    //
+    // `frame::read` is NOT cancellation-safe: it reads a 4-byte length prefix
+    // and then the body, as two sequential awaits. `tokio::select!` cancels the
+    // branches that do not win, so an outbound command arriving between those
+    // two reads discards the partially-read frame and leaves the stream
+    // mid-message. Every later read then misinterprets body bytes as a length
+    // prefix.
+    //
+    // The server was fixed for this in `cf2b7a4`; the client had the identical
+    // pattern and simply never sent enough to trigger it. Task 09 made it send
+    // an input every tick, and the symptom was that a client joined, received
+    // its material table, and then silently received no chunks at all — the
+    // stream had desynchronised on the first input it sent.
+    //
+    // A channel receive IS cancellation-safe, so selecting on one is correct.
+    let (incoming_tx, mut incoming) = tokio::sync::mpsc::channel::<
+        Result<ServerMessage, tiamot_server::transport::frame::FrameError>,
+    >(64);
+    let reader = tokio::spawn(async move {
+        loop {
+            let message =
+                tiamot_server::transport::frame::read::<_, ServerMessage>(&mut recv).await;
+            let failed = message.is_err();
+            if incoming_tx.send(message).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+
     loop {
         let message = tokio::select! {
             // Reading is biased first. A client that preferred its own outbound
@@ -490,7 +527,11 @@ async fn session(
             // direction.
             biased;
 
-            incoming = tiamot_server::transport::frame::read::<_, ServerMessage>(&mut recv) => {
+            incoming = incoming.recv() => {
+                let Some(incoming) = incoming else {
+                    finish("the server closed the connection".to_owned());
+                    break;
+                };
                 match incoming {
                     // Charter rule 14 in the direction that is easy to forget:
                     // a decoded message is not a trustworthy one. The server is
@@ -706,20 +747,32 @@ async fn session(
             // wait for Tasks 14 and 12. All four are ignored rather than warned
             // about — a warning here would mean the client complaining about a
             // server behaving correctly.
-            //
-            // `PlayerState` is the odd one out and is only here TEMPORARILY:
-            // protocol v4 carries it and the validator above already checks it,
-            // but nothing sends one yet — the server does not simulate players
-            // until its half of Task 09 lands, and reconciling needs the
-            // prediction buffer that arrives with it. Unlike the four above,
-            // this one is a gap rather than a decision.
+            ServerMessage::PlayerState {
+                last_processed_input,
+                chunk,
+                local,
+                velocity,
+                on_ground,
+            } => {
+                let _ = events.send(Event::PlayerState(crate::predict::Authoritative {
+                    last_processed_input,
+                    chunk,
+                    local,
+                    velocity,
+                    on_ground,
+                }));
+            }
+
             ServerMessage::HelloAck { .. }
             | ServerMessage::ModManifest { .. }
             | ServerMessage::InventoryUpdate { .. }
-            | ServerMessage::EntityStateDelta { .. }
-            | ServerMessage::PlayerState { .. } => {}
+            | ServerMessage::EntityStateDelta { .. } => {}
         }
     }
+
+    // The reader borrows the receive stream, so it would otherwise outlive this
+    // function and hold the connection open after the player has left.
+    reader.abort();
 }
 
 /// Accepts one content slice, returning whether it completed an item.

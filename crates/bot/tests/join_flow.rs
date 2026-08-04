@@ -89,20 +89,29 @@ fn a_bot_completes_the_whole_join_flow() {
         let mut bot = connect(&server, Identity::generate().expect("identity")).await;
         bot.join("Alice").await.expect("join");
 
-        let kinds: Vec<&str> = bot.received().iter().map(describe).collect();
+        let all: Vec<&str> = bot.received().iter().map(describe).collect();
+        // The join flow is a PREFIX, not the whole conversation. The moment
+        // `JoinWorld` lands the server starts streaming, and since Task 09 it
+        // also sends a `PlayerState` every tick — so asserting on everything
+        // received made this a race that only lost under parallel load.
+        let expected = [
+            "HelloAck",
+            "AuthChallenge",
+            "ModManifest",
+            // Protocol v3. It rides with the manifest and before the world,
+            // because a chunk that arrived first would be a grid of numbers
+            // the client cannot name.
+            "MaterialTable",
+            "JoinWorld",
+        ];
+        assert!(
+            all.len() >= expected.len(),
+            "the join flow is incomplete, got {all:?}"
+        );
         assert_eq!(
-            kinds,
-            vec![
-                "HelloAck",
-                "AuthChallenge",
-                "ModManifest",
-                // Protocol v3. It rides with the manifest and before the world,
-                // because a chunk that arrived first would be a grid of numbers
-                // the client cannot name.
-                "MaterialTable",
-                "JoinWorld"
-            ],
-            "the join flow must arrive in order, got {kinds:?}"
+            &all[..expected.len()],
+            &expected[..],
+            "the join flow must arrive in order, got {all:?}"
         );
         bot.disconnect().await;
     });

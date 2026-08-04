@@ -117,6 +117,8 @@ struct Seen {
     store: ChunkStore,
     warnings: Vec<String>,
     disconnect: Option<String>,
+    /// Authoritative positions, in the order they arrived.
+    states: Vec<client::predict::Authoritative>,
 }
 
 impl Seen {
@@ -140,6 +142,7 @@ impl Seen {
             }
             Event::Warning(text) => self.warnings.push(text),
             Event::Disconnected { reason } => self.disconnect = Some(reason),
+            Event::PlayerState(state) => self.states.push(state),
             Event::Chat { .. } => {}
         }
     }

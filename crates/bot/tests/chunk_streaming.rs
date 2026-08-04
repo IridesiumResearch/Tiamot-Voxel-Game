@@ -636,3 +636,57 @@ fn walking_far_enough_streams_new_chunks_and_unloads_the_ones_left_behind() {
 
     assert!(server.stop());
 }
+
+#[test]
+fn a_client_that_talks_constantly_still_receives_its_world() {
+    // A regression test for a starvation bug that made a client join, receive
+    // its material table, and then never receive a single chunk.
+    //
+    // The streaming beat was a `sleep` constructed INSIDE the connection's
+    // `tokio::select!`, so it was rebuilt from zero every time any other branch
+    // won. A peer that said anything more often than the beat therefore starved
+    // it forever — the timer never got 50 ms of quiet in which to elapse.
+    //
+    // Nothing sent that often until Task 09 gave the client an input per tick.
+    // Note the shape this test needs: a BURST of inputs does not reproduce it,
+    // because the quiet afterwards lets the timer fire. It has to be a steady
+    // trickle, which is exactly what a player holding a key produces.
+    let view = ViewDistance::MINIMUM;
+    let server = start_on_ground("constant-talker", view);
+    let spawn_chunk = BlockPos::new(0, 1, 0).chunk();
+    let expected = interest::chunks_around(spawn_chunk, view).len();
+
+    block_on(async {
+        let mut alice = join(&server, "Alice").await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut tick = 1;
+        while std::time::Instant::now() < deadline {
+            // Faster than the 50 ms beat, which is the whole point.
+            alice
+                .send(&tiamot_core::proto::ClientMessage::PlayerInput {
+                    tick,
+                    movement: [0.0, 0.0, 0.0],
+                    look: [0.0, 0.0],
+                    actions: 0,
+                })
+                .await
+                .expect("send input");
+            tick += 1;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            if alice.chunks_received().len() >= expected {
+                break;
+            }
+        }
+
+        assert!(
+            alice.chunks_received().len() >= expected,
+            "a client sending an input every 20 ms received {} of {expected} chunks; the \
+             streaming beat is being starved by its own traffic",
+            alice.chunks_received().len()
+        );
+    });
+
+    assert!(server.stop());
+}

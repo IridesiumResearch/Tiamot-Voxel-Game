@@ -631,6 +631,22 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
     let mut broadcasts = shared.outbound.subscribe();
     let mut kicks = shared.kicks.subscribe();
     let mut streamer: Option<Streamer> = None;
+
+    // The streaming beat is an `interval`, NOT a `sleep` inside the select.
+    //
+    // A `sleep` future constructed in the select expression is built fresh on
+    // every iteration, so it restarts from zero each time any other branch
+    // wins. A peer that says anything more often than the beat therefore
+    // starves it forever — the timer never gets 50 ms of quiet in which to
+    // elapse. Nothing sent that often until Task 09 gave the client an input
+    // per tick, and then it showed up as a client that joined, received its
+    // material table, and never received a single chunk.
+    //
+    // An `interval` keeps its own schedule across cancellation, which is the
+    // property this needs. `Delay` rather than `Burst` so that a connection
+    // which stalls does not come back to a pile of instantly-ready ticks.
+    let mut beat = tokio::time::interval(tiamot_core::tick::TICK_DURATION);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut transfers = crate::content::Transfers::new();
     // Chunk deliveries the simulation has answered, waiting to be written.
     let mut pending: Vec<(
@@ -647,7 +663,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
             // Streaming runs on its own beat rather than piggybacking on client
             // traffic. A player standing still sends nothing, and their world
             // must still finish loading.
-            () = tokio::time::sleep(tiamot_core::tick::TICK_DURATION),
+            _ = beat.tick(),
                 if streamer.is_some() || transfers.queued() > 0 =>
             {
                 // Content before terrain: a client still waiting on textures

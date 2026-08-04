@@ -159,6 +159,12 @@ impl Held {
             up: axis(self.up, self.down),
             look: self.look,
             sprint: self.sprint,
+            // The same keys serve both movement modes: before the join there is
+            // no body, so space and shift fly the camera; afterwards they jump
+            // and sneak. One binding either way, which is what a player
+            // expects — see `App::advance`.
+            sneak: self.down,
+            jump: self.up,
             teleport,
         };
         // Mouse movement is a delta, so it is consumed rather than held: a
@@ -388,9 +394,12 @@ impl Client {
         }
         surface.app.remesh();
 
+        // `advance` reports the input itself, once per simulation tick rather
+        // than once per frame. Reporting per frame sent the same tick number
+        // repeatedly on a fast machine and skipped ticks on a slow one, and the
+        // server's input queue is keyed by tick.
         let input = self.held.as_input(self.pending_teleport.take());
         surface.app.advance(input, dt);
-        surface.app.report_input(input);
 
         let frame = match surface.surface.get_current_texture() {
             // Suboptimal still hands over a usable texture. Reconfiguring is

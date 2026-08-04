@@ -692,8 +692,16 @@ impl Bot {
 
     /// Whether the server has disconnected, and why.
     ///
-    /// Reads with a short timeout: "nothing arrived" means the operation was
-    /// accepted, since the server answers a refusal and stays silent on success.
+    /// Waits up to `timeout` for a `Disconnect`, SKIPPING anything else that
+    /// arrives meanwhile. "Nothing arrived" means the operation was accepted,
+    /// since the server answers a refusal and stays silent on success.
+    ///
+    /// Skipping is load-bearing rather than defensive. This used to read
+    /// exactly one message and treat anything that was not a refusal as
+    /// acceptance, which was true only while a joined-but-idle connection was
+    /// silent. Since Task 09 the server sends a `PlayerState` every tick, so
+    /// the first message after any request is almost always that — and every
+    /// "was this refused?" test started reporting "accepted".
     ///
     /// # Errors
     ///
@@ -702,10 +710,17 @@ impl Bot {
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<Option<DisconnectReason>, BotError> {
-        match tokio::time::timeout(timeout, self.recv()).await {
-            Ok(Ok(ServerMessage::Disconnect { reason })) => Ok(Some(reason)),
-            Ok(Ok(_)) => Ok(None),
-            Ok(Err(_)) | Err(_) => Ok(None),
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            match tokio::time::timeout(remaining, self.recv()).await {
+                Ok(Ok(ServerMessage::Disconnect { reason })) => return Ok(Some(reason)),
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(_) => return Ok(None),
+            }
         }
     }
 

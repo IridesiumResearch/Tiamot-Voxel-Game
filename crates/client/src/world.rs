@@ -286,6 +286,20 @@ impl ChunkStore {
     }
 }
 
+/// Lets the client's physics collide against the chunks it has been sent.
+///
+/// The same trait the server implements over its own store, so
+/// `tiamot_core::phys` runs unchanged on both sides — which is what makes a
+/// client's prediction agree with the server's answer rather than approximate
+/// it. Chunks still in flight are absent here, and `Voxels` treats absent as
+/// solid, so a player at the edge of what has arrived stops rather than
+/// falling through the world.
+impl tiamot_core::phys::ChunkLookup for ChunkStore {
+    fn chunk(&self, pos: ChunkPos) -> Option<&Chunk> {
+        self.get(pos)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

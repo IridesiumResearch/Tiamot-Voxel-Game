@@ -22,12 +22,14 @@
 
 use std::collections::BTreeMap;
 
+use tiamot_core::phys::{self, Intent, Tuning};
 use tiamot_core::{ChunkPos, MaterialId};
 
 use crate::camera::{Camera, Position};
 use crate::config::Config;
 use crate::mesher;
 use crate::net::{Command, Connection, Event};
+use crate::predict::Predictor;
 use crate::render::Renderer;
 use crate::texture::{Atlas, Image};
 use crate::world::{ABSENT_POLICY, ChunkStore};
@@ -80,6 +82,10 @@ pub struct Input {
     pub look: (f32, f32),
     /// Whether to move faster.
     pub sprint: bool,
+    /// Whether to move slowly and refuse to walk off edges.
+    pub sneak: bool,
+    /// Whether to jump.
+    pub jump: bool,
     /// A one-shot debug teleport.
     pub teleport: Option<Teleport>,
 }
@@ -105,6 +111,18 @@ pub struct App {
     tick: u64,
     /// What the connection reported about the server's certificate.
     server_label: String,
+    /// The locally predicted body, once the world has been joined.
+    ///
+    /// `None` before the join, and until then the camera free-flies — there is
+    /// no world to stand in yet, and a controller with nothing under it would
+    /// simply fall.
+    predictor: Option<Predictor>,
+    /// Seconds carried over toward the next simulation tick.
+    ///
+    /// The simulation is a fixed 20 Hz (charter rule 4) and rendering is not,
+    /// so frames and ticks are decoupled here: a fast machine predicts the same
+    /// ticks a slow one does, just with more frames between them.
+    tick_carry: f32,
     /// Whole chunks the drawn world has been displaced by, for the
     /// floating-origin debug teleport. `[0, 0, 0]` in normal play.
     ///
@@ -135,6 +153,8 @@ impl App {
             fps: 0.0,
             tick: 0,
             server_label: "connecting…".to_owned(),
+            predictor: None,
+            tick_carry: 0.0,
             displacement: [0, 0, 0],
         }
     }
@@ -260,6 +280,22 @@ impl App {
                     self.spawn = Some(position);
                     self.tick = tick;
                     self.joined = true;
+
+                    // The body starts where the server said, in the same
+                    // (chunk, local cells) pair the server simulates in — no
+                    // conversion, so nothing to disagree about.
+                    let origin = spawn.chunk();
+                    let corner = tiamot_core::BlockPos::from_chunk_corner(origin);
+                    let cells = tiamot_core::SUBNODES_PER_AXIS as f32;
+                    self.predictor = Some(Predictor::new(
+                        origin,
+                        [
+                            (spawn.x - corner.x) as f32 * cells + cells / 2.0,
+                            (spawn.y - corner.y) as f32 * cells,
+                            (spawn.z - corner.z) as f32 * cells + cells / 2.0,
+                        ],
+                        tick,
+                    ));
                 }
 
                 Event::Chunk(chunk) => self.store.insert(*chunk),
@@ -275,6 +311,19 @@ impl App {
 
                 Event::Edit(edit) => {
                     self.store.apply(&edit);
+                }
+
+                Event::PlayerState(state) => {
+                    // Not while the debug teleport is displacing the world: the
+                    // server does not know about it, so every state would drag
+                    // the camera back and the floating-origin check could not
+                    // be looked at.
+                    if self.displacement == [0, 0, 0]
+                        && let Some(predictor) = self.predictor.as_mut()
+                    {
+                        let voxels = phys::Voxels::new(&self.store, predictor.origin());
+                        predictor.reconcile(&voxels, &state, &Tuning::DEFAULT);
+                    }
                 }
 
                 Event::Chat { text, .. } => tracing::info!("{text}"),
@@ -328,15 +377,119 @@ impl App {
         self.camera
             .look(input.look.0 * sensitivity, -input.look.1 * sensitivity);
 
-        let speed = self.config.fly_speed * if input.sprint { 4.0 } else { 1.0 } * dt;
-        if input.forward != 0.0 || input.right != 0.0 || input.up != 0.0 {
-            self.camera
-                .fly(input.forward * speed, input.right * speed, input.up * speed);
+        if self.predictor.is_some() {
+            self.walk(input, dt);
+        } else {
+            // Not in the world yet, so there is nothing to stand on and no
+            // server to reconcile with. Free-fly until the join lands.
+            let speed = self.config.fly_speed * if input.sprint { 4.0 } else { 1.0 } * dt;
+            if input.forward != 0.0 || input.right != 0.0 || input.up != 0.0 {
+                self.camera
+                    .fly(input.forward * speed, input.right * speed, input.up * speed);
+            }
         }
 
         if let Some(teleport) = input.teleport {
             self.teleport(teleport);
         }
+    }
+
+    /// Runs whole simulation ticks and points the camera at the result.
+    ///
+    /// Frames and ticks are deliberately decoupled. The simulation is a fixed
+    /// 20 Hz because charter rule 4 requires a fixed timestep, and rendering is
+    /// whatever the machine manages — so this accumulates real time and spends
+    /// it in whole ticks. A 200 fps machine predicts exactly the ticks a 40 fps
+    /// machine does, which is what stops the frame rate changing how fast a
+    /// player walks.
+    fn walk(&mut self, input: Input, dt: f32) {
+        const TICK_SECONDS: f32 = 1.0 / 20.0;
+        /// Ticks simulated in one frame before the rest is abandoned.
+        ///
+        /// After a stall — an alt-tab, a long chunk upload — the carry can hold
+        /// seconds of unspent time. Spending it would fast-forward the player
+        /// through the world in one frame; the server never saw those inputs
+        /// and would drag them straight back.
+        const MAX_CATCH_UP: u32 = 4;
+
+        self.tick_carry += dt;
+        let mut spent = 0;
+        while self.tick_carry >= TICK_SECONDS && spent < MAX_CATCH_UP {
+            self.tick_carry -= TICK_SECONDS;
+            spent += 1;
+            self.tick += 1;
+
+            let intent = self.intent_from(input);
+            if let Some(predictor) = self.predictor.as_mut() {
+                let voxels = phys::Voxels::new(&self.store, predictor.origin());
+                predictor.predict(&voxels, self.tick, intent, &Tuning::DEFAULT);
+            }
+            self.report_input(input, intent);
+        }
+        if spent == MAX_CATCH_UP {
+            self.tick_carry = 0.0;
+        }
+
+        // Presentation only: blends away whatever the last correction was.
+        if let Some(predictor) = self.predictor.as_mut() {
+            predictor.smooth(dt / TICK_SECONDS);
+        }
+        self.follow_body();
+    }
+
+    /// Turns this frame's keys into a world-space intent.
+    ///
+    /// The rotation by yaw happens HERE, on the client, and that is a charter
+    /// rule 4 decision rather than a convenience: `sin` and `cos` are banned
+    /// from simulation because they are libm calls that differ across
+    /// platforms. The client is exempt — this is input handling, not the tick —
+    /// so it rotates once and sends the result, and both ends then simulate
+    /// from identical numbers.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "charter rule 4 exempts client input handling from the deterministic float \
+                  subset; this rotates a keypress into a direction and the RESULT is what both \
+                  ends simulate from, so no platform-dependent value ever reaches the tick"
+    )]
+    fn intent_from(&self, input: Input) -> Intent {
+        let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
+        // Matches `Camera::forward`: yaw turns right, and east is −x.
+        let forward = [-sin_yaw, cos_yaw];
+        let right = [cos_yaw, sin_yaw];
+
+        Intent {
+            walk: [
+                forward[0] * input.forward + right[0] * input.right,
+                forward[1] * input.forward + right[1] * input.right,
+            ],
+            jump: input.jump,
+            gait: if input.sneak {
+                phys::Gait::Sneak
+            } else if input.sprint {
+                phys::Gait::Sprint
+            } else {
+                phys::Gait::Walk
+            },
+        }
+    }
+
+    /// Puts the camera at the predicted body's eyes.
+    fn follow_body(&mut self) {
+        let Some(predictor) = self.predictor.as_ref() else {
+            return;
+        };
+        let local = predictor.render_local();
+        let cells = f64::from(tiamot_core::SUBNODES_PER_AXIS);
+        let corner = tiamot_core::BlockPos::from_chunk_corner(predictor.origin());
+
+        // Cells to blocks, and the eye offset on top. Presentation arithmetic:
+        // the division by three is exact enough for a camera and never feeds
+        // back into the body.
+        self.camera.position = Position::from_world(
+            f64::from(corner.x) + f64::from(local[0]) / cells,
+            f64::from(corner.y) + f64::from(local[1] + phys::EYE_HEIGHT) / cells,
+            f64::from(corner.z) + f64::from(local[2]) / cells,
+        );
     }
 
     /// Jumps to the edge of the world, for the floating-origin check.
@@ -385,19 +538,33 @@ impl App {
         });
     }
 
-    /// Sends the frame's input to the server.
+    /// Sends one tick's input to the server.
     ///
-    /// Movement is reported rather than applied: the server owns the
-    /// simulation (charter rule 2), and Task 09's physics is what consumes
-    /// this. Sending it now means the wire format is exercised from the first
-    /// visible build rather than first used on the day it starts to matter.
-    pub fn report_input(&self, input: Input) {
+    /// The movement sent is the **world-space** vector the client just
+    /// simulated with, not the raw keys — see [`App::intent_from`]. Sending the
+    /// keys and letting the server rotate them would put a `sin` and a `cos`
+    /// inside the tick, which charter rule 4 forbids, and would give the two
+    /// ends two chances to disagree about the same movement.
+    fn report_input(&self, input: Input, intent: Intent) {
+        use tiamot_core::proto::actions;
+
         let turn = std::f32::consts::TAU;
+        let mut held = 0;
+        if intent.jump {
+            held |= actions::JUMP;
+        }
+        match intent.gait {
+            phys::Gait::Sprint => held |= actions::SPRINT,
+            phys::Gait::Sneak => held |= actions::SNEAK,
+            phys::Gait::Walk => {}
+        }
+        let _ = input;
+
         self.connection.send(Command::Input {
             tick: self.tick,
-            movement: [input.right, input.up, input.forward],
+            movement: [intent.walk[0], 0.0, intent.walk[1]],
             look: [self.camera.yaw / turn, self.camera.pitch / turn],
-            actions: 0,
+            actions: held,
         });
     }
 
