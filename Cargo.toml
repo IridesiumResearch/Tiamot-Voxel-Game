@@ -172,7 +172,20 @@ winit = { version = "0.30", default-features = false, features = [
 # HUD text. Immediate-mode, so there is no widget tree to keep in sync with the
 # world — the HUD is written out fresh each frame from what the frame already
 # knows. Task 14 builds the real UI on this.
-egui = "0.35"
+# NOT default features, and the omission is `default_fonts`.
+#
+# egui's bundled fonts are `(MIT OR Apache-2.0) AND OFL-1.1 AND
+# Ubuntu-font-1.0`. Both font licences are free, and the argument that a
+# bundled font is aggregated with the program rather than derived from it is a
+# good one — but the Ubuntu Font Licence is not FSF-recognised as
+# GPL-compatible, so it is an argument rather than a fact. Charter rule 17 puts
+# enforcement hygiene ahead of convenience, and a dependency whose licensing
+# needs an argument will need it again at the worst possible moment.
+#
+# The client ships Go Mono instead, BSD-3-Clause, vendored under
+# `crates/client/assets/third-party/go-font/` with its licence and the
+# reasoning. See `client::app::install_fonts`.
+egui = { version = "0.35", default-features = false }
 egui-wgpu = "0.35"
 egui-winit = { version = "0.35", default-features = false, features = ["links", "wayland", "x11"] }
 

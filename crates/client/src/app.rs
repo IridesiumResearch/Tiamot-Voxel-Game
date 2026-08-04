@@ -34,6 +34,37 @@ use crate::render::Renderer;
 use crate::texture::{Atlas, Image};
 use crate::world::{ABSENT_POLICY, ChunkStore};
 
+/// The font every glyph the HUD draws comes from.
+///
+/// Go Mono, BSD-3-Clause, vendored with its licence and the reasoning in
+/// `assets/third-party/go-font/`. Compiled in rather than loaded at runtime: a
+/// client that could fail to find its font is a client that can start with an
+/// invisible HUD, and 170 KiB is not worth a failure mode.
+const HUD_FONT: &[u8] = include_bytes!("../assets/third-party/go-font/Go-Mono.ttf");
+
+/// Installs [`HUD_FONT`] as the only font egui has.
+///
+/// **Required, not cosmetic.** The client builds egui without `default_fonts`
+/// — see the workspace manifest for why — so egui starts with no glyphs at
+/// all, and a HUD with no font renders nothing while reporting no error. It is
+/// mapped to both families because the HUD wants one look and neither family
+/// may be left empty.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::empty();
+    fonts.font_data.insert(
+        "go-mono".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(HUD_FONT)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("go-mono".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// Chunks remeshed per frame. See the module docs.
 pub const REMESH_BUDGET: usize = 4;
 
@@ -754,6 +785,68 @@ mod tests {
         assert!(
             worst_case_ms < 16.0 / 4.0,
             "a full remesh budget is {worst_case_ms} ms, too much of a 16 ms frame"
+        );
+    }
+
+    /// Lays out a string and returns how wide it came out.
+    fn measure(ctx: &egui::Context, text: &str) -> f32 {
+        // A pass has to have run before there are fonts to lay out with.
+        // `run_ui` rather than `run`: egui 0.35 renamed it and hands back a
+        // `Ui` instead of a `Context`.
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    text.to_owned(),
+                    egui::FontId::monospace(14.0),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+        })
+    }
+
+    #[test]
+    fn the_hud_has_a_font_to_draw_with() {
+        // egui is built WITHOUT `default_fonts`, because its bundled ones are
+        // under licences this project would rather not argue about. That makes
+        // `install_fonts` load-bearing: forget it and egui has no glyphs, so
+        // the HUD renders nothing at all — no panic, no warning, just an empty
+        // corner of the screen that looks like a HUD bug rather than a missing
+        // font.
+        //
+        // The counter-example is the whole test. A context WITHOUT the call
+        // must measure zero, or this would pass on a build that still had the
+        // default fonts and prove nothing about the vendored one.
+        let bare = egui::Context::default();
+        assert_eq!(
+            measure(&bare, "1234567890").to_bits(),
+            0.0f32.to_bits(),
+            "egui came with fonts of its own; this test cannot tell whether the vendored font is \
+             installed"
+        );
+
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        assert!(
+            measure(&ctx, "1234567890") > 1.0,
+            "the vendored font produced no glyphs"
+        );
+    }
+
+    #[test]
+    fn the_font_is_monospaced_so_the_hud_does_not_jitter() {
+        // The HUD is mostly numbers that change every frame. In a proportional
+        // font the columns shuffle sideways as digits change, which reads as
+        // the readout being unstable rather than the values being.
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+
+        let narrow = measure(&ctx, "1111111111");
+        let wide = measure(&ctx, "0000000000");
+        assert!(
+            (narrow - wide).abs() < 0.01,
+            "digits are not the same width: {narrow} against {wide}"
         );
     }
 }

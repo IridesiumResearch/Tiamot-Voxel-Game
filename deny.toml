@@ -71,31 +71,15 @@ allow = [
 
 # Per-crate exceptions go here, each with a comment justifying it. Empty is the
 # correct state; every entry is a small ongoing liability.
-exceptions = [
-    # egui's bundled fonts (Ubuntu Mono, Noto Emoji, Hack), which the client's
-    # HUD renders with. `OFL-1.1 AND Ubuntu-font-1.0` deliberately stays OFF the
-    # global allow-list and is granted to this one crate, because the argument
-    # below is about fonts and does not generalise to code.
-    #
-    # Why this is compatible with a GPL-3.0-only engine:
-    #
-    #   * These licences cover FONT FILES carried as data. They are separate
-    #     works aggregated with the program, not source linked into it, so they
-    #     do not make the engine a derivative of the font or vice versa.
-    #   * Both licences explicitly permit embedding and redistribution. OFL-1.1
-    #     is an FSF-recognised free copyleft font licence; its conditions are
-    #     the reserved-font-name rule and that the font not be sold on its own,
-    #     neither of which this project does.
-    #   * The Ubuntu Font Licence is the weaker of the two — free and
-    #     DFSG-accepted, but not FSF-blessed as GPL-compatible. It is accepted
-    #     here on the same aggregation reasoning, and it is the entry to
-    #     re-examine first if this is ever challenged.
-    #
-    # The clean way out, if that reasoning is ever unwanted: turn off egui's
-    # `default_fonts` feature and ship a font under a plain permissive licence.
-    # That is Task 14's business — the HUD needs *a* font today.
-    { name = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
-]
+#
+# It was not empty for a day. `epaint_default_fonts` is `(MIT OR Apache-2.0)
+# AND OFL-1.1 AND Ubuntu-font-1.0`, and carrying it meant arguing that a bundled
+# font is aggregated with the program rather than derived from it. The argument
+# is a good one, and the Ubuntu Font Licence is still not FSF-recognised as
+# GPL-compatible, so it stayed an argument. The client ships Go Mono
+# (BSD-3-Clause) instead and the exception is gone rather than reworded — the
+# cheapest licence question is the one nobody has to answer.
+exceptions = []
 
 [[licenses.clarify]]
 # ring's licence file bundles several notices and machine detection is not

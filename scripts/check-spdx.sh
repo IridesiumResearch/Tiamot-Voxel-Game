@@ -37,6 +37,21 @@ expected_license_for() {
     esac
 }
 
+# Vendored third-party files, which carry SOMEBODY ELSE'S licence.
+#
+# Rule 2 would otherwise make it impossible to vendor anything correctly: a
+# bundled BSD font's own LICENSE declares BSD-3-Clause, which is exactly right
+# and exactly what the rule rejects. The convention is a `third-party/`
+# directory component, so the exemption is visible in the path rather than
+# hidden in this script as a list of blessed files.
+#
+# These files still need to be licence-compatible — that is `cargo deny`'s job
+# for crates and a human's for vendored assets, and each such directory carries
+# a README saying what it is and why it is allowed to be here.
+is_third_party() {
+    printf '%s' "$1" | grep -q '\(^\|/\)third-party/'
+}
+
 missing=()
 wrong_license=()
 missing_copyright=()
@@ -50,7 +65,7 @@ while IFS= read -r file; do
     declared=$(grep -m1 -o 'SPDX-License-Identifier:[[:space:]]*[A-Za-z0-9.+-]*' "$file" 2>/dev/null \
         | sed 's/.*SPDX-License-Identifier:[[:space:]]*//' || true)
 
-    if printf '%s' "$file" | grep -qE "$REQUIRED_EXTENSIONS"; then
+    if ! is_third_party "$file" && printf '%s' "$file" | grep -qE "$REQUIRED_EXTENSIONS"; then
         if [ -z "$declared" ]; then
             missing+=("$file (expected $expected)")
             continue
@@ -60,7 +75,11 @@ while IFS= read -r file; do
         fi
     fi
 
-    # Rule 2 applies to every tracked file, header-required or not.
+    # Rule 2 applies to every tracked file, header-required or not — except
+    # vendored ones, which declare the licence they actually came under.
+    if is_third_party "$file"; then
+        continue
+    fi
     if [ -n "$declared" ] && [ "$declared" != "$expected" ]; then
         wrong_license+=("$file: declares '$declared', expected '$expected'")
     fi

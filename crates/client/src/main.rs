@@ -351,6 +351,9 @@ impl Client {
         let renderer = Renderer::new(gpu, self.config.render_mode, size.0, size.1)?;
 
         let egui = egui::Context::default();
+        // egui is built without `default_fonts`, so it has no glyphs until this
+        // runs. Skipping it renders an empty HUD and reports nothing.
+        client::app::install_fonts(&egui);
         let egui_state = egui_winit::State::new(
             egui.clone(),
             egui.viewport_id(),
