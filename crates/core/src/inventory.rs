@@ -150,19 +150,6 @@ pub const fn display(units: u32) -> (u32, u32) {
     (units / UNITS_PER_BLOCK, units % UNITS_PER_BLOCK)
 }
 
-/// What breaking a block yields.
-///
-/// - `Uniform` of a solid material yields 27 units of it.
-/// - `Uniform` of air yields nothing.
-/// - `Partial` yields one unit per set occupancy bit.
-/// - `Mixed` yields one stack per distinct non-air material, each with its own
-///   cell count.
-///
-/// **Output order is ascending [`MaterialId`]**, always. Drop order is
-/// observable — it decides which stack an almost-full inventory keeps — so it
-/// must not depend on cell iteration order, hash order, or anything else that
-/// could differ between machines running the same simulation (charter rule 4).
-#[must_use]
 /// The occupancy mask for placing `units` sub-nodes of a material.
 ///
 /// **Fills bottom-up: the whole bottom layer, then the next, then the top.**
@@ -202,6 +189,19 @@ pub fn placement_mask(units: u32) -> u32 {
     mask
 }
 
+/// What breaking a block yields.
+///
+/// - `Uniform` of a solid material yields 27 units of it.
+/// - `Uniform` of air yields nothing.
+/// - `Partial` yields one unit per set occupancy bit.
+/// - `Mixed` yields one stack per distinct non-air material, each with its own
+///   cell count.
+///
+/// **Output order is ascending [`MaterialId`]**, always. Drop order is
+/// observable — it decides which stack an almost-full inventory keeps — so it
+/// must not depend on cell iteration order, hash order, or anything else that
+/// could differ between machines running the same simulation (charter rule 4).
+#[must_use]
 pub fn break_block(block: BlockView<'_>) -> Vec<Stack> {
     match block {
         BlockView::Uniform(material) => Stack::new(material, UNITS_PER_BLOCK).into_iter().collect(),
