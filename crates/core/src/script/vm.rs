@@ -226,44 +226,7 @@ pub struct BlockTexture {
     pub path: String,
 }
 
-/// How a tool removes material.
-///
-/// The shape a mod chooses when it registers a tool, and the reason
-/// `register_tool` takes a table rather than a string: `"block"` and
-/// `"subnode"` are the two the engine implements, and a mod that wants a 3×3
-/// column later should be able to say so without the API changing shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Brush {
-    /// Removes the whole block containing the targeted cell.
-    #[default]
-    Block,
-    /// Removes only the cell under the crosshair.
-    ///
-    /// The mechanism the whole sub-node design exists for. `core:chisel` in the
-    /// reference mods is the proof that a mod can reach it.
-    SubNode,
-}
-
-impl Brush {
-    /// Parses the wire/script spelling.
-    #[must_use]
-    pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "block" => Some(Self::Block),
-            "subnode" => Some(Self::SubNode),
-            _ => None,
-        }
-    }
-
-    /// The spelling a mod writes.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Block => "block",
-            Self::SubNode => "subnode",
-        }
-    }
-}
+pub use crate::dig::Brush;
 
 /// What a mod said about how hard a block is to break, and what it yields.
 ///
