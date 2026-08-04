@@ -363,3 +363,91 @@ fn one_players_mining_does_not_credit_another() {
 
     server.stop();
 }
+
+#[test]
+fn a_dig_takes_time_and_yields_the_block_it_broke() {
+    // The whole server-authoritative dig loop, end to end: the client says
+    // where, the server counts ticks against the block's hardness, applies the
+    // removal, computes the drop and credits it.
+    //
+    // The timing assertion is the load-bearing one. A server that broke the
+    // block on the first `StartDig` would pass every "is it gone" check, and
+    // would also let any client break every block in the world instantly —
+    // which is precisely what charter rule 2 puts the decision on the server
+    // to prevent.
+    let server = start("timed-dig");
+    let stone = stone();
+
+    block_on(async {
+        let mut bot = join(&server).await;
+        let pos = BlockPos::new(2, 40, 2);
+        bot.place(pos, stone).await.expect("place");
+        bot.expect_block(pos, stone, Duration::from_secs(10))
+            .await
+            .expect("the block should exist before it can be dug");
+
+        // Aim at the middle cell of the block.
+        let target = tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
+        let started = std::time::Instant::now();
+        bot.start_dig(target).await.expect("start dig");
+
+        bot.expect_block(pos, tiamot_core::MaterialId::AIR.0, Duration::from_secs(20))
+            .await
+            .expect("the block should break on its own once the ticks are counted");
+        let took = started.elapsed();
+
+        assert!(
+            took >= Duration::from_millis(200),
+            "the block broke in {took:?}; a server that breaks on the first message is not \
+             counting anything"
+        );
+
+        // Sub-Node Contract §9: a whole block of one material yields 27 units.
+        let carried = bot
+            .await_inventory(Duration::from_secs(10))
+            .await
+            .expect("the drop should be credited");
+        assert!(
+            carried
+                .iter()
+                .any(|(id, units)| *id == stone && *units == 27),
+            "expected 27 units of stone, got {carried:?}"
+        );
+    });
+
+    assert!(server.stop());
+}
+
+#[test]
+fn cancelling_a_dig_leaves_the_block_alone() {
+    // The counter-example to the test above: without this, a server that
+    // ignored `CancelDig` and broke everything eventually would still pass.
+    let server = start("cancelled-dig");
+    let stone = stone();
+
+    block_on(async {
+        let mut bot = join(&server).await;
+        let pos = BlockPos::new(4, 40, 4);
+        bot.place(pos, stone).await.expect("place");
+        bot.expect_block(pos, stone, Duration::from_secs(10))
+            .await
+            .expect("place should land");
+
+        let target = tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
+        bot.start_dig(target).await.expect("start");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        bot.stop_dig().await.expect("cancel");
+
+        // Long enough that an uncancelled dig would have finished several times
+        // over — the default hardness is 0.75 s.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            bot.expect_block(pos, stone, Duration::from_millis(500))
+                .await
+                .is_ok(),
+            "the block went away after the dig was cancelled"
+        );
+    });
+
+    assert!(server.stop());
+}

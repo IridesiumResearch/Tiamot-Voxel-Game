@@ -172,6 +172,19 @@ pub struct Shared {
     /// in the connection task because charter rule 2 allows exactly one
     /// simulation: a player's physics must run on the tick, in a fixed order,
     /// against a world only that thread may read.
+    /// Every registered tool, by qualified id.
+    ///
+    /// Built once at startup from the frozen registries (charter rule 9), so
+    /// there is nothing that could change it while the server runs.
+    pub tools: std::collections::BTreeMap<String, tiamot_core::script::Tool>,
+
+    /// Seconds to break each material with a bare hand.
+    ///
+    /// Keyed by WORLD material id, because that is what a chunk holds. A
+    /// material with no entry gets the engine default rather than being
+    /// unbreakable — see `BlockRules::DEFAULT_HARDNESS`.
+    pub hardness: std::collections::BTreeMap<tiamot_core::MaterialId, f32>,
+
     /// Named `bodies` rather than `players` because `players` is already the
     /// connected *count* on this struct, and two fields whose names differ only
     /// by what they happen to hold is how the wrong one gets locked.
@@ -187,6 +200,10 @@ pub struct PlayerSim {
     pub body: tiamot_core::phys::Body,
     /// Inputs filed under the tick that will apply them.
     pub inputs: tiamot_core::phys::InputQueue,
+    /// What this player is breaking, if anything.
+    pub dig: Option<tiamot_core::dig::Dig>,
+    /// The tool they say they are holding, or `None` for a bare hand.
+    pub tool: Option<String>,
 }
 
 impl PlayerSim {
@@ -207,6 +224,8 @@ impl PlayerSim {
             origin,
             body: tiamot_core::phys::Body::at(local),
             inputs: tiamot_core::phys::InputQueue::new(tick),
+            dig: None,
+            tool: None,
         }
     }
 }
@@ -330,6 +349,119 @@ impl Shared {
         bodies
             .get_mut(uuid)
             .is_some_and(|player| player.inputs.offer(tick, intent))
+    }
+
+    /// Starts, re-aims, or stops a player's dig.
+    ///
+    /// Re-aiming discards progress — see [`tiamot_core::dig::Dig::retarget`]
+    /// for why it must not bank.
+    pub fn set_dig(&self, uuid: &PlayerUuid, target: Option<tiamot_core::SubNodePos>) {
+        let Ok(mut bodies) = self.bodies.lock() else {
+            return;
+        };
+        let Some(player) = bodies.get_mut(uuid) else {
+            return;
+        };
+        match target {
+            None => player.dig = None,
+            Some(target) => {
+                // The brush comes from the tool, which the simulation resolves
+                // — this layer does not know what a chisel is.
+                let brush = self.brush_of(player.tool.as_deref());
+                match player.dig.as_mut() {
+                    Some(dig) => {
+                        dig.retarget(target, brush);
+                    }
+                    None => player.dig = Some(tiamot_core::dig::Dig::start(target, brush)),
+                }
+            }
+        }
+    }
+
+    /// Records which tool a player says they are holding.
+    ///
+    /// An id the loaded mods did not register becomes a bare hand rather than a
+    /// refusal: a client that is out of date with the server's mod set is
+    /// wrong, not hostile, and digging slowly is a better answer than a
+    /// disconnect.
+    pub fn select_tool(&self, uuid: &PlayerUuid, tool: Option<String>) {
+        let known = tool.filter(|id| self.tools.contains_key(id));
+        if let Ok(mut bodies) = self.bodies.lock()
+            && let Some(player) = bodies.get_mut(uuid)
+        {
+            // The brush changes, so anything in progress starts over.
+            player.dig = None;
+            player.tool = known;
+        }
+    }
+
+    /// The brush a tool removes with, defaulting to a bare hand's whole block.
+    #[must_use]
+    pub fn brush_of(&self, tool: Option<&str>) -> tiamot_core::dig::Brush {
+        tool.and_then(|id| self.tools.get(id))
+            .map_or(tiamot_core::dig::Brush::Block, |tool| tool.brush)
+    }
+
+    /// How fast a tool digs, defaulting to a bare hand's 1.0.
+    #[must_use]
+    pub fn speed_of(&self, tool: Option<&str>) -> f32 {
+        tool.and_then(|id| self.tools.get(id))
+            .map_or(1.0, |tool| tool.speed_multiplier)
+    }
+
+    /// How long a material takes to break with a bare hand, in seconds.
+    #[must_use]
+    pub fn hardness_of(&self, material: tiamot_core::MaterialId) -> f32 {
+        self.hardness
+            .get(&material)
+            .copied()
+            .unwrap_or(tiamot_core::script::BlockRules::DEFAULT_HARDNESS)
+    }
+
+    /// Every dig currently running, as `(player, target, brush)`.
+    ///
+    /// A snapshot rather than a borrow: the caller reads and writes the world
+    /// between entries, and holding the lock across that would put a
+    /// connection task's contention inside the tick.
+    #[must_use]
+    pub fn digs_in_progress(
+        &self,
+    ) -> Vec<(PlayerUuid, tiamot_core::SubNodePos, tiamot_core::dig::Brush)> {
+        let Ok(bodies) = self.bodies.lock() else {
+            return Vec::new();
+        };
+        bodies
+            .iter()
+            .filter_map(|(uuid, player)| {
+                let dig = player.dig.as_ref()?;
+                Some((*uuid, dig.target(), dig.brush()))
+            })
+            .collect()
+    }
+
+    /// Advances a player's dig by one tick.
+    ///
+    /// Returns whether it completed, or `None` if they are no longer digging —
+    /// they may have cancelled between the snapshot and here.
+    pub fn advance_dig(&self, uuid: &PlayerUuid, hardness: f32) -> Option<bool> {
+        let mut bodies = self.bodies.lock().ok()?;
+        let player = bodies.get_mut(uuid)?;
+        let speed = self
+            .tools
+            .get(player.tool.as_deref().unwrap_or(""))
+            .map_or(1.0, |tool| tool.speed_multiplier);
+        Some(player.dig.as_mut()?.advance(hardness, speed))
+    }
+
+    /// A player's dig progress, for the crack overlay.
+    #[must_use]
+    pub fn dig_progress(&self, uuid: &PlayerUuid) -> Option<ServerMessage> {
+        let bodies = self.bodies.lock().ok()?;
+        let dig = bodies.get(uuid)?.dig.as_ref()?;
+        Some(ServerMessage::DigProgress {
+            target: dig.target(),
+            progress: dig.progress(),
+        })
     }
 
     /// A snapshot of where the simulation has a player, for sending on.
@@ -706,10 +838,15 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 // every tick rather than only on change: a client that missed
                 // the one state saying "you stopped" would predict straight
                 // through a wall until the next change, and states are small.
-                if let Some(uuid) = session.uuid()
-                    && let Some(state) = shared.player_state(&uuid)
-                {
-                    frame::write(&mut send, &state).await?;
+                if let Some(uuid) = session.uuid() {
+                    if let Some(state) = shared.player_state(&uuid) {
+                        frame::write(&mut send, &state).await?;
+                    }
+                    // Only to the digger, and only while a dig is running:
+                    // nobody else draws their crack.
+                    if let Some(progress) = shared.dig_progress(&uuid) {
+                        frame::write(&mut send, &progress).await?;
+                    }
                 }
                 continue;
             }
@@ -865,6 +1002,16 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     // three-input redundancy, or an input whose tick has
                     // already been simulated.
                     shared.queue_input(&uuid, *tick, intent_from_wire(*movement, *actions));
+                }
+            }
+            Action::Dig { target } => {
+                if let Some(uuid) = session.uuid() {
+                    shared.set_dig(&uuid, *target);
+                }
+            }
+            Action::SelectTool { tool } => {
+                if let Some(uuid) = session.uuid() {
+                    shared.select_tool(&uuid, tool.clone());
                 }
             }
             Action::None => {}
@@ -1032,6 +1179,8 @@ mod tests {
             kicks: tokio::sync::broadcast::channel(4).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            tools: std::collections::BTreeMap::new(),
+            hardness: std::collections::BTreeMap::new(),
         }
     }
 

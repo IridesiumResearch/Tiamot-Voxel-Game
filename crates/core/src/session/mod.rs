@@ -78,6 +78,21 @@ pub enum Action {
         text: String,
     },
 
+    /// Begin, re-aim, or stop breaking something.
+    ///
+    /// `None` is a cancel. Applying it is the simulation's business — the
+    /// session only decides that the player is in the world and may ask.
+    Dig {
+        /// The cell to break, or `None` to stop.
+        target: Option<crate::coords::SubNodePos>,
+    },
+
+    /// Choose the tool the player is holding.
+    SelectTool {
+        /// The qualified tool id, or `None` for a bare hand.
+        tool: Option<String>,
+    },
+
     /// Record a movement/look input for the next tick.
     Input {
         /// The tick the client believes it is on.
@@ -272,6 +287,16 @@ impl Session {
             (Phase::InWorld, ClientMessage::Chat { text }) => {
                 Response::act(Action::Chat { text: text.clone() })
             }
+            (Phase::InWorld, ClientMessage::StartDig { target }) => Response::act(Action::Dig {
+                target: Some(*target),
+            }),
+            (Phase::InWorld, ClientMessage::CancelDig) => {
+                Response::act(Action::Dig { target: None })
+            }
+            (Phase::InWorld, ClientMessage::SelectTool { tool }) => {
+                Response::act(Action::SelectTool { tool: tool.clone() })
+            }
+
             (
                 Phase::InWorld,
                 ClientMessage::PlayerInput {
@@ -646,6 +671,9 @@ impl Session {
             ClientMessage::AddKey { .. } => "AddKey",
             ClientMessage::RotateKey { .. } => "RotateKey",
             ClientMessage::Disconnect => "Disconnect",
+            ClientMessage::StartDig { .. } => "StartDig",
+            ClientMessage::CancelDig => "CancelDig",
+            ClientMessage::SelectTool { .. } => "SelectTool",
         };
         self.close_with(DisconnectReason::ProtocolError {
             detail: format!("{what} is not valid in phase {:?}", self.phase),

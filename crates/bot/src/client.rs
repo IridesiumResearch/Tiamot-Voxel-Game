@@ -791,6 +791,39 @@ impl Bot {
         }
     }
 
+    /// Asks the server to start breaking a cell.
+    ///
+    /// The server counts the ticks; this only says where to point. Sending it
+    /// again with a different target re-aims and discards progress.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn start_dig(&mut self, target: tiamot_core::SubNodePos) -> Result<(), BotError> {
+        self.send(&ClientMessage::StartDig { target }).await
+    }
+
+    /// Stops breaking, discarding progress.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn stop_dig(&mut self) -> Result<(), BotError> {
+        self.send(&ClientMessage::CancelDig).await
+    }
+
+    /// Chooses the held tool. `None` is a bare hand.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn select_tool(&mut self, tool: Option<&str>) -> Result<(), BotError> {
+        self.send(&ClientMessage::SelectTool {
+            tool: tool.map(str::to_owned),
+        })
+        .await
+    }
+
     /// Digs one sub-node: replaces a single cell with air.
     ///
     /// One of 27, which is the whole point of the engine. A client that could

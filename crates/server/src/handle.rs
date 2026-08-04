@@ -388,6 +388,41 @@ impl ServerHandle {
             "material table built"
         );
 
+        // Breaking rules, keyed by WORLD id because that is what a chunk holds.
+        // Built here, after the world's id map exists, for the same reason the
+        // material table is: a table of this session's runtime ids would name
+        // every material one number out on any world that has seen a different
+        // mod set (charter rule 8).
+        let hardness = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_block_rules())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|rules| {
+                // `Registry` has no name lookup — it is an ordered list, and
+                // adding an index for one caller at startup would be a data
+                // structure for a hot path that does not exist.
+                let runtime = registry
+                    .iter()
+                    .find(|(_, name)| *name == rules.block)
+                    .map(|(id, _)| id)?;
+                let world_id = world.materials().to_world(runtime).ok()?;
+                Some((tiamot_core::MaterialId(world_id), rules.hardness))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let tools = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_tools())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool| (tool.id.clone(), tool))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        info!(
+            hardness = hardness.len(),
+            tools = tools.len(),
+            "breaking rules built"
+        );
+
         let cert = ServerCert::load_or_create(&settings.world_path)?;
         let cert_fingerprint = cert.fingerprint;
         info!(
@@ -430,6 +465,8 @@ impl ServerHandle {
             kicks: tokio::sync::broadcast::channel(64).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            hardness,
+            tools,
         });
 
         // The runtime is built here rather than inside the network thread, and
@@ -627,6 +664,60 @@ impl ServerHandle {
                                     player.body.velocity = [0.0; 3];
                                 }
                             }
+                        }
+
+                        // Digging, after movement so a dig is judged against
+                        // where the player actually ended up this tick.
+                        //
+                        // The whole loop is on this thread for the same reason
+                        // movement is: it reads the world, it writes the world,
+                        // and doing it from a connection task would make the
+                        // result depend on which one woke first.
+                        for (uuid, target, brush) in shared.digs_in_progress() {
+                            let material = world
+                                .subnode(target, &mut source)
+                                .unwrap_or(tiamot_core::MaterialId::AIR);
+                            if material.is_air() {
+                                // Whatever they aimed at is already gone —
+                                // someone else broke it, or they are digging
+                                // air. Not an error, just nothing to do.
+                                shared.set_dig(&uuid, None);
+                                continue;
+                            }
+
+                            let hardness = shared.hardness_of(material);
+                            let Some(done) = shared.advance_dig(&uuid, hardness) else {
+                                continue;
+                            };
+                            if !done {
+                                continue;
+                            }
+
+                            // Contract §2 and §9: the brush decides what comes
+                            // out, and `break_block` decides what it yields.
+                            let edit = match brush {
+                                tiamot_core::dig::Brush::SubNode => tiamot_core::proto::Edit::SubNode {
+                                    pos: target,
+                                    material: tiamot_core::MaterialId::AIR.0,
+                                },
+                                tiamot_core::dig::Brush::Block => tiamot_core::proto::Edit::Block {
+                                    pos: target.block(),
+                                    material: tiamot_core::MaterialId::AIR.0,
+                                },
+                            };
+                            match world.apply(&edit, &mut source) {
+                                Ok((_, removed)) => {
+                                    shared.credit(uuid, removed);
+                                    shared.broadcast(ServerMessage::BlockDelta {
+                                        edit,
+                                        actor: Some(*uuid.as_bytes()),
+                                    });
+                                }
+                                Err(err) => {
+                                    debug!(actor = %uuid.short(), "a completed dig would not apply: {err}");
+                                }
+                            }
+                            shared.set_dig(&uuid, None);
                         }
 
                         // Mod tick hooks, before edits are applied: a mod

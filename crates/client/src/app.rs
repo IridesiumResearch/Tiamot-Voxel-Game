@@ -148,6 +148,12 @@ pub struct App {
     /// no world to stand in yet, and a controller with nothing under it would
     /// simply fall.
     predictor: Option<Predictor>,
+    /// The server's answer about what is being broken and how far along.
+    ///
+    /// Presentation only — the crack overlay is drawn from it. Not predicted:
+    /// the server decides when a block goes (charter rule 2), and a client that
+    /// guessed would show a block breaking that then came back.
+    dig: Option<(tiamot_core::SubNodePos, f32)>,
     /// Seconds carried over toward the next simulation tick.
     ///
     /// The simulation is a fixed 20 Hz (charter rule 4) and rendering is not,
@@ -185,6 +191,7 @@ impl App {
             tick: 0,
             server_label: "connecting…".to_owned(),
             predictor: None,
+            dig: None,
             tick_carry: 0.0,
             displacement: [0, 0, 0],
         }
@@ -355,6 +362,10 @@ impl App {
                         let voxels = phys::Voxels::new(&self.store, predictor.origin());
                         predictor.reconcile(&voxels, &state, &Tuning::DEFAULT);
                     }
+                }
+
+                Event::DigProgress { target, progress } => {
+                    self.dig = Some((target, progress));
                 }
 
                 Event::Chat { text, .. } => tracing::info!("{text}"),

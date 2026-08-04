@@ -44,12 +44,14 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
 // v4 (Task 09): appended `ServerMessage::PlayerState`, and `ServerMessage`
 // stopped deriving `Eq` because that variant carries `f32` fields.
+// v5 (Task 09): appended `ClientMessage::{StartDig, CancelDig, SelectTool}` and
+// `ServerMessage::DigProgress`. `ClientMessage` was already `PartialEq`-only.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -335,6 +337,43 @@ pub enum ClientMessage {
     },
     /// Client is leaving.
     Disconnect,
+
+    /// Begin breaking the block or cell the player is pointing at.
+    ///
+    /// **Appended at the end** (protocol v5), for the reason on
+    /// `ServerMessage::InventoryUpdate`.
+    ///
+    /// The client says *start* and the server counts the ticks. It cannot work
+    /// the other way round: a client that decided when a block broke could
+    /// break every block instantly, and charter rule 2 puts that decision on
+    /// the server. What comes back is [`ServerMessage::DigProgress`], which is
+    /// what the crack overlay is drawn from.
+    ///
+    /// Re-sending with a different target re-aims and discards progress, so a
+    /// client that simply repeats this every tick while the button is held is
+    /// behaving correctly.
+    StartDig {
+        /// The sub-node cell under the crosshair.
+        target: SubNodePos,
+    },
+
+    /// Stop breaking, discarding progress.
+    ///
+    /// **Appended at the end** (protocol v5).
+    CancelDig,
+
+    /// Choose the tool the player is holding.
+    ///
+    /// **Appended at the end** (protocol v5).
+    ///
+    /// `None` is a bare hand, which is also what an unknown id falls back to —
+    /// a client naming a tool the server's mods did not register is out of
+    /// date, not hostile, and digging slowly is a better answer than a
+    /// disconnect.
+    SelectTool {
+        /// The qualified tool id, e.g. `"core:chisel"`.
+        tool: Option<String>,
+    },
 }
 
 /// Messages a server sends.
@@ -486,6 +525,19 @@ pub enum ServerMessage {
         /// Whether the server has the player standing on something.
         on_ground: bool,
     },
+
+    /// How far along the player's current dig is.
+    ///
+    /// **Appended at the end** (protocol v5).
+    ///
+    /// Sent only to the digger — nobody else needs to draw their crack — and
+    /// only while a dig is running. `progress` is `0.0..=1.0`.
+    DigProgress {
+        /// Which cell is being broken.
+        target: SubNodePos,
+        /// How far along, `0.0..=1.0`.
+        progress: f32,
+    },
 }
 
 /// A message could not be encoded or decoded.
@@ -599,6 +651,11 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ProtocolErro
 /// [`ProtocolError::FieldTooLarge`] naming the offending field.
 pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolError> {
     match message {
+        ClientMessage::SelectTool { tool: Some(tool) } => {
+            // An id is a string from a peer. Bounded like a display name, and
+            // for the same reason: it is stored and echoed.
+            check_len("tool", tool.len(), MAX_NAME_BYTES)?;
+        }
         ClientMessage::Hello { display_name, .. } => {
             check_len("display_name", display_name.len(), MAX_NAME_BYTES)?;
             if display_name.is_empty() {
@@ -634,6 +691,9 @@ pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolEr
         | ClientMessage::BlockDelta { .. }
         | ClientMessage::AddKey { .. }
         | ClientMessage::RotateKey { .. }
+        | ClientMessage::StartDig { .. }
+        | ClientMessage::CancelDig
+        | ClientMessage::SelectTool { tool: None }
         | ClientMessage::Disconnect => {}
     }
     Ok(())
@@ -669,6 +729,17 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
                         limit: 0,
                     });
                 }
+            }
+        }
+        ServerMessage::DigProgress { progress, .. } => {
+            // Drives a crack overlay's texture index. A NaN or an out-of-range
+            // value is an index off the end of that texture.
+            if !progress.is_finite() || !(0.0..=1.0).contains(progress) {
+                return Err(ProtocolError::FieldTooLarge {
+                    field: "dig_progress",
+                    len: 0,
+                    limit: 0,
+                });
             }
         }
         ServerMessage::Chat { text, .. } => check_len("chat", text.len(), MAX_CHAT_BYTES)?,
@@ -952,7 +1023,7 @@ mod tests {
         // test fails after an edit, something was inserted or reordered rather
         // than appended, and PROTOCOL_VERSION must be bumped.
         let signature = WireSignature([0u8; 64]);
-        let client: [(ClientMessage, u8); 10] = [
+        let client: [(ClientMessage, u8); 13] = [
             (
                 ClientMessage::Hello {
                     protocol_version: 0,
@@ -1006,6 +1077,17 @@ mod tests {
                 8,
             ),
             (ClientMessage::Disconnect, 9),
+            // Protocol v5, appended after Disconnect — the variant an append
+            // is most likely to displace, for the same reason it is on the
+            // server side: it reads like the natural end of the enum.
+            (
+                ClientMessage::StartDig {
+                    target: SubNodePos::new(0, 0, 0),
+                },
+                10,
+            ),
+            (ClientMessage::CancelDig, 11),
+            (ClientMessage::SelectTool { tool: None }, 12),
         ];
 
         for (message, expected) in client {
@@ -1141,6 +1223,19 @@ mod tests {
         })
         .expect("encode");
         assert_eq!(state[0], 13);
+
+        // Protocol v5, appended after PlayerState.
+        //
+        // Written above it first, which moved `PlayerState` from 13 to 14 and
+        // would have silently reinterpreted every position update on every
+        // existing peer. This test caught it on the first run — which is the
+        // entire reason every ordinal is pinned rather than just the last.
+        let dig = encode(&ServerMessage::DigProgress {
+            target: SubNodePos::new(0, 0, 0),
+            progress: 0.0,
+        })
+        .expect("encode");
+        assert_eq!(dig[0], 14);
     }
 
     #[test]

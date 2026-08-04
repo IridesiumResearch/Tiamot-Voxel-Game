@@ -166,6 +166,14 @@ pub enum Event {
     /// store, and this task has no business touching it.
     PlayerState(crate::predict::Authoritative),
 
+    /// How far along the local player's dig is, for the crack overlay.
+    DigProgress {
+        /// Which cell is being broken.
+        target: tiamot_core::SubNodePos,
+        /// How far along, `0.0..=1.0`.
+        progress: f32,
+    },
+
     /// Something went wrong that the player should see but that is not fatal.
     ///
     /// A poisoned texture, a chunk that would not decode, a content transfer
@@ -197,6 +205,16 @@ pub enum Command {
         look: [f32; 2],
         /// Held actions.
         actions: u32,
+    },
+    /// Start or re-aim a dig, or stop one with `None`.
+    Dig {
+        /// The cell under the crosshair, or `None` to cancel.
+        target: Option<tiamot_core::SubNodePos>,
+    },
+    /// Choose the held tool.
+    SelectTool {
+        /// Qualified tool id, or `None` for a bare hand.
+        tool: Option<String>,
     },
     /// Leave.
     Disconnect,
@@ -763,6 +781,10 @@ async fn session(
                 }));
             }
 
+            ServerMessage::DigProgress { target, progress } => {
+                let _ = events.send(Event::DigProgress { target, progress });
+            }
+
             ServerMessage::HelloAck { .. }
             | ServerMessage::ModManifest { .. }
             | ServerMessage::InventoryUpdate { .. }
@@ -877,6 +899,11 @@ fn to_wire(command: Command) -> ClientMessage {
         },
         // Handled before this is reached; the connection is torn down rather
         // than a message written.
+        Command::Dig {
+            target: Some(target),
+        } => ClientMessage::StartDig { target },
+        Command::Dig { target: None } => ClientMessage::CancelDig,
+        Command::SelectTool { tool } => ClientMessage::SelectTool { tool },
         Command::Disconnect => ClientMessage::Disconnect,
     }
 }
