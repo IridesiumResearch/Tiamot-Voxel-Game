@@ -120,8 +120,8 @@ function Stream:next_bool() end
 ---@field id string Required. Namespaced with your mod id automatically.
 ---@field name string? Display name.
 ---@field description string? One-line description.
----@field hardness number? How long it takes to break.
----@field drops any? What breaking it yields.
+---@field hardness number? Seconds to break with a bare hand. Default 0.75. Must not be negative.
+---@field drops table<string, integer>? Overrides what breaking it yields: block id to UNITS (27 to a block). Omit for the ordinary rule — the block drops itself, 27 units whole or one per occupied sub-node. Bare ids are namespaced with your mod id.
 ---@field tags string[]? Arbitrary tags for other mods to match on.
 ---@field textures Tiamot.BlockTextures? Which images clients draw this block with.
 
@@ -135,6 +135,13 @@ function Stream:next_bool() end
 ---mod API.
 ---@class Tiamot.BlockTextures
 ---@field all string Required. The image every face uses, e.g. `"textures/white.png"`.
+
+---Fields accepted by `game.register_tool`.
+---@class Tiamot.ToolSpec
+---@field id string Required. Namespaced with your mod id automatically.
+---@field name string? Display name.
+---@field brush string? What shape it removes: `"block"` (default) or `"subnode"`.
+---@field speed_multiplier number? How much faster than a bare hand. Default 1.0, must be positive.
 
 ---Fields accepted by `game.register_action`.
 ---@class Tiamot.ActionSpec
@@ -162,6 +169,17 @@ function game.log(message) end
 ---@param spec Tiamot.BlockSpec
 ---@return integer id The numeric id, for use with the fill operations.
 function game.register_block(spec) end
+
+---Registers a tool.
+---
+---**Registration window only**, like `game.register_block`.
+---
+---`brush` is what makes sub-node resolution reachable from a mod. `"block"`
+---removes the whole block containing the targeted cell; `"subnode"` removes
+---only the cell under the crosshair, which is how a chisel works. An unknown
+---brush is an error naming it rather than a silent fallback.
+---@param spec Tiamot.ToolSpec
+function game.register_tool(spec) end
 
 ---Registers a world generation callback.
 ---

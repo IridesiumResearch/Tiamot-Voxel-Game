@@ -35,12 +35,16 @@ fn reference_mods() -> PathBuf {
 
 /// A server whose world has GROUND, so a joining player stands on it.
 ///
-/// The plain [`start`] runs with no mods, which means a world of pure air —
-/// and since Task 09 gave players physics, a player in one falls forever. That
-/// is correct behaviour, not a bug: an empty world has nothing to stand on.
-/// It does mean a test about a *stationary* observer's interest set has to put
-/// something under them, or it is really a test about a falling one.
-fn start_on_ground(name: &str, view: ViewDistance) -> ServerHandle {
+/// **This is the default, and running without mods is the special case.** A
+/// world with no mods is pure air, and since Task 09 gave players physics a
+/// player in one falls forever — correct behaviour, since there is nothing to
+/// stand on, but it means their interest set drifts downwards for as long as
+/// the test runs. Every assertion here about *which* chunks arrive is really
+/// an assertion about a stationary observer, and a falling one fails it
+/// eventually. It first showed up as one test failing only on the macOS
+/// runner, which is slower, so the fall got further before the collection
+/// finished.
+fn start(name: &str, view: ViewDistance) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: world_dir(name),
@@ -55,7 +59,14 @@ fn start_on_ground(name: &str, view: ViewDistance) -> ServerHandle {
     .expect("start")
 }
 
-fn start(name: &str, view: ViewDistance) -> ServerHandle {
+/// A server with no mods, and therefore no ground.
+///
+/// Only for tests that do not care where the player ends up. See [`start`].
+#[expect(
+    dead_code,
+    reason = "kept for tests that genuinely want an empty world"
+)]
+fn start_without_ground(name: &str, view: ViewDistance) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: world_dir(name),
@@ -295,7 +306,7 @@ fn streaming_respects_the_configured_view_distance() {
         ("view-small", small, expected_small),
         ("view-large", large, expected_large),
     ] {
-        let server = start_on_ground(name, view);
+        let server = start(name, view);
         block_on(async {
             let mut alice = join(&server, "Alice").await;
             let received = alice
@@ -327,7 +338,7 @@ fn each_chunk_is_sent_only_once() {
     // set every pass and saturate the link, while still passing every test that
     // only checks the set of chunks received.
     let view = ViewDistance::MINIMUM;
-    let server = start_on_ground("no-duplicates", view);
+    let server = start("no-duplicates", view);
     let spawn_chunk = BlockPos::new(0, 1, 0).chunk();
     let expected = interest::chunks_around(spawn_chunk, view).len();
 
@@ -652,7 +663,7 @@ fn a_client_that_talks_constantly_still_receives_its_world() {
     // because the quiet afterwards lets the timer fire. It has to be a steady
     // trickle, which is exactly what a player holding a key produces.
     let view = ViewDistance::MINIMUM;
-    let server = start_on_ground("constant-talker", view);
+    let server = start("constant-talker", view);
     let spawn_chunk = BlockPos::new(0, 1, 0).chunk();
     let expected = interest::chunks_around(spawn_chunk, view).len();
 
