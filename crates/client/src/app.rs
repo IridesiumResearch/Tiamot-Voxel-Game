@@ -201,6 +201,8 @@ pub struct Pacing {
     worst_frame: f32,
     /// Worst [`App::remesh`] so far in that window, in milliseconds.
     worst_remesh: f32,
+    /// How much of that worst remesh was meshing rather than upload.
+    worst_remesh_meshing: f32,
     /// Chunks rebuilt by that worst remesh.
     worst_remesh_chunks: usize,
     /// The last completed window's worst frame, in milliseconds.
@@ -210,6 +212,8 @@ pub struct Pacing {
     reported_frame: f32,
     /// The last completed window's worst remesh, in milliseconds.
     reported_remesh: f32,
+    /// How much of it was meshing rather than upload.
+    reported_remesh_meshing: f32,
     /// Chunks rebuilt by that remesh.
     reported_remesh_chunks: usize,
 }
@@ -223,22 +227,21 @@ impl Pacing {
         self.worst_frame = self.worst_frame.max(dt * 1000.0);
         self.elapsed += dt;
         if self.elapsed >= Self::WINDOW {
-            self.reported_frame = self.worst_frame;
-            self.reported_remesh = self.worst_remesh;
-            self.reported_remesh_chunks = self.worst_remesh_chunks;
             *self = Self {
-                reported_frame: self.reported_frame,
-                reported_remesh: self.reported_remesh,
-                reported_remesh_chunks: self.reported_remesh_chunks,
+                reported_frame: self.worst_frame,
+                reported_remesh: self.worst_remesh,
+                reported_remesh_meshing: self.worst_remesh_meshing,
+                reported_remesh_chunks: self.worst_remesh_chunks,
                 ..Self::default()
             };
         }
     }
 
-    /// Folds one remesh's duration in.
-    fn remesh(&mut self, millis: f32, chunks: usize) {
+    /// Folds one remesh's duration in, and how much of it was meshing.
+    fn remesh(&mut self, millis: f32, meshing_millis: f32, chunks: usize) {
         if millis > self.worst_remesh {
             self.worst_remesh = millis;
+            self.worst_remesh_meshing = meshing_millis;
             self.worst_remesh_chunks = chunks;
         }
     }
@@ -254,6 +257,21 @@ impl Pacing {
     #[must_use]
     pub const fn worst_remesh_ms(&self) -> (f32, usize) {
         (self.reported_remesh, self.reported_remesh_chunks)
+    }
+
+    /// How that worst remesh split between meshing and uploading, in
+    /// milliseconds.
+    ///
+    /// The split is the diagnosis. Meshing is CPU work that shows up the same
+    /// on every machine; uploading is driver work that a software rasteriser
+    /// reports as free, so a devcontainer measuring "the remesh" as a single
+    /// number can be an order of magnitude out and look entirely healthy.
+    #[must_use]
+    pub const fn worst_remesh_split_ms(&self) -> (f32, f32) {
+        (
+            self.reported_remesh_meshing,
+            self.reported_remesh - self.reported_remesh_meshing,
+        )
     }
 }
 
@@ -563,7 +581,7 @@ impl App {
                         // The mesh has to go with the data. A renderer holding
                         // a mesh for a chunk the store has forgotten draws a
                         // ghost that nothing will ever update.
-                        self.renderer.remove_chunk(self.drawn_at(pos));
+                        self.renderer.remove_chunk(&self.drawn_at(pos));
                     }
                 }
 
@@ -616,24 +634,33 @@ impl App {
             return 0;
         }
 
-        // Timed because the cost that matters is not the meshing — it is
-        // `set_chunk`, which creates two fresh GPU buffers per chunk and drops
-        // the old ones. On a software rasteriser that is a `malloc` and
-        // measures as nothing; on a real driver it is device-memory churn that
-        // can stall for milliseconds. No test on a headless CI box can tell the
-        // difference, so the client measures itself and puts the number where a
-        // human running it can read it.
+        // Meshing and upload are timed SEPARATELY, because they are different
+        // problems with different fixes and the first version of this could not
+        // tell them apart. Measured on an RTX 5070 Ti, the pair cost 15.6 ms of
+        // a 17.0 ms frame for four chunks whose meshes together came to well
+        // under a megabyte — and a cost that ignores data size is allocation
+        // overhead, which is upload, not meshing. Splitting the clock is what
+        // turns "the remesh is slow" into something actionable.
         let started = std::time::Instant::now();
+        let mut meshing = std::time::Duration::ZERO;
         for pos in &due {
             let Some(chunk) = self.store.get(*pos) else {
                 continue;
             };
             let neighbours = self.store.neighbours(*pos);
+
+            let mesh_started = std::time::Instant::now();
             let mesh = mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY);
+            meshing += mesh_started.elapsed();
+
             self.renderer.set_chunk(self.drawn_at(*pos), &mesh);
         }
-        self.pacing
-            .remesh(started.elapsed().as_secs_f32() * 1000.0, due.len());
+
+        self.pacing.remesh(
+            started.elapsed().as_secs_f32() * 1000.0,
+            meshing.as_secs_f32() * 1000.0,
+            due.len(),
+        );
         due.len()
     }
 
@@ -837,7 +864,9 @@ impl App {
         let material_count = self.materials.len();
 
         let (remesh_ms, remesh_chunks) = self.pacing.worst_remesh_ms();
+        let (meshing, upload) = self.pacing.worst_remesh_split_ms();
         let worst = self.pacing.worst_frame_ms();
+        let (created, reused) = self.renderer.buffer_stats();
 
         vec![
             format!("{:.0} fps", self.fps),
@@ -846,8 +875,13 @@ impl App {
             // an 11 ms worst frame is a hitch the average cannot express.
             format!(
                 "worst frame {worst:.1} ms ({:.0} fps) · worst remesh {remesh_ms:.1} ms over \
-                 {remesh_chunks} chunks",
+                 {remesh_chunks} chunks ({meshing:.1} mesh + {upload:.1} upload)",
                 if worst > 0.0 { 1000.0 / worst } else { 0.0 }
+            ),
+            format!(
+                "{created} mesh buffers created, {reused} reused from the pool",
+                created = created,
+                reused = reused
             ),
             format!("{x:.1}, {y:.1}, {z:.1}  ({facing})"),
             format!(
@@ -1027,7 +1061,7 @@ mod tests {
         for _ in 0..899 {
             pacing.frame(1.0 / 900.0);
         }
-        pacing.remesh(11.0, 4);
+        pacing.remesh(11.0, 0.4, 4);
         pacing.frame(0.011);
         // One more frame to close the window and publish it.
         pacing.frame(1.0 / 900.0);
@@ -1052,7 +1086,7 @@ mod tests {
         // during startup would sit on the HUD for the rest of the session
         // claiming the client still hitches.
         let mut pacing = Pacing::default();
-        pacing.remesh(11.0, 4);
+        pacing.remesh(11.0, 0.4, 4);
         pacing.frame(0.011);
         pacing.frame(1.0);
         assert!((pacing.worst_frame_ms() - 1000.0).abs() < 0.01);
