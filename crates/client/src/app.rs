@@ -181,6 +181,82 @@ pub fn intent_at_yaw(yaw: f32, input: Input) -> Intent {
     }
 }
 
+/// The worst frame of the last second, and what it was doing.
+///
+/// **A smoothed frame rate actively hides what charter rule 18 measures.** The
+/// average says 900 fps through a frame that took 11 ms, because one frame in a
+/// thousand barely moves an average — and one 11 ms frame is exactly the hitch a
+/// player sees. So the worst frame is kept, not the mean.
+///
+/// The remesh numbers sit beside it to answer the only question that matters
+/// once a hitch is real: whether it *is* the remesh. A worst frame of 11 ms
+/// alongside a worst remesh of 11 ms is meshing or mesh upload; a worst frame of
+/// 11 ms alongside a worst remesh of 0.2 ms is something else entirely, and
+/// would send anyone optimising the mesher after the wrong thing.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Pacing {
+    /// Seconds accumulated into the window still being measured.
+    elapsed: f32,
+    /// Worst frame so far in the window being measured, in milliseconds.
+    worst_frame: f32,
+    /// Worst [`App::remesh`] so far in that window, in milliseconds.
+    worst_remesh: f32,
+    /// Chunks rebuilt by that worst remesh.
+    worst_remesh_chunks: usize,
+    /// The last completed window's worst frame, in milliseconds.
+    ///
+    /// Reported rather than the live figure so the readout holds still long
+    /// enough to be read off a screen or a screenshot.
+    reported_frame: f32,
+    /// The last completed window's worst remesh, in milliseconds.
+    reported_remesh: f32,
+    /// Chunks rebuilt by that remesh.
+    reported_remesh_chunks: usize,
+}
+
+impl Pacing {
+    /// How long a window is before its worst figures are published, in seconds.
+    const WINDOW: f32 = 1.0;
+
+    /// Folds one frame's duration in, publishing the window when it is full.
+    fn frame(&mut self, dt: f32) {
+        self.worst_frame = self.worst_frame.max(dt * 1000.0);
+        self.elapsed += dt;
+        if self.elapsed >= Self::WINDOW {
+            self.reported_frame = self.worst_frame;
+            self.reported_remesh = self.worst_remesh;
+            self.reported_remesh_chunks = self.worst_remesh_chunks;
+            *self = Self {
+                reported_frame: self.reported_frame,
+                reported_remesh: self.reported_remesh,
+                reported_remesh_chunks: self.reported_remesh_chunks,
+                ..Self::default()
+            };
+        }
+    }
+
+    /// Folds one remesh's duration in.
+    fn remesh(&mut self, millis: f32, chunks: usize) {
+        if millis > self.worst_remesh {
+            self.worst_remesh = millis;
+            self.worst_remesh_chunks = chunks;
+        }
+    }
+
+    /// The worst frame of the last completed window, in milliseconds.
+    #[must_use]
+    pub const fn worst_frame_ms(&self) -> f32 {
+        self.reported_frame
+    }
+
+    /// The worst remesh of the last completed window, and how many chunks it
+    /// rebuilt.
+    #[must_use]
+    pub const fn worst_remesh_ms(&self) -> (f32, usize) {
+        (self.reported_remesh, self.reported_remesh_chunks)
+    }
+}
+
 /// The client, between frames.
 pub struct App {
     config: Config,
@@ -198,6 +274,8 @@ pub struct App {
     warnings: Vec<String>,
     /// A smoothed frame rate, for the HUD.
     fps: f32,
+    /// Frame pacing over the last second, and what the remesh cost during it.
+    pacing: Pacing,
     /// The server's tick when it last said so.
     tick: u64,
     /// What the connection reported about the server's certificate.
@@ -252,6 +330,7 @@ impl App {
             joined: false,
             warnings: Vec::new(),
             fps: 0.0,
+            pacing: Pacing::default(),
             tick: 0,
             server_label: "connecting…".to_owned(),
             predictor: None,
@@ -388,6 +467,12 @@ impl App {
     #[must_use]
     pub const fn joined(&self) -> bool {
         self.joined
+    }
+
+    /// Frame pacing over the last completed second.
+    #[must_use]
+    pub const fn pacing(&self) -> &Pacing {
+        &self.pacing
     }
 
     /// Whether there is a predicted body driving the camera.
@@ -527,7 +612,18 @@ impl App {
         // makes "nearest first" order the queue from 50,000 blocks away.
         let centre = self.camera_chunk();
         let due = self.store.take_dirty(centre, REMESH_BUDGET);
+        if due.is_empty() {
+            return 0;
+        }
 
+        // Timed because the cost that matters is not the meshing — it is
+        // `set_chunk`, which creates two fresh GPU buffers per chunk and drops
+        // the old ones. On a software rasteriser that is a `malloc` and
+        // measures as nothing; on a real driver it is device-memory churn that
+        // can stall for milliseconds. No test on a headless CI box can tell the
+        // difference, so the client measures itself and puts the number where a
+        // human running it can read it.
+        let started = std::time::Instant::now();
         for pos in &due {
             let Some(chunk) = self.store.get(*pos) else {
                 continue;
@@ -536,6 +632,8 @@ impl App {
             let mesh = mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY);
             self.renderer.set_chunk(self.drawn_at(*pos), &mesh);
         }
+        self.pacing
+            .remesh(started.elapsed().as_secs_f32() * 1000.0, due.len());
         due.len()
     }
 
@@ -552,6 +650,9 @@ impl App {
                 self.fps * 0.9 + instant * 0.1
             };
         }
+        // The unsmoothed half. See [`Pacing`]: the average above cannot show a
+        // hitch, and the hitch is the thing charter rule 18 is about.
+        self.pacing.frame(dt);
 
         let sensitivity = self.config.mouse_sensitivity;
         self.camera
@@ -735,8 +836,19 @@ impl App {
         let facing = compass(self.camera.yaw);
         let material_count = self.materials.len();
 
+        let (remesh_ms, remesh_chunks) = self.pacing.worst_remesh_ms();
+        let worst = self.pacing.worst_frame_ms();
+
         vec![
             format!("{:.0} fps", self.fps),
+            // The average above is the reassuring number; this is the honest
+            // one. Charter rule 18 measures pacing, and a 900 fps average with
+            // an 11 ms worst frame is a hitch the average cannot express.
+            format!(
+                "worst frame {worst:.1} ms ({:.0} fps) · worst remesh {remesh_ms:.1} ms over \
+                 {remesh_chunks} chunks",
+                if worst > 0.0 { 1000.0 / worst } else { 0.0 }
+            ),
             format!("{x:.1}, {y:.1}, {z:.1}  ({facing})"),
             format!(
                 "chunk {}, {}, {}",
@@ -903,6 +1015,62 @@ mod tests {
         assert!(
             strafe[0] < 0.0,
             "pressing right walked west; A and D are swapped"
+        );
+    }
+
+    #[test]
+    fn pacing_reports_the_worst_frame_and_not_the_average() {
+        // The whole reason this type exists. A second of 900 fps with one 11 ms
+        // frame in it averages to 900 fps — the hitch a player actually sees
+        // rounds away to nothing. Charter rule 18 measures pacing.
+        let mut pacing = Pacing::default();
+        for _ in 0..899 {
+            pacing.frame(1.0 / 900.0);
+        }
+        pacing.remesh(11.0, 4);
+        pacing.frame(0.011);
+        // One more frame to close the window and publish it.
+        pacing.frame(1.0 / 900.0);
+
+        assert!(
+            (pacing.worst_frame_ms() - 11.0).abs() < 0.01,
+            "the window reported {} ms; the 11 ms frame was averaged away, which is the bug \
+             this type exists to prevent",
+            pacing.worst_frame_ms()
+        );
+        assert_eq!(
+            pacing.worst_remesh_ms(),
+            (11.0, 4),
+            "the remesh that coincided with the worst frame has to be reported with it, or \
+             there is no way to tell a meshing hitch from any other kind"
+        );
+    }
+
+    #[test]
+    fn a_new_pacing_window_forgets_the_last_one() {
+        // Otherwise the worst frame is the worst frame EVER, and a single stall
+        // during startup would sit on the HUD for the rest of the session
+        // claiming the client still hitches.
+        let mut pacing = Pacing::default();
+        pacing.remesh(11.0, 4);
+        pacing.frame(0.011);
+        pacing.frame(1.0);
+        assert!((pacing.worst_frame_ms() - 1000.0).abs() < 0.01);
+
+        // A quiet second after it.
+        for _ in 0..60 {
+            pacing.frame(1.0 / 60.0);
+        }
+        pacing.frame(1.0 / 60.0);
+        assert!(
+            pacing.worst_frame_ms() < 20.0,
+            "a quiet second still reported {} ms from the stall before it",
+            pacing.worst_frame_ms()
+        );
+        assert_eq!(
+            pacing.worst_remesh_ms(),
+            (0.0, 0),
+            "the remesh figure outlived its window too"
         );
     }
 
