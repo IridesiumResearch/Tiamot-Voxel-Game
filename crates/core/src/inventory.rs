@@ -163,6 +163,45 @@ pub const fn display(units: u32) -> (u32, u32) {
 /// must not depend on cell iteration order, hash order, or anything else that
 /// could differ between machines running the same simulation (charter rule 4).
 #[must_use]
+/// The occupancy mask for placing `units` sub-nodes of a material.
+///
+/// **Fills bottom-up: the whole bottom layer, then the next, then the top.**
+/// Within a layer it goes in [`crate::block::subnode_index`] order, which is x
+/// fastest then z. The order is documented because it is *observable* — a
+/// player placing five spare nodes sees exactly which five cells appear, and a
+/// mod computing the same shape has to be able to predict it.
+///
+/// Bottom-up rather than any other order because material placed against a
+/// surface should rest on it. A fill that started at the top would leave spare
+/// nodes floating with a gap underneath, which looks like a bug whatever the
+/// documentation says.
+///
+/// `units` at or above [`UNITS_PER_BLOCK`] returns a full mask; the caller
+/// turns that into a `Uniform` block rather than a `Partial` one.
+#[must_use]
+pub fn placement_mask(units: u32) -> u32 {
+    if units >= UNITS_PER_BLOCK {
+        return (1 << UNITS_PER_BLOCK) - 1;
+    }
+
+    let mut mask = 0;
+    let mut placed = 0;
+    // y outermost is what makes it bottom-up; the inner two are the canonical
+    // index order so the result is a contiguous run of indices per layer.
+    'fill: for y in 0..crate::SUBNODES_PER_AXIS {
+        for z in 0..crate::SUBNODES_PER_AXIS {
+            for x in 0..crate::SUBNODES_PER_AXIS {
+                if placed == units {
+                    break 'fill;
+                }
+                mask |= 1 << crate::block::subnode_index(x, y, z);
+                placed += 1;
+            }
+        }
+    }
+    mask
+}
+
 pub fn break_block(block: BlockView<'_>) -> Vec<Stack> {
     match block {
         BlockView::Uniform(material) => Stack::new(material, UNITS_PER_BLOCK).into_iter().collect(),
@@ -646,5 +685,103 @@ mod tests {
         let ids: Vec<u16> = yielded.iter().map(|stack| stack.material.0).collect();
         assert_eq!(ids, vec![3, 4, 5], "ascending material id");
         assert_eq!(yielded[2].units, 2, "two cells of material 5");
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_block_of_units_fills_every_cell() {
+        assert_eq!(
+            placement_mask(UNITS_PER_BLOCK).count_ones(),
+            UNITS_PER_BLOCK
+        );
+        // And more than a block's worth does not overflow into nothing.
+        assert_eq!(
+            placement_mask(UNITS_PER_BLOCK + 5).count_ones(),
+            UNITS_PER_BLOCK
+        );
+    }
+
+    #[test]
+    fn nothing_placed_is_an_empty_mask() {
+        assert_eq!(placement_mask(0), 0);
+    }
+
+    #[test]
+    fn spare_nodes_fill_the_bottom_layer_first() {
+        // The documented order, and the one a player sees. Material placed
+        // against a surface should rest on it — a fill that started at the top
+        // would leave nodes floating with a gap under them.
+        let mask = placement_mask(9);
+        for z in 0..3 {
+            for x in 0..3 {
+                assert!(
+                    mask & (1 << crate::block::subnode_index(x, 0, z)) != 0,
+                    "cell ({x}, 0, {z}) should be filled"
+                );
+            }
+        }
+        assert_eq!(mask.count_ones(), 9, "exactly the bottom layer");
+
+        // Nothing above it.
+        for y in 1..3 {
+            for z in 0..3 {
+                for x in 0..3 {
+                    assert!(
+                        mask & (1 << crate::block::subnode_index(x, y, z)) == 0,
+                        "cell ({x}, {y}, {z}) should be empty"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_partial_layer_fills_in_index_order_within_it() {
+        // Five nodes: the whole bottom row of three, then two of the next.
+        let mask = placement_mask(5);
+        assert_eq!(mask.count_ones(), 5);
+        for (x, z, expected) in [
+            (0, 0, true),
+            (1, 0, true),
+            (2, 0, true),
+            (0, 1, true),
+            (1, 1, true),
+            (2, 1, false),
+        ] {
+            let filled = mask & (1 << crate::block::subnode_index(x, 0, z)) != 0;
+            assert_eq!(filled, expected, "cell ({x}, 0, {z})");
+        }
+    }
+
+    #[test]
+    fn every_count_places_exactly_that_many() {
+        // The property that makes the 27-unit arithmetic hold: placing n units
+        // consumes n and occupies n cells, with no rounding anywhere.
+        for units in 0..=UNITS_PER_BLOCK {
+            assert_eq!(
+                placement_mask(units).count_ones(),
+                units,
+                "placing {units} units"
+            );
+        }
+    }
+
+    #[test]
+    fn what_is_placed_is_what_breaking_it_gives_back() {
+        // Conservation, which is the whole point of counting in units: place
+        // n spare nodes, break the result, get n back. Contract §9 pairs with
+        // the fill order here.
+        for units in 1..UNITS_PER_BLOCK {
+            let drops = break_block(BlockView::Partial {
+                material: crate::MaterialId(7),
+                occupancy: placement_mask(units),
+            });
+            let total: u32 = drops.iter().map(|stack| stack.units).sum();
+            assert_eq!(total, units, "placing and breaking {units} units");
+        }
     }
 }
