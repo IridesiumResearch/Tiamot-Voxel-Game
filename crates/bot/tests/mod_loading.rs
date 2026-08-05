@@ -97,7 +97,10 @@ fn the_reference_mods_load_and_their_blocks_are_placeable() {
             pos: BlockPos::new(1, 2, 3),
             material: white.0,
         };
-        alice.edit(edit.clone()).await.expect("send edit");
+        // Written by the operator, not by the client — a client cannot edit the
+        // world. What is under test is that the id the mod registered is one
+        // the world will ACCEPT, and that is the same check either way.
+        assert!(server.seed_block(BlockPos::new(1, 2, 3), white.0));
 
         let seen = alice
             .next_block_delta(Duration::from_secs(5))
@@ -206,14 +209,9 @@ fn a_mod_that_fails_to_load_is_disabled_rather_than_fatal() {
 
     block_on(async {
         let mut alice = join(&server, "Alice").await;
-        // The good mod's block registered, so id 2 is placeable.
-        alice
-            .edit(Edit::Block {
-                pos: BlockPos::new(0, 0, 0),
-                material: 2,
-            })
-            .await
-            .expect("send");
+        // The good mod's block registered, so id 2 is a material the world
+        // accepts.
+        assert!(server.seed_block(BlockPos::new(0, 0, 0), 2));
         assert!(
             alice
                 .next_block_delta(Duration::from_secs(5))
@@ -305,10 +303,7 @@ fn mod_blocks_get_the_ids_the_vm_promised_them() {
         // `zebra:zulu` registered first, so it is id 2 and `zebra:alpha` is 3.
         // If the replay had sorted by name they would be swapped.
         for (material, pos) in [(2u16, BlockPos::new(0, 0, 0)), (3, BlockPos::new(1, 0, 0))] {
-            alice
-                .edit(Edit::Block { pos, material })
-                .await
-                .expect("send");
+            assert!(server.seed_block(pos, material));
             let seen = alice
                 .next_block_delta(Duration::from_secs(5))
                 .await
@@ -319,13 +314,7 @@ fn mod_blocks_get_the_ids_the_vm_promised_them() {
 
         // And nothing beyond them: a third id would mean the registry picked up
         // something the VM did not register.
-        alice
-            .edit(Edit::Block {
-                pos: BlockPos::new(2, 0, 0),
-                material: 4,
-            })
-            .await
-            .expect("send");
+        assert!(server.seed_block(BlockPos::new(2, 0, 0), 4));
         assert!(
             alice
                 .next_block_delta(Duration::from_millis(500))

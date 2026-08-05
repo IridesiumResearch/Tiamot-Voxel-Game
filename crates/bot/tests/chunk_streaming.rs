@@ -12,7 +12,7 @@ use std::time::Duration;
 use bot::Bot;
 use tiamot_core::identity::{Allowlist, Identity};
 use tiamot_core::interest::{self, ViewDistance};
-use tiamot_core::proto::{Edit, ServerMessage};
+use tiamot_core::proto::ServerMessage;
 use tiamot_core::{BlockPos, MaterialId};
 use tiamot_server::{ServerHandle, Settings};
 
@@ -239,13 +239,10 @@ fn a_streamed_chunk_carries_the_edits_made_to_it() {
 
     block_on(async {
         let mut builder = join(&server, "Builder").await;
-        builder
-            .edit(Edit::Block {
-                pos,
-                material: stone,
-            })
-            .await
-            .expect("send edit");
+        // The operator arranges it. What is under test is that a player joining
+        // LATER receives the edited chunk, which does not care who made the
+        // edit — only that the world has it.
+        assert!(server.seed_block(pos, stone));
         builder
             .next_block_delta(Duration::from_secs(5))
             .await

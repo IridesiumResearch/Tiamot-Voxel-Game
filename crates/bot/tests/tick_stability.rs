@@ -106,12 +106,10 @@ fn two_hundred_ticks_under_four_bots_stays_within_budget() {
                     // do real work rather than hitting one hot chunk.
                     let offset = i32::try_from(round).expect("fits")
                         + i32::try_from(index).expect("fits") * 97;
-                    bot.edit(Edit::Block {
-                        pos: BlockPos::new(offset, 4, offset / 3),
-                        material: stone,
-                    })
-                    .await
-                    .expect("send edit");
+                    // Load on the edit path, applied as the operator: what
+                    // this measures is the cost of applying and broadcasting
+                    // edits under a full server, not who asked for them.
+                    assert!(server.seed_block(BlockPos::new(offset, 4, offset / 3), stone));
                     sent += 1;
                 }
             }
@@ -304,7 +302,7 @@ fn four_bots_all_see_a_fourth_bots_edit() {
                 pos: BlockPos::new(64, 65, 66),
                 material: stone,
             };
-            bots[0].edit(edit.clone()).await.expect("send edit");
+            assert!(server.seed_block(BlockPos::new(64, 65, 66), stone));
 
             for (index, bot) in bots.iter_mut().enumerate() {
                 let seen = bot

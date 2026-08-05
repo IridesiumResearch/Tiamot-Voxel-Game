@@ -126,12 +126,20 @@ async fn join(server: &ServerHandle) -> Bot {
 }
 
 /// Fills a 3x3x1 slab so there is something to mine, and waits for it to land.
-async fn build_slab(bot: &mut Bot, origin: BlockPos, material: u16) -> Vec<BlockPos> {
+async fn build_slab(
+    bot: &mut Bot,
+    server: &ServerHandle,
+    origin: BlockPos,
+    material: u16,
+) -> Vec<BlockPos> {
     let mut placed = Vec::new();
     for dx in 0..3 {
         for dz in 0..3 {
             let pos = BlockPos::new(origin.x + dx, origin.y, origin.z + dz);
-            bot.place(pos, material).await.expect("place");
+            // The operator arranges the slab. A client cannot edit the world,
+            // and mining is what these tests are about — the arranging is
+            // scaffolding and should not be asserting a capability of its own.
+            assert!(server.seed_block(pos, material), "seed queue full");
             placed.push(pos);
         }
     }
@@ -143,30 +151,70 @@ async fn build_slab(bot: &mut Bot, origin: BlockPos, material: u16) -> Vec<Block
     placed
 }
 
+/// Digs a whole block for real and waits for the server to confirm it.
+///
+/// The Task 07 stand-in wrote air straight into the world; this counts ticks
+/// with a mod-registered tool, which is the only way a block comes out now.
+/// Re-aimed until it lands: re-aiming at the same cell keeps its progress, so
+/// repeating is free and it survives a message going missing.
+async fn dig_whole_block(bot: &mut Bot, pos: BlockPos) {
+    bot.select_tool(None).await.expect("bare hand");
+    let target = SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        bot.start_dig(target).await.expect("start dig");
+        if bot
+            .expect_block(pos, MaterialId::AIR.0, Duration::from_secs(4))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "digging {pos:?} never completed"
+        );
+    }
+}
+
+/// Chisels one cell for real, with a mod-registered sub-node brush.
+async fn chisel_cell(bot: &mut Bot, target: SubNodePos, expect_units: u32, stone: u16) {
+    bot.select_tool(Some("core_tools:chisel"))
+        .await
+        .expect("select chisel");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        bot.start_dig(target).await.expect("start dig");
+        let _ = bot.await_inventory(Duration::from_secs(4)).await;
+        if bot.units_of(stone) >= expect_units {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "chiselling {target:?} never yielded {expect_units} units"
+        );
+    }
+}
+
 #[test]
 fn mining_a_three_by_three_yields_exactly_nine_blocks_and_no_spares() {
     // `mine_3x3.lua` as a Rust test: nine whole blocks is 243 units, which must
     // display as exactly 9 blocks and 0 spare nodes. A yield that rounded, or
     // that counted blocks instead of units, fails here.
-    let server = start("mine-3x3");
+    let server = start_with_mods("mine-3x3");
     let stone = stone();
 
     block_on(async {
         let mut bot = join(&server).await;
         let origin = BlockPos::new(4, 6, 4);
-        let blocks = build_slab(&mut bot, origin, stone).await;
+        let blocks = build_slab(&mut bot, &server, origin, stone).await;
 
         // Placing yielded whatever was there before (air, so nothing). Start
         // counting from here.
         let before = bot.units_of(stone);
 
         for pos in &blocks {
-            bot.dig_block(*pos).await.expect("dig");
-        }
-        for pos in &blocks {
-            bot.expect_block(*pos, MaterialId::AIR.0, Duration::from_secs(10))
-                .await
-                .expect("the dig should be confirmed");
+            dig_whole_block(&mut bot, *pos).await;
         }
 
         // Let the last inventory update arrive.
@@ -202,13 +250,13 @@ fn mining_single_subnodes_yields_one_unit_each_and_the_spares_add_up() {
     // `subnode_mining.lua` as a Rust test, and the half that makes the design
     // fair: chiselling must yield ONE unit per cell. If a sub-node dig yielded
     // a whole block, a player could mine 27 blocks' worth by taking 27 corners.
-    let server = start("subnode-mining");
+    let server = start_with_mods("subnode-mining");
     let stone = stone();
 
     block_on(async {
         let mut bot = join(&server).await;
         let block = BlockPos::new(8, 6, 8);
-        bot.place(block, stone).await.expect("place");
+        assert!(server.seed_block(block, stone), "seed queue full");
         bot.expect_block(block, stone, Duration::from_secs(10))
             .await
             .expect("confirmed");
@@ -222,20 +270,17 @@ fn mining_single_subnodes_yields_one_unit_each_and_the_spares_add_up() {
         // the test was wrong, which is a good sign for the arithmetic.
         let base = SubNodePos::new(block.x * 3, block.y * 3, block.z * 3);
         let cells = [(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 0), (0, 0, 1)];
-        for (dx, dy, dz) in cells {
-            bot.dig_subnode(SubNodePos::new(base.x + dx, base.y + dy, base.z + dz))
-                .await
-                .expect("chisel");
+        for (index, (dx, dy, dz)) in cells.into_iter().enumerate() {
+            let want = before + u32::try_from(index).expect("fits") + 1;
+            chisel_cell(
+                &mut bot,
+                SubNodePos::new(base.x + dx, base.y + dy, base.z + dz),
+                want,
+                stone,
+            )
+            .await;
         }
-
-        let mut units = 0;
-        for _ in 0..50 {
-            bot.await_inventory(Duration::from_millis(200)).await.ok();
-            units = bot.units_of(stone).saturating_sub(before);
-            if units >= 5 {
-                break;
-            }
-        }
+        let units = bot.units_of(stone).saturating_sub(before);
 
         assert_eq!(units, 5, "five cells is five units, got {units}");
         assert_eq!(
@@ -255,7 +300,7 @@ fn twenty_seven_chiselled_nodes_equal_one_mined_block() {
     // The arithmetic that ties the two halves together, over the wire. Taking a
     // block apart one cell at a time must yield exactly what breaking it whole
     // does — otherwise one of the two paths is cheating.
-    let server = start("chisel-equals-block");
+    let server = start_with_mods("chisel-equals-block");
     let stone = stone();
 
     block_on(async {
@@ -263,16 +308,12 @@ fn twenty_seven_chiselled_nodes_equal_one_mined_block() {
 
         // Block A: mined whole.
         let whole = BlockPos::new(12, 6, 12);
-        bot.place(whole, stone).await.expect("place");
+        assert!(server.seed_block(whole, stone), "seed queue full");
         bot.expect_block(whole, stone, Duration::from_secs(10))
             .await
             .expect("confirmed");
         let before_whole = bot.units_of(stone);
-        bot.dig_block(whole).await.expect("dig");
-        bot.expect_block(whole, MaterialId::AIR.0, Duration::from_secs(10))
-            .await
-            .expect("confirmed");
-
+        dig_whole_block(&mut bot, whole).await;
         let mut whole_yield = 0;
         for _ in 0..50 {
             bot.await_inventory(Duration::from_millis(200)).await.ok();
@@ -284,31 +325,29 @@ fn twenty_seven_chiselled_nodes_equal_one_mined_block() {
 
         // Block B: chiselled away, all 27 cells.
         let chiselled = BlockPos::new(14, 6, 14);
-        bot.place(chiselled, stone).await.expect("place");
+        assert!(server.seed_block(chiselled, stone), "seed queue full");
         bot.expect_block(chiselled, stone, Duration::from_secs(10))
             .await
             .expect("confirmed");
         let before_chisel = bot.units_of(stone);
 
         let base = SubNodePos::new(chiselled.x * 3, chiselled.y * 3, chiselled.z * 3);
+        let mut taken = 0;
         for dx in 0..3 {
             for dy in 0..3 {
                 for dz in 0..3 {
-                    bot.dig_subnode(SubNodePos::new(base.x + dx, base.y + dy, base.z + dz))
-                        .await
-                        .expect("chisel");
+                    taken += 1;
+                    chisel_cell(
+                        &mut bot,
+                        SubNodePos::new(base.x + dx, base.y + dy, base.z + dz),
+                        before_chisel + taken,
+                        stone,
+                    )
+                    .await;
                 }
             }
         }
-
-        let mut chisel_yield = 0;
-        for _ in 0..80 {
-            bot.await_inventory(Duration::from_millis(200)).await.ok();
-            chisel_yield = bot.units_of(stone).saturating_sub(before_chisel);
-            if chisel_yield >= UNITS_PER_BLOCK {
-                break;
-            }
-        }
+        let chisel_yield = bot.units_of(stone).saturating_sub(before_chisel);
 
         assert_eq!(whole_yield, UNITS_PER_BLOCK, "a whole block is 27 units");
         assert_eq!(
@@ -326,18 +365,27 @@ fn twenty_seven_chiselled_nodes_equal_one_mined_block() {
 fn digging_air_yields_nothing() {
     // A stack of air would be a bug that propagated into every inventory that
     // touched it.
-    let server = start("dig-air");
+    let server = start_with_mods("dig-air");
     let stone = stone();
 
     block_on(async {
         let mut bot = join(&server).await;
         let empty = BlockPos::new(20, 30, 20);
 
-        bot.dig_block(empty).await.expect("dig");
-        bot.expect_block(empty, MaterialId::AIR.0, Duration::from_secs(10))
-            .await
-            .expect("confirmed");
-        bot.await_inventory(Duration::from_millis(500)).await.ok();
+        // Aiming at air and holding the button. The dig never COMPLETES —
+        // the server cancels one whose target is already gone — so there is no
+        // confirmation to wait for, and the assertion is about what did not
+        // happen: nothing credited, and above all no stack of air.
+        //
+        // The old version of this test wrote air into an air block and waited
+        // for the broadcast, which the direct-edit path obligingly sent. There
+        // is no such path now, and the claim is the same one.
+        bot.select_tool(None).await.expect("bare hand");
+        let target = SubNodePos::new(empty.x * 3 + 1, empty.y * 3 + 1, empty.z * 3 + 1);
+        for _ in 0..40 {
+            bot.start_dig(target).await.expect("start dig");
+            let _ = bot.await_inventory(Duration::from_millis(50)).await;
+        }
 
         assert_eq!(bot.units_of(stone), 0);
         assert!(
@@ -358,7 +406,7 @@ fn digging_air_yields_nothing() {
 fn one_players_mining_does_not_credit_another() {
     // Inventories are per-identity. A yield credited to whoever happened to be
     // connected would be worse than no inventory at all.
-    let server = start("per-player");
+    let server = start_with_mods("per-player");
     let stone = stone();
 
     block_on(async {
@@ -373,16 +421,12 @@ fn one_players_mining_does_not_credit_another() {
         bystander.join("Bystander").await.expect("join");
 
         let pos = BlockPos::new(30, 6, 30);
-        miner.place(pos, stone).await.expect("place");
+        assert!(server.seed_block(pos, stone), "seed queue full");
         miner
             .expect_block(pos, stone, Duration::from_secs(10))
             .await
             .expect("confirmed");
-        miner.dig_block(pos).await.expect("dig");
-        miner
-            .expect_block(pos, MaterialId::AIR.0, Duration::from_secs(10))
-            .await
-            .expect("confirmed");
+        dig_whole_block(&mut miner, pos).await;
 
         for _ in 0..50 {
             miner.await_inventory(Duration::from_millis(200)).await.ok();
@@ -429,7 +473,7 @@ fn a_dig_takes_time_and_yields_the_block_it_broke() {
     block_on(async {
         let mut bot = join(&server).await;
         let pos = BlockPos::new(2, 40, 2);
-        bot.place(pos, stone).await.expect("place");
+        assert!(server.seed_block(pos, stone), "seed queue full");
         bot.expect_block(pos, stone, Duration::from_secs(10))
             .await
             .expect("the block should exist before it can be dug");
@@ -476,7 +520,7 @@ fn cancelling_a_dig_leaves_the_block_alone() {
     block_on(async {
         let mut bot = join(&server).await;
         let pos = BlockPos::new(4, 40, 4);
-        bot.place(pos, stone).await.expect("place");
+        assert!(server.seed_block(pos, stone), "seed queue full");
         bot.expect_block(pos, stone, Duration::from_secs(10))
             .await
             .expect("place should land");
@@ -520,7 +564,7 @@ fn deleting_the_tools_mod_makes_the_world_undiggable() {
     block_on(async {
         let mut bot = join(&server).await;
         let pos = BlockPos::new(6, 40, 6);
-        bot.place(pos, stone).await.expect("place");
+        assert!(server.seed_block(pos, stone), "seed queue full");
         bot.expect_block(pos, stone, Duration::from_secs(10))
             .await
             .expect("place should land");
@@ -537,7 +581,7 @@ fn deleting_the_tools_mod_makes_the_world_undiggable() {
     block_on(async {
         let mut bot = join(&server).await;
         let pos = BlockPos::new(6, 40, 6);
-        bot.place(pos, stone).await.expect("place");
+        assert!(server.seed_block(pos, stone), "seed queue full");
         bot.expect_block(pos, stone, Duration::from_secs(10))
             .await
             .expect("place should land");
@@ -569,7 +613,7 @@ fn the_chisel_takes_one_cell_where_a_hand_takes_the_block() {
         let pos = BlockPos::new(8, 40, 8);
         let target = tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
 
-        bot.place(pos, stone).await.expect("place");
+        assert!(server.seed_block(pos, stone), "seed queue full");
         bot.expect_block(pos, stone, Duration::from_secs(10))
             .await
             .expect("place should land");
