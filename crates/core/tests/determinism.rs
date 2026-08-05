@@ -88,6 +88,115 @@ fn golden_fingerprints_match() {
     );
 }
 
+/// The physics golden: a fixed scene, a fixed input log, and the hash of every
+/// tick of the result.
+///
+/// **Regenerate only with the reasoning in the module docs.** This is the
+/// number that says a client's prediction and a server's simulation are the
+/// same computation — if they were not, reconciliation would correct every
+/// tick and the player would never stop being dragged.
+const PHYSICS_GOLDEN: u64 = 8_510_785_279_271_553_158;
+
+/// Runs the fixed physics scenario and hashes every tick of it.
+///
+/// Hashes EVERY tick rather than the final state: a run that diverged and
+/// converged again — a body that clipped a corner differently and landed in the
+/// same place — would pass a final-state check while being a different
+/// simulation.
+fn physics_fingerprint() -> u64 {
+    use tiamot_core::phys::{Body, Gait, Intent, Solid, Tuning};
+
+    /// A staircase with a wall, so the log exercises step-up, collision and
+    /// falling rather than open ground.
+    struct Scene;
+    impl Solid for Scene {
+        fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+            // A floor, a step at x = 4, and a wall at x = 9.
+            y < 0 || (y < 1 && (4..9).contains(&x)) || (x == 9 && y < 6 && (-8..8).contains(&z))
+        }
+    }
+
+    // A VARIED log. A constant intent would hold the body against one surface
+    // and never exercise the transitions, which is where a divergence would
+    // actually come from.
+    let script: [(f32, f32, bool, u8); 8] = [
+        (1.0, 0.0, false, 0),
+        (1.0, 0.3, true, 1),
+        (0.0, 1.0, false, 2),
+        (-1.0, 0.2, true, 0),
+        (0.5, -0.9, false, 1),
+        (1.0, 1.0, true, 2),
+        (-0.4, -0.4, false, 0),
+        (0.0, 0.0, false, 1),
+    ];
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tiamot:phys-golden:v1");
+    let mut body = Body::at([1.5, 3.0, 0.5]);
+    for tick in 0..240u32 {
+        let (x, z, jump, gait) = script[(tick as usize) % script.len()];
+        let intent = Intent {
+            walk: [x, z],
+            jump,
+            gait: match gait {
+                0 => Gait::Walk,
+                1 => Gait::Sprint,
+                _ => Gait::Sneak,
+            },
+        };
+        body = tiamot_core::phys::step(&Scene, body, intent, &Tuning::DEFAULT);
+
+        // Bit patterns, not values: two floats that compare equal can still be
+        // different bits, and the whole point is that the bits agree.
+        for value in body.position.iter().chain(body.velocity.iter()) {
+            hasher.update(&value.to_bits().to_le_bytes());
+        }
+        hasher.update(&[u8::from(body.on_ground)]);
+    }
+    u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("BLAKE3 output is 32 bytes"),
+    )
+}
+
+#[test]
+fn an_input_log_simulates_to_its_golden_hash() {
+    // **Task 09's determinism criterion, and what underwrites prediction.**
+    // The client replays inputs through `phys::step` and compares with the
+    // server's answer; that comparison is only meaningful if the same inputs
+    // give the same bits on every machine. The CI matrix runs this on Linux,
+    // Windows and macOS.
+    //
+    // Charter rule 4 says this is achievable with plain `f32` because Rust
+    // guarantees IEEE semantics and forbids fast-math, FMA contraction and
+    // reassociation. This is the assertion that the guarantee holds in
+    // practice, for the code players actually run.
+    //
+    // Sensitivity, measured rather than assumed: perturbing
+    // `Tuning::ground_acceleration` from 0.43 to 0.4300001 — two parts in ten
+    // million — changes this hash. Perturbing `walk_speed` does NOT, and that
+    // is not a gap: it is a CAP, and the speed a body settles at comes from
+    // acceleration and friction, so the cap never binds. `tuning`'s own
+    // `friction_and_acceleration_settle_at_the_walk_speed` is what keeps the
+    // two agreeing.
+    assert_eq!(
+        physics_fingerprint(),
+        PHYSICS_GOLDEN,
+        "the same input log simulated to a different result. Do NOT update the constant to \
+         match — see the module docs. Either a banned operation reached `phys`, a thread is \
+         in flush-to-zero mode, or the physics changed deliberately."
+    );
+}
+
+#[test]
+fn the_physics_golden_is_stable_across_repeated_calls() {
+    // The counter-example to the golden being satisfied by chance: if the
+    // scenario were not reproducible even in one process, the constant above
+    // would be meaningless whatever it said.
+    assert_eq!(physics_fingerprint(), physics_fingerprint());
+}
+
 #[test]
 fn every_golden_case_is_distinct() {
     // A gate whose cases collide is weaker than it looks: a change could move

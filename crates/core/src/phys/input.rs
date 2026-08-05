@@ -5,12 +5,21 @@
 //!
 //! # Why a buffer at all
 //!
-//! Inputs are sent with redundancy — Task 09's design puts the last three in
-//! every packet — over a network that reorders and drops. So the server sees
-//! the same input several times, sees tick 41 after tick 42, and sometimes
-//! never sees tick 40 at all. The tick loop needs one answer per tick anyway,
-//! because a fixed timestep is what makes the simulation deterministic
-//! (charter rule 4), and "wait for the input" is not available to it.
+//! Task 09's design has inputs sent with redundancy — the last three in every
+//! packet — over a network that reorders and drops. So the server may see the
+//! same input several times, see tick 41 after tick 42, or never see tick 40 at
+//! all. The tick loop needs one answer per tick regardless, because a fixed
+//! timestep is what makes the simulation deterministic (charter rule 4), and
+//! "wait for the input" is not available to it.
+//!
+//! **The transport delivers none of that today**, and this buffer is built for
+//! it anyway. Inputs travel on a bidirectional QUIC stream, which is reliable
+//! and ordered, so `App::report_input` sends one input per tick and no
+//! duplicates — see its docs for why triplicating them over a reliable stream
+//! would be bandwidth spent against a loss that cannot happen. What this
+//! absorbs today is the client's own tick drift and the gaps a stall leaves.
+//! What it is READY for is the day inputs move to datagrams, which is a change
+//! on the sending side alone.
 //!
 //! This turns that stream into exactly one [`Intent`] per tick:
 //!

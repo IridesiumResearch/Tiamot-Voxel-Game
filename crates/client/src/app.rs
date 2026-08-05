@@ -1231,6 +1231,22 @@ impl App {
     /// keys and letting the server rotate them would put a `sin` and a `cos`
     /// inside the tick, which charter rule 4 forbids, and would give the two
     /// ends two chances to disagree about the same movement.
+    /// Sends one input per tick, and **deliberately not the last three**.
+    ///
+    /// Task 09's design says inputs are "sent unreliably with redundancy (last
+    /// 3 inputs per packet)". That is the right design for a datagram
+    /// transport, where an input that is lost is simply gone. This engine does
+    /// not have one: `client::net` opens a **bidirectional QUIC stream**, which
+    /// is reliable and ordered, so an input either arrives or the connection is
+    /// over. Sending each one three times would triple the input bandwidth to
+    /// insure against a loss the transport has already ruled out.
+    ///
+    /// The server-side machinery for redundancy exists anyway and is not
+    /// wasted: `phys::InputQueue` ignores duplicates, which is what makes a
+    /// change of transport a one-line change here rather than a protocol
+    /// question. If inputs ever move to datagrams — the reason to, one day,
+    /// being that a lost input should not delay every input behind it — this is
+    /// where the last three start being sent.
     fn report_input(&self, input: Input, intent: Intent) {
         use tiamot_core::proto::actions;
 
