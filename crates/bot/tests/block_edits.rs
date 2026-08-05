@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bot::Bot;
 use tiamot_core::identity::{Allowlist, Identity};
-use tiamot_core::proto::{Edit, ServerMessage};
+use tiamot_core::proto::{DisconnectReason, Edit, ServerMessage};
 use tiamot_core::{BlockPos, MaterialId, SubNodePos};
 use tiamot_server::{ServerHandle, Settings};
 
@@ -417,6 +417,63 @@ fn an_edit_with_an_unregistered_material_is_ignored_without_dropping_the_player(
         );
 
         alice.disconnect().await;
+    });
+
+    server.stop();
+}
+
+#[test]
+fn the_retired_block_delta_is_refused_rather_than_ignored() {
+    // **The point of the whole exercise.** Task 07's `BlockDelta` let a client
+    // write a block straight into the world, which made every rule digging and
+    // placing enforce — you pay for what you take, you are refused what you may
+    // not have, a mod may veto it — optional for anyone who sent the older
+    // message instead.
+    //
+    // It cannot be deleted: postcard encodes a variant as its ordinal, so
+    // removing it would renumber `Chat`, `AddKey` and everything after, and any
+    // peer built against either side would silently reinterpret every later
+    // message. Deprecated in place is the only way to retire one.
+    //
+    // Refused rather than ignored, and this asserts which. A client built
+    // against an engine that no longer exists should find out immediately
+    // rather than watch its edits vanish.
+    let dir = world_dir("retired-blockdelta");
+    let server = ServerHandle::start(&settings(&dir)).expect("start");
+    let stone = material_id(&server, "test:stone");
+
+    block_on(async {
+        let mut alice = join(&server, "Alice").await;
+        let pos = BlockPos::new(5, 5, 5);
+        alice
+            .send_retired_block_delta(Edit::Block {
+                pos,
+                material: stone,
+            })
+            .await
+            .expect("send");
+
+        let reason = alice
+            .refusal(Duration::from_secs(5))
+            .await
+            .expect("wait")
+            .expect("the server must say why rather than ignoring it");
+        assert!(
+            matches!(reason, DisconnectReason::ProtocolError { .. }),
+            "expected a protocol error, got {reason:?}"
+        );
+
+        // And nothing reached the world: a watcher joining afterwards sees a
+        // world without the block. Refusing loudly is only half the claim.
+        let mut watcher = join(&server, "Watcher").await;
+        assert!(
+            watcher
+                .expect_block(pos, stone, Duration::from_millis(500))
+                .await
+                .is_err(),
+            "the refused edit reached the world anyway"
+        );
+        watcher.disconnect().await;
     });
 
     server.stop();

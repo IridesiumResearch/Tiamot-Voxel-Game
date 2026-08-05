@@ -16,11 +16,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use client::cache::ContentCache;
-use client::net::{Command, Connection, Event};
+use client::net::{Connection, Event};
 use client::world::ChunkStore;
 use tiamot_core::identity::{Allowlist, Identity};
 use tiamot_core::interest::ViewDistance;
-use tiamot_core::proto::{Edit, MaterialDef};
+use tiamot_core::proto::MaterialDef;
 use tiamot_core::{BlockPos, MaterialId};
 use tiamot_server::{ServerHandle, Settings};
 
@@ -385,10 +385,10 @@ fn an_edit_arrives_and_dirties_exactly_the_chunk_it_landed_in() {
         .find(|entry| entry.name == "core:white")
         .map(|entry| entry.id)
         .expect("core:white");
-    assert!(connection.send(Command::Edit(Edit::Block {
-        pos: target,
-        material: stone,
-    })));
+    // Seeded by the OPERATOR. A client cannot edit the world any more, and
+    // what this test is about is the remesh path — that an edit ARRIVING marks
+    // the right chunk dirty — which does not care who made it.
+    assert!(server.seed_block(target, stone), "seed queue full");
 
     assert!(
         pump(&mut connection, &mut seen, |seen| {

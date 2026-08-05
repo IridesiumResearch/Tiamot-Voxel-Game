@@ -413,12 +413,23 @@ impl Bot {
         Ok(())
     }
 
-    /// Sends a block or sub-node edit.
+    /// Sends a retired `BlockDelta`, which the server now refuses.
+    ///
+    /// **Kept solely to prove the refusal.** Task 07 used this to write blocks
+    /// straight into the world; Task 09 replaced it with digging and placing,
+    /// and a message that skipped both made every rule they enforce optional.
+    /// The variant stays on the wire because postcard encodes variants by
+    /// ordinal and removing one renumbers everything after it — deprecated in
+    /// place is the only way to retire one.
     ///
     /// # Errors
     ///
-    /// [`BotError::Frame`] if the write fails.
-    pub async fn edit(&mut self, edit: tiamot_core::proto::Edit) -> Result<(), BotError> {
+    /// [`BotError::Frame`] if the write fails. The DISCONNECT that follows is
+    /// what a caller should be looking for; see [`Bot::refusal`].
+    pub async fn send_retired_block_delta(
+        &mut self,
+        edit: tiamot_core::proto::Edit,
+    ) -> Result<(), BotError> {
         self.send(&ClientMessage::BlockDelta { edit }).await
     }
 
@@ -743,17 +754,97 @@ impl Bot {
         }
     }
 
-    /// Digs a whole block: replaces it with air.
+    /// The tools the server said its mods registered.
+    ///
+    /// Empty until the table arrives, and on a server whose mods registered
+    /// none — which is a world nobody can dig in, and correct rather than
+    /// broken (charter rule 1).
+    #[must_use]
+    pub fn tools(&self) -> Vec<tiamot_core::proto::ToolDef> {
+        self.received()
+            .into_iter()
+            .find_map(|message| match message {
+                ServerMessage::ToolTable { tools } => Some(tools),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Holds the first tool with the given brush, if the mods registered one.
+    ///
+    /// Chosen by BRUSH rather than by name because the engine has no opinion
+    /// about what a chisel is called — a bot that named one would be coupled to
+    /// `game/` rather than to the API.
     ///
     /// # Errors
     ///
-    /// [`BotError::Frame`] if the write fails.
+    /// [`BotError::Unexpected`] if no registered tool has that brush.
+    pub async fn hold_brush(&mut self, brush: &str) -> Result<(), BotError> {
+        let id = self
+            .tools()
+            .into_iter()
+            .find(|tool| tool.brush == brush)
+            .map(|tool| tool.id)
+            .ok_or_else(|| BotError::Unexpected {
+                expected: "a registered tool with the requested brush",
+                got: format!("no tool has brush `{brush}`; the mod set registers none"),
+            })?;
+        self.select_tool(Some(&id)).await
+    }
+
+    /// Digs a whole block and waits for the server to confirm it is gone.
+    ///
+    /// **A real dig**, not a world edit: it holds a mod-registered tool with a
+    /// whole-block brush, aims at the block's centre cell, and lets the server
+    /// count the ticks. Until Task 09 this wrote air straight into the world,
+    /// which meant every scenario using it was exercising a client's ability to
+    /// edit the world — a capability that no longer exists.
+    ///
+    /// Re-aimed until it lands. Re-aiming at the same cell keeps its progress,
+    /// so repeating costs nothing and survives a message going missing.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Unexpected`] if no whole-block tool is registered, or if the
+    /// block never breaks.
     pub async fn dig_block(&mut self, pos: tiamot_core::BlockPos) -> Result<(), BotError> {
-        self.edit(tiamot_core::proto::Edit::Block {
-            pos,
-            material: tiamot_core::MaterialId::AIR.0,
-        })
+        self.hold_brush(tiamot_core::dig::Brush::Block.name())
+            .await?;
+        self.dig_until_gone(
+            tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1),
+            |bot| bot.saw_block(pos, tiamot_core::MaterialId::AIR.0),
+        )
         .await
+    }
+
+    /// Aims at a cell until `done`, re-sending the dig each round.
+    async fn dig_until_gone(
+        &mut self,
+        target: tiamot_core::SubNodePos,
+        done: impl Fn(&Self) -> bool,
+    ) -> Result<(), BotError> {
+        /// Long enough for the slowest tool the reference mods register, with
+        /// room for a lost message on top.
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            self.start_dig(target).await?;
+            let round = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            while tokio::time::Instant::now() < round {
+                if done(self) {
+                    return Ok(());
+                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), self.recv()).await;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BotError::Unexpected {
+                    expected: "the dig to complete",
+                    got: format!("{target:?} was still there after {PATIENCE:?}"),
+                });
+            }
+        }
     }
 
     /// Walks in a world-space direction until the server has simulated
@@ -852,25 +943,59 @@ impl Bot {
     ///
     /// [`BotError::Frame`] if the write fails.
     pub async fn dig_subnode(&mut self, pos: tiamot_core::SubNodePos) -> Result<(), BotError> {
-        self.edit(tiamot_core::proto::Edit::SubNode {
-            pos,
-            material: tiamot_core::MaterialId::AIR.0,
+        self.hold_brush(tiamot_core::dig::Brush::SubNode.name())
+            .await?;
+        self.dig_until_gone(pos, move |bot| {
+            bot.received().iter().any(|message| {
+                matches!(
+                    message,
+                    ServerMessage::BlockDelta {
+                        edit: tiamot_core::proto::Edit::SubNode { pos: at, material },
+                        ..
+                    } if *at == pos && *material == tiamot_core::MaterialId::AIR.0
+                )
+            })
         })
         .await
     }
 
-    /// Places a material at a block position.
+    /// Places a material at a block position and waits for it to appear.
+    ///
+    /// **A real placement**, which means the player has to be CARRYING the
+    /// material: this asks and the server decides. It used to write the block
+    /// straight into the world, so a scenario could build out of nothing.
     ///
     /// # Errors
     ///
-    /// [`BotError::Frame`] if the write fails.
+    /// [`BotError::Unexpected`] if the block never appears — which includes
+    /// every reason the server may refuse. Read [`Bot::notices`] for which one.
     pub async fn place(
         &mut self,
         pos: tiamot_core::BlockPos,
         material: u16,
     ) -> Result<(), BotError> {
-        self.edit(tiamot_core::proto::Edit::Block { pos, material })
-            .await
+        /// Re-sent while waiting, because a request can go missing and a
+        /// refusal is reported rather than retried.
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let target = tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            self.place_from_inventory(target, material).await?;
+            if self
+                .expect_block(pos, material, std::time::Duration::from_secs(2))
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BotError::Unexpected {
+                    expected: "the placed block to appear",
+                    got: format!("nothing at {pos:?}; notices: {:?}", self.notices()),
+                });
+            }
+        }
     }
 
     /// Waits until the server confirms `pos` holds `material`.

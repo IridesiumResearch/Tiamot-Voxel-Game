@@ -1,34 +1,54 @@
 -- SPDX-FileCopyrightText: Iridesium
 -- SPDX-License-Identifier: GPL-3.0-only
 --
--- Edit/undo loops, for load.
+-- Dig/rebuild loops, for load.
 --
--- Places and removes the same blocks repeatedly. Self-cleaning on purpose: a
--- load script that only placed would grow the world without bound and end up
--- measuring the disk rather than the server.
+-- Digs blocks out and puts them straight back. Self-cleaning on purpose: a load
+-- script that only dug would eat the world, and one that only built would grow
+-- it without bound and end up measuring the disk rather than the server.
+--
+-- **Dig FIRST, build second.** It used to place and then dig, which needed the
+-- player to be carrying something before they had mined anything. A client
+-- cannot conjure material any more, so the loop runs the way a player's does:
+-- take it out, put it back.
 --
 -- Run: bot run crates/bot/scripts/churn.lua --server 127.0.0.1:47811
 
-local STONE = 2
 local ROUNDS = 20
 local WIDTH = 4
-local Y = 6
+-- The top solid layer. The worldgen fills BELOW its heightmap, so a surface of
+-- 0 puts the highest real block at y = -1; digging at 0 would find air and the
+-- dig would never complete.
+local Y = -1
 
 bot.join("churner")
 
+-- What the ground is made of, learned rather than assumed: one dig, then read
+-- the inventory. A hard-coded id would be a scenario coupled to one mod set.
+bot.dig_block(60, Y, 40)
+local material = nil
+for id, units in pairs(bot.inventory()) do
+    if units > 0 then
+        material = id
+    end
+end
+bot.assert(material ~= nil, "the first dig credited nothing to build with")
+bot.place(60, Y, 40, material)
+
 for round = 1, ROUNDS do
+    local z = 60 + (round % 8)
     for i = 0, WIDTH - 1 do
-        bot.place(60 + i, Y, 60 + (round % 8), STONE)
+        bot.dig_block(60 + i, Y, z)
     end
     for i = 0, WIDTH - 1 do
-        bot.dig_block(60 + i, Y, 60 + (round % 8))
+        bot.place(60 + i, Y, z, material)
     end
     bot.sleep_ticks(1)
 end
 
--- The world must end where it started: every placed block was dug back out.
+-- The world must end where it started: everything dug was put back.
 for i = 0, WIDTH - 1 do
-    bot.expect_block(60 + i, Y, 60 + (ROUNDS % 8), bot.AIR, 10000)
+    bot.expect_block(60 + i, Y, 60 + (ROUNDS % 8), material, 10000)
 end
 
 bot.disconnect()

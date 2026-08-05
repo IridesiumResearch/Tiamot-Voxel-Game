@@ -44,6 +44,14 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// The reference mods, which register the tools and generate the terrain.
+fn reference_mods() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../game")
+        .canonicalize()
+        .expect("the reference mods live at the repo root")
+}
+
 fn start(name: &str) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
@@ -51,7 +59,11 @@ fn start(name: &str) -> ServerHandle {
         max_players: 32,
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
-        mods_path: None,
+        // The reference mods, because scenarios now DIG rather than writing
+        // blocks into the world. Charter rule 1 means the engine has no tools,
+        // so a modless server is one where every script would fail at the first
+        // dig — and `core_worldgen` is what puts terrain under them to dig.
+        mods_path: Some(reference_mods()),
         seed: Some(9),
         rcon: None,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
@@ -237,11 +249,15 @@ fn a_long_write_burst_does_not_stall_the_connection() {
     let script = dir.join("burst.lua");
     std::fs::write(
         &script,
+        // Chat rather than block edits. What this test is about is a client
+        // writing hard without reading — the transport, not the world — and
+        // chat is the cheapest message that does that. Placing would now need
+        // an inventory to draw on, which would make the burst a test of
+        // whether the player is carrying anything.
         "bot.join('burst')\n\
          for i = 0, 2000 do\n\
-           bot.place(100 + (i % 32), 6, 100 + ((i // 32) % 32), 2)\n\
+           bot.chat('burst ' .. i)\n\
          end\n\
-         bot.expect_block(100, 6, 100, 2, 15000)\n\
          bot.disconnect()",
     )
     .expect("write");
@@ -315,11 +331,18 @@ fn replay_applies_a_recording_against_a_live_server() {
     let session = dir.join("session.log");
     std::fs::write(
         &session,
+        // Digs first, then builds with what the digging yielded. A recording
+        // that placed before digging would need the player to be carrying
+        // something at tick zero, and nobody is.
+        //
+        // The worldgen fills BELOW its heightmap, so y = -1 is the highest
+        // block that actually exists and y = 0 is the air above it — dig the
+        // first, build in the second.
         "# a tiny recorded session\n\
-         0 place 70 6 70 2\n\
-         2 place 71 6 70 2\n\
-         4 dig_block 70 6 70\n\
-         6 dig_block 71 6 70\n",
+         0 dig_block 70 -1 70\n\
+         2 dig_block 71 -1 70\n\
+         4 place 70 0 70 2\n\
+         6 place 71 0 70 2\n",
     )
     .expect("write");
 

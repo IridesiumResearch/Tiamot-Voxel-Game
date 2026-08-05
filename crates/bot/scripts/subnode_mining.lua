@@ -1,37 +1,45 @@
 -- SPDX-FileCopyrightText: Iridesium
 -- SPDX-License-Identifier: GPL-3.0-only
 --
--- Chisels single sub-nodes and checks the spares arithmetic.
+-- Chisels single sub-nodes out of real terrain and checks the spares
+-- arithmetic.
 --
 -- The half of the 27-unit design that makes it fair: one cell must yield ONE
 -- unit. If a sub-node dig yielded a whole block, a player could mine 27 blocks'
 -- worth of material by taking 27 corners.
 --
+-- `bot.dig_subnode` holds a tool whose brush is `"subnode"`, chosen by BRUSH
+-- rather than by name -- the engine has no opinion about what a chisel is
+-- called (charter rule 1), so a scenario that named one would be coupled to
+-- `game/` instead of to the API.
+--
 -- Run: bot run crates/bot/scripts/subnode_mining.lua --server 127.0.0.1:47811
 
-local STONE = 2
-local BX, BY, BZ = 50, 6, 50
+-- The top solid layer: `core_worldgen` fills below its heightmap, so y = -1 is
+-- the highest block that is actually there.
+local BX, BY, BZ = 50, -1, 50
 
 bot.join("chiseller")
 
-bot.place(BX, BY, BZ, STONE)
-bot.expect_block(BX, BY, BZ, STONE, 10000)
-
-local before = bot.inventory()[STONE] or 0
+local before = 0
+for _, units in pairs(bot.inventory()) do
+    before = before + units
+end
 
 -- A block is 3x3x3 sub-nodes, so the cell coordinates are the block's times
--- three. Walking one axis past 2 lands in the NEXT block, which is air.
+-- three. Walking one axis past 2 lands in the NEXT block, which would be a
+-- different block rather than another of this one's cells.
 local sx, sy, sz = BX * 3, BY * 3, BZ * 3
 local cells = { {0,0,0}, {1,0,0}, {2,0,0}, {0,1,0}, {0,0,1} }
 for _, cell in ipairs(cells) do
     bot.dig_subnode(sx + cell[1], sy + cell[2], sz + cell[3])
 end
 
--- Wait for the yields rather than sleeping and hoping. A fixed sleep is a
--- guess about how fast the server is, and macOS CI proved the guess wrong:
--- five digs, sleep 200ms, and only one had landed.
-bot.expect_units(STONE, before + #cells, 15000)
-local gained = (bot.inventory()[STONE] or 0) - before
+local gained = 0
+for _, units in pairs(bot.inventory()) do
+    gained = gained + units
+end
+gained = gained - before
 
 bot.assert(gained == #cells, "five cells should be five units, got " .. gained)
 

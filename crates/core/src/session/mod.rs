@@ -301,8 +301,27 @@ impl Session {
             // Gameplay, accepted ONLY in world. The phase is the access
             // control: there is no flag to forget to check, because reaching
             // these arms at all requires having got through the handshake.
-            (Phase::InWorld, ClientMessage::BlockDelta { edit }) => {
-                Response::act(Action::Edit(edit.clone()))
+            // **Refused, in every phase.** `BlockDelta` was Task 07's
+            // stand-in: it let a client write a block straight into the world
+            // so there was something to test against before digging existed.
+            // Digging and placing exist now, and they are the whole point —
+            // a player pays for what they take and is refused what they may
+            // not have. A message that skips all of it makes every one of
+            // those rules optional.
+            //
+            // The VARIANT stays on the wire. postcard encodes a variant as its
+            // ordinal, so removing it would renumber `Chat`, `AddKey` and
+            // everything after it, and any peer built against either side
+            // would silently reinterpret every later message. Deprecated in
+            // place is the only way to retire one.
+            //
+            // Refused rather than ignored: a client still sending this is
+            // built against an engine that no longer exists, and finding that
+            // out immediately is kinder than having its edits vanish.
+            (_, ClientMessage::BlockDelta { .. }) => {
+                self.close_with(DisconnectReason::ProtocolError {
+                    detail: "BlockDelta was retired in Task 09; use StartDig or Place".to_owned(),
+                })
             }
             (Phase::InWorld, ClientMessage::Chat { text }) => {
                 Response::act(Action::Chat { text: text.clone() })
@@ -820,6 +839,60 @@ mod tests {
     }
 
     #[test]
+    fn the_retired_block_delta_closes_the_session_in_every_phase() {
+        // Task 07's stand-in let a client write a block straight into the
+        // world, which made every rule digging and placing enforce optional for
+        // anyone who sent the older message. It cannot be DELETED — postcard
+        // encodes a variant as its ordinal, so removing it renumbers every
+        // variant after it — so it is refused in place, and refused in every
+        // phase rather than only in world: a peer sending it has been built
+        // against an engine that no longer exists whatever stage it is at.
+        let alice = Identity::generate().expect("generate");
+        let mut registry = registry_with(&alice);
+        let allowlist = Allowlist::open();
+        let mods = Vec::new();
+        let context = context(&allowlist, &mods);
+        let auth = SelfSovereign;
+
+        let edit = crate::proto::Edit::Block {
+            pos: BlockPos::new(1, 2, 3),
+            material: 4,
+        };
+
+        // Before the handshake has even started.
+        let mut fresh = Session::new();
+        let response = fresh.handle(
+            &ClientMessage::BlockDelta { edit: edit.clone() },
+            &context,
+            &auth,
+            &mut registry,
+        );
+        assert!(response.close, "a retired message must close the session");
+        assert_eq!(fresh.phase(), Phase::Closed);
+
+        // And in world, where it used to be accepted.
+        let (mut session, _) = join(&alice, "Alice", &mut registry, &allowlist);
+        assert_eq!(session.phase(), Phase::InWorld);
+        let response = session.handle(
+            &ClientMessage::BlockDelta { edit },
+            &context,
+            &auth,
+            &mut registry,
+        );
+        assert!(response.close);
+        assert!(
+            matches!(
+                response.send.first(),
+                Some(ServerMessage::Disconnect {
+                    reason: DisconnectReason::ProtocolError { .. }
+                })
+            ),
+            "the refusal must say what happened: {:?}",
+            response.send
+        );
+    }
+
+    #[test]
     fn no_world_state_flows_before_identity_is_proven() {
         // The ordering constraint, as an assertion. Everything a peer could ask
         // for before authenticating must be refused.
@@ -1310,21 +1383,22 @@ mod tests {
         let (mut session, _) = join(&alice, "Alice", &mut registry, &allowlist);
         assert_eq!(session.phase(), Phase::InWorld);
 
-        let edit = crate::proto::Edit::Block {
-            pos: BlockPos::new(1, 2, 3),
-            material: 4,
-        };
+        // Digging is the in-world gameplay message now; `BlockDelta` is
+        // retired and has its own test below.
+        let target = crate::coords::SubNodePos::new(1, 2, 3);
         let response = session.handle(
-            &ClientMessage::BlockDelta { edit: edit.clone() },
+            &ClientMessage::StartDig { target },
             &context,
             &auth,
             &mut registry,
         );
-        assert!(
-            !response.close,
-            "an in-world edit must not close the session"
+        assert!(!response.close, "a dig must not close the session");
+        assert_eq!(
+            response.action,
+            Action::Dig {
+                target: Some(target)
+            }
         );
-        assert_eq!(response.action, Action::Edit(edit));
 
         let response = session.handle(
             &ClientMessage::Chat {

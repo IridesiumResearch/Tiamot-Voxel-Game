@@ -210,8 +210,6 @@ pub enum Event {
 /// Something the render loop wants to say.
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// Place or remove a block or sub-node.
-    Edit(Edit),
     /// Say something.
     Chat(String),
     /// Report this frame's movement intent.
@@ -956,7 +954,6 @@ fn emit_materials(pending: &mut Pending, events: &mpsc::UnboundedSender<Event>) 
 /// A command as it goes on the wire.
 fn to_wire(command: Command) -> ClientMessage {
     match command {
-        Command::Edit(edit) => ClientMessage::BlockDelta { edit },
         Command::Chat(text) => ClientMessage::Chat { text },
         Command::Input {
             tick,

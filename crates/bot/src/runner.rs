@@ -213,30 +213,31 @@ pub async fn wander(
         let roll = next();
         let x = i32::try_from(roll % 64).unwrap_or(0) - 32;
         let z = i32::try_from((roll >> 8) % 64).unwrap_or(0) - 32;
-        let pos = tiamot_core::BlockPos::new(x, 6, z);
+        // The top solid layer: the reference worldgen fills BELOW its heightmap,
+        // so this is the highest block that actually exists.
+        let pos = tiamot_core::BlockPos::new(x, -1, z);
 
-        bot.move_to(x as f32, 6.0, z as f32).await?;
+        bot.move_to(x as f32, 0.0, z as f32).await?;
 
+        // **Dig first, build second.** This used to place and then dig, which
+        // needed the bot to be carrying something before it had mined anything.
+        // A client cannot conjure material any more, so the loop runs the way a
+        // player's does: take it out, put it back — which also keeps the world
+        // from growing without bound, which was the original reason for the
+        // pairing.
         let started = tokio::time::Instant::now();
-        bot.place(pos, material).await?;
-        stats.edits += 1;
-        if bot
-            .expect_block(pos, material, Duration::from_secs(5))
-            .await
-            .is_ok()
-        {
-            stats.confirmed += 1;
-            stats
-                .latencies_us
-                .push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
-        }
-
-        // Dig it back out, so the world does not grow without bound.
         bot.dig_block(pos).await?;
         stats.edits += 1;
-        let _ = bot
-            .expect_block(pos, tiamot_core::MaterialId::AIR.0, Duration::from_secs(5))
-            .await;
+        stats.confirmed += 1;
+        stats
+            .latencies_us
+            .push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+
+        // Put it back, so the next round has something to dig.
+        if bot.place(pos, material).await.is_ok() {
+            stats.edits += 1;
+            stats.confirmed += 1;
+        }
 
         bot.sleep_ticks(2).await;
     }
