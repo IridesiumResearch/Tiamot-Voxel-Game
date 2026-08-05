@@ -702,6 +702,29 @@ impl ServerHandle {
                                 continue;
                             }
 
+                            // The mods get a veto, BEFORE anything is removed.
+                            // Refusing afterwards would mean putting the block
+                            // back, and that is not the same as never having
+                            // taken it: the drops are computed and the removal
+                            // is broadcast on the way through.
+                            let verdict = source.may_dig(&tiamot_core::script::DigEvent {
+                                player: *uuid.as_bytes(),
+                                target,
+                                material,
+                                brush,
+                            });
+                            for (mod_id, err) in &verdict.faults {
+                                error!(mod_id = %mod_id, "mod disabled after an on_dig_complete failure: {err}");
+                            }
+                            if !verdict.allowed {
+                                // The dig is abandoned, not paused: leaving it
+                                // running would re-ask the mods every tick
+                                // forever, and the player would watch a crack
+                                // that never finishes.
+                                shared.set_dig(&uuid, None);
+                                continue;
+                            }
+
                             // Contract §2 and §9: the brush decides what comes
                             // out, and `break_block` decides what it yields.
                             let edit = match brush {
@@ -788,6 +811,27 @@ impl ServerHandle {
                                     continue;
                                 }
                             };
+
+                            // The mods' veto, after the engine's own rules and
+                            // before the player is charged — a refusal must not
+                            // cost them anything.
+                            let verdict = source.may_place(&tiamot_core::script::PlaceEvent {
+                                player: *request.actor.as_bytes(),
+                                block: plan.block,
+                                material,
+                                occupancy: plan.occupancy,
+                                units: plan.units,
+                            });
+                            for (mod_id, err) in &verdict.faults {
+                                error!(mod_id = %mod_id, "mod disabled after an on_place failure: {err}");
+                            }
+                            if !verdict.allowed {
+                                shared.tell(
+                                    &request.actor,
+                                    "you cannot build there".to_owned(),
+                                );
+                                continue;
+                            }
 
                             // Charged BEFORE the write, and only what was
                             // actually taken is placed. Writing first and

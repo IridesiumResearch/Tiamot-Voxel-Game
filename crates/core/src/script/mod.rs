@@ -37,7 +37,10 @@ mod host;
 mod vm;
 
 pub use host::{HostError, ModHost, Phase, read_manifest};
-pub use vm::{Backend, BlockRules, BlockTexture, Brush, ScriptError, ScriptVm, Tool, VmLimits};
+pub use vm::{
+    Backend, BlockRules, BlockTexture, Brush, DigEvent, HookOutcome, PlaceEvent, ScriptError,
+    ScriptVm, Tool, VmLimits,
+};
 
 #[cfg(feature = "script")]
 mod mlua_vm;

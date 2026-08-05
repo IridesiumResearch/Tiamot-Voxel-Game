@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use crate::chunk::Chunk;
-use crate::coords::ChunkPos;
+use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 use crate::material::MaterialId;
 
 /// Which scripting backend a build was compiled against.
@@ -280,6 +280,75 @@ pub struct Tool {
     pub default: bool,
 }
 
+/// A dig the server is about to carry out.
+///
+/// Handed to `on_dig_complete` *before* the geometry goes, so a mod that
+/// refuses it leaves the world untouched. Refusing after the fact would mean
+/// putting the block back, and putting a block back is not the same as never
+/// having removed it — the drops have already been computed and the removal has
+/// already been broadcast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigEvent {
+    /// Who is digging, as the canonical player UUID (charter rule 13 — never
+    /// the display name). 32 bytes, because it is a BLAKE3 of the root key.
+    pub player: [u8; 32],
+    /// The cell under their crosshair.
+    pub target: SubNodePos,
+    /// What is there.
+    pub material: MaterialId,
+    /// What the tool would remove.
+    pub brush: Brush,
+}
+
+/// A placement the server is about to carry out.
+///
+/// Handed to `on_place` after the engine's own rules have passed — the player
+/// holds the material, the target is empty, nobody is standing in it — and
+/// before anything is written or charged. A mod refusing here costs the player
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceEvent {
+    /// Who is placing.
+    pub player: [u8; 32],
+    /// The block that would be written.
+    pub block: BlockPos,
+    /// What it would be made of.
+    pub material: MaterialId,
+    /// Which of its 27 cells would be filled.
+    pub occupancy: u32,
+    /// How many units it would cost, which is `occupancy.count_ones()`.
+    pub units: u32,
+}
+
+/// What a round of cancellable hooks decided.
+///
+/// # A faulted mod does not get a veto
+///
+/// Charter rule 10 says a mod error disables that mod and never kills the tick.
+/// The corollary here is that an error is **not** a refusal: a mod that throws
+/// while deciding whether a dig may proceed is disabled and the dig goes ahead.
+/// The alternative — treating a crash as "no" — would let one broken mod stop
+/// everybody on the server from digging, which is a far worse failure than the
+/// one it was trying to prevent.
+#[derive(Debug, Default)]
+pub struct HookOutcome {
+    /// Whether the action may proceed.
+    pub allowed: bool,
+    /// Mods that faulted during this round, now disabled.
+    pub faults: Vec<(String, ScriptError)>,
+}
+
+impl HookOutcome {
+    /// An outcome nothing objected to.
+    #[must_use]
+    pub const fn allow() -> Self {
+        Self {
+            allowed: true,
+            faults: Vec::new(),
+        }
+    }
+}
+
 /// A script VM hosting the server-mod tier.
 ///
 /// Implementors own the sandbox. Nothing above this trait may assume a
@@ -350,6 +419,27 @@ pub trait ScriptVm: Sized {
     /// Never returns `Err` for a mod fault — those are in the returned list.
     /// The `Result` is for a VM-level failure that affects everything.
     fn tick(&mut self, dt_ticks: u32) -> Result<Vec<(String, ScriptError)>, ScriptError>;
+
+    /// Asks every registered `on_dig_complete` whether a dig may proceed.
+    ///
+    /// Called **before** the geometry is removed. A mod returning `false`
+    /// cancels it; returning nothing, `nil`, or anything else allows it, so a
+    /// hook that only wants to observe does not have to remember to return
+    /// anything.
+    ///
+    /// **Stops at the first refusal.** Once a dig is not happening, running the
+    /// remaining hooks would invite them to take side effects — spawn an
+    /// effect, charge something, log a break — for an action that will not
+    /// occur. The cost is that a later mod does not observe an attempt an
+    /// earlier one vetoed, which is the lesser problem and is deterministic:
+    /// hook order is load order, which the resolver already fixed.
+    fn dig_complete(&mut self, event: &DigEvent) -> HookOutcome;
+
+    /// Asks every registered `on_place` whether a placement may proceed.
+    ///
+    /// The same rules as [`Self::dig_complete`], and called after the engine's
+    /// own checks pass but before anything is written or charged.
+    fn place(&mut self, event: &PlaceEvent) -> HookOutcome;
 
     /// Blocks registered during the loading window, **ordered by numeric id**.
     ///

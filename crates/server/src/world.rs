@@ -166,6 +166,31 @@ impl Generator {
             Self::Air(_) => Vec::new(),
         }
     }
+
+    /// Asks the mods whether a dig may proceed.
+    ///
+    /// A server with no mods allows everything: charter rule 1 puts the rules
+    /// in mods, and no mods means no rules rather than no actions.
+    pub fn may_dig(
+        &mut self,
+        event: &tiamot_core::script::DigEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().dig_complete(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
+    /// Asks the mods whether a placement may proceed.
+    pub fn may_place(
+        &mut self,
+        event: &tiamot_core::script::PlaceEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().place(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
 }
 
 impl ChunkSource for Generator {

@@ -35,9 +35,24 @@ fi
 # flagged `game.mod_id` — a lowercase field — as an undocumented function. What
 # matters is that each name is documented SOMEHOW, either as a function or as a
 # field.
+#
+# Newlines are stripped first and whitespace is allowed after the paren,
+# because `rustfmt` breaks the line whenever the arguments are long enough:
+#
+#     game.set(
+#         "register_on_dig_complete",
+#         self.hook_registrar(mod_id, HOOK_DIG, DIGGERS)?,
+#     )
+#
+# A line-oriented grep sees no `game.set("` there and reports the function as
+# undocumented-in-reverse — a warning that says the stubs describe something the
+# engine does not have, when the engine has it and the check cannot see it. That
+# is the worst kind of drift check: one that is wrong in the reassuring
+# direction.
 registered=$(
-    grep -oE 'game\.set\("[A-Za-z_]+"' "$SOURCE" \
-        | sed 's/game\.set("//; s/"$//' \
+    tr -d '\n' < "$SOURCE" \
+        | grep -oE 'game\.set\([[:space:]]*"[A-Za-z_]+"' \
+        | sed 's/.*"\(.*\)"/\1/' \
         | sort -u
 )
 

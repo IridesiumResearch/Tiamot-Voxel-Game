@@ -207,6 +207,63 @@ function game.register_on_generate(callback) end
 ---@param callback fun(dt_ticks: integer)
 function game.register_on_tick(callback) end
 
+---A dig about to happen.
+---@class Tiamot.DigEvent
+---@field player string Who is digging, as 64 hex characters. This is the canonical player UUID — key any per-player state on it, never on the display name, which a player can change and which is not unique across servers.
+---@field x integer Sub-node cell being dug. These are CELL coordinates, three per block on each axis, so the block is `x // 3`.
+---@field y integer
+---@field z integer
+---@field material integer Numeric id of what is there. Compare against `game.get_block_id("yourmod:something")`.
+---@field brush string `"block"` for the whole block, `"subnode"` for the single cell.
+
+---A placement about to happen.
+---@class Tiamot.PlaceEvent
+---@field player string Who is placing, as 64 hex characters.
+---@field x integer The BLOCK being written — block coordinates, not cells.
+---@field y integer
+---@field z integer
+---@field material integer What it would be made of.
+---@field occupancy integer Bitmask of which of the block's 27 cells would be filled.
+---@field units integer How many units it would cost, which is the number of set bits in `occupancy`.
+
+---Registers a veto on completed digs.
+---
+---**Registration window only.**
+---
+---Called when a dig has finished counting down and is about to remove
+---geometry — before anything is removed, so refusing costs nothing and leaves
+---no trace. Return `false` to cancel it.
+---
+---Anything else allows it, including returning nothing at all. That is
+---deliberate: a hook that only wants to watch should not have to remember to
+---return something, and forgetting a `return` should not silently make the
+---world unbreakable.
+---
+---**The first mod to refuse wins, and the hooks after it do not run.** Once the
+---dig is not happening, running them would invite them to take side effects for
+---an action that will not occur. Order is mod load order.
+---
+---If your callback raises an error, your mod is disabled for the rest of the
+---session **and the dig goes ahead**. A crash is not a veto — otherwise one
+---broken mod could stop everybody on the server from digging.
+---@param callback fun(event: Tiamot.DigEvent): boolean?
+function game.register_on_dig_complete(callback) end
+
+---Registers a veto on placements.
+---
+---**Registration window only.**
+---
+---Called after the engine's own rules have passed — the player is carrying the
+---material, the target block is empty, and nobody is standing in it — and
+---before anything is written or charged. Return `false` to cancel it; the
+---player keeps their material.
+---
+---The same rules as `game.register_on_dig_complete`: only an explicit `false`
+---cancels, the first refusal stops the rest, and an error disables your mod
+---while letting the placement through.
+---@param callback fun(event: Tiamot.PlaceEvent): boolean?
+function game.register_on_place(callback) end
+
 ---Registers a named input action.
 ---
 ---Mods register actions; the engine owns key bindings and mods never read keys.

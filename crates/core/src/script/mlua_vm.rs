@@ -33,8 +33,24 @@ use crate::coords::{ChunkPos, LocalBlock};
 use crate::detgen::{ChunkBuffer, FractalParams, Region2d, StreamRng, fill_2d};
 use crate::material::MaterialId;
 use crate::script::vm::{
-    Backend, BlockRules, BlockTexture, Brush, ScriptError, ScriptVm, Tool, VmLimits,
+    Backend, BlockRules, BlockTexture, Brush, HookOutcome, ScriptError, ScriptVm, Tool, VmLimits,
 };
+
+/// Registry key holding the mods that registered `on_dig_complete`.
+///
+/// A list of mod ids in load order, exactly like `tiamot.tickers`; the callback
+/// itself lives under [`MluaVm::hook_key`]. Two structures because the ORDER is
+/// the contract and a Lua table keyed by mod id has no order at all.
+const DIGGERS: &str = "tiamot.diggers";
+
+/// Registry key holding the mods that registered `on_place`.
+const PLACERS: &str = "tiamot.placers";
+
+/// Hook name used in registry keys and in fault messages.
+const HOOK_DIG: &str = "on_dig_complete";
+
+/// Hook name used in registry keys and in fault messages.
+const HOOK_PLACE: &str = "on_place";
 
 /// Globals removed from every mod environment.
 ///
@@ -562,6 +578,44 @@ impl ScriptVm for MluaVm {
         Ok(faults)
     }
 
+    fn dig_complete(&mut self, event: &crate::script::DigEvent) -> HookOutcome {
+        let Ok(table) = self.hook_event(event.player).and_then(|table| {
+            table.set("x", event.target.x)?;
+            table.set("y", event.target.y)?;
+            table.set("z", event.target.z)?;
+            table.set("material", event.material.0)?;
+            table.set(
+                "brush",
+                match event.brush {
+                    crate::dig::Brush::Block => "block",
+                    crate::dig::Brush::SubNode => "subnode",
+                },
+            )?;
+            Ok(table)
+        }) else {
+            // The table could not be built, which is a VM problem rather than a
+            // mod problem. Allowing is the safe answer: refusing would stop
+            // every dig on the server because of an allocation failure.
+            return HookOutcome::allow();
+        };
+        self.run_hook(HOOK_DIG, DIGGERS, &table)
+    }
+
+    fn place(&mut self, event: &crate::script::PlaceEvent) -> HookOutcome {
+        let Ok(table) = self.hook_event(event.player).and_then(|table| {
+            table.set("x", event.block.x)?;
+            table.set("y", event.block.y)?;
+            table.set("z", event.block.z)?;
+            table.set("material", event.material.0)?;
+            table.set("occupancy", event.occupancy)?;
+            table.set("units", event.units)?;
+            Ok(table)
+        }) else {
+            return HookOutcome::allow();
+        };
+        self.run_hook(HOOK_PLACE, PLACERS, &table)
+    }
+
     fn registered_blocks(&self) -> Vec<(String, MaterialId)> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.blocks") else {
             return Vec::new();
@@ -751,6 +805,60 @@ impl MluaVm {
         Ok(())
     }
 
+    /// Installs `register_on_dig_complete` and `register_on_place`.
+    ///
+    /// The two `game.set` calls spell out literal names rather than looping,
+    /// and that is load-bearing: `scripts/check-stubs.sh` finds the engine's
+    /// API surface by grepping for `game.set("...")`, so a name that exists
+    /// only as a loop variable is a name the drift check cannot see. The shared
+    /// body lives in [`MluaVm::hook_registrar`], so this costs a line rather
+    /// than a copy.
+    fn install_cancellable_hooks(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        game.set(
+            "register_on_dig_complete",
+            self.hook_registrar(mod_id, HOOK_DIG, DIGGERS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
+        game.set(
+            "register_on_place",
+            self.hook_registrar(mod_id, HOOK_PLACE, PLACERS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
+    /// The `register_on_*` function for one cancellable hook.
+    ///
+    /// One implementation for both: they differ only in which list they append
+    /// to and which registry key they write, and the version with two copies
+    /// had already drifted by the time the second one was written.
+    fn hook_registrar(
+        &self,
+        mod_id: &str,
+        hook: &str,
+        list: &'static str,
+    ) -> Result<mlua::Function, ScriptError> {
+        let owner = mod_id.to_owned();
+        let key = Self::hook_key(hook, mod_id);
+        self.lua
+            .create_function(move |lua, callback: mlua::Function| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                lua.set_named_registry_value(&key, callback)?;
+                // Load order, which the resolver already made deterministic —
+                // so which mod gets to veto first is a property of the mod set
+                // rather than of anything at runtime.
+                let registered: Table = lua.named_registry_value(list)?;
+                registered.push(owner.clone())?;
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))
+    }
+
     /// The `register_*` family, live only during the registration window.
     fn install_registration(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- registration -------------------------------------------------
@@ -815,6 +923,11 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         game.set("register_on_tick", register_on_tick)
             .map_err(|err| self.vm_error(&err))?;
+
+        // The two cancellable hooks. Registered exactly like `on_tick` — one
+        // callback per mod, ordered by load order — so a mod author has one
+        // shape to learn rather than three.
+        self.install_cancellable_hooks(mod_id, game)?;
 
         let owner = mod_id.to_owned();
         let register_action = self
@@ -964,6 +1077,12 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.tickers", tickers)
             .map_err(|err| self.vm_error(&err))?;
+        for list in [DIGGERS, PLACERS] {
+            let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+            self.lua
+                .set_named_registry_value(list, table)
+                .map_err(|err| self.vm_error(&err))?;
+        }
         self.lua
             .set_named_registry_value("tiamot.generators", generators)
             .map_err(|err| self.vm_error(&err))?;
@@ -993,6 +1112,99 @@ impl MluaVm {
     /// Registry key holding a mod's `on_tick` callback.
     fn tick_key(mod_id: &str) -> String {
         format!("tiamot.on_tick.{mod_id}")
+    }
+
+    /// Where one mod's callback for a named hook is stashed.
+    fn hook_key(hook: &str, mod_id: &str) -> String {
+        format!("tiamot.{hook}.{mod_id}")
+    }
+
+    /// Runs one cancellable hook across every mod that registered it.
+    ///
+    /// The shared body of [`ScriptVm::dig_complete`] and [`ScriptVm::place`],
+    /// which differ only in which list they walk and what table they hand over.
+    /// Two copies of this drifted apart in about the time it took to write the
+    /// second one.
+    ///
+    /// **Only an explicit `false` cancels.** A hook that returns nothing, or
+    /// `nil`, or a table, is observing rather than voting — otherwise every mod
+    /// author who forgot a `return` would silently make their block
+    /// unbreakable, and the engine cannot tell that apart from a deliberate
+    /// veto.
+    fn run_hook(&mut self, hook: &str, list: &str, event: &Table) -> HookOutcome {
+        let Ok(registered) = self.lua.named_registry_value::<Table>(list) else {
+            // No list means nothing ever registered for this hook, which is the
+            // ordinary case on a server with no mods that care.
+            return HookOutcome::allow();
+        };
+        let mods: Vec<String> = registered
+            .sequence_values::<String>()
+            .filter_map(Result::ok)
+            .collect();
+
+        let mut outcome = HookOutcome::allow();
+        for mod_id in mods {
+            if self.faulted.contains(&mod_id) {
+                continue;
+            }
+            let Ok(callback) = self
+                .lua
+                .named_registry_value::<mlua::Function>(&Self::hook_key(hook, &mod_id))
+            else {
+                continue;
+            };
+
+            if self.arm_budget(self.limits.instructions_per_call).is_err() {
+                continue;
+            }
+            let result = callback.call::<mlua::Value>(event.clone());
+            self.disarm_budget();
+
+            match result {
+                // Charter rule 10, and the reason it matters here more than
+                // anywhere else: a mod that throws while deciding whether a dig
+                // may happen is disabled and the dig PROCEEDS. Treating a crash
+                // as a refusal would let one broken mod stop everybody on the
+                // server from digging.
+                Err(err) => {
+                    let error = Self::classify(&err, &mod_id, hook);
+                    self.faulted.insert(mod_id.clone());
+                    tracing::error!(
+                        mod_id = %mod_id,
+                        error = %error,
+                        "disabling mod after a {hook} failure; the action is allowed to proceed"
+                    );
+                    outcome.faults.push((mod_id, error));
+                }
+                Ok(mlua::Value::Boolean(false)) => {
+                    outcome.allowed = false;
+                    // Stop here: see the trait docs. A hook running after a
+                    // veto would be invited to take side effects for an action
+                    // that is not going to happen.
+                    return outcome;
+                }
+                Ok(_) => {}
+            }
+        }
+        outcome
+    }
+
+    /// Builds the Lua table a hook receives.
+    ///
+    /// The UUID goes over as a lowercase hex string. Charter rule 13 keys
+    /// everything on the UUID and never on the display name, and a mod that
+    /// wants to store per-player state needs something it can use as a table
+    /// key — which 16 raw bytes in a Lua string technically is and legibly is
+    /// not, the moment anyone prints one.
+    fn hook_event(&self, player: [u8; 32]) -> Result<Table, mlua::Error> {
+        let event = self.lua.create_table()?;
+        let mut hex = String::with_capacity(64);
+        for byte in player {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+        }
+        event.set("player", hex)?;
+        Ok(event)
     }
 
     /// Blocks registered so far, keyed by string id.
@@ -1322,6 +1534,206 @@ mod tests {
             .expect("the callback should see the catch-up count");
         vm.eval_in("counter", "assert(math.type(seen) == 'integer')")
             .expect("a step count is an integer, not a float duration");
+    }
+
+    /// A dig event for a fixed player and cell.
+    fn a_dig() -> crate::script::DigEvent {
+        crate::script::DigEvent {
+            player: [0xAB; 32],
+            target: crate::coords::SubNodePos::new(3, 4, 5),
+            material: MaterialId(7),
+            brush: Brush::SubNode,
+        }
+    }
+
+    /// A placement event for a fixed player and block.
+    fn a_place() -> crate::script::PlaceEvent {
+        crate::script::PlaceEvent {
+            player: [0xCD; 32],
+            block: crate::coords::BlockPos::new(1, 2, 3),
+            material: MaterialId(7),
+            occupancy: 0b111,
+            units: 3,
+        }
+    }
+
+    #[test]
+    fn a_mod_can_refuse_a_dig_and_a_placement() {
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "warden",
+            "game.register_on_dig_complete(function() return false end)\n\
+             game.register_on_place(function() return false end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(!vm.dig_complete(&a_dig()).allowed, "the veto was ignored");
+        assert!(!vm.place(&a_place()).allowed, "the veto was ignored");
+    }
+
+    #[test]
+    fn only_an_explicit_false_cancels() {
+        // A hook that returns nothing is observing, not voting. If a bare
+        // `return` cancelled, every mod author who forgot one would silently
+        // make the world unbreakable — and the engine could not tell that apart
+        // from a deliberate veto.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "watcher",
+            "seen = 0\n\
+             game.register_on_dig_complete(function() seen = seen + 1 end)\n\
+             game.register_on_place(function() seen = seen + 1 return 'yes' end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(vm.dig_complete(&a_dig()).allowed, "a bare return cancelled");
+        assert!(vm.place(&a_place()).allowed, "a truthy return cancelled");
+        vm.eval_in("watcher", "assert(seen == 2, 'seen is ' .. seen)")
+            .expect("both hooks should have run");
+    }
+
+    #[test]
+    fn a_hook_sees_the_event_it_is_deciding_about() {
+        // A veto is only useful if the mod can tell WHAT it is vetoing. The
+        // uuid is hex rather than raw bytes so it can be used as a table key
+        // and printed in the same breath (charter rule 13 keys on the uuid).
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "inspector",
+            "dug = nil placed = nil\n\
+             game.register_on_dig_complete(function(e) dug = e end)\n\
+             game.register_on_place(function(e) placed = e end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        vm.dig_complete(&a_dig());
+        vm.place(&a_place());
+        vm.eval_in(
+            "inspector",
+            "assert(dug.x == 3 and dug.y == 4 and dug.z == 5, 'dig position')\n\
+             assert(dug.material == 7, 'dig material')\n\
+             assert(dug.brush == 'subnode', 'dig brush is ' .. tostring(dug.brush))\n\
+             assert(#dug.player == 64, 'uuid should be 32 bytes of hex')\n\
+             assert(placed.x == 1 and placed.y == 2 and placed.z == 3, 'place position')\n\
+             assert(placed.units == 3, 'units')\n\
+             assert(placed.occupancy == 7, 'occupancy')",
+        )
+        .expect("the hooks should have received the event fields");
+    }
+
+    #[test]
+    fn a_mod_that_throws_while_vetoing_is_disabled_and_the_action_proceeds() {
+        // Charter rule 10's sharpest edge. If a crash counted as a refusal, one
+        // broken mod would stop everybody on the server from digging — a much
+        // worse outcome than whatever it was trying to prevent.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "broken",
+            "game.register_on_dig_complete(function() error('boom') end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let outcome = vm.dig_complete(&a_dig());
+        assert!(
+            outcome.allowed,
+            "a mod's crash was treated as a refusal, which lets one bad mod stop the server"
+        );
+        assert_eq!(outcome.faults.len(), 1, "the fault was not reported");
+        assert_eq!(outcome.faults[0].0, "broken");
+
+        // And it is disabled from then on, so it cannot fault every tick.
+        let again = vm.dig_complete(&a_dig());
+        assert!(again.allowed);
+        assert!(
+            again.faults.is_empty(),
+            "a disabled mod ran again and faulted again"
+        );
+    }
+
+    #[test]
+    fn a_veto_stops_the_hooks_after_it() {
+        // Documented behaviour, and the reason for it: once the dig is not
+        // happening, a later hook running would be invited to take side effects
+        // for an action that will not occur.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "first",
+            "game.register_on_dig_complete(function() return false end)",
+        )
+        .expect("load");
+        load(
+            &mut vm,
+            "second",
+            "ran = false\ngame.register_on_dig_complete(function() ran = true end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(!vm.dig_complete(&a_dig()).allowed);
+        vm.eval_in("second", "assert(ran == false, 'a hook ran after a veto')")
+            .expect("the second hook must not have run");
+    }
+
+    #[test]
+    fn every_hook_runs_when_nobody_objects() {
+        // The counter-example to the test above: short-circuiting must happen
+        // ONLY on a refusal, or the second mod would never run at all and that
+        // test would pass for the wrong reason.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "first",
+            "game.register_on_dig_complete(function() end)",
+        )
+        .expect("load");
+        load(
+            &mut vm,
+            "second",
+            "ran = false\ngame.register_on_dig_complete(function() ran = true end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(vm.dig_complete(&a_dig()).allowed);
+        vm.eval_in("second", "assert(ran == true, 'the second hook never ran')")
+            .expect("both hooks should have run");
+    }
+
+    #[test]
+    fn registering_a_hook_after_freeze_is_refused() {
+        // Charter rule 9: the registration window closes and `register_*`
+        // becomes a hard error. A hook registered after freeze would be a
+        // callback the engine never learned about, or worse, one it did.
+        let mut vm = vm();
+        load(&mut vm, "late", "").expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(
+            vm.eval_in("late", "game.register_on_place(function() end)")
+                .is_err(),
+            "a hook was registered after the registries froze"
+        );
+    }
+
+    #[test]
+    fn a_server_with_no_hooks_allows_everything() {
+        // The ordinary case, and the one that must not cost anything: a world
+        // whose mods have no opinion about digging is a world you can dig in.
+        let mut vm = vm();
+        load(&mut vm, "quiet", "").expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(vm.dig_complete(&a_dig()).allowed);
+        assert!(vm.place(&a_place()).allowed);
     }
 
     #[test]
