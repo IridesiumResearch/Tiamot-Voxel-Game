@@ -666,6 +666,87 @@ impl App {
         self.connection.send(Command::Place { target, material });
     }
 
+    /// The cells the next dig would remove, as world positions.
+    ///
+    /// **Honours the tool's brush and the block's occupancy**, which is what
+    /// makes it worth drawing at all. A `"subnode"` brush outlines the single
+    /// cell under the crosshair; a `"block"` brush outlines every *occupied*
+    /// cell of the block containing it — so a partially-chiselled block is
+    /// outlined in its real shape rather than as the cube it used to be.
+    ///
+    /// Empty when nothing is in reach, which includes the sky.
+    #[must_use]
+    pub fn selection(&self) -> Vec<tiamot_core::SubNodePos> {
+        let Some(hit) = self.looking_at() else {
+            return Vec::new();
+        };
+        let Some(cell) = self.target_of(hit.cell) else {
+            return Vec::new();
+        };
+
+        let whole_block = self
+            .held_tool()
+            .is_none_or(|tool| tool.brush != tiamot_core::dig::Brush::SubNode.name());
+        if !whole_block {
+            return vec![cell];
+        }
+
+        // Every occupied cell of the block. Reading the chunk rather than
+        // assuming 27: the whole point of sub-nodes is that a block need not be
+        // a cube, and an outline that drew one anyway would be a lie exactly
+        // where the player is looking.
+        let block = cell.block();
+        let base = tiamot_core::SubNodePos::new(block.x * 3, block.y * 3, block.z * 3);
+        let Some(chunk) = self.store.get(block.chunk()) else {
+            return vec![cell];
+        };
+        let occupied: Vec<tiamot_core::SubNodePos> = (0..3)
+            .flat_map(|y| (0..3).flat_map(move |z| (0..3).map(move |x| (x, y, z))))
+            .map(|(x, y, z)| tiamot_core::SubNodePos::new(base.x + x, base.y + y, base.z + z))
+            .filter(|at| {
+                chunk
+                    .get_subnode(*at)
+                    .is_some_and(|material| !material.is_air())
+            })
+            .collect();
+
+        // A block that reads as entirely air is one the ray hit and the store
+        // disagrees about — a chunk edit in flight. Outlining the cell that was
+        // actually hit is better than outlining nothing.
+        if occupied.is_empty() {
+            vec![cell]
+        } else {
+            occupied
+        }
+    }
+
+    /// Hands the current selection to the renderer, camera-relative.
+    ///
+    /// The same floating-origin treatment chunk instances get: the offset is
+    /// computed in `f64` and narrowed once it is small (charter rule 7), so an
+    /// outline at the edge of the world is drawn from the same small numbers as
+    /// one at the origin.
+    fn update_selection(&mut self) {
+        let cells = self.selection();
+        let mut corners: Vec<[f32; 3]> = Vec::with_capacity(cells.len());
+        let (camera_x, camera_y, camera_z) = self.camera.position.to_world();
+        let per_block = f64::from(tiamot_core::SUBNODES_PER_AXIS);
+        let shift = [
+            f64::from(self.displacement[0]) * f64::from(tiamot_core::CHUNK_BLOCKS),
+            f64::from(self.displacement[1]) * f64::from(tiamot_core::CHUNK_BLOCKS),
+            f64::from(self.displacement[2]) * f64::from(tiamot_core::CHUNK_BLOCKS),
+        ];
+        for cell in cells {
+            // Cells to blocks, displaced the way the drawn world is, then made
+            // relative to the camera BEFORE narrowing to f32.
+            let x = (f64::from(cell.x) / per_block + shift[0] - camera_x) * per_block;
+            let y = (f64::from(cell.y) / per_block + shift[1] - camera_y) * per_block;
+            let z = (f64::from(cell.z) / per_block + shift[2] - camera_z) * per_block;
+            corners.push([x as f32, y as f32, z as f32]);
+        }
+        self.renderer.set_selection(&corners);
+    }
+
     /// Cycles to the next registered tool and tells the server.
     ///
     /// Nothing happens with no tools, which is a world nobody can dig in —
@@ -676,6 +757,27 @@ impl App {
         }
         self.held_tool = (self.held_tool + 1) % self.tools.len();
         self.send_held_tool();
+    }
+
+    /// Selects the first tool with a sub-node brush, if the mods registered one.
+    ///
+    /// For tests, which need to pick a brush rather than a name — the engine
+    /// has no opinion about what a chisel is called (charter rule 1), so a test
+    /// that named one would be asserting about `game/` rather than the engine.
+    pub fn select_subnode_tool(&mut self) {
+        self.select_brush(tiamot_core::dig::Brush::SubNode.name());
+    }
+
+    /// Selects the first tool with a whole-block brush.
+    pub fn select_block_tool(&mut self) {
+        self.select_brush(tiamot_core::dig::Brush::Block.name());
+    }
+
+    fn select_brush(&mut self, brush: &str) {
+        if let Some(index) = self.tools.iter().position(|tool| tool.brush == brush) {
+            self.held_tool = index;
+            self.send_held_tool();
+        }
     }
 
     /// Tells the server which tool is in hand.
@@ -1041,6 +1143,9 @@ impl App {
         // tick boundary. Without it the camera moves 20 times a second no
         // matter how fast the client draws.
         self.follow_body(self.tick_carry / TICK_SECONDS);
+        // After the camera moves, so the outline is where the crosshair points
+        // this frame rather than last.
+        self.update_selection();
     }
 
     /// Turns this frame's keys into a world-space intent.

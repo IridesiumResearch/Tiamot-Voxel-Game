@@ -320,6 +320,49 @@ fn the_same_scene_renders_to_the_same_hash_twice() {
 }
 
 #[test]
+fn the_selection_outline_reaches_the_pixels() {
+    // The outline is a separate pipeline with its own shader, its own primitive
+    // topology, and a depth state that writes nothing. Every one of those is a
+    // way for it to compile, bind, issue a draw call, and put no pixels on the
+    // screen — with nothing anywhere reporting a problem. The app-level test
+    // asserts which CELLS are selected; this asserts that selecting them is
+    // visible.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    let before = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // A box right in front of the camera, in the camera-relative cells the
+    // renderer expects.
+    renderer.set_selection(&[[0.0, -2.0, 6.0]]);
+    let after = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    assert_ne!(
+        perceptual_hash(&before),
+        perceptual_hash(&after),
+        "the selection outline changed no pixels; it is being drawn into nothing"
+    );
+
+    // And it goes away again, so it is genuinely per-frame state rather than
+    // something baked in on the first draw.
+    renderer.set_selection(&[]);
+    let cleared = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    assert_eq!(
+        perceptual_hash(&before),
+        perceptual_hash(&cleared),
+        "clearing the selection left the outline on screen"
+    );
+}
+
+#[test]
 fn an_edit_changes_the_picture() {
     // The remesh path, proven where it matters: a block removed must show up in
     // the pixels. This is the [A]-assertable half of "block edits made by a bot

@@ -125,6 +125,14 @@ struct ChunkMesh {
     used_bytes: u64,
 }
 
+/// Line-segment vertices the selection buffer holds without growing.
+///
+/// A box is 12 segments, so this is 32 boxes — comfortably more than the 27
+/// cells of a single block, which is the largest thing any brush can outline
+/// today. Sized once rather than grown, because a buffer that reallocates every
+/// time the crosshair moves is the churn `BufferPool` exists to avoid.
+const SELECTION_CAPACITY: usize = 32 * 12 * 2;
+
 /// The smallest buffer the pool hands out, in bytes.
 ///
 /// Chunk meshes in open terrain are startlingly small — a flat surface greedily
@@ -376,6 +384,13 @@ pub struct Renderer {
     mode: RenderMode,
     /// How many chunks the last frame actually drew.
     drawn: usize,
+    /// The outline pipeline, and the line segments it draws this frame.
+    selection_pipeline: wgpu::RenderPipeline,
+    selection: wgpu::Buffer,
+    /// Vertices actually written, which is twice the segment count.
+    selection_vertices: u32,
+    /// How many vertices [`Renderer::selection`] can hold.
+    selection_capacity: usize,
 }
 
 impl Renderer {
@@ -431,6 +446,17 @@ impl Renderer {
 
         let pipeline = build_pipeline(&gpu, &shader, &bind_layout, mode);
 
+        let selection_shader = gpu
+            .device
+            .create_shader_module(wgpu::include_wgsl!("selection.wgsl"));
+        let selection_pipeline = build_selection_pipeline(&gpu, &selection_shader, &bind_layout);
+        let selection_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("selection"),
+            size: (SELECTION_CAPACITY * size_of::<[f32; 3]>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let globals = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: size_of::<Globals>() as u64,
@@ -479,6 +505,10 @@ impl Renderer {
             atlas_side: side,
             chunks: BTreeMap::new(),
             pool: BufferPool::default(),
+            selection_pipeline,
+            selection: selection_buffer,
+            selection_vertices: 0,
+            selection_capacity: SELECTION_CAPACITY,
             instances,
             instance_capacity: 64,
             depth,
@@ -576,6 +606,32 @@ impl Renderer {
     pub fn clear(&mut self) {
         for (_, mesh) in std::mem::take(&mut self.chunks) {
             self.pool.give_mesh(mesh);
+        }
+    }
+
+    /// Sets the outline to draw, as camera-relative boxes in **cells**.
+    ///
+    /// Each entry is one cell's low corner. The caller has already applied the
+    /// floating origin, exactly as it does for chunk instances — nothing in the
+    /// render path ever sees a world coordinate (charter rule 7).
+    ///
+    /// Anything past [`SELECTION_CAPACITY`] is dropped rather than growing the
+    /// buffer: the outline is a hint, and a hint is not worth a reallocation
+    /// every time the crosshair moves.
+    pub fn set_selection(&mut self, cells: &[[f32; 3]]) {
+        let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(cells.len() * 24);
+        for cell in cells {
+            push_box_edges(&mut vertices, *cell);
+            if vertices.len() >= self.selection_capacity {
+                vertices.truncate(self.selection_capacity);
+                break;
+            }
+        }
+        self.selection_vertices = u32::try_from(vertices.len()).unwrap_or(0);
+        if !vertices.is_empty() {
+            self.gpu
+                .queue
+                .write_buffer(&self.selection, 0, bytemuck::cast_slice(&vertices));
         }
     }
 
@@ -734,6 +790,15 @@ impl Renderer {
                 let instance = index as u32;
                 pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
             }
+
+            // Last, so it draws over the world it outlines. Its pipeline does
+            // not write depth, so the order within the pass is what decides
+            // this rather than the depth buffer.
+            if self.selection_vertices > 0 {
+                pass.set_pipeline(&self.selection_pipeline);
+                pass.set_vertex_buffer(0, self.selection.slice(..));
+                pass.draw(0..self.selection_vertices, 0..1);
+            }
         }
 
         self.gpu.queue.submit(Some(encoder.finish()));
@@ -745,6 +810,115 @@ impl Renderer {
 /// A function rather than more of [`Renderer::new`], which was long enough that
 /// the interesting decisions in it — winding, culling, depth comparison —
 /// were buried in the middle of resource creation.
+/// Appends the twelve edges of a unit cube at `corner`, as line-list vertices.
+///
+/// Twelve segments, twenty-four vertices. A line *strip* would need degenerate
+/// segments to jump between the disconnected edges of a cube, and those show up
+/// as stray diagonals the moment anything upstream reorders them.
+fn push_box_edges(out: &mut Vec<[f32; 3]>, corner: [f32; 3]) {
+    // Bottom face, top face, then the four uprights joining them.
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+
+    let [x, y, z] = corner;
+    let corners = [
+        [x, y, z],
+        [x + 1.0, y, z],
+        [x + 1.0, y, z + 1.0],
+        [x, y, z + 1.0],
+        [x, y + 1.0, z],
+        [x + 1.0, y + 1.0, z],
+        [x + 1.0, y + 1.0, z + 1.0],
+        [x, y + 1.0, z + 1.0],
+    ];
+    for (from, to) in EDGES {
+        out.push(corners[from]);
+        out.push(corners[to]);
+    }
+}
+
+/// Builds the selection-outline pipeline.
+///
+/// A line list with **no depth write and a `LessEqual` test**, which is the
+/// combination that makes an outline usable. Writing depth would let the lines
+/// occlude each other where they cross; a strict `Less` test would z-fight with
+/// the very surface being outlined, since the outline sits exactly on it. This
+/// draws on top of what it surrounds and leaves the buffer alone.
+fn build_selection_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    bind_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let layout = gpu
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("selection-pipeline-layout"),
+            bind_group_layouts: &[Some(bind_layout)],
+            immediate_size: 0,
+        });
+
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("selection"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vertex_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: size_of::<[f32; 3]>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    }],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fragment_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: COLOUR_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+}
+
 fn build_pipeline(
     gpu: &Gpu,
     shader: &wgpu::ShaderModule,

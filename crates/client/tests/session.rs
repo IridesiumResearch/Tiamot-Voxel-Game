@@ -405,6 +405,79 @@ fn a_player_can_dig_and_then_build_with_what_they_dug() {
 }
 
 #[test]
+fn the_selection_outlines_the_real_shape_of_a_chiselled_block() {
+    // The task asks for an outline "honouring Partial occupancy — outline the
+    // actual occupied sub-node cells". The easy version draws a cube whatever
+    // is there, which is a lie precisely where the player is looking, and looks
+    // right in every screenshot of un-chiselled terrain.
+    //
+    // So: outline a solid block, chisel a cell out of it, and assert the
+    // outline lost exactly that cell.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("selection");
+    let mut app = client("selection", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+
+    app.look_down_by(std::f32::consts::FRAC_PI_4);
+    assert!(
+        run_frames(&mut app, |app| !app.selection().is_empty()),
+        "nothing was outlined even with ground in view"
+    );
+
+    // A whole-block brush on solid ground outlines all 27 cells.
+    let solid = app.selection();
+    assert_eq!(
+        solid.len(),
+        27,
+        "a solid block should outline all 27 of its cells, got {}",
+        solid.len()
+    );
+
+    // Chisel one cell out of it and look again. The cell removed is the one
+    // the crosshair is on, so it must be the one that leaves the outline.
+    let removed = app.dig_target().expect("something to aim at");
+    app.select_subnode_tool();
+    let deadline = Instant::now() + PATIENCE;
+    let mut gone = false;
+    while Instant::now() < deadline && !gone {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        app.dig();
+        gone = app
+            .store()
+            .get(removed.chunk())
+            .and_then(|chunk| chunk.get_subnode(removed))
+            .is_some_and(tiamot_core::MaterialId::is_air);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(gone, "the chisel never removed {removed:?}");
+    app.stop_digging();
+
+    // Back to a whole-block brush, and the outline must now be the real shape.
+    app.select_block_tool();
+    app.advance(Input::default(), 1.0 / 60.0);
+    let chiselled = app.selection();
+    assert!(
+        !chiselled.contains(&removed),
+        "the outline still includes {removed:?}, which was chiselled away — it is drawing \
+         the cube the block used to be"
+    );
+    assert_eq!(
+        chiselled.len(),
+        26,
+        "one cell was removed, so 26 should remain; got {}",
+        chiselled.len()
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}
+
+#[test]
 fn a_stall_does_not_leave_the_player_unable_to_move() {
     // The reported symptom — jitter with no movement — reproduced by the thing
     // a real client does and a headless test never does: STALL.
