@@ -145,7 +145,7 @@ fn a_staircase_survives_a_hundred_and_fifty_millisecond_round_trip_and_five_perc
         // per step, since each place costs a block's worth of units.
         let quarry: Vec<BlockPos> = (0..STEPS).map(|i| BlockPos::new(20 + i, 40, 20)).collect();
         for pos in &quarry {
-            bot.place(*pos, stone).await.expect("seed");
+            assert!(server.seed_block(*pos, stone), "seed queue full");
         }
         for pos in &quarry {
             bot.expect_block(*pos, stone, Duration::from_secs(10))

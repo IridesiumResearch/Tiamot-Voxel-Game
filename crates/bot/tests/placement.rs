@@ -111,8 +111,11 @@ fn held(bot: &Bot, material: u16) -> u32 {
 }
 
 /// Digs a whole block with the default tool and waits for the units to land.
-async fn mine_a_block(bot: &mut Bot, pos: BlockPos, material: u16) {
-    bot.place(pos, material).await.expect("seed the block");
+async fn mine_a_block(bot: &mut Bot, server: &ServerHandle, pos: BlockPos, material: u16) {
+    // Seeded by the operator. A client cannot edit the world directly, and a
+    // test that arranged one that way would depend on a capability that is
+    // deliberately not there.
+    assert!(server.seed_block(pos, material), "seed queue full");
     bot.expect_block(pos, material, Duration::from_secs(10))
         .await
         .expect("the seeded block should land");
@@ -134,7 +137,7 @@ fn placing_a_whole_block_spends_exactly_twenty_seven_units() {
     block_on(async {
         let mut bot = join(&server, "Builder").await;
         let quarry = BlockPos::new(8, 40, 8);
-        mine_a_block(&mut bot, quarry, stone).await;
+        mine_a_block(&mut bot, &server, quarry, stone).await;
 
         let before = held(&bot, stone);
         assert_eq!(
@@ -178,7 +181,7 @@ fn chiselled_spares_place_back_as_a_partial_block() {
     block_on(async {
         let mut bot = join(&server, "Sculptor").await;
         let quarry = BlockPos::new(8, 40, 8);
-        bot.place(quarry, stone).await.expect("seed the block");
+        assert!(server.seed_block(quarry, stone), "seed queue full");
         bot.expect_block(quarry, stone, Duration::from_secs(10))
             .await
             .expect("the seeded block should land");
@@ -300,12 +303,12 @@ fn placing_into_something_solid_is_refused() {
     block_on(async {
         let mut bot = join(&server, "Overlapper").await;
         let quarry = BlockPos::new(8, 40, 8);
-        mine_a_block(&mut bot, quarry, stone).await;
+        mine_a_block(&mut bot, &server, quarry, stone).await;
 
         // Somewhere solid: seed a block with the free Task 07 edit path, then
         // try to place into it.
         let target = BlockPos::new(8, 40, 12);
-        bot.place(target, stone).await.expect("seed");
+        assert!(server.seed_block(target, stone), "seed queue full");
         bot.expect_block(target, stone, Duration::from_secs(10))
             .await
             .expect("the seed should land");
@@ -343,7 +346,7 @@ fn placing_inside_a_player_is_refused() {
     block_on(async {
         let mut bot = join(&server, "Selfsealer").await;
         let quarry = BlockPos::new(8, 40, 8);
-        mine_a_block(&mut bot, quarry, stone).await;
+        mine_a_block(&mut bot, &server, quarry, stone).await;
         let before = held(&bot, stone);
 
         // Where the server says the body is, in cells, converted to the block

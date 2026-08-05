@@ -121,6 +121,20 @@ pub struct Shared {
     /// faster than 20 Hz can apply them and grow this until the server died.
     pub edits: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, Edit)>>,
 
+    /// World edits queued by the operator rather than by a player.
+    ///
+    /// **Not reachable from the network.** These come from
+    /// [`crate::ServerHandle::seed_block`] — a test arranging a world, or an
+    /// operator fixing one — and are applied with no inventory effect at all:
+    /// nobody is credited for what they remove and nobody is charged for what
+    /// they add, because nobody did it.
+    ///
+    /// Separate from [`Shared::edits`] for exactly that reason. That queue
+    /// carries a `PlayerUuid` because a player is answerable for what it does;
+    /// this one has no actor, and giving it a synthetic one would mean every
+    /// consumer had to remember which uuids were real.
+    pub seeds: std::sync::Mutex<std::collections::VecDeque<Edit>>,
+
     /// Placements waiting for the tick that will decide them.
     ///
     /// Separate from [`Shared::edits`] because they are a different kind of
@@ -379,6 +393,29 @@ impl Shared {
             material,
         });
         true
+    }
+
+    /// Queues an operator edit, bypassing every player-facing rule.
+    ///
+    /// Returns whether it was accepted; the queue is bounded like the others.
+    pub fn queue_seed(&self, edit: Edit) -> bool {
+        let Ok(mut queue) = self.seeds.lock() else {
+            return false;
+        };
+        if queue.len() >= MAX_QUEUED_EDITS {
+            return false;
+        }
+        queue.push_back(edit);
+        true
+    }
+
+    /// Takes every queued operator edit, leaving the queue empty.
+    #[must_use]
+    pub fn drain_seeds(&self) -> Vec<Edit> {
+        self.seeds
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
     }
 
     /// Takes every queued placement, leaving the queue empty.
@@ -1349,6 +1386,7 @@ mod tests {
             control: Control::new(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             outbound: tokio::sync::broadcast::channel(16).0,
             chunk_requests: std::sync::Mutex::new(std::collections::VecDeque::new()),
             view_distance: tiamot_core::interest::ViewDistance::MINIMUM,

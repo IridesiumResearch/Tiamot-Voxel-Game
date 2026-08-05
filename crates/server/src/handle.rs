@@ -478,6 +478,7 @@ impl ServerHandle {
             control: control.clone(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             // Capacity is per-receiver backlog, not a total. 1024 messages at
             // 20 Hz is roughly fifty seconds behind before a client starts
@@ -616,6 +617,24 @@ impl ServerHandle {
                             && let Err(err) = store::flush(world.db(), &mut identities)
                         {
                             error!("could not persist identity changes: {err}");
+                        }
+
+                        // Operator edits first, and with no inventory effect
+                        // at all: nobody is credited for what they remove and
+                        // nobody is charged for what they add, because nobody
+                        // did it. A test arranging a world before a player acts
+                        // is the whole use, and it goes first so the player's
+                        // own actions this tick see the arranged world.
+                        for edit in shared.drain_seeds() {
+                            match world.apply(&edit, &mut source) {
+                                Ok(_) => shared.broadcast(ServerMessage::BlockDelta {
+                                    edit,
+                                    actor: None,
+                                }),
+                                Err(err) => {
+                                    debug!("an operator edit would not apply: {err}");
+                                }
+                            }
                         }
 
                         // Edits, in tick order, on one thread. Applying them
@@ -1013,6 +1032,33 @@ impl ServerHandle {
             rcon: None,
             materials: Vec::new(),
         })
+    }
+
+    /// Writes a block directly, as the operator rather than as a player.
+    ///
+    /// **This is not a client capability and must never become one.** Charter
+    /// rule 2 puts every world decision on the server, and the whole point of
+    /// the dig and place paths is that a player pays for what they take and is
+    /// refused what they may not have. This bypasses all of it, which is why it
+    /// hangs off the handle — something you can only call if you are already
+    /// running the server in your own process.
+    ///
+    /// What it is for: arranging a world before a test acts on it. That used to
+    /// be done by having a bot send `ClientMessage::BlockDelta`, which meant
+    /// every one of those tests quietly depended on clients being able to edit
+    /// the world — the exact thing that should not be true.
+    ///
+    /// Applied on the next tick and broadcast like any other edit, so a
+    /// connected client sees it arrive. Returns whether it was queued.
+    pub fn seed_block(&self, pos: tiamot_core::BlockPos, material: u16) -> bool {
+        self.shared
+            .queue_seed(tiamot_core::proto::Edit::Block { pos, material })
+    }
+
+    /// The same, for one sub-node cell.
+    pub fn seed_subnode(&self, pos: tiamot_core::SubNodePos, material: u16) -> bool {
+        self.shared
+            .queue_seed(tiamot_core::proto::Edit::SubNode { pos, material })
     }
 
     /// The address the server is actually listening on.

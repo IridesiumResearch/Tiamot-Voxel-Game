@@ -133,8 +133,11 @@ fn centre_of(pos: BlockPos) -> SubNodePos {
 ///
 /// The Task 07 direct-edit path seeds it, because what is under test is the
 /// dig, not the seeding.
-async fn dig_and_see(bot: &mut Bot, pos: BlockPos, material: u16) -> bool {
-    bot.place(pos, material).await.expect("seed");
+async fn dig_and_see(bot: &mut Bot, server: &ServerHandle, pos: BlockPos, material: u16) -> bool {
+    // Seeded by the OPERATOR, not by the bot. A client cannot edit the world,
+    // and a test that arranged one by pretending otherwise would be asserting
+    // against a capability that should not exist.
+    assert!(server.seed_block(pos, material), "seed queue full");
     bot.expect_block(pos, material, Duration::from_secs(10))
         .await
         .expect("the seed should land");
@@ -177,7 +180,7 @@ fn a_mod_can_refuse_a_dig() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let removed = dig_and_see(&mut bot, BlockPos::new(8, 40, 8), stone).await;
+        let removed = dig_and_see(&mut bot, &server, BlockPos::new(8, 40, 8), stone).await;
         assert!(
             !removed,
             "the mod refused the dig and the block went anyway"
@@ -207,7 +210,7 @@ fn a_hook_that_does_not_refuse_lets_the_dig_through() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let removed = dig_and_see(&mut bot, BlockPos::new(8, 40, 8), stone).await;
+        let removed = dig_and_see(&mut bot, &server, BlockPos::new(8, 40, 8), stone).await;
         assert!(
             removed,
             "a hook that returned nothing cancelled the dig; only an explicit false should"
@@ -233,7 +236,7 @@ fn a_mod_that_throws_while_vetoing_does_not_stop_the_dig() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let removed = dig_and_see(&mut bot, BlockPos::new(8, 40, 8), stone).await;
+        let removed = dig_and_see(&mut bot, &server, BlockPos::new(8, 40, 8), stone).await;
         assert!(
             removed,
             "a mod's crash was treated as a veto, so one bad mod can stop the server digging"
@@ -261,7 +264,7 @@ fn a_mod_can_refuse_a_placement_and_the_player_keeps_their_material() {
         // veto is specific to placing rather than a mod that broke everything.
         let quarry = BlockPos::new(8, 40, 8);
         assert!(
-            dig_and_see(&mut bot, quarry, stone).await,
+            dig_and_see(&mut bot, &server, quarry, stone).await,
             "digging should still work; only placing is refused here"
         );
         bot.await_inventory(Duration::from_secs(10))
@@ -318,11 +321,11 @@ fn a_hook_can_refuse_selectively_using_the_event_it_is_given() {
     block_on(async {
         let mut bot = join(&server).await;
         assert!(
-            !dig_and_see(&mut bot, guarded, stone).await,
+            !dig_and_see(&mut bot, &server, guarded, stone).await,
             "the guarded block was dug"
         );
         assert!(
-            dig_and_see(&mut bot, BlockPos::new(20, 40, 8), stone).await,
+            dig_and_see(&mut bot, &server, BlockPos::new(20, 40, 8), stone).await,
             "a block outside the guarded range was refused too, so the hook is not reading \
              the event"
         );
@@ -427,7 +430,7 @@ fn the_reference_mods_register_no_vetoes() {
     block_on(async {
         let mut bot = join(&server).await;
         assert!(
-            dig_and_see(&mut bot, BlockPos::new(8, 40, 8), stone).await,
+            dig_and_see(&mut bot, &server, BlockPos::new(8, 40, 8), stone).await,
             "a reference mod is refusing digs"
         );
     });
