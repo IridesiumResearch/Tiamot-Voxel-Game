@@ -326,6 +326,85 @@ fn the_teleport_survives_the_frame_after_it() {
 }
 
 #[test]
+fn a_player_can_dig_and_then_build_with_what_they_dug() {
+    // The whole loop through the CLIENT rather than a bot: aim with the real
+    // raycast, dig what the crosshair is on, and place it back against a face.
+    // Until this landed none of it was reachable from the window at all — left
+    // click only grabbed the cursor, so digging had never once been done by a
+    // person.
+    //
+    // The pairing is the point. Digging alone leaves a hole and proves nothing
+    // about placement; placing alone cannot happen, because there is nothing to
+    // place until something has been dug.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("dig-and-build");
+    let mut app = client("dig-and-build", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+
+    // Aim down at a slant rather than straight down. Straight down finds the
+    // cell the player is standing ON: digging it drops them into the hole, and
+    // the placement that follows is then refused for being inside a player —
+    // which is the rule working correctly and the test staging it wrong. A 45°
+    // slant lands about five cells away, clear of a body 1.8 cells wide.
+    app.look_down_by(std::f32::consts::FRAC_PI_4);
+    assert!(
+        run_frames(&mut app, |app| app.looking_at().is_some()),
+        "the crosshair found nothing within reach even pointing straight down"
+    );
+
+    let target = app.dig_target().expect("something to dig");
+    // Its own loop rather than `run_frames`, which hands out a shared borrow —
+    // and digging is a thing the frame does, not a thing it observes. Re-aimed
+    // every frame exactly as `main.rs` does while the button is held.
+    let mut dug = false;
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline && !dug {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        app.dig();
+        dug = !app.carried().is_empty();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        dug,
+        "digging the ground never credited anything; warnings: {:?}",
+        app.warnings()
+    );
+    app.stop_digging();
+
+    let carried = app.carried()[0];
+    assert!(carried.1 > 0, "credited an empty stack: {carried:?}");
+
+    // And build with it. Aim at a face rather than the hole just made — the
+    // ground beside it will do — and place.
+    assert!(
+        run_frames(&mut app, |app| app.place_target().is_some()),
+        "nothing to place against after digging"
+    );
+    let placed_at = app.place_target().expect("a face to build on");
+    app.place();
+
+    assert!(
+        run_frames(&mut app, |app| {
+            app.store()
+                .get(placed_at.chunk())
+                .and_then(|chunk| chunk.get_subnode(placed_at))
+                .is_some_and(|material| !material.is_air())
+        }),
+        "the placed block never appeared at {placed_at:?}; dug {target:?}, carried \
+         {carried:?}, warnings: {:?}",
+        app.warnings()
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}
+
+#[test]
 fn a_stall_does_not_leave_the_player_unable_to_move() {
     // The reported symptom — jitter with no movement — reproduced by the thing
     // a real client does and a headless test never does: STALL.

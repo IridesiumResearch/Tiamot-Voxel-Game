@@ -144,6 +144,7 @@ impl Seen {
             Event::Disconnected { reason } => self.disconnect = Some(reason),
             Event::PlayerState(state) => self.states.push(state),
             Event::DigProgress { .. } => {}
+            Event::Inventory { .. } => {}
             Event::Chat { .. } => {}
         }
     }

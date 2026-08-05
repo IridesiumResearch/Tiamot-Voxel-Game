@@ -130,6 +130,16 @@ pub enum Event {
         images: BTreeMap<u16, Image>,
     },
 
+    /// What the player is carrying, in **units** (charter rule 5).
+    ///
+    /// Whole, not a delta: an inventory is tens of stacks at most, and a delta
+    /// stream that ever dropped a message would leave the client permanently
+    /// wrong with no way to notice.
+    Inventory {
+        /// Material id and unit count, in ascending material order.
+        stacks: Vec<(u16, u32)>,
+    },
+
     /// The player is in the world.
     Joined {
         /// The identity the server resolved.
@@ -215,6 +225,16 @@ pub enum Command {
     SelectTool {
         /// Qualified tool id, or `None` for a bare hand.
         tool: Option<String>,
+    },
+    /// Ask to place material from the inventory into a cell.
+    ///
+    /// A request: the server decides whether it happens, and says why when it
+    /// does not. See `tiamot_core::place`.
+    Place {
+        /// The cell to fill, already stepped across the face being looked at.
+        target: tiamot_core::SubNodePos,
+        /// Which material, as a world material id.
+        material: u16,
     },
     /// Leave.
     Disconnect,
@@ -797,10 +817,10 @@ async fn session(
             // each for its own reason. `HelloAck` is acknowledged by the
             // challenge that follows it. `ModManifest` names content the
             // material table fetches by hash instead, and nothing needs the mod
-            // list until client-side scripts exist. Inventory and entity state
-            // wait for Tasks 14 and 12. All four are ignored rather than warned
-            // about — a warning here would mean the client complaining about a
-            // server behaving correctly.
+            // list until client-side scripts exist. Entity state waits for Task
+            // 12. They are ignored rather than warned about — a warning here
+            // would mean the client complaining about a server behaving
+            // correctly.
             ServerMessage::PlayerState {
                 last_processed_input,
                 chunk,
@@ -821,9 +841,12 @@ async fn session(
                 let _ = events.send(Event::DigProgress { target, progress });
             }
 
+            ServerMessage::InventoryUpdate { stacks } => {
+                let _ = events.send(Event::Inventory { stacks });
+            }
+
             ServerMessage::HelloAck { .. }
             | ServerMessage::ModManifest { .. }
-            | ServerMessage::InventoryUpdate { .. }
             | ServerMessage::EntityStateDelta { .. } => {}
         }
     }
@@ -940,6 +963,7 @@ fn to_wire(command: Command) -> ClientMessage {
         } => ClientMessage::StartDig { target },
         Command::Dig { target: None } => ClientMessage::CancelDig,
         Command::SelectTool { tool } => ClientMessage::SelectTool { tool },
+        Command::Place { target, material } => ClientMessage::Place { target, material },
         Command::Disconnect => ClientMessage::Disconnect,
         // Unreachable: the session loop applies it and never gets here. A
         // panic rather than a placeholder message, because sending SOMETHING

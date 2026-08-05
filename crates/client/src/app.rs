@@ -360,6 +360,19 @@ pub struct App {
     /// so frames and ticks are decoupled here: a fast machine predicts the same
     /// ticks a slow one does, just with more frames between them.
     tick_carry: f32,
+    /// What the server says the player is carrying, in ascending material
+    /// order and in **units** (charter rule 5).
+    ///
+    /// Server-authoritative and never edited here: the client is told what it
+    /// has. An inventory a client could change is not an inventory.
+    carried: Vec<(u16, u32)>,
+    /// Which entry of [`App::carried`] the hotbar is on.
+    ///
+    /// An index into a list that changes as material is gained and spent, so it
+    /// is clamped on every update rather than trusted — a slot that outlived
+    /// its stack would otherwise build with whatever moved into that position.
+    selected: usize,
+
     /// Whole chunks the drawn world has been displaced by, for the
     /// floating-origin debug teleport. `[0, 0, 0]` in normal play.
     ///
@@ -396,6 +409,8 @@ impl App {
             confirmed_tick: 0,
             dig: None,
             tick_carry: 0.0,
+            carried: Vec::new(),
+            selected: 0,
             displacement: [0, 0, 0],
         }
     }
@@ -544,6 +559,144 @@ impl App {
         self.predictor.is_some()
     }
 
+    /// Points the camera down by `radians` from the horizon.
+    ///
+    /// For tests. The controller spawns standing on the ground, so aiming
+    /// downward is the one direction guaranteed to find something within reach
+    /// whatever the terrain looks like — but **straight** down finds the cell
+    /// the player is standing on, and digging that drops them into the hole
+    /// they then cannot build in. A slant lands a few cells away instead.
+    pub fn look_down_by(&mut self, radians: f32) {
+        self.camera.pitch = -radians;
+    }
+
+    /// What the crosshair is pointing at, if anything is in reach.
+    ///
+    /// The cell and the face it was entered through, in world cells. Placement
+    /// goes in `cell + normal` — the normal points back out of the surface for
+    /// exactly that reason.
+    ///
+    /// `None` when nothing is within [`phys::REACH`], which includes looking at
+    /// the sky and looking into terrain that has not arrived yet.
+    #[must_use]
+    pub fn looking_at(&self) -> Option<phys::Hit> {
+        let predictor = self.predictor.as_ref()?;
+        let voxels = phys::Voxels::new(&self.store, predictor.origin());
+        let eye = predictor.body().eye();
+        let forward = self.camera.forward();
+        phys::ray::cast(&voxels, eye, [forward.x, forward.y, forward.z], phys::REACH)
+    }
+
+    /// The same target, in the world's own coordinates.
+    ///
+    /// `looking_at` reports cells relative to the predicted body's chunk origin
+    /// (charter rule 7 again), and everything on the wire is absolute. Getting
+    /// this conversion wrong digs a hole somewhere else entirely.
+    fn target_of(&self, cell: [i32; 3]) -> Option<tiamot_core::SubNodePos> {
+        let predictor = self.predictor.as_ref()?;
+        let origin = predictor.origin();
+        let span = tiamot_core::CHUNK_SUBNODES as i32;
+        Some(tiamot_core::SubNodePos::new(
+            origin.x * span + cell[0],
+            origin.y * span + cell[1],
+            origin.z * span + cell[2],
+        ))
+    }
+
+    /// The cell under the crosshair, for digging.
+    #[must_use]
+    pub fn dig_target(&self) -> Option<tiamot_core::SubNodePos> {
+        self.target_of(self.looking_at()?.cell)
+    }
+
+    /// The cell a placement would fill: one step out of the surface.
+    #[must_use]
+    pub fn place_target(&self) -> Option<tiamot_core::SubNodePos> {
+        let hit = self.looking_at()?;
+        self.target_of([
+            hit.cell[0] + hit.normal[0],
+            hit.cell[1] + hit.normal[1],
+            hit.cell[2] + hit.normal[2],
+        ])
+    }
+
+    /// Starts or re-aims a dig at whatever the crosshair is on.
+    ///
+    /// Re-sent every frame the button is held, which is what `StartDig`'s
+    /// protocol docs ask for: re-aiming at the same cell keeps its progress, so
+    /// repeating is free and it means a dig follows the crosshair.
+    pub fn dig(&mut self) {
+        let Some(target) = self.dig_target() else {
+            return;
+        };
+        self.connection.send(Command::Dig {
+            target: Some(target),
+        });
+    }
+
+    /// Stops digging, discarding progress.
+    pub fn stop_digging(&mut self) {
+        self.dig = None;
+        self.connection.send(Command::Dig { target: None });
+    }
+
+    /// Places the selected material against the face under the crosshair.
+    ///
+    /// Nothing happens with an empty inventory or nothing in reach. Anything
+    /// else the server may still refuse — it owns that decision (charter rule
+    /// 2) — and says why, which arrives as a warning.
+    pub fn place(&mut self) {
+        let Some(material) = self.selected_material() else {
+            self.warn("nothing selected to build with".to_owned());
+            return;
+        };
+        let Some(target) = self.place_target() else {
+            return;
+        };
+        self.connection.send(Command::Place { target, material });
+    }
+
+    /// The material the hotbar is on, if the player is carrying anything.
+    #[must_use]
+    pub fn selected_material(&self) -> Option<u16> {
+        self.carried.get(self.selected).map(|(id, _)| *id)
+    }
+
+    /// Moves the hotbar selection, wrapping.
+    ///
+    /// Wrapping rather than clamping because the input is a mouse wheel, and a
+    /// wheel that stops at the end feels broken.
+    pub fn select_next(&mut self, forward: bool) {
+        if self.carried.is_empty() {
+            return;
+        }
+        let count = self.carried.len();
+        self.selected = if forward {
+            (self.selected + 1) % count
+        } else {
+            (self.selected + count - 1) % count
+        };
+    }
+
+    /// Selects a slot directly, as the number keys do.
+    pub fn select_slot(&mut self, slot: usize) {
+        if slot < self.carried.len() {
+            self.selected = slot;
+        }
+    }
+
+    /// What the player is carrying, as `(material, units)` in id order.
+    #[must_use]
+    pub fn carried(&self) -> &[(u16, u32)] {
+        &self.carried
+    }
+
+    /// Which slot is selected.
+    #[must_use]
+    pub const fn selected_slot(&self) -> usize {
+        self.selected
+    }
+
     /// Starts simulating a bad network on everything sent from here on.
     ///
     /// **For tests.** See [`crate::net::Command::Impair`] for why it is applied
@@ -657,6 +810,16 @@ impl App {
 
                 Event::DigProgress { target, progress } => {
                     self.dig = Some((target, progress));
+                }
+
+                Event::Inventory { stacks } => {
+                    self.carried = stacks;
+                    // Clamped rather than trusted. The list shrinks when a
+                    // stack is spent, and a selection left pointing past the
+                    // end would build with whatever slid into that position —
+                    // which is the sort of bug a player reports as "it placed
+                    // the wrong thing" and nobody can reproduce.
+                    self.selected = self.selected.min(self.carried.len().saturating_sub(1));
                 }
 
                 Event::Chat { text, .. } => tracing::info!("{text}"),
@@ -983,9 +1146,45 @@ impl App {
                 self.renderer.gpu().adapter,
                 self.renderer.gpu().backend
             ),
+            // The hotbar, such as it is. Names rather than ids: a player
+            // debugging a placement needs to know it is stone, not that it is 2.
+            if self.carried.is_empty() {
+                "carrying nothing — dig something".to_owned()
+            } else {
+                self.carried
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, (id, units))| {
+                        let name = self
+                            .materials
+                            .get(id)
+                            .map_or_else(|| format!("#{id}"), Clone::clone);
+                        // Charter rule 5's display: blocks and spare nodes, not
+                        // a raw unit count. 27 units is one block.
+                        let (blocks, spares) = tiamot_core::inventory::display(*units);
+                        let marker = if slot == self.selected { ">" } else { " " };
+                        format!("{marker}{}:{name} {blocks}b+{spares}n", slot + 1)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            },
+            // What the crosshair is on, which is the other half of knowing why
+            // a placement went where it did.
+            match self.looking_at() {
+                Some(hit) => {
+                    let target = self.place_target().map_or_else(String::new, |cell| {
+                        format!(" → {},{},{}", cell.x, cell.y, cell.z)
+                    });
+                    format!(
+                        "looking at cell {},{},{} face {:?}{target}",
+                        hit.cell[0], hit.cell[1], hit.cell[2], hit.normal
+                    )
+                }
+                None => "looking at nothing in reach".to_owned(),
+            },
             // The floating-origin check is a human gate, and a gate nobody can
             // find the key for gets reported as "nothing happened".
-            "T or F8: jump 50,000 blocks · H or F7: home".to_owned(),
+            "LMB dig · RMB place · 1-9 or wheel: slot · T/F8: jump 50,000 · H/F7: home".to_owned(),
         ]
     }
 

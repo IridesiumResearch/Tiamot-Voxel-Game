@@ -118,6 +118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         last_frame: std::time::Instant::now(),
         pending_teleport: None,
         grabbed: false,
+        digging: false,
         error: None,
     };
     event_loop.run_app(&mut client)?;
@@ -186,6 +187,12 @@ struct Client {
     last_frame: std::time::Instant,
     pending_teleport: Option<Teleport>,
     grabbed: bool,
+    /// Whether the dig button is down.
+    ///
+    /// Held rather than clicked: a dig is counted in ticks by the server, so
+    /// the client re-aims at the crosshair every frame the button is down and
+    /// cancels when it comes up.
+    digging: bool,
     /// Set when something went wrong badly enough to stop, so `run` can report
     /// it rather than exiting zero after printing a log line.
     error: Option<Box<dyn std::error::Error>>,
@@ -242,14 +249,39 @@ impl ApplicationHandler for Client {
                 );
             }
 
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                // Click to look. The cursor is released with Escape, which is
-                // what every game does and therefore what a player will try.
-                self.grabbed = grab(&surface.window, true);
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                match button {
+                    // Click to look FIRST. Until the cursor is grabbed a click
+                    // is the player asking for mouse-look, not asking to dig a
+                    // hole in whatever happens to be under an unaimed
+                    // crosshair.
+                    MouseButton::Left if pressed && !self.grabbed => {
+                        self.grabbed = grab(&surface.window, true);
+                    }
+                    // Held, not clicked: a dig takes a second or two of ticks
+                    // and the server counts them. Releasing cancels, which is
+                    // why the state has to be tracked rather than acted on once.
+                    MouseButton::Left => {
+                        self.digging = pressed;
+                        if !pressed {
+                            surface.app.stop_digging();
+                        }
+                    }
+                    // A single action, unlike digging. Repeating while held
+                    // would build a wall out of one click.
+                    MouseButton::Right if pressed && self.grabbed => surface.app.place(),
+                    _ => {}
+                }
+            }
+
+            // The hotbar, on the wheel as well as the number keys.
+            WindowEvent::MouseWheel { delta, .. } => {
+                let forward = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y < 0.0,
+                    winit::event::MouseScrollDelta::PixelDelta(position) => position.y < 0.0,
+                };
+                surface.app.select_next(forward);
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -283,6 +315,21 @@ impl ApplicationHandler for Client {
                         }
                         KeyCode::F7 | KeyCode::KeyH if pressed => {
                             self.pending_teleport = Some(Teleport::Home);
+                        }
+                        // The hotbar's number keys. `Digit1` is slot 0.
+                        KeyCode::Digit1
+                        | KeyCode::Digit2
+                        | KeyCode::Digit3
+                        | KeyCode::Digit4
+                        | KeyCode::Digit5
+                        | KeyCode::Digit6
+                        | KeyCode::Digit7
+                        | KeyCode::Digit8
+                        | KeyCode::Digit9
+                            if pressed =>
+                        {
+                            let slot = code as usize - KeyCode::Digit1 as usize;
+                            surface.app.select_slot(slot);
                         }
                         _ => {}
                     }
@@ -403,6 +450,15 @@ impl Client {
         // server's input queue is keyed by tick.
         let input = self.held.as_input(self.pending_teleport.take());
         surface.app.advance(input, dt);
+
+        // After `advance`, so the dig aims at where the player ended up this
+        // frame rather than where they started. Re-sent every frame the button
+        // is held: re-aiming at the same cell keeps its progress, so this is
+        // free, and it means a dig follows the crosshair rather than sticking
+        // to whatever was under it when the button went down.
+        if self.digging {
+            surface.app.dig();
+        }
 
         let frame = match surface.surface.get_current_texture() {
             // Suboptimal still hands over a usable texture. Reconfiguring is
