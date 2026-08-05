@@ -191,6 +191,12 @@ pub struct JoinContext<'a> {
     /// cannot name — and would have to either buffer the chunk or draw it
     /// wrong. See [`crate::proto::MaterialDef`].
     pub materials: &'a [crate::proto::MaterialDef],
+    /// Every tool the loaded mods registered, in ascending id order.
+    ///
+    /// Sent alongside the materials and for the same reason: charter rule 1
+    /// means the engine has no tools of its own, so a client that was not told
+    /// could not offer a way to pick one. See [`crate::proto::ToolDef`].
+    pub tools: &'a [crate::proto::ToolDef],
     /// Who is permitted to join.
     pub allowlist: &'a Allowlist,
     /// Maximum simultaneous players.
@@ -555,6 +561,9 @@ impl Session {
                 ServerMessage::MaterialTable {
                     materials: context.materials.to_vec(),
                 },
+                ServerMessage::ToolTable {
+                    tools: context.tools.to_vec(),
+                },
             ],
             close: false,
             action: Action::None,
@@ -722,6 +731,7 @@ mod tests {
             mods,
             mod_set_fingerprint: 0xCAFE,
             materials: &[],
+            tools: &[],
             allowlist,
             max_players: 50,
             current_players: 0,
@@ -802,7 +812,11 @@ mod tests {
         // allowed into the world: a chunk that arrived first would be a grid of
         // numbers the client cannot name.
         assert!(matches!(sent[3], ServerMessage::MaterialTable { .. }));
-        assert!(matches!(sent[4], ServerMessage::JoinWorld { .. }));
+        // And the tool table with it, for the same reason one step further on:
+        // the engine has no tools of its own (charter rule 1), so a client that
+        // was not told this could not offer a way to choose one.
+        assert!(matches!(sent[4], ServerMessage::ToolTable { .. }));
+        assert!(matches!(sent[5], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]

@@ -75,6 +75,21 @@ fn write_warden(name: &str, hooks: &str) -> PathBuf {
     root
 }
 
+/// A mod that registers no tools at all, for the empty-table case.
+fn write_warden_without_tools(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("quiet");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"quiet\"\nname = \"Quiet\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("init.lua"), "-- registers nothing\n").expect("script");
+    root
+}
+
 fn start(name: &str, mods: PathBuf) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
@@ -322,6 +337,82 @@ fn reference_mods() -> PathBuf {
         .join("../../game")
         .canonicalize()
         .expect("the reference mods live at the repo root")
+}
+
+#[test]
+fn a_client_is_told_which_tools_the_mods_registered() {
+    // Charter rule 1, from the client's side. The engine has no tools of its
+    // own — not even a bare hand — so a client cannot offer a way to choose one
+    // without being told what exists, and hard-coding `core_tools:chisel` into
+    // the client would be exactly the special-casing rule 1 forbids.
+    //
+    // This is why protocol v7 exists. Before it, the chisel was registered,
+    // reachable over the wire, and impossible to select from the window: there
+    // was no way for the client to know its name.
+    let server = start("tool-table", reference_mods());
+
+    block_on(async {
+        let bot = join(&server).await;
+        let tools: Vec<tiamot_core::proto::ToolDef> = bot
+            .received()
+            .into_iter()
+            .find_map(|message| match message {
+                tiamot_core::proto::ServerMessage::ToolTable { tools } => Some(tools),
+                _ => None,
+            })
+            .expect("the server should send a tool table on join");
+
+        let chisel = tools
+            .iter()
+            .find(|tool| tool.id == "core_tools:chisel")
+            .expect("the reference mods register a chisel");
+        assert_eq!(
+            chisel.brush, "subnode",
+            "the chisel's brush is the whole reason sub-nodes exist"
+        );
+        assert_eq!(chisel.name, "Chisel", "the mod's display name was dropped");
+        assert!(!chisel.default);
+
+        // And exactly one default, or a client cannot tell what a bare hand is.
+        let defaults: Vec<&str> = tools
+            .iter()
+            .filter(|tool| tool.default)
+            .map(|tool| tool.id.as_str())
+            .collect();
+        assert_eq!(
+            defaults,
+            vec!["core_tools:hand"],
+            "expected exactly one default tool"
+        );
+    });
+
+    assert!(server.stop());
+}
+
+#[test]
+fn a_world_with_no_tool_mods_sends_an_empty_table() {
+    // The counter-example, and the shape charter rule 1 actually asks for: an
+    // engine with no mods has no tools, so the table is empty and nothing in
+    // that world can be dug. Correct rather than broken.
+    let server = start("no-tools", write_warden_without_tools("no-tools"));
+
+    block_on(async {
+        let bot = join(&server).await;
+        let tools = bot
+            .received()
+            .into_iter()
+            .find_map(|message| match message {
+                tiamot_core::proto::ServerMessage::ToolTable { tools } => Some(tools),
+                _ => None,
+            })
+            .expect("a tool table should be sent even when it is empty");
+        assert!(
+            tools.is_empty(),
+            "a mod set that registers no tools produced {tools:?}"
+        );
+    });
+
+    assert!(server.stop());
 }
 
 #[test]

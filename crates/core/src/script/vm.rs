@@ -263,6 +263,11 @@ impl BlockRules {
 pub struct Tool {
     /// The qualified tool id, e.g. `"core_tools:chisel"`.
     pub id: String,
+    /// What to call it on screen, if the mod said.
+    ///
+    /// `None` falls back to the id, which is always present and always
+    /// unambiguous — an unnamed tool should look unpolished, not invisible.
+    pub name: Option<String>,
     /// What shape it removes.
     pub brush: Brush,
     /// How much faster than a bare hand it digs.

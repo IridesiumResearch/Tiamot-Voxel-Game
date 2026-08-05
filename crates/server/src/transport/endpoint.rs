@@ -86,6 +86,13 @@ pub struct Shared {
     /// Built once at startup and never changed: registries freeze before the
     /// world opens (charter rule 9), so there is nothing that could change it.
     pub materials: Vec<tiamot_core::proto::MaterialDef>,
+    /// The same tools, in the shape a client is sent on join.
+    ///
+    /// Separate from [`Shared::tools`], which is a lookup keyed by id for the
+    /// simulation. This one is an ordered list of the wire type, because the
+    /// order a client shows tools in should be a property of the mod set rather
+    /// than of a map's iteration.
+    pub tool_table: Vec<tiamot_core::proto::ToolDef>,
     /// Who is permitted to join.
     ///
     /// Behind a lock because RCON changes it at runtime: an operator adding
@@ -1077,6 +1084,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 mods: &shared.mods,
                 mod_set_fingerprint: shared.mod_set_fingerprint,
                 materials: &shared.materials,
+                tools: &shared.tool_table,
                 allowlist: &allowlist,
                 max_players: shared.max_players,
                 current_players: shared.players.load(Ordering::Acquire),
@@ -1333,6 +1341,7 @@ mod tests {
             mods: Vec::new(),
             mod_set_fingerprint: 0,
             materials: Vec::new(),
+            tool_table: Vec::new(),
             allowlist: std::sync::RwLock::new(Allowlist::open()),
             max_players: 2,
             spawn: tiamot_core::BlockPos::new(0, 1, 0),

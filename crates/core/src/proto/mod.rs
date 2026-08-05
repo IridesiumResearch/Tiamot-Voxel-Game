@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -55,6 +55,7 @@ pub const PROTOCOL_VERSION: u32 = 6;
 // v6 (Task 09): appended `ClientMessage::Place` and `Edit::Partial`. `Edit` is
 // nested inside `BlockDelta` on both sides, so appending a variant to it
 // changes what both messages can carry without moving either of them.
+// v7 (Task 09): appended `ServerMessage::ToolTable`.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -232,6 +233,37 @@ pub enum Edit {
         /// cell, so a peer setting one is broken or probing.
         occupancy: u32,
     },
+}
+
+/// One tool a mod registered, as the client needs to see it.
+///
+/// # Why the client is told this at all
+///
+/// Charter rule 1: the engine has no tools of its own, not even a bare hand —
+/// a mod says what a player digs with. So a client cannot offer a way to
+/// *choose* one without being told what exists, and hard-coding `core_tools:
+/// chisel` into the client would put mod content in the engine, which is the
+/// one thing the charter's first rule forbids.
+///
+/// This is the tool equivalent of [`MaterialDef`], and it arrives the same way
+/// and for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolDef {
+    /// The qualified id, e.g. `"core_tools:chisel"`.
+    pub id: String,
+    /// What to show a player. Empty when the mod did not say, and the client
+    /// falls back to the id.
+    pub name: String,
+    /// What shape it removes: `"block"` or `"subnode"`.
+    ///
+    /// A string rather than an enum because [`crate::dig::Brush`] is a
+    /// simulation type and the task's own wording calls the brush format
+    /// "extensible", so mods will grow shapes this enum does not have. A client
+    /// showing an unfamiliar brush verbatim is right; one that could not decode
+    /// the message at all is not.
+    pub brush: String,
+    /// Whether this is what a player digs with holding nothing.
+    pub default: bool,
 }
 
 /// One material in the world's id table, as the client needs to see it.
@@ -594,6 +626,20 @@ pub enum ServerMessage {
         /// How far along, `0.0..=1.0`.
         progress: f32,
     },
+
+    /// Every tool the loaded mods registered.
+    ///
+    /// **Appended at the end** (protocol v7).
+    ///
+    /// Sent once, beside the material table. A client cannot offer a way to
+    /// choose a tool without being told which exist, and charter rule 1 means
+    /// it must not simply know: the engine has no tools of its own, not even a
+    /// bare hand, so `core_tools:chisel` is mod content and hard-coding it in
+    /// the client would be exactly the special-casing rule 1 forbids.
+    ToolTable {
+        /// Every tool, in ascending id order.
+        tools: Vec<ToolDef>,
+    },
 }
 
 /// A message could not be encoded or decoded.
@@ -840,7 +886,8 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::EntityStateDelta { .. }
         | ServerMessage::Disconnect { .. }
         | ServerMessage::InventoryUpdate { .. }
-        | ServerMessage::MaterialTable { .. } => {}
+        | ServerMessage::MaterialTable { .. }
+        | ServerMessage::ToolTable { .. } => {}
     }
     Ok(())
 }
@@ -1280,7 +1327,7 @@ mod tests {
 
     #[test]
     fn server_variant_ordinals_are_pinned() {
-        let server: [(ServerMessage, u8); 10] = [
+        let server: [(ServerMessage, u8); 11] = [
             (
                 ServerMessage::HelloAck {
                     protocol_version: 0,
@@ -1350,6 +1397,9 @@ mod tests {
                 },
                 9,
             ),
+            // Protocol v7. `appended_server_variants_keep_their_ordinals`
+            // covers the ones added between; this pins the newest.
+            (ServerMessage::ToolTable { tools: Vec::new() }, 15),
         ];
 
         for (message, expected) in server {

@@ -391,6 +391,32 @@ fn server_messages() -> Vec<Vec<u8>> {
             target: SubNodePos::new(0, 0, 0),
             progress: f32::NAN,
         },
+        // Protocol v7's tool table. Empty, ordinary, and with a brush string
+        // the engine does not know — mods grow brush shapes, and a client that
+        // could not decode an unfamiliar one would refuse the whole message.
+        ServerMessage::ToolTable { tools: Vec::new() },
+        ServerMessage::ToolTable {
+            tools: vec![
+                tiamot_core::proto::ToolDef {
+                    id: "core_tools:hand".to_owned(),
+                    name: "Bare Hand".to_owned(),
+                    brush: "block".to_owned(),
+                    default: true,
+                },
+                tiamot_core::proto::ToolDef {
+                    id: "core_tools:chisel".to_owned(),
+                    name: "Chisel".to_owned(),
+                    brush: "subnode".to_owned(),
+                    default: false,
+                },
+                tiamot_core::proto::ToolDef {
+                    id: "m:big".to_owned(),
+                    name: String::new(),
+                    brush: "three_by_three_column".to_owned(),
+                    default: false,
+                },
+            ],
+        },
         // Protocol v6's partial edit, on the way back out.
         ServerMessage::BlockDelta {
             edit: Edit::Partial {

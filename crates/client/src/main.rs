@@ -316,6 +316,11 @@ impl ApplicationHandler for Client {
                         KeyCode::F7 | KeyCode::KeyH if pressed => {
                             self.pending_teleport = Some(Teleport::Home);
                         }
+                        // Cycles the tool. A cycle rather than a fixed key
+                        // per tool, because the engine does not know how many
+                        // there are — charter rule 1 puts that entirely in the
+                        // mods, and a server could register twenty.
+                        KeyCode::KeyR if pressed => surface.app.next_tool(),
                         // The hotbar's number keys. `Digit1` is slot 0.
                         KeyCode::Digit1
                         | KeyCode::Digit2

@@ -366,6 +366,14 @@ pub struct App {
     /// Server-authoritative and never edited here: the client is told what it
     /// has. An inventory a client could change is not an inventory.
     carried: Vec<(u16, u32)>,
+    /// Every tool the server's mods registered, in ascending id order.
+    ///
+    /// Empty until the server says. Charter rule 1: the engine has no tools of
+    /// its own, so a client with an empty list is a client connected to a world
+    /// nobody can dig in — which is correct rather than broken.
+    tools: Vec<tiamot_core::proto::ToolDef>,
+    /// Which of them is in hand.
+    held_tool: usize,
     /// Which entry of [`App::carried`] the hotbar is on.
     ///
     /// An index into a list that changes as material is gained and spent, so it
@@ -411,6 +419,8 @@ impl App {
             tick_carry: 0.0,
             carried: Vec::new(),
             selected: 0,
+            tools: Vec::new(),
+            held_tool: 0,
             displacement: [0, 0, 0],
         }
     }
@@ -656,6 +666,33 @@ impl App {
         self.connection.send(Command::Place { target, material });
     }
 
+    /// Cycles to the next registered tool and tells the server.
+    ///
+    /// Nothing happens with no tools, which is a world nobody can dig in —
+    /// correct rather than broken, and the state a server with no mods is in.
+    pub fn next_tool(&mut self) {
+        if self.tools.is_empty() {
+            return;
+        }
+        self.held_tool = (self.held_tool + 1) % self.tools.len();
+        self.send_held_tool();
+    }
+
+    /// Tells the server which tool is in hand.
+    ///
+    /// Sent by id rather than by index: the client's list order is its own, and
+    /// an index would mean the two ends had to agree about it forever.
+    fn send_held_tool(&mut self) {
+        let tool = self.tools.get(self.held_tool).map(|tool| tool.id.clone());
+        self.connection.send(Command::SelectTool { tool });
+    }
+
+    /// The tool in hand, if the server has sent its table.
+    #[must_use]
+    pub fn held_tool(&self) -> Option<&tiamot_core::proto::ToolDef> {
+        self.tools.get(self.held_tool)
+    }
+
     /// The material the hotbar is on, if the player is carrying anything.
     #[must_use]
     pub fn selected_material(&self) -> Option<u16> {
@@ -810,6 +847,23 @@ impl App {
 
                 Event::DigProgress { target, progress } => {
                     self.dig = Some((target, progress));
+                }
+
+                Event::Tools { tools } => {
+                    // The default first, so a player who never touches the tool
+                    // key is holding whatever the mods call a bare hand.
+                    self.held_tool = tools.iter().position(|tool| tool.default).unwrap_or(0);
+                    self.tools = tools;
+                    // **Recorded, not announced.** The table arrives while the
+                    // session is still `Authenticated`, and `SelectTool` is only
+                    // valid in world — replying here got the client disconnected
+                    // with "SelectTool is not valid in phase Authenticated".
+                    //
+                    // There is nothing to announce anyway: a player who has
+                    // selected nothing digs with the server's own default, which
+                    // is the same tool this just picked. The first `next_tool`
+                    // is the first time the two could disagree, and that is when
+                    // it is sent.
                 }
 
                 Event::Inventory { stacks } => {
@@ -1168,6 +1222,13 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("  ")
             },
+            // The tool, and what it does. The brush is the point: a player
+            // needs to know whether the next click takes a cell or a cube, and
+            // that is the whole reason sub-nodes exist.
+            match self.held_tool() {
+                Some(tool) => format!("holding {} ({} brush)", tool.name, tool.brush),
+                None => "no tools registered — nothing here can be dug".to_owned(),
+            },
             // What the crosshair is on, which is the other half of knowing why
             // a placement went where it did.
             match self.looking_at() {
@@ -1184,7 +1245,8 @@ impl App {
             },
             // The floating-origin check is a human gate, and a gate nobody can
             // find the key for gets reported as "nothing happened".
-            "LMB dig · RMB place · 1-9 or wheel: slot · T/F8: jump 50,000 · H/F7: home".to_owned(),
+            "LMB dig · RMB place · R: tool · 1-9/wheel: slot · T/F8: jump 50,000 · H/F7: home"
+                .to_owned(),
         ]
     }
 

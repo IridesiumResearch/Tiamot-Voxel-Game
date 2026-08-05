@@ -119,6 +119,8 @@ struct Seen {
     disconnect: Option<String>,
     /// Authoritative positions, in the order they arrived.
     states: Vec<client::predict::Authoritative>,
+    /// The tool table, which charter rule 1 says only the mods can supply.
+    tools: Vec<tiamot_core::proto::ToolDef>,
 }
 
 impl Seen {
@@ -145,6 +147,7 @@ impl Seen {
             Event::PlayerState(state) => self.states.push(state),
             Event::DigProgress { .. } => {}
             Event::Inventory { .. } => {}
+            Event::Tools { tools } => self.tools = tools,
             Event::Chat { .. } => {}
         }
     }

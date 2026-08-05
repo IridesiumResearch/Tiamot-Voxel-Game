@@ -767,6 +767,7 @@ impl ScriptVm for MluaVm {
                     brush: Brush::parse(&entry.get::<String>("brush").ok()?)?,
                     speed_multiplier: entry.get("speed").ok()?,
                     default: entry.get("default").unwrap_or(false),
+                    name: entry.get::<Option<String>>("name").ok().flatten(),
                     id,
                 })
             })
@@ -1425,6 +1426,11 @@ fn register_tool(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     entry.set("brush", brush)?;
     entry.set("speed", speed)?;
     entry.set("default", default)?;
+    // Accepted since tools existed and discarded until now, which meant a mod
+    // could name its tool and the name went nowhere. The client shows it.
+    if let Ok(Some(name)) = spec.get::<Option<String>>("name") {
+        entry.set("name", name)?;
+    }
     registry.set(qualified, entry)?;
     Ok(())
 }

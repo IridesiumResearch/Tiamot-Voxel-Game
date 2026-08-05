@@ -102,6 +102,10 @@ fn a_bot_completes_the_whole_join_flow() {
             // because a chunk that arrived first would be a grid of numbers
             // the client cannot name.
             "MaterialTable",
+            // Protocol v7, beside the materials and for the same reason: the
+            // engine has no tools of its own (charter rule 1), so a client that
+            // was not told this could not offer a way to choose one.
+            "ToolTable",
             "JoinWorld",
         ];
         assert!(
@@ -494,6 +498,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::AuthChallenge { .. } => "AuthChallenge",
         ServerMessage::ModManifest { .. } => "ModManifest",
         ServerMessage::MaterialTable { .. } => "MaterialTable",
+        ServerMessage::ToolTable { .. } => "ToolTable",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",
         _ => "other",

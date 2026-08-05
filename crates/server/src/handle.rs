@@ -382,6 +382,22 @@ impl ServerHandle {
             &content_index,
             &block_textures,
         );
+        // Charter rule 1: the engine has no tools of its own, so this list is
+        // whatever the mods registered and nothing else. A client is told it
+        // for the same reason it is told the materials — so it can offer a
+        // choice without the engine knowing what a chisel is.
+        let tool_table: Vec<tiamot_core::proto::ToolDef> = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_tools())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool| tiamot_core::proto::ToolDef {
+                name: tool.name.unwrap_or_else(|| tool.id.clone()),
+                id: tool.id,
+                brush: tool.brush.name().to_owned(),
+                default: tool.default,
+            })
+            .collect();
         info!(
             materials = materials.len(),
             textured = materials.iter().filter(|m| m.texture.is_some()).count(),
@@ -453,6 +469,7 @@ impl ServerHandle {
             mod_set_fingerprint: mod_set_fingerprint(&mods),
             mods,
             materials,
+            tool_table,
             content: content_index,
             allowlist: std::sync::RwLock::new(settings.allowlist.clone()),
             max_players: settings.max_players,

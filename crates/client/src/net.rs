@@ -130,6 +130,15 @@ pub enum Event {
         images: BTreeMap<u16, Image>,
     },
 
+    /// Every tool the server's mods registered.
+    ///
+    /// Sent once, on join. Charter rule 1: the engine has no tools of its own,
+    /// so this is the only way a client learns that a chisel exists.
+    Tools {
+        /// The tools, in ascending id order.
+        tools: Vec<tiamot_core::proto::ToolDef>,
+    },
+
     /// What the player is carrying, in **units** (charter rule 5).
     ///
     /// Whole, not a delta: an inventory is tens of stacks at most, and a delta
@@ -843,6 +852,10 @@ async fn session(
 
             ServerMessage::InventoryUpdate { stacks } => {
                 let _ = events.send(Event::Inventory { stacks });
+            }
+
+            ServerMessage::ToolTable { tools } => {
+                let _ = events.send(Event::Tools { tools });
             }
 
             ServerMessage::HelloAck { .. }
