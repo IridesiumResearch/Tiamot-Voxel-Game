@@ -27,7 +27,7 @@ pub mod replay;
 pub mod runner;
 pub mod script;
 
-pub use client::{Bot, BotError};
+pub use client::{Bot, BotError, Impairment};
 pub use runner::{SwarmStats, drive, wander};
 pub use script::{Channel, Command, Reply, ScriptOutcome, run_script};
 

@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use quinn::{ClientConfig, Endpoint};
 use rustls_pki_types::CertificateDer;
+use tiamot_core::detgen::StreamRng;
 use tiamot_core::identity::{Identity, challenge_payload};
 use tiamot_core::proto::{
     ClientMessage, DisconnectReason, PROTOCOL_VERSION, ServerMessage, WireSignature,
@@ -100,7 +101,12 @@ pub struct Bot {
     identity: Identity,
     endpoint: Endpoint,
     connection: quinn::Connection,
-    send: quinn::SendStream,
+    /// The control stream, unless a writer task has taken it.
+    ///
+    /// `None` once `impair` has started the delayed writer: two writers on one
+    /// QUIC stream would interleave frames and produce bytes neither of them
+    /// wrote, so ownership moves rather than being shared.
+    send: Option<quinn::SendStream>,
     /// Messages the reader task has taken off the wire but the script has not
     /// consumed yet.
     inbox: tokio::sync::mpsc::UnboundedReceiver<ServerMessage>,
@@ -114,13 +120,81 @@ pub struct Bot {
     reader: tokio::task::JoinHandle<()>,
     /// The fingerprint the server actually presented.
     cert_fingerprint: [u8; 32],
+    /// Artificial latency and loss applied to outbound messages.
+    impairment: Impairment,
+    /// Queue feeding the delayed writer, once latency is being simulated.
+    delayed: Option<tokio::sync::mpsc::UnboundedSender<(tokio::time::Instant, Vec<u8>)>>,
+    /// The delayed writer, aborted when the bot goes away.
+    writer: Option<tokio::task::JoinHandle<()>>,
+    /// Draws for the loss decision. Seeded, so a failure reproduces.
+    loss_rng: StreamRng,
+}
+
+/// Artificial network conditions applied to what a bot sends.
+///
+/// # Why the harness fakes this rather than using a real bad network
+///
+/// Prediction and reconciliation are correct on loopback by construction: the
+/// round trip is microseconds, so the client is barely ahead of the server and
+/// there is nothing to reconcile. **Every prediction bug hides on loopback**,
+/// which is the only network the test suite has. Task 09 asks for 150 ms and
+/// 5% loss specifically because that is where the mechanism starts doing
+/// something.
+///
+/// # Loss here is not packet loss
+///
+/// QUIC retransmits, so a lost *packet* on a stream is invisible above the
+/// transport — dropping those would test quinn, not this engine. What this
+/// drops is whole **messages**, at the application layer, which is the failure
+/// the engine actually has to survive: an input that never arrives. The server
+/// covers those with `phys::input`'s reorder buffer and its repeat window, and
+/// this is what exercises them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Impairment {
+    /// One-way delay added before a message goes out, in milliseconds.
+    ///
+    /// One way, so a round trip is twice this — 150 ms of latency in the task's
+    /// sense is `latency_ms: 75` here. Named for what it does rather than for
+    /// what a player would call it, because getting that backwards silently
+    /// halves the test.
+    pub latency_ms: u64,
+    /// Percentage of outbound messages dropped entirely, 0 to 100.
+    pub loss_percent: u32,
+    /// Seed for the loss draws.
+    ///
+    /// Fixed rather than random: a test that fails one run in twenty and
+    /// cannot be re-run into the same failure is a test people delete.
+    pub seed: u64,
+}
+
+impl Impairment {
+    /// The conditions Task 09's test list names: 150 ms round trip, 5% loss.
+    #[must_use]
+    pub const fn task_09() -> Self {
+        Self {
+            latency_ms: 75,
+            loss_percent: 5,
+            seed: 0x7069_6e67,
+        }
+    }
+
+    /// Whether anything is actually being impaired.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.latency_ms == 0 && self.loss_percent == 0
+    }
 }
 
 impl Drop for Bot {
     fn drop(&mut self) {
         // The reader borrows nothing from the bot, so it would otherwise
-        // outlive it and hold the connection open.
+        // outlive it and hold the connection open. Same for the delayed
+        // writer, which additionally OWNS the send stream — leaving it running
+        // would keep the stream open after the bot it belongs to is gone.
         self.reader.abort();
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
+        }
     }
 }
 
@@ -233,11 +307,15 @@ impl Bot {
             identity,
             endpoint,
             connection,
-            send,
+            send: Some(send),
             inbox,
             history,
             reader,
             cert_fingerprint,
+            delayed: None,
+            writer: None,
+            impairment: Impairment::default(),
+            loss_rng: StreamRng::global(0, "bot:loss"),
         })
     }
 
@@ -280,8 +358,89 @@ impl Bot {
     ///
     /// [`BotError::Frame`] if the write fails.
     pub async fn send(&mut self, message: &ClientMessage) -> Result<(), BotError> {
-        frame::write(&mut self.send, message).await?;
-        Ok(())
+        // Dropped BEFORE anything else, so a dropped message costs no time —
+        // it never existed. Deciding to drop it after the delay would make a
+        // lossy link slower than a clean one for a reason no real link has.
+        if self.impairment.loss_percent > 0
+            && self.loss_rng.below(100) < u64::from(self.impairment.loss_percent)
+        {
+            return Ok(());
+        }
+
+        // Handed to the writer task rather than slept on here. **Sleeping in
+        // this function would model the wrong thing entirely**: `Bot::walk`
+        // sends eight inputs in a row per server state, and a 75 ms sleep
+        // before each write turns that into 600 ms of wall clock — a link that
+        // SPACES messages 75 ms apart rather than one that delivers them 75 ms
+        // late. The bot would fall permanently behind and the test would be
+        // measuring the harness.
+        //
+        // The delay is constant, so FIFO order is already deadline order and
+        // the writer needs no sorting.
+        let Some(queue) = self.delayed.as_ref() else {
+            if let Some(stream) = self.send.as_mut() {
+                frame::write(stream, message).await?;
+            }
+            return Ok(());
+        };
+        let body = tiamot_core::proto::encode(message).map_err(frame::FrameError::from)?;
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(self.impairment.latency_ms);
+        // A closed channel means the writer task ended, which means the
+        // connection did. Reported as an ordinary write failure.
+        queue.send((deadline, body)).map_err(|_| {
+            BotError::Frame(frame::FrameError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "the delayed writer ended",
+            )))
+        })
+    }
+
+    /// Applies artificial latency and loss to everything sent from now on.
+    ///
+    /// Outbound only. Impairing the inbound side would need the reader task to
+    /// hold messages back, and the interesting direction is this one: what the
+    /// engine has to survive is an input that arrives late or not at all, and
+    /// that is decided on the way TO the server.
+    ///
+    /// Latency starts a writer task that owns the send stream from then on.
+    /// Two writers on one QUIC stream would interleave frames and produce
+    /// bytes neither of them wrote.
+    pub fn impair(&mut self, impairment: Impairment) {
+        self.loss_rng = StreamRng::global(impairment.seed, "bot:loss");
+        self.impairment = impairment;
+
+        if impairment.latency_ms == 0 || self.delayed.is_some() {
+            return;
+        }
+
+        let Some(mut stream) = self.send.take() else {
+            return;
+        };
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+        self.delayed = Some(sender);
+        self.writer = Some(tokio::spawn(async move {
+            while let Some((deadline, body)) = receiver.recv().await {
+                tokio::time::sleep_until(deadline).await;
+                let Ok(prefix) = u32::try_from(body.len()) else {
+                    continue;
+                };
+                if stream.write_all(&prefix.to_be_bytes()).await.is_err()
+                    || stream.write_all(&body).await.is_err()
+                {
+                    // The connection went away. Nothing to report to — the
+                    // next read finds out.
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// The conditions currently being simulated.
+    #[must_use]
+    pub const fn impairment(&self) -> Impairment {
+        self.impairment
     }
 
     /// Takes the next message the reader task has queued.
@@ -1107,7 +1266,9 @@ impl Bot {
     /// Closes the connection cleanly.
     pub async fn disconnect(mut self) {
         let _ = self.send(&ClientMessage::Disconnect).await;
-        let _ = self.send.finish();
+        if let Some(stream) = self.send.as_mut() {
+            let _ = stream.finish();
+        }
         self.connection.close(0u32.into(), b"bye");
         self.endpoint.wait_idle().await;
     }
