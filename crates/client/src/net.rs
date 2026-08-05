@@ -218,6 +218,19 @@ pub enum Command {
     },
     /// Leave.
     Disconnect,
+
+    /// Start simulating a bad network on everything sent from here on.
+    ///
+    /// **A test affordance, and the only `Command` that never reaches the
+    /// wire.** It exists because impairing from the moment the socket opens
+    /// makes the *handshake* lossy, and the handshake has no retries —
+    /// `Hello`, `AuthResponse` and `JoinWorld` are each sent exactly once, so a
+    /// 5% drop
+    /// there is a 5% chance the client simply never joins. Real loss does not
+    /// work that way: QUIC retransmits, and what this simulates is a message
+    /// the application never sends again. So a test joins cleanly and impairs
+    /// afterwards, exactly as the bot harness does.
+    Impair(tiamot_server::transport::Impairment),
 }
 
 /// A live connection, as the render loop sees it.
@@ -265,6 +278,35 @@ impl Connection {
         cache: ContentCache,
         trust_path: &std::path::Path,
     ) -> Result<Self, NetError> {
+        Self::open_impaired(
+            address,
+            identity,
+            display_name,
+            cache,
+            trust_path,
+            tiamot_server::transport::Impairment::default(),
+        )
+    }
+
+    /// Opens a connection over a deliberately bad network.
+    ///
+    /// **For tests, and only for tests.** Prediction and reconciliation are
+    /// correct on loopback by construction — the round trip is microseconds, so
+    /// the client is barely ahead of the server and there is nothing to
+    /// reconcile — which means every bug in them hides on the only network the
+    /// suite has. See [`tiamot_server::transport::Impairment`].
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Connection::open`].
+    pub fn open_impaired(
+        address: SocketAddr,
+        identity: Identity,
+        display_name: String,
+        cache: ContentCache,
+        trust_path: &std::path::Path,
+        impairment: tiamot_server::transport::Impairment,
+    ) -> Result<Self, NetError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -287,6 +329,7 @@ impl Connection {
             cache,
             event_tx,
             command_rx,
+            impairment,
         ));
 
         Ok(Self {
@@ -460,16 +503,23 @@ async fn session(
     cache: ContentCache,
     events: mpsc::UnboundedSender<Event>,
     mut commands: mpsc::UnboundedReceiver<Command>,
+    impairment: tiamot_server::transport::Impairment,
 ) {
     let Connected {
         endpoint,
         connection,
-        mut send,
+        send,
         mut recv,
         address,
         fingerprint,
         first_use,
     } = connected;
+
+    // Everything this task writes goes through the link, so a test can make
+    // the network bad without any of the code below knowing. Unimpaired — the
+    // only case in production — it is a direct write.
+    let mut send = tiamot_server::transport::Link::new(send);
+    send.impair(impairment);
 
     let _ = events.send(Event::Connected {
         address,
@@ -485,15 +535,13 @@ async fn session(
     };
 
     // Hello, and then everything else is driven by what arrives.
-    if let Err(err) = tiamot_server::transport::frame::write(
-        &mut send,
-        &ClientMessage::Hello {
+    if let Err(err) = send
+        .write(&ClientMessage::Hello {
             protocol_version: PROTOCOL_VERSION,
             public_key: *identity.public_key().as_bytes(),
             display_name,
-        },
-    )
-    .await
+        })
+        .await
     {
         finish(format!("could not greet the server: {err}"));
         return;
@@ -576,19 +624,20 @@ async fn session(
             command = commands.recv() => {
                 match command {
                     Some(Command::Disconnect) | None => {
-                        let _ = tiamot_server::transport::frame::write(
-                            &mut send, &ClientMessage::Disconnect
-                        ).await;
-                        let _ = send.finish();
+                        let _ = send.write(&ClientMessage::Disconnect).await;
+                        send.finish();
                         connection.close(0u32.into(), b"bye");
                         endpoint.wait_idle().await;
                         finish("you left".to_owned());
                         break;
                     }
+                    // Applied here rather than sent: see `Command::Impair`.
+                    Some(Command::Impair(impairment)) => {
+                        send.impair(impairment);
+                        None
+                    }
                     Some(command) => {
-                        if let Err(err) =
-                            tiamot_server::transport::frame::write(&mut send, &to_wire(command)).await
-                        {
+                        if let Err(err) = send.write(&to_wire(command)).await {
                             finish(format!("could not send to the server: {err}"));
                             break;
                         }
@@ -617,10 +666,7 @@ async fn session(
             // materials complete.
             if !pending.joined && !pending.table.is_empty() && pending.outstanding == 0 {
                 emit_materials(&mut pending, &events);
-                if let Err(err) =
-                    tiamot_server::transport::frame::write(&mut send, &ClientMessage::JoinWorld)
-                        .await
-                {
+                if let Err(err) = send.write(&ClientMessage::JoinWorld).await {
                     finish(format!("could not ask to join: {err}"));
                     break;
                 }
@@ -633,13 +679,11 @@ async fn session(
             ServerMessage::AuthChallenge { nonce } => {
                 let signature =
                     identity.sign(&challenge_payload(&nonce, &fingerprint, PROTOCOL_VERSION));
-                if let Err(err) = tiamot_server::transport::frame::write(
-                    &mut send,
-                    &ClientMessage::AuthResponse {
+                if let Err(err) = send
+                    .write(&ClientMessage::AuthResponse {
                         signature: WireSignature(signature.to_bytes()),
-                    },
-                )
-                .await
+                    })
+                    .await
                 {
                     finish(format!("could not answer the challenge: {err}"));
                     break;
@@ -667,19 +711,14 @@ async fn session(
 
                 if missing.is_empty() {
                     emit_materials(&mut pending, &events);
-                    if let Err(err) =
-                        tiamot_server::transport::frame::write(&mut send, &ClientMessage::JoinWorld)
-                            .await
-                    {
+                    if let Err(err) = send.write(&ClientMessage::JoinWorld).await {
                         finish(format!("could not ask to join: {err}"));
                         break;
                     }
                     pending.joined = true;
-                } else if let Err(err) = tiamot_server::transport::frame::write(
-                    &mut send,
-                    &ClientMessage::ContentRequest { hashes: missing },
-                )
-                .await
+                } else if let Err(err) = send
+                    .write(&ClientMessage::ContentRequest { hashes: missing })
+                    .await
                 {
                     finish(format!("could not ask for content: {err}"));
                     break;
@@ -703,10 +742,7 @@ async fn session(
 
                 if !pending.joined && pending.outstanding == 0 && !pending.table.is_empty() {
                     emit_materials(&mut pending, &events);
-                    if let Err(err) =
-                        tiamot_server::transport::frame::write(&mut send, &ClientMessage::JoinWorld)
-                            .await
-                    {
+                    if let Err(err) = send.write(&ClientMessage::JoinWorld).await {
                         finish(format!("could not ask to join: {err}"));
                         break;
                     }
@@ -905,6 +941,10 @@ fn to_wire(command: Command) -> ClientMessage {
         Command::Dig { target: None } => ClientMessage::CancelDig,
         Command::SelectTool { tool } => ClientMessage::SelectTool { tool },
         Command::Disconnect => ClientMessage::Disconnect,
+        // Unreachable: the session loop applies it and never gets here. A
+        // panic rather than a placeholder message, because sending SOMETHING
+        // for it would be a silent protocol violation.
+        Command::Impair(_) => unreachable!("Command::Impair is applied, never sent"),
     }
 }
 

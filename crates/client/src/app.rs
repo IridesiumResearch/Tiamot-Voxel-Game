@@ -221,6 +221,8 @@ pub struct Pacing {
     worst_remesh_meshing: f32,
     /// Chunks rebuilt by that worst remesh.
     worst_remesh_chunks: usize,
+    /// Largest prediction correction seen in the window, in cells.
+    worst_correction: f32,
     /// The last completed window's worst frame, in milliseconds.
     ///
     /// Reported rather than the live figure so the readout holds still long
@@ -232,6 +234,8 @@ pub struct Pacing {
     reported_remesh_meshing: f32,
     /// Chunks rebuilt by that remesh.
     reported_remesh_chunks: usize,
+    /// The last completed window's largest correction, in cells.
+    reported_correction: f32,
 }
 
 impl Pacing {
@@ -248,9 +252,15 @@ impl Pacing {
                 reported_remesh: self.worst_remesh,
                 reported_remesh_meshing: self.worst_remesh_meshing,
                 reported_remesh_chunks: self.worst_remesh_chunks,
+                reported_correction: self.worst_correction,
                 ..Self::default()
             };
         }
+    }
+
+    /// Folds in how far this frame's prediction was corrected, in cells.
+    fn correction(&mut self, cells: f32) {
+        self.worst_correction = self.worst_correction.max(cells);
     }
 
     /// Folds one remesh's duration in, and how much of it was meshing.
@@ -273,6 +283,20 @@ impl Pacing {
     #[must_use]
     pub const fn worst_remesh_ms(&self) -> (f32, usize) {
         (self.reported_remesh, self.reported_remesh_chunks)
+    }
+
+    /// The largest prediction correction of the last completed window, in
+    /// cells.
+    ///
+    /// **The number that says whether prediction is working.** A correction
+    /// that is never zero means the client and the server disagree every tick,
+    /// which is otherwise very hard to notice and very bad: the player sees a
+    /// world that is subtly not where they left it, and no single frame looks
+    /// wrong. `predict::SNAP_DISTANCE` is where a correction stops being
+    /// blended and starts being a teleport.
+    #[must_use]
+    pub const fn worst_correction_cells(&self) -> f32 {
+        self.reported_correction
     }
 
     /// How that worst remesh split between meshing and uploading, in
@@ -518,6 +542,16 @@ impl App {
     #[must_use]
     pub const fn predicting(&self) -> bool {
         self.predictor.is_some()
+    }
+
+    /// Starts simulating a bad network on everything sent from here on.
+    ///
+    /// **For tests.** See [`crate::net::Command::Impair`] for why it is applied
+    /// after the join rather than at connect time.
+    ///
+    /// Returns whether the connection is still up.
+    pub fn impair(&self, impairment: tiamot_server::transport::Impairment) -> bool {
+        self.connection.send(Command::Impair(impairment))
     }
 
     /// Closes the connection.
@@ -776,6 +810,14 @@ impl App {
         if let Some(predictor) = self.predictor.as_mut() {
             predictor.smooth(dt / TICK_SECONDS);
         }
+        // Recorded before the blend finishes, so what is measured is how far
+        // the server disagreed rather than how much of the disagreement is
+        // left. A correction that is never zero is prediction failing, and it
+        // is otherwise almost impossible to notice: no single frame looks
+        // wrong, the world is just subtly not where it was left.
+        if let Some(predictor) = self.predictor.as_ref() {
+            self.pacing.correction(predictor.error());
+        }
 
         // Whatever time did not buy a whole tick is how far through the current
         // one this frame is, and the camera is drawn there rather than at the
@@ -901,6 +943,7 @@ impl App {
         let (meshing, upload) = self.pacing.worst_remesh_split_ms();
         let worst = self.pacing.worst_frame_ms();
         let (created, reused) = self.renderer.buffer_stats();
+        let correction = self.pacing.worst_correction_cells();
 
         vec![
             format!("{:.0} fps", self.fps),
@@ -913,9 +956,8 @@ impl App {
                 if worst > 0.0 { 1000.0 / worst } else { 0.0 }
             ),
             format!(
-                "{created} mesh buffers created, {reused} reused from the pool",
-                created = created,
-                reused = reused
+                "{created} mesh buffers created, {reused} reused from the pool · worst \
+                 correction {correction:.2} cells",
             ),
             format!("{x:.1}, {y:.1}, {z:.1}  ({facing})"),
             format!(

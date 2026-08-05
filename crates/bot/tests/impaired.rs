@@ -171,11 +171,27 @@ fn a_staircase_survives_a_hundred_and_fifty_millisecond_round_trip_and_five_perc
         let mut built = Vec::new();
         for (index, source) in quarry.iter().enumerate() {
             let step = i32::try_from(index).expect("fits");
-            bot.start_dig(centre_of(*source)).await.expect("dig");
-            let dug = until(&mut bot, Duration::from_secs(20), |bot| {
-                saw(bot, *source, MaterialId::AIR.0)
-            })
-            .await;
+            // Re-aimed at the same cell until it takes. **Sending this once is
+            // a 5% chance of the step never starting**, which over four steps
+            // is a one-in-five flake — and the first version of this test did
+            // exactly that, passing only because the seed happened to spare it.
+            //
+            // Repeating is also what a real client does: `StartDig`'s protocol
+            // docs say a client that re-sends every tick while the button is
+            // held is behaving correctly, because re-aiming at the SAME target
+            // is defined to be a no-op that keeps the progress it has.
+            let mut dug = false;
+            for _ in 0..10 {
+                bot.start_dig(centre_of(*source)).await.expect("dig");
+                if until(&mut bot, Duration::from_secs(4), |bot| {
+                    saw(bot, *source, MaterialId::AIR.0)
+                })
+                .await
+                {
+                    dug = true;
+                    break;
+                }
+            }
             assert!(dug, "step {step}: the quarry block was never broken");
 
             // The units have to arrive before they can be spent. Under 5% loss
