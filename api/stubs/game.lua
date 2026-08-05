@@ -264,6 +264,27 @@ function game.register_on_dig_complete(callback) end
 ---@param callback fun(event: Tiamot.PlaceEvent): boolean?
 function game.register_on_place(callback) end
 
+---One entity hitting another.
+---@class Tiamot.PunchEvent
+---@field attacker string Who threw the punch, as 64 hex characters.
+---@field target string Who received it.
+---@field player string The same value as `attacker`. Present so every hook event has a `player` field; prefer `attacker` here, because a punch has two parties and `player` does not say which.
+
+---Registers a veto on punches.
+---
+---**Registration window only.**
+---
+---**Nothing calls this yet.** Entities are Task 12, and the only things in the
+---world today are players and voxels, so there is nothing to left-click on. The
+---registration and dispatch exist and are tested, so that task adds a caller
+---rather than an API — the same arrangement `game.register_action` has.
+---
+---When it does fire, the rules are the same as the other two hooks: return
+---`false` to cancel, anything else allows, the first refusal stops the rest,
+---and an error disables your mod while letting the punch land.
+---@param callback fun(event: Tiamot.PunchEvent): boolean?
+function game.register_on_punch(callback) end
+
 ---Registers a named input action.
 ---
 ---Mods register actions; the engine owns key bindings and mods never read keys.

@@ -52,6 +52,27 @@ const HOOK_DIG: &str = "on_dig_complete";
 /// Hook name used in registry keys and in fault messages.
 const HOOK_PLACE: &str = "on_place";
 
+/// A player UUID as lowercase hex, for handing to Lua.
+///
+/// Hex rather than the raw 32 bytes because a mod keying per-player state needs
+/// something it can use as a table key and print in the same breath, and raw
+/// bytes in a Lua string are technically the former and emphatically not the
+/// latter the moment anyone logs one.
+fn hex_uuid(uuid: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(64);
+    for byte in uuid {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Registry key holding the mods that registered `on_punch`.
+const PUNCHERS: &str = "tiamot.punchers";
+
+/// Hook name used in registry keys and in fault messages.
+const HOOK_PUNCH: &str = "on_punch";
+
 /// Globals removed from every mod environment.
 ///
 /// `os` and `io` are filesystem and process access. `dofile` and `loadfile`
@@ -616,6 +637,21 @@ impl ScriptVm for MluaVm {
         self.run_hook(HOOK_PLACE, PLACERS, &table)
     }
 
+    fn punch(&mut self, event: &crate::script::PunchEvent) -> HookOutcome {
+        let Ok(table) = self.hook_event(event.attacker).and_then(|table| {
+            // `attacker` as well as `player`, because a punch has two parties
+            // and a field called `player` would be ambiguous the moment anyone
+            // read the other one. `player` stays for consistency with the other
+            // two events, which have only one.
+            table.set("attacker", table.get::<String>("player")?)?;
+            table.set("target", hex_uuid(event.target))?;
+            Ok(table)
+        }) else {
+            return HookOutcome::allow();
+        };
+        self.run_hook(HOOK_PUNCH, PUNCHERS, &table)
+    }
+
     fn registered_blocks(&self) -> Vec<(String, MaterialId)> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.blocks") else {
             return Vec::new();
@@ -822,6 +858,11 @@ impl MluaVm {
         game.set(
             "register_on_place",
             self.hook_registrar(mod_id, HOOK_PLACE, PLACERS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
+        game.set(
+            "register_on_punch",
+            self.hook_registrar(mod_id, HOOK_PUNCH, PUNCHERS)?,
         )
         .map_err(|err| self.vm_error(&err))?;
         Ok(())
@@ -1077,7 +1118,7 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.tickers", tickers)
             .map_err(|err| self.vm_error(&err))?;
-        for list in [DIGGERS, PLACERS] {
+        for list in [DIGGERS, PLACERS, PUNCHERS] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
             self.lua
                 .set_named_registry_value(list, table)
@@ -1198,12 +1239,7 @@ impl MluaVm {
     /// not, the moment anyone prints one.
     fn hook_event(&self, player: [u8; 32]) -> Result<Table, mlua::Error> {
         let event = self.lua.create_table()?;
-        let mut hex = String::with_capacity(64);
-        for byte in player {
-            use std::fmt::Write as _;
-            let _ = write!(hex, "{byte:02x}");
-        }
-        event.set("player", hex)?;
+        event.set("player", hex_uuid(player))?;
         Ok(event)
     }
 
@@ -1706,6 +1742,35 @@ mod tests {
         assert!(vm.dig_complete(&a_dig()).allowed);
         vm.eval_in("second", "assert(ran == true, 'the second hook never ran')")
             .expect("both hooks should have run");
+    }
+
+    #[test]
+    fn the_punch_hook_works_even_though_nothing_calls_it_yet() {
+        // Entities are Task 12, so there is nothing to punch and no caller.
+        // Registration and dispatch exist and are tested now so that task adds
+        // a CALLER rather than an API — and so this does not arrive untested
+        // and half-remembered when it is finally needed.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "referee",
+            "seen = nil\ngame.register_on_punch(function(e) seen = e return false end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let event = crate::script::PunchEvent {
+            attacker: [0x11; 32],
+            target: [0x22; 32],
+        };
+        assert!(!vm.punch(&event).allowed, "the veto was ignored");
+        vm.eval_in(
+            "referee",
+            "assert(seen.attacker == string.rep('11', 32), 'attacker')\n\
+             assert(seen.target == string.rep('22', 32), 'target')\n\
+             assert(seen.attacker ~= seen.target, 'the two parties must be distinguishable')",
+        )
+        .expect("the hook should see both parties");
     }
 
     #[test]

@@ -320,6 +320,26 @@ pub struct PlaceEvent {
     pub units: u32,
 }
 
+/// One entity hitting another.
+///
+/// **Nothing dispatches this yet, and that is not an oversight.** Entities are
+/// Task 12; the only things in the world today are players and voxels, and
+/// "left-click on an entity" has nothing to land on. What exists now is the
+/// registration and the dispatch path, tested, so that Task 12 adds a caller
+/// rather than an API — the same arrangement `register_action` has, which is
+/// stored now and inert until Task 13.
+///
+/// Both parties are canonical UUIDs (charter rule 13). When entities arrive
+/// they will need a wider target type than a player UUID, and that is a
+/// deliberate future edit rather than something to guess at now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PunchEvent {
+    /// Who threw the punch.
+    pub attacker: [u8; 32],
+    /// Who received it.
+    pub target: [u8; 32],
+}
+
 /// What a round of cancellable hooks decided.
 ///
 /// # A faulted mod does not get a veto
@@ -440,6 +460,13 @@ pub trait ScriptVm: Sized {
     /// The same rules as [`Self::dig_complete`], and called after the engine's
     /// own checks pass but before anything is written or charged.
     fn place(&mut self, event: &PlaceEvent) -> HookOutcome;
+
+    /// Asks every registered `on_punch` whether a hit lands.
+    ///
+    /// The same rules again. **No caller yet** — see [`PunchEvent`]: entities
+    /// are Task 12, so there is nothing to punch. This is here, and tested, so
+    /// that task adds a caller rather than an API.
+    fn punch(&mut self, event: &PunchEvent) -> HookOutcome;
 
     /// Blocks registered during the loading window, **ordered by numeric id**.
     ///
