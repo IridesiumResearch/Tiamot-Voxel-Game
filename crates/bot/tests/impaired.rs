@@ -143,7 +143,10 @@ fn a_staircase_survives_a_hundred_and_fifty_millisecond_round_trip_and_five_perc
         // Seeded and confirmed on a CLEAN link, so what the impairment is
         // tested against is the building, not the setting up. A quarry block
         // per step, since each place costs a block's worth of units.
-        let quarry: Vec<BlockPos> = (0..STEPS).map(|i| BlockPos::new(20 + i, 40, 20)).collect();
+        // Within arm's reach of spawn, because the server bounds both digging
+        // and placing by `phys::REACH` now: a staircase built across the map
+        // would be refused before the impairment got a chance to matter.
+        let quarry: Vec<BlockPos> = (0..STEPS).map(|i| BlockPos::new(i - 2, -1, 2)).collect();
         for pos in &quarry {
             assert!(server.seed_block(*pos, stone), "seed queue full");
         }
@@ -206,7 +209,10 @@ fn a_staircase_survives_a_hundred_and_fifty_millisecond_round_trip_and_five_perc
             .await;
             assert!(funded, "step {step}: the dig never credited a full block");
 
-            let target = BlockPos::new(20 + step, 41 + step, 24);
+            // Each step one higher and one along, still inside reach: four
+            // steps is four blocks up, which from an eye at ground level is
+            // comfortably under the bound.
+            let target = BlockPos::new(step - 2, step, -2);
             // Re-sent until it lands. A placement is a request and 5% of them
             // never arrive; a client that sent once and assumed would be
             // relying on a network it was explicitly told is lossy.
@@ -243,7 +249,7 @@ fn a_staircase_survives_a_hundred_and_fifty_millisecond_round_trip_and_five_perc
                 saw(&bot, *pos, stone),
                 "step {step} is missing from the finished staircase"
             );
-            assert_eq!(pos.y, 41 + step, "step {step} is at the wrong height");
+            assert_eq!(pos.y, step, "step {step} is at the wrong height");
         }
         assert_eq!(
             built.len(),

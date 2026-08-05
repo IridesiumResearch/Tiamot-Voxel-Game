@@ -62,7 +62,17 @@ fn write_warden(name: &str, hooks: &str) -> PathBuf {
     std::fs::write(
         dir.join("init.lua"),
         format!(
-            "game.register_tool{{\n\
+            // Ground, as well as a tool. **An empty world is not a neutral
+            // fixture**: with nothing to stand on the player free-falls, their
+            // eye leaves the block under test, and the server refuses the dig
+            // for being out of reach — which looks exactly like the hook
+            // vetoing it. The reference generator does the same thing; this is
+            // the smallest version of it.
+            "local ground = game.register_block{{ id = \"ground\" }}\n\
+             game.register_on_generate(function(buf, pos)\n\
+             \x20   buf:fill_below_heightmap(game.flat_heightmap(0), ground)\n\
+             end)\n\
+             game.register_tool{{\n\
              \x20   id = \"hand\",\n\
              \x20   brush = \"block\",\n\
              \x20   speed_multiplier = 1.0,\n\
@@ -180,7 +190,7 @@ fn a_mod_can_refuse_a_dig() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let removed = dig_and_see(&mut bot, &server, BlockPos::new(8, 40, 8), stone).await;
+        let removed = dig_and_see(&mut bot, &server, BlockPos::new(2, -1, 0), stone).await;
         assert!(
             !removed,
             "the mod refused the dig and the block went anyway"
@@ -210,7 +220,7 @@ fn a_hook_that_does_not_refuse_lets_the_dig_through() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let removed = dig_and_see(&mut bot, &server, BlockPos::new(8, 40, 8), stone).await;
+        let removed = dig_and_see(&mut bot, &server, BlockPos::new(2, -1, 0), stone).await;
         assert!(
             removed,
             "a hook that returned nothing cancelled the dig; only an explicit false should"
@@ -236,7 +246,7 @@ fn a_mod_that_throws_while_vetoing_does_not_stop_the_dig() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let removed = dig_and_see(&mut bot, &server, BlockPos::new(8, 40, 8), stone).await;
+        let removed = dig_and_see(&mut bot, &server, BlockPos::new(2, -1, 0), stone).await;
         assert!(
             removed,
             "a mod's crash was treated as a veto, so one bad mod can stop the server digging"
@@ -262,7 +272,7 @@ fn a_mod_can_refuse_a_placement_and_the_player_keeps_their_material() {
 
         // Mine a block so there is something to place, which also proves the
         // veto is specific to placing rather than a mod that broke everything.
-        let quarry = BlockPos::new(8, 40, 8);
+        let quarry = BlockPos::new(2, -1, 0);
         assert!(
             dig_and_see(&mut bot, &server, quarry, stone).await,
             "digging should still work; only placing is refused here"
@@ -273,7 +283,7 @@ fn a_mod_can_refuse_a_placement_and_the_player_keeps_their_material() {
         let before = bot.inventory();
         assert!(!before.is_empty(), "nothing was credited to place with");
 
-        let target = BlockPos::new(8, 40, 12);
+        let target = BlockPos::new(-2, 0, 0);
         bot.place_from_inventory(centre_of(target), stone)
             .await
             .expect("send");
@@ -302,7 +312,7 @@ fn a_hook_can_refuse_selectively_using_the_event_it_is_given() {
     // The useful case, and the one that proves the event payload is real: a
     // mod that protects one region and allows everywhere else. A hook that
     // could only say "no to everything" would not be worth having.
-    let guarded = BlockPos::new(8, 40, 8);
+    let guarded = BlockPos::new(2, -1, 0);
     let server = start(
         "selective",
         write_warden(
@@ -325,7 +335,7 @@ fn a_hook_can_refuse_selectively_using_the_event_it_is_given() {
             "the guarded block was dug"
         );
         assert!(
-            dig_and_see(&mut bot, &server, BlockPos::new(20, 40, 8), stone).await,
+            dig_and_see(&mut bot, &server, BlockPos::new(-2, -1, 0), stone).await,
             "a block outside the guarded range was refused too, so the hook is not reading \
              the event"
         );
@@ -430,7 +440,7 @@ fn the_reference_mods_register_no_vetoes() {
     block_on(async {
         let mut bot = join(&server).await;
         assert!(
-            dig_and_see(&mut bot, &server, BlockPos::new(8, 40, 8), stone).await,
+            dig_and_see(&mut bot, &server, BlockPos::new(2, -1, 0), stone).await,
             "a reference mod is refusing digs"
         );
     });

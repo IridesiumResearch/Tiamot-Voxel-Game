@@ -730,6 +730,25 @@ impl ServerHandle {
                                 continue;
                             }
 
+                            // Reach, checked every tick rather than only when
+                            // the dig starts: a player who walks away from a
+                            // dig in progress should stop digging, and one who
+                            // never came close should never have started.
+                            //
+                            // Without this a client could mine anything it
+                            // could name, anywhere in the world, which is a
+                            // rather larger hole than the one it is standing
+                            // in. The client's own raycast is bounded by
+                            // `phys::REACH`, but a bound only the client
+                            // enforces is not a bound.
+                            if let Some((origin, eye)) = shared.player_eye(&uuid)
+                                && !tiamot_core::place::within_reach(origin, eye, target)
+                            {
+                                shared.set_dig(&uuid, None);
+                                shared.tell(&uuid, "that is too far away".to_owned());
+                                continue;
+                            }
+
                             let hardness = shared.hardness_of(material);
                             let Some(done) = shared.advance_dig(&uuid, hardness) else {
                                 continue;
@@ -804,6 +823,18 @@ impl ServerHandle {
                                 &shared.inventory_of(&request.actor),
                                 material,
                             );
+
+                            // The same bound as digging. A placement is a
+                            // request and this is one more reason to refuse it.
+                            let in_reach = shared
+                                .player_eye(&request.actor)
+                                .is_none_or(|(origin, eye)| {
+                                    tiamot_core::place::within_reach(origin, eye, request.target)
+                                });
+                            if !in_reach {
+                                shared.tell(&request.actor, "that is too far away".to_owned());
+                                continue;
+                            }
 
                             let outcome = tiamot_core::place::plan(request.target, held)
                                 .and_then(|plan| {

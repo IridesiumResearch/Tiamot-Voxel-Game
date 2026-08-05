@@ -20,6 +20,10 @@ local Y = -1
 
 bot.join("miner")
 
+-- Everything within arm's reach of spawn. The server bounds digging by
+-- `phys::REACH` (charter rule 2 — a bound only the client enforces is not one),
+-- so a scenario mining at x = 40 would be refused before it proved anything.
+--
 -- The material is whatever the worldgen put there, so read it from the first
 -- dig rather than assuming an id. A scenario that hard-coded one would break
 -- the moment the mod set changed, which is exactly what mods are for.
@@ -30,7 +34,7 @@ end
 
 for dx = 0, 2 do
     for dz = 0, 2 do
-        bot.dig_block(40 + dx, Y, 40 + dz)
+        bot.dig_block(dx - 1, Y, dz - 1)
     end
 end
 

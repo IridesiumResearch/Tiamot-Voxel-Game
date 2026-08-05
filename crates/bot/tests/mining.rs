@@ -206,7 +206,7 @@ fn mining_a_three_by_three_yields_exactly_nine_blocks_and_no_spares() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let origin = BlockPos::new(4, 6, 4);
+        let origin = BlockPos::new(-1, -1, -1);
         let blocks = build_slab(&mut bot, &server, origin, stone).await;
 
         // Placing yielded whatever was there before (air, so nothing). Start
@@ -255,7 +255,7 @@ fn mining_single_subnodes_yields_one_unit_each_and_the_spares_add_up() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let block = BlockPos::new(8, 6, 8);
+        let block = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(block, stone), "seed queue full");
         bot.expect_block(block, stone, Duration::from_secs(10))
             .await
@@ -307,7 +307,7 @@ fn twenty_seven_chiselled_nodes_equal_one_mined_block() {
         let mut bot = join(&server).await;
 
         // Block A: mined whole.
-        let whole = BlockPos::new(12, 6, 12);
+        let whole = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(whole, stone), "seed queue full");
         bot.expect_block(whole, stone, Duration::from_secs(10))
             .await
@@ -324,7 +324,7 @@ fn twenty_seven_chiselled_nodes_equal_one_mined_block() {
         }
 
         // Block B: chiselled away, all 27 cells.
-        let chiselled = BlockPos::new(14, 6, 14);
+        let chiselled = BlockPos::new(-2, -1, 0);
         assert!(server.seed_block(chiselled, stone), "seed queue full");
         bot.expect_block(chiselled, stone, Duration::from_secs(10))
             .await
@@ -362,6 +362,68 @@ fn twenty_seven_chiselled_nodes_equal_one_mined_block() {
 }
 
 #[test]
+fn nothing_can_be_dug_or_built_across_the_map() {
+    // The client's raycast stops at `phys::REACH`, but **a bound only the
+    // client enforces is not a bound**: nothing stopped a peer naming any cell
+    // in the world and mining it from spawn. Charter rule 2 puts the decision
+    // on the server, so the server checks it.
+    //
+    // Deliberately generous — see `place::REACH_TOLERANCE`. The server checks
+    // against a position several ticks older than the one the client aimed
+    // from, so an exact bound would refuse legitimate actions from anyone who
+    // was moving. This asserts the bound exists, not where exactly it sits.
+    let server = start_with_mods("out-of-reach");
+    let stone = stone();
+
+    block_on(async {
+        let mut bot = join(&server).await;
+
+        let far = BlockPos::new(400, -1, 400);
+        assert!(server.seed_block(far, stone), "seed queue full");
+
+        // Aim at it and hold. Nothing should ever come of it.
+        let target = SubNodePos::new(far.x * 3 + 1, far.y * 3 + 1, far.z * 3 + 1);
+        for _ in 0..40 {
+            bot.start_dig(target).await.expect("start dig");
+            let _ = bot.await_inventory(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !saw_removal(&bot, far),
+            "a block 400 blocks away was mined from spawn"
+        );
+        assert_eq!(bot.units_of(stone), 0, "and nothing was credited for it");
+        assert!(
+            bot.notices().iter().any(|text| text.contains("too far")),
+            "the refusal was silent; notices {:?}",
+            bot.notices()
+        );
+
+        // The counter-example, without which this passes on a server where
+        // digging is broken outright: the same dig, in arm's reach, works.
+        let near = BlockPos::new(2, -1, 0);
+        assert!(server.seed_block(near, stone), "seed queue full");
+        bot.expect_block(near, stone, Duration::from_secs(10))
+            .await
+            .expect("the near seed should land");
+        dig_whole_block(&mut bot, near).await;
+        // The removal broadcast and the inventory update are separate messages,
+        // so the credit can still be in flight when the block has gone.
+        for _ in 0..50 {
+            if bot.units_of(stone) > 0 {
+                break;
+            }
+            let _ = bot.await_inventory(Duration::from_millis(200)).await;
+        }
+        assert!(
+            bot.units_of(stone) > 0,
+            "the reachable dig yielded nothing either, so this proves nothing"
+        );
+    });
+
+    server.stop();
+}
+
+#[test]
 fn digging_air_yields_nothing() {
     // A stack of air would be a bug that propagated into every inventory that
     // touched it.
@@ -370,7 +432,7 @@ fn digging_air_yields_nothing() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let empty = BlockPos::new(20, 30, 20);
+        let empty = BlockPos::new(2, 2, 0);
 
         // Aiming at air and holding the button. The dig never COMPLETES —
         // the server cancels one whose target is already gone — so there is no
@@ -420,7 +482,7 @@ fn one_players_mining_does_not_credit_another() {
         .expect("connect");
         bystander.join("Bystander").await.expect("join");
 
-        let pos = BlockPos::new(30, 6, 30);
+        let pos = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(pos, stone), "seed queue full");
         miner
             .expect_block(pos, stone, Duration::from_secs(10))
@@ -472,7 +534,7 @@ fn a_dig_takes_time_and_yields_the_block_it_broke() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let pos = BlockPos::new(2, 40, 2);
+        let pos = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(pos, stone), "seed queue full");
         bot.expect_block(pos, stone, Duration::from_secs(10))
             .await
@@ -519,7 +581,7 @@ fn cancelling_a_dig_leaves_the_block_alone() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let pos = BlockPos::new(4, 40, 4);
+        let pos = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(pos, stone), "seed queue full");
         bot.expect_block(pos, stone, Duration::from_secs(10))
             .await
@@ -563,7 +625,7 @@ fn deleting_the_tools_mod_makes_the_world_undiggable() {
     let server = start_with_mods("tools-present");
     block_on(async {
         let mut bot = join(&server).await;
-        let pos = BlockPos::new(6, 40, 6);
+        let pos = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(pos, stone), "seed queue full");
         bot.expect_block(pos, stone, Duration::from_secs(10))
             .await
@@ -580,7 +642,7 @@ fn deleting_the_tools_mod_makes_the_world_undiggable() {
     let server = start("tools-absent");
     block_on(async {
         let mut bot = join(&server).await;
-        let pos = BlockPos::new(6, 40, 6);
+        let pos = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(pos, stone), "seed queue full");
         bot.expect_block(pos, stone, Duration::from_secs(10))
             .await
@@ -610,7 +672,7 @@ fn the_chisel_takes_one_cell_where_a_hand_takes_the_block() {
 
     block_on(async {
         let mut bot = join(&server).await;
-        let pos = BlockPos::new(8, 40, 8);
+        let pos = BlockPos::new(2, -1, 0);
         let target = tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
 
         assert!(server.seed_block(pos, stone), "seed queue full");

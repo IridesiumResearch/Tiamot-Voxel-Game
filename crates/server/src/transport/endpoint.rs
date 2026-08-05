@@ -427,6 +427,17 @@ impl Shared {
             .unwrap_or_default()
     }
 
+    /// Where a player's eyes are, for the reach check.
+    ///
+    /// The chunk origin and the eye offset within it (charter rule 7), which is
+    /// the frame `place::within_reach` expects.
+    #[must_use]
+    pub fn player_eye(&self, uuid: &PlayerUuid) -> Option<(tiamot_core::ChunkPos, [f32; 3])> {
+        let bodies = self.bodies.lock().ok()?;
+        let player = bodies.get(uuid)?;
+        Some((player.origin, player.body.eye()))
+    }
+
     /// Every player's chunk origin and body box, for the placement check.
     ///
     /// A snapshot, like [`Shared::digs_in_progress`]: the caller writes the

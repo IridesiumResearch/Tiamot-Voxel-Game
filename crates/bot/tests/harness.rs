@@ -339,10 +339,10 @@ fn replay_applies_a_recording_against_a_live_server() {
         // block that actually exists and y = 0 is the air above it — dig the
         // first, build in the second.
         "# a tiny recorded session\n\
-         0 dig_block 70 -1 70\n\
-         2 dig_block 71 -1 70\n\
-         4 place 70 0 70 2\n\
-         6 place 71 0 70 2\n",
+         0 dig_block 2 -1 0\n\
+         2 dig_block 1 -1 0\n\
+         4 place 2 0 0 2\n\
+         6 place 1 0 0 2\n",
     )
     .expect("write");
 

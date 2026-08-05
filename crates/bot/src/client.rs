@@ -81,6 +81,21 @@ pub struct PlayerPosition {
     pub local: [f32; 3],
 }
 
+/// A reported position in whole blocks, as `f64`.
+///
+/// `f64` because a chunk origin times 48 plus an offset is exactly the sum
+/// charter rule 7 keeps out of `f32` — and this is presentation for a bot's
+/// navigation rather than simulation, so the wider type costs nothing.
+fn world_blocks(position: &PlayerPosition) -> [f64; 3] {
+    let span = f64::from(tiamot_core::CHUNK_SUBNODES);
+    let per_block = f64::from(tiamot_core::SUBNODES_PER_AXIS);
+    [
+        (f64::from(position.chunk.x) * span + f64::from(position.local[0])) / per_block,
+        (f64::from(position.chunk.y) * span + f64::from(position.local[1])) / per_block,
+        (f64::from(position.chunk.z) * span + f64::from(position.local[2])) / per_block,
+    ]
+}
+
 impl PlayerPosition {
     /// The position in whole blocks, for asserting about where a bot ended up.
     #[must_use]
@@ -1234,13 +1249,54 @@ impl Bot {
     ///
     /// [`BotError::Frame`] if the write fails.
     pub async fn move_to(&mut self, x: f32, y: f32, z: f32) -> Result<(), BotError> {
-        self.send(&ClientMessage::PlayerInput {
-            tick: 0,
-            movement: [x, y, z],
-            look: [0.0, 0.0],
-            actions: 0,
-        })
-        .await
+        /// How close, in blocks, counts as arrived.
+        const ARRIVED: f64 = 1.0;
+        /// Ticks of walking between course corrections.
+        const LEG: u64 = 5;
+        /// Legs before giving up. A straight line cannot get everywhere.
+        const LEGS: u32 = 40;
+
+        let _ = y;
+        let mut stalled = 0u32;
+        let mut previous: Option<[f64; 3]> = None;
+
+        for _ in 0..LEGS {
+            // Where the SERVER says we are. Walking toward a position the bot
+            // merely believed would drift, and the drift compounds.
+            let here = self.walk([0.0; 3], 0, 1).await?;
+            let at = world_blocks(&here);
+            let to = [f64::from(x) - at[0], f64::from(z) - at[2]];
+            let distance = (to[0] * to[0] + to[1] * to[1]).sqrt();
+            if distance <= ARRIVED {
+                return Ok(());
+            }
+
+            // No progress since the last leg means something is in the way.
+            // Jump at it: a straight line with a jump gets over the one-block
+            // steps terrain actually has, and anything more is pathfinding,
+            // which a load bot has no business doing.
+            let actions = if previous.is_some_and(|was| {
+                let moved = (at[0] - was[0]).abs() + (at[2] - was[2]).abs();
+                moved < 0.1
+            }) {
+                stalled += 1;
+                tiamot_core::proto::actions::JUMP
+            } else {
+                stalled = 0;
+                0
+            };
+            if stalled > 4 {
+                // Jumping is not helping either. Report where it got to rather
+                // than spinning: a caller that needs to be somewhere exact will
+                // notice, and one that just wanted to move has moved.
+                return Ok(());
+            }
+            previous = Some(at);
+
+            let direction = [(to[0] / distance) as f32, 0.0, (to[1] / distance) as f32];
+            self.walk(direction, actions, LEG).await?;
+        }
+        Ok(())
     }
 
     /// Waits roughly `ticks` server ticks.

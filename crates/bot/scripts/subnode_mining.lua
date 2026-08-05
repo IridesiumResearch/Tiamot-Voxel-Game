@@ -17,7 +17,7 @@
 
 -- The top solid layer: `core_worldgen` fills below its heightmap, so y = -1 is
 -- the highest block that is actually there.
-local BX, BY, BZ = 50, -1, 50
+local BX, BY, BZ = 2, -1, 0
 
 bot.join("chiseller")
 

@@ -213,11 +213,15 @@ pub async fn wander(
         let roll = next();
         let x = i32::try_from(roll % 64).unwrap_or(0) - 32;
         let z = i32::try_from((roll >> 8) % 64).unwrap_or(0) - 32;
-        // The top solid layer: the reference worldgen fills BELOW its heightmap,
-        // so this is the highest block that actually exists.
-        let pos = tiamot_core::BlockPos::new(x, -1, z);
-
+        // Walk somewhere, then dig **where the bot actually ended up** rather
+        // than where it was aiming. `move_to` is a straight line with a jump
+        // heuristic and makes no promise of arriving; the server bounds digging
+        // by `phys::REACH`, so a bot that dug at its intended destination
+        // instead of its real position would be refused every time it fell
+        // short — and the failure would look like the reach check being broken.
         bot.move_to(x as f32, 0.0, z as f32).await?;
+        let here = bot.walk([0.0; 3], 0, 1).await?.block();
+        let pos = tiamot_core::BlockPos::new(here.x, here.y - 1, here.z);
 
         // **Dig first, build second.** This used to place and then dig, which
         // needed the bot to be carrying something before it had mined anything.

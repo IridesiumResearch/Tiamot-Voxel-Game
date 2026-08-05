@@ -159,6 +159,57 @@ pub fn blocks_a_body(placement: &Placement, bodies: &[(ChunkPos, Aabb)]) -> bool
     })
 }
 
+/// How much further than [`crate::phys::REACH`] the server allows.
+///
+/// **The server cannot use the client's own number.** The client raycasts from
+/// where IT thinks the player is, which is up to `INPUT_LEAD` ticks ahead of
+/// where the server has them — that is the whole design of prediction. Checking
+/// the exact reach against the server's older position would refuse legitimate
+/// actions whenever the player was moving, and the faster they moved the more
+/// often it would happen.
+///
+/// Four ticks of sprinting is about 3.4 cells, and the body is 1.8 across. Five
+/// cells covers both with room to spare. This is a bound on absurdity — no
+/// mining across the map — rather than a precise gate, and erring generous is
+/// correct: refusing something a player legitimately did is a bug they will
+/// report, while allowing a dig half a metre further than intended is not.
+pub const REACH_TOLERANCE: f32 = 5.0;
+
+/// Whether `target` is close enough to a player's eye to act on.
+///
+/// Measured in world cells with the same `i64`/`f64` care as
+/// [`blocks_a_body`], and for the same reason: the eye is a chunk origin plus a
+/// local offset (charter rule 7) while the target is absolute, so bringing them
+/// together in `f32` world space would be exact at the origin and metres out at
+/// the edge of the world.
+///
+/// Compares squared distances, so nothing needs a square root — `sqrt` is in
+/// charter rule 4's allowed subset, but not needing it is cheaper and exact.
+#[must_use]
+pub fn within_reach(origin: ChunkPos, eye: [f32; 3], target: SubNodePos) -> bool {
+    let span = f64::from(CHUNK_SUBNODES);
+    let eye_world = [
+        f64::from(origin.x) * span + f64::from(eye[0]),
+        f64::from(origin.y) * span + f64::from(eye[1]),
+        f64::from(origin.z) * span + f64::from(eye[2]),
+    ];
+    // The cell's centre, not its corner: a player looking at the far face of a
+    // cell they are just touching should not be refused by half a cell.
+    let target_world = [
+        f64::from(target.x) + 0.5,
+        f64::from(target.y) + 0.5,
+        f64::from(target.z) + 0.5,
+    ];
+
+    let mut squared = 0.0;
+    for axis in 0..3 {
+        let delta = target_world[axis] - eye_world[axis];
+        squared += delta * delta;
+    }
+    let limit = f64::from(crate::phys::REACH + REACH_TOLERANCE);
+    squared <= limit * limit
+}
+
 /// The last cell index a span reaching `high` touches.
 ///
 /// One less than the floor when `high` sits exactly on a boundary, which is the
@@ -242,6 +293,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn something_underfoot_is_within_reach_and_the_horizon_is_not() {
+        let origin = ChunkPos::new(0, 0, 0);
+        let eye = [24.0, 10.0, 24.0];
+        assert!(
+            within_reach(origin, eye, cell(24, 5, 24)),
+            "the cell a player is standing on must be reachable"
+        );
+        assert!(
+            !within_reach(origin, eye, cell(24, 5, 240)),
+            "a cell 200 cells away must not be"
+        );
+    }
+
+    #[test]
+    fn the_reach_check_crosses_chunk_origins() {
+        // The eye is a chunk origin plus a local offset (charter rule 7) and
+        // the target is absolute. A check that ignored the origin would pass
+        // for everyone at spawn and refuse everything for anyone who walked —
+        // the same trap `blocks_a_body` has, and worth its own test because the
+        // two compute it separately.
+        let far = ChunkPos::new(10, 0, 10);
+        let eye = [24.0, 10.0, 24.0];
+        let underfoot = cell(
+            10 * CHUNK_SUBNODES as i32 + 24,
+            5,
+            10 * CHUNK_SUBNODES as i32 + 24,
+        );
+        assert!(
+            within_reach(far, eye, underfoot),
+            "a player in chunk 10,0,10 cannot reach the block under their own feet"
+        );
+        // And the same cell is far out of reach from the origin chunk.
+        assert!(!within_reach(ChunkPos::new(0, 0, 0), eye, underfoot));
+    }
+
+    #[test]
+    fn the_tolerance_is_generous_rather_than_exact() {
+        // The server checks against an older position than the client raycast
+        // from — that is what prediction IS — so an exact bound would refuse
+        // legitimate actions whenever the player was moving. This pins that the
+        // slack exists and is on the generous side.
+        let origin = ChunkPos::new(0, 0, 0);
+        let eye = [0.0, 0.0, 0.0];
+        let just_past = crate::phys::REACH + 1.0;
+        assert!(
+            within_reach(origin, eye, cell(just_past as i32, 0, 0)),
+            "a cell just past the client's own reach must still be allowed"
+        );
+        let far_past = crate::phys::REACH + REACH_TOLERANCE + 4.0;
+        assert!(
+            !within_reach(origin, eye, cell(far_past as i32, 0, 0)),
+            "the tolerance must still be a bound, not an absence of one"
+        );
     }
 
     #[test]

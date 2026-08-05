@@ -138,7 +138,7 @@ fn two_bots_see_each_others_block_edits() {
         let mut bob = join(&server, "Bob").await;
 
         // Something for Alice to break, arranged by the operator.
-        let pos = BlockPos::new(4, 5, 6);
+        let pos = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(pos, stone), "seed queue full");
         for bot in [&mut alice, &mut bob] {
             bot.expect_block(pos, stone, Duration::from_secs(10))
@@ -173,7 +173,7 @@ fn an_editor_sees_their_own_edit_confirmed() {
 
     block_on(async {
         let mut alice = join(&server, "Alice").await;
-        let pos = BlockPos::new(1, 1, 1);
+        let pos = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(pos, stone), "seed queue full");
         alice
             .expect_block(pos, stone, Duration::from_secs(10))
@@ -204,7 +204,7 @@ fn a_subnode_edit_is_broadcast_at_subnode_resolution() {
         let mut alice = join(&server, "Alice").await;
         let mut bob = join(&server, "Bob").await;
 
-        let block = BlockPos::new(10, 11, 12);
+        let block = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(block, glass), "seed queue full");
         for bot in [&mut alice, &mut bob] {
             bot.expect_block(block, glass, Duration::from_secs(10))

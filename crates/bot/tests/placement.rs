@@ -136,7 +136,7 @@ fn placing_a_whole_block_spends_exactly_twenty_seven_units() {
 
     block_on(async {
         let mut bot = join(&server, "Builder").await;
-        let quarry = BlockPos::new(8, 40, 8);
+        let quarry = BlockPos::new(2, -1, 0);
         mine_a_block(&mut bot, &server, quarry, stone).await;
 
         let before = held(&bot, stone);
@@ -145,7 +145,7 @@ fn placing_a_whole_block_spends_exactly_twenty_seven_units() {
             "mining one block should yield 27 units, got {before}"
         );
 
-        let target = BlockPos::new(8, 40, 12);
+        let target = BlockPos::new(-2, 0, 0);
         bot.place_from_inventory(centre_of(target), stone)
             .await
             .expect("place");
@@ -180,7 +180,7 @@ fn chiselled_spares_place_back_as_a_partial_block() {
 
     block_on(async {
         let mut bot = join(&server, "Sculptor").await;
-        let quarry = BlockPos::new(8, 40, 8);
+        let quarry = BlockPos::new(2, -1, 0);
         assert!(server.seed_block(quarry, stone), "seed queue full");
         bot.expect_block(quarry, stone, Duration::from_secs(10))
             .await
@@ -236,7 +236,7 @@ fn chiselled_spares_place_back_as_a_partial_block() {
         );
 
         // Place them back, into empty space.
-        let target = BlockPos::new(8, 40, 12);
+        let target = BlockPos::new(-2, 0, 0);
         bot.place_from_inventory(centre_of(target), stone)
             .await
             .expect("place");
@@ -271,7 +271,7 @@ fn placing_with_nothing_in_hand_is_refused_and_says_so() {
 
     block_on(async {
         let mut bot = join(&server, "Pauper").await;
-        let target = BlockPos::new(8, 40, 8);
+        let target = BlockPos::new(-2, 0, 0);
 
         bot.place_from_inventory(centre_of(target), stone)
             .await
@@ -302,12 +302,12 @@ fn placing_into_something_solid_is_refused() {
 
     block_on(async {
         let mut bot = join(&server, "Overlapper").await;
-        let quarry = BlockPos::new(8, 40, 8);
+        let quarry = BlockPos::new(2, -1, 0);
         mine_a_block(&mut bot, &server, quarry, stone).await;
 
         // Somewhere solid: seed a block with the free Task 07 edit path, then
         // try to place into it.
-        let target = BlockPos::new(8, 40, 12);
+        let target = BlockPos::new(-2, 0, 0);
         assert!(server.seed_block(target, stone), "seed queue full");
         bot.expect_block(target, stone, Duration::from_secs(10))
             .await
@@ -345,7 +345,7 @@ fn placing_inside_a_player_is_refused() {
 
     block_on(async {
         let mut bot = join(&server, "Selfsealer").await;
-        let quarry = BlockPos::new(8, 40, 8);
+        let quarry = BlockPos::new(2, -1, 0);
         mine_a_block(&mut bot, &server, quarry, stone).await;
         let before = held(&bot, stone);
 
