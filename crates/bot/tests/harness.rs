@@ -369,6 +369,21 @@ fn replay_applies_a_recording_against_a_live_server() {
 }
 
 #[test]
+fn chisel_sculpt_passes_and_proves_the_subnode_round_trip() {
+    // **Task 09's [A] criterion, as a scenario a modder can read and change.**
+    // Chisel 13 of a block's 27 cells, hold 13 spare nodes, put them back, and
+    // get a block that is 13 cells full — not a cube and not nothing.
+    //
+    // The Rust version of this lives in `crates/bot/tests/placement.rs`. Having
+    // both is the point of a scripting harness at all: one proves the engine,
+    // the other proves the engine is usable from outside it.
+    let server = start("chisel-sculpt");
+    let (code, output) = run_script(&server, &repo_script("chisel_sculpt.lua"));
+    assert_eq!(code, 0, "chisel_sculpt.lua should pass:\n{output}");
+    server.stop();
+}
+
+#[test]
 fn a_malformed_recording_is_refused_with_a_line_number() {
     let dir = scratch("bad-replay");
     let session = dir.join("bad.log");

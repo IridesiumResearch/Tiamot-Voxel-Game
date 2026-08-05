@@ -997,12 +997,20 @@ impl Bot {
         let deadline = tokio::time::Instant::now() + PATIENCE;
         loop {
             self.place_from_inventory(target, material).await?;
-            if self
-                .expect_block(pos, material, std::time::Duration::from_secs(2))
-                .await
-                .is_ok()
-            {
-                return Ok(());
+            // **Either form counts.** 27 units is broadcast as `Edit::Block`
+            // and anything less as `Edit::Partial`, and waiting only for the
+            // first meant a spare-node placement never saw its own success —
+            // so this retried, and the retries failed with "you are not
+            // carrying any of that" because the FIRST attempt had worked and
+            // spent everything. The symptom was a refusal that named the
+            // opposite of the problem.
+            let round = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while tokio::time::Instant::now() < round {
+                if self.saw_block(pos, material) || self.saw_any_partial(pos, material) {
+                    return Ok(());
+                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), self.recv()).await;
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(BotError::Unexpected {
@@ -1125,6 +1133,26 @@ impl Bot {
                 Err(_) => {}
             }
         }
+    }
+
+    /// Whether any partial placement of this material has landed at `pos`.
+    ///
+    /// Unlike [`Bot::saw_partial`] this does not care how many cells were
+    /// filled — for a caller that only needs to know the placement happened.
+    fn saw_any_partial(&self, pos: tiamot_core::BlockPos, material: u16) -> bool {
+        self.received().iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockDelta {
+                    edit: tiamot_core::proto::Edit::Partial {
+                        pos: got,
+                        material: got_material,
+                        ..
+                    },
+                    ..
+                } if *got == pos && *got_material == material
+            )
+        })
     }
 
     /// Whether a matching partial placement has been seen.

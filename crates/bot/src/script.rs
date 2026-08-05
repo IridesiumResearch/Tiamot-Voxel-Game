@@ -53,6 +53,12 @@ pub enum Command {
     Place(BlockPos, u16),
     /// Wait for a block to hold a material.
     ExpectBlock(BlockPos, u16, u64),
+    /// Wait for a block to be PARTIALLY filled, with a given cell count.
+    ///
+    /// The shape, not merely the presence: a scenario that only checked
+    /// something appeared could not tell 13 spare nodes from a whole block,
+    /// which is the entire distinction sub-nodes exist to make.
+    ExpectPartial(BlockPos, u16, u32, u64),
     /// Report movement intent.
     MoveTo(f32, f32, f32),
     /// Send a chat line.
@@ -238,6 +244,11 @@ pub fn run_script(source: &str, name: &str, channel: Channel) -> Result<ScriptOu
     bind!("expect_block", (i32, i32, i32, u16, u64), |_lua, p| {
         Command::ExpectBlock(BlockPos::new(p.0, p.1, p.2), p.3, p.4)
     });
+    bind!(
+        "expect_partial",
+        (i32, i32, i32, u16, u32, u64),
+        |_lua, p| { Command::ExpectPartial(BlockPos::new(p.0, p.1, p.2), p.3, p.4, p.5) }
+    );
     bind!("expect_units", (u16, u32, u64), |_lua, p| {
         Command::ExpectUnits(p.0, p.1, p.2)
     });
