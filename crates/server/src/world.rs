@@ -308,6 +308,7 @@ impl World {
         let (chunk_pos, material) = match edit {
             Edit::Block { pos, material } => (pos.chunk(), *material),
             Edit::SubNode { pos, material } => (pos.chunk(), *material),
+            Edit::Partial { pos, material, .. } => (pos.chunk(), *material),
         };
 
         // Validate the material BEFORE loading a chunk. A peer spraying edits
@@ -339,6 +340,7 @@ impl World {
         let block_pos = match edit {
             Edit::Block { pos, .. } => *pos,
             Edit::SubNode { pos, .. } => pos.block(),
+            Edit::Partial { pos, .. } => *pos,
         };
         let before: Cells = chunk
             .get_block(block_pos)
@@ -353,6 +355,24 @@ impl World {
             Edit::SubNode { pos, .. } => {
                 chunk
                     .set_subnode(*pos, material)
+                    .map_err(|_| EditError::OutOfWorld)?;
+            }
+            Edit::Partial { pos, occupancy, .. } => {
+                // A mask with every bit set is a `Uniform` block, not a
+                // `Partial` one with 27 cells: the two are the same geometry,
+                // and letting the second form exist would make a placed full
+                // block and a generated full block store and hash differently
+                // for no reason a player could observe.
+                let value = if *occupancy == (1 << tiamot_core::UNITS_PER_BLOCK) - 1 {
+                    BlockValue::Uniform(material)
+                } else {
+                    BlockValue::Partial {
+                        material,
+                        occupancy: *occupancy,
+                    }
+                };
+                chunk
+                    .set_block(*pos, value)
                     .map_err(|_| EditError::OutOfWorld)?;
             }
         }

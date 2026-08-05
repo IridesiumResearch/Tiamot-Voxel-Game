@@ -297,6 +297,43 @@ pub fn total_units(stacks: &[Stack]) -> u64 {
     stacks.iter().map(|stack| u64::from(stack.units)).sum()
 }
 
+/// Units of one material held across a set of stacks.
+#[must_use]
+pub fn units_of(stacks: &[Stack], material: MaterialId) -> u32 {
+    stacks
+        .iter()
+        .filter(|stack| stack.material == material)
+        .fold(0u32, |total, stack| total.saturating_add(stack.units))
+}
+
+/// Removes up to `units` of a material, returning how many were actually taken.
+///
+/// **Takes what is there rather than failing when it is short**, and the caller
+/// acts on the returned count. That is what makes placing spare nodes work: a
+/// player with 13 units who asks to place a block gets a `Partial` of 13 rather
+/// than a refusal, which is the behaviour the task specifies. A caller that
+/// needs all-or-nothing checks [`units_of`] first — the two are on the same
+/// borrow, so nothing can change in between.
+///
+/// Empty stacks are dropped, so an inventory does not accumulate zero-unit
+/// entries that display as materials the player does not have.
+pub fn debit(stacks: &mut Vec<Stack>, material: MaterialId, units: u32) -> u32 {
+    let mut remaining = units;
+    for stack in stacks.iter_mut() {
+        if remaining == 0 {
+            break;
+        }
+        if stack.material != material {
+            continue;
+        }
+        let take = stack.units.min(remaining);
+        stack.units -= take;
+        remaining -= take;
+    }
+    stacks.retain(|stack| !stack.is_empty());
+    units - remaining
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

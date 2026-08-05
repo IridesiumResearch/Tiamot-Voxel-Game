@@ -902,6 +902,107 @@ impl Bot {
         }
     }
 
+    /// Asks the server to place material from the inventory.
+    ///
+    /// The real placement path, unlike [`Bot::place`], which is the Task 07
+    /// direct-edit stand-in and writes the world without paying for it. This
+    /// sends a *request*: the server decides how much is actually placed from
+    /// what the player is carrying, and may refuse it outright. Nothing comes
+    /// back on success beyond the ordinary `BlockDelta` broadcast — use
+    /// [`Bot::expect_partial`] to wait for it, and read [`Bot::notices`] for
+    /// the reason if it never arrives.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn place_from_inventory(
+        &mut self,
+        target: tiamot_core::SubNodePos,
+        material: u16,
+    ) -> Result<(), BotError> {
+        self.send(&tiamot_core::proto::ClientMessage::Place { target, material })
+            .await
+    }
+
+    /// Waits until the server confirms a partially-filled block at `pos`.
+    ///
+    /// `cells` is how many sub-nodes are expected to be filled, which is what
+    /// makes this an assertion about spare-node arithmetic rather than about
+    /// something merely having happened.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Unexpected`] if the timeout expires first.
+    pub async fn expect_partial(
+        &mut self,
+        pos: tiamot_core::BlockPos,
+        material: u16,
+        cells: u32,
+        timeout: std::time::Duration,
+    ) -> Result<(), BotError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        if self.saw_partial(pos, material, cells) {
+            return Ok(());
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(BotError::Unexpected {
+                    expected: "a block delta confirming a partial placement",
+                    got: format!(
+                        "nothing for {pos:?} = {material} with {cells} cells within the \
+                         timeout; notices: {:?}",
+                        self.notices()
+                    ),
+                });
+            }
+            match tokio::time::timeout(remaining, self.recv()).await {
+                Ok(Ok(_)) => {
+                    if self.saw_partial(pos, material, cells) {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Whether a matching partial placement has been seen.
+    fn saw_partial(&self, pos: tiamot_core::BlockPos, material: u16, cells: u32) -> bool {
+        self.received().iter().rev().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockDelta {
+                    edit: tiamot_core::proto::Edit::Partial {
+                        pos: got,
+                        material: got_material,
+                        occupancy,
+                    },
+                    ..
+                } if *got == pos
+                    && *got_material == material
+                    && occupancy.count_ones() == cells
+            )
+        })
+    }
+
+    /// Everything the server has said to this player alone.
+    ///
+    /// Chat with no sender: the server's answer when it refused to do
+    /// something. Without reading these, a refused placement and a lost packet
+    /// look identical from a script.
+    #[must_use]
+    pub fn notices(&self) -> Vec<String> {
+        self.received()
+            .iter()
+            .filter_map(|message| match message {
+                ServerMessage::Chat { from: None, text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Whether a matching block delta has been seen.
     fn saw_block(&self, pos: tiamot_core::BlockPos, material: u16) -> bool {
         self.received().iter().rev().any(|message| {

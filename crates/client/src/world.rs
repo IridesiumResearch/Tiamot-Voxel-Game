@@ -136,17 +136,39 @@ impl ChunkStore {
     /// and when it comes back it comes back with the edit already in it.
     pub fn apply(&mut self, edit: &Edit) -> bool {
         match *edit {
-            Edit::Block { pos, material } => self.set_block(pos, MaterialId(material)),
+            Edit::Block { pos, material } => {
+                self.write_block(pos, BlockValue::Uniform(MaterialId(material)))
+            }
             Edit::SubNode { pos, material } => self.set_subnode(pos, MaterialId(material)),
+            Edit::Partial {
+                pos,
+                material,
+                occupancy,
+            } => self.write_block(
+                pos,
+                // The same normalisation the server does: a fully-set mask is
+                // a `Uniform` block. Storing it as a `Partial` with 27 cells
+                // would be the same geometry in a different representation, and
+                // the two would then mesh from different code paths for a
+                // difference nobody can see.
+                if occupancy == (1 << tiamot_core::UNITS_PER_BLOCK) - 1 {
+                    BlockValue::Uniform(MaterialId(material))
+                } else {
+                    BlockValue::Partial {
+                        material: MaterialId(material),
+                        occupancy,
+                    }
+                },
+            ),
         }
     }
 
-    fn set_block(&mut self, pos: BlockPos, material: MaterialId) -> bool {
+    fn write_block(&mut self, pos: BlockPos, value: BlockValue) -> bool {
         let chunk_pos = pos.chunk();
         let Some(chunk) = self.chunks.get_mut(&chunk_pos) else {
             return false;
         };
-        if chunk.set_block(pos, BlockValue::Uniform(material)).is_err() {
+        if chunk.set_block(pos, value).is_err() {
             return false;
         }
 

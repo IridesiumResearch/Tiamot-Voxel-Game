@@ -114,6 +114,15 @@ pub struct Shared {
     /// faster than 20 Hz can apply them and grow this until the server died.
     pub edits: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, Edit)>>,
 
+    /// Placements waiting for the tick that will decide them.
+    ///
+    /// Separate from [`Shared::edits`] because they are a different kind of
+    /// thing. An edit has already been decided and is waiting to be applied; a
+    /// placement is a *request* that the tick may refuse, and it needs the
+    /// player's identity to charge the material to, which is why it carries a
+    /// uuid rather than being turned into an `Edit` on the connection task.
+    pub placements: std::sync::Mutex<std::collections::VecDeque<PlacementRequest>>,
+
     /// Messages to fan out to every connected player.
     ///
     /// A `broadcast` channel: each connection holds a receiver and forwards
@@ -147,16 +156,22 @@ pub struct Shared {
     /// Server-authoritative. The client is told what it has; it never asserts
     /// it, because an inventory a client could edit is not an inventory.
     ///
-    /// Task 09 owns the rest of the player-interaction loop — placement does
-    /// not yet consume from this. What is here is the half `mine_3x3.lua`
-    /// needs to be a real proof of the 27-unit design rather than a vacuous
-    /// one.
+    /// Digging credits it and placing debits it, so the 27-unit arithmetic of
+    /// charter rule 5 is a round trip rather than a one-way accumulation.
     pub inventories: std::sync::Mutex<
         std::collections::BTreeMap<PlayerUuid, Vec<tiamot_core::inventory::Stack>>,
     >,
 
     /// Players whose inventory changed and have not been told yet.
     pub inventory_dirty: std::sync::Mutex<std::collections::BTreeSet<PlayerUuid>>,
+
+    /// Text waiting to be sent to one particular player.
+    ///
+    /// For things only the player who asked should see — chiefly why a
+    /// placement was refused. Not [`Shared::outbound`], which goes to everyone:
+    /// telling the whole server that somebody tried to build into a wall is
+    /// noise at best.
+    pub notices: std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, Vec<String>>>,
 
     /// Every distributable file the loaded mods supply, by hash.
     ///
@@ -276,6 +291,22 @@ pub struct ChunkRequest {
     pub reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
 }
 
+/// A player asking to place material.
+///
+/// Deliberately not an [`Edit`]: an edit says what the world will become, and
+/// this says only what somebody asked for. What it becomes — a `Uniform` block,
+/// a `Partial` one, or nothing at all — is decided on the tick thread against
+/// the world and every body in it.
+#[derive(Debug, Clone, Copy)]
+pub struct PlacementRequest {
+    /// Who asked, and who pays for it.
+    pub actor: PlayerUuid,
+    /// The cell they want filled.
+    pub target: tiamot_core::SubNodePos,
+    /// The material they claim to be holding.
+    pub material: u16,
+}
+
 /// How many chunk requests the simulation serves per tick, across all players.
 ///
 /// This is the shared budget, not a per-client one: the work is encoding, it
@@ -300,6 +331,13 @@ pub const MAX_QUEUED_CHUNK_REQUESTS: usize = 512;
 /// cannot grow it into a memory problem.
 pub const MAX_QUEUED_EDITS: usize = 4096;
 
+/// How many unread notices one player may accumulate.
+///
+/// Small on purpose. These are answers to things the player just did, so a
+/// backlog of them is already stale by the time it would be read; dropping the
+/// surplus is better than delivering a minute-old explanation.
+pub const MAX_QUEUED_NOTICES: usize = 16;
+
 impl Shared {
     /// The current tick, for stamping outbound messages.
     fn tick(&self) -> u64 {
@@ -312,6 +350,77 @@ impl Shared {
     /// Dropping is deliberate: blocking here would let one client's flood stall
     /// the connection task, and growing without bound would let it exhaust
     /// memory.
+    /// Queues a placement request for the next tick.
+    ///
+    /// Returns whether it was accepted. Bounded like the edit queue and for the
+    /// same reason: a client can send these faster than 20 Hz can decide them.
+    pub fn queue_placement(
+        &self,
+        actor: PlayerUuid,
+        target: tiamot_core::SubNodePos,
+        material: u16,
+    ) -> bool {
+        let Ok(mut queue) = self.placements.lock() else {
+            return false;
+        };
+        if queue.len() >= MAX_QUEUED_EDITS {
+            return false;
+        }
+        queue.push_back(PlacementRequest {
+            actor,
+            target,
+            material,
+        });
+        true
+    }
+
+    /// Takes every queued placement, leaving the queue empty.
+    #[must_use]
+    pub fn drain_placements(&self) -> Vec<PlacementRequest> {
+        self.placements
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Every player's chunk origin and body box, for the placement check.
+    ///
+    /// A snapshot, like [`Shared::digs_in_progress`]: the caller writes the
+    /// world between reading this and acting on it, and holding the lock across
+    /// that puts a connection task's contention inside the tick.
+    #[must_use]
+    pub fn body_boxes(&self) -> Vec<(tiamot_core::ChunkPos, tiamot_core::phys::Aabb)> {
+        self.bodies
+            .lock()
+            .map(|bodies| {
+                bodies
+                    .values()
+                    .map(|player| (player.origin, player.body.aabb()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Takes up to `units` of a material from a player, returning how many.
+    ///
+    /// Marks the inventory dirty only when something was actually taken, so a
+    /// refused placement does not cost a sync message.
+    pub fn debit(&self, uuid: &PlayerUuid, material: tiamot_core::MaterialId, units: u32) -> u32 {
+        let Ok(mut inventories) = self.inventories.lock() else {
+            return 0;
+        };
+        let Some(held) = inventories.get_mut(uuid) else {
+            return 0;
+        };
+        let taken = tiamot_core::inventory::debit(held, material, units);
+        if taken > 0
+            && let Ok(mut dirty) = self.inventory_dirty.lock()
+        {
+            dirty.insert(*uuid);
+        }
+        taken
+    }
+
     pub fn queue_edit(&self, actor: PlayerUuid, edit: Edit) -> bool {
         let Ok(mut queue) = self.edits.lock() else {
             // The mutex is poisoned, which means a previous holder panicked
@@ -575,6 +684,36 @@ impl Shared {
     /// A send with no receivers is not an error — it means nobody is connected.
     pub fn broadcast(&self, message: ServerMessage) {
         let _ = self.outbound.send(message);
+    }
+
+    /// Queues a line of text for one player.
+    ///
+    /// **The counterpart to every server-side refusal.** Charter rule 2 puts
+    /// the decision on the server, which means a client that asked to place
+    /// something and saw nothing happen cannot work out why — it does not know
+    /// what the player is carrying, what is already in the target, or where
+    /// everyone else is standing. Without this, every refusal is
+    /// indistinguishable from a dropped packet.
+    ///
+    /// Bounded per player: the queue is drained on that player's own connection
+    /// task, and a client that spams refusable requests faster than it reads
+    /// would otherwise grow this without limit.
+    pub fn tell(&self, uuid: &PlayerUuid, text: String) {
+        if let Ok(mut notices) = self.notices.lock() {
+            let queue = notices.entry(*uuid).or_default();
+            if queue.len() < MAX_QUEUED_NOTICES {
+                queue.push(text);
+            }
+        }
+    }
+
+    /// Takes everything queued for one player.
+    #[must_use]
+    pub fn take_notices(&self, uuid: &PlayerUuid) -> Vec<String> {
+        self.notices
+            .lock()
+            .map(|mut notices| notices.remove(uuid).unwrap_or_default())
+            .unwrap_or_default()
     }
 
     /// Asks an identity's connections to disconnect.
@@ -858,6 +997,13 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     if let Some(progress) = shared.dig_progress(&uuid) {
                         frame::write(&mut send, &progress).await?;
                     }
+                    // Why the last thing they asked for did not happen. Sent
+                    // as chat from nobody: a refusal the player never sees is
+                    // indistinguishable from the server having lost the
+                    // message, and they will simply try again.
+                    for text in shared.take_notices(&uuid) {
+                        frame::write(&mut send, &ServerMessage::Chat { from: None, text }).await?;
+                    }
                 }
                 continue;
             }
@@ -1025,6 +1171,18 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     shared.select_tool(&uuid, tool.clone());
                 }
             }
+            // Queued, not carried out. Deciding a placement needs the world
+            // and every body in it, and both belong to the tick thread — the
+            // same reason digging and movement are queued rather than applied
+            // here. Two connection tasks placing at once would otherwise
+            // resolve in whichever order the OS woke them.
+            Action::Place { target, material } => {
+                if let Some(uuid) = session.uuid()
+                    && !shared.queue_placement(uuid, *target, *material)
+                {
+                    warn!("placement queue is full; dropping a placement");
+                }
+            }
             Action::None => {}
         }
 
@@ -1181,12 +1339,14 @@ mod tests {
             players: AtomicU32::new(0),
             control: Control::new(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             outbound: tokio::sync::broadcast::channel(16).0,
             chunk_requests: std::sync::Mutex::new(std::collections::VecDeque::new()),
             view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
             content: tiamot_core::content::ContentIndex::new(),
             inventories: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             inventory_dirty: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             kicks: tokio::sync::broadcast::channel(4).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),

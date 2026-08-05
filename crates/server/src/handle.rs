@@ -460,6 +460,8 @@ impl ServerHandle {
             players: AtomicU32::new(0),
             control: control.clone(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             // Capacity is per-receiver backlog, not a total. 1024 messages at
             // 20 Hz is roughly fifty seconds behind before a client starts
             // losing them, which is far longer than a connection worth keeping.
@@ -725,6 +727,125 @@ impl ServerHandle {
                                 }
                             }
                             shared.set_dig(&uuid, None);
+                        }
+
+                        // Placement, after digging and after movement. The
+                        // order matters and is not arbitrary: a player who dug
+                        // a block this tick can place into the hole this tick,
+                        // and a placement is judged against where every body
+                        // actually ended up rather than where it started.
+                        //
+                        // Every refusal is told to the player who asked. A
+                        // build that silently did nothing is the worst of the
+                        // options — charter rule 2 means the client cannot work
+                        // out the reason for itself, so it has to be sent one.
+                        for request in shared.drain_placements() {
+                            let material = tiamot_core::MaterialId(request.material);
+                            let held = tiamot_core::inventory::units_of(
+                                &shared.inventory_of(&request.actor),
+                                material,
+                            );
+
+                            let outcome = tiamot_core::place::plan(request.target, held)
+                                .and_then(|plan| {
+                                    // Air only. Placing into occupied space
+                                    // would have to decide what happens to what
+                                    // was already there, and "it is destroyed"
+                                    // is a conservation hole (charter rule 5).
+                                    let occupied = tiamot_core::place::occupied_cells(&plan)
+                                        .any(|cell| {
+                                            i32::try_from(cell[0]).is_ok_and(|x| {
+                                                let (Ok(y), Ok(z)) = (
+                                                    i32::try_from(cell[1]),
+                                                    i32::try_from(cell[2]),
+                                                ) else {
+                                                    return false;
+                                                };
+                                                world
+                                                    .subnode(
+                                                        tiamot_core::SubNodePos::new(x, y, z),
+                                                        &mut source,
+                                                    )
+                                                    .is_ok_and(|found| !found.is_air())
+                                            })
+                                        });
+                                    if occupied {
+                                        return Err(tiamot_core::place::Refusal::Occupied);
+                                    }
+                                    if tiamot_core::place::blocks_a_body(
+                                        &plan,
+                                        &shared.body_boxes(),
+                                    ) {
+                                        return Err(tiamot_core::place::Refusal::InsideAPlayer);
+                                    }
+                                    Ok(plan)
+                                });
+
+                            let plan = match outcome {
+                                Ok(plan) => plan,
+                                Err(refusal) => {
+                                    shared.tell(&request.actor, refusal.to_string());
+                                    continue;
+                                }
+                            };
+
+                            // Charged BEFORE the write, and only what was
+                            // actually taken is placed. Writing first and
+                            // charging after would hand a player free material
+                            // on any path where the debit came up short —
+                            // another connection of theirs spending it between
+                            // the check and here is enough.
+                            let paid = shared.debit(&request.actor, material, plan.units);
+                            if paid == 0 {
+                                shared.tell(
+                                    &request.actor,
+                                    tiamot_core::place::Refusal::NothingHeld.to_string(),
+                                );
+                                continue;
+                            }
+
+                            // A full block goes out as `Edit::Block`, not as a
+                            // `Partial` with every bit set. The two produce
+                            // identical geometry, so sending the second form
+                            // would mean the same result arrived as two
+                            // different messages depending on how it was made —
+                            // and everything watching for a block appearing
+                            // would have to know about both.
+                            let occupancy = tiamot_core::inventory::placement_mask(paid);
+                            let edit = if paid >= tiamot_core::UNITS_PER_BLOCK {
+                                tiamot_core::proto::Edit::Block {
+                                    pos: plan.block,
+                                    material: request.material,
+                                }
+                            } else {
+                                tiamot_core::proto::Edit::Partial {
+                                    pos: plan.block,
+                                    material: request.material,
+                                    occupancy,
+                                }
+                            };
+                            match world.apply(&edit, &mut source) {
+                                Ok(_) => shared.broadcast(ServerMessage::BlockDelta {
+                                    edit,
+                                    actor: Some(*request.actor.as_bytes()),
+                                }),
+                                Err(err) => {
+                                    // The write failed after the charge, so
+                                    // give it back. Anything else destroys
+                                    // material on a path a player did not cause
+                                    // and cannot see.
+                                    shared.credit(
+                                        request.actor,
+                                        tiamot_core::inventory::Stack::new(material, paid)
+                                            .into_iter()
+                                            .collect(),
+                                    );
+                                    debug!(
+                                        actor = %request.actor.short(),
+                                        "a placement would not apply: {err}"
+                                    );
+                                }
+                            }
                         }
 
                         // Mod tick hooks, before edits are applied: a mod

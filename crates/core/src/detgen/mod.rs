@@ -66,6 +66,22 @@ pub fn floor_to_i32(x: f32) -> i32 {
     truncated.saturating_sub(i32::from(x < truncated as f32))
 }
 
+/// [`floor_to_i32`] in double precision.
+///
+/// The same reasoning applies unchanged, and for the same instruction: the
+/// one-step `f64` floor is `roundsd`, which is also `SSE4.1`, so `f64::floor` on
+/// the `SSE2` baseline is also a libm call with nothing in the source to say so.
+///
+/// Wanted wherever two coordinate frames have to be compared in absolute world
+/// cells — see [`crate::place::blocks_a_body`]. `i64` because a 120,000-block
+/// world is 360,000 cells across and the arithmetic that gets there should not
+/// have to think about where `i32` ends.
+#[must_use]
+pub fn floor_to_i64(x: f64) -> i64 {
+    let truncated = x as i64;
+    truncated.saturating_sub(i64::from(x < truncated as f64))
+}
+
 /// The subnormal probe input: the smallest positive **normal** `f32`.
 const FTZ_PROBE_INPUT: u32 = 0x0080_0000;
 

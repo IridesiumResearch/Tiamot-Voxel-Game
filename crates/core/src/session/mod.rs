@@ -93,6 +93,20 @@ pub enum Action {
         tool: Option<String>,
     },
 
+    /// Ask to place material from the player's inventory.
+    ///
+    /// A request. The session has established only that this player is in the
+    /// world and is allowed to ask; whether they hold the material, whether the
+    /// target is empty, and whether the result would be inside somebody are all
+    /// decided by the simulation, which is the only thing that can see the
+    /// world and every body in it at once.
+    Place {
+        /// The cell to fill.
+        target: crate::coords::SubNodePos,
+        /// The material to place, as a world material id.
+        material: u16,
+    },
+
     /// Record a movement/look input for the next tick.
     Input {
         /// The tick the client believes it is on.
@@ -295,6 +309,12 @@ impl Session {
             }
             (Phase::InWorld, ClientMessage::SelectTool { tool }) => {
                 Response::act(Action::SelectTool { tool: tool.clone() })
+            }
+            (Phase::InWorld, ClientMessage::Place { target, material }) => {
+                Response::act(Action::Place {
+                    target: *target,
+                    material: *material,
+                })
             }
 
             (
@@ -674,6 +694,7 @@ impl Session {
             ClientMessage::StartDig { .. } => "StartDig",
             ClientMessage::CancelDig => "CancelDig",
             ClientMessage::SelectTool { .. } => "SelectTool",
+            ClientMessage::Place { .. } => "Place",
         };
         self.close_with(DisconnectReason::ProtocolError {
             detail: format!("{what} is not valid in phase {:?}", self.phase),

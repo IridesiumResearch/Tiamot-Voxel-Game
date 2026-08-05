@@ -111,6 +111,39 @@ fn client_messages() -> Vec<Vec<u8>> {
                 material: 0,
             },
         },
+        // Protocol v6's `Edit::Partial`, with the occupancy masks worth having
+        // an example of: a legitimate partial fill, a completely full one, an
+        // empty one, and one whose bits address cells a block does not have —
+        // which the validator refuses, and which is the shape a mutator is most
+        // likely to produce from the others.
+        ClientMessage::BlockDelta {
+            edit: Edit::Partial {
+                pos: BlockPos::new(4, 5, 6),
+                material: 3,
+                occupancy: 0b0000_0001_1111_1111_1111,
+            },
+        },
+        ClientMessage::BlockDelta {
+            edit: Edit::Partial {
+                pos: BlockPos::new(0, 0, 0),
+                material: 1,
+                occupancy: (1 << tiamot_core::UNITS_PER_BLOCK) - 1,
+            },
+        },
+        ClientMessage::BlockDelta {
+            edit: Edit::Partial {
+                pos: BlockPos::new(-1, -1, -1),
+                material: u16::MAX,
+                occupancy: 0,
+            },
+        },
+        ClientMessage::BlockDelta {
+            edit: Edit::Partial {
+                pos: BlockPos::new(1, 1, 1),
+                material: 2,
+                occupancy: u32::MAX,
+            },
+        },
         ClientMessage::Chat {
             text: "hello there".to_owned(),
         },
@@ -142,6 +175,35 @@ fn client_messages() -> Vec<Vec<u8>> {
             signature: WireSignature([0xFF; 64]),
         },
         ClientMessage::Disconnect,
+        // Protocol v5. These were appended without the corpus being re-seeded,
+        // so until now the fuzzer had never seen a valid encoding of any of
+        // them — it was mutating outwards from a protocol that stopped at
+        // `Disconnect`, and reporting a clean run while doing it.
+        ClientMessage::StartDig {
+            target: SubNodePos::new(3, 4, 5),
+        },
+        ClientMessage::StartDig {
+            target: SubNodePos::new(i32::MIN, 0, i32::MAX),
+        },
+        ClientMessage::CancelDig,
+        ClientMessage::SelectTool { tool: None },
+        ClientMessage::SelectTool {
+            tool: Some("core_tools:chisel".to_owned()),
+        },
+        // At the name-length bound, which is where the check either holds or
+        // does not.
+        ClientMessage::SelectTool {
+            tool: Some("t".repeat(32)),
+        },
+        // Protocol v6.
+        ClientMessage::Place {
+            target: SubNodePos::new(6, 7, 8),
+            material: 3,
+        },
+        ClientMessage::Place {
+            target: SubNodePos::new(i32::MAX, i32::MIN, 0),
+            material: u16::MAX,
+        },
     ];
     messages.iter().filter_map(|m| encode(m).ok()).collect()
 }
@@ -301,6 +363,42 @@ fn server_messages() -> Vec<Vec<u8>> {
                     texture: Some([0x00; 32]),
                 },
             ],
+        },
+        // Protocol v4 and v5, also never seeded when they were added. Both
+        // carry `f32` fields that `validate_server_message` bounds, so the
+        // shapes worth having are the ordinary one and the ones that are only
+        // rejected because something checks them: a non-finite position, and a
+        // dig progress outside 0..=1.
+        ServerMessage::PlayerState {
+            last_processed_input: 1234,
+            chunk: ChunkPos::new(1, 2, 3),
+            local: [24.0, 0.5, 47.9],
+            velocity: [0.1, -0.2, 0.3],
+            on_ground: true,
+        },
+        ServerMessage::PlayerState {
+            last_processed_input: u64::MAX,
+            chunk: ChunkPos::new(i32::MIN, 0, i32::MAX),
+            local: [f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+            velocity: [f32::MAX, f32::MIN, 0.0],
+            on_ground: false,
+        },
+        ServerMessage::DigProgress {
+            target: SubNodePos::new(9, 9, 9),
+            progress: 0.5,
+        },
+        ServerMessage::DigProgress {
+            target: SubNodePos::new(0, 0, 0),
+            progress: f32::NAN,
+        },
+        // Protocol v6's partial edit, on the way back out.
+        ServerMessage::BlockDelta {
+            edit: Edit::Partial {
+                pos: BlockPos::new(2, 3, 4),
+                material: 5,
+                occupancy: 0b0000_0111_1111_1111_1111_1111,
+            },
+            actor: Some([0xAB; 32]),
         },
     ];
     messages.iter().filter_map(|m| encode(m).ok()).collect()

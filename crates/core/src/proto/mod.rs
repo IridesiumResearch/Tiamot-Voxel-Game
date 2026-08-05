@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -52,6 +52,9 @@ pub const PROTOCOL_VERSION: u32 = 5;
 // stopped deriving `Eq` because that variant carries `f32` fields.
 // v5 (Task 09): appended `ClientMessage::{StartDig, CancelDig, SelectTool}` and
 // `ServerMessage::DigProgress`. `ClientMessage` was already `PartialEq`-only.
+// v6 (Task 09): appended `ClientMessage::Place` and `Edit::Partial`. `Edit` is
+// nested inside `BlockDelta` on both sides, so appending a variant to it
+// changes what both messages can carry without moving either of them.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -203,6 +206,31 @@ pub enum Edit {
         pos: SubNodePos,
         /// The new material's numeric id.
         material: u16,
+    },
+
+    /// Replace a whole block with a partially-filled one.
+    ///
+    /// **Appended at the end** (protocol v6). [`Edit`] is a postcard enum and
+    /// postcard encodes variants positionally, so a variant inserted anywhere
+    /// else silently reinterprets every message a differently-built peer sends.
+    ///
+    /// One edit rather than 27 [`Edit::SubNode`]s. Placing spare nodes is a
+    /// single player action and it produces a single block, so sending it as
+    /// two dozen independent cell writes would put a partially-built block on
+    /// screen for as long as the burst took to arrive, and would cost 27 times
+    /// the bytes to say the same thing.
+    Partial {
+        /// Which block.
+        pos: BlockPos,
+        /// The material filling the occupied cells.
+        material: u16,
+        /// Which of the 27 cells are filled, indexed by
+        /// [`crate::block::subnode_index`].
+        ///
+        /// Bits at or above [`crate::UNITS_PER_BLOCK`] are invalid
+        /// and rejected by [`validate_client_message`]; they cannot address a
+        /// cell, so a peer setting one is broken or probing.
+        occupancy: u32,
     },
 }
 
@@ -373,6 +401,34 @@ pub enum ClientMessage {
     SelectTool {
         /// The qualified tool id, e.g. `"core:chisel"`.
         tool: Option<String>,
+    },
+
+    /// Place material from the player's inventory into a cell.
+    ///
+    /// **Appended at the end** (protocol v6).
+    ///
+    /// A *request*, not an instruction. The server decides whether it happens
+    /// at all: whether the player holds any of that material, whether the
+    /// target is empty, and whether the resulting geometry would be inside
+    /// somebody. Charter rule 2 puts every one of those on the server, and a
+    /// client that could place by asserting it had would be able to build out
+    /// of nothing and seal players inside blocks.
+    ///
+    /// The material is named rather than taken from a selected slot because a
+    /// slot index is not stable: inventories are consolidated on every credit,
+    /// so the index a client selected can name a different stack by the time
+    /// its next message lands. Naming the material is unambiguous, and the
+    /// server verifies the player actually has it.
+    Place {
+        /// The cell to fill. Its block is what actually gets written — see
+        /// [`crate::inventory::placement_mask`] for the fill order within it.
+        ///
+        /// The client sends the cell it wants filled, already stepped across
+        /// the face it is pointing at. Which cell that is depends on the
+        /// camera, and the camera is presentation.
+        target: SubNodePos,
+        /// Which material to place, as a world material id.
+        material: u16,
     },
 }
 
@@ -686,15 +742,38 @@ pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolEr
                 }
             }
         }
+        ClientMessage::BlockDelta { edit } => check_occupancy(edit)?,
+
         ClientMessage::AuthResponse { .. }
         | ClientMessage::JoinWorld
-        | ClientMessage::BlockDelta { .. }
         | ClientMessage::AddKey { .. }
         | ClientMessage::RotateKey { .. }
         | ClientMessage::StartDig { .. }
         | ClientMessage::CancelDig
         | ClientMessage::SelectTool { tool: None }
+        | ClientMessage::Place { .. }
         | ClientMessage::Disconnect => {}
+    }
+    Ok(())
+}
+
+/// Rejects an occupancy mask that addresses cells a block does not have.
+///
+/// A block has [`crate::UNITS_PER_BLOCK`] cells, so only that many
+/// bits mean anything. A peer setting a higher one is broken or probing, and
+/// the honest answer is to refuse the message rather than to mask the bits off
+/// and act on a request nobody made.
+fn check_occupancy(edit: &Edit) -> Result<(), ProtocolError> {
+    let Edit::Partial { occupancy, .. } = edit else {
+        return Ok(());
+    };
+    let addressable = (1u32 << crate::UNITS_PER_BLOCK) - 1;
+    if occupancy & !addressable != 0 {
+        return Err(ProtocolError::FieldTooLarge {
+            field: "occupancy",
+            len: occupancy.count_ones() as usize,
+            limit: crate::UNITS_PER_BLOCK as usize,
+        });
     }
     Ok(())
 }
@@ -746,13 +825,18 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         ServerMessage::ContentChunk { data, .. } => {
             check_len("content_chunk", data.len(), MAX_CONTENT_CHUNK_BYTES)?;
         }
+        // The same bound as the client side: a server is not automatically
+        // trusted either (charter rule 14), and an occupancy mask that
+        // addresses cells a block does not have would be applied to the
+        // client's own copy of the world.
+        ServerMessage::BlockDelta { edit, .. } => check_occupancy(edit)?,
+
         ServerMessage::HelloAck { .. }
         | ServerMessage::AuthChallenge { .. }
         | ServerMessage::ModManifest { .. }
         | ServerMessage::JoinWorld { .. }
         | ServerMessage::ChunkData { .. }
         | ServerMessage::ChunkUnload { .. }
-        | ServerMessage::BlockDelta { .. }
         | ServerMessage::EntityStateDelta { .. }
         | ServerMessage::Disconnect { .. }
         | ServerMessage::InventoryUpdate { .. }
@@ -1023,7 +1107,7 @@ mod tests {
         // test fails after an edit, something was inserted or reordered rather
         // than appended, and PROTOCOL_VERSION must be bumped.
         let signature = WireSignature([0u8; 64]);
-        let client: [(ClientMessage, u8); 13] = [
+        let client: [(ClientMessage, u8); 14] = [
             (
                 ClientMessage::Hello {
                     protocol_version: 0,
@@ -1088,6 +1172,14 @@ mod tests {
             ),
             (ClientMessage::CancelDig, 11),
             (ClientMessage::SelectTool { tool: None }, 12),
+            // Protocol v6.
+            (
+                ClientMessage::Place {
+                    target: SubNodePos::new(0, 0, 0),
+                    material: 0,
+                },
+                13,
+            ),
         ];
 
         for (message, expected) in client {
@@ -1097,6 +1189,93 @@ mod tests {
                 "{message:?} should be ordinal {expected}; a variant was inserted or reordered"
             );
         }
+    }
+
+    #[test]
+    fn edit_variant_ordinals_are_pinned() {
+        // `Edit` is nested inside `BlockDelta` on both sides, so it is exactly
+        // as position-encoded as the messages themselves and exactly as
+        // dangerous to reorder — with the extra hazard that its ordinal is
+        // buried in a message body rather than sitting at byte zero, so a peer
+        // reading a shifted `Edit` gets a plausible-looking edit at a wrong
+        // position rather than an obvious failure.
+        //
+        // It had no pin until protocol v6 appended `Partial`. This is that pin.
+        let edits: [(Edit, u8); 3] = [
+            (
+                Edit::Block {
+                    pos: BlockPos::new(0, 0, 0),
+                    material: 0,
+                },
+                0,
+            ),
+            (
+                Edit::SubNode {
+                    pos: SubNodePos::new(0, 0, 0),
+                    material: 0,
+                },
+                1,
+            ),
+            (
+                Edit::Partial {
+                    pos: BlockPos::new(0, 0, 0),
+                    material: 0,
+                    occupancy: 0,
+                },
+                2,
+            ),
+        ];
+
+        for (edit, expected) in edits {
+            let bytes = postcard::to_allocvec(&edit).expect("encode");
+            assert_eq!(
+                bytes[0], expected,
+                "{edit:?} should be ordinal {expected}; a variant was inserted or reordered"
+            );
+        }
+    }
+
+    #[test]
+    fn an_occupancy_mask_addressing_cells_a_block_does_not_have_is_refused() {
+        // A mask is 27 meaningful bits in a `u32`, so five bits of it address
+        // nothing. A peer setting one is broken or probing, and masking them
+        // off silently would apply a request nobody made.
+        let hostile = Edit::Partial {
+            pos: BlockPos::new(0, 0, 0),
+            material: 1,
+            occupancy: 1 << crate::UNITS_PER_BLOCK,
+        };
+        assert!(
+            validate_client_message(&ClientMessage::BlockDelta {
+                edit: hostile.clone()
+            })
+            .is_err(),
+            "an out-of-range occupancy bit was accepted from a client"
+        );
+        // A server is not trusted either (charter rule 14) — this one lands in
+        // the client's own copy of the world.
+        assert!(
+            validate_server_message(&ServerMessage::BlockDelta {
+                edit: hostile,
+                actor: None
+            })
+            .is_err(),
+            "an out-of-range occupancy bit was accepted from a server"
+        );
+
+        // The counter-example: a full, legitimate mask must still pass, or this
+        // would be satisfied by a validator that refused everything.
+        assert!(
+            validate_client_message(&ClientMessage::BlockDelta {
+                edit: Edit::Partial {
+                    pos: BlockPos::new(0, 0, 0),
+                    material: 1,
+                    occupancy: (1 << crate::UNITS_PER_BLOCK) - 1,
+                }
+            })
+            .is_ok(),
+            "a legitimate full occupancy mask was refused"
+        );
     }
 
     #[test]
