@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use bot::Bot;
 use tiamot_core::identity::{Allowlist, Identity};
-use tiamot_core::proto::Edit;
+use tiamot_core::proto::{Edit, ServerMessage};
 use tiamot_core::{BlockPos, MaterialId, SubNodePos};
 use tiamot_server::{ServerHandle, Settings};
 
@@ -38,6 +38,49 @@ fn settings(dir: &std::path::Path) -> Settings {
         mods_path: None,
         seed: Some(1),
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
+    }
+}
+
+/// The reference mods, which register the tools a dig needs.
+///
+/// Charter rule 1: the engine has no tools of its own, not even a bare hand, so
+/// a world with no mods is one nobody can dig in. Any test here that breaks a
+/// block needs these; the ones that only check persistence do not.
+fn reference_mods() -> PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../game")
+        .canonicalize()
+        .expect("the reference mods live at the repo root")
+}
+
+fn settings_with_mods(dir: &std::path::Path) -> Settings {
+    Settings {
+        mods_path: Some(reference_mods()),
+        ..settings(dir)
+    }
+}
+
+/// Digs a whole block for real, re-aiming until the server confirms it.
+///
+/// Re-aiming at the same cell keeps its progress, so repeating costs nothing
+/// and survives a message going missing.
+async fn dig(bot: &mut Bot, pos: BlockPos) {
+    bot.select_tool(None).await.expect("bare hand");
+    let target = SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        bot.start_dig(target).await.expect("start dig");
+        if bot
+            .expect_block(pos, MaterialId::AIR.0, Duration::from_secs(4))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "digging {pos:?} never completed"
+        );
     }
 }
 
@@ -80,27 +123,37 @@ async fn join(server: &ServerHandle, name: &str) -> Bot {
 
 #[test]
 fn two_bots_see_each_others_block_edits() {
-    // THE acceptance criterion for Task 06.
+    // THE acceptance criterion for Task 06, on the path Task 09 replaced it
+    // with. It used to be "Alice sends a BlockDelta and Bob sees it", which
+    // stopped being possible when clients lost the ability to edit the world
+    // directly — so the criterion is now what it always meant: **a change one
+    // player makes shows up for another**, made the way a player actually
+    // makes one.
     let dir = world_dir("two-bots");
-    let server = ServerHandle::start(&settings(&dir)).expect("start");
+    let server = ServerHandle::start(&settings_with_mods(&dir)).expect("start");
     let stone = material_id(&server, "test:stone");
 
     block_on(async {
         let mut alice = join(&server, "Alice").await;
         let mut bob = join(&server, "Bob").await;
 
-        let edit = Edit::Block {
-            pos: BlockPos::new(4, 5, 6),
-            material: stone,
-        };
-        alice.edit(edit.clone()).await.expect("send edit");
+        // Something for Alice to break, arranged by the operator.
+        let pos = BlockPos::new(4, 5, 6);
+        assert!(server.seed_block(pos, stone), "seed queue full");
+        for bot in [&mut alice, &mut bob] {
+            bot.expect_block(pos, stone, Duration::from_secs(10))
+                .await
+                .expect("the seed should reach both");
+        }
 
-        let seen = bob
-            .next_block_delta(Duration::from_secs(5))
-            .await
-            .expect("wait")
-            .expect("Bob must see Alice's edit");
-        assert_eq!(seen, edit, "Bob must see exactly what Alice placed");
+        dig(&mut alice, pos).await;
+
+        assert!(
+            bob.expect_block(pos, MaterialId::AIR.0, Duration::from_secs(10))
+                .await
+                .is_ok(),
+            "Bob must see the block Alice broke"
+        );
 
         alice.disconnect().await;
         bob.disconnect().await;
@@ -115,23 +168,22 @@ fn an_editor_sees_their_own_edit_confirmed() {
     // rather than silently dropped — otherwise it has to guess, and a guess
     // that is wrong leaves a ghost block on screen.
     let dir = world_dir("own-edit");
-    let server = ServerHandle::start(&settings(&dir)).expect("start");
+    let server = ServerHandle::start(&settings_with_mods(&dir)).expect("start");
     let stone = material_id(&server, "test:stone");
 
     block_on(async {
         let mut alice = join(&server, "Alice").await;
-        let edit = Edit::Block {
-            pos: BlockPos::new(1, 1, 1),
-            material: stone,
-        };
-        alice.edit(edit.clone()).await.expect("send edit");
-
-        let seen = alice
-            .next_block_delta(Duration::from_secs(5))
+        let pos = BlockPos::new(1, 1, 1);
+        assert!(server.seed_block(pos, stone), "seed queue full");
+        alice
+            .expect_block(pos, stone, Duration::from_secs(10))
             .await
-            .expect("wait")
-            .expect("the editor must get a confirmation");
-        assert_eq!(seen, edit);
+            .expect("the seed should land");
+
+        // The digger is not excluded from their own broadcast. A client that
+        // had to predict its own edits and never hear about them would have no
+        // way to notice one being refused.
+        dig(&mut alice, pos).await;
 
         alice.disconnect().await;
     });
@@ -145,27 +197,67 @@ fn a_subnode_edit_is_broadcast_at_subnode_resolution() {
     // rounded a chisel up to a whole block would make it invisible to everyone
     // but the editor.
     let dir = world_dir("subnode-broadcast");
-    let server = ServerHandle::start(&settings(&dir)).expect("start");
+    let server = ServerHandle::start(&settings_with_mods(&dir)).expect("start");
     let glass = material_id(&server, "test:glass");
 
     block_on(async {
         let mut alice = join(&server, "Alice").await;
         let mut bob = join(&server, "Bob").await;
 
-        let edit = Edit::SubNode {
-            pos: SubNodePos::new(10, 11, 12),
-            material: glass,
-        };
-        alice.edit(edit.clone()).await.expect("send edit");
+        let block = BlockPos::new(10, 11, 12);
+        assert!(server.seed_block(block, glass), "seed queue full");
+        for bot in [&mut alice, &mut bob] {
+            bot.expect_block(block, glass, Duration::from_secs(10))
+                .await
+                .expect("the seed should reach both");
+        }
 
-        let seen = bob
-            .next_block_delta(Duration::from_secs(5))
+        // A real chisel, with the sub-node brush a MOD registered — which is
+        // the whole argument for sub-nodes existing.
+        let target = SubNodePos::new(block.x * 3, block.y * 3, block.z * 3);
+        alice
+            .select_tool(Some("core_tools:chisel"))
             .await
-            .expect("wait")
-            .expect("Bob must see the chisel");
-        assert_eq!(
-            seen, edit,
-            "the broadcast must keep sub-node resolution, not round to a block"
+            .expect("select chisel");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let saw_cell = loop {
+            alice.start_dig(target).await.expect("start dig");
+            let _ = tokio::time::timeout(Duration::from_secs(2), bob.recv()).await;
+            let seen = bob.received().into_iter().any(|message| {
+                matches!(
+                    message,
+                    ServerMessage::BlockDelta {
+                        edit: Edit::SubNode { pos, material },
+                        ..
+                    } if pos == target && material == MaterialId::AIR.0
+                )
+            });
+            if seen {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+        };
+
+        assert!(
+            saw_cell,
+            "Bob never saw a SUB-NODE removal; a broadcast that rounded the chisel up to a \
+             whole block would make it invisible to everyone but the digger"
+        );
+        // And emphatically not the whole block: that is the failure this test
+        // exists to catch, and it looks identical from the digger's side.
+        assert!(
+            !bob.received().into_iter().any(|message| {
+                matches!(
+                    message,
+                    ServerMessage::BlockDelta {
+                        edit: Edit::Block { pos, material },
+                        ..
+                    } if pos == block && material == MaterialId::AIR.0
+                )
+            }),
+            "the chisel was broadcast as a whole-block removal"
         );
 
         alice.disconnect().await;
@@ -186,13 +278,9 @@ fn an_edit_survives_a_server_restart() {
     let stone = material_id(&server, "test:stone");
     block_on(async {
         let mut alice = join(&server, "Alice").await;
-        alice
-            .edit(Edit::Block {
-                pos,
-                material: stone,
-            })
-            .await
-            .expect("send edit");
+        // What persists is a world edit, whoever made it — so this arranges one
+        // rather than acting out a player making it.
+        assert!(server.seed_block(pos, stone), "seed queue full");
 
         // Wait for the server to confirm it applied, so the shutdown save has
         // something to write.
@@ -238,13 +326,7 @@ fn an_edit_reaches_the_database_without_waiting_for_shutdown() {
 
     block_on(async {
         let mut alice = join(&server, "Alice").await;
-        alice
-            .edit(Edit::Block {
-                pos,
-                material: stone,
-            })
-            .await
-            .expect("send edit");
+        assert!(server.seed_block(pos, stone), "seed queue full");
         alice
             .next_block_delta(Duration::from_secs(5))
             .await
@@ -301,37 +383,37 @@ fn an_edit_with_an_unregistered_material_is_ignored_without_dropping_the_player(
     block_on(async {
         let mut alice = join(&server, "Alice").await;
 
+        // A placement naming a material that does not exist. The client-side
+        // edit path this used to test is gone; `Place` is where a bad material
+        // id can still arrive from a peer, and the requirement is unchanged —
+        // refused, and not with a disconnect.
         alice
-            .edit(Edit::Block {
-                pos: BlockPos::new(2, 2, 2),
-                material: 60_000,
-            })
+            .place_from_inventory(SubNodePos::new(6, 6, 6), 60_000)
             .await
             .expect("send");
-
-        // Nothing should come back for the bad edit.
         assert!(
             alice
                 .next_block_delta(Duration::from_millis(500))
                 .await
                 .expect("wait")
                 .is_none(),
-            "an unregistered material must not be broadcast"
+            "an unregistered material must not reach the world"
         );
 
-        // And the connection must still work.
-        let good = Edit::Block {
-            pos: BlockPos::new(3, 3, 3),
-            material: stone,
-        };
-        alice.edit(good.clone()).await.expect("send");
+        // And the connection must still work: the operator writes a block and
+        // Alice, still connected, sees it.
+        let pos = BlockPos::new(3, 3, 3);
+        assert!(server.seed_block(pos, stone), "seed queue full");
         assert_eq!(
             alice
                 .next_block_delta(Duration::from_secs(5))
                 .await
                 .expect("wait"),
-            Some(good),
-            "a bad edit must not have cost the player their session"
+            Some(Edit::Block {
+                pos,
+                material: stone
+            }),
+            "a bad request must not have cost the player their session"
         );
 
         alice.disconnect().await;
@@ -357,11 +439,16 @@ fn a_bot_that_never_joined_cannot_edit() {
         .await
         .expect("connect");
 
+        // Both gameplay requests, from a peer that has authenticated but never
+        // entered the world. The session refuses anything but the handshake
+        // before `Phase::InWorld`, and the check is the phase itself rather
+        // than a flag someone can forget to test.
         intruder
-            .edit(Edit::Block {
-                pos: BlockPos::new(0, 0, 0),
-                material: stone,
-            })
+            .place_from_inventory(SubNodePos::new(0, 0, 0), stone)
+            .await
+            .expect("send");
+        intruder
+            .start_dig(SubNodePos::new(0, 0, 0))
             .await
             .expect("send");
 
