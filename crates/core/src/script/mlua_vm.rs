@@ -739,12 +739,26 @@ impl ScriptVm for MluaVm {
                         drops.sort();
                         drops
                     });
+                let light_emit = entry
+                    .as_ref()
+                    .and_then(|entry| entry.get::<Option<Table>>("light_emit").ok().flatten())
+                    .map_or((0, 0, 0), |emit| {
+                        let channel = |key: &str| {
+                            emit.get::<Option<u8>>(key)
+                                .ok()
+                                .flatten()
+                                .unwrap_or(0)
+                                .min(crate::light::MAX_LEVEL)
+                        };
+                        (channel("r"), channel("g"), channel("b"))
+                    });
                 (
                     *id,
                     BlockRules {
                         block: block.clone(),
                         hardness,
                         drops,
+                        light_emit,
                     },
                 )
             })
@@ -1335,6 +1349,30 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
         if let Some(hardness) = hardness {
             entry.set("hardness", hardness)?;
         }
+
+        // `light_emit = { r = 0..15, g = ..., b = ... }`. Validated here rather
+        // than clamped silently, because a mod asking for 30 has misunderstood
+        // the range and should be told at registration — when the error names
+        // the mod and the block — rather than shipping a lamp that is quietly
+        // dimmer than its author intended.
+        if let Some(emit) = spec.get::<Option<Table>>("light_emit")? {
+            for key in ["r", "g", "b"] {
+                let Some(level) = emit.get::<Option<i64>>(key)? else {
+                    continue;
+                };
+                if !(0..=i64::from(crate::light::MAX_LEVEL)).contains(&level) {
+                    return Err(mlua::Error::external(format!(
+                        "register_block(\"{id}\"): light_emit.{key} must be 0..={}, got {level}",
+                        crate::light::MAX_LEVEL
+                    )));
+                }
+            }
+            let stored = lua.create_table()?;
+            for key in ["r", "g", "b"] {
+                stored.set(key, emit.get::<Option<u8>>(key)?.unwrap_or(0))?;
+            }
+            entry.set("light_emit", stored)?;
+        }
         if let Some(drops) = drops {
             let parsed = lua.create_table()?;
             for pair in drops.pairs::<String, u32>() {
@@ -1439,7 +1477,7 @@ fn register_tool(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
 const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "default"];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
-const BLOCK_FIELDS: [&str; 7] = [
+const BLOCK_FIELDS: [&str; 8] = [
     "id",
     "name",
     "drops",
@@ -1447,6 +1485,7 @@ const BLOCK_FIELDS: [&str; 7] = [
     "description",
     "tags",
     "textures",
+    "light_emit",
 ];
 
 /// Keys the `textures` sub-table accepts.
@@ -2273,6 +2312,65 @@ mod dig_rules_tests {
             order,
             vec!["core:zeta", "core:alpha", "core:mu"],
             "registration order is id order, not alphabetical"
+        );
+    }
+
+    #[test]
+    fn a_block_emits_nothing_unless_its_mod_says_so() {
+        // Charter rule 1 for light sources: the engine has no lamps of its own,
+        // so a world whose mods register none is lit only by the sky.
+        let mut vm = vm();
+        load(&mut vm, "core", r#"game.register_block{ id = "plain" }"#).expect("load");
+
+        let rules = vm.registered_block_rules();
+        assert_eq!(rules[0].light_emit, (0, 0, 0));
+        assert!(rules[0].emission().is_dark());
+    }
+
+    #[test]
+    fn a_mod_can_register_a_coloured_lamp() {
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core",
+            r#"
+            game.register_block{ id = "torch", light_emit = { r = 15, g = 9, b = 2 } }
+            game.register_block{ id = "moonstone", light_emit = { b = 12 } }
+            "#,
+        )
+        .expect("load");
+
+        let rules = vm.registered_block_rules();
+        assert_eq!(rules[0].light_emit, (15, 9, 2));
+        // An omitted channel is zero, so this is a blue lamp and not a white
+        // one — the difference between "unset" and "full" for a mod that wrote
+        // only the channel it cared about.
+        assert_eq!(rules[1].light_emit, (0, 0, 12));
+
+        // And the packed form the simulation actually uses keeps the sun
+        // channel clear: a block emits colour, daylight comes from the sky.
+        let emission = rules[0].emission();
+        assert_eq!(emission.red(), 15);
+        assert_eq!(emission.green(), 9);
+        assert_eq!(emission.blue(), 2);
+        assert_eq!(emission.sun(), 0, "a block emitted sunlight");
+    }
+
+    #[test]
+    fn a_light_level_out_of_range_is_refused_rather_than_clamped() {
+        // Same reasoning as hardness: clamping leaves a mod believing it set
+        // something. A lamp quietly dimmer than its author asked for is a bug
+        // they would chase in the wrong place.
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core",
+            r#"game.register_block{ id = "toobright", light_emit = { r = 30 } }"#,
+        )
+        .expect_err("should refuse");
+        assert!(
+            detail_of(&err).contains("light_emit.r"),
+            "the error should name the channel: {err:?}"
         );
     }
 

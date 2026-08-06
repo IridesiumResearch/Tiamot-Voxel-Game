@@ -251,11 +251,31 @@ pub struct BlockRules {
     /// drops itself, 27 units for a full block and one per occupied cell
     /// otherwise. `Some` replaces that outright, in units.
     pub drops: Option<Vec<(String, u32)>>,
+    /// Light this block gives off, as `(r, g, b)` each 0..=15.
+    ///
+    /// `(0, 0, 0)` for almost everything — a block is not a lamp unless its mod
+    /// says so. **The engine registers no light sources of its own**, the same
+    /// way it registers no tools (charter rule 1): a world whose mods define no
+    /// emissive block is a world lit only by the sky, and that is a mod set's
+    /// decision rather than a missing engine feature.
+    ///
+    /// Sunlight is not settable here. It comes from the sky, not from a block.
+    pub light_emit: (u8, u8, u8),
 }
 
 impl BlockRules {
     /// Seconds to break a block whose mod said nothing about hardness.
     pub const DEFAULT_HARDNESS: f32 = 0.75;
+
+    /// What this block contributes to block light.
+    ///
+    /// The sun channel is always zero: a block emits colour, and daylight is
+    /// the sky's business.
+    #[must_use]
+    pub const fn emission(&self) -> crate::light::Light {
+        let (red, green, blue) = self.light_emit;
+        crate::light::Light::new(0, red, green, blue)
+    }
 }
 
 /// A tool a mod registered.

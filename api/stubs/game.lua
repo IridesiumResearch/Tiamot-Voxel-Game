@@ -124,6 +124,20 @@ function Stream:next_bool() end
 ---@field drops table<string, integer>? Overrides what breaking it yields: block id to UNITS (27 to a block). Omit for the ordinary rule — the block drops itself, 27 units whole or one per occupied sub-node. Bare ids are namespaced with your mod id.
 ---@field tags string[]? Arbitrary tags for other mods to match on.
 ---@field textures Tiamot.BlockTextures? Which images clients draw this block with.
+---@field light_emit Tiamot.LightEmit? Light this block gives off. Omit for anything that is not a lamp.
+
+---Light a block gives off, per colour channel, 0 to 15.
+---
+---There is no sunlight channel: daylight comes from the sky, not from a block.
+---A channel you omit is zero, so `{ r = 15 }` is a red lamp and not a white one.
+---
+---**The engine registers no light sources of its own.** A world whose mods
+---define no emissive block is lit only by the sky — that is a mod set's
+---decision, the same way a world with no tools is one nobody can dig in.
+---@class Tiamot.LightEmit
+---@field r integer? Red, 0..15. Default 0.
+---@field g integer? Green, 0..15. Default 0.
+---@field b integer? Blue, 0..15. Default 0.
 
 ---Textures for a block. Paths are relative to your mod's own directory, and the
 ---files are pushed to clients through the content pipeline — an absolute path,
