@@ -30,9 +30,11 @@
 use crate::block::{BlockView, subnode_index};
 use crate::material::MaterialId;
 
+mod emission;
 mod layer;
 pub mod propagate;
 
+pub use emission::Emissions;
 pub use layer::LightLayer;
 pub use propagate::{Neighbourhood, Region, flood, relight};
 

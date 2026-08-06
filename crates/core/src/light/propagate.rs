@@ -154,6 +154,46 @@ fn arriving(channel: usize, level: u8, face: usize) -> u8 {
     level.saturating_sub(ATTENUATION)
 }
 
+/// Seeds a block's own emission, and pushes it into its neighbours.
+///
+/// **An emitter's light ignores the emitter's own faces and respects its
+/// neighbours'.** Without this a solid lamp lights nothing at all: the
+/// permeability rule makes a full block opaque on every face (Contract §3), so
+/// its own glow would be sealed inside it, and `light_emit` would only ever
+/// work on blocks somebody had chiselled first.
+///
+/// The physical reading is that a block glows on its *surface* rather than in
+/// its middle. A lamp against open air lights the air; a lamp walled in on every
+/// side still lights nothing, because the neighbours' facing layers stop it.
+fn seed_emission(world: &mut impl Neighbourhood, pos: BlockPos, queue: &mut VecDeque<BlockPos>) {
+    let emission = world.emission(pos);
+    if emission.is_dark() {
+        return;
+    }
+
+    let here = world.light(pos).max(emission);
+    world.set_light(pos, here);
+    queue.push_back(pos);
+
+    for face in 0..FACE_COUNT {
+        let Some(next) = removal_step(world, pos, face) else {
+            continue;
+        };
+        let current = world.light(next);
+        let mut updated = current;
+        for channel in 0..CHANNELS {
+            let arrives = arriving(channel, emission.channel(channel), face);
+            if arrives > updated.channel(channel) {
+                updated = updated.with_channel(channel, arrives);
+            }
+        }
+        if updated != current {
+            world.set_light(next, updated);
+            queue.push_back(next);
+        }
+    }
+}
+
 /// Floods light outward from everything already in `queue`.
 ///
 /// The queue holds positions whose light has just increased and whose
@@ -218,11 +258,7 @@ pub fn relight(world: &mut impl Neighbourhood, region: Region) {
     }
 
     for pos in region.blocks() {
-        let emission = world.emission(pos);
-        if !emission.is_dark() {
-            world.set_light(pos, emission);
-            queue.push_back(pos);
-        }
+        seed_emission(world, pos, &mut queue);
     }
 
     for pos in region.blocks() {
@@ -270,6 +306,7 @@ pub fn edited(world: &mut impl Neighbourhood, pos: BlockPos) {
         after = after.max(Light::DAYLIGHT);
     }
     world.set_light(pos, after);
+    let became_emissive = !after.is_dark();
 
     let mut refill = VecDeque::new();
     for channel in 0..CHANNELS {
@@ -285,6 +322,12 @@ pub fn edited(world: &mut impl Neighbourhood, pos: BlockPos) {
         if let Some(next) = removal_step(world, pos, face) {
             refill.push_back(next);
         }
+    }
+    if became_emissive {
+        // Through the same door emission uses in `relight`: a lamp placed as a
+        // solid block would otherwise light nothing, because its own faces are
+        // shut.
+        seed_emission(world, pos, &mut refill);
     }
     if !world.light(pos).is_dark() {
         refill.push_back(pos);
@@ -536,6 +579,52 @@ mod tests {
         // One block away, one level down.
         assert_eq!(world.at(BlockPos::new(6, 5, 5)).red(), MAX_LEVEL - 1);
         assert_eq!(world.at(BlockPos::new(7, 5, 5)).red(), MAX_LEVEL - 2);
+    }
+
+    #[test]
+    fn a_solid_lamp_lights_the_air_beside_it() {
+        // **The rule a strict reading of Contract §3 would get wrong.** A full
+        // block is opaque on every face, so an emitter's own glow would be
+        // sealed inside it and `light_emit` would only work on blocks somebody
+        // had chiselled first. An emitter ignores its own faces and respects
+        // its neighbours'.
+        let mut world = open_box(12);
+        world.fill(BlockPos::new(0, 0, 0), BlockPos::new(12, 12, 12));
+        for x in 4..=10 {
+            world.set_solid(BlockPos::new(x, 6, 6), false);
+        }
+        // The lamp itself stays SOLID, which is the whole point.
+        let lamp = BlockPos::new(4, 6, 6);
+        world.set_solid(lamp, true);
+        world.lamp(lamp, Light::new(0, MAX_LEVEL, 0, 0));
+        let region = world.region;
+        relight(&mut world, region);
+
+        assert_eq!(
+            world.at(BlockPos::new(5, 6, 6)).red(),
+            MAX_LEVEL - 1,
+            "a solid lamp lit nothing, so its glow was sealed inside it"
+        );
+        assert_eq!(world.at(BlockPos::new(6, 6, 6)).red(), MAX_LEVEL - 2);
+    }
+
+    #[test]
+    fn a_lamp_walled_in_on_every_side_lights_nothing() {
+        // The counter-example that keeps the rule above honest: an emitter
+        // ignores its OWN faces, not its neighbours'. Otherwise a lamp buried
+        // in rock would glow through it.
+        let mut world = open_box(12);
+        world.fill(BlockPos::new(0, 0, 0), BlockPos::new(12, 12, 12));
+        let lamp = BlockPos::new(6, 6, 6);
+        world.lamp(lamp, Light::new(0, MAX_LEVEL, 0, 0));
+        let region = world.region;
+        relight(&mut world, region);
+
+        assert_eq!(
+            world.at(BlockPos::new(7, 6, 6)).red(),
+            0,
+            "a lamp buried in solid rock lit the rock next to it"
+        );
     }
 
     #[test]

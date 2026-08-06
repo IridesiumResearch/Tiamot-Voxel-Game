@@ -23,6 +23,7 @@ pub mod checkmods;
 pub mod config;
 pub mod content;
 pub mod handle;
+pub mod light;
 pub mod rcon;
 pub mod shutdown;
 pub mod sim;
