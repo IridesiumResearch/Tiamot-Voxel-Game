@@ -1392,6 +1392,25 @@ impl App {
         });
     }
 
+    /// The time of day, as a line a person can read.
+    ///
+    /// A 24-hour clock rather than the raw fraction, because "0.5" means
+    /// nothing at a glance and "12:00" means noon to everybody. The fraction is
+    /// kept beside it for anyone comparing against a server log.
+    fn clock_line(&self) -> String {
+        if !self.sky.has_day() {
+            return "no sky mod: permanent daylight".to_owned();
+        }
+        let time = self.sky.time();
+        let minutes = (time * 24.0 * 60.0) as u32;
+        format!(
+            "{:02}:{:02} ({time:.3}) · sun {:.2}",
+            minutes / 60,
+            minutes % 60,
+            self.renderer.sun_intensity()
+        )
+    }
+
     /// The HUD lines, top to bottom.
     #[must_use]
     pub fn hud(&self) -> Vec<String> {
@@ -1460,6 +1479,7 @@ impl App {
             // swapchain, which lands in `Phases::acquire` and looks exactly
             // like a hitch — and working out which mode a reading came from
             // otherwise costs a round trip with whoever took it.
+            self.clock_line(),
             format!(
                 "{} on {} / {} · vsync {}",
                 self.server_label,
