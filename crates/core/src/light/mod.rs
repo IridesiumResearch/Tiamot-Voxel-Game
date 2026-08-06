@@ -37,7 +37,7 @@ pub mod propagate;
 
 pub use emission::Emissions;
 pub use layer::LightLayer;
-pub use propagate::{Neighbourhood, Region, flood, relight};
+pub use propagate::{Neighbourhood, Region, edited, flood, relight};
 
 /// The brightest a channel can be.
 ///

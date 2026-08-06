@@ -197,6 +197,173 @@ fn the_physics_golden_is_stable_across_repeated_calls() {
     assert_eq!(physics_fingerprint(), physics_fingerprint());
 }
 
+/// The golden light fingerprint.
+///
+/// **Regenerate ONLY with a deliberate change to propagation**, exactly as with
+/// the physics golden above. Light is integer arithmetic, so this is not
+/// guarding against a float subset violation — it guards the other half of
+/// charter rule 4, which is that the *order* of a computation must not vary
+/// between platforms. A BFS whose queue order, face order, or container
+/// iteration differed would reach a different fixed point on one of the three
+/// CI targets and nowhere else.
+const LIGHT_GOLDEN: u64 = 7_215_387_918_458_500_778;
+
+/// Lights a fixed scene and hashes every block of it.
+///
+/// The scene is built so every rule has somewhere to show: open sky, a roof
+/// with a shaft through it so there is a gradient under the lip, and a sealed
+/// room with two lamps of different colours in it so the channels mix rather
+/// than one drowning the others.
+fn light_fingerprint() -> u64 {
+    use std::collections::BTreeMap;
+    use tiamot_core::coords::BlockPos;
+    use tiamot_core::light::propagate::{Neighbourhood, Region};
+    use tiamot_core::light::{Faces, Light, MAX_LEVEL, relight};
+
+    struct Scene {
+        region: Region,
+        solid: BTreeMap<(i32, i32, i32), bool>,
+        lamps: BTreeMap<(i32, i32, i32), Light>,
+        light: BTreeMap<(i32, i32, i32), Light>,
+    }
+
+    impl Neighbourhood for Scene {
+        fn faces(&self, pos: BlockPos) -> Option<Faces> {
+            if !self.region.contains(pos) {
+                return None;
+            }
+            let solid = self
+                .solid
+                .get(&(pos.x, pos.y, pos.z))
+                .copied()
+                .unwrap_or(false);
+            Some(if solid { Faces::OPAQUE } else { Faces::OPEN })
+        }
+
+        fn emission(&self, pos: BlockPos) -> Light {
+            self.lamps
+                .get(&(pos.x, pos.y, pos.z))
+                .copied()
+                .unwrap_or(Light::DARK)
+        }
+
+        fn light(&self, pos: BlockPos) -> Light {
+            self.light
+                .get(&(pos.x, pos.y, pos.z))
+                .copied()
+                .unwrap_or(Light::DARK)
+        }
+
+        fn set_light(&mut self, pos: BlockPos, level: Light) {
+            if self.region.contains(pos) {
+                self.light.insert((pos.x, pos.y, pos.z), level);
+            }
+        }
+    }
+
+    const SIZE: i32 = 24;
+    let mut scene = Scene {
+        region: Region {
+            min: BlockPos::new(0, 0, 0),
+            max: BlockPos::new(SIZE, SIZE, SIZE),
+        },
+        solid: BTreeMap::new(),
+        lamps: BTreeMap::new(),
+        light: BTreeMap::new(),
+    };
+
+    // A roof at y = 16 with a two-block shaft through it.
+    for z in 0..=SIZE {
+        for x in 0..=SIZE {
+            scene.solid.insert((x, 16, z), true);
+        }
+    }
+    for z in 10..12 {
+        for x in 10..12 {
+            scene.solid.insert((x, 16, z), false);
+        }
+    }
+    // A sealed room in the corner, with two lamps inside it.
+    for y in 2..8 {
+        for z in 2..8 {
+            for x in 2..8 {
+                let wall = x == 2 || x == 7 || y == 2 || y == 7 || z == 2 || z == 7;
+                scene.solid.insert((x, y, z), wall);
+            }
+        }
+    }
+    scene
+        .lamps
+        .insert((3, 3, 3), Light::new(0, MAX_LEVEL, 0, 4));
+    scene
+        .lamps
+        .insert((6, 6, 6), Light::new(0, 2, MAX_LEVEL, 0));
+
+    let region = scene.region;
+    relight(&mut scene, region);
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tiamot:light-golden:v1");
+    // A fixed traversal rather than the map's own order: the hash has to
+    // describe the light, not the container it happens to be in.
+    for y in 0..=SIZE {
+        for z in 0..=SIZE {
+            for x in 0..=SIZE {
+                let level = scene.light(BlockPos::new(x, y, z));
+                hasher.update(&level.0.to_le_bytes());
+            }
+        }
+    }
+    u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("BLAKE3 output is 32 bytes"),
+    )
+}
+
+#[test]
+fn a_lit_scene_hashes_to_its_golden() {
+    // **Task 10's cross-platform determinism criterion.** The CI matrix runs
+    // this on Linux, Windows and macOS against the same constant.
+    assert_eq!(
+        light_fingerprint(),
+        LIGHT_GOLDEN,
+        "the same scene lit to a different result. Do NOT update the constant to match unless \
+         propagation changed deliberately — a difference here means the BFS order, the face \
+         order, or a container's iteration order varies between builds."
+    );
+}
+
+#[test]
+fn the_light_golden_is_stable_across_repeated_calls() {
+    // The counter-example that makes the constant mean something: a scene not
+    // even reproducible in one process could not be reproducible across three
+    // platforms.
+    assert_eq!(light_fingerprint(), light_fingerprint());
+}
+
+#[test]
+fn the_lit_scene_is_not_trivially_uniform() {
+    // A golden over an all-dark scene would pass against an implementation
+    // that did nothing at all. This pins that the fixture exercises the rules
+    // it was built for.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tiamot:light-golden:v1");
+    for _ in 0..(25 * 25 * 25) {
+        hasher.update(&0u16.to_le_bytes());
+    }
+    let all_dark = u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("BLAKE3 output is 32 bytes"),
+    );
+    assert_ne!(
+        light_fingerprint(),
+        all_dark,
+        "the golden scene is entirely dark, so the hash proves nothing"
+    );
+}
+
 #[test]
 fn every_golden_case_is_distinct() {
     // A gate whose cases collide is weaker than it looks: a change could move

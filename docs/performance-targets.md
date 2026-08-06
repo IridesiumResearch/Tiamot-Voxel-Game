@@ -115,6 +115,45 @@ optimistic and the ratios as the useful part:
 Sub-node resolution is not the expensive part of this engine. When something
 later is slow, that is where to look — not here.
 
+### What Task 10 measured (light)
+
+Same machine, `cargo bench -p tiamot-core --bench light`, against the real
+implementation rather than 02b's spike.
+
+| Operation | Cost | Share of a 50 ms tick |
+|---|---|---|
+| Full-chunk relight, open sky | 0.233 ms | 0.5% |
+| Full-chunk relight, solid rock | 0.078 ms | 0.2% |
+| Full-chunk relight, every block chiselled | 0.233 ms | 0.5% |
+| Digging one block into a lit wall | 0.00012 ms | negligible |
+| Placing a lamp | 0.119 ms | 0.24% |
+| Breaking a lamp | 0.271 ms | 0.54% |
+
+**The chiselled case costs the same as open air.** That is the cached
+permeability byte earning charter rule 19: Task 02b measured the uncached face
+test at a ≈50% penalty on exactly this content, and the penalty is gone.
+
+**Read these against how many happen per tick, not on their own:**
+
+- Newly loaded chunks are capped at `RELIGHTS_PER_TICK` (32), so the worst a
+  tick can spend filling in terrain is **32 × 0.233 ms ≈ 7.5 ms, 15% of the
+  budget**. That cap exists because a teleport or a fresh start can make
+  thousands of chunks resident at once; what a tick does not reach it takes on
+  the next one.
+- Ordinary digging is free at any player count — 50 players digging flat out is
+  0.006 ms a tick.
+- **Lamps are the expensive edit.** Fifty players breaking lamps as fast as
+  they can would be 13.5 ms a tick, 27% of the budget. That is a load nobody
+  will generate by playing, and it is the number to remember if lighting ever
+  looks like the problem.
+
+02b's spike measured 0.059 ms for the same shape of work. The real
+implementation is four times that, and the difference is honest rather than a
+regression: it carries four channels instead of one, it seeds and floods
+sunlight as well as block light, and it tests both facing layers per crossing
+rather than one. The absolute figure still leaves lighting well inside its
+share.
+
 ## Bandwidth targets
 
 | | |

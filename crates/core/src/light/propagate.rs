@@ -157,13 +157,17 @@ fn sky_reaches(world: &impl Neighbourhood, pos: BlockPos) -> bool {
         .is_some_and(|faces| faces.passes(super::face_positive(1)))
 }
 
-/// Whether light at `level` crossing from `from` into its neighbour survives.
+/// Whether light crosses out of a block through `face`, given its own faces.
 ///
 /// **Both facing layers are tested** — Sub-Node Contract §3 says so explicitly,
 /// and the asymmetric case is real: a block open on its `+x` face against a
 /// neighbour sealed on its `-x` face passes nothing.
-fn crosses(world: &impl Neighbourhood, from: BlockPos, face: usize) -> Option<BlockPos> {
-    let here = world.faces(from)?;
+fn crosses_from(
+    world: &impl Neighbourhood,
+    here: Faces,
+    from: BlockPos,
+    face: usize,
+) -> Option<BlockPos> {
     if !here.passes(face) {
         return None;
     }
@@ -171,6 +175,19 @@ fn crosses(world: &impl Neighbourhood, from: BlockPos, face: usize) -> Option<Bl
     let there = BlockPos::new(from.x + offset[0], from.y + offset[1], from.z + offset[2]);
     let neighbour = world.faces(there)?;
     neighbour.passes(opposite(face)).then_some(there)
+}
+
+/// Whether light crosses out of `from` through `face`, fetching its faces.
+///
+/// **Test-only, and that is the honest shape rather than an oversight.** Every
+/// production caller already holds the source's faces: `flood` hoists the
+/// lookup out of its face loop because asking six times per visit is six hash
+/// lookups into the chunk cache in the server's adapter, and removal
+/// deliberately ignores the source's faces entirely. What is left is the
+/// property test, which walks arbitrary blocks and has nothing in hand.
+#[cfg(test)]
+fn crosses(world: &impl Neighbourhood, from: BlockPos, face: usize) -> Option<BlockPos> {
+    crosses_from(world, world.faces(from)?, from, face)
 }
 
 /// The level one channel arrives at across a face.
@@ -242,9 +259,17 @@ pub fn flood(world: &mut impl Neighbourhood, queue: &mut VecDeque<BlockPos>) {
         if level.is_dark() {
             continue;
         }
+        // Hoisted out of the face loop. `crosses` would ask for this block's
+        // own permeability once per face — six times per visit, and in the
+        // server's adapter every one of those is a hash lookup into the chunk
+        // cache. The neighbour's answer still has to be fetched per face,
+        // because it is a different block each time.
+        let Some(here) = world.faces(pos) else {
+            continue;
+        };
 
         for face in 0..FACE_COUNT {
-            let Some(next) = crosses(world, pos, face) else {
+            let Some(next) = crosses_from(world, here, pos, face) else {
                 continue;
             };
 

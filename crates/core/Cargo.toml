@@ -57,3 +57,7 @@ harness = false
 [[bench]]
 name = "detgen"
 harness = false
+
+[[bench]]
+name = "light"
+harness = false
