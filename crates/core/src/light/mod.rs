@@ -31,8 +31,10 @@ use crate::block::{BlockView, subnode_index};
 use crate::material::MaterialId;
 
 mod layer;
+pub mod propagate;
 
 pub use layer::LightLayer;
+pub use propagate::{Neighbourhood, Region, flood, relight};
 
 /// The brightest a channel can be.
 ///
