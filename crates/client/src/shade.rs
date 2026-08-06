@@ -71,6 +71,36 @@ impl Shade {
     }
 }
 
+/// Cell-resolution occupancy, for ambient occlusion.
+///
+/// Coordinates are chunk-local cells and **may be out of range**, which is the
+/// interesting case: a face on a chunk's boundary has neighbours across it.
+pub trait CellOccupancy {
+    /// Whether a cell is solid. Out-of-range cells read as empty.
+    fn solid(&self, x: i32, y: i32, z: i32) -> bool;
+}
+
+/// Nothing is solid. For tests about light rather than about corners.
+#[derive(Debug, Clone, Copy)]
+pub struct Empty;
+
+impl CellOccupancy for Empty {
+    fn solid(&self, _x: i32, _y: i32, _z: i32) -> bool {
+        false
+    }
+}
+
+/// How much light a corner keeps, per occlusion level, in twentieths.
+///
+/// Level 3 is open and keeps everything; level 0 is a corner boxed in on both
+/// sides and keeps a little over half. **The darkest step is not zero**: a fully
+/// occluded corner in a lit room is in shadow, not in a different room, and
+/// black corners read as holes in the geometry rather than as shading.
+const OCCLUSION: [u32; 4] = [11, 14, 17, 20];
+
+/// The denominator [`OCCLUSION`] is expressed in.
+const OCCLUSION_FULL: u32 = 20;
+
 /// The light at the four corners of one cell's face.
 ///
 /// `cell` is the solid cell being drawn and `(axis, positive)` its face, so the
@@ -80,6 +110,7 @@ impl Shade {
 #[must_use]
 pub fn face_shade(
     light: &impl BlockLight,
+    occupancy: &impl CellOccupancy,
     axis: usize,
     positive: bool,
     cell: (i32, i32, i32),
@@ -91,9 +122,73 @@ pub fn face_shade(
     // The mesher's corner order. `(du, dv)` picks which of the four lattice
     // points around the cell face this corner sits on.
     for (index, (du, dv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
-        corners[index] = corner_light(light, outside, u_axis, v_axis, du, dv);
+        let level = corner_light(light, outside, u_axis, v_axis, du, dv);
+        let occlusion = corner_occlusion(occupancy, outside, u_axis, v_axis, du, dv);
+        corners[index] = darken(level, occlusion);
     }
     Shade(corners)
+}
+
+/// The classic three-neighbour ambient occlusion level, `0..=3`.
+///
+/// Looks at the two cells beside the corner in the face's own plane and the one
+/// diagonally between them, all in the layer *outside* the surface. Three is
+/// open sky; zero is a corner with geometry on both sides.
+///
+/// **Two solid sides give the darkest level whatever the diagonal does.** The
+/// diagonal is invisible from a corner already closed on both sides, and
+/// counting it would make an inside corner brighten when the block behind it
+/// was removed — which reads as the wrong block having been dug.
+///
+/// # A known seam
+///
+/// Cells outside the chunk read as empty, so a face on a chunk boundary gets no
+/// occlusion from geometry across it and is very slightly lighter than the same
+/// corner one block inside. The mesher's grid cannot answer diagonally across a
+/// boundary — its padding covers one cell along each column axis and no more —
+/// so closing this needs the store, and a store lookup per corner is twelve
+/// hash lookups per cell face. Recorded rather than hidden.
+fn corner_occlusion(
+    occupancy: &impl CellOccupancy,
+    outside: (i32, i32, i32),
+    u_axis: usize,
+    v_axis: usize,
+    du: i32,
+    dv: i32,
+) -> usize {
+    // From a lattice point, the neighbours that matter are on the corner's own
+    // side: `du = 0` looks towards -u, `du = 1` towards +u.
+    let toward_u = 2 * du - 1;
+    let toward_v = 2 * dv - 1;
+
+    let solid = |cell: (i32, i32, i32)| usize::from(occupancy.solid(cell.0, cell.1, cell.2));
+    let side_u = solid(step(outside, u_axis, toward_u));
+    let side_v = solid(step(outside, v_axis, toward_v));
+    if side_u == 1 && side_v == 1 {
+        return 0;
+    }
+    let diagonal = solid(step(step(outside, u_axis, toward_u), v_axis, toward_v));
+    3 - (side_u + side_v + diagonal)
+}
+
+/// One corner's light, scaled by its occlusion.
+///
+/// **Baked into the light rather than carried beside it**, which the task asks
+/// for and which has a useful consequence: occlusion becomes part of the merge
+/// key for free, so a quad splits at an AO discontinuity exactly as it does at
+/// a lighting one. Two faces that shade differently are not one quad however
+/// the difference arose.
+fn darken(level: Light, occlusion: usize) -> Light {
+    let keep = OCCLUSION[occlusion.min(3)];
+    if keep == OCCLUSION_FULL {
+        return level;
+    }
+    let mut out = Light::DARK;
+    for channel in 0..CHANNELS {
+        let scaled = u32::from(level.channel(channel)) * keep / OCCLUSION_FULL;
+        out = out.with_channel(channel, scaled as u8);
+    }
+    out
 }
 
 /// The average of the four blocks touching one corner of a face.
@@ -105,21 +200,33 @@ fn corner_light(
     du: i32,
     dv: i32,
 ) -> Light {
-    let mut totals = [0u32; CHANNELS];
+    let mut samples = [Light::DARK; 4];
     for i in 0..2 {
         for j in 0..2 {
             // The four cells sharing this lattice point, in the plane of the
             // face and on its outside layer.
             let cell = step(step(outside, u_axis, du - 1 + i), v_axis, dv - 1 + j);
-            let level = light.at(block_of(cell.0), block_of(cell.1), block_of(cell.2));
-            for (channel, total) in totals.iter_mut().enumerate() {
-                *total += u32::from(level.channel(channel));
-            }
+            samples[(i * 2 + j) as usize] =
+                light.at(block_of(cell.0), block_of(cell.1), block_of(cell.2));
         }
     }
 
+    // **The overwhelmingly common case, and worth its own path.** Light is per
+    // block and a block is three cells across, so most corners sit inside one
+    // block's neighbourhood and all four samples are the same value. Averaging
+    // four copies of a number channel by channel — unpacking, summing, rounding
+    // and repacking sixteen nibbles — costs more than the comparison that
+    // avoids it, and this runs for every corner of every face in a chunk.
+    if samples[1] == samples[0] && samples[2] == samples[0] && samples[3] == samples[0] {
+        return samples[0];
+    }
+
     let mut out = Light::DARK;
-    for (channel, total) in totals.into_iter().enumerate() {
+    for channel in 0..CHANNELS {
+        let total: u32 = samples
+            .iter()
+            .map(|level| u32::from(level.channel(channel)))
+            .sum();
         // Rounded rather than truncated: four corners each losing three
         // quarters of a level is a visible step darker across a whole surface.
         out = out.with_channel(channel, ((total + 2) / 4) as u8);
@@ -179,8 +286,8 @@ mod tests {
         // The case that keeps greedy meshing intact: if this were not exact,
         // every quad on open ground would split at every block boundary.
         let light = Uniform(Light::DAYLIGHT);
-        let a = face_shade(&light, 1, true, (0, 0, 0));
-        let b = face_shade(&light, 1, true, (30, 0, 17));
+        let a = face_shade(&light, &Empty, 1, true, (0, 0, 0));
+        let b = face_shade(&light, &Empty, 1, true, (30, 0, 17));
         assert_eq!(a, Shade::flat(Light::DAYLIGHT));
         assert_eq!(a, b, "two faces in the same light shaded differently");
     }
@@ -197,7 +304,7 @@ mod tests {
 
         // A top face of the cell at (1, 2, 1) — block (0, 0, 0) — looks up into
         // block (0, 1, 0).
-        let shade = face_shade(&light, 1, true, (1, 2, 1));
+        let shade = face_shade(&light, &Empty, 1, true, (1, 2, 1));
         assert_eq!(
             shade,
             Shade::flat(Light::DAYLIGHT),
@@ -216,7 +323,7 @@ mod tests {
 
         // A top face on the cell whose +z lattice edge is the block boundary at
         // z = 6 (block 2 starts there).
-        let shade = face_shade(&light, 1, true, (1, 2, 5));
+        let shade = face_shade(&light, &Empty, 1, true, (1, 2, 5));
         let levels: Vec<u8> = shade.0.iter().map(|level| level.sun()).collect();
         assert!(
             levels.contains(&MAX_LEVEL),
@@ -243,7 +350,7 @@ mod tests {
         // 0 and 1, one of each lamp. At z = 5 both sampled cells land in block
         // 1 and every corner is green: correct arithmetic over a fixture that
         // never crossed a boundary.
-        let shade = face_shade(&light, 1, true, (0, 2, 3));
+        let shade = face_shade(&light, &Empty, 1, true, (0, 2, 3));
         assert!(
             shade
                 .0
@@ -267,12 +374,108 @@ mod tests {
         // into cell y = 0, which is block 0 — the lit one. Cell y = -1 is
         // block -1, so a fixture one cell lower samples nothing and proves
         // nothing.
-        let shade = face_shade(&light, 1, true, (-2, -1, -2));
+        let shade = face_shade(&light, &Empty, 1, true, (-2, -1, -2));
         assert!(
             shade.0.iter().any(|level| level.sun() > 0),
             "a face west of the origin sampled the wrong block: {:?}",
             shade.0
         );
+    }
+
+    /// Solidity set per cell, empty elsewhere.
+    struct Cells(std::collections::BTreeSet<(i32, i32, i32)>);
+
+    impl CellOccupancy for Cells {
+        fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+            self.0.contains(&(x, y, z))
+        }
+    }
+
+    #[test]
+    fn a_corner_beside_geometry_is_darker_than_one_in_the_open() {
+        // Voxel AO's whole job: without it, an inside corner is exactly as
+        // bright as open ground and the geometry reads as flat.
+        let light = Uniform(Light::DAYLIGHT);
+        let open = face_shade(&light, &Empty, 1, true, (5, 5, 5));
+
+        // A wall standing on the surface, along -u of the face. The face's
+        // plane for axis 1 is (x, z), so -u is -x.
+        let mut cells = std::collections::BTreeSet::new();
+        cells.insert((4, 6, 5));
+        let occluded = face_shade(&light, &Cells(cells), 1, true, (5, 5, 5));
+
+        assert!(
+            occluded.0.iter().any(|level| level.sun() < MAX_LEVEL),
+            "a corner beside a wall was not darkened at all: {:?}",
+            occluded.0
+        );
+        assert!(
+            occluded.0.iter().any(|level| level.sun() == MAX_LEVEL),
+            "every corner darkened, so this is not occlusion but a dimmer: {:?}",
+            occluded.0
+        );
+        assert_ne!(open, occluded);
+    }
+
+    #[test]
+    fn a_corner_closed_on_both_sides_is_the_darkest_step_and_not_black() {
+        // Two solid sides is the darkest level whatever the diagonal does, and
+        // the darkest level still keeps over half its light: a black corner
+        // reads as a hole in the geometry rather than as shading.
+        let light = Uniform(Light::DAYLIGHT);
+        let mut cells = std::collections::BTreeSet::new();
+        cells.insert((4, 6, 5));
+        cells.insert((5, 6, 4));
+        let shade = face_shade(&light, &Cells(cells), 1, true, (5, 5, 5));
+
+        let darkest = shade.0.iter().map(|level| level.sun()).min().unwrap_or(0);
+        assert_eq!(
+            u32::from(darkest),
+            u32::from(MAX_LEVEL) * OCCLUSION[0] / OCCLUSION_FULL,
+            "the closed corner is not at the darkest occlusion step"
+        );
+        assert!(darkest > 0, "an occluded corner went black");
+    }
+
+    #[test]
+    fn the_diagonal_cannot_brighten_a_corner_that_is_already_closed() {
+        // The rule that stops an inside corner brightening when the block
+        // BEHIND it is removed, which reads as the wrong block having been dug.
+        let light = Uniform(Light::DAYLIGHT);
+        let sides = [(4, 6, 5), (5, 6, 4)];
+
+        let mut without = std::collections::BTreeSet::new();
+        without.extend(sides);
+        let mut with = without.clone();
+        with.insert((4, 6, 4));
+
+        assert_eq!(
+            face_shade(&light, &Cells(without), 1, true, (5, 5, 5)),
+            face_shade(&light, &Cells(with), 1, true, (5, 5, 5)),
+            "the diagonal changed a corner that was already closed on both sides"
+        );
+    }
+
+    #[test]
+    fn occlusion_scales_every_channel_and_not_just_the_sun() {
+        // A red lamp in an occluded corner should be a darker red, not a
+        // darker white — the shading multiplies the colour rather than mixing
+        // grey into it.
+        let light = Uniform(Light::new(0, MAX_LEVEL, 0, 0));
+        let mut cells = std::collections::BTreeSet::new();
+        cells.insert((4, 6, 5));
+        cells.insert((5, 6, 4));
+        let shade = face_shade(&light, &Cells(cells), 1, true, (5, 5, 5));
+
+        let darkest = shade
+            .0
+            .iter()
+            .min_by_key(|level| level.red())
+            .copied()
+            .unwrap_or(Light::DARK);
+        assert!(darkest.red() < MAX_LEVEL, "the red was not occluded");
+        assert!(darkest.red() > 0, "the red went black");
+        assert_eq!(darkest.green(), 0, "occlusion invented a green channel");
     }
 
     #[test]

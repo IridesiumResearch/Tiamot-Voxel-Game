@@ -51,6 +51,11 @@ use client::mesher::{Absent, Neighbours, mesh_chunk};
 use tiamot_core::coords::SubNodePos;
 use tiamot_core::{Chunk, MaterialId};
 
+/// Full daylight. **The uniform case is the right one for a mesh timing**: it
+/// is what leaves greedy merging exactly as Task 02b measured it, so these
+/// numbers stay comparable with the baseline they are gated against.
+const DAY: client::shade::Uniform = client::shade::Uniform(tiamot_core::light::Light::DAYLIGHT);
+
 const STONE: MaterialId = MaterialId(2);
 const DIRT: MaterialId = MaterialId(3);
 const GRASS: MaterialId = MaterialId(4);
@@ -249,12 +254,12 @@ fn skip_unless_optimised(name: &str) -> bool {
 /// not decide a gate, and the median is the statistic that ignores it.
 fn median_mesh_time(chunk: &Chunk, runs: usize) -> Duration {
     // One warm-up pass, so the first run's page faults are not measured.
-    let _ = mesh_chunk(chunk, &Neighbours::open(), Absent::Air);
+    let _ = mesh_chunk(chunk, &Neighbours::open(), Absent::Air, &DAY);
 
     let mut samples: Vec<Duration> = (0..runs)
         .map(|_| {
             let started = Instant::now();
-            let mesh = mesh_chunk(chunk, &Neighbours::open(), Absent::Air);
+            let mesh = mesh_chunk(chunk, &Neighbours::open(), Absent::Air, &DAY);
             let elapsed = started.elapsed();
             // Keep the result observable so the optimiser cannot delete the
             // work being measured.
@@ -343,11 +348,11 @@ fn border_aware_meshing_does_not_cost_more_than_the_spike_measured() {
         neighbours.sides[side] = Some(&neighbour);
     }
 
-    let _ = mesh_chunk(&chunk, &neighbours, Absent::Air);
+    let _ = mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY);
     let mut samples: Vec<Duration> = (0..25)
         .map(|_| {
             let started = Instant::now();
-            let mesh = mesh_chunk(&chunk, &neighbours, Absent::Air);
+            let mesh = mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY);
             let elapsed = started.elapsed();
             std::hint::black_box(mesh.quads.len());
             elapsed

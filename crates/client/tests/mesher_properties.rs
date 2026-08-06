@@ -20,6 +20,11 @@ use proptest::prelude::*;
 use tiamot_core::coords::SubNodePos;
 use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId};
 
+/// Full daylight, so these properties are about geometry. Light is its own
+/// merge key (see `client::shade`), and a varying field would be testing that
+/// instead of the greedy mesher against its oracle.
+const DAY: client::shade::Uniform = client::shade::Uniform(tiamot_core::light::Light::DAYLIGHT);
+
 /// Every quad expanded back into the cell faces it covers.
 ///
 /// A `BTreeSet` because it also catches a face emitted twice — two quads
@@ -103,8 +108,8 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air);
-        let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
         prop_assert_eq!(
             faces(&merged.quads),
@@ -122,8 +127,8 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air);
-        let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
         let merged_area: u32 = merged
             .quads
@@ -143,8 +148,8 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air);
-        let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
         prop_assert!(
             merged.quads.len() <= naive.len(),
@@ -162,7 +167,7 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
         for quad in &merged.quads {
             prop_assert!(quad.du >= 1 && quad.dv >= 1, "degenerate quad {:?}", quad);
@@ -191,8 +196,8 @@ proptest! {
             let mut neighbours = Neighbours::none();
             neighbours.sides[side] = Some(&neighbour);
 
-            let merged = mesh_chunk(&chunk, &neighbours, Absent::Air);
-            let naive = reference::mesh_chunk(&chunk, &neighbours, Absent::Air);
+            let merged = mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY);
+            let naive = reference::mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY);
 
             prop_assert_eq!(
                 faces(&merged.quads),
@@ -210,7 +215,7 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
         let (vertices, indices) = merged.to_buffers();
 
         for vertex in &vertices {

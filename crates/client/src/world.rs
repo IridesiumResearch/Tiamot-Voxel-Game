@@ -128,6 +128,18 @@ impl ChunkStore {
             .map_or(Light::DARK, |layer| layer.get(pos.local()))
     }
 
+    /// A light sampler for meshing one chunk.
+    ///
+    /// Reads across chunk boundaries, which is what smooth lighting at a seam
+    /// needs. A neighbour whose light has not arrived reads as dark rather than
+    /// as daylight — the honest answer, and the safe one: the faces against an
+    /// absent neighbour are not drawn at all (see [`Absent`]), so the dark only
+    /// ever applies where a real, loaded, genuinely dark chunk is.
+    #[must_use]
+    pub const fn light_for(&self, pos: ChunkPos) -> ChunkLight<'_> {
+        ChunkLight { store: self, pos }
+    }
+
     /// Whether any light has arrived for a chunk.
     #[must_use]
     pub fn has_light(&self, pos: ChunkPos) -> bool {
@@ -380,6 +392,24 @@ impl tiamot_core::phys::ChunkLookup for ChunkStore {
     }
 }
 
+/// One chunk's view of the light field, in chunk-local block coordinates.
+///
+/// Coordinates outside `0..16` reach into the neighbours, which is ordinary:
+/// a vertex on a chunk's edge samples blocks on both sides of it.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkLight<'a> {
+    store: &'a ChunkStore,
+    pos: ChunkPos,
+}
+
+impl crate::shade::BlockLight for ChunkLight<'_> {
+    fn at(&self, x: i32, y: i32, z: i32) -> Light {
+        let corner = BlockPos::from_chunk_corner(self.pos);
+        self.store
+            .light_at(BlockPos::new(corner.x + x, corner.y + y, corner.z + z))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,6 +631,7 @@ mod tests {
             chunk,
             &store.neighbours(ChunkPos::new(0, 0, 0)),
             ABSENT_POLICY,
+            &crate::shade::Uniform(Light::DAYLIGHT),
         );
         assert!(
             mesh.is_empty(),

@@ -36,6 +36,10 @@ use client::render::{Gpu, Offscreen, Renderer};
 use client::texture::{Atlas, Image};
 use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId};
 
+/// Full daylight, so these scenes measure what they are about rather than the
+/// light that has not arrived for them.
+const DAY: client::shade::Uniform = client::shade::Uniform(tiamot_core::light::Light::DAYLIGHT);
+
 /// Frame size for every test here.
 ///
 /// Small on purpose: a software rasteriser is the target, and 320x240 renders
@@ -192,7 +196,7 @@ fn upload(renderer: &mut Renderer, chunks: &[Chunk]) {
                 .get(&ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz))
                 .copied();
         }
-        let mesh = mesher::mesh_chunk(chunk, &neighbours, Absent::Air);
+        let mesh = mesher::mesh_chunk(chunk, &neighbours, Absent::Air, &DAY);
         renderer.set_chunk(pos, &mesh);
     }
 }

@@ -106,8 +106,27 @@ struct Globals {
     tile: u32,
     padding: u32,
     render_mode: u32,
-    pad: [u32; 3],
+    /// How bright the sun is, `0.0..=1.0`.
+    ///
+    /// **The stored sunlight channel is always full daylight**, and this scales
+    /// it at draw time. That is what lets dusk cost nothing: a value that meant
+    /// "the current sun" would dirty every chunk in the world twenty times a
+    /// second.
+    sun_intensity: f32,
+    /// The floor under the darkest place, so a cave is legible rather than
+    /// pitch black. Presentation only — the stored light really is zero there.
+    ambient: f32,
+    pad: u32,
+    /// The sun's colour, which a mod sets through the sky (Task 10).
+    sun_colour: [f32; 4],
 }
+
+/// How much light the darkest place still gets.
+///
+/// A pure black cave is not atmospheric, it is unplayable — a player cannot see
+/// the wall they are standing against. This is presentation only: the stored
+/// light really is zero down there, and `game.get_light` tells a mod so.
+const AMBIENT_FLOOR: f32 = 0.03;
 
 /// One chunk's camera-relative offset, as an instance attribute.
 #[repr(C)]
@@ -382,6 +401,13 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     depth_size: (u32, u32),
     mode: RenderMode,
+    /// How bright the sun is now, `0.0..=1.0`.
+    ///
+    /// Set by the sky each frame once time of day exists; full daylight until
+    /// then, which is what Task 08's scenes assumed.
+    sun_intensity: f32,
+    /// The sun's colour now.
+    sun_colour: [f32; 4],
     /// How many chunks the last frame actually drew.
     drawn: usize,
     /// The outline pipeline, and the line segments it draws this frame.
@@ -514,6 +540,10 @@ impl Renderer {
             depth,
             depth_size: (width, height),
             mode,
+            // Full daylight until a sky says otherwise, which is what Task
+            // 08's scenes assumed and what a world with no sky mod gets.
+            sun_intensity: 1.0,
+            sun_colour: [1.0, 1.0, 1.0, 1.0],
             drawn: 0,
         })
     }
@@ -522,6 +552,23 @@ impl Renderer {
     #[must_use]
     pub const fn gpu(&self) -> &Gpu {
         &self.gpu
+    }
+
+    /// Sets the sun's strength and colour for the frames that follow.
+    ///
+    /// **The world's stored sunlight never changes with the time of day** — it
+    /// is always full daylight, and this scales it at draw time. Anything else
+    /// would dirty every chunk in the world twenty times a second and relight
+    /// them all for a change nobody can distinguish from a multiply.
+    pub fn set_sun(&mut self, intensity: f32, colour: [f32; 3]) {
+        self.sun_intensity = intensity.clamp(0.0, 1.0);
+        self.sun_colour = [colour[0], colour[1], colour[2], 1.0];
+    }
+
+    /// The sun's current strength, for tests and the HUD.
+    #[must_use]
+    pub const fn sun_intensity(&self) -> f32 {
+        self.sun_intensity
     }
 
     /// How many chunk meshes are resident.
@@ -706,7 +753,10 @@ impl Renderer {
                 tile: crate::texture::TILE,
                 padding: crate::texture::PADDING,
                 render_mode: u32::from(self.mode == RenderMode::Flat),
-                pad: [0; 3],
+                sun_intensity: self.sun_intensity,
+                ambient: AMBIENT_FLOOR,
+                pad: 0,
+                sun_colour: self.sun_colour,
             }),
         );
 

@@ -1113,7 +1113,8 @@ impl App {
             let neighbours = self.store.neighbours(*pos);
 
             let mesh_started = std::time::Instant::now();
-            let mesh = mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY);
+            let light = self.store.light_for(*pos);
+            let mesh = mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &light);
             meshing += mesh_started.elapsed();
 
             self.renderer.set_chunk(self.drawn_at(*pos), &mesh);

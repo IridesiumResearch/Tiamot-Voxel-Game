@@ -30,6 +30,9 @@ use client::render::{Gpu, Renderer};
 use tiamot_core::coords::LocalBlock;
 use tiamot_core::{BlockValue, Chunk, ChunkPos, MaterialId};
 
+/// Full daylight: these tests are about buffer reuse, not about light.
+const DAY: client::shade::Uniform = client::shade::Uniform(tiamot_core::light::Light::DAYLIGHT);
+
 const STONE: MaterialId = MaterialId(2);
 const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
@@ -78,7 +81,7 @@ fn streaming_chunks_reuses_buffers_instead_of_allocating_new_ones() {
 
     let mesh_of = |pos: ChunkPos, height: u32| {
         let chunk = surfaced(pos, height);
-        mesh_chunk(&chunk, &Neighbours::default(), Absent::Air)
+        mesh_chunk(&chunk, &Neighbours::default(), Absent::Air, &DAY)
     };
 
     // Warm up: fill the resident set once. These are honest allocations — the
@@ -143,7 +146,7 @@ fn remeshing_a_chunk_in_place_allocates_nothing() {
     let chunk = surfaced(pos, 8);
     renderer.set_chunk(
         pos,
-        &mesh_chunk(&chunk, &Neighbours::default(), Absent::Air),
+        &mesh_chunk(&chunk, &Neighbours::default(), Absent::Air, &DAY),
     );
     let (baseline, _) = renderer.buffer_stats();
     assert!(baseline > 0, "the first upload allocated nothing");
@@ -151,7 +154,7 @@ fn remeshing_a_chunk_in_place_allocates_nothing() {
     for _ in 0..50 {
         renderer.set_chunk(
             pos,
-            &mesh_chunk(&chunk, &Neighbours::default(), Absent::Air),
+            &mesh_chunk(&chunk, &Neighbours::default(), Absent::Air, &DAY),
         );
     }
 
@@ -188,8 +191,8 @@ fn a_mesh_that_outgrows_its_buffer_gets_a_bigger_one() {
         }
     }
 
-    let small_mesh = mesh_chunk(&small, &Neighbours::default(), Absent::Air);
-    let large_mesh = mesh_chunk(&large, &Neighbours::default(), Absent::Air);
+    let small_mesh = mesh_chunk(&small, &Neighbours::default(), Absent::Air, &DAY);
+    let large_mesh = mesh_chunk(&large, &Neighbours::default(), Absent::Air, &DAY);
     assert!(
         large_mesh.to_buffers().0.len() > small_mesh.to_buffers().0.len() * 4,
         "the two scenes are not different enough in size to exercise a grow"

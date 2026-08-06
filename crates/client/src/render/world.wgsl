@@ -28,9 +28,12 @@ struct Globals {
     padding: u32,
     // 0 textured, 1 flat. Wireframe is a pipeline state, not a branch.
     render_mode: u32,
+    // Time of day scales the stored sunlight here rather than in the world, so
+    // dusk dirties nothing. See `Globals` on the Rust side.
+    sun_intensity: f32,
+    ambient: f32,
     pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    sun_colour: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -40,7 +43,7 @@ struct Globals {
 struct VertexIn {
     // x:6 | y:6 | z:6 | axis:2 | positive:1
     @location(0) packed: u32,
-    // material:16 | light:8
+    // material:16 | light:16, the light half a packed `core::light::Light`
     @location(1) material: u32,
     // Per-instance: this chunk's camera-relative offset, in blocks.
     @location(2) chunk_offset: vec4<f32>,
@@ -51,6 +54,12 @@ struct VertexOut {
     @location(0) tile_uv: vec2<f32>,
     @location(1) @interpolate(flat) slot: u32,
     @location(2) shade: f32,
+    // Sunlight and block colour, interpolated across the face. **This is what
+    // makes lighting smooth**: each vertex carries the average of the four
+    // blocks at its corner and the hardware fills in between them, so a
+    // surface gets a gradient rather than a per-block staircase.
+    @location(3) sun: f32,
+    @location(4) block_light: vec3<f32>,
 };
 
 // Lighting mode 1: directional face shading, matching `mesher::face_shade`.
@@ -95,16 +104,49 @@ fn vertex_main(input: VertexIn) -> VertexOut {
     }
 
     out.slot = input.material & 0xFFFFu;
-    let light = f32((input.material >> 16u) & 0xFFu) / 255.0;
-    out.shade = face_shade(axis, positive) * light;
+
+    // Unpack `core::light::Light`: sun in the top nibble, then r, g, b.
+    // Four bits each, so 15 is full and the divisor is 15 rather than 16 —
+    // dividing by 16 leaves a fully lit surface at 94% and the whole world
+    // very slightly grey.
+    let packed_light = (input.material >> 16u) & 0xFFFFu;
+    let levels = vec4<f32>(
+        f32((packed_light >> 12u) & 0xFu),
+        f32((packed_light >> 8u) & 0xFu),
+        f32((packed_light >> 4u) & 0xFu),
+        f32(packed_light & 0xFu),
+    ) / 15.0;
+
+    out.shade = face_shade(axis, positive);
+    out.sun = levels.x;
+    out.block_light = levels.yzw;
     return out;
+}
+
+// What one fragment's light comes to, as a colour multiplier.
+//
+// Sunlight is scaled by the time of day and block light is not: that is the
+// whole reason they are separate channels. A cave stays dark at noon and lit by
+// its own lamps at midnight, from one stored value per block.
+//
+// The two are combined with `max` per channel rather than added. Adding them
+// blows out to white wherever a lamp stands in daylight, which is most lamps
+// anyone places outdoors.
+fn lighting(input: VertexOut) -> vec3<f32> {
+    let daylight = input.sun * globals.sun_intensity * globals.sun_colour.rgb;
+    let lit = max(daylight, input.block_light);
+    // A floor under the darkest cave, so a dark room is legible rather than
+    // pitch black. Presentation, not simulation — the stored light really is
+    // zero down there.
+    return max(lit, vec3<f32>(globals.ambient)) * input.shade;
 }
 
 @fragment
 fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (globals.render_mode == 1u) {
-        // Flat: shading only. If the world looks right here and wrong in
-        // textured mode, the mesher is fine and the atlas is not.
+        // Flat: directional shading only, no propagated light. **Mode 1 must
+        // keep Task 08's cost profile exactly**, and that includes ignoring
+        // light rather than sampling it and throwing the result away.
         return vec4<f32>(vec3<f32>(input.shade), 1.0);
     }
 

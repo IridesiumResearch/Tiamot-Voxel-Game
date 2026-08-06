@@ -133,6 +133,23 @@ implementation rather than 02b's spike.
 permeability byte earning charter rule 19: Task 02b measured the uncached face
 test at a ≈50% penalty on exactly this content, and the penalty is gone.
 
+Meshing pays for lighting too, and the figure moved:
+
+| Scene | Task 08 | Task 10 | 02b gate |
+|---|---|---|---|
+| Realistic content | 0.108 ms | 0.243 ms | 1 ms |
+| Every block chiselled | 0.143 ms | 0.758 ms | 4 ms |
+
+**Both stay comfortably inside the gates** — 24% and 19% — but the cost is real
+and worth naming: every cell face now samples four corners, each averaging four
+blocks of light and testing three neighbours for occlusion. Caching the shade
+per cell and short-circuiting the identical-samples case (which is most corners,
+since light is per block and a block is three cells across) each bought only a
+few percent, so the cost is the per-corner work itself rather than repetition.
+The practical consequence is that `REMESH_TIME_BUDGET`'s 2 ms retires roughly
+eight chunks a frame instead of eighteen. If chunk streaming ever feels slow,
+this is where to look first.
+
 **Read these against how many happen per tick, not on their own:**
 
 - Newly loaded chunks are capped at `RELIGHTS_PER_TICK` (32), so the worst a
