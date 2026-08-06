@@ -49,8 +49,13 @@ pub enum Command {
     DigBlock(BlockPos),
     /// Dig one sub-node.
     DigSubNode(SubNodePos),
-    /// Place a material.
+    /// Place a material as a whole block.
     Place(BlockPos, u16),
+    /// Place one unit into one sub-node cell — the cell named, not the block's.
+    ///
+    /// The mirror of [`Command::DigSubNode`], and the other half of what makes
+    /// carving reversible.
+    PlaceSubNode(SubNodePos, u16),
     /// Wait for a block to hold a material.
     ExpectBlock(BlockPos, u16, u64),
     /// Wait for a block to be PARTIALLY filled, with a given cell count.
@@ -238,6 +243,9 @@ pub fn run_script(source: &str, name: &str, channel: Channel) -> Result<ScriptOu
         BlockPos::new(p.0, p.1, p.2),
         p.3
     ));
+    bind!("place_subnode", (i32, i32, i32, u16), |_lua, p| {
+        Command::PlaceSubNode(SubNodePos::new(p.0, p.1, p.2), p.3)
+    });
     bind!("move_to", (f32, f32, f32), |_lua, p| Command::MoveTo(
         p.0, p.1, p.2
     ));

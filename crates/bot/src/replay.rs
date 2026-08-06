@@ -79,6 +79,15 @@ pub fn parse(text: &str) -> Result<Vec<Recorded>, String> {
                     .map_err(|_| format!("line {number}: material must be a number"))?;
                 Command::Place(pos, material)
             }
+            "place_subnode" => {
+                let pos = subnode_pos(&rest, number)?;
+                let material = rest
+                    .get(3)
+                    .ok_or_else(|| format!("line {number}: place_subnode needs x y z material"))?
+                    .parse()
+                    .map_err(|_| format!("line {number}: material must be a number"))?;
+                Command::PlaceSubNode(pos, material)
+            }
             "move_to" => {
                 let coords = floats(&rest, number)?;
                 Command::MoveTo(coords[0], coords[1], coords[2])
@@ -87,7 +96,7 @@ pub fn parse(text: &str) -> Result<Vec<Recorded>, String> {
             other => {
                 return Err(format!(
                     "line {number}: unknown verb `{other}`; expected dig_block, dig_subnode, \
-                     place, move_to, or chat"
+                     place, place_subnode, move_to, or chat"
                 ));
             }
         };
@@ -134,6 +143,11 @@ pub fn render(recorded: &[Recorded]) -> String {
                 "{} place {} {} {} {material}",
                 entry.tick, pos.x, pos.y, pos.z
             ),
+            Command::PlaceSubNode(pos, material) => writeln!(
+                out,
+                "{} place_subnode {} {} {} {material}",
+                entry.tick, pos.x, pos.y, pos.z
+            ),
             Command::MoveTo(x, y, z) => writeln!(out, "{} move_to {x} {y} {z}", entry.tick),
             Command::Chat(text) => writeln!(out, "{} chat {text}", entry.tick),
             // Only the recordable verbs round-trip. The rest are session
@@ -175,6 +189,7 @@ pub async fn run(mut bot: Bot, recorded: &[Recorded], name: &str) -> Result<usiz
             Command::DigBlock(pos) => bot.dig_block(*pos).await?,
             Command::DigSubNode(pos) => bot.dig_subnode(*pos).await?,
             Command::Place(pos, material) => bot.place(*pos, *material).await?,
+            Command::PlaceSubNode(pos, material) => bot.place_subnode(*pos, *material).await?,
             Command::MoveTo(x, y, z) => bot.move_to(*x, *y, *z).await?,
             Command::Chat(text) => bot.chat(text).await?,
             _ => continue,
@@ -245,6 +260,14 @@ mod tests {
             Recorded {
                 tick: 9,
                 command: Command::DigSubNode(SubNodePos::new(-4, 5, 6)),
+            },
+            Recorded {
+                tick: 10,
+                // Negative on every axis: a sub-node placement names a CELL,
+                // and a renderer that dropped the sign would round-trip every
+                // recording made east and above the origin and none made west
+                // of it.
+                command: Command::PlaceSubNode(SubNodePos::new(-4, -5, -6), 7),
             },
             Recorded {
                 tick: 12,

@@ -836,12 +836,21 @@ impl ServerHandle {
                                 continue;
                             }
 
-                            let outcome = tiamot_core::place::plan(request.target, held)
+                            // The tool decides what a placement writes, exactly
+                            // as it decides what a dig removes: a sub-node
+                            // brush fills the cell that was aimed at, a block
+                            // brush fills the block bottom-up.
+                            let brush = shared.place_brush(&request.actor);
+
+                            let outcome = tiamot_core::place::plan(request.target, held, brush)
                                 .and_then(|plan| {
-                                    // Air only. Placing into occupied space
-                                    // would have to decide what happens to what
-                                    // was already there, and "it is destroyed"
-                                    // is a conservation hole (charter rule 5).
+                                    // Air only, judged cell by cell. Placing
+                                    // into occupied space would have to decide
+                                    // what happens to what was already there,
+                                    // and "it is destroyed" is a conservation
+                                    // hole (charter rule 5). Per cell rather
+                                    // than per block is what lets a chisel fill
+                                    // the gaps in a block it carved.
                                     let occupied = tiamot_core::place::occupied_cells(&plan)
                                         .any(|cell| {
                                             i32::try_from(cell[0]).is_ok_and(|x| {
@@ -922,17 +931,36 @@ impl ServerHandle {
                             // different messages depending on how it was made —
                             // and everything watching for a block appearing
                             // would have to know about both.
-                            let occupancy = tiamot_core::inventory::placement_mask(paid);
-                            let edit = if paid >= tiamot_core::UNITS_PER_BLOCK {
-                                tiamot_core::proto::Edit::Block {
-                                    pos: plan.block,
-                                    material: request.material,
+                            //
+                            // A sub-node placement goes out as `Edit::SubNode`
+                            // for a stronger reason than symmetry with digging:
+                            // `Edit::Partial` REPLACES a block, so sending one
+                            // cell that way would delete whatever else was in
+                            // the block — the conservation hole the occupancy
+                            // check above exists to prevent, reintroduced by
+                            // the message that reports the placement.
+                            let edit = match brush {
+                                tiamot_core::dig::Brush::SubNode => {
+                                    tiamot_core::proto::Edit::SubNode {
+                                        pos: request.target,
+                                        material: request.material,
+                                    }
                                 }
-                            } else {
-                                tiamot_core::proto::Edit::Partial {
-                                    pos: plan.block,
-                                    material: request.material,
-                                    occupancy,
+                                tiamot_core::dig::Brush::Block => {
+                                    let occupancy =
+                                        tiamot_core::inventory::placement_mask(paid);
+                                    if paid >= tiamot_core::UNITS_PER_BLOCK {
+                                        tiamot_core::proto::Edit::Block {
+                                            pos: plan.block,
+                                            material: request.material,
+                                        }
+                                    } else {
+                                        tiamot_core::proto::Edit::Partial {
+                                            pos: plan.block,
+                                            material: request.material,
+                                            occupancy,
+                                        }
+                                    }
                                 }
                             };
                             match world.apply(&edit, &mut source) {

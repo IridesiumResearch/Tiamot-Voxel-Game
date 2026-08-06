@@ -77,6 +77,10 @@ async fn execute(bot: &mut Bot, command: &Command) -> Result<Reply, BotError> {
             bot.place(*pos, *material).await?;
             Ok(Reply::Done)
         }
+        Command::PlaceSubNode(pos, material) => {
+            bot.place_subnode(*pos, *material).await?;
+            Ok(Reply::Done)
+        }
         Command::ExpectPartial(pos, material, cells, timeout_ms) => {
             bot.expect_partial(*pos, *material, *cells, Duration::from_millis(*timeout_ms))
                 .await?;

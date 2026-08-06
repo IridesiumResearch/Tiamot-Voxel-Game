@@ -172,6 +172,36 @@ Nothing falls, nothing collapses, nothing checks for support.
 A mod that wants structural rules implements them through the mod API. The
 engine has no opinion.
 
+### 7.1 Placement resolution — the acting tool's brush decides
+
+**A placement writes at the resolution its brush addresses, symmetrically with
+digging (§2, and `dig::Brush`).** The engine has no placement resolution of its
+own; the tool the player holds carries one, and a mod says which.
+
+- **A sub-node brush fills the cell that was aimed at**, one unit, and nothing
+  else. The client names a cell, and that cell is what is written.
+- **A block brush fills the containing block from the bottom up**, up to 27
+  units, per `inventory::placement_mask`. Here the named cell selects the
+  *block* and not the fill: the order is fixed so that identical actions produce
+  identical geometry regardless of where the player was looking.
+- **A world with no tools still places, at block resolution.** Digging refuses
+  without a mod-registered tool because the engine has no rule of its own for
+  breaking things; placing has no such rule to be missing, and refusing it would
+  let a mod set strand an inventory with no way to spend it.
+
+**Occupancy is judged per cell, never per block.** A placement is refused if any
+cell it would fill is already occupied — so a chiselled block's empty cells can
+be filled, and a whole-block placement into a block with anything in it is
+refused because its cells overlap.
+
+Together these are what make carving **reversible**: a cell taken out of a block
+can be put back into the same cell of the same block. Without either half — a
+fill anchored to the block's bottom, or a refusal that looked at the whole block
+— sub-node resolution would exist only for removal.
+
+Task 09 implements this; `crates/core/src/place.rs` is the implementation and
+`a_chiselled_cell_goes_back_into_the_cell_it_came_out_of` is the test.
+
 ---
 
 ## 8. Rendering — sub-node resolution, binary greedy meshing

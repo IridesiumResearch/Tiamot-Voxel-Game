@@ -235,6 +235,14 @@ fn chiselled_spares_place_back_as_a_partial_block() {
             "13 units should display as 0 blocks and 13 spare nodes"
         );
 
+        // Put the chisel away first. The brush decides what a placement writes
+        // as well as what a dig removes, so building with a chisel still in
+        // hand would put ONE cell down — which is the point of a chisel and not
+        // what this criterion is about. The bare hand is a mod-registered tool
+        // with a `"block"` brush, so this is a tool switch and not an engine
+        // special case.
+        bot.select_tool(None).await.expect("put the chisel away");
+
         // Place them back, into empty space.
         let target = BlockPos::new(-2, 0, 0);
         bot.place_from_inventory(centre_of(target), stone)
@@ -256,6 +264,122 @@ fn chiselled_spares_place_back_as_a_partial_block() {
             held(&bot, stone),
             0,
             "placing 13 spares should have spent all 13 units"
+        );
+    });
+
+    assert!(server.stop());
+}
+
+#[test]
+fn a_chiselled_cell_goes_back_into_the_cell_it_came_out_of() {
+    // Sculpting, in both directions. A chisel takes one cell out of a block and
+    // puts one cell back — into the cell that was AIMED at, and into a block
+    // that still holds the other 26.
+    //
+    // Two rules meet here and the test fails without either. A sub-node brush
+    // fills the aimed cell rather than the bottom of the block, so the cell
+    // comes back where it was taken from; and the occupied check is per cell
+    // rather than per block, so a block with anything in it can still be built
+    // into. Before both, a chiselled block could only ever be carved further.
+    let server = start("sculpt-back");
+    let stone = stone();
+
+    block_on(async {
+        let mut bot = join(&server, "Sculptor").await;
+        let quarry = BlockPos::new(2, -1, 0);
+        assert!(server.seed_block(quarry, stone), "seed queue full");
+        bot.expect_block(quarry, stone, Duration::from_secs(10))
+            .await
+            .expect("the seeded block should land");
+
+        // The top far corner, which is the cell a bottom-up fill would be
+        // least likely to reach by accident: index 26 of 27.
+        let corner = SubNodePos::new(quarry.x * 3 + 2, quarry.y * 3 + 2, quarry.z * 3 + 2);
+        bot.dig_subnode(corner)
+            .await
+            .expect("chisel the corner out");
+        bot.await_inventory(Duration::from_secs(10))
+            .await
+            .expect("the unit should be credited");
+        assert_eq!(held(&bot, stone), 1, "one cell should yield one unit");
+
+        // And back into the same cell, with the chisel still in hand.
+        bot.place_subnode(corner, stone)
+            .await
+            .unwrap_or_else(|err| panic!("the cell should fill: {err}"));
+
+        bot.await_inventory(Duration::from_secs(10))
+            .await
+            .expect("the charge should be reported");
+        assert_eq!(
+            held(&bot, stone),
+            0,
+            "placing the cell should have spent the unit"
+        );
+    });
+
+    assert!(server.stop());
+}
+
+#[test]
+fn a_subnode_placement_into_an_occupied_cell_is_refused_and_says_so() {
+    // The counter-example that makes the test above mean something. Per-cell
+    // occupancy is a relaxation of the old per-block rule, not the removal of
+    // it: a cell with something in it is still refused, and still says why. If
+    // it were not, the test above would pass on a server that let a player
+    // place material into solid rock and lose it.
+    let server = start("sculpt-occupied");
+    let stone = stone();
+
+    block_on(async {
+        let mut bot = join(&server, "Sculptor").await;
+        let quarry = BlockPos::new(2, -1, 0);
+        assert!(server.seed_block(quarry, stone), "seed queue full");
+        bot.expect_block(quarry, stone, Duration::from_secs(10))
+            .await
+            .expect("the seeded block should land");
+
+        // Chisel one cell out to have something to carry, then aim at a
+        // DIFFERENT cell of the same block — one that is still solid.
+        let corner = SubNodePos::new(quarry.x * 3 + 2, quarry.y * 3 + 2, quarry.z * 3 + 2);
+        let solid = SubNodePos::new(quarry.x * 3, quarry.y * 3, quarry.z * 3);
+        bot.dig_subnode(corner)
+            .await
+            .expect("chisel the corner out");
+        bot.await_inventory(Duration::from_secs(10))
+            .await
+            .expect("credit");
+        assert_eq!(held(&bot, stone), 1);
+
+        bot.hold_brush(tiamot_core::dig::Brush::SubNode.name())
+            .await
+            .expect("a subnode tool is registered");
+        bot.place_from_inventory(solid, stone).await.expect("send");
+
+        // Nothing lands, a reason arrives, and the unit is still carried.
+        //
+        // Bounded by the clock rather than by "receive until nothing is
+        // waiting". The server sends `PlayerState` every tick, so a
+        // drain-until-idle loop is never idle and never returns.
+        let until = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < until {
+            let _ = tokio::time::timeout(Duration::from_millis(100), bot.recv()).await;
+        }
+        assert!(
+            !bot.saw_subnode(solid, stone),
+            "material was placed into a cell that was already solid"
+        );
+        assert!(
+            bot.notices()
+                .iter()
+                .any(|text| text.contains("already something there")),
+            "the refusal was silent; notices were {:?}",
+            bot.notices()
+        );
+        assert_eq!(
+            held(&bot, stone),
+            1,
+            "a refused placement charged the player anyway"
         );
     });
 

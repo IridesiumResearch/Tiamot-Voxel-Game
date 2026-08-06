@@ -82,9 +82,16 @@ local spares = gained % bot.UNITS_PER_BLOCK
 bot.assert(blocks == 0, CELLS .. " units is no whole blocks, got " .. blocks)
 bot.assert(spares == CELLS, CELLS .. " units is " .. CELLS .. " spare nodes, got " .. spares)
 
--- And put them back. Fewer than 27 units makes a PARTIAL block: the engine
--- fills it from the bottom up, which `inventory::placement_mask` documents
--- because the order is observable.
+-- And put them back. The chisel goes away first: the brush decides what a
+-- placement WRITES as well as what a dig removes, so building with a chisel in
+-- hand puts down one cell -- the cell under the crosshair, which is what makes
+-- carving reversible and is exercised by `sculpt_back` below. This part of the
+-- scenario is about the block that 13 spare units make, so it wants the
+-- whole-block brush. `bot.place` selects it, again by brush and not by name.
+--
+-- Fewer than 27 units makes a PARTIAL block: the engine fills it from the
+-- bottom up, which `inventory::placement_mask` documents because the order is
+-- observable.
 bot.place(TX, TY, TZ, material)
 
 -- The geometry, server-side. `expect_partial` waits for the broadcast that says
@@ -100,6 +107,35 @@ end
 bot.assert(
     after == before,
     "placing " .. CELLS .. " spares should have spent all of them, " .. after .. " left"
+)
+
+-- Sculpting in both directions, which is the reason a sub-node brush places
+-- into the cell it is aimed at.
+--
+-- Take one cell out of a block and put it straight back into the SAME cell.
+-- Two engine rules have to hold for this to work, and the scenario fails
+-- visibly without either: a sub-node placement fills the cell under the
+-- crosshair rather than the bottom of the block, and the "is it already
+-- occupied" check is per cell rather than per block, so a block that still
+-- holds its other 26 cells can be built into.
+--
+-- The top far corner: cell 26 of 27, the one a bottom-up fill would be least
+-- likely to reach by accident.
+local cx, cy, cz = sx + 2, sy + 2, sz + 2
+bot.dig_subnode(cx, cy, cz)
+bot.expect_units(material, 1, 10000)
+
+-- `place_subnode` holds a tool by BRUSH, the same way `dig_subnode` does, so
+-- this stays a statement about the mod API and not about `core_tools`.
+bot.place_subnode(cx, cy, cz, material)
+
+local left = 0
+for _, units in pairs(bot.inventory()) do
+    left = left + units
+end
+bot.assert(
+    left == before,
+    "the chiselled cell should have gone back into the world, " .. left .. " units left over"
 )
 
 bot.disconnect()

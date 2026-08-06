@@ -571,6 +571,29 @@ impl Shared {
         }
     }
 
+    /// The brush a player's placements write with.
+    ///
+    /// The same tool that decides what they dig decides what they build, which
+    /// is what makes sculpting reversible: a chisel takes one cell out and puts
+    /// one cell back, into the cell that was aimed at.
+    ///
+    /// **Falls back to [`Brush::Block`] where digging falls back to refusing.**
+    /// The two are not the same question. A world whose mods registered no
+    /// tools is one nobody can dig in — the engine has no bare hand of its own
+    /// (charter rule 1) — but placing is putting down material you already
+    /// hold, and there is no rule to be missing. Refusing it would mean a mod
+    /// set could strand a player's inventory with no way to spend it.
+    #[must_use]
+    pub fn place_brush(&self, uuid: &PlayerUuid) -> tiamot_core::dig::Brush {
+        let Ok(bodies) = self.bodies.lock() else {
+            return tiamot_core::dig::Brush::Block;
+        };
+        bodies
+            .get(uuid)
+            .and_then(|player| self.resolve_tool(player.tool.as_deref()))
+            .map_or(tiamot_core::dig::Brush::Block, |tool| tool.brush)
+    }
+
     /// The tool a player is actually using: what they chose, or the mod's
     /// default, or nothing.
     ///

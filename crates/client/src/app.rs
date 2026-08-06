@@ -652,9 +652,16 @@ impl App {
 
     /// Places the selected material against the face under the crosshair.
     ///
+    /// **How much lands is the held tool's business, not this method's.** The
+    /// brush decides (Sub-Node Contract §7.1): a chisel fills the single cell
+    /// across the face, a whole-block tool fills the block bottom-up. The
+    /// client's job is to name the cell the player is pointing at, which is
+    /// [`App::place_target`] — deciding what to do with it is the server's
+    /// (charter rule 2).
+    ///
     /// Nothing happens with an empty inventory or nothing in reach. Anything
-    /// else the server may still refuse — it owns that decision (charter rule
-    /// 2) — and says why, which arrives as a warning.
+    /// else the server may still refuse — it owns that decision — and says why,
+    /// which arrives as a warning.
     pub fn place(&mut self) {
         let Some(material) = self.selected_material() else {
             self.warn("nothing selected to build with".to_owned());

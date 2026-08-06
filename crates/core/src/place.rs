@@ -15,20 +15,40 @@
 //! was asked is worse than one that did nothing, because the player finds out
 //! later and somewhere else.
 //!
-//! # Why a block, not a cell
+//! # The brush decides, exactly as it does for digging
 //!
-//! Placement writes a whole block, filled from the bottom up by
-//! [`crate::inventory::placement_mask`]. A player holding fewer than 27 units
-//! gets a `Partial` rather than a refusal — that is what "spare-node placement"
-//! means, and it is the mechanism the chisel scenario exercises end to end.
+//! [`crate::dig::Brush`] says what a tool addresses, and placement honours the
+//! same answer digging does. **This module implements Sub-Node Contract §7.1**,
+//! which is where the rules below are authoritative.
 //!
-//! The cell the client names selects the *block*; it does not select which cell
-//! within it gets filled. That is the fill order's business, and the fill order
-//! is fixed so it cannot depend on where a player happened to be looking.
+//! - [`Brush::Block`] writes a whole block, filled from the bottom up by
+//!   [`crate::inventory::placement_mask`]. A player holding fewer than 27 units
+//!   gets a `Partial` rather than a refusal — that is what "spare-node
+//!   placement" means, and it is what the chisel scenario ends with. The cell
+//!   the client names selects the *block* and not which of its cells get
+//!   filled: the fill order is fixed so that it cannot depend on where a player
+//!   happened to be looking.
+//! - [`Brush::SubNode`] writes exactly the cell under the crosshair, one unit.
+//!
+//! # Why a sub-node brush places into the aimed cell
+//!
+//! Because otherwise this engine can carve detail and never build it back. A
+//! chisel takes one cell out of a block; if putting one back always dropped it
+//! to the bottom of the containing block, sculpting would be a one-way
+//! operation and the sub-node resolution the whole engine is built around would
+//! exist only for removal.
+//!
+//! This is a deliberate reversal of the original rule, which fixed the fill
+//! order for *every* placement so that identical actions produced identical
+//! geometry. That property is worth keeping where it costs nothing, so it still
+//! holds for [`Brush::Block`] — where a player is asking for "a block here" and
+//! not for a shape. A sub-node brush is a request for a *particular cell*, and
+//! answering it with a different cell is the surprise, not the precision.
 
 use crate::block::subnode_offset;
 use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 use crate::detgen::floor_to_i64;
+use crate::dig::Brush;
 use crate::phys::Aabb;
 use crate::{CHUNK_SUBNODES, SUBNODES_PER_AXIS, UNITS_PER_BLOCK};
 
@@ -43,7 +63,12 @@ pub enum Refusal {
     #[error("you are not carrying any of that")]
     NothingHeld,
 
-    /// The target block already contains something.
+    /// Something already fills a cell the placement would write.
+    ///
+    /// Judged per *cell*, not per block: a chiselled block has empty cells and
+    /// a sub-node brush is allowed to fill them, which is the other half of
+    /// making sculpting reversible. A block brush aimed at a block with
+    /// anything in it still lands here, because the cells it fills overlap.
     #[error("there is already something there")]
     Occupied,
 
@@ -63,27 +88,48 @@ pub struct Placement {
     pub units: u32,
 }
 
-/// Works out what placing into `target` would write, given what is held.
+/// Works out what placing into `target` with `brush` would write, given what is
+/// held.
 ///
-/// Does not consult the world — [`Placement::block`] still has to be checked
-/// empty, and the geometry still has to be checked against every body. Split
-/// that way because the arithmetic is worth testing on its own, and because the
-/// two world checks need a world and a body list that this crate's tests would
-/// otherwise have to fabricate to test 27 lines of bit twiddling.
+/// Does not consult the world — every cell in [`Placement::occupancy`] still
+/// has to be checked empty, and the geometry still has to be checked against
+/// every body. Split that way because the arithmetic is worth testing on its
+/// own, and because the two world checks need a world and a body list that this
+/// crate's tests would otherwise have to fabricate to test 27 lines of bit
+/// twiddling.
 ///
 /// # Errors
 ///
 /// [`Refusal::NothingHeld`] if `held` is zero.
-pub fn plan(target: SubNodePos, held: u32) -> Result<Placement, Refusal> {
+pub fn plan(target: SubNodePos, held: u32, brush: Brush) -> Result<Placement, Refusal> {
     if held == 0 {
         return Err(Refusal::NothingHeld);
     }
-    let units = held.min(UNITS_PER_BLOCK);
-    Ok(Placement {
-        block: target.block(),
-        occupancy: crate::inventory::placement_mask(units),
-        units,
-    })
+    match brush {
+        Brush::SubNode => Ok(Placement {
+            block: target.block(),
+            occupancy: 1 << cell_index(target),
+            units: 1,
+        }),
+        Brush::Block => {
+            let units = held.min(UNITS_PER_BLOCK);
+            Ok(Placement {
+                block: target.block(),
+                occupancy: crate::inventory::placement_mask(units),
+                units,
+            })
+        }
+    }
+}
+
+/// Which of its block's 27 cells a world cell is.
+///
+/// `rem_euclid` rather than `%`: at negative coordinates the remainder is
+/// negative and indexes the wrong cell — the same trap [`SubNodePos::block`]
+/// documents, and it only ever shows up west or below the origin.
+fn cell_index(target: SubNodePos) -> usize {
+    let axis = |v: i32| v.rem_euclid(SUBNODES_PER_AXIS as i32) as u32;
+    crate::block::subnode_index(axis(target.x), axis(target.y), axis(target.z))
 }
 
 /// The world cells a placement would fill.
@@ -241,7 +287,7 @@ mod tests {
 
     #[test]
     fn a_full_block_of_units_places_a_solid_block() {
-        let plan = plan(cell(0, 0, 0), UNITS_PER_BLOCK).expect("27 units is a block");
+        let plan = plan(cell(0, 0, 0), UNITS_PER_BLOCK, Brush::Block).expect("27 units is a block");
         assert_eq!(plan.units, UNITS_PER_BLOCK);
         assert_eq!(plan.occupancy.count_ones(), UNITS_PER_BLOCK);
     }
@@ -250,7 +296,7 @@ mod tests {
     fn more_than_a_block_still_places_exactly_one() {
         // The surplus stays in the inventory. Placing two blocks' worth into
         // one block would destroy 27 units.
-        let plan = plan(cell(0, 0, 0), UNITS_PER_BLOCK * 3 + 4).expect("plenty held");
+        let plan = plan(cell(0, 0, 0), UNITS_PER_BLOCK * 3 + 4, Brush::Block).expect("plenty held");
         assert_eq!(
             plan.units, UNITS_PER_BLOCK,
             "a placement consumed more than the block it filled"
@@ -261,7 +307,7 @@ mod tests {
     fn spare_nodes_place_a_partial_rather_than_being_refused() {
         // The behaviour the chisel scenario depends on: 13 units is not a
         // block, and the answer is 13 cells rather than "you cannot".
-        let plan = plan(cell(0, 0, 0), 13).expect("13 units is a partial block");
+        let plan = plan(cell(0, 0, 0), 13, Brush::Block).expect("13 units is a partial block");
         assert_eq!(plan.units, 13);
         assert_eq!(plan.occupancy.count_ones(), 13);
         assert_ne!(
@@ -273,19 +319,73 @@ mod tests {
 
     #[test]
     fn holding_nothing_is_refused() {
-        assert_eq!(plan(cell(0, 0, 0), 0), Err(Refusal::NothingHeld));
+        assert_eq!(
+            plan(cell(0, 0, 0), 0, Brush::Block),
+            Err(Refusal::NothingHeld)
+        );
     }
 
     #[test]
-    fn the_cell_selects_the_block_and_not_the_fill() {
-        // Every cell of a block plans the same placement. The fill order is
-        // fixed (bottom-up) so that it cannot depend on where the player was
-        // looking, which would make the same action produce different geometry.
-        let first = plan(cell(0, 0, 0), 5).expect("held");
+    fn a_subnode_brush_fills_the_cell_that_was_aimed_at() {
+        // The reason sub-nodes survive being put back. Each of the 27 cells
+        // plans a different placement, and each one is the cell named.
         for x in 0..3 {
             for y in 0..3 {
                 for z in 0..3 {
-                    let other = plan(cell(x, y, z), 5).expect("held");
+                    let plan = plan(cell(x, y, z), 27, Brush::SubNode).expect("held");
+                    assert_eq!(plan.units, 1, "a sub-node placement spent more than a unit");
+                    assert_eq!(
+                        plan.occupancy.count_ones(),
+                        1,
+                        "a sub-node placement filled more than a cell"
+                    );
+                    let filled: Vec<[i64; 3]> = occupied_cells(&plan).collect();
+                    assert_eq!(
+                        filled,
+                        vec![[i64::from(x), i64::from(y), i64::from(z)]],
+                        "cell {x},{y},{z} was placed somewhere else"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_subnode_brush_aims_correctly_west_of_the_origin() {
+        // `%` on a negative coordinate is negative, which indexes the wrong
+        // cell — or shifts by a negative amount and panics. The same trap
+        // `Hit::block` documents, and it only reproduces west of the origin.
+        let plan = plan(cell(-1, -1, -1), 27, Brush::SubNode).expect("held");
+        assert_eq!(plan.block, BlockPos::new(-1, -1, -1));
+        let filled: Vec<[i64; 3]> = occupied_cells(&plan).collect();
+        assert_eq!(
+            filled,
+            vec![[-1, -1, -1]],
+            "the aimed cell was not the cell filled"
+        );
+    }
+
+    #[test]
+    fn a_subnode_brush_places_one_unit_however_much_is_held() {
+        // A chisel is precision, not throughput: holding a hundred units does
+        // not fill a hundred cells, and holding one is enough.
+        let many = plan(cell(1, 1, 1), 500, Brush::SubNode).expect("held");
+        let one = plan(cell(1, 1, 1), 1, Brush::SubNode).expect("held");
+        assert_eq!(many, one, "how much was held changed a sub-node placement");
+        assert_eq!(one.units, 1);
+    }
+
+    #[test]
+    fn a_block_brush_lets_the_cell_select_the_block_and_not_the_fill() {
+        // Every cell of a block plans the same placement. The fill order is
+        // fixed (bottom-up) so that it cannot depend on where the player was
+        // looking, which would make the same action produce different geometry.
+        // Deliberately NOT true of a sub-node brush — see the test above.
+        let first = plan(cell(0, 0, 0), 5, Brush::Block).expect("held");
+        for x in 0..3 {
+            for y in 0..3 {
+                for z in 0..3 {
+                    let other = plan(cell(x, y, z), 5, Brush::Block).expect("held");
                     assert_eq!(
                         other, first,
                         "cell {x},{y},{z} planned differently from cell 0,0,0"
@@ -355,7 +455,7 @@ mod tests {
     fn a_placement_inside_a_standing_player_is_refused() {
         // The rule that stops a player being sealed into a block, and stops one
         // player entombing another.
-        let plan = plan(cell(3, 0, 3), UNITS_PER_BLOCK).expect("held");
+        let plan = plan(cell(3, 0, 3), UNITS_PER_BLOCK, Brush::Block).expect("held");
         let feet = Aabb::player_at([4.0, 1.0, 4.0]);
         assert!(
             blocks_a_body(&plan, &[(ChunkPos::new(0, 0, 0), feet)]),
@@ -367,7 +467,7 @@ mod tests {
     fn a_placement_beside_a_player_is_allowed() {
         // The counter-example that makes the test above mean something: if the
         // check were "always true" it would pass just as well.
-        let plan = plan(cell(30, 0, 30), UNITS_PER_BLOCK).expect("held");
+        let plan = plan(cell(30, 0, 30), UNITS_PER_BLOCK, Brush::Block).expect("held");
         let feet = Aabb::player_at([4.0, 1.0, 4.0]);
         assert!(
             !blocks_a_body(&plan, &[(ChunkPos::new(0, 0, 0), feet)]),
@@ -380,7 +480,7 @@ mod tests {
         // A body resting on a surface has its minimum exactly on the boundary.
         // Counting that as "inside" would make it impossible to place a block
         // against the ground anyone is standing on — which is most placements.
-        let plan = plan(cell(0, 0, 0), UNITS_PER_BLOCK).expect("held");
+        let plan = plan(cell(0, 0, 0), UNITS_PER_BLOCK, Brush::Block).expect("held");
         // Feet exactly on the top face of the block filling cells 0..3.
         let standing = Aabb::player_at([1.5, 3.0, 1.5]);
         assert!(
@@ -397,7 +497,12 @@ mod tests {
         // everywhere else — the kind of bug that only reproduces after someone
         // has walked for a while.
         let block_cell = CHUNK_SUBNODES as i32 + 3;
-        let plan = plan(cell(block_cell, 0, block_cell), UNITS_PER_BLOCK).expect("held");
+        let plan = plan(
+            cell(block_cell, 0, block_cell),
+            UNITS_PER_BLOCK,
+            Brush::Block,
+        )
+        .expect("held");
         let body = Aabb::player_at([4.0, 1.0, 4.0]);
         assert!(
             blocks_a_body(&plan, &[(ChunkPos::new(1, 0, 1), body)]),
@@ -414,7 +519,7 @@ mod tests {
         // Bottom-up fill means a few spare nodes occupy the bottom layer only,
         // so a player whose feet are above that layer is not in the way. A
         // check that used the whole block's extent would refuse this.
-        let plan = plan(cell(0, 0, 0), 3).expect("held");
+        let plan = plan(cell(0, 0, 0), 3, Brush::Block).expect("held");
         assert_eq!(plan.occupancy.count_ones(), 3);
         let above = Aabb::player_at([1.5, 1.0, 1.5]);
         assert!(
@@ -434,7 +539,7 @@ mod tests {
         // Head height, not just feet: sealing someone's head in is as bad as
         // sealing their feet, and the body is 5.4 cells tall.
         let head_cell = PLAYER_HEIGHT as i32 - 1;
-        let plan = plan(cell(0, head_cell, 0), UNITS_PER_BLOCK).expect("held");
+        let plan = plan(cell(0, head_cell, 0), UNITS_PER_BLOCK, Brush::Block).expect("held");
         let body = Aabb::player_at([1.5, 0.0, 1.5]);
         assert!(
             blocks_a_body(&plan, &[(ChunkPos::new(0, 0, 0), body)]),

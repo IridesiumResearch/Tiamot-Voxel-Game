@@ -81,8 +81,9 @@ benchmark can be bisected by deleting lines.
 6 dig_block 71 6 70
 ```
 
-Verbs: `place x y z material`, `dig_block x y z`, `dig_subnode x y z`,
-`move_to x y z`, `chat text`. Blank lines and `#` comments are ignored.
+Verbs: `place x y z material`, `place_subnode x y z material`,
+`dig_block x y z`, `dig_subnode x y z`, `move_to x y z`, `chat text`. Blank
+lines and `#` comments are ignored.
 
 Replay honours the **gaps** between ticks, not the absolute tick numbers. A
 slower machine would otherwise fall behind and then rush to catch up, which
@@ -95,7 +96,8 @@ measures the replayer rather than the server.
 | `bot.join(name)` | Complete the join flow |
 | `bot.dig_block(x, y, z)` | Replace a whole block with air |
 | `bot.dig_subnode(x, y, z)` | Replace one of 27 sub-nodes with air |
-| `bot.place(x, y, z, material)` | Place a material |
+| `bot.place(x, y, z, material)` | Place a whole block of a material |
+| `bot.place_subnode(x, y, z, material)` | Place one unit into the cell named |
 | `bot.expect_block(x, y, z, material, timeout_ms)` | Block until the server confirms |
 | `bot.move_to(x, y, z)` | Report movement intent |
 | `bot.chat(text)` | Send a chat line |

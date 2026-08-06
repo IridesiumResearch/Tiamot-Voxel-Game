@@ -974,6 +974,69 @@ impl Bot {
         .await
     }
 
+    /// Places one sub-node: fills a single cell, the one aimed at.
+    ///
+    /// The mirror of [`Bot::dig_subnode`], and it holds a tool the same way —
+    /// by brush rather than by name, because the engine has no opinion about
+    /// what a chisel is called (charter rule 1). The brush decides what a
+    /// placement writes as well as what a dig removes, so holding a sub-node
+    /// tool is what makes this one cell rather than a whole block.
+    ///
+    /// Unlike [`Bot::place`] this does not retry. A sub-node placement into an
+    /// occupied cell is refused, so a retry that arrived after a successful
+    /// first attempt would be reported as a failure of the wrong thing — the
+    /// trap [`Bot::place`]'s own comment describes, from the other side.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Unexpected`] if no sub-node tool is registered, or if the
+    /// cell never fills. Read [`Bot::notices`] for the server's reason.
+    pub async fn place_subnode(
+        &mut self,
+        pos: tiamot_core::SubNodePos,
+        material: u16,
+    ) -> Result<(), BotError> {
+        /// Long enough to cover a tick and the broadcast back.
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+        self.hold_brush(tiamot_core::dig::Brush::SubNode.name())
+            .await?;
+        self.place_from_inventory(pos, material).await?;
+
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            if self.saw_subnode(pos, material) {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(BotError::Unexpected {
+                    expected: "the placed cell to appear",
+                    got: format!("nothing at {pos:?}; notices: {:?}", self.notices()),
+                });
+            }
+            let _ = tokio::time::timeout(
+                remaining.min(std::time::Duration::from_millis(100)),
+                self.recv(),
+            )
+            .await;
+        }
+    }
+
+    /// Whether a cell edit setting `pos` to `material` has been broadcast.
+    #[must_use]
+    pub fn saw_subnode(&self, pos: tiamot_core::SubNodePos, material: u16) -> bool {
+        self.received().iter().any(|message| {
+            matches!(
+                message,
+                ServerMessage::BlockDelta {
+                    edit: tiamot_core::proto::Edit::SubNode { pos: at, material: got },
+                    ..
+                } if *at == pos && *got == material
+            )
+        })
+    }
+
     /// Places a material at a block position and waits for it to appear.
     ///
     /// **A real placement**, which means the player has to be CARRYING the
@@ -992,6 +1055,25 @@ impl Bot {
         /// Re-sent while waiting, because a request can go missing and a
         /// refusal is reported rather than retried.
         const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+        // A whole block wants a whole-block brush, the same way [`Bot::dig_block`]
+        // does — the brush decides what a placement writes. Without this, a
+        // scenario that chiselled first would still be holding the chisel and
+        // would place one cell, then wait for a block that was never coming.
+        //
+        // Only if the mod set has one, and no error if it does not: placing is
+        // spending material already held rather than a rule a mod must supply,
+        // so the server falls back to a block brush and a world with no tools
+        // can still build. Digging cannot say the same, which is why
+        // `dig_block` insists.
+        if self
+            .tools()
+            .iter()
+            .any(|tool| tool.brush == tiamot_core::dig::Brush::Block.name())
+        {
+            self.hold_brush(tiamot_core::dig::Brush::Block.name())
+                .await?;
+        }
 
         let target = tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1);
         let deadline = tokio::time::Instant::now() + PATIENCE;
