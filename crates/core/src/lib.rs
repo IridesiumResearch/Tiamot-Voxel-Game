@@ -69,6 +69,7 @@ pub mod dig;
 pub mod identity;
 pub mod interest;
 pub mod inventory;
+pub mod light;
 pub mod material;
 pub mod modload;
 pub mod persist;

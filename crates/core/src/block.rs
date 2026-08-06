@@ -309,6 +309,29 @@ pub enum BlockView<'a> {
     Mixed(&'a Cells),
 }
 
+impl BlockValue {
+    /// Borrows this value as a [`BlockView`].
+    ///
+    /// The two describe the same thing — one owns its cells and the other
+    /// borrows them — and code that reads block geometry is written against the
+    /// view. Without this, every caller holding a `BlockValue` has to
+    /// re-match the three variants to ask a question about its shape.
+    #[must_use]
+    pub const fn view(&self) -> BlockView<'_> {
+        match self {
+            Self::Uniform(material) => BlockView::Uniform(*material),
+            Self::Partial {
+                material,
+                occupancy,
+            } => BlockView::Partial {
+                material: *material,
+                occupancy: *occupancy,
+            },
+            Self::Cells(cells) => BlockView::Mixed(cells),
+        }
+    }
+}
+
 impl BlockView<'_> {
     /// The material at a sub-node index.
     ///

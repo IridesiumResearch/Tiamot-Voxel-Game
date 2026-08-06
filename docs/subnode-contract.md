@@ -116,6 +116,21 @@ not a suggestion — Task 02b measured the uncached test at **≈50% overhead** 
 chiselled chunk against a treat-Partial-as-solid baseline, failing that gate.
 The remedy is six bits per block, recomputed only when the block changes.
 
+**As implemented (Task 10), the cache lives on the palette entry rather than on
+the block.** Permeability is a pure function of block content, and a chunk
+already stores each distinct content exactly once, so a uniform chunk caches one
+value instead of 4,096 — and lighting pays no extra indirection, because
+resolving a block to its palette entry is how it reads the block at all.
+`Chunk::faces` is the accessor; `light::permeability` is the rule it caches.
+
+The trade is stated rather than hidden: four bytes per palette entry after
+alignment, so a saturated 4,096-entry palette costs 16 KiB where a per-block
+byte would have cost 4 KiB. Every realistic chunk is far cheaper and the
+saturated case is not a shape terrain produces. A stale cache would leak light
+through solid rock hours from the edit that caused it, so
+`the_cached_permeability_survives_an_arbitrary_edit_sequence` checks every block
+against the uncached function after edits and after a repack.
+
 ---
 
 ## 4. Fluid — block resolution

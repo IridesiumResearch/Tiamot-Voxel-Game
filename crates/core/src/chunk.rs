@@ -36,6 +36,7 @@ use std::collections::BTreeMap;
 use crate::bitpack::BitArray;
 use crate::block::{BlockContent, BlockValue, BlockView, Cells, SlotIndex};
 use crate::coords::{BlockPos, ChunkPos, LocalBlock, SubNodePos};
+use crate::light::Faces;
 use crate::material::MaterialId;
 use crate::{BLOCKS_PER_CHUNK, CHUNK_SUBNODES, block};
 
@@ -56,6 +57,38 @@ struct PaletteEntry {
     content: BlockContent,
     /// Blocks referring to this entry. Zero means the slot is free for reuse.
     refs: u32,
+    /// Which faces let light through — **derived from `content`, cached here.**
+    ///
+    /// Charter rule 19 and Sub-Node Contract §3 require this to be cached
+    /// rather than recomputed per lighting visit; Task 02b measured the
+    /// uncached test at ≈50% overhead on a chiselled chunk.
+    ///
+    /// It lives on the palette entry rather than on the block because
+    /// permeability is a pure function of content, and the palette already
+    /// stores each distinct content once: a uniform chunk caches one byte
+    /// instead of 4,096. Every site that writes `content` must write this with
+    /// it — [`faces_of`] is the only way to compute it, so the sites are
+    /// findable.
+    faces: Faces,
+}
+
+/// Which faces of a block content let light through.
+///
+/// Needs the mixed table because [`BlockContent::Mixed`] names its cells by
+/// slot, and the cells are what the rule looks at.
+fn faces_of(content: BlockContent, mixed: &MixedTable) -> Faces {
+    let view = match content {
+        BlockContent::Uniform(material) => BlockView::Uniform(material),
+        BlockContent::Partial {
+            material,
+            occupancy,
+        } => BlockView::Partial {
+            material,
+            occupancy,
+        },
+        BlockContent::Mixed(slot) => BlockView::Mixed(mixed.get(slot)),
+    };
+    crate::light::permeability(&view)
 }
 
 /// Interned `[MaterialId; 27]` arrays for [`BlockContent::Mixed`] blocks.
@@ -280,6 +313,7 @@ impl Chunk {
         let palette = vec![PaletteEntry {
             content: BlockContent::Uniform(fill),
             refs: BLOCKS_PER_CHUNK as u32,
+            faces: crate::light::permeability(&BlockView::Uniform(fill)),
         }];
 
         Self {
@@ -346,6 +380,18 @@ impl Chunk {
             self.get_block_local(pos.block().local())
                 .subnode_at(x, y, z),
         )
+    }
+
+    /// Which faces of a block let light through.
+    ///
+    /// **The cached answer** (charter rule 19, Sub-Node Contract §3) — a
+    /// palette lookup, never the 3×3 face test, which is why lighting can
+    /// afford to ask it for every block it visits. Identical to
+    /// [`crate::light::permeability`] of the same block, and a property test
+    /// holds it to that across arbitrary edit sequences.
+    #[must_use]
+    pub fn faces(&self, local: LocalBlock) -> Faces {
+        self.palette[self.indices.get(local.index()) as usize].faces
     }
 
     /// Whether every block in this chunk is the same uniform material.
@@ -555,6 +601,9 @@ impl Chunk {
             packed.push(PaletteEntry {
                 content,
                 refs: entry.refs,
+                // Re-interning moves the cells to another slot without changing
+                // them, and permeability depends only on the cells.
+                faces: entry.faces,
             });
         }
 
@@ -594,12 +643,21 @@ impl Chunk {
     ///
     /// | Chunk | Palette | Bits/index | Bytes |
     /// |---|---|---|---|
-    /// | Uniform (solid or air) | 1 | 0 | 12 |
-    /// | Two materials, split in half | 2 | 1 | 560 |
-    /// | Flat terrain, 4 layers | 4 | 2 | 1,072 |
-    /// | One chiselled block in solid stone | 2 | 1 | 560 |
-    /// | Every block a distinct partial mask | 4096 | 12 | 55,296 |
-    /// | Every block a distinct 2-material mix | 4096 | 12 | 350,208 |
+    /// | Uniform (solid or air) | 1 | 0 | 16 |
+    /// | Two materials, split in half | 2 | 1 | 576 |
+    /// | Flat terrain, 4 layers | 4 | 2 | 1,088 |
+    /// | One chiselled block in solid stone | 2 | 1 | 576 |
+    /// | Every block a distinct partial mask | 4096 | 12 | 71,680 |
+    /// | Every block a distinct 2-material mix | 4096 | 12 | 366,592 |
+    ///
+    /// **These grew by four bytes per palette entry in Task 10**, when
+    /// [`PaletteEntry`] gained its cached permeability (charter rule 19). One
+    /// byte of cache costs four after alignment. The trade is worth naming: the
+    /// contract specifies a per-*block* byte, which would be a flat 4,096 bytes
+    /// per chunk, so caching per entry is cheaper for every realistic chunk —
+    /// a uniform chunk pays 4 bytes rather than 4,096 — and dearer only in the
+    /// pathological last two rows, where a saturated palette pays 16 KiB.
+    /// Those rows are not shapes real terrain produces.
     ///
     /// For scale, an uncompressed chunk storing 27 `MaterialId`s per block
     /// unconditionally would be 221,184 bytes regardless of contents. Ordinary
@@ -694,7 +752,16 @@ impl Chunk {
             pos,
             palette: palette
                 .into_iter()
-                .map(|(content, refs)| PaletteEntry { content, refs })
+                .map(|(content, refs)| PaletteEntry {
+                    content,
+                    refs,
+                    // Derived on load rather than stored in the file. A cached
+                    // byte read back from disk could disagree with the content
+                    // it claims to describe, and light leaking through solid
+                    // rock is not a failure anyone would trace to the file
+                    // format.
+                    faces: faces_of(content, &mixed),
+                })
                 .collect(),
             free: free_palette,
             live_entries,
@@ -883,13 +950,25 @@ impl Chunk {
             return slot as u16;
         }
 
+        // Computed here, once per distinct content entering the palette, and
+        // never again — this is the whole point of caching it.
+        let faces = faces_of(content, &self.mixed);
+
         let slot = if let Some(reused) = self.free.pop() {
-            self.palette[reused as usize] = PaletteEntry { content, refs: 1 };
+            self.palette[reused as usize] = PaletteEntry {
+                content,
+                refs: 1,
+                faces,
+            };
             reused
         } else {
             let slot = u16::try_from(self.palette.len())
                 .expect("a chunk has 4096 blocks, so its palette cannot exceed 4096 entries");
-            self.palette.push(PaletteEntry { content, refs: 1 });
+            self.palette.push(PaletteEntry {
+                content,
+                refs: 1,
+                faces,
+            });
             self.grow_indices_if_needed();
             slot
         };
@@ -959,7 +1038,7 @@ mod tests {
             0,
             "one entry needs no index storage"
         );
-        assert_eq!(chunk.memory_usage(), 12);
+        assert_eq!(chunk.memory_usage(), 16);
     }
 
     #[test]
@@ -1298,7 +1377,7 @@ mod tests {
             "repack should release the mixed table: {} vs peak {peak}",
             chunk.memory_usage()
         );
-        assert_eq!(chunk.memory_usage(), 12, "back to a uniform chunk's cost");
+        assert_eq!(chunk.memory_usage(), 16, "back to a uniform chunk's cost");
     }
 
     #[test]
@@ -1312,7 +1391,7 @@ mod tests {
         assert_eq!(UNCOMPRESSED, 221_184);
 
         let uniform = Chunk::new(origin(), STONE);
-        assert_eq!(uniform.memory_usage(), 12);
+        assert_eq!(uniform.memory_usage(), 16);
 
         let mut halves = Chunk::new(origin(), STONE);
         for z in 0..16 {
@@ -1323,7 +1402,7 @@ mod tests {
             }
         }
         assert_eq!(halves.palette_len(), 2);
-        assert_eq!(halves.memory_usage(), 560);
+        assert_eq!(halves.memory_usage(), 576);
 
         let mut layered = Chunk::new(origin(), STONE);
         for z in 0..16 {
@@ -1334,7 +1413,7 @@ mod tests {
             }
         }
         assert_eq!(layered.palette_len(), 4);
-        assert_eq!(layered.memory_usage(), 1_072);
+        assert_eq!(layered.memory_usage(), 1_088);
 
         let mut chiselled = Chunk::new(origin(), STONE);
         chiselled.set_block_local(
@@ -1344,7 +1423,7 @@ mod tests {
                 occupancy: 0b1011,
             },
         );
-        assert_eq!(chiselled.memory_usage(), 560);
+        assert_eq!(chiselled.memory_usage(), 576);
 
         // Pathological: every block a distinct partial mask. Task 02b measures
         // whether shapes like this need capping.
@@ -1361,7 +1440,7 @@ mod tests {
         }
         assert_eq!(all_partial.palette_len(), 4096);
         assert_eq!(all_partial.bits_per_index(), 12);
-        assert_eq!(all_partial.memory_usage(), 55_296);
+        assert_eq!(all_partial.memory_usage(), 71_680);
         assert!(all_partial.memory_usage() < UNCOMPRESSED);
 
         // Pathological: every block a distinct multi-material mix. The two
@@ -1381,7 +1460,7 @@ mod tests {
             "no two blocks should share a slot"
         );
         assert_eq!(all_mixed.bits_per_index(), 12);
-        assert_eq!(all_mixed.memory_usage(), 350_208);
+        assert_eq!(all_mixed.memory_usage(), 366_592);
     }
 
     #[test]
@@ -1415,5 +1494,134 @@ mod tests {
             .set_subnode(SubNodePos::new(0, 0, 0), MaterialId::AIR)
             .expect("in chunk");
         assert_eq!(chunk.is_uniform(), None);
+    }
+
+    #[test]
+    fn the_cached_permeability_survives_an_arbitrary_edit_sequence() {
+        // **The failure mode this guards is a silent one.** A stale cache does
+        // not panic or corrupt anything visible — it leaks light through solid
+        // rock, or leaves a hole dark, hours of play away from the edit that
+        // caused it. So the cache is checked against the function it caches,
+        // for every block, after a sequence that exercises every path that
+        // writes content: uniform fills, whole-block writes, single cells,
+        // region fills, palette slot reuse, and a repack.
+        let mut chunk = Chunk::new(ChunkPos::new(0, 0, 0), STONE);
+        let mut seed = 0x5eed_u64;
+        let mut next = || {
+            // xorshift: the sequence only has to be varied and repeatable, and
+            // this needs no dependency to be either.
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for step in 0..400 {
+            let value = next();
+            let x = (value % 16) as u32;
+            let y = ((value >> 8) % 16) as u32;
+            let z = ((value >> 16) % 16) as u32;
+            match step % 4 {
+                0 => {
+                    let cell = ((value >> 24) % 27) as usize;
+                    let (cx, cy, cz) = block::subnode_offset(cell);
+                    let pos = SubNodePos::new(
+                        (x * 3 + cx) as i32,
+                        (y * 3 + cy) as i32,
+                        (z * 3 + cz) as i32,
+                    );
+                    let material = if value & 1 == 0 {
+                        MaterialId::AIR
+                    } else {
+                        DIRT
+                    };
+                    chunk.set_subnode(pos, material).expect("in chunk");
+                }
+                1 => chunk.set_block_local(
+                    LocalBlock::new(x, y, z),
+                    BlockValue::Partial {
+                        material: STONE,
+                        occupancy: (value >> 8) as u32 & block::OCCUPANCY_FULL,
+                    },
+                ),
+                2 => chunk.set_block_local(
+                    LocalBlock::new(x, y, z),
+                    BlockValue::Uniform(MaterialId::AIR),
+                ),
+                _ => {
+                    let mut cells = [MaterialId::AIR; SUBNODES_PER_BLOCK];
+                    for (index, cell) in cells.iter_mut().enumerate() {
+                        *cell = if (value >> (index % 32)) & 1 == 0 {
+                            DIRT
+                        } else {
+                            STONE
+                        };
+                    }
+                    chunk.set_block_local(LocalBlock::new(x, y, z), BlockValue::Cells(cells));
+                }
+            }
+        }
+
+        let check = |chunk: &Chunk, when: &str| {
+            for index in 0..BLOCKS_PER_CHUNK {
+                let local = LocalBlock::from_index(index);
+                let expected = crate::light::permeability(&chunk.get_block_local(local));
+                assert_eq!(
+                    chunk.faces(local),
+                    expected,
+                    "block {index} cached {:?} but its content says {expected:?} ({when})",
+                    chunk.faces(local)
+                );
+            }
+        };
+        check(&chunk, "after edits");
+
+        // And across a repack, which rebuilds every palette entry and moves
+        // every mixed slot. Carrying the cached byte to the wrong entry here
+        // would be invisible without this second pass.
+        chunk.repack();
+        check(&chunk, "after repack");
+    }
+
+    #[test]
+    fn a_serialised_chunk_reloads_with_a_correct_permeability_cache() {
+        // The cache is derived on load rather than stored, so this asserts the
+        // derivation happens at all — a chunk whose palette came back from disk
+        // with a default `Faces` would be uniformly opaque and every cave
+        // would be lit.
+        let mut chunk = Chunk::new(ChunkPos::new(1, 2, 3), STONE);
+        chunk.set_block_local(
+            LocalBlock::new(2, 2, 2),
+            BlockValue::Partial {
+                material: STONE,
+                occupancy: 0b101,
+            },
+        );
+        let mut cells = [STONE; SUBNODES_PER_BLOCK];
+        cells[0] = MaterialId::AIR;
+        cells[1] = DIRT;
+        chunk.set_block_local(LocalBlock::new(3, 3, 3), BlockValue::Cells(cells));
+
+        let bytes = postcard::to_allocvec(&chunk.to_parts()).expect("serialise");
+        let parts = postcard::from_bytes(&bytes).expect("deserialise");
+        let reloaded = Chunk::from_parts(chunk.pos(), parts).expect("valid chunk");
+
+        for index in 0..BLOCKS_PER_CHUNK {
+            let local = LocalBlock::from_index(index);
+            assert_eq!(
+                reloaded.faces(local),
+                crate::light::permeability(&reloaded.get_block_local(local)),
+                "block {index} reloaded with a cache that disagrees with its content"
+            );
+        }
+        // Non-vacuous: the chunk really does hold blocks that are neither
+        // fully open nor fully opaque.
+        assert!(
+            (0..BLOCKS_PER_CHUNK).any(|index| {
+                let faces = reloaded.faces(LocalBlock::from_index(index));
+                faces.any() && faces != crate::light::Faces::OPEN
+            }),
+            "the fixture held no partially permeable block, so this proved nothing"
+        );
     }
 }
