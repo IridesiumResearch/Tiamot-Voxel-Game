@@ -1418,14 +1418,20 @@ impl App {
                 self.store.dirty_len()
             ),
             format!(
-                "{:.1} MiB of meshes, {material_count} materials",
-                self.renderer.mesh_bytes() as f64 / (1024.0 * 1024.0)
+                "{} of meshes, {material_count} materials",
+                human_bytes(self.renderer.mesh_bytes())
             ),
+            // Vsync sits here because a worst-frame figure cannot be read
+            // without it. An unsynchronised loop is back-pressured by the
+            // swapchain, which lands in `Phases::acquire` and looks exactly
+            // like a hitch — and working out which mode a reading came from
+            // otherwise costs a round trip with whoever took it.
             format!(
-                "{} on {} / {}",
+                "{} on {} / {} · vsync {}",
                 self.server_label,
                 self.renderer.gpu().adapter,
-                self.renderer.gpu().backend
+                self.renderer.gpu().backend,
+                if self.config.vsync { "on" } else { "OFF" }
             ),
             // The hotbar, such as it is. Names rather than ids: a player
             // debugging a placement needs to know it is stone, not that it is 2.
@@ -1489,6 +1495,20 @@ impl App {
         if self.warnings.len() > WARNING_HISTORY {
             self.warnings.remove(0);
         }
+    }
+}
+
+/// A byte count at a readable scale.
+///
+/// KiB below a mebibyte. A flat world greedy-meshes to about forty kilobytes
+/// across two hundred chunks, so a MiB-only readout reads "0.0 MiB" for every
+/// scene anyone actually tests on and answers nothing.
+fn human_bytes(bytes: u64) -> String {
+    let bytes = bytes as f64;
+    if bytes < 1024.0 * 1024.0 {
+        format!("{:.0} KiB", bytes / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes / (1024.0 * 1024.0))
     }
 }
 
