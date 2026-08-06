@@ -116,9 +116,18 @@ struct Globals {
     /// The floor under the darkest place, so a cave is legible rather than
     /// pitch black. Presentation only — the stored light really is zero there.
     ambient: f32,
-    pad: u32,
+    /// Where fog starts, in blocks from the camera.
+    fog_start: f32,
     /// The sun's colour, which a mod sets through the sky (Task 10).
     sun_colour: [f32; 4],
+    /// The sky's colour in `xyz`, and where fog reaches full strength in `w`.
+    ///
+    /// **Fog is the sky's colour or it does not work.** Fading geometry towards
+    /// any other colour puts a coloured haze between the player and the
+    /// horizon; fading it towards the sky makes distant terrain dissolve into
+    /// the sky it is standing against, which is what hides the edge of the
+    /// loaded world.
+    sky_colour: [f32; 4],
 }
 
 /// How much light the darkest place still gets.
@@ -127,6 +136,21 @@ struct Globals {
 /// the wall they are standing against. This is presentation only: the stored
 /// light really is zero down there, and `game.get_light` tells a mod so.
 const AMBIENT_FLOOR: f32 = 0.03;
+
+/// How far out fog begins, as a fraction of where it becomes total.
+///
+/// Three quarters leaves a band deep enough to hide a chunk arriving without
+/// washing out the middle distance a player is actually looking at.
+const FOG_START_FRACTION: f32 = 0.75;
+
+/// The default sky, as the shader wants it.
+///
+/// The same value the frame is cleared to. Fog and background must agree or
+/// the horizon has a seam exactly where the fog was supposed to hide one.
+#[must_use]
+pub fn sky_colour() -> [f32; 3] {
+    [SKY.r as f32, SKY.g as f32, SKY.b as f32]
+}
 
 /// One chunk's camera-relative offset, as an instance attribute.
 #[repr(C)]
@@ -408,6 +432,11 @@ pub struct Renderer {
     sun_intensity: f32,
     /// The sun's colour now.
     sun_colour: [f32; 4],
+    /// The sky's colour now, which fog fades towards.
+    sky_colour: [f32; 3],
+    /// Where fog begins and where it is total, in blocks.
+    fog_start: f32,
+    fog_end: f32,
     /// How many chunks the last frame actually drew.
     drawn: usize,
     /// The outline pipeline, and the line segments it draws this frame.
@@ -544,6 +573,12 @@ impl Renderer {
             // 08's scenes assumed and what a world with no sky mod gets.
             sun_intensity: 1.0,
             sun_colour: [1.0, 1.0, 1.0, 1.0],
+            sky_colour: sky_colour(),
+            // Far enough that nothing fogs until a view distance is set. A
+            // client that fogged by default would hide geometry the Task 08
+            // scenes assert on.
+            fog_start: f32::MAX,
+            fog_end: f32::MAX,
             drawn: 0,
         })
     }
@@ -563,6 +598,19 @@ impl Renderer {
     pub fn set_sun(&mut self, intensity: f32, colour: [f32; 3]) {
         self.sun_intensity = intensity.clamp(0.0, 1.0);
         self.sun_colour = [colour[0], colour[1], colour[2], 1.0];
+    }
+
+    /// Sets the sky's colour and where fog fades to it.
+    ///
+    /// `far` is the distance at which terrain is entirely sky, in blocks —
+    /// normally the view distance. **Fog starts well before it**, because fog
+    /// that begins at the far plane has nothing to hide: chunks would appear
+    /// at full contrast the instant they arrive, which is the pop the fog
+    /// exists to cover.
+    pub fn set_sky(&mut self, colour: [f32; 3], far: f32) {
+        self.sky_colour = colour;
+        self.fog_end = far.max(1.0);
+        self.fog_start = self.fog_end * FOG_START_FRACTION;
     }
 
     /// The sun's current strength, for tests and the HUD.
@@ -729,6 +777,34 @@ impl Renderer {
         self.chunks.values().map(|chunk| chunk.used_bytes).sum()
     }
 
+    /// Everything the shader is told about this frame.
+    ///
+    /// Split out of [`Renderer::render`] because it is a list of settings and
+    /// the draw loop is a sequence of steps; reading one while looking for the
+    /// other is what makes a long function hard rather than its length.
+    fn globals_for(&self, view_projection: glam::Mat4) -> Globals {
+        Globals {
+            view_projection: view_projection.to_cols_array_2d(),
+            atlas_grid: self.atlas_grid,
+            atlas_side: self.atlas_side,
+            tile: crate::texture::TILE,
+            padding: crate::texture::PADDING,
+            render_mode: u32::from(self.mode == RenderMode::Flat),
+            sun_intensity: self.sun_intensity,
+            ambient: AMBIENT_FLOOR,
+            fog_start: self.fog_start,
+            sun_colour: self.sun_colour,
+            // Fog's far distance rides in the sky colour's unused fourth
+            // component rather than costing another sixteen bytes of padding.
+            sky_colour: [
+                self.sky_colour[0],
+                self.sky_colour[1],
+                self.sky_colour[2],
+                self.fog_end,
+            ],
+        }
+    }
+
     /// Renders one frame into `target`.
     ///
     /// `size` is the target's dimensions; the depth buffer is rebuilt when they
@@ -746,18 +822,7 @@ impl Renderer {
         self.gpu.queue.write_buffer(
             &self.globals,
             0,
-            bytemuck::bytes_of(&Globals {
-                view_projection: view_projection.to_cols_array_2d(),
-                atlas_grid: self.atlas_grid,
-                atlas_side: self.atlas_side,
-                tile: crate::texture::TILE,
-                padding: crate::texture::PADDING,
-                render_mode: u32::from(self.mode == RenderMode::Flat),
-                sun_intensity: self.sun_intensity,
-                ambient: AMBIENT_FLOOR,
-                pad: 0,
-                sun_colour: self.sun_colour,
-            }),
+            bytemuck::bytes_of(&self.globals_for(view_projection)),
         );
 
         // Cull, then build the instance array. Both in one pass so a chunk's

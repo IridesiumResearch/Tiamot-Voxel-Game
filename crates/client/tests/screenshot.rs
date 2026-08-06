@@ -229,6 +229,71 @@ fn is_sky(colour: [f32; 3]) -> bool {
 }
 
 #[test]
+fn distant_terrain_fades_into_the_sky() {
+    // **Fog exists to hide the edge of the loaded world.** Without it, the far
+    // chunk boundary is a hard line between terrain and sky and every chunk
+    // arrives at full contrast; with it, distance dissolves into the same
+    // colour the frame is cleared to.
+    //
+    // Asserted as a comparison rather than an absolute: the near floor and the
+    // far floor are the same material under the same light, so any difference
+    // between them is the fog.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Fog well inside the scene, so there is near ground and far ground in one
+    // frame. The sky colour is the clear colour, which is what makes the two
+    // meet without a seam.
+    // Aggressive on purpose: the fixture's floor is white and the sky is a
+    // pale blue, so a gentle fog moves the colour by a few thousandths and the
+    // assertion would be measuring rounding. Eight blocks puts the far ground
+    // most of the way to sky.
+    renderer.set_sky(client::render::sky_colour(), 16.0);
+    let hazy = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // The same frame with fog pushed past everything, as the control.
+    renderer.set_sky(client::render::sky_colour(), 100_000.0);
+    let clear = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // Just below the horizon is the most distant ground in the frame.
+    let far_hazy = average(&hazy, 0, HEIGHT * 9 / 20, WIDTH, HEIGHT / 2);
+    let far_clear = average(&clear, 0, HEIGHT * 9 / 20, WIDTH, HEIGHT / 2);
+    let near_hazy = average(&hazy, 0, HEIGHT * 7 / 8, WIDTH, HEIGHT);
+    let near_clear = average(&clear, 0, HEIGHT * 7 / 8, WIDTH, HEIGHT);
+
+    // The control is a white floor under white light, so its blueness is
+    // exactly zero: any separation from it is the fog.
+    let blueness = |colour: [f32; 3]| colour[2] - colour[0];
+    assert!(
+        blueness(far_hazy) > blueness(far_clear) + 0.004,
+        "distant ground did not move towards the sky: {far_hazy:?} against {far_clear:?}"
+    );
+
+    // **The property that makes this fog rather than a tint**: it deepens with
+    // distance. Stated within one frame rather than against an absolute,
+    // because how far away the bottom of the frame is depends on where the
+    // fixture's camera stands — and a test encoding that breaks when the
+    // viewpoint moves for unrelated reasons.
+    assert!(
+        blueness(far_hazy) > blueness(near_hazy) + 0.004,
+        "fog did not deepen with distance: near {near_hazy:?}, far {far_hazy:?}"
+    );
+    // The unfogged frame has no such gradient, which is what makes the
+    // comparison above about the fog rather than about the scene's shading.
+    assert!(
+        (blueness(far_clear) - blueness(near_clear)).abs() < 0.004,
+        "the control frame already had a distance gradient: near {near_clear:?}, far \
+         {far_clear:?}"
+    );
+}
+
+#[test]
 fn a_frame_of_the_fixed_scene_has_sky_above_and_world_below() {
     // The structural assertion that catches almost every real regression: a
     // world that stopped drawing is all sky, a camera pointing the wrong way

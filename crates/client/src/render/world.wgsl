@@ -32,8 +32,11 @@ struct Globals {
     // dusk dirties nothing. See `Globals` on the Rust side.
     sun_intensity: f32,
     ambient: f32,
-    pad0: u32,
+    // Where fog starts, in blocks. It becomes total at `sky_colour.w`.
+    fog_start: f32,
     sun_colour: vec4<f32>,
+    // Sky colour in xyz, fog's far distance in w.
+    sky_colour: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -60,6 +63,9 @@ struct VertexOut {
     // surface gets a gradient rather than a per-block staircase.
     @location(3) sun: f32,
     @location(4) block_light: vec3<f32>,
+    // Distance from the camera, in blocks. The chunk offset is already
+    // camera-relative (floating origin), so this needs no camera position.
+    @location(5) distance: f32,
 };
 
 // Lighting mode 1: directional face shading, matching `mesher::face_shade`.
@@ -89,7 +95,9 @@ fn vertex_main(input: VertexIn) -> VertexOut {
     let local = vec3<f32>(x, y, z) / subnodes;
 
     var out: VertexOut;
-    out.clip = globals.view_projection * vec4<f32>(local + input.chunk_offset.xyz, 1.0);
+    let camera_relative = local + input.chunk_offset.xyz;
+    out.clip = globals.view_projection * vec4<f32>(camera_relative, 1.0);
+    out.distance = length(camera_relative);
 
     // The two coordinates that span this face's plane. Must match
     // `SubNodeGrid::cell`: axis 0 spans (y, z), axis 1 spans (x, z), axis 2
@@ -121,6 +129,17 @@ fn vertex_main(input: VertexIn) -> VertexOut {
     out.sun = levels.x;
     out.block_light = levels.yzw;
     return out;
+}
+
+// How much of the sky has taken over at this distance, 0 to 1.
+//
+// Linear between the two distances rather than exponential. Exponential fog is
+// prettier in the middle distance and never quite reaches the sky colour, which
+// leaves a faint edge exactly where the loaded world stops — the one place this
+// fog exists to hide.
+fn fog_amount(distance: f32) -> f32 {
+    let far = globals.sky_colour.w;
+    return clamp((distance - globals.fog_start) / max(far - globals.fog_start, 0.001), 0.0, 1.0);
 }
 
 // What one fragment's light comes to, as a colour multiplier.
@@ -164,5 +183,11 @@ fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
     let uv = origin + fract(input.tile_uv) * extent;
 
     let texel = textureSampleGrad(atlas, atlas_sampler, uv, ddx, ddy);
-    return vec4<f32>(texel.rgb * input.shade, texel.a);
+    let lit = texel.rgb * lighting(input);
+
+    // Fog last, over the lit colour rather than under it: fog is between the
+    // eye and the surface, so it is not something the surface's own light
+    // shines through. Mixing before lighting would let a lamp brighten the air.
+    let haze = fog_amount(input.distance);
+    return vec4<f32>(mix(lit, globals.sky_colour.rgb, haze), texel.a);
 }

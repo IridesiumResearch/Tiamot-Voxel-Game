@@ -461,11 +461,19 @@ pub struct App {
 impl App {
     /// Builds an app around an already-open connection and renderer.
     #[must_use]
-    pub fn new(config: Config, connection: Connection, renderer: Renderer) -> Self {
+    pub fn new(config: Config, connection: Connection, mut renderer: Renderer) -> Self {
         let camera = Camera {
             fov_y: config.fov_degrees.to_radians(),
             ..Camera::default()
         };
+        // Fog reaches the sky exactly where the loaded world stops, so terrain
+        // dissolves into the horizon rather than ending at a visible edge.
+        // Until a sky mod says otherwise this is the clear colour, so fog and
+        // background are the same colour by construction.
+        renderer.set_sky(
+            crate::render::sky_colour(),
+            f32::from(config.view_distance) * tiamot_core::CHUNK_BLOCKS as f32,
+        );
         Self {
             config,
             connection,
