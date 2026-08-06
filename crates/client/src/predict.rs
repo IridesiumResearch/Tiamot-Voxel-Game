@@ -97,9 +97,36 @@ pub struct Predictor {
     /// taken, so [`Predictor::settle`] re-homing the origin mid-walk would
     /// leave it a whole chunk out; a delta is the same number in either frame.
     last_step: [f32; 3],
+    /// How far the drawn camera trails the body after a step, in cells.
+    ///
+    /// See [`Predictor::smooth_step`]. Presentation only: it never reaches the
+    /// body, so reconciliation replays exactly what it would have anyway.
+    step_lag: f32,
     /// The last tick predicted.
     tick: u64,
 }
+
+/// How long the camera takes to catch up after a step, in seconds.
+///
+/// A tenth of a second: long enough to turn a one-tick teleport into a rise the
+/// eye reads as movement, short enough that the camera is never meaningfully
+/// behind where the player is standing. Longer feels like the world is on a
+/// spring; shorter does not smooth anything at 20 Hz.
+const STEP_SMOOTHING: f32 = 0.1;
+
+/// The most the camera will ever trail the body, in cells.
+///
+/// Three cells is a whole block. A body climbing stairs faster than the camera
+/// catches up would otherwise accumulate lag without bound and end up looking
+/// out of the floor.
+const MAX_STEP_LAG: f32 = 3.0;
+
+/// The slowest the camera catches up, in cells per [`STEP_SMOOTHING`].
+///
+/// A purely proportional decay approaches zero and never arrives, leaving a
+/// permanent fraction of a cell of offset that shows as the world sitting
+/// slightly low. This floor makes the last of it finish.
+const MIN_STEP_CATCHUP: f32 = 0.5;
 
 impl Predictor {
     /// A predictor starting from a spawn position.
@@ -111,6 +138,7 @@ impl Predictor {
             pending: VecDeque::new(),
             error: [0.0; 3],
             last_step: [0.0; 3],
+            step_lag: 0.0,
             tick,
         }
     }
@@ -244,9 +272,50 @@ impl Predictor {
         let behind = 1.0 - alpha.clamp(0.0, 1.0);
         [
             self.body.position[0] - self.last_step[0] * behind + self.error[0],
-            self.body.position[1] - self.last_step[1] * behind + self.error[1],
+            self.body.position[1] - self.last_step[1] * behind + self.error[1] - self.step_lag,
             self.body.position[2] - self.last_step[2] * behind + self.error[2],
         ]
+    }
+
+    /// Eases the camera up after a step, and reports where it now stands.
+    ///
+    /// # Why a step needs its own smoothing at all
+    ///
+    /// **Step-up is a teleport, and the tick interpolation cannot hide it.**
+    /// Sub-Node Contract §2 lifts a blocked body one sub-node in a single tick
+    /// with no vertical velocity, so the body's height jumps a third of a block
+    /// between two ticks and then holds. Interpolating between those two ticks
+    /// spreads the jump over 50 ms and no further, so walking up a chiselled
+    /// slope reads as *pop, flat, flat, flat, pop* — which is exactly what a
+    /// player means by "the motion is not fluid". It was reported from the
+    /// window before this existed.
+    ///
+    /// The remedy is a camera that lags the body and catches up: the step is
+    /// recorded as an offset, subtracted from the drawn height, and decayed to
+    /// nothing over [`STEP_SMOOTHING`]. **The body is untouched** — this is
+    /// presentation, charter rule 4 exempts it, and nothing here re-enters what
+    /// gets replayed for reconciliation.
+    ///
+    /// Only upward steps are smoothed. Falling is a real acceleration the
+    /// player should feel, and easing it would make every drop feel like a
+    /// float.
+    /// **Decay only.** The step itself is recorded once, by the tick that made
+    /// it — see [`Predictor::step`]. Recording it here instead was the first
+    /// version and it was wrong: this runs once per FRAME and a tick lasts
+    /// several frames, so one step was counted three times at 60 fps and the
+    /// camera sank further with every stair.
+    pub fn smooth_step(&mut self, dt: f32) {
+        if self.step_lag <= 0.0 {
+            return;
+        }
+        let decay = dt / STEP_SMOOTHING;
+        self.step_lag = (self.step_lag - self.step_lag.max(MIN_STEP_CATCHUP) * decay).max(0.0);
+    }
+
+    /// How far the drawn camera currently trails the body, in cells.
+    #[must_use]
+    pub const fn step_lag(&self) -> f32 {
+        self.step_lag
     }
 
     /// One simulation tick, recording how far it moved the body.
@@ -264,6 +333,15 @@ impl Predictor {
             self.body.position[1] - before[1],
             self.body.position[2] - before[2],
         ];
+
+        // A rise with no upward velocity is a step-up rather than a jump: a
+        // jump has velocity and should be felt immediately. Recorded here, once
+        // per tick, and eased away per frame by `smooth_step`.
+        let rise = self.last_step[1];
+        if rise > 0.0 && self.body.velocity[1] <= 0.0 {
+            self.step_lag = (self.step_lag + rise).min(MAX_STEP_LAG);
+        }
+
         self.settle();
     }
 
@@ -292,6 +370,82 @@ impl Predictor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_step_up_is_eased_rather_than_teleported() {
+        // **The reported bug**: "jumping past a block into a hole ... the
+        // motion isn't fluid". Sub-Node Contract §2 lifts a blocked body one
+        // sub-node in a single tick with no vertical velocity, so the drawn
+        // height jumps a third of a block between two ticks and then holds.
+        // Interpolating between ticks spreads that over 50 ms and no further,
+        // which reads as pop, flat, flat, pop.
+        let mut predictor = Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 0);
+
+        // What a tick that stepped up leaves behind, exactly as
+        // `resolve_horizontal` does: a rise with no upward velocity.
+        predictor.last_step = [0.0, 1.0, 0.0];
+        predictor.body.position[1] += 1.0;
+        predictor.body.velocity[1] = 0.0;
+        predictor.step_lag = 1.0;
+
+        let lagged = predictor.render_local_at(1.0)[1];
+        assert!(
+            lagged < predictor.body.position[1],
+            "the drawn camera is not behind the body: {lagged} against {}",
+            predictor.body.position[1]
+        );
+
+        // **The body is untouched.** Anything else would feed the smoothing
+        // back into what reconciliation replays, and presentation must not.
+        assert!(
+            (predictor.body.position[1] - 1.0).abs() < 1e-6,
+            "smoothing moved the body: {}",
+            predictor.body.position[1]
+        );
+
+        // And it catches up rather than leaving the world permanently low.
+        // Sixty frames is a second, six times the smoothing window.
+        for _ in 0..60 {
+            predictor.smooth_step(1.0 / 60.0);
+        }
+        assert!(
+            predictor.step_lag() <= 0.0,
+            "the camera never finished catching up: {} cells behind",
+            predictor.step_lag()
+        );
+    }
+
+    #[test]
+    fn falling_is_not_smoothed() {
+        // Only upward steps are eased. Falling is a real acceleration a player
+        // should feel, and easing it makes every drop feel like a float.
+        let mut predictor = Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 10.0, 24.0], 0);
+        predictor.last_step = [0.0, -2.0, 0.0];
+        predictor.body.velocity[1] = -2.0;
+
+        // Nothing recorded it, because only a tick records a step and a fall is
+        // not one.
+        assert!(
+            predictor.step_lag() <= 0.0,
+            "a fall was smoothed: {} cells of lag",
+            predictor.step_lag()
+        );
+    }
+
+    #[test]
+    fn a_jump_is_felt_immediately_rather_than_eased() {
+        // A jump has upward velocity; a step does not. Easing a jump would take
+        // the punch out of the one movement players notice most.
+        let mut predictor = Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 0);
+        predictor.last_step = [0.0, 1.5, 0.0];
+        predictor.body.velocity[1] = 1.5;
+
+        assert!(
+            predictor.step_lag() <= 0.0,
+            "a jump was smoothed: {} cells of lag",
+            predictor.step_lag()
+        );
+    }
+
     use std::collections::BTreeSet;
 
     use tiamot_core::phys::Gait;

@@ -369,7 +369,7 @@ impl Mesh {
                     quad.axis,
                     quad.positive,
                     quad.material,
-                    quad.shade.0[corner],
+                    quad.shade.corner(corner),
                 ));
             }
             // The y axis's (u, v, w) mapping is an odd permutation, so its
@@ -412,7 +412,7 @@ pub const fn face_shade(axis: u8, positive: bool) -> f32 {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PackedVertex {
-    /// x:6 | y:6 | z:6 | axis:2 | positive:1
+    /// x:6 | y:6 | z:6 | axis:2 | positive:1 | occlusion:2
     pub packed: u32,
     /// material:16 | light:16
     ///
@@ -437,15 +437,23 @@ impl PackedVertex {
             axis,
             positive,
             material,
-            tiamot_core::light::Light::DAYLIGHT,
+            crate::shade::Corner {
+                light: tiamot_core::light::Light::DAYLIGHT,
+                occlusion: 3,
+            },
         )
     }
 
-    /// Packs one corner with its own light level.
+    /// Packs one corner with its light and its occlusion.
     ///
-    /// The light occupies the top 16 bits, which Task 08 reserved for exactly
-    /// this — so mode 2 costs no more per vertex than mode 1 did, and Task
+    /// The light occupies the top 16 bits of `material`, which Task 08 reserved
+    /// for exactly this; occlusion takes two of the eleven bits `packed` had
+    /// spare. **So mode 2 costs no more per vertex than mode 1 did**, and Task
     /// 02b's VRAM measurements still hold.
+    ///
+    /// Occlusion is kept apart from the light rather than multiplied into it —
+    /// see [`crate::shade::Shade`]. Scaling the light keeps its hue, so a corner
+    /// shadowed under a low sun comes out dim orange rather than dark.
     #[must_use]
     pub const fn lit(
         x: u32,
@@ -454,11 +462,16 @@ impl PackedVertex {
         axis: u8,
         positive: bool,
         material: u16,
-        light: tiamot_core::light::Light,
+        corner: crate::shade::Corner,
     ) -> Self {
         Self {
-            packed: x | (y << 6) | (z << 12) | ((axis as u32) << 18) | ((positive as u32) << 20),
-            material: (material as u32) | ((light.0 as u32) << 16),
+            packed: x
+                | (y << 6)
+                | (z << 12)
+                | ((axis as u32) << 18)
+                | ((positive as u32) << 20)
+                | (((corner.occlusion & 0x3) as u32) << 21),
+            material: (material as u32) | ((corner.light.0 as u32) << 16),
         }
     }
 
@@ -466,6 +479,12 @@ impl PackedVertex {
     #[must_use]
     pub const fn light(&self) -> tiamot_core::light::Light {
         tiamot_core::light::Light((self.material >> 16) as u16)
+    }
+
+    /// The occlusion level this vertex carries, `0` darkest to `3` open.
+    #[must_use]
+    pub const fn occlusion(&self) -> u8 {
+        ((self.packed >> 21) & 0x3) as u8
     }
 
     /// The sub-node position this vertex sits at.
@@ -1106,13 +1125,13 @@ mod tests {
 
         let brightest = top
             .iter()
-            .flat_map(|quad| quad.shade.0.iter())
+            .flat_map(|quad| quad.shade.light.iter())
             .map(|level| level.sun())
             .max()
             .unwrap_or(0);
         let dimmest = top
             .iter()
-            .flat_map(|quad| quad.shade.0.iter())
+            .flat_map(|quad| quad.shade.light.iter())
             .map(|level| level.sun())
             .min()
             .unwrap_or(0);

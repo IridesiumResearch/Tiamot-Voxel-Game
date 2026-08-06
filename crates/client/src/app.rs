@@ -1264,7 +1264,7 @@ impl App {
         // one this frame is, and the camera is drawn there rather than at the
         // tick boundary. Without it the camera moves 20 times a second no
         // matter how fast the client draws.
-        self.follow_body(self.tick_carry / TICK_SECONDS);
+        self.follow_body(self.tick_carry / TICK_SECONDS, dt);
         // After the camera moves, so the outline is where the crosshair points
         // this frame rather than last.
         self.update_selection();
@@ -1276,7 +1276,15 @@ impl App {
     }
 
     /// Puts the camera at the predicted body's eyes.
-    fn follow_body(&mut self, alpha: f32) {
+    ///
+    /// `dt` drives the step smoothing — see [`crate::predict::Predictor::smooth_step`].
+    /// It is done here rather than in `walk` because it is a per-FRAME ease and
+    /// `walk` runs per simulation tick: easing at 20 Hz would replace one
+    /// staircase with a slower one.
+    fn follow_body(&mut self, alpha: f32, dt: f32) {
+        if let Some(predictor) = self.predictor.as_mut() {
+            predictor.smooth_step(dt);
+        }
         let Some(predictor) = self.predictor.as_ref() else {
             return;
         };

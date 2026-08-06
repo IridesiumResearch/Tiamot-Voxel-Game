@@ -44,7 +44,7 @@ struct Globals {
 @group(0) @binding(2) var atlas_sampler: sampler;
 
 struct VertexIn {
-    // x:6 | y:6 | z:6 | axis:2 | positive:1
+    // x:6 | y:6 | z:6 | axis:2 | positive:1 | occlusion:2
     @location(0) packed: u32,
     // material:16 | light:16, the light half a packed `core::light::Light`
     @location(1) material: u32,
@@ -66,12 +66,21 @@ struct VertexOut {
     // Distance from the camera, in blocks. The chunk offset is already
     // camera-relative (floating origin), so this needs no camera position.
     @location(5) distance: f32,
+    // Ambient occlusion, 0 darkest to 1 open, interpolated across the face.
+    @location(6) occlusion: f32,
 };
 
 // Lighting mode 1: directional face shading, matching `mesher::face_shade`.
 // Flat-lit voxels are unreadable — every edge disappears and the world is one
 // white mass. Task 10 replaces the light byte with propagated light; this
 // stays.
+// How much light the most occluded corner keeps.
+//
+// Strong enough to read as shading rather than as a smudge — the first attempt
+// kept 55% and was reported from the window as barely visible. Not zero: a
+// corner boxed in on both sides is in shadow, not in a different room.
+const AO_FLOOR: f32 = 0.35;
+
 fn face_shade(axis: u32, positive: bool) -> f32 {
     if (axis == 1u) {
         if (positive) { return 1.0; }   // top
@@ -126,6 +135,14 @@ fn vertex_main(input: VertexIn) -> VertexOut {
     ) / 15.0;
 
     out.shade = face_shade(axis, positive);
+
+    // **Occlusion is applied to the colour, not to the light.** Scaling the
+    // stored light would keep its hue, so a corner shadowed under a low sun
+    // came out dim orange rather than dark. Geometry darkens whatever lands on
+    // it. `AO_FLOOR` keeps a boxed-in corner from going black, which reads as a
+    // hole in the geometry rather than as shading.
+    let level = f32((input.packed >> 21u) & 0x3u) / 3.0;
+    out.occlusion = AO_FLOOR + (1.0 - AO_FLOOR) * level;
     out.sun = levels.x;
     out.block_light = levels.yzw;
     return out;
@@ -157,16 +174,18 @@ fn lighting(input: VertexOut) -> vec3<f32> {
     // A floor under the darkest cave, so a dark room is legible rather than
     // pitch black. Presentation, not simulation — the stored light really is
     // zero down there.
-    return max(lit, vec3<f32>(globals.ambient)) * input.shade;
+    return max(lit, vec3<f32>(globals.ambient)) * input.shade * input.occlusion;
 }
 
 @fragment
 fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (globals.render_mode == 1u) {
-        // Flat: directional shading only, no propagated light. **Mode 1 must
-        // keep Task 08's cost profile exactly**, and that includes ignoring
-        // light rather than sampling it and throwing the result away.
-        return vec4<f32>(vec3<f32>(input.shade), 1.0);
+        // Flat: directional shading and occlusion, no propagated light.
+        // **Mode 1 must keep Task 08's cost profile exactly**, and that
+        // includes ignoring light rather than sampling it and discarding it —
+        // but occlusion is geometry, and a flat mode without it is unreadable
+        // in exactly the way flat lighting is.
+        return vec4<f32>(vec3<f32>(input.shade * input.occlusion), 1.0);
     }
 
     let side = f32(globals.atlas_side);
