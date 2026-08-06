@@ -214,6 +214,12 @@ pub struct World {
     /// Separate from the cache so a save iterates only what moved. A server
     /// holding ten thousand chunks typically dirties a handful per tick.
     dirty: Vec<ChunkPos>,
+    /// Chunks that have entered memory and not yet been reported.
+    ///
+    /// See [`World::take_arrived`]. A list rather than a set because a chunk
+    /// can only arrive once between drains — it is already in the cache the
+    /// second time.
+    arrived: Vec<ChunkPos>,
 }
 
 impl World {
@@ -238,6 +244,7 @@ impl World {
             seed,
             cache: HashMap::new(),
             dirty: Vec::new(),
+            arrived: Vec::new(),
         })
     }
 
@@ -282,6 +289,31 @@ impl World {
         self.cache.get(&pos)
     }
 
+    /// Puts a chunk back on the arrival list.
+    ///
+    /// For a caller that drained the list and could not process everything this
+    /// tick — lighting caps how many chunks it relights per tick, and what it
+    /// does not reach has to come back rather than stay dark for as long as it
+    /// remains loaded.
+    pub fn defer_arrival(&mut self, pos: ChunkPos) {
+        self.arrived.push(pos);
+    }
+
+    /// Chunks that have entered memory since this was last called, and clears
+    /// the list.
+    ///
+    /// **In arrival order, which is deterministic**, and that is the point:
+    /// scanning the cache for new chunks would mean iterating a `HashMap`,
+    /// whose order is per-process random and which charter rule 4 forbids
+    /// anything observable from depending on. Recording arrivals as they happen
+    /// is also O(new) rather than O(loaded) — a server holding two thousand
+    /// chunks does not walk them every tick to find the one that just arrived.
+    ///
+    /// Lighting is the caller: a chunk with blocks and no light renders black.
+    pub fn take_arrived(&mut self) -> Vec<ChunkPos> {
+        std::mem::take(&mut self.arrived)
+    }
+
     /// Loads a chunk, generating it if the world has never seen it.
     ///
     /// # Errors
@@ -307,6 +339,7 @@ impl World {
                 }
             };
             self.cache.insert(pos, chunk);
+            self.arrived.push(pos);
         }
         Ok(self
             .cache

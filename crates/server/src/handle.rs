@@ -114,12 +114,54 @@ fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
     )
 }
 
+/// Sends every touched chunk's light to everyone.
+///
+/// Broadcast rather than aimed, the same as `BlockDelta`: interest sets live in
+/// the transport and the simulation thread does not hold them. A client filters
+/// what it is not holding, and the payload for the uniform chunks that make up
+/// most of a world is three bytes.
+fn broadcast_light(
+    shared: &Shared,
+    lighting: &crate::light::Lighting,
+    touched: &std::collections::BTreeSet<tiamot_core::ChunkPos>,
+) {
+    for pos in touched {
+        let Some(layer) = lighting.layer(*pos) else {
+            continue;
+        };
+        shared.broadcast(ServerMessage::ChunkLight {
+            pos: *pos,
+            light: tiamot_core::light::codec::encode(layer),
+        });
+    }
+}
+
+/// The block an edit changed.
+const fn edited_block(edit: &tiamot_core::proto::Edit) -> tiamot_core::BlockPos {
+    match edit {
+        tiamot_core::proto::Edit::Block { pos, .. }
+        | tiamot_core::proto::Edit::Partial { pos, .. } => *pos,
+        tiamot_core::proto::Edit::SubNode { pos, .. } => pos.block(),
+    }
+}
+
 /// How often dirty chunks are written out, in ticks.
 ///
 /// 40 ticks is two seconds. Short enough that a crash loses very little, long
 /// enough that a player chiselling one block does not cause twenty writes a
 /// second of the same chunk.
 const SAVE_INTERVAL_TICKS: u64 = 40;
+
+/// How many chunks may be relit from scratch in one tick.
+///
+/// A full-chunk relight was measured at about 30 µs in Task 02b, so 32 of them
+/// is roughly 1 ms — 2% of the 50 ms budget (charter rule 18), and that is with
+/// every one of them being the pathological chiselled case. The cap exists
+/// because a player teleporting or a server starting can make thousands of
+/// chunks resident at once, and an unbounded pass would spend the whole tick on
+/// terrain nobody is looking at yet. What it does not reach this tick it reaches
+/// on the next.
+const RELIGHTS_PER_TICK: usize = 32;
 
 /// Anything that stops a server starting.
 #[derive(Debug, thiserror::Error)]
@@ -426,6 +468,28 @@ impl ServerHandle {
                 Some((tiamot_core::MaterialId(world_id), rules.hardness))
             })
             .collect::<std::collections::BTreeMap<_, _>>();
+        // Emissive blocks, keyed by world id for the same reason hardness is.
+        // A world that has seen a different mod set numbers its materials
+        // differently, and a table of this session's runtime ids would name
+        // every lamp one number out (charter rule 8).
+        let emissions = crate::light::emissions_from_rules(
+            &host
+                .as_ref()
+                .map(|loaded| loaded.vm().registered_block_rules())
+                .unwrap_or_default(),
+            |block| {
+                let runtime = registry
+                    .iter()
+                    .find(|(_, name)| *name == block)
+                    .map(|(id, _)| id)?;
+                world
+                    .materials()
+                    .to_world(runtime)
+                    .ok()
+                    .map(tiamot_core::MaterialId)
+            },
+        );
+
         let tools = host
             .as_ref()
             .map(|loaded| loaded.vm().registered_tools())
@@ -590,6 +654,13 @@ impl ServerHandle {
                     };
                     info!(seed = world.seed(), "world seed");
 
+                    // Light is derived and lives only in memory — see
+                    // `crate::light`. It is built here rather than in `Shared`
+                    // because only the simulation thread may touch it: every
+                    // read walks the chunk cache, and a second thread doing
+                    // that would need a lock around the world itself.
+                    let mut lighting = crate::light::Lighting::new(emissions);
+
                     // Either the mods generate terrain, or there are no mods
                     // and the world is air. Both are legitimate.
                     let mut source = match host {
@@ -601,6 +672,14 @@ impl ServerHandle {
 
                     let mut clock = sim::MonotonicClock::new();
                     sim::run(&mut clock, &control, |tick| {
+                        // Every block edited this tick, relit once at the end
+                        // rather than four times in the middle. Batching is
+                        // what makes the cost of a swarm of players placing
+                        // lamps a function of the blocks they changed rather
+                        // than of where in the tick they changed them, and it
+                        // is the natural place to put a per-tick cap if the
+                        // load test ever needs one.
+                        let mut relight: Vec<tiamot_core::BlockPos> = Vec::new();
                         // ALL database access happens on this thread. The
                         // network side mutates the in-memory registry and this
                         // side writes it out, so a slow disk cannot stall a
@@ -627,10 +706,13 @@ impl ServerHandle {
                         // own actions this tick see the arranged world.
                         for edit in shared.drain_seeds() {
                             match world.apply(&edit, &mut source) {
-                                Ok(_) => shared.broadcast(ServerMessage::BlockDelta {
-                                    edit,
-                                    actor: None,
-                                }),
+                                Ok(_) => {
+                                    relight.push(edited_block(&edit));
+                                    shared.broadcast(ServerMessage::BlockDelta {
+                                        edit,
+                                        actor: None,
+                                    });
+                                }
                                 Err(err) => {
                                     debug!("an operator edit would not apply: {err}");
                                 }
@@ -643,6 +725,7 @@ impl ServerHandle {
                         for (actor, edit) in shared.drain_edits() {
                             match world.apply(&edit, &mut source) {
                                 Ok((_, removed)) => {
+                                    relight.push(edited_block(&edit));
                                     // Charter rule 5: what the edit took out,
                                     // in units. 27 for a block, 1 for a
                                     // sub-node.
@@ -794,6 +877,7 @@ impl ServerHandle {
                             };
                             match world.apply(&edit, &mut source) {
                                 Ok((_, removed)) => {
+                                    relight.push(edited_block(&edit));
                                     shared.credit(uuid, removed);
                                     shared.broadcast(ServerMessage::BlockDelta {
                                         edit,
@@ -964,10 +1048,13 @@ impl ServerHandle {
                                 }
                             };
                             match world.apply(&edit, &mut source) {
-                                Ok(_) => shared.broadcast(ServerMessage::BlockDelta {
-                                    edit,
-                                    actor: Some(*request.actor.as_bytes()),
-                                }),
+                                Ok(_) => {
+                                    relight.push(edited_block(&edit));
+                                    shared.broadcast(ServerMessage::BlockDelta {
+                                        edit,
+                                        actor: Some(*request.actor.as_bytes()),
+                                    });
+                                }
                                 Err(err) => {
                                     // The write failed after the charge, so
                                     // give it back. Anything else destroys
@@ -1013,10 +1100,59 @@ impl ServerHandle {
                                     None
                                 }
                             };
+                            // Light for a chunk that is about to be sent. A
+                            // client that had blocks and no light would draw
+                            // the world black until something happened to
+                            // relight it, so this is not an optimisation to
+                            // defer.
+                            if blob.is_some() {
+                                let touched = lighting.chunk_loaded(&world, request.pos);
+                                broadcast_light(&shared, &lighting, &touched);
+                            }
                             // A failed send means the connection went away
                             // between asking and being answered, which is
                             // ordinary rather than an error.
                             let _ = request.reply.send(blob);
+                        }
+
+                        // Light, once, after every edit this tick has landed.
+                        // Order matters: relighting between edits would do the
+                        // work twice for two edits in the same room, and the
+                        // second answer is the only one anybody sees.
+                        if !relight.is_empty() {
+                            let mut touched = std::collections::BTreeSet::new();
+                            for pos in relight.drain(..) {
+                                touched.extend(lighting.edited(&world, pos));
+                            }
+                            broadcast_light(&shared, &lighting, &touched);
+                        }
+
+                        // Chunks that arrived this tick, whatever brought
+                        // them in — a chunk request, a player walking, a mod
+                        // reading. Asking the world what arrived rather than
+                        // hunting every load site means the next route somebody
+                        // adds is lit too, instead of being silently black.
+                        let arrived = world.take_arrived();
+                        if !arrived.is_empty() {
+                            let mut touched = std::collections::BTreeSet::new();
+                            let mut done = 0;
+                            for pos in arrived {
+                                if lighting.holds(pos) {
+                                    continue;
+                                }
+                                if done >= RELIGHTS_PER_TICK {
+                                    // Put the rest back, in order, for the next
+                                    // tick. Dropping them would leave those
+                                    // chunks black for as long as they stayed
+                                    // loaded, which is the kind of bug that
+                                    // only shows up after a teleport.
+                                    world.defer_arrival(pos);
+                                    continue;
+                                }
+                                touched.extend(lighting.chunk_loaded(&world, pos));
+                                done += 1;
+                            }
+                            broadcast_light(&shared, &lighting, &touched);
                         }
 
                         // Debounced saves. Writing every dirty chunk every tick

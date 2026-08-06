@@ -76,6 +76,15 @@ impl Lighting {
         self.layers.is_empty()
     }
 
+    /// Whether a chunk has light at all.
+    ///
+    /// The question the tick's catch-up pass asks: a chunk with blocks and no
+    /// light renders black, so anything resident and unlit is work to do.
+    #[must_use]
+    pub fn holds(&self, pos: ChunkPos) -> bool {
+        self.layers.contains_key(&pos)
+    }
+
     /// A chunk's levels, for sending to a client.
     #[must_use]
     pub fn layer(&self, pos: ChunkPos) -> Option<&LightLayer> {
@@ -102,14 +111,26 @@ impl Lighting {
     pub fn chunk_loaded(&mut self, world: &World, pos: ChunkPos) -> BTreeSet<ChunkPos> {
         self.layers.entry(pos).or_insert_with(LightLayer::dark);
 
+        // Exactly the chunk. The blocks around it are handled as a boundary
+        // condition by `relight` — they keep their light and flood inward —
+        // rather than being relit as part of the region. Widening the region
+        // instead would clear the neighbours' light and then fail to re-seed
+        // it, because the sky that lit them is further away still.
         let corner = BlockPos::from_chunk_corner(pos);
-        let span = CHUNK_BLOCKS as i32;
+        let span = CHUNK_BLOCKS as i32 - 1;
         let region = Region {
-            min: BlockPos::new(corner.x - 1, corner.y - 1, corner.z - 1),
+            min: corner,
             max: BlockPos::new(corner.x + span, corner.y + span, corner.z + span),
         };
 
         let mut touched = Touched::default();
+        // The chunk itself, always — even when relighting changed nothing.
+        // "Nothing changed" is measured against the dark layer this function
+        // just inserted, but a client has no layer at all, so a chunk that is
+        // genuinely pitch black still has to be told to it. Without this a
+        // client cannot tell "dark" from "not arrived yet", and every
+        // underground chunk goes unreported.
+        touched.chunks.insert(pos);
         {
             let mut lit = Lit {
                 world,
@@ -374,6 +395,39 @@ mod tests {
             before,
             "relighting generated {} chunks",
             world.cached() - before
+        );
+    }
+
+    #[test]
+    fn a_chunk_that_is_pitch_black_is_still_reported() {
+        // A client has no layer for a chunk it has never been told about, so
+        // "dark" and "not arrived" are the same to it. Reporting only what
+        // CHANGED would leave every underground chunk unsent, and a client
+        // cannot tell that from a message still in flight.
+        let mut world = world();
+        let mut light = lighting();
+        let pos = ChunkPos::new(0, -4, 0);
+        {
+            let chunk = world.chunk(pos, &mut Empty).expect("chunk");
+            for index in 0..tiamot_core::BLOCKS_PER_CHUNK {
+                chunk.set_block_local(
+                    tiamot_core::coords::LocalBlock::from_index(index),
+                    BlockValue::Uniform(STONE),
+                );
+            }
+        }
+
+        let touched = light.chunk_loaded(&world, pos);
+
+        assert!(
+            touched.contains(&pos),
+            "a chunk that relit to unchanged darkness was not reported: {touched:?}"
+        );
+        assert!(
+            light.layer(pos).is_some_and(|layer| layer
+                .is_uniform()
+                .is_some_and(tiamot_core::light::Light::is_dark)),
+            "solid rock with no lamps should be uniformly dark"
         );
     }
 

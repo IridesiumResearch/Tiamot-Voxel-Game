@@ -1006,6 +1006,8 @@ impl App {
 
                 Event::Chunk(chunk) => self.store.insert(*chunk),
 
+                Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
+
                 Event::ChunkUnload(pos) => {
                     if self.store.remove(pos) {
                         // The mesh has to go with the data. A renderer holding

@@ -80,6 +80,40 @@ pub struct Region {
 }
 
 impl Region {
+    /// The blocks just outside the region, in a fixed order.
+    ///
+    /// **The boundary condition for a bounded relight.** A region is relit by
+    /// clearing it and re-seeding, but the light coming *into* it from outside
+    /// has sources that are not in it — daylight descending from the chunk
+    /// above, a lamp in the chunk next door. Those blocks keep their light and
+    /// flood inward, which is what makes relighting one chunk give the same
+    /// answer as relighting the world.
+    ///
+    /// Six slabs, one per face, walked in a fixed order. Corners and edges
+    /// appear once each because the slabs are trimmed to be disjoint — a
+    /// duplicate would only cost a wasted queue entry, but the order has to be
+    /// deterministic and "sometimes twice" is harder to reason about than not.
+    fn border(self) -> impl Iterator<Item = BlockPos> {
+        let Self { min, max } = self;
+        let low = BlockPos::new(min.x - 1, min.y - 1, min.z - 1);
+        let high = BlockPos::new(max.x + 1, max.y + 1, max.z + 1);
+
+        // The two y slabs take the full x/z extent; the z slabs take the full
+        // x extent but only the interior y; the x slabs take only interior y
+        // and z. That covers the shell exactly once.
+        let y_slabs = [low.y, high.y].into_iter().flat_map(move |y| {
+            (low.z..=high.z)
+                .flat_map(move |z| (low.x..=high.x).map(move |x| BlockPos::new(x, y, z)))
+        });
+        let z_slabs = [low.z, high.z].into_iter().flat_map(move |z| {
+            (min.y..=max.y).flat_map(move |y| (low.x..=high.x).map(move |x| BlockPos::new(x, y, z)))
+        });
+        let x_slabs = [low.x, high.x].into_iter().flat_map(move |x| {
+            (min.y..=max.y).flat_map(move |y| (min.z..=max.z).map(move |z| BlockPos::new(x, y, z)))
+        });
+        y_slabs.chain(z_slabs).chain(x_slabs)
+    }
+
     /// Every block in the region, in a fixed order.
     ///
     /// Y outermost so that a caller walking columns sees each column's blocks
@@ -255,6 +289,19 @@ pub fn relight(world: &mut impl Neighbourhood, region: Region) {
 
     for pos in region.blocks() {
         world.set_light(pos, Light::DARK);
+    }
+
+    // **The blocks around the region are sources, not part of it.** They keep
+    // whatever light they have and flood inward. Clearing them too — which is
+    // what relighting a region with a margin amounts to — destroys the daylight
+    // descending from the chunk above and the light from the lamp next door,
+    // and the region comes back lit only by whatever it contains itself. The
+    // symptom is a freshly loaded chunk under open sky that is almost, but not
+    // quite, dark.
+    for pos in region.border() {
+        if !world.light(pos).is_dark() {
+            queue.push_back(pos);
+        }
     }
 
     for pos in region.blocks() {
@@ -675,6 +722,39 @@ mod tests {
             world.at(BlockPos::new(6, 5, 5)).red(),
             0,
             "light crossed a face the block seals"
+        );
+    }
+
+    #[test]
+    fn relighting_part_of_a_world_keeps_the_light_coming_into_it() {
+        // **The boundary condition, and a bug that reached an integration test
+        // before it was caught here.** Relighting a region clears it — but the
+        // light entering it has sources outside it, and if those are cleared
+        // too the region comes back lit only by whatever it contains. A chunk
+        // relit under open sky was coming back almost, but not quite, dark:
+        // the daylight descending into it belonged to the region above.
+        let mut world = open_box(20);
+        let whole = world.region;
+        relight(&mut world, whole);
+        assert_eq!(world.at(BlockPos::new(10, 0, 10)).sun(), MAX_LEVEL);
+
+        // Now relight only the bottom slab, whose own top is not open to the
+        // sky — everything above it is loaded.
+        let slab = Region {
+            min: BlockPos::new(0, 0, 0),
+            max: BlockPos::new(20, 5, 20),
+        };
+        relight(&mut world, slab);
+
+        assert_eq!(
+            world.at(BlockPos::new(10, 0, 10)).sun(),
+            MAX_LEVEL,
+            "relighting a slab lost the daylight falling into it from above"
+        );
+        assert_eq!(
+            world.at(BlockPos::new(10, 5, 10)).sun(),
+            MAX_LEVEL,
+            "the top of the slab should be lit by the block above it"
         );
     }
 

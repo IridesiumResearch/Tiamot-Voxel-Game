@@ -1023,6 +1023,62 @@ impl Bot {
         }
     }
 
+    /// The light the server has most recently reported for a chunk.
+    ///
+    /// `None` until a `ChunkLight` arrives for it. Decoded here rather than
+    /// stored raw so a scenario asserting about light does not have to know the
+    /// wire format — and so a payload that will not decode fails the test that
+    /// cares rather than being silently treated as darkness.
+    #[must_use]
+    pub fn light_at(&self, pos: tiamot_core::BlockPos) -> Option<tiamot_core::light::Light> {
+        let chunk = pos.chunk();
+        // The LAST one wins: light is re-sent whenever it changes, and an
+        // earlier payload describes a world that has moved on.
+        self.received()
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ServerMessage::ChunkLight { pos: at, light } if *at == chunk => {
+                    tiamot_core::light::codec::decode(light).ok()
+                }
+                _ => None,
+            })
+            .map(|layer| layer.get(pos.local()))
+    }
+
+    /// Waits until the server reports light at `pos` satisfying `wanted`.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Unexpected`] if the timeout expires first.
+    pub async fn expect_light(
+        &mut self,
+        pos: tiamot_core::BlockPos,
+        wanted: impl Fn(tiamot_core::light::Light) -> bool,
+        timeout: std::time::Duration,
+    ) -> Result<tiamot_core::light::Light, BotError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(level) = self.light_at(pos)
+                && wanted(level)
+            {
+                return Ok(level);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(BotError::Unexpected {
+                    expected: "light matching the condition",
+                    got: format!("{:?} at {pos:?}", self.light_at(pos)),
+                });
+            }
+            let _ = tokio::time::timeout(
+                remaining.min(std::time::Duration::from_millis(100)),
+                self.recv(),
+            )
+            .await;
+        }
+    }
+
     /// Whether a cell edit setting `pos` to `material` has been broadcast.
     #[must_use]
     pub fn saw_subnode(&self, pos: tiamot_core::SubNodePos, material: u16) -> bool {

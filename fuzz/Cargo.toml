@@ -36,4 +36,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "light_decode"
+path = "fuzz_targets/light_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

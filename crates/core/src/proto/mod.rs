@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -56,6 +56,11 @@ pub const PROTOCOL_VERSION: u32 = 7;
 // nested inside `BlockDelta` on both sides, so appending a variant to it
 // changes what both messages can carry without moving either of them.
 // v7 (Task 09): appended `ServerMessage::ToolTable`.
+// v8 (Task 10): appended `ServerMessage::ChunkLight`. Light is a separate
+// message rather than a field on `ChunkData` for two reasons: a chunk's light
+// changes without its blocks changing — a lamp placed next door — so the two
+// have different lifetimes on the wire, and appending a variant is the only
+// shape of protocol change this format makes safe.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -640,6 +645,28 @@ pub enum ServerMessage {
         /// Every tool, in ascending id order.
         tools: Vec<ToolDef>,
     },
+
+    /// A chunk's light levels.
+    ///
+    /// **Appended at the end** (protocol v8).
+    ///
+    /// Separate from [`ServerMessage::ChunkData`] rather than a field on it,
+    /// because the two change independently: placing a lamp relights its
+    /// neighbours without altering a single block in them, and re-sending whole
+    /// chunk blobs to say so would cost thousands of times the bytes. It
+    /// follows that this is both the initial payload and the update — a client
+    /// applies it the same way whenever it arrives.
+    ///
+    /// The payload is [`crate::light::codec`]'s run-length form, which is three
+    /// bytes for the uniform chunks that make up most of a world. **It is
+    /// hostile input** (charter rule 14): the decoder bounds every run before
+    /// writing and has a fuzz target.
+    ChunkLight {
+        /// Which chunk.
+        pos: ChunkPos,
+        /// Run-length encoded levels — see [`crate::light::codec::decode`].
+        light: Vec<u8>,
+    },
 }
 
 /// A message could not be encoded or decoded.
@@ -887,7 +914,8 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::Disconnect { .. }
         | ServerMessage::InventoryUpdate { .. }
         | ServerMessage::MaterialTable { .. }
-        | ServerMessage::ToolTable { .. } => {}
+        | ServerMessage::ToolTable { .. }
+        | ServerMessage::ChunkLight { .. } => {}
     }
     Ok(())
 }
@@ -1327,7 +1355,7 @@ mod tests {
 
     #[test]
     fn server_variant_ordinals_are_pinned() {
-        let server: [(ServerMessage, u8); 11] = [
+        let server: [(ServerMessage, u8); 12] = [
             (
                 ServerMessage::HelloAck {
                     protocol_version: 0,
@@ -1400,6 +1428,13 @@ mod tests {
             // Protocol v7. `appended_server_variants_keep_their_ordinals`
             // covers the ones added between; this pins the newest.
             (ServerMessage::ToolTable { tools: Vec::new() }, 15),
+            (
+                ServerMessage::ChunkLight {
+                    pos: ChunkPos::new(0, 0, 0),
+                    light: Vec::new(),
+                },
+                16,
+            ),
         ];
 
         for (message, expected) in server {

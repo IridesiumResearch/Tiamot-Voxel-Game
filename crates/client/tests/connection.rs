@@ -136,6 +136,7 @@ impl Seen {
             }
             Event::Joined { spawn, .. } => self.joined = Some(spawn),
             Event::Chunk(chunk) => self.store.insert(*chunk),
+            Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
             Event::ChunkUnload(pos) => {
                 self.store.remove(pos);
             }

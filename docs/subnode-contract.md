@@ -131,6 +131,21 @@ through solid rock hours from the edit that caused it, so
 `the_cached_permeability_survives_an_arbitrary_edit_sequence` checks every block
 against the uncached function after edits and after a repack.
 
+**Two rules the face test alone does not decide, settled in Task 10:**
+
+- **An emitter's light ignores its own faces and respects its neighbours'.** A
+  lamp is usually a full block, which the rule above makes opaque on all six
+  faces, so its own glow would be sealed inside it and `light_emit` would only
+  work on blocks somebody had chiselled. A block glows on its surface rather
+  than in its middle. A lamp walled in on every side still lights nothing.
+- **Removal walks out of a block regardless of that block's new faces.** The
+  commonest edit is a block becoming solid, and testing its new state finds
+  every face shut — the light it used to pass would stay where it was, leaving
+  a shaft lit under a roof that was just placed.
+
+Both live in `crates/core/src/light/propagate.rs` and are shared by the full and
+incremental paths, so the property test holding those two equal covers them.
+
 ---
 
 ## 4. Fluid — block resolution

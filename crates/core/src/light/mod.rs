@@ -30,6 +30,7 @@
 use crate::block::{BlockView, subnode_index};
 use crate::material::MaterialId;
 
+pub mod codec;
 mod emission;
 mod layer;
 pub mod propagate;

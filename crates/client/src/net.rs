@@ -165,6 +165,12 @@ pub enum Event {
     /// one would make the whole queue pay for it.
     Chunk(Box<Chunk>),
 
+    /// A chunk's light levels, initial or updated.
+    ///
+    /// Boxed for the same reason [`Event::Chunk`] is, if less dramatically: a
+    /// dense layer is 8 KiB and every other variant is a handful of bytes.
+    ChunkLight(ChunkPos, Box<tiamot_core::light::LightLayer>),
+
     /// A chunk left the interest set.
     ChunkUnload(ChunkPos),
 
@@ -799,6 +805,21 @@ async fn session(
                     }
                     Err(err) => say(format!(
                         "the server sent a chunk at {pos:?} that would not decode: {err}"
+                    )),
+                }
+            }
+
+            ServerMessage::ChunkLight { pos, light } => {
+                // Hostile input, charter rule 14. A payload that will not
+                // decode costs that chunk its light and earns a warning; it
+                // does not end the session, and it does not reach the store
+                // half-applied.
+                match tiamot_core::light::codec::decode(&light) {
+                    Ok(layer) => {
+                        let _ = events.send(Event::ChunkLight(pos, Box::new(layer)));
+                    }
+                    Err(err) => say(format!(
+                        "the server sent light for {pos:?} that would not decode: {err}"
                     )),
                 }
             }

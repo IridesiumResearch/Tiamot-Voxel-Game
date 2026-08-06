@@ -426,6 +426,33 @@ fn server_messages() -> Vec<Vec<u8>> {
             },
             actor: Some([0xAB; 32]),
         },
+        // Protocol v8's chunk light, in all three shapes the format has: the
+        // uniform payload that most of a world is, a run-length one, and an
+        // empty body — which is not valid light but IS valid framing, and the
+        // fuzzer should start from a message whose envelope parses.
+        ServerMessage::ChunkLight {
+            pos: ChunkPos::new(0, 0, 0),
+            light: tiamot_core::light::codec::encode(&tiamot_core::light::LightLayer::uniform(
+                tiamot_core::light::Light::DAYLIGHT,
+            )),
+        },
+        ServerMessage::ChunkLight {
+            pos: ChunkPos::new(-3, 1, 7),
+            light: {
+                let mut layer = tiamot_core::light::LightLayer::dark();
+                for index in 0..tiamot_core::BLOCKS_PER_CHUNK {
+                    layer.set(
+                        tiamot_core::coords::LocalBlock::from_index(index),
+                        tiamot_core::light::Light::new((index % 16) as u8, 3, 0, 9),
+                    );
+                }
+                tiamot_core::light::codec::encode(&layer)
+            },
+        },
+        ServerMessage::ChunkLight {
+            pos: ChunkPos::new(1, 1, 1),
+            light: Vec::new(),
+        },
     ];
     messages.iter().filter_map(|m| encode(m).ok()).collect()
 }

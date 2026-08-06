@@ -27,6 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use tiamot_core::light::{Light, LightLayer};
 use tiamot_core::proto::Edit;
 use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId, SubNodePos};
 
@@ -58,6 +59,13 @@ pub const ABSENT_POLICY: Absent = Absent::Solid;
 pub struct ChunkStore {
     chunks: BTreeMap<ChunkPos, Chunk>,
     dirty: BTreeSet<ChunkPos>,
+    /// Light levels, keyed by chunk.
+    ///
+    /// Separate from the chunks rather than a field on them, because the two
+    /// arrive independently and either can outlive the other by a frame: light
+    /// is its own message (protocol v8), and a lamp placed next door relights a
+    /// chunk whose blocks did not change.
+    light: BTreeMap<ChunkPos, LightLayer>,
 }
 
 impl ChunkStore {
@@ -91,6 +99,41 @@ impl ChunkStore {
         self.chunks.get(&pos)
     }
 
+    /// Stores a chunk's light, marking it for remeshing.
+    ///
+    /// **Only the chunk itself, not its neighbours.** Light is baked into
+    /// vertex colours, so a level changing means this chunk's mesh is stale —
+    /// but the neighbours' meshes sample their own light and are unaffected.
+    /// Marking them too would triple the remesh cost of every lamp for no
+    /// visible difference, and lamps are placed constantly.
+    ///
+    /// Light for a chunk that is not held is kept anyway: the server sends it
+    /// alongside the chunk rather than after it, and the two can arrive in
+    /// either order.
+    pub fn set_light(&mut self, pos: ChunkPos, layer: LightLayer) {
+        self.light.insert(pos, layer);
+        self.mark(pos);
+    }
+
+    /// The light level at a block, or [`Light::DARK`] where nothing is held.
+    ///
+    /// Dark rather than daylight for the absent case, and it matters which:
+    /// a chunk whose light has not arrived yet renders dark for a frame, where
+    /// guessing daylight would flash the inside of a cave white as it streamed
+    /// in.
+    #[must_use]
+    pub fn light_at(&self, pos: tiamot_core::BlockPos) -> Light {
+        self.light
+            .get(&pos.chunk())
+            .map_or(Light::DARK, |layer| layer.get(pos.local()))
+    }
+
+    /// Whether any light has arrived for a chunk.
+    #[must_use]
+    pub fn has_light(&self, pos: ChunkPos) -> bool {
+        self.light.contains_key(&pos)
+    }
+
     /// Every held position, in a stable order.
     pub fn positions(&self) -> impl Iterator<Item = ChunkPos> + '_ {
         self.chunks.keys().copied()
@@ -112,6 +155,10 @@ impl ChunkStore {
     /// Returns whether anything was held there.
     pub fn remove(&mut self, pos: ChunkPos) -> bool {
         let held = self.chunks.remove(&pos).is_some();
+        // Light goes with the chunk. Keeping it would be a slow leak across a
+        // session of walking, and stale light for a chunk that comes back is
+        // worse than none — the server sends fresh light with it.
+        self.light.remove(&pos);
         self.dirty.remove(&pos);
         if held {
             self.mark_neighbours(pos);
@@ -127,6 +174,7 @@ impl ChunkStore {
     pub fn clear(&mut self) {
         self.chunks.clear();
         self.dirty.clear();
+        self.light.clear();
     }
 
     /// Applies a server edit to the local copy.
