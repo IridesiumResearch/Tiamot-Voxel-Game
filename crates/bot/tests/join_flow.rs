@@ -106,6 +106,10 @@ fn a_bot_completes_the_whole_join_flow() {
             // engine has no tools of its own (charter rule 1), so a client that
             // was not told this could not offer a way to choose one.
             "ToolTable",
+            // Protocol v9, and the same reason a third time: the engine has no
+            // sky of its own, so a client not told this would draw one frame of
+            // whatever it guessed.
+            "SkyTable",
             "JoinWorld",
         ];
         assert!(
@@ -499,6 +503,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::ModManifest { .. } => "ModManifest",
         ServerMessage::MaterialTable { .. } => "MaterialTable",
         ServerMessage::ToolTable { .. } => "ToolTable",
+        ServerMessage::SkyTable { .. } => "SkyTable",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",
         _ => "other",

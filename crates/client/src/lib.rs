@@ -44,6 +44,7 @@ pub mod net;
 pub mod predict;
 pub mod render;
 pub mod shade;
+pub mod sky;
 pub mod texture;
 pub mod trust;
 pub mod world;

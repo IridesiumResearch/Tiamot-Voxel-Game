@@ -1,0 +1,9 @@
+# The engine's reference sky.
+#
+# The mod id is `core_sky`, following the same rule as `core_tools`: a mod owns
+# only its own id as a registration namespace.
+id = "core_sky"
+name = "Core Sky"
+version = "0.1.0"
+description = "A day/night cycle and sky colours. A test fixture, not a game."
+license = "GPL-3.0-only"

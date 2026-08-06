@@ -33,7 +33,8 @@ use crate::coords::{ChunkPos, LocalBlock};
 use crate::detgen::{ChunkBuffer, FractalParams, Region2d, StreamRng, fill_2d};
 use crate::material::MaterialId;
 use crate::script::vm::{
-    Backend, BlockRules, BlockTexture, Brush, HookOutcome, ScriptError, ScriptVm, Tool, VmLimits,
+    Backend, BlockRules, BlockTexture, Brush, HookOutcome, ScriptError, ScriptVm, Sky, SkyKeyframe,
+    Tool, VmLimits,
 };
 
 /// Registry key holding the mods that registered `on_dig_complete`.
@@ -792,6 +793,53 @@ impl ScriptVm for MluaVm {
         tools
     }
 
+    fn registered_sky(&self) -> Option<Sky> {
+        let registry = self
+            .lua
+            .named_registry_value::<Table>("tiamot.skies")
+            .ok()?;
+
+        // Lowest mod id wins where several register one, the same rule the
+        // default tool uses: arbitrary but fixed beats depending on load order.
+        let mut entries: Vec<(String, Table)> = registry
+            .pairs::<String, Table>()
+            .filter_map(Result::ok)
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let (mod_id, entry) = entries.into_iter().next()?;
+
+        let frames: Table = entry.get("keyframes").ok()?;
+        let mut keyframes: Vec<SkyKeyframe> = frames
+            .sequence_values::<Table>()
+            .filter_map(Result::ok)
+            .filter_map(|frame| {
+                let colour = |key: &str| -> Option<[f32; 3]> {
+                    let table: Table = frame.get(key).ok()?;
+                    Some([table.get(1).ok()?, table.get(2).ok()?, table.get(3).ok()?])
+                };
+                Some(SkyKeyframe {
+                    time: frame.get("time").ok()?,
+                    sky: colour("sky")?,
+                    sun: colour("sun")?,
+                    intensity: frame.get("intensity").ok()?,
+                })
+            })
+            .collect();
+        if keyframes.is_empty() {
+            return None;
+        }
+        // Sorted here rather than trusted from the mod: the client walks these
+        // in order to interpolate, and an out-of-order list would make the sky
+        // jump backwards partway through the day.
+        keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
+
+        Some(Sky {
+            mod_id,
+            day_length_ticks: entry.get("day_length_ticks").ok()?,
+            keyframes,
+        })
+    }
+
     fn call_void(&mut self, mod_id: &str, name: &str) -> Result<(), ScriptError> {
         let env = self.environment(mod_id)?;
         let function: mlua::Function = env
@@ -955,6 +1003,14 @@ impl MluaVm {
             .create_function(move |lua, spec: Table| register_tool(lua, &owner, &spec))
             .map_err(|err| self.vm_error(&err))?;
         game.set("register_tool", register_tool)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
+        let register_sky = self
+            .lua
+            .create_function(move |lua, spec: Table| register_sky(lua, &owner, &spec))
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_sky", register_sky)
             .map_err(|err| self.vm_error(&err))?;
 
         let owner = mod_id.to_owned();
@@ -1128,6 +1184,10 @@ impl MluaVm {
         let tools = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.tools", tools)
+            .map_err(|err| self.vm_error(&err))?;
+        let skies = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.skies", skies)
             .map_err(|err| self.vm_error(&err))?;
         let tickers = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
@@ -1472,6 +1532,93 @@ fn register_tool(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     registry.set(qualified, entry)?;
     Ok(())
 }
+
+/// Registers the sky: how long a day is and what colour it goes.
+///
+/// **Charter rule 1.** The engine has no idea what a day is. It knows how to
+/// advance a number and how to interpolate colours, and a mod supplies both the
+/// number's period and the colours.
+fn register_sky(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
+    let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+    if frozen {
+        return Err(mlua::Error::external(format!(
+            "mod `{owner}`: registration is closed"
+        )));
+    }
+
+    for pair in spec.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !SKY_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "register_sky: unknown field `{name}`"
+                )));
+            }
+        }
+    }
+
+    let day_length_ticks: u32 = spec.get("day_length_ticks").map_err(|_| {
+        mlua::Error::external("register_sky: missing required field `day_length_ticks`")
+    })?;
+    if day_length_ticks == 0 {
+        return Err(mlua::Error::external(
+            "register_sky: day_length_ticks must be at least 1; a day of no ticks never advances",
+        ));
+    }
+
+    let keyframes: Table = spec
+        .get("keyframes")
+        .map_err(|_| mlua::Error::external("register_sky: missing required field `keyframes`"))?;
+    let mut count = 0;
+    for frame in keyframes.sequence_values::<Table>() {
+        let frame = frame?;
+        let time: f32 = frame
+            .get("time")
+            .map_err(|_| mlua::Error::external("register_sky: every keyframe needs a `time`"))?;
+        if !(0.0..=1.0).contains(&time) {
+            return Err(mlua::Error::external(format!(
+                "register_sky: keyframe time must be 0..=1, got {time}"
+            )));
+        }
+        let intensity: f32 = frame.get("intensity").map_err(|_| {
+            mlua::Error::external("register_sky: every keyframe needs an `intensity`")
+        })?;
+        if !(0.0..=1.0).contains(&intensity) {
+            return Err(mlua::Error::external(format!(
+                "register_sky: keyframe intensity must be 0..=1, got {intensity}"
+            )));
+        }
+        for key in ["sky", "sun"] {
+            let colour: Table = frame.get(key).map_err(|_| {
+                mlua::Error::external(format!(
+                    "register_sky: every keyframe needs a `{key}` colour"
+                ))
+            })?;
+            if colour.len()? != 3 {
+                return Err(mlua::Error::external(format!(
+                    "register_sky: `{key}` must be three numbers, {{r, g, b}}"
+                )));
+            }
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return Err(mlua::Error::external(
+            "register_sky: `keyframes` is empty; a sky with no colours has nothing to draw",
+        ));
+    }
+
+    let registry: Table = lua.named_registry_value("tiamot.skies")?;
+    let entry = lua.create_table()?;
+    entry.set("day_length_ticks", day_length_ticks)?;
+    entry.set("keyframes", keyframes)?;
+    registry.set(owner.to_owned(), entry)?;
+    Ok(())
+}
+
+/// Fields `register_sky` accepts.
+const SKY_FIELDS: [&str; 2] = ["day_length_ticks", "keyframes"];
 
 /// Fields `register_tool` accepts.
 const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "default"];
@@ -2386,6 +2533,99 @@ mod dig_rules_tests {
         .expect_err("should refuse");
         assert!(
             detail_of(&err).contains("hardness"),
+            "the error should name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_world_with_no_sky_mod_has_no_sky() {
+        // Charter rule 1: the engine has no day. A world whose mods register
+        // no sky is legitimate — it simply never changes — rather than being
+        // given a default the engine invented.
+        let mut vm = vm();
+        load(&mut vm, "core", r#"game.register_block{ id = "plain" }"#).expect("load");
+        assert!(vm.registered_sky().is_none());
+    }
+
+    #[test]
+    fn a_mod_registers_the_length_of_a_day_and_its_colours() {
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core_sky",
+            r"
+            game.register_sky{
+                day_length_ticks = 24000,
+                keyframes = {
+                    { time = 0.5, sky = {0.5, 0.7, 1.0}, sun = {1, 1, 1}, intensity = 1.0 },
+                    { time = 0.0, sky = {0.0, 0.0, 0.05}, sun = {0.2, 0.2, 0.4}, intensity = 0.05 },
+                },
+            }
+            ",
+        )
+        .expect("load");
+
+        let sky = vm.registered_sky().expect("a sky was registered");
+        assert_eq!(sky.mod_id, "core_sky");
+        assert_eq!(sky.day_length_ticks, 24_000);
+        // **Sorted by the engine, not trusted from the mod.** The client walks
+        // these in order to interpolate, and an out-of-order list makes the sky
+        // jump backwards partway through the day.
+        assert_eq!(sky.keyframes.len(), 2);
+        assert!((sky.keyframes[0].time - 0.0).abs() < 1e-6);
+        assert!((sky.keyframes[1].time - 0.5).abs() < 1e-6);
+        assert!((sky.keyframes[1].intensity - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_day_of_no_ticks_is_refused() {
+        // It would never advance, and a sky frozen at midnight is a bug report
+        // rather than a design.
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core_sky",
+            r"game.register_sky{ day_length_ticks = 0, keyframes = {
+                { time = 0, sky = {0,0,0}, sun = {0,0,0}, intensity = 0 },
+            } }",
+        )
+        .expect_err("should refuse");
+        assert!(
+            detail_of(&err).contains("day_length_ticks"),
+            "the error should name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_sky_with_no_keyframes_is_refused() {
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core_sky",
+            r"game.register_sky{ day_length_ticks = 100, keyframes = {} }",
+        )
+        .expect_err("should refuse");
+        assert!(
+            detail_of(&err).contains("keyframes"),
+            "the error should name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_keyframe_outside_the_day_is_refused_rather_than_clamped() {
+        // Same reasoning as hardness and light_emit: clamping leaves a mod
+        // believing it set something.
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core_sky",
+            r"game.register_sky{ day_length_ticks = 100, keyframes = {
+                { time = 1.5, sky = {0,0,0}, sun = {0,0,0}, intensity = 0 },
+            } }",
+        )
+        .expect_err("should refuse");
+        assert!(
+            detail_of(&err).contains("time"),
             "the error should name the field: {err:?}"
         );
     }

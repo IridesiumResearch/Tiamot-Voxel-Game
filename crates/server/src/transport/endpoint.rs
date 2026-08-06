@@ -93,6 +93,19 @@ pub struct Shared {
     /// order a client shows tools in should be a property of the mod set rather
     /// than of a map's iteration.
     pub tool_table: Vec<tiamot_core::proto::ToolDef>,
+
+    /// Ticks in a full day, or 0 if no mod registered a sky.
+    pub sky_day_length: u32,
+
+    /// The sky's colour keyframes, sorted by time.
+    pub sky_keyframes: Vec<tiamot_core::proto::SkyFrame>,
+
+    /// Where the clock stands in the day, in ticks since midnight.
+    ///
+    /// **The server owns this.** A client advancing its own clock would drift,
+    /// and two players standing together would see different skies — which is
+    /// the same reason the simulation owns everything else players share.
+    pub time_of_day: std::sync::atomic::AtomicU64,
     /// Who is permitted to join.
     ///
     /// Behind a lock because RCON changes it at runtime: an operator adding
@@ -592,6 +605,35 @@ impl Shared {
             .get(uuid)
             .and_then(|player| self.resolve_tool(player.tool.as_deref()))
             .map_or(tiamot_core::dig::Brush::Block, |tool| tool.brush)
+    }
+
+    /// Advances the clock by one tick and returns where the day now stands.
+    ///
+    /// `0.0..1.0`, midnight to midnight. A world with no sky mod has no day
+    /// length, so its clock never moves and this is always zero — which the
+    /// client renders as a sky that does not change.
+    pub fn advance_day(&self) -> f32 {
+        use std::sync::atomic::Ordering;
+        if self.sky_day_length == 0 {
+            return 0.0;
+        }
+        let length = u64::from(self.sky_day_length);
+        // Wrapped in the counter rather than allowed to grow: a server up for a
+        // year would otherwise accumulate a number whose `as f32` conversion
+        // has lost the precision this divides by.
+        let next = (self.time_of_day.load(Ordering::Relaxed) + 1) % length;
+        self.time_of_day.store(next, Ordering::Relaxed);
+        next as f32 / length as f32
+    }
+
+    /// Where the day stands now, without advancing it.
+    #[must_use]
+    pub fn day_fraction(&self) -> f32 {
+        use std::sync::atomic::Ordering;
+        if self.sky_day_length == 0 {
+            return 0.0;
+        }
+        self.time_of_day.load(Ordering::Relaxed) as f32 / f64::from(self.sky_day_length) as f32
     }
 
     /// The tool a player is actually using: what they chose, or the mod's
@@ -1156,6 +1198,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 mod_set_fingerprint: shared.mod_set_fingerprint,
                 materials: &shared.materials,
                 tools: &shared.tool_table,
+                sky: (shared.sky_day_length, &shared.sky_keyframes),
                 allowlist: &allowlist,
                 max_players: shared.max_players,
                 current_players: shared.players.load(Ordering::Acquire),
@@ -1413,6 +1456,9 @@ mod tests {
             mod_set_fingerprint: 0,
             materials: Vec::new(),
             tool_table: Vec::new(),
+            sky_day_length: 0,
+            sky_keyframes: Vec::new(),
+            time_of_day: std::sync::atomic::AtomicU64::new(0),
             allowlist: std::sync::RwLock::new(Allowlist::open()),
             max_players: 2,
             spawn: tiamot_core::BlockPos::new(0, 1, 0),

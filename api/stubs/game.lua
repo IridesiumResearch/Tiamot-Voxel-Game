@@ -158,6 +158,26 @@ function Stream:next_bool() end
 ---@field speed_multiplier number? How much faster than a bare hand. Default 1.0, must be positive.
 ---@field default boolean? Whether this is what a player digs with holding nothing. The engine has no bare hand of its own, so a world whose mods register no default is one nobody can dig in. Lowest id wins if several mods mark one.
 
+---Fields accepted by `game.register_sky`.
+---
+---**Registration window only.** The engine has no sky of its own: a world whose
+---mods register none has no day and holds its colours fixed, which is a
+---legitimate world rather than a missing feature.
+---@class Tiamot.SkySpec
+---@field day_length_ticks integer Required. Ticks in a full day, at 20 ticks a second. Must be at least 1.
+---@field keyframes Tiamot.SkyKeyframe[] Required, and not empty. Need not be sorted — the engine sorts them, because an out-of-order list would make the sky walk backwards partway through the day.
+
+---One moment in your day.
+---
+---The client interpolates between keyframes, so a handful describes a whole
+---day. Make the last keyframe restate the first's colours, or the sky cuts hard
+---at the moment the clock wraps.
+---@class Tiamot.SkyKeyframe
+---@field time number Required. When in the day, 0 to 1, where 0 is midnight and 0.5 is noon.
+---@field sky number[] Required. `{r, g, b}` for the sky itself. Distance fog fades towards this, so it is also the horizon.
+---@field sun number[] Required. `{r, g, b}` tinting the sunlight stored in the world.
+---@field intensity number Required, 0 to 1. Scales stored sunlight at DRAW time — which is why a day/night cycle costs nothing: the world's sunlight is always full daylight and never needs relighting.
+
 ---Fields accepted by `game.register_action`.
 ---@class Tiamot.ActionSpec
 ---@field id string Required. Namespaced with your mod id automatically.
@@ -184,6 +204,16 @@ function game.log(message) end
 ---@param spec Tiamot.BlockSpec
 ---@return integer id The numeric id, for use with the fill operations.
 function game.register_block(spec) end
+
+---Registers the sky: how long a day is, and what colour it goes.
+---
+---**Registration window only.**
+---
+---Everything a player would call "the sky" is yours. The engine advances a
+---number from 0 to 1 over the period you set and interpolates between the
+---colours you list; it has no idea what dawn is.
+---@param spec Tiamot.SkySpec
+function game.register_sky(spec) end
 
 ---Registers a tool.
 ---

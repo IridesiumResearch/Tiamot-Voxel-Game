@@ -163,6 +163,13 @@ const SAVE_INTERVAL_TICKS: u64 = 40;
 /// on the next.
 const RELIGHTS_PER_TICK: usize = 32;
 
+/// How often the time of day goes out, in ticks.
+///
+/// Once a second. The clock advances every tick, but a client interpolates
+/// between updates and a second of drift in a twenty-minute day is a thousandth
+/// of it — invisible, against twenty times the messages.
+const TIME_BROADCAST_TICKS: u64 = 20;
+
 /// Anything that stops a server starting.
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
@@ -490,6 +497,33 @@ impl ServerHandle {
             },
         );
 
+        // The sky, as the wire carries it. Absent is legitimate: a world whose
+        // mods register no sky has no day, and the client holds its colours
+        // fixed rather than being given one the engine invented.
+        let sky = host
+            .as_ref()
+            .and_then(|loaded| loaded.vm().registered_sky())
+            .map_or((0, Vec::new()), |sky| {
+                let frames = sky
+                    .keyframes
+                    .iter()
+                    .map(|frame| tiamot_core::proto::SkyFrame {
+                        time: frame.time,
+                        sky: frame.sky,
+                        sun: frame.sun,
+                        intensity: frame.intensity,
+                    })
+                    .collect();
+                (sky.day_length_ticks, frames)
+            });
+        if sky.0 > 0 {
+            info!(
+                day_length_ticks = sky.0,
+                keyframes = sky.1.len(),
+                "a mod registered a sky"
+            );
+        }
+
         let tools = host
             .as_ref()
             .map(|loaded| loaded.vm().registered_tools())
@@ -534,6 +568,9 @@ impl ServerHandle {
             mods,
             materials,
             tool_table,
+            sky_day_length: sky.0,
+            sky_keyframes: sky.1,
+            time_of_day: std::sync::atomic::AtomicU64::new(0),
             content: content_index,
             allowlist: std::sync::RwLock::new(settings.allowlist.clone()),
             max_players: settings.max_players,
@@ -1153,6 +1190,18 @@ impl ServerHandle {
                                 done += 1;
                             }
                             broadcast_light(&shared, &lighting, &touched);
+                        }
+
+                        // The day advances once per tick, and is broadcast at
+                        // a rate a person can read rather than at the rate it
+                        // changes. Twenty updates a second of a float nobody
+                        // can distinguish frame to frame would be bandwidth
+                        // spent on nothing; a client interpolates between
+                        // these, and a second of drift in a twenty-minute day
+                        // is a thousandth of it.
+                        let day = shared.advance_day();
+                        if tick % TIME_BROADCAST_TICKS == 0 {
+                            shared.broadcast(ServerMessage::TimeOfDay { time: day });
                         }
 
                         // Debounced saves. Writing every dirty chunk every tick

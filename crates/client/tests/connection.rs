@@ -57,6 +57,45 @@ fn start(name: &str) -> ServerHandle {
     .expect("start")
 }
 
+/// A server whose mod directory is a copy of `game/` with one mod removed.
+///
+/// **This is how the sky criterion is checked**, and it is checked by absence:
+/// the claim is that sky content lives in a mod, and the way to test that is to
+/// take the mod away and watch the day disappear while everything else keeps
+/// working.
+fn start_without(name: &str, omit: &str) -> ServerHandle {
+    let mods = scratch(&format!("{name}-mods"));
+    let _ = std::fs::remove_dir_all(&mods);
+    std::fs::create_dir_all(&mods).expect("mod dir");
+    for entry in std::fs::read_dir(reference_mods()).expect("read game/") {
+        let entry = entry.expect("entry");
+        if !entry.path().is_dir() || entry.file_name() == omit {
+            continue;
+        }
+        let target = mods.join(entry.file_name());
+        std::fs::create_dir_all(&target).expect("mod dir");
+        for file in std::fs::read_dir(entry.path()).expect("read mod") {
+            let file = file.expect("entry");
+            if file.path().is_file() {
+                std::fs::copy(file.path(), target.join(file.file_name())).expect("copy");
+            }
+        }
+    }
+
+    ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: scratch(&format!("{name}-world")),
+        max_players: 4,
+        allowlist: Allowlist::open(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(mods),
+        seed: Some(4242),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("start")
+}
+
 /// One client's data directory: an identity, a content cache, a known-hosts file.
 struct Home {
     root: PathBuf,
@@ -121,6 +160,10 @@ struct Seen {
     states: Vec<client::predict::Authoritative>,
     /// The tool table, which charter rule 1 says only the mods can supply.
     tools: Vec<tiamot_core::proto::ToolDef>,
+    /// The sky, which charter rule 1 says the same about.
+    sky: Option<client::sky::Sky>,
+    /// The most recent time of day the server sent.
+    time_of_day: Option<f32>,
 }
 
 impl Seen {
@@ -137,6 +180,8 @@ impl Seen {
             Event::Joined { spawn, .. } => self.joined = Some(spawn),
             Event::Chunk(chunk) => self.store.insert(*chunk),
             Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
+            Event::Sky(sky) => self.sky = Some(sky),
+            Event::TimeOfDay(time) => self.time_of_day = Some(time),
             Event::ChunkUnload(pos) => {
                 self.store.remove(pos);
             }
@@ -406,6 +451,82 @@ fn an_edit_arrives_and_dirties_exactly_the_chunk_it_landed_in() {
         dirty.contains(&target.chunk()),
         "the chunk the edit landed in must be queued for a remesh: {dirty:?}"
     );
+
+    connection.shutdown();
+    assert!(server.stop());
+}
+
+#[test]
+fn the_sky_comes_from_a_mod_and_goes_when_the_mod_does() {
+    // **Task 10's fourth acceptance criterion, checked by absence.** The claim
+    // is that sky content — how long a day is, what colour it goes — lives in
+    // `game/core_sky` and not in the engine. Deleting the directory is the test:
+    // the world keeps its light, its lamps and its terrain, and simply stops
+    // having a day.
+    //
+    // The positive half first, or the negative half proves nothing.
+    let server = start("sky-present");
+    let home = Home::new("sky-present");
+    let mut connection = home.open(&server);
+    let mut seen = Seen::default();
+
+    assert!(
+        pump(&mut connection, &mut seen, |seen| seen.sky.is_some()
+            && seen.joined.is_some()),
+        "the server never sent a sky; warnings={:?}",
+        seen.warnings
+    );
+    let sky = seen.sky.clone().expect("a sky");
+    assert!(
+        sky.has_day(),
+        "the reference mods registered a sky but it has no day"
+    );
+    // And it really is the mod's day rather than something the engine invented:
+    // the colours change across it.
+    let mut walked = sky.clone();
+    walked.set_time(0.0);
+    let midnight = walked.moment();
+    walked.set_time(0.5);
+    let noon = walked.moment();
+    assert!(
+        noon.intensity > midnight.intensity + 0.5,
+        "noon is not brighter than midnight: {} against {}",
+        noon.intensity,
+        midnight.intensity
+    );
+
+    connection.shutdown();
+    assert!(server.stop());
+
+    // Now the same world with the sky mod deleted.
+    let server = start_without("sky-absent", "core_sky");
+    let home = Home::new("sky-absent");
+    let mut connection = home.open(&server);
+    let mut seen = Seen::default();
+
+    assert!(
+        pump(&mut connection, &mut seen, |seen| seen.joined.is_some()
+            && !seen.store.is_empty()),
+        "the client should still join a world with no sky mod; warnings={:?}",
+        seen.warnings
+    );
+    let sky = seen
+        .sky
+        .clone()
+        .expect("a sky table is still sent, just an empty one");
+    assert!(
+        !sky.has_day(),
+        "the day survived deleting the only mod that defines one"
+    );
+
+    // The rest of the world is untouched, which is what makes this about the
+    // sky rather than about the server failing to start.
+    assert!(
+        seen.warnings.is_empty(),
+        "removing the sky mod produced warnings: {:?}",
+        seen.warnings
+    );
+    assert!(!seen.tools.is_empty(), "the tools mod went with it");
 
     connection.shutdown();
     assert!(server.stop());

@@ -3,8 +3,19 @@
 
 # `game/` — reference mods and test fixtures
 
-**This directory is not the game.** It is empty for now, and what eventually
-lands here is reference implementations and test fixtures, not shipped content.
+**This directory is not the game.** What lands here is reference
+implementations and test fixtures, not shipped content.
+
+| Mod | The mechanism it proves |
+|---|---|
+| `core_blocks` | Block registration and textures reach a client. |
+| `core_worldgen` | A mod can generate terrain through the native heightmap fills. |
+| `core_tools` | Digging rules live in Lua — delete it and nothing can be broken, because the engine has no bare hand (Task 09). |
+| `core_sky` | Sky content lives in Lua — delete it and the world loses its day and keeps everything else (Task 10). |
+
+Each of those is checked by a test that removes the directory and asserts what
+stops working, which is the only way a claim like "this lives in a mod" can be
+anything more than an intention.
 
 The distinction matters enough that the charter opens with it. Every mod in this
 directory exists to prove that a specific engine mechanism works *through the

@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -61,6 +61,11 @@ pub const PROTOCOL_VERSION: u32 = 8;
 // changes without its blocks changing — a lamp placed next door — so the two
 // have different lifetimes on the wire, and appending a variant is the only
 // shape of protocol change this format makes safe.
+// v9 (Task 10): appended `ServerMessage::{SkyTable, TimeOfDay}`. The sky is sent
+// once on join because it is registration data; the time is sent repeatedly
+// because it is state. Two messages rather than one for exactly that reason —
+// re-sending a mod's whole keyframe list twenty times a second to carry one
+// float would be absurd.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -667,6 +672,51 @@ pub enum ServerMessage {
         /// Run-length encoded levels — see [`crate::light::codec::decode`].
         light: Vec<u8>,
     },
+
+    /// The sky a mod registered, sent once on join.
+    ///
+    /// **Appended at the end** (protocol v9).
+    ///
+    /// Empty keyframes mean no mod registered a sky, which is a legitimate
+    /// world with no day rather than an error — the client holds its colours
+    /// fixed. Charter rule 1: the engine has no sky of its own to fall back to.
+    SkyTable {
+        /// Ticks in a full day.
+        day_length_ticks: u32,
+        /// Colour keyframes, sorted by time.
+        keyframes: Vec<SkyFrame>,
+    },
+
+    /// Where the server's clock stands in the day.
+    ///
+    /// **Appended at the end** (protocol v9).
+    ///
+    /// Separate from [`ServerMessage::SkyTable`] because it is state rather
+    /// than registration: this arrives repeatedly and that arrives once. The
+    /// server owns it — a client that advanced its own clock would drift, and
+    /// two players standing together would see different skies.
+    TimeOfDay {
+        /// Position in the day, `0.0..1.0`, midnight to midnight.
+        time: f32,
+    },
+}
+
+/// One moment in a mod's day, on the wire.
+///
+/// The protocol's own copy of [`crate::script::SkyKeyframe`] rather than a
+/// re-export: the script type is what a mod's Lua produces and this is what
+/// peers agree on, and letting one change the other silently would make a mod
+/// API edit into a protocol break.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SkyFrame {
+    /// When in the day, `0.0..=1.0`.
+    pub time: f32,
+    /// The sky's colour, which fog fades towards.
+    pub sky: [f32; 3],
+    /// The sun's colour.
+    pub sun: [f32; 3],
+    /// How strong the sun is, `0.0..=1.0`.
+    pub intensity: f32,
 }
 
 /// A message could not be encoded or decoded.
@@ -915,7 +965,9 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::InventoryUpdate { .. }
         | ServerMessage::MaterialTable { .. }
         | ServerMessage::ToolTable { .. }
-        | ServerMessage::ChunkLight { .. } => {}
+        | ServerMessage::ChunkLight { .. }
+        | ServerMessage::SkyTable { .. }
+        | ServerMessage::TimeOfDay { .. } => {}
     }
     Ok(())
 }
@@ -1355,7 +1407,7 @@ mod tests {
 
     #[test]
     fn server_variant_ordinals_are_pinned() {
-        let server: [(ServerMessage, u8); 12] = [
+        let server: [(ServerMessage, u8); 14] = [
             (
                 ServerMessage::HelloAck {
                     protocol_version: 0,
@@ -1435,6 +1487,14 @@ mod tests {
                 },
                 16,
             ),
+            (
+                ServerMessage::SkyTable {
+                    day_length_ticks: 0,
+                    keyframes: Vec::new(),
+                },
+                17,
+            ),
+            (ServerMessage::TimeOfDay { time: 0.0 }, 18),
         ];
 
         for (message, expected) in server {

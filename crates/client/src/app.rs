@@ -402,6 +402,12 @@ pub struct App {
     /// Where the frame that just ended spent its time, waiting to be paired
     /// with the `dt` that measures it on the next frame.
     last_phases: Phases,
+    /// The sky a mod described, and where the day stands.
+    ///
+    /// Starts as [`crate::sky::Sky::none`] — a world with no day — and is
+    /// replaced when the server sends one. That default is not a placeholder:
+    /// it is what a world whose mods register no sky legitimately looks like.
+    sky: crate::sky::Sky,
     /// The server's tick when it last said so.
     tick: u64,
     /// What the connection reported about the server's certificate.
@@ -487,6 +493,7 @@ impl App {
             fps: 0.0,
             pacing: Pacing::default(),
             last_phases: Phases::default(),
+            sky: crate::sky::Sky::none(),
             tick: 0,
             server_label: "connecting…".to_owned(),
             predictor: None,
@@ -1016,6 +1023,10 @@ impl App {
 
                 Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
 
+                Event::Sky(sky) => self.sky = sky,
+
+                Event::TimeOfDay(time) => self.sky.set_time(time),
+
                 Event::ChunkUnload(pos) => {
                     if self.store.remove(pos) {
                         // The mesh has to go with the data. A renderer holding
@@ -1166,6 +1177,18 @@ impl App {
         // The unsmoothed half. See [`Pacing`]: the average above cannot show a
         // hitch, and the hitch is the thing charter rule 18 is about.
         self.pacing.frame(dt, self.last_phases);
+
+        // The sky moves every frame and is corrected by the server once a
+        // second. Advancing locally between updates is what makes dawn a fade
+        // rather than twenty steps; `set_time` snapping to the server's answer
+        // is what stops it drifting.
+        self.sky.advance(dt);
+        let moment = self.sky.moment();
+        self.renderer.set_sun(moment.intensity, moment.sun);
+        self.renderer.set_sky(
+            moment.sky,
+            f32::from(self.config.view_distance) * tiamot_core::CHUNK_BLOCKS as f32,
+        );
 
         let sensitivity = self.config.mouse_sensitivity;
         self.camera

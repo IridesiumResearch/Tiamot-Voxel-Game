@@ -197,6 +197,11 @@ pub struct JoinContext<'a> {
     /// means the engine has no tools of its own, so a client that was not told
     /// could not offer a way to pick one. See [`crate::proto::ToolDef`].
     pub tools: &'a [crate::proto::ToolDef],
+    /// The sky a mod registered: how long a day is, and its keyframes.
+    ///
+    /// A day length of zero with no keyframes means no mod registered one,
+    /// which is a world without a day rather than an error.
+    pub sky: (u32, &'a [crate::proto::SkyFrame]),
     /// Who is permitted to join.
     pub allowlist: &'a Allowlist,
     /// Maximum simultaneous players.
@@ -583,6 +588,14 @@ impl Session {
                 ServerMessage::ToolTable {
                     tools: context.tools.to_vec(),
                 },
+                // The sky travels with the other registration tables rather
+                // than after the join, so a client has it before the first
+                // frame it draws. Arriving later would show one frame of
+                // whatever the client guessed.
+                ServerMessage::SkyTable {
+                    day_length_ticks: context.sky.0,
+                    keyframes: context.sky.1.to_vec(),
+                },
             ],
             close: false,
             action: Action::None,
@@ -751,6 +764,7 @@ mod tests {
             mod_set_fingerprint: 0xCAFE,
             materials: &[],
             tools: &[],
+            sky: (0, &[]),
             allowlist,
             max_players: 50,
             current_players: 0,
@@ -835,7 +849,11 @@ mod tests {
         // the engine has no tools of its own (charter rule 1), so a client that
         // was not told this could not offer a way to choose one.
         assert!(matches!(sent[4], ServerMessage::ToolTable { .. }));
-        assert!(matches!(sent[5], ServerMessage::JoinWorld { .. }));
+        // And the sky, for the third instance of the same reason: the engine
+        // has no day of its own, so a client not told this would draw one
+        // frame of whatever it guessed before being corrected.
+        assert!(matches!(sent[5], ServerMessage::SkyTable { .. }));
+        assert!(matches!(sent[6], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]

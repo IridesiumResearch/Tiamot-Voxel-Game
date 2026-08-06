@@ -278,6 +278,45 @@ impl BlockRules {
     }
 }
 
+/// One moment in a mod's day, as a set of colours.
+///
+/// The sky is a list of these and the client interpolates between them, which
+/// is why a mod can describe dawn without the engine knowing what dawn is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyKeyframe {
+    /// When in the day, `0.0..=1.0`, where 0 is midnight and 0.5 is noon.
+    pub time: f32,
+    /// The sky's own colour, which is also what distance fog fades towards.
+    pub sky: [f32; 3],
+    /// The sun's colour, multiplied into the stored sunlight channel.
+    pub sun: [f32; 3],
+    /// How strong the sun is, `0.0..=1.0`.
+    ///
+    /// **This scales stored sunlight at draw time**, which is what makes a
+    /// day/night cycle free: the world's sunlight is always full daylight, so
+    /// dusk dirties no chunks and relights nothing.
+    pub intensity: f32,
+}
+
+/// The sky a mod registered.
+///
+/// **Charter rule 1 in its purest form.** The engine has no opinion about how
+/// long a day is, what colour the sky goes at dusk, or whether there is a day
+/// at all — a world whose mods register no sky gets a fixed one and never
+/// changes. Everything here is content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sky {
+    /// The mod that registered it.
+    pub mod_id: String,
+    /// Ticks in one full day.
+    ///
+    /// At the 20 Hz tick, 24,000 is twenty minutes — the figure this genre
+    /// settled on, chosen here by the reference mod rather than by the engine.
+    pub day_length_ticks: u32,
+    /// Colour keyframes, sorted by time and never empty.
+    pub keyframes: Vec<SkyKeyframe>,
+}
+
 /// A tool a mod registered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tool {
@@ -521,6 +560,14 @@ pub trait ScriptVm: Sized {
 
     /// Tools registered during the loading window, ordered by id.
     fn registered_tools(&self) -> Vec<Tool>;
+
+    /// The sky a mod registered, if any.
+    ///
+    /// `None` means no mod registered one, which is a legitimate world rather
+    /// than a failure: it simply has no day. Where several mods register one,
+    /// the lowest mod id wins, for the same reason the default tool does —
+    /// a rule that is arbitrary but fixed beats one that depends on load order.
+    fn registered_sky(&self) -> Option<Sky>;
 
     /// Calls a named zero-argument global, for benchmarking and tests.
     ///

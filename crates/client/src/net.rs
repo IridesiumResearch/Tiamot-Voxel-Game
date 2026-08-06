@@ -171,6 +171,12 @@ pub enum Event {
     /// dense layer is 8 KiB and every other variant is a handful of bytes.
     ChunkLight(ChunkPos, Box<tiamot_core::light::LightLayer>),
 
+    /// The sky a mod registered, sent once on join.
+    Sky(crate::sky::Sky),
+
+    /// Where the server's clock stands in the day, `0.0..1.0`.
+    TimeOfDay(f32),
+
     /// A chunk left the interest set.
     ChunkUnload(ChunkPos),
 
@@ -822,6 +828,20 @@ async fn session(
                         "the server sent light for {pos:?} that would not decode: {err}"
                     )),
                 }
+            }
+
+            ServerMessage::SkyTable {
+                day_length_ticks,
+                keyframes,
+            } => {
+                let _ = events.send(Event::Sky(crate::sky::Sky::new(
+                    day_length_ticks,
+                    keyframes,
+                )));
+            }
+
+            ServerMessage::TimeOfDay { time } => {
+                let _ = events.send(Event::TimeOfDay(time));
             }
 
             ServerMessage::ChunkUnload { pos } => {
