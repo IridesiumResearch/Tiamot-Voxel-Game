@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use client::app::{App, Input, Teleport};
+use client::app::{App, Input, Phases, Teleport};
 use client::cache::ContentCache;
 use client::config::{Config, ServerChoice};
 use client::net::Connection;
@@ -444,15 +444,27 @@ impl Client {
         let dt = (now - self.last_frame).as_secs_f32().min(0.1);
         self.last_frame = now;
 
+        // Every phase is timed, and the breakdown of the frame that turns out
+        // to be the worst is what the HUD reports. See `app::Phases`: a set of
+        // independent per-phase maxima does not add up to the worst frame, so
+        // it cannot say what the worst frame was doing.
+        let mut phases = Phases::default();
+
+        let phase = std::time::Instant::now();
         if !surface.app.pump_network() {
             return false;
         }
+        phases.network = elapsed_ms(phase);
+
+        let phase = std::time::Instant::now();
         surface.app.remesh();
+        phases.remesh = elapsed_ms(phase);
 
         // `advance` reports the input itself, once per simulation tick rather
         // than once per frame. Reporting per frame sent the same tick number
         // repeatedly on a fast machine and skipped ticks on a slow one, and the
         // server's input queue is keyed by tick.
+        let phase = std::time::Instant::now();
         let input = self.held.as_input(self.pending_teleport.take());
         surface.app.advance(input, dt);
 
@@ -464,7 +476,15 @@ impl Client {
         if self.digging {
             surface.app.dig();
         }
+        phases.advance = elapsed_ms(phase);
 
+        // Acquire and present are timed separately from the drawing between
+        // them because they measure something different in kind: both block on
+        // the swapchain, so time here is the GPU or the compositor holding the
+        // frame rather than work this process is doing. Optimising client code
+        // against a hitch that lives in these two would be chasing the wrong
+        // machine entirely.
+        let phase = std::time::Instant::now();
         let frame = match surface.surface.get_current_texture() {
             // Suboptimal still hands over a usable texture. Reconfiguring is
             // recommended, not required, and doing it mid-frame would drop a
@@ -501,16 +521,35 @@ impl Client {
         // shortcut that happens to work — the second call fails, and on a
         // backend where it does not, the two passes render into different
         // buffers and the HUD is never seen.
+        phases.acquire = elapsed_ms(phase);
+
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let camera = *surface.app.camera();
-        surface.app.renderer().render(&view, &camera, surface.size);
-        draw_hud(surface, &view);
 
+        let phase = std::time::Instant::now();
+        surface.app.renderer().render(&view, &camera, surface.size);
+        phases.world = elapsed_ms(phase);
+
+        let phase = std::time::Instant::now();
+        draw_hud(surface, &view);
+        phases.hud = elapsed_ms(phase);
+
+        let phase = std::time::Instant::now();
         frame.present();
+        phases.present = elapsed_ms(phase);
+
+        // Paired with the `dt` measured at the top of the NEXT frame, which is
+        // what actually measures this one.
+        surface.app.record_phases(phases);
         true
     }
+}
+
+/// Milliseconds since an instant, for one phase of a frame.
+fn elapsed_ms(since: std::time::Instant) -> f32 {
+    since.elapsed().as_secs_f32() * 1000.0
 }
 
 /// Draws the HUD over the frame that has just been rendered.

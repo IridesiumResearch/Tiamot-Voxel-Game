@@ -197,6 +197,46 @@ pub fn intent_at_yaw(yaw: f32, input: Input) -> Intent {
     }
 }
 
+/// Where one frame's time went, in milliseconds.
+///
+/// **Measured for every frame, kept for the worst one.** Independent per-phase
+/// maxima do not add up to the worst frame — they are maxima of different
+/// frames — so a breakdown assembled that way can account for 3 ms of an 11 ms
+/// hitch and leave no way to tell whether the missing 8 ms was one phase or all
+/// of them. These are the phases of the frame that actually hitched.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Phases {
+    /// Draining the network and inserting what arrived.
+    pub network: f32,
+    /// [`App::remesh`], which is also reported on its own.
+    pub remesh: f32,
+    /// Movement, prediction, and aiming.
+    pub advance: f32,
+    /// Waiting for a swapchain image. **Time spent here is the GPU or the
+    /// compositor holding the frame, not work the client is doing.**
+    pub acquire: f32,
+    /// Recording and submitting the world pass.
+    pub world: f32,
+    /// Laying out and drawing the HUD.
+    pub hud: f32,
+    /// Presenting. Blocks on the swapchain for the same reason `acquire` does.
+    pub present: f32,
+}
+
+impl Phases {
+    /// Everything accounted for, in milliseconds.
+    #[must_use]
+    pub fn total(&self) -> f32 {
+        self.network
+            + self.remesh
+            + self.advance
+            + self.acquire
+            + self.world
+            + self.hud
+            + self.present
+    }
+}
+
 /// The worst frame of the last second, and what it was doing.
 ///
 /// **A smoothed frame rate actively hides what charter rule 18 measures.** The
@@ -209,6 +249,10 @@ pub fn intent_at_yaw(yaw: f32, input: Input) -> Intent {
 /// alongside a worst remesh of 11 ms is meshing or mesh upload; a worst frame of
 /// 11 ms alongside a worst remesh of 0.2 ms is something else entirely, and
 /// would send anyone optimising the mesher after the wrong thing.
+///
+/// [`Phases`] is the general form of that argument, added after a reading came
+/// back with an 8.8 ms worst frame beside a 2.3 ms worst remesh — enough to
+/// clear the mesher and not enough to convict anything else.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Pacing {
     /// Seconds accumulated into the window still being measured.
@@ -221,6 +265,8 @@ pub struct Pacing {
     worst_remesh_meshing: f32,
     /// Chunks rebuilt by that worst remesh.
     worst_remesh_chunks: usize,
+    /// Where the worst frame of the window spent its time.
+    worst_phases: Phases,
     /// Largest prediction correction seen in the window, in cells.
     worst_correction: f32,
     /// The last completed window's worst frame, in milliseconds.
@@ -236,6 +282,8 @@ pub struct Pacing {
     reported_remesh_chunks: usize,
     /// The last completed window's largest correction, in cells.
     reported_correction: f32,
+    /// Where that window's worst frame spent its time.
+    reported_phases: Phases,
 }
 
 impl Pacing {
@@ -243,8 +291,18 @@ impl Pacing {
     const WINDOW: f32 = 1.0;
 
     /// Folds one frame's duration in, publishing the window when it is full.
-    fn frame(&mut self, dt: f32) {
-        self.worst_frame = self.worst_frame.max(dt * 1000.0);
+    ///
+    /// `phases` are the phases of the frame `dt` measures, which is the frame
+    /// *before* this one: `dt` is the gap between two frame starts, so it is
+    /// the previous frame's duration, and the caller records phases when a
+    /// frame ends. Pairing them the other way would label every hitch with the
+    /// work of the frame that came after it.
+    fn frame(&mut self, dt: f32, phases: Phases) {
+        let millis = dt * 1000.0;
+        if millis > self.worst_frame {
+            self.worst_frame = millis;
+            self.worst_phases = phases;
+        }
         self.elapsed += dt;
         if self.elapsed >= Self::WINDOW {
             *self = Self {
@@ -253,6 +311,7 @@ impl Pacing {
                 reported_remesh_meshing: self.worst_remesh_meshing,
                 reported_remesh_chunks: self.worst_remesh_chunks,
                 reported_correction: self.worst_correction,
+                reported_phases: self.worst_phases,
                 ..Self::default()
             };
         }
@@ -276,6 +335,12 @@ impl Pacing {
     #[must_use]
     pub const fn worst_frame_ms(&self) -> f32 {
         self.reported_frame
+    }
+
+    /// Where that worst frame spent its time.
+    #[must_use]
+    pub const fn worst_frame_phases(&self) -> Phases {
+        self.reported_phases
     }
 
     /// The worst remesh of the last completed window, and how many chunks it
@@ -334,6 +399,9 @@ pub struct App {
     fps: f32,
     /// Frame pacing over the last second, and what the remesh cost during it.
     pacing: Pacing,
+    /// Where the frame that just ended spent its time, waiting to be paired
+    /// with the `dt` that measures it on the next frame.
+    last_phases: Phases,
     /// The server's tick when it last said so.
     tick: u64,
     /// What the connection reported about the server's certificate.
@@ -410,6 +478,7 @@ impl App {
             warnings: Vec::new(),
             fps: 0.0,
             pacing: Pacing::default(),
+            last_phases: Phases::default(),
             tick: 0,
             server_label: "connecting…".to_owned(),
             predictor: None,
@@ -556,6 +625,18 @@ impl App {
     #[must_use]
     pub const fn pacing(&self) -> &Pacing {
         &self.pacing
+    }
+
+    /// Records where the frame that has just finished spent its time.
+    ///
+    /// Called at the END of a frame by whatever is driving it, because only the
+    /// driver sees the phases outside [`App`] — acquiring a swapchain image,
+    /// presenting — and those are the two that can block on something other
+    /// than the client's own work. A headless caller that never calls this gets
+    /// a zeroed breakdown, which reads as "not measured" rather than as "no
+    /// time spent".
+    pub const fn record_phases(&mut self, phases: Phases) {
+        self.last_phases = phases;
     }
 
     /// Whether there is a predicted body driving the camera.
@@ -1073,7 +1154,7 @@ impl App {
         }
         // The unsmoothed half. See [`Pacing`]: the average above cannot show a
         // hitch, and the hitch is the thing charter rule 18 is about.
-        self.pacing.frame(dt);
+        self.pacing.frame(dt, self.last_phases);
 
         let sensitivity = self.config.mouse_sensitivity;
         self.camera
@@ -1287,6 +1368,7 @@ impl App {
         let (remesh_ms, remesh_chunks) = self.pacing.worst_remesh_ms();
         let (meshing, upload) = self.pacing.worst_remesh_split_ms();
         let worst = self.pacing.worst_frame_ms();
+        let phases = self.pacing.worst_frame_phases();
         let (created, reused) = self.renderer.buffer_stats();
         let correction = self.pacing.worst_correction_cells();
 
@@ -1299,6 +1381,23 @@ impl App {
                 "worst frame {worst:.1} ms ({:.0} fps) · worst remesh {remesh_ms:.1} ms over \
                  {remesh_chunks} chunks ({meshing:.1} mesh + {upload:.1} upload)",
                 if worst > 0.0 { 1000.0 / worst } else { 0.0 }
+            ),
+            // What that worst frame was actually doing. `acquire` and `present`
+            // are the swapchain, so time there is the GPU or the compositor
+            // holding the frame rather than the client working; `rest` is
+            // whatever the phases did not account for, which is winit, event
+            // handling, and the gap between frames.
+            format!(
+                "  = net {:.1} + remesh {:.1} + advance {:.1} + acquire {:.1} + world {:.1} + \
+                 hud {:.1} + present {:.1} + rest {:.1}",
+                phases.network,
+                phases.remesh,
+                phases.advance,
+                phases.acquire,
+                phases.world,
+                phases.hud,
+                phases.present,
+                (worst - phases.total()).max(0.0),
             ),
             format!(
                 "{created} mesh buffers created, {reused} reused from the pool · worst \
@@ -1523,13 +1622,21 @@ mod tests {
         // frame in it averages to 900 fps — the hitch a player actually sees
         // rounds away to nothing. Charter rule 18 measures pacing.
         let mut pacing = Pacing::default();
+        let quiet = Phases::default();
+        // The hitching frame spent its time waiting on the swapchain, which is
+        // the case the breakdown exists to distinguish from the client's own
+        // work.
+        let stalled = Phases {
+            present: 10.5,
+            ..Phases::default()
+        };
         for _ in 0..899 {
-            pacing.frame(1.0 / 900.0);
+            pacing.frame(1.0 / 900.0, quiet);
         }
         pacing.remesh(11.0, 0.4, 4);
-        pacing.frame(0.011);
+        pacing.frame(0.011, stalled);
         // One more frame to close the window and publish it.
-        pacing.frame(1.0 / 900.0);
+        pacing.frame(1.0 / 900.0, quiet);
 
         assert!(
             (pacing.worst_frame_ms() - 11.0).abs() < 0.01,
@@ -1543,6 +1650,12 @@ mod tests {
             "the remesh that coincided with the worst frame has to be reported with it, or \
              there is no way to tell a meshing hitch from any other kind"
         );
+        assert_eq!(
+            pacing.worst_frame_phases(),
+            stalled,
+            "the breakdown reported belongs to some other frame; the 899 quiet frames each \
+             had their own, and reporting one of those would describe the wrong frame"
+        );
     }
 
     #[test]
@@ -1551,16 +1664,21 @@ mod tests {
         // during startup would sit on the HUD for the rest of the session
         // claiming the client still hitches.
         let mut pacing = Pacing::default();
+        let quiet = Phases::default();
+        let stalled = Phases {
+            present: 10.5,
+            ..Phases::default()
+        };
         pacing.remesh(11.0, 0.4, 4);
-        pacing.frame(0.011);
-        pacing.frame(1.0);
+        pacing.frame(0.011, stalled);
+        pacing.frame(1.0, stalled);
         assert!((pacing.worst_frame_ms() - 1000.0).abs() < 0.01);
 
         // A quiet second after it.
         for _ in 0..60 {
-            pacing.frame(1.0 / 60.0);
+            pacing.frame(1.0 / 60.0, quiet);
         }
-        pacing.frame(1.0 / 60.0);
+        pacing.frame(1.0 / 60.0, quiet);
         assert!(
             pacing.worst_frame_ms() < 20.0,
             "a quiet second still reported {} ms from the stall before it",
@@ -1570,6 +1688,12 @@ mod tests {
             pacing.worst_remesh_ms(),
             (0.0, 0),
             "the remesh figure outlived its window too"
+        );
+        assert_eq!(
+            pacing.worst_frame_phases(),
+            quiet,
+            "the stalled frame's breakdown outlived its window, so the HUD would still be \
+             blaming the swapchain a second after the stall"
         );
     }
 
