@@ -20,6 +20,7 @@
 //! cargo test -p bot --test swarm_load --release -- --ignored --nocapture
 //! ```
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tiamot_core::identity::Allowlist;
@@ -48,6 +49,14 @@ fn rss_kib() -> Option<u64> {
     None
 }
 
+/// The reference mods, which register the tools and generate the terrain.
+fn reference_mods() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../game")
+        .canonicalize()
+        .expect("the reference mods live at the repo root")
+}
+
 #[test]
 #[ignore = "takes about a minute; CI runs it explicitly"]
 fn twenty_bots_for_sixty_seconds_leave_the_server_healthy() {
@@ -64,7 +73,16 @@ fn twenty_bots_for_sixty_seconds_leave_the_server_healthy() {
         max_players: 64,
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
-        mods_path: None,
+        // The reference mods, because the swarm DIGS rather than writing blocks
+        // into the world. Charter rule 1 leaves the engine with no tools of its
+        // own, so a modless server is one where every bot fails at its first
+        // dig — and `core_worldgen` is what puts ground under them to dig.
+        //
+        // This test ran modless until the light work landed, which was harmless
+        // only for as long as `wander` could edit the world directly. Nightly
+        // caught it; nothing in the fast CI loop could, because nothing else
+        // runs this workload.
+        mods_path: Some(reference_mods()),
         seed: Some(21),
         rcon: None,
         materials: vec!["load:stone".to_owned()],
@@ -92,7 +110,7 @@ fn twenty_bots_for_sixty_seconds_leave_the_server_healthy() {
             handles.push(tokio::spawn(bot::wander(
                 addr,
                 format!("load{index}"),
-                2,
+                index,
                 Duration::from_secs(SECONDS),
                 u64::from(index).wrapping_mul(0x9E37_79B9) | 1,
             )));

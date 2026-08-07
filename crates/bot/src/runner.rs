@@ -183,15 +183,48 @@ impl SwarmStats {
     }
 }
 
+/// The material a bot is holding most of, if it is holding anything.
+///
+/// Learned rather than assumed, for the reason `churn.lua` gives: a hard-coded
+/// id is a scenario coupled to one mod set, and the reference mods are a test
+/// fixture rather than the game (charter's scope discipline).
+///
+/// Waits briefly for an update rather than reading what is already known: the
+/// credit for a dig arrives on its own message, which can land a tick after the
+/// block delta the dig was waiting for.
+///
+/// Ties break toward the lower id so two bots in the same state choose the same
+/// material — a swarm is easier to reason about when its bots are not each
+/// making a different arbitrary choice.
+async fn carrying(bot: &mut Bot) -> Option<u16> {
+    let stacks = bot.await_inventory(Duration::from_millis(200)).await.ok()?;
+    stacks
+        .into_iter()
+        .filter(|(_, units)| *units > 0)
+        .max_by_key(|(id, units)| (*units, std::cmp::Reverse(*id)))
+        .map(|(id, _)| id)
+}
+
 /// Runs one wandering bot for `duration`, editing as it goes.
 ///
-/// The `wander` behaviour: move somewhere, place a block, dig it back out.
-/// Deliberately self-cleaning — a swarm that only placed would grow the world
-/// without bound and measure disk rather than the server.
+/// The `wander` behaviour: move somewhere, dig a block out, put it straight
+/// back. Deliberately self-cleaning — a swarm that only dug would eat the world
+/// and one that only built would grow it without bound, and either measures the
+/// disk rather than the server.
+///
+/// # Every bot gets its own strip
+///
+/// `index` is what keeps twenty bots out of each other's way: bot *n* wanders
+/// a column of the world `STRIP` blocks wide and edits only inside it. Sharing
+/// one area looks more like a real server and is not: two bots digging the same
+/// block means one of them asks for a block that is *already* air, and a dig
+/// that can never complete is a hang rather than a failure — the server has
+/// nothing to broadcast, so the bot waits out its patience for a delta that
+/// will never come.
 pub async fn wander(
     addr: SocketAddr,
     name: String,
-    material: u16,
+    index: u32,
     duration: Duration,
     seed: u64,
 ) -> Result<SwarmStats, BotError> {
@@ -218,9 +251,16 @@ pub async fn wander(
         state
     };
 
+    /// How wide a strip each bot owns, in blocks. Wide enough that a bot has
+    /// somewhere to go, narrow enough that twenty of them still span several
+    /// chunks and give the cache and the dirty set real work.
+    const STRIP: u32 = 8;
+
+    let home = i32::try_from(index).unwrap_or(0) * i32::try_from(STRIP).unwrap_or(8);
+
     while tokio::time::Instant::now() < deadline {
         let roll = next();
-        let x = i32::try_from(roll % 64).unwrap_or(0) - 32;
+        let x = home + i32::try_from(roll % u64::from(STRIP)).unwrap_or(0);
         let z = i32::try_from((roll >> 8) % 64).unwrap_or(0) - 32;
         // Walk somewhere, then dig **where the bot actually ended up** rather
         // than where it was aiming. `move_to` is a straight line with a jump
@@ -230,7 +270,11 @@ pub async fn wander(
         // short — and the failure would look like the reach check being broken.
         bot.move_to(x as f32, 0.0, z as f32).await?;
         let here = bot.walk([0.0; 3], 0, 1).await?.block();
-        let pos = tiamot_core::BlockPos::new(here.x, here.y - 1, here.z);
+        // BESIDE the bot, never underneath it. Digging the block you are
+        // standing on drops you into the hole, and putting it back is then
+        // refused for being inside a player — the rule working, and the
+        // scenario staging it wrong. `churn.lua` learned this first.
+        let pos = tiamot_core::BlockPos::new(here.x + 1, here.y - 1, here.z);
 
         // **Dig first, build second.** This used to place and then dig, which
         // needed the bot to be carrying something before it had mined anything.
@@ -246,8 +290,15 @@ pub async fn wander(
             .latencies_us
             .push(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
 
-        // Put it back, so the next round has something to dig.
-        if bot.place(pos, material).await.is_ok() {
+        // Put it back, so the next round has something to dig — with whatever
+        // the dig actually credited. A hard-coded material id would couple the
+        // swarm to one mod set, and would spend the whole run being refused for
+        // carrying none of it. `Bot::place` waits ten seconds before reporting a
+        // refusal, so asking only when there is something to place is the
+        // difference between a load test and a bot asleep in a queue.
+        if let Some(material) = carrying(&mut bot).await
+            && bot.place(pos, material).await.is_ok()
+        {
             stats.edits += 1;
             stats.confirmed += 1;
         }

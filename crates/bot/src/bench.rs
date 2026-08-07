@@ -226,6 +226,24 @@ pub struct Comparison {
 /// Fails a run whose p99 is more than this multiple of the baseline's.
 pub const REGRESSION_FACTOR: u64 = 2;
 
+/// A p99 at or below this is never a regression, whatever the ratio says.
+///
+/// 5% of the 50 ms tick — charter rule 18's unit, deliberately, because the
+/// question the gate exists to answer is "does this still fit in a tick" and not
+/// "is this the same number as last month".
+///
+/// The floor became necessary when the p99 fell below a millisecond. A ratio on
+/// a 0.36 ms measurement is a scheduler detector: the CI runner is shared
+/// silicon and was measured at 1.65× this project's reference machine on the
+/// same workload, so a 2× limit over a sub-millisecond baseline fails on a busy
+/// runner and teaches everyone to ignore the gate. Below 2.5 ms the server is
+/// not the thing being measured.
+///
+/// A regression big enough to matter goes clean through this: it takes 7× to
+/// reach the floor from where the benchmark sits today, and the numbers are in
+/// the log and the uploaded artifact either way.
+pub const NOISE_FLOOR_US: u64 = 2_500;
+
 /// Compares a run against a baseline.
 ///
 /// A run *faster* than the baseline is never a failure — that is the point of
@@ -273,7 +291,10 @@ pub fn compare(baseline: &TickReport, run: &TickReport) -> Comparison {
         };
     }
 
-    let limit = baseline.p99_us.saturating_mul(REGRESSION_FACTOR);
+    let limit = baseline
+        .p99_us
+        .saturating_mul(REGRESSION_FACTOR)
+        .max(NOISE_FLOOR_US);
     if run.p99_us > limit {
         Comparison {
             within_tolerance: false,
@@ -314,40 +335,156 @@ fn percentile(sorted: &[u64], percentile: u32) -> u64 {
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
-/// Generates the standard benchmark session: four bots, fixed commands.
+/// The block a bot's home sits on. The reference generator fills BELOW its
+/// heightmap, so a surface of 0 puts the highest solid block at y = -1 and
+/// digging at y = 0 would find air and never complete.
+pub const GROUND: i32 = -1;
+
+/// Digs one block and reports what it credited, then puts it back.
+///
+/// The benchmark has to name a material to build with, and it learns it here
+/// rather than hard-coding an id — the id depends on the mod set's registration
+/// order, so a constant would be a benchmark that measured a mod set. Runs
+/// before the warmup, and restores the block it took, so it costs the
+/// measurement nothing and leaves every run starting from the same world.
+///
+/// # Errors
+///
+/// A message naming what went wrong, including a dig that credited nothing —
+/// which means the mod set has no drops and the workload cannot run at all.
+pub async fn probe_material(addr: std::net::SocketAddr) -> Result<u16, String> {
+    use tiamot_core::BlockPos;
+
+    let identity = tiamot_core::identity::Identity::generate().map_err(|err| err.to_string())?;
+    let mut bot = crate::Bot::connect_trusting(addr, identity)
+        .await
+        .map_err(|err| err.to_string())?;
+    bot.join("bench-probe")
+        .await
+        .map_err(|err| err.to_string())?;
+
+    // Beside spawn, and well clear of every bot's work area.
+    let pos = BlockPos::new(2, GROUND, 0);
+    bot.dig_block(pos).await.map_err(|err| err.to_string())?;
+    let material = bot
+        .await_inventory(Duration::from_millis(500))
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter(|(_, units)| *units > 0)
+        .max_by_key(|(id, units)| (*units, std::cmp::Reverse(*id)))
+        .map(|(id, _)| id)
+        .ok_or_else(|| {
+            "the probe dig credited nothing; the mod set defines no drops, so there is \
+             nothing to build with"
+                .to_owned()
+        })?;
+    bot.place(pos, material)
+        .await
+        .map_err(|err| err.to_string())?;
+    bot.disconnect().await;
+    Ok(material)
+}
+
+/// How far apart bots' work areas are, in blocks.
+///
+/// Wide enough that no two bots ever touch the same block — which matters now
+/// that digging is real: a bot asking for a block another bot has already dug
+/// waits out its patience for a delta the server has no reason to send.
+/// Narrow enough that the whole grid stays inside a walk `Bot::move_to` can
+/// actually finish, which is about forty blocks before it gives up.
+const SPREAD: i32 = 24;
+
+/// Where bot `index` of `bots` sets up, in blocks, relative to spawn.
+///
+/// A square grid centred on the spawn point: bots land in different chunks so
+/// the chunk cache and the dirty set do real work, and no bot is farther from
+/// spawn than it can walk. The spacing shrinks as the grid grows for that
+/// second reason — the alternative is a fixed spacing that puts the outer bots
+/// somewhere they never arrive, and a dig out of reach looks like a broken
+/// reach check rather than a benchmark that staged itself wrong.
+fn home(index: u32, bots: u32) -> (i32, i32) {
+    // Integer side length, so the grid is the same on every machine. No
+    // `sqrt` on a float, which would be a needless step outside the arithmetic
+    // this file can promise is identical everywhere.
+    let side = (1u32..).find(|s| s * s >= bots.max(1)).unwrap_or(1);
+    let spacing = (SPREAD / i32::try_from(side).unwrap_or(1)).max(4);
+    let column = i32::try_from(index % side).unwrap_or(0);
+    let row = i32::try_from(index / side).unwrap_or(0);
+    let centre = (i32::try_from(side).unwrap_or(1) - 1) * spacing / 2;
+    (column * spacing - centre, row * spacing - centre)
+}
+
+/// Generates the standard benchmark session for ONE bot.
 ///
 /// Deterministic by construction — no randomness, no wall-clock — so the
 /// workload is identical on every machine and every run.
+///
+/// # Why the session is per-bot rather than one recording replayed by all
+///
+/// It used to be one list every bot replayed, which worked while a client could
+/// write blocks straight into the world: four bots writing the same block four
+/// times is wasteful but harmless. It stopped working the moment digging became
+/// real (Task 09). Now the first bot to arrive digs the block and the other
+/// three ask for one that is already air, get nothing, carry nothing, and fail
+/// on the placement that follows. The workload has to give each bot its own
+/// ground, the way fifty real players have their own.
+///
+/// # What one round is
+///
+/// Walk home once, then per round: dig the block beside you, put it back,
+/// and every fourth round chisel one sub-node out and back. Digging first is
+/// not a style choice — a player cannot conjure material, so the only thing a
+/// bot has to build with is what it just mined. `material` is what the ground
+/// turned out to be, learned by digging rather than assumed, because a
+/// hard-coded id is a benchmark coupled to one mod set.
+///
+/// Beside the bot rather than under it: digging the block you are standing on
+/// drops you into the hole, and the placement that follows is refused for being
+/// inside a player.
 #[must_use]
-pub fn standard_session(bots: u32, rounds: u64) -> Vec<crate::replay::Recorded> {
+pub fn standard_session(
+    index: u32,
+    bots: u32,
+    rounds: u64,
+    material: u16,
+) -> Vec<crate::replay::Recorded> {
     use crate::script::Command;
     use tiamot_core::{BlockPos, SubNodePos};
 
-    let mut out = Vec::new();
-    for round in 0..rounds {
-        for bot in 0..bots {
-            // Spread the bots across chunks so the cache and the dirty set do
-            // real work rather than hammering one hot chunk.
-            let x = i32::try_from(bot).unwrap_or(0) * 37 + i32::try_from(round % 16).unwrap_or(0);
-            let z = i32::try_from(bot).unwrap_or(0) * 53 - i32::try_from(round % 11).unwrap_or(0);
-            let pos = BlockPos::new(x, 6, z);
+    let (home_x, home_z) = home(index, bots);
+    let mut out = vec![crate::replay::Recorded {
+        tick: 0,
+        command: Command::MoveTo(home_x as f32, 0.0, home_z as f32),
+    }];
 
+    for round in 0..rounds {
+        // A small ring around home, so consecutive rounds are not the same
+        // block and every one of them is inside `phys::REACH`.
+        let x = home_x + 1 + i32::try_from(round % 3).unwrap_or(0);
+        let z = home_z + i32::try_from((round / 3) % 3).unwrap_or(0) - 1;
+        let pos = BlockPos::new(x, GROUND, z);
+
+        out.push(crate::replay::Recorded {
+            tick: round,
+            command: Command::DigBlock(pos),
+        });
+        out.push(crate::replay::Recorded {
+            tick: round,
+            command: Command::Place(pos, material),
+        });
+        // Every fourth round, chisel as well — the sub-node path is the
+        // expensive one and the benchmark should feel it. Out and straight
+        // back, so the world ends each round the way it started.
+        if round % 4 == 0 {
+            let cell = SubNodePos::new(x * 3 + 1, GROUND * 3 + 1, z * 3 + 1);
             out.push(crate::replay::Recorded {
                 tick: round,
-                command: Command::Place(pos, 2),
+                command: Command::DigSubNode(cell),
             });
-            // Every fourth round, chisel instead of placing whole blocks — the
-            // sub-node path is the expensive one and the benchmark should feel
-            // it.
-            if round % 4 == 0 {
-                out.push(crate::replay::Recorded {
-                    tick: round,
-                    command: Command::DigSubNode(SubNodePos::new(x * 3 + 1, 6 * 3 + 1, z * 3 + 1)),
-                });
-            }
             out.push(crate::replay::Recorded {
                 tick: round,
-                command: Command::DigBlock(pos),
+                command: Command::PlaceSubNode(cell, material),
             });
         }
     }
@@ -432,20 +569,45 @@ mod tests {
     fn a_doubled_p99_is_within_tolerance_and_more_is_not() {
         // The gate's exact boundary, both sides. A gate whose threshold is off
         // by one is a gate nobody trusts.
-        let baseline = report(1000);
+        //
+        // The baseline is above `NOISE_FLOOR_US` so this measures the ratio.
+        // Below the floor the floor is the limit, which the next test covers.
+        let baseline = report(NOISE_FLOOR_US * 2);
 
         assert!(
-            compare(&baseline, &report(2000)).within_tolerance,
+            compare(&baseline, &report(NOISE_FLOOR_US * 4)).within_tolerance,
             "exactly 2x must pass"
         );
         assert!(
-            !compare(&baseline, &report(2001)).within_tolerance,
+            !compare(&baseline, &report(NOISE_FLOOR_US * 4 + 1)).within_tolerance,
             "just over 2x must fail"
         );
-        assert!(compare(&baseline, &report(1000)).within_tolerance);
+        assert!(compare(&baseline, &report(NOISE_FLOOR_US * 2)).within_tolerance);
         assert!(
             compare(&baseline, &report(500)).within_tolerance,
             "faster is fine"
+        );
+    }
+
+    #[test]
+    fn a_tiny_baseline_is_gated_by_the_floor_rather_than_by_the_ratio() {
+        // The case the floor exists for: a p99 well under a millisecond, where
+        // twice the baseline is inside the runner's scheduling noise. Ten times
+        // a 0.3 ms p99 is still 3 ms, and a server that spends 3 ms on a tick
+        // it used to spend 0.3 ms on has not stopped fitting in a tick.
+        let baseline = report(300);
+
+        assert!(
+            compare(&baseline, &report(700)).within_tolerance,
+            "over 2x but far under the floor: this must not fail a build"
+        );
+        assert!(
+            compare(&baseline, &report(NOISE_FLOOR_US)).within_tolerance,
+            "exactly at the floor must pass"
+        );
+        assert!(
+            !compare(&baseline, &report(NOISE_FLOOR_US + 1)).within_tolerance,
+            "past the floor must still fail, or the gate catches nothing"
         );
     }
 
@@ -548,8 +710,8 @@ mod tests {
     fn the_standard_session_is_deterministic() {
         // The whole point of a replay benchmark: same input every run, so any
         // change in the output is the server's.
-        assert_eq!(standard_session(4, 50), standard_session(4, 50));
-        assert!(!standard_session(4, 50).is_empty());
+        assert_eq!(standard_session(1, 4, 50, 7), standard_session(1, 4, 50, 7));
+        assert!(!standard_session(1, 4, 50, 7).is_empty());
     }
 
     #[test]
@@ -557,20 +719,100 @@ mod tests {
         // The expensive path. A benchmark that only placed whole blocks would
         // miss the engine's defining feature entirely.
         use crate::script::Command;
-        let session = standard_session(4, 8);
+        let session = standard_session(0, 4, 8, 7);
         assert!(
             session
                 .iter()
                 .any(|entry| matches!(entry.command, Command::DigSubNode(_))),
             "the benchmark must chisel, not only place"
         );
+        assert!(
+            session
+                .iter()
+                .any(|entry| matches!(entry.command, Command::PlaceSubNode(..))),
+            "and put the cell back, or the world erodes over a long run"
+        );
     }
 
     #[test]
     fn the_standard_session_renders_and_parses() {
-        let session = standard_session(2, 4);
+        let session = standard_session(2, 4, 4, 7);
         let rendered = crate::replay::render(&session);
         let parsed = crate::replay::parse(&rendered).expect("parse");
         assert_eq!(parsed, session);
+    }
+
+    #[test]
+    fn every_dig_is_paid_for_before_it_is_spent() {
+        // The rule the old session broke: a bot cannot conjure material, so
+        // every placement must follow a dig that credited it. Checked as an
+        // ordering property rather than by reading the generator, because the
+        // generator is exactly what would be wrong.
+        use crate::script::Command;
+        let session = standard_session(0, 4, 12, 7);
+        let mut dug = 0i32;
+        for entry in &session {
+            match entry.command {
+                Command::DigBlock(_) | Command::DigSubNode(_) => dug += 1,
+                Command::Place(..) | Command::PlaceSubNode(..) => {
+                    dug -= 1;
+                    assert!(
+                        dug >= 0,
+                        "a placement at tick {} has nothing behind it",
+                        entry.tick
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(dug, 0, "the world must end the run the way it started");
+    }
+
+    #[test]
+    fn no_two_bots_are_given_the_same_ground() {
+        // Two bots on one block is not a busier benchmark, it is a hang: the
+        // second one asks for a block that is already air and waits out its
+        // patience for a delta the server has no reason to send.
+        use crate::script::Command;
+        use std::collections::BTreeSet;
+
+        for bots in [1u32, 4, 9, 20] {
+            // A bot revisits its own blocks round after round, which is the
+            // point; what must not happen is two bots sharing one. So the
+            // comparison is between whole per-bot SETS, not between visits.
+            let mut claimed: BTreeSet<(i32, i32, i32)> = BTreeSet::new();
+            for index in 0..bots {
+                let mine: BTreeSet<(i32, i32, i32)> = standard_session(index, bots, 12, 7)
+                    .iter()
+                    .filter_map(|entry| match entry.command {
+                        Command::DigBlock(pos) => Some((pos.x, pos.y, pos.z)),
+                        _ => None,
+                    })
+                    .collect();
+                for block in mine {
+                    assert!(
+                        claimed.insert(block),
+                        "{bots} bots: two of them were sent to {block:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_bot_can_walk_to_its_home() {
+        // `Bot::move_to` gives up after forty legs, which is about forty blocks
+        // of walking. A grid that puts the outer bots past that leaves them
+        // digging out of reach, and the failure reads as a broken reach check
+        // rather than a benchmark that staged itself wrong.
+        for bots in [1u32, 4, 9, 20, 50] {
+            for index in 0..bots {
+                let (x, z) = home(index, bots);
+                assert!(
+                    x * x + z * z <= 40 * 40,
+                    "{bots} bots: bot {index} is sent to ({x}, {z}), too far to walk"
+                );
+            }
+        }
     }
 }

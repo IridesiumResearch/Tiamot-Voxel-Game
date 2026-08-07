@@ -65,9 +65,6 @@ enum Mode {
         /// Which behaviour to run. Only `wander` exists so far.
         #[arg(long, default_value = "wander")]
         behavior: String,
-        /// Material id to build with.
-        #[arg(long, default_value_t = 2)]
-        material: u16,
         /// Seed for the movement sequence, so a run can be repeated.
         #[arg(long, default_value_t = 1)]
         seed: u64,
@@ -131,7 +128,6 @@ fn main() -> ExitCode {
             server,
             duration,
             behavior,
-            material,
             seed,
         } => swarm_mode(
             &runtime,
@@ -139,7 +135,6 @@ fn main() -> ExitCode {
             server,
             Duration::from_secs(duration),
             &behavior,
-            material,
             seed,
         ),
         Mode::Replay { session, server } => replay_mode(&runtime, &session, server),
@@ -238,7 +233,6 @@ fn swarm_mode(
     server: SocketAddr,
     duration: Duration,
     behavior: &str,
-    material: u16,
     seed: u64,
 ) -> u8 {
     if behavior != "wander" {
@@ -256,7 +250,7 @@ fn swarm_mode(
             handles.push(tokio::spawn(bot::wander(
                 server,
                 name,
-                material,
+                index,
                 duration,
                 seed.wrapping_add(u64::from(index))
                     .wrapping_mul(0x9E37_79B9),
@@ -416,10 +410,24 @@ fn bench_mode(
     };
 
     let addr = server.local_addr();
-    let session = bot::bench::standard_session(bots, rounds);
+
+    // What the ground is made of, before anything is measured. A bot builds
+    // with what it dug, so the workload cannot be written down until this is
+    // known — see `bench::probe_material`.
+    let material = match runtime.block_on(bot::bench::probe_material(addr)) {
+        Ok(material) => material,
+        Err(err) => {
+            eprintln!("could not learn what the ground is made of: {err}");
+            return 1;
+        }
+    };
+
+    let sessions: Vec<_> = (0..bots)
+        .map(|index| bot::bench::standard_session(index, bots, rounds, material))
+        .collect();
     println!(
-        "macro bench: {bots} bots, {rounds} rounds, {} commands",
-        session.len()
+        "macro bench: {bots} bots, {rounds} rounds, {} commands each, material {material}",
+        sessions.first().map_or(0, Vec::len)
     );
 
     // Let startup settle, then throw away the samples it produced: the first
@@ -430,8 +438,7 @@ fn bench_mode(
 
     let outcome = runtime.block_on(async {
         let mut handles = Vec::new();
-        for index in 0..bots {
-            let session = session.clone();
+        for (index, session) in sessions.into_iter().enumerate() {
             handles.push(tokio::spawn(async move {
                 let identity = Identity::generate().map_err(|err| err.to_string())?;
                 let client = bot::Bot::connect_trusting(addr, identity)
