@@ -58,12 +58,14 @@ render_mode = "textured"
 
 # How the world is LIT. Switchable while playing with L (or F5), so this is
 # the mode the client starts in rather than the mode it stays in.
-#   "simple"  — mode 1: directional face shading and ambient occlusion only.
-#               The cheapest mode, and the one the others are measured against.
-#   "classic" — mode 2: smooth propagated light, coloured, with distance fog.
-# Mode 3, with shadow maps and post-processing, is not implemented yet and is
-# deliberately not listed: a mode you could select that did nothing would be
-# worse than one that is honestly absent.
+#   "simple"    — mode 1: directional face shading and ambient occlusion only.
+#                 The cheapest mode, and the one the others are measured
+#                 against. It allocates none of mode 3's targets.
+#   "classic"   — mode 2: smooth propagated light, coloured, with distance fog.
+#   "beautiful" — mode 3: mode 2 drawn into a float target and put through a
+#                 post chain — lamp-lit surfaces bloom, and highlights roll off
+#                 instead of clipping. Shadow maps and time-of-day grading are
+#                 still to come; each pass is listed here as it lands.
 lighting_mode = "classic"
 
 # Wait for vertical blank. On by default: frame PACING is the metric this

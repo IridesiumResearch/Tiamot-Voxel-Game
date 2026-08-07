@@ -628,43 +628,44 @@ fn the_lighting_mode_switches_without_a_restart() {
     let held = app.store().len();
     assert_eq!(app.lighting_mode(), LightingMode::Classic, "the default");
 
-    app.cycle_lighting_mode();
-
-    assert_eq!(
-        app.lighting_mode(),
+    // Every mode in turn, and home again. Walking the whole cycle rather than
+    // checking one switch is what catches a mode that was added to the enum and
+    // not to everything that matches on it.
+    for expected in [
+        LightingMode::Beautiful,
         LightingMode::Simple,
-        "the switch did not take"
-    );
-    assert_eq!(
-        app.renderer().lighting_mode(),
-        LightingMode::Simple,
-        "the renderer is still drawing the old mode, so the switch is invisible"
-    );
-    assert_eq!(
-        app.pending_chunks(),
-        held,
-        "switching modes left the world meshed for the mode it is no longer in"
-    );
+        LightingMode::Classic,
+    ] {
+        app.cycle_lighting_mode();
 
-    // And it draws. A mode that switches cleanly and then renders nothing is
-    // the failure this whole test would otherwise miss.
-    assert!(
-        run_frames(&mut app, |app| app.pending_chunks() == 0),
-        "the world never re-meshed after the switch"
-    );
-    let target = Offscreen::new(app.renderer().gpu(), WIDTH, HEIGHT);
-    let camera = *app.camera();
-    let frame = target
-        .capture(app.renderer(), &camera)
-        .expect("a frame in the new mode");
-    assert!(
-        shows_a_world(&frame),
-        "mode 1 drew an empty sky where the world used to be"
-    );
+        assert_eq!(app.lighting_mode(), expected, "the switch did not take");
+        assert_eq!(
+            app.renderer().lighting_mode(),
+            expected,
+            "the renderer is still drawing the old mode, so the switch is invisible"
+        );
+        assert_eq!(
+            app.pending_chunks(),
+            held,
+            "switching to {expected:?} left the world meshed for the mode it is no longer in"
+        );
 
-    // Back again, because a switch that only goes one way is half a feature.
-    app.cycle_lighting_mode();
-    assert_eq!(app.lighting_mode(), LightingMode::Classic);
+        // And it draws. A mode that switches cleanly and then renders nothing
+        // is the failure this whole test would otherwise miss.
+        assert!(
+            run_frames(&mut app, |app| app.pending_chunks() == 0),
+            "the world never re-meshed after switching to {expected:?}"
+        );
+        let target = Offscreen::new(app.renderer().gpu(), WIDTH, HEIGHT);
+        let camera = *app.camera();
+        let frame = target
+            .capture(app.renderer(), &camera)
+            .expect("a frame in the new mode");
+        assert!(
+            shows_a_world(&frame),
+            "{expected:?} drew an empty sky where the world used to be"
+        );
+    }
 
     assert!(server.stop());
 }

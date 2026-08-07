@@ -28,6 +28,7 @@
 //! test is worth having.
 
 pub mod frustum;
+pub mod graph;
 pub mod offscreen;
 
 use std::collections::BTreeMap;
@@ -444,6 +445,16 @@ pub struct Renderer {
     /// that swapped pipelines could not be switched without a stall and would
     /// be two code paths to keep agreeing.
     lighting: crate::config::LightingMode,
+    /// The world and selection shaders, kept so mode 3 can compile the same
+    /// code against its float target rather than loading a second copy.
+    world_shader: wgpu::ShaderModule,
+    selection_shader: wgpu::ShaderModule,
+    /// Mode 3's targets and post chain, built when that mode is showing and
+    /// dropped when it is not.
+    ///
+    /// `None` is the criterion: "no shadow/post allocations when in mode 1" is
+    /// a property something can assert, and [`Renderer::post_bytes`] is how.
+    post: Option<graph::Post>,
     /// How bright the sun is now, `0.0..=1.0`.
     ///
     /// Set by the sky each frame once time of day exists; full daylight until
@@ -486,12 +497,13 @@ impl Renderer {
 
         let bind_layout = build_bind_layout(&gpu);
 
-        let pipeline = build_pipeline(&gpu, &shader, &bind_layout, mode);
+        let pipeline = build_pipeline(&gpu, &shader, &bind_layout, mode, COLOUR_FORMAT);
 
         let selection_shader = gpu
             .device
             .create_shader_module(wgpu::include_wgsl!("selection.wgsl"));
-        let selection_pipeline = build_selection_pipeline(&gpu, &selection_shader, &bind_layout);
+        let selection_pipeline =
+            build_selection_pipeline(&gpu, &selection_shader, &bind_layout, COLOUR_FORMAT);
         let selection_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("selection"),
             size: (SELECTION_CAPACITY * size_of::<[f32; 3]>()) as u64,
@@ -559,6 +571,9 @@ impl Renderer {
             // Classic until told otherwise: a client with no config gets the
             // mode the world was lit for.
             lighting: crate::config::LightingMode::default(),
+            world_shader: shader,
+            selection_shader,
+            post: None,
             // Full daylight until a sky says otherwise, which is what Task
             // 08's scenes assumed and what a world with no sky mod gets.
             sun_intensity: 1.0,
@@ -616,14 +631,28 @@ impl Renderer {
     /// reconfigure. The caller is responsible for remeshing — the mesher bakes
     /// light into vertices, so the geometry drawn under the new mode has to be
     /// rebuilt for it (see `App::set_lighting_mode`).
-    pub const fn set_lighting_mode(&mut self, mode: crate::config::LightingMode) {
+    pub fn set_lighting_mode(&mut self, mode: crate::config::LightingMode) {
         self.lighting = mode;
+        if !mode.uses_post() {
+            // Dropped rather than kept for later. A player who tried mode 3
+            // once and went back to mode 1 for the frame rate should not still
+            // be paying for its targets, and "mode 1 allocates none of this" is
+            // only true if leaving gives it back.
+            self.post = None;
+        }
     }
 
     /// Which lighting mode is showing.
     #[must_use]
     pub const fn lighting_mode(&self) -> crate::config::LightingMode {
         self.lighting
+    }
+
+    /// Texture memory the post chain is holding, in bytes. Zero unless mode 3
+    /// is showing.
+    #[must_use]
+    pub fn post_bytes(&self) -> u64 {
+        self.post.as_ref().map_or(0, graph::Post::bytes)
     }
 
     /// How many chunk meshes are resident.
@@ -797,7 +826,7 @@ impl Renderer {
             tile: crate::texture::TILE,
             padding: crate::texture::PADDING,
             render_mode: u32::from(self.mode == RenderMode::Flat),
-            lighting_mode: u32::from(self.lighting == crate::config::LightingMode::Classic),
+            lighting_mode: self.lighting.code(),
             sun_intensity: self.sun_intensity,
             ambient: AMBIENT_FLOOR,
             fog_start: self.fog_start,
@@ -814,37 +843,27 @@ impl Renderer {
         }
     }
 
-    /// Renders one frame into `target`.
+    /// Frustum-culls the resident chunks and uploads their offsets.
     ///
-    /// `size` is the target's dimensions; the depth buffer is rebuilt when they
-    /// change, because a depth attachment must match its colour attachment
-    /// exactly or the pass fails to begin.
-    pub fn render(&mut self, target: &wgpu::TextureView, camera: &Camera, size: (u32, u32)) {
-        if size != self.depth_size && size.0 > 0 && size.1 > 0 {
-            self.depth = make_depth(&self.gpu, size.0, size.1);
-            self.depth_size = size;
-        }
-
-        let aspect = size.0 as f32 / size.1.max(1) as f32;
-        let view_projection = camera.view_projection(aspect);
-
-        self.gpu.queue.write_buffer(
-            &self.globals,
-            0,
-            bytemuck::bytes_of(&self.globals_for(view_projection)),
-        );
-
+    /// Returns the meshes to draw, in the order their instances were written —
+    /// the draw loop indexes the instance array by position in this list, so
+    /// the two must not be built separately.
+    fn cull_and_upload(&mut self, camera: &Camera, view_projection: glam::Mat4) -> Vec<ChunkPos> {
         // Cull, then build the instance array. Both in one pass so a chunk's
         // offset is computed exactly once per frame.
         let frustum = Frustum::from_view_projection(view_projection);
         let mut visible = Vec::with_capacity(self.chunks.len());
         let mut instances = Vec::with_capacity(self.chunks.len());
-        for (pos, mesh) in &self.chunks {
+        for pos in self.chunks.keys() {
             let offset = camera.position.chunk_offset(*pos);
             if !frustum.contains_chunk(offset) {
                 continue;
             }
-            visible.push(mesh);
+            // Positions rather than the meshes themselves: this method takes
+            // `&mut self` to grow the instance buffer, and a borrow of a mesh
+            // would keep that borrow alive across the draw loop. The lookup it
+            // costs is one `BTreeMap` probe per drawn chunk per frame.
+            visible.push(*pos);
             instances.push(Instance {
                 offset: [offset.x, offset.y, offset.z, 0.0],
             });
@@ -869,6 +888,62 @@ impl Renderer {
                 .write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));
         }
 
+        visible
+    }
+
+    /// Builds or drops mode 3's targets to match the mode and the frame size.
+    ///
+    /// Checked every frame rather than on a mode change or a resize event, for
+    /// the reason the depth buffer is: a target built for the old size draws
+    /// the world into a texture the wrong shape, and a resize that arrives
+    /// without an event — which happens — would leave it that way.
+    fn prepare_post(&mut self, size: (u32, u32)) {
+        if !self.lighting.uses_post() || size.0 == 0 || size.1 == 0 {
+            self.post = None;
+            return;
+        }
+        if self
+            .post
+            .as_ref()
+            .is_some_and(|post| post.fits(size.0, size.1))
+        {
+            return;
+        }
+        self.post = Some(graph::Post::new(
+            &self.gpu,
+            &self.world_shader,
+            &self.selection_shader,
+            &self.bind_layout,
+            self.mode,
+            size.0,
+            size.1,
+        ));
+    }
+
+    /// Renders one frame into `target`.
+    ///
+    /// `size` is the target's dimensions; the depth buffer is rebuilt when they
+    /// change, because a depth attachment must match its colour attachment
+    /// exactly or the pass fails to begin.
+    pub fn render(&mut self, target: &wgpu::TextureView, camera: &Camera, size: (u32, u32)) {
+        if size != self.depth_size && size.0 > 0 && size.1 > 0 {
+            self.depth = make_depth(&self.gpu, size.0, size.1);
+            self.depth_size = size;
+        }
+
+        self.prepare_post(size);
+
+        let aspect = size.0 as f32 / size.1.max(1) as f32;
+        let view_projection = camera.view_projection(aspect);
+
+        self.gpu.queue.write_buffer(
+            &self.globals,
+            0,
+            bytemuck::bytes_of(&self.globals_for(view_projection)),
+        );
+
+        let visible = self.cull_and_upload(camera, view_projection);
+
         let mut encoder = self
             .gpu
             .device
@@ -876,11 +951,32 @@ impl Renderer {
                 label: Some("frame"),
             });
 
+        // Where the world goes: straight to the target in modes 1 and 2, and
+        // into the float scene texture in mode 3 so the post chain has
+        // something with headroom in it to read.
+        let (colour, depth, world_pipeline, selection_pipeline) = match self.post.as_ref() {
+            Some(post) => {
+                let (scene, depth) = post.scene_target();
+                (
+                    scene,
+                    depth,
+                    post.world_pipeline(),
+                    post.selection_pipeline(),
+                )
+            }
+            None => (
+                target,
+                &self.depth,
+                &self.pipeline,
+                &self.selection_pipeline,
+            ),
+        };
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
+                    view: colour,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -889,7 +985,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
+                    view: depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -901,11 +997,14 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(world_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(1, self.instances.slice(..));
 
-            for (index, mesh) in visible.iter().enumerate() {
+            for (index, pos) in visible.iter().enumerate() {
+                let Some(mesh) = self.chunks.get(pos) else {
+                    continue;
+                };
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 // The instance range picks this chunk's offset out of the
@@ -919,10 +1018,17 @@ impl Renderer {
             // not write depth, so the order within the pass is what decides
             // this rather than the depth buffer.
             if self.selection_vertices > 0 {
-                pass.set_pipeline(&self.selection_pipeline);
+                pass.set_pipeline(selection_pipeline);
                 pass.set_vertex_buffer(0, self.selection.slice(..));
                 pass.draw(0..self.selection_vertices, 0..1);
             }
+        }
+
+        // The post chain, if this mode has one. It reads the scene texture the
+        // pass above just wrote and lands on `target`, so from outside the
+        // renderer a frame looks the same in every mode.
+        if let Some(post) = self.post.as_ref() {
+            post.run(&self.gpu, &mut encoder, target);
         }
 
         self.gpu.queue.submit(Some(encoder.finish()));
@@ -979,6 +1085,7 @@ fn build_selection_pipeline(
     gpu: &Gpu,
     shader: &wgpu::ShaderModule,
     bind_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
     let layout = gpu
         .device
@@ -1011,7 +1118,7 @@ fn build_selection_pipeline(
                 entry_point: Some("fragment_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: COLOUR_FORMAT,
+                    format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1083,11 +1190,15 @@ fn build_bind_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
 /// A function rather than more of [`Renderer::new`], which was long enough that
 /// the interesting decisions in it — winding, culling, depth comparison — were
 /// buried in the middle of resource creation.
+/// `format` is the colour target's, because a pipeline is compiled against one
+/// and lighting mode 3 draws the world into a float texture rather than the
+/// swapchain.
 fn build_pipeline(
     gpu: &Gpu,
     shader: &wgpu::ShaderModule,
     bind_layout: &wgpu::BindGroupLayout,
     mode: RenderMode,
+    format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
     let layout = gpu
         .device
@@ -1147,7 +1258,7 @@ fn build_pipeline(
                 entry_point: Some("fragment_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: COLOUR_FORMAT,
+                    format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],

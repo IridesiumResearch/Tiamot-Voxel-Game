@@ -29,7 +29,7 @@
 
 use client::app::TELEPORT_CHUNKS;
 use client::camera::{Camera, Position};
-use client::config::RenderMode;
+use client::config::{LightingMode, RenderMode};
 use client::mesher::{self, Absent, Neighbours};
 use client::render::offscreen::{hash_hex, perceptual_hash};
 use client::render::{Gpu, Offscreen, Renderer};
@@ -798,4 +798,170 @@ fn every_face_of_a_block_is_drawn_at_its_own_brightness() {
             "{a} and {b} should be equally lit: {brightness:?}"
         );
     }
+}
+
+#[test]
+fn mode_three_draws_the_world_through_its_post_chain() {
+    // The chain end to end, as pixels: the world is drawn into a float target,
+    // thresholded, blurred twice, and composited back through a tonemap. A
+    // mistake anywhere in it — a pass reading its own output, a target bound
+    // the wrong way round, a shader that fails to compile — shows up here as a
+    // frame with no world in it.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    let frame = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    let top = average(&frame, 0, 0, WIDTH, HEIGHT / 8);
+    let bottom = average(&frame, 0, HEIGHT * 3 / 4, WIDTH, HEIGHT);
+    assert!(is_sky(top), "mode 3 lost the sky: {top:?}");
+    assert!(!is_sky(bottom), "mode 3 lost the world: {bottom:?}");
+
+    // The tonemap is not a no-op, and this is the cheapest honest way to say
+    // so: the same renderer, the same uploaded meshes, the same viewpoint, and
+    // mode 2 goes straight to the target instead. Identical frames would mean
+    // the chain ran and changed nothing.
+    renderer.set_lighting_mode(LightingMode::Classic);
+    let plain = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    assert_ne!(
+        perceptual_hash(&frame),
+        perceptual_hash(&plain),
+        "mode 3 produced the same picture as mode 2, so the post chain ran and changed nothing"
+    );
+}
+
+#[test]
+fn only_mode_three_allocates_the_post_chain() {
+    // Task 10's criterion that mode 1 keeps Task 08's cost profile, "no
+    // shadow/post allocations when in mode 1". Asserted as a property of the
+    // renderer rather than measured as a frame time, for the reason the buffer
+    // pool test gives: on lavapipe a texture is a malloc and the cost of one
+    // measures nothing, while the count is the same on every driver.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    for mode in [LightingMode::Simple, LightingMode::Classic] {
+        renderer.set_lighting_mode(mode);
+        let _ = target
+            .capture(&mut renderer, &viewpoint())
+            .expect("capture");
+        assert_eq!(
+            renderer.post_bytes(),
+            0,
+            "{mode:?} allocated post targets it cannot draw with"
+        );
+    }
+
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let _ = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    assert!(
+        renderer.post_bytes() > 0,
+        "mode 3 drew without allocating anything, so it is not running the chain"
+    );
+
+    // And gives it back. A player who tries mode 3 once should not still be
+    // paying for its targets after going back for the frame rate.
+    renderer.set_lighting_mode(LightingMode::Simple);
+    assert_eq!(
+        renderer.post_bytes(),
+        0,
+        "leaving mode 3 kept its targets alive"
+    );
+}
+
+#[test]
+fn a_surface_brighter_than_white_bleeds_light_past_its_edge() {
+    // Bloom, as the only thing it can honestly be asserted to be: light where
+    // the geometry is not. A lamp-lit surface in mode 3 is pushed past white by
+    // `EMISSIVE_GAIN`, the threshold catches it, and the blur spreads it — so
+    // the sky just above the world gets brighter than the same sky in mode 2.
+    //
+    // Without something over white nothing blooms at all, which is why this
+    // scene lights its blocks rather than reusing the daylit fixture: the rest
+    // of the renderer lands in 0..1 by construction.
+    let Some(gpu) = gpu() else { return };
+
+    struct Lamplit;
+    impl client::shade::BlockLight for Lamplit {
+        fn at(&self, _x: i32, _y: i32, _z: i32) -> tiamot_core::light::Light {
+            // Full block light, no sun: a room lit entirely by lamps.
+            tiamot_core::light::Light::new(0, 15, 15, 15)
+        }
+    }
+
+    let chunks = scene();
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+    renderer.set_atlas(&Atlas::build(&[
+        None,
+        None,
+        Some(Image::white_with_border()),
+    ]));
+    let by_pos: std::collections::BTreeMap<ChunkPos, &Chunk> =
+        chunks.iter().map(|chunk| (chunk.pos(), chunk)).collect();
+    for chunk in &chunks {
+        let pos = chunk.pos();
+        let mut neighbours = Neighbours::none();
+        for (index, (dx, dy, dz)) in [
+            (-1, 0, 0),
+            (1, 0, 0),
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            neighbours.sides[index] = by_pos
+                .get(&ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz))
+                .copied();
+        }
+        renderer.set_chunk(
+            pos,
+            &mesher::mesh_chunk(chunk, &neighbours, Absent::Air, &Lamplit),
+        );
+    }
+
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // The band of sky immediately above the horizon, which is where light
+    // spilling off the world has to land.
+    let horizon = |frame: &Image| {
+        let mut brightest = 0.0f32;
+        for y in 0..HEIGHT {
+            let row = average(frame, 0, y, WIDTH, y + 1);
+            if is_sky(row) {
+                brightest = brightest.max(row[0] + row[1] + row[2]);
+            }
+        }
+        brightest
+    };
+
+    renderer.set_lighting_mode(LightingMode::Classic);
+    let plain = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let bloomed = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    let before = horizon(&plain);
+    let after = horizon(&bloomed);
+    assert!(
+        after > before,
+        "the brightest sky is {after} in mode 3 against {before} in mode 2, so nothing bled \
+         past the geometry and the bloom passes did nothing"
+    );
 }

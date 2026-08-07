@@ -133,9 +133,10 @@ pub enum RenderMode {
 /// is selected, and nothing about the world changes when one is picked — only
 /// how it is drawn.
 ///
-/// Mode 3, the one with shadow maps and post-processing, is not here yet. The
-/// variant will be added with the passes it names; a mode that could be selected
-/// and did nothing would be worse than one that is honestly absent.
+/// Mode 3 is being built pass by pass, and each one is added as it lands
+/// rather than reserved: a mode that can be selected does what it says today,
+/// which is more useful than a mode that promises the whole list and shows
+/// none of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LightingMode {
@@ -152,6 +153,12 @@ pub enum LightingMode {
     /// Mode 2. Smooth propagated light, coloured, with sky-tinted distance fog.
     #[default]
     Classic,
+    /// Mode 3. Mode 2, drawn into a float target and put through a post chain:
+    /// bloom from anything brighter than white, then a filmic tonemap.
+    ///
+    /// Shadow maps and time-of-day grading are the passes still to come; the
+    /// chain they slot into is `render::graph`.
+    Beautiful,
 }
 
 impl LightingMode {
@@ -160,8 +167,41 @@ impl LightingMode {
     pub const fn next(self) -> Self {
         match self {
             Self::Simple => Self::Classic,
-            Self::Classic => Self::Simple,
+            Self::Classic => Self::Beautiful,
+            Self::Beautiful => Self::Simple,
         }
+    }
+
+    /// What the shader is told this mode is.
+    ///
+    /// A number rather than a bool, and it has been both: while there were two
+    /// modes the uniform was `mode == Classic`, and adding a third quietly made
+    /// mode 3 draw as mode 1 — the flat-lit branch — because everything that
+    /// was not Classic was false. Numbering them makes the next mode a compile
+    /// error here rather than a wrong picture.
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Simple => 0,
+            Self::Classic => 1,
+            Self::Beautiful => 2,
+        }
+    }
+
+    /// Whether this mode uses the propagated light the server sends.
+    ///
+    /// Mode 1 does not, and the mesher is handed a flat value instead — see the
+    /// variant's own documentation for why that is a meshing decision rather
+    /// than a shading one.
+    #[must_use]
+    pub const fn uses_propagated_light(self) -> bool {
+        !matches!(self, Self::Simple)
+    }
+
+    /// Whether this mode draws through the post chain.
+    #[must_use]
+    pub const fn uses_post(self) -> bool {
+        matches!(self, Self::Beautiful)
     }
 
     /// What to call it on the HUD.
@@ -170,6 +210,7 @@ impl LightingMode {
         match self {
             Self::Simple => "1 simple",
             Self::Classic => "2 classic",
+            Self::Beautiful => "3 beautiful",
         }
     }
 }
@@ -567,10 +608,14 @@ mod tests {
             toml::from_str("lighting_mode = \"classic\"").expect("classic should parse");
         assert_eq!(config.lighting_mode, LightingMode::Classic);
 
+        let config: Config =
+            toml::from_str("lighting_mode = \"beautiful\"").expect("beautiful should parse");
+        assert_eq!(config.lighting_mode, LightingMode::Beautiful);
+
         assert!(
-            toml::from_str::<Config>("lighting_mode = \"beautiful\"").is_err(),
-            "mode 3 does not exist yet, and naming it must fail rather than \
-             silently select something else"
+            toml::from_str::<Config>("lighting_mode = \"cinematic\"").is_err(),
+            "a mode that does not exist must fail rather than silently \
+             selecting something else"
         );
 
         // The default is what a config with no opinion gets, and it is the mode
@@ -580,13 +625,16 @@ mod tests {
 
     #[test]
     fn cycling_the_lighting_mode_visits_every_mode_and_comes_back() {
+        // Two full turns, so the cycle both visits everything and comes home.
+        // A count that is not a multiple of the number of modes proves the
+        // first half and quietly fails the second.
         let mut mode = LightingMode::default();
         let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..8 {
+        for _ in 0..6 {
             seen.insert(format!("{mode:?}"));
             mode = mode.next();
         }
-        assert_eq!(seen.len(), 2, "the cycle skipped a mode: {seen:?}");
+        assert_eq!(seen.len(), 3, "the cycle skipped a mode: {seen:?}");
         assert_eq!(
             mode,
             LightingMode::default(),

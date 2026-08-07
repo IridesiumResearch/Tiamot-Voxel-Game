@@ -1177,14 +1177,11 @@ impl App {
             // quads along every shadow edge. Handing it a constant puts the
             // merge rate, and therefore the vertex count and the meshing cost,
             // back exactly where Task 08 left them.
-            let mesh = match self.config.lighting_mode {
-                crate::config::LightingMode::Simple => {
-                    mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &FLAT_DAYLIGHT)
-                }
-                crate::config::LightingMode::Classic => {
-                    let light = self.store.light_for(*pos);
-                    mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &light)
-                }
+            let mesh = if self.config.lighting_mode.uses_propagated_light() {
+                let light = self.store.light_for(*pos);
+                mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &light)
+            } else {
+                mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &FLAT_DAYLIGHT)
             };
             meshing += mesh_started.elapsed();
 

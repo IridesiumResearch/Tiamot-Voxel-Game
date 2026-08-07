@@ -173,6 +173,19 @@ fn fog_amount(distance: f32) -> f32 {
 // The two are combined with `max` per channel rather than added. Adding them
 // blows out to white wherever a lamp stands in daylight, which is most lamps
 // anyone places outdoors.
+// How far past white a surface at full block light is pushed in mode 3.
+//
+// **This is what gives bloom something to find.** Every other quantity in this
+// shader lands in 0..1, so a threshold at white would never fire and the glow
+// pass would be an expensive way to add zero. Pushing block light — and only
+// block light — above white means a wall beside a lamp blooms and a wall in
+// daylight does not, which is the distinction the effect is supposed to draw.
+//
+// Stylised rather than physical, as Task 10 asks: a real lamp is not 1.6 times
+// the sun. Charter rule 4 does not reach here; nothing about this feeds the
+// simulation.
+const EMISSIVE_GAIN: f32 = 1.6;
+
 fn lighting(input: VertexOut) -> vec3<f32> {
     // Mode 1: face shading and occlusion only, which is Task 08's world. The
     // vertices still carry light — the mesher was handed a flat daylight value
@@ -182,7 +195,11 @@ fn lighting(input: VertexOut) -> vec3<f32> {
         return vec3<f32>(input.shade * input.occlusion);
     }
     let daylight = input.sun * globals.sun_intensity * globals.sun_colour.rgb;
-    let lit = max(daylight, input.block_light);
+    var block = input.block_light;
+    if (globals.lighting_mode == 2u) {
+        block = block * EMISSIVE_GAIN;
+    }
+    let lit = max(daylight, block);
     // A floor under the darkest cave, so a dark room is legible rather than
     // pitch black. Presentation, not simulation — the stored light really is
     // zero down there.
