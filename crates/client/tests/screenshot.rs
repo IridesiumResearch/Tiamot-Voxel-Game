@@ -1054,3 +1054,179 @@ fn mode_three_tints_its_fog_toward_the_sun() {
         warmth(&away)
     );
 }
+
+#[test]
+fn an_occluded_corner_loses_its_colour_rather_than_keeping_it_dimly() {
+    // Reported twice from the window as "the AO is yellow", and the second time
+    // after a commit that claimed to have fixed it — because that fix moved a
+    // multiply from one side of an associative product to the other, which is
+    // no change at all. A scaled colour keeps its hue exactly, so a corner
+    // beside a warm lamp stays warm and only gets darker.
+    //
+    // The property that says it is fixed: an occluded corner under coloured
+    // light is LESS SATURATED than an open surface under the same light, not
+    // merely dimmer.
+    let Some(gpu) = gpu() else { return };
+
+    /// Full warm block light, no sun: a world lit only by lamps, which is where
+    /// the complaint comes from.
+    struct WarmLamps;
+    impl client::shade::BlockLight for WarmLamps {
+        fn at(&self, _x: i32, _y: i32, _z: i32) -> tiamot_core::light::Light {
+            tiamot_core::light::Light::new(0, 15, 11, 6)
+        }
+    }
+
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Classic);
+    let by_pos: std::collections::BTreeMap<ChunkPos, &Chunk> =
+        chunks.iter().map(|chunk| (chunk.pos(), chunk)).collect();
+    for chunk in &chunks {
+        let pos = chunk.pos();
+        let mut neighbours = Neighbours::none();
+        for (index, (dx, dy, dz)) in [
+            (-1, 0, 0),
+            (1, 0, 0),
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            neighbours.sides[index] = by_pos
+                .get(&ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz))
+                .copied();
+        }
+        renderer.set_chunk(
+            pos,
+            &mesher::mesh_chunk(chunk, &neighbours, Absent::Air, &WarmLamps),
+        );
+    }
+
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    let frame = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // Saturation as the gap between the strongest and weakest channel, scaled
+    // by brightness — the thing "yellow" describes.
+    let saturation = |colour: [f32; 3]| {
+        let high = colour[0].max(colour[1]).max(colour[2]);
+        let low = colour[0].min(colour[1]).min(colour[2]);
+        if high <= f32::EPSILON {
+            0.0
+        } else {
+            (high - low) / high
+        }
+    };
+
+    // The brightest and darkest patches in the frame: open surface against
+    // occluded corner, under the same lamp colour.
+    let mut brightest = ([0.0; 3], -1.0f32);
+    let mut darkest = ([0.0; 3], f32::MAX);
+    for y in (0..HEIGHT - 8).step_by(8) {
+        for x in (0..WIDTH - 8).step_by(8) {
+            let colour = average(&frame, x, y, x + 8, y + 8);
+            if is_sky(colour) {
+                continue;
+            }
+            let level = colour[0] + colour[1] + colour[2];
+            if level > brightest.1 {
+                brightest = (colour, level);
+            }
+            if level < darkest.1 {
+                darkest = (colour, level);
+            }
+        }
+    }
+
+    assert!(
+        darkest.1 < brightest.1,
+        "the frame has no shading in it at all: {darkest:?} against {brightest:?}"
+    );
+    assert!(
+        saturation(darkest.0) < saturation(brightest.0),
+        "the darkest patch is {} saturated against the brightest's {} — occlusion is scaling \
+         the colour rather than taking it away, which is what reads as yellow",
+        saturation(darkest.0),
+        saturation(brightest.0)
+    );
+}
+
+#[test]
+fn the_debug_body_is_actually_drawn_and_actually_casts() {
+    // Reported from the window as "I am not seeing any shadow on me", which has
+    // two possible causes and they need telling apart: the box is not being
+    // drawn at all, or it is drawn and does not reach the shadow map.
+    //
+    // Both are checked here from a fixed camera, so nothing depends on where a
+    // predicted body happened to be.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Camera-relative blocks, which is the only coordinate system the renderer
+    // has (charter rule 7). `viewpoint` looks down and forward along +z from
+    // ten blocks above the floor, so this is out in front of it and on the
+    // ground — an earlier version put the body six blocks ABOVE a camera
+    // pointing down, and "the body is not in the frame" was the test's fault
+    // rather than the renderer's.
+    let where_it_stands = [0.0, -10.0, 6.0];
+
+    renderer.set_lighting_mode(LightingMode::Classic);
+    let without = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    renderer.set_body(Some(where_it_stands));
+    let with = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    // Counted pixels rather than the perceptual hash, and the difference
+    // matters: the body is two cells wide and five tall, which is about forty
+    // pixels at this resolution, and the hash averages the frame into a 16x16
+    // grid precisely so that something that small cannot move it. The hash is
+    // the right tool for "did the world stop drawing" and the wrong one for
+    // "is this one small object present".
+    let differing = (0..HEIGHT)
+        .step_by(2)
+        .flat_map(|y| (0..WIDTH).step_by(2).map(move |x| (x, y)))
+        .filter(|(x, y)| without.pixel(*x, *y) != with.pixel(*x, *y))
+        .count();
+    assert!(
+        differing > 8,
+        "only {differing} sampled pixels changed when the body appeared, so third person shows          the world moving around nothing"
+    );
+
+    // And in mode 3, where it has to reach the cascades as well. The sun is put
+    // low and to one side so the box throws a shadow across the floor rather
+    // than under itself.
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    renderer.set_sun(1.0, [1.0, 1.0, 1.0], [0.75, -0.35, 0.55]);
+    renderer.set_body(None);
+    let unshadowed = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    renderer.set_body(Some(where_it_stands));
+    let shadowed = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // The floor is darker with the body there: its own pixels plus the shadow
+    // it throws. Measured over the whole frame so it does not depend on knowing
+    // where the shadow lands.
+    let ground = |frame: &Image| {
+        let colour = average(frame, 0, HEIGHT / 2, WIDTH, HEIGHT);
+        colour[0] + colour[1] + colour[2]
+    };
+    assert!(
+        ground(&shadowed) < ground(&unshadowed),
+        "the floor is {} with the body and {} without it, so the body reaches the world pass \
+         but not the shadow pass",
+        ground(&shadowed),
+        ground(&unshadowed)
+    );
+}

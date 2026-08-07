@@ -113,6 +113,20 @@ impl ChunkStore {
     pub fn set_light(&mut self, pos: ChunkPos, layer: LightLayer) {
         self.light.insert(pos, layer);
         self.mark(pos);
+        // **And its neighbours**, because smooth lighting reads across the
+        // boundary: a face in the next chunk takes part of its corner light
+        // from blocks in this one (see [`crate::shade`]). Marking only this
+        // chunk was reported from the window as a lamp placed near a seam
+        // lighting one side of it and not the other, and as its glow staying
+        // behind on the far side when the lamp was broken. The light values
+        // were right throughout — the server's own tests and a bot over the
+        // wire both agreed — and the stale thing was the neighbour's mesh.
+        //
+        // Six extra chunks queued per light update, which sounds worse than it
+        // is: the queue is bounded per frame by `REMESH_TIME_BUDGET`, a chunk
+        // already dirty stays one entry, and during streaming the neighbours
+        // are arriving and being marked anyway.
+        self.mark_neighbours(pos);
     }
 
     /// The light level at a block, or [`Light::DARK`] where nothing is held.
@@ -649,5 +663,41 @@ mod tests {
         store.clear();
         assert!(store.is_empty());
         assert_eq!(store.dirty_len(), 0);
+    }
+
+    #[test]
+    fn light_arriving_for_one_chunk_dirties_the_neighbours_that_sample_it() {
+        // Reported from the window: a lamp placed near a chunk boundary lit its
+        // own chunk and left the next one looking unchanged, and removing it
+        // left the glow behind on the far side of the seam.
+        //
+        // The light values were right the whole time — the server's own tests
+        // and a bot over the wire both agree. What was wrong is here: **smooth
+        // lighting samples across the boundary**, so a face in the NEXT chunk
+        // takes part of its corner light from blocks in this one. Change this
+        // chunk's light and that face is stale, and nothing was marking it.
+        let mut store = ChunkStore::new();
+        store.insert(chunk_at(0, 0, 0));
+        store.insert(chunk_at(1, 0, 0));
+        let _ = store.take_dirty(ChunkPos::new(0, 0, 0), 8);
+        assert_eq!(store.dirty_len(), 0, "the fixture starts clean");
+
+        // A layer that is not what the neighbour last assumed.
+        let mut layer = LightLayer::dark();
+        layer.set(
+            tiamot_core::coords::LocalBlock::new(15, 8, 8),
+            Light::new(0, 15, 0, 0),
+        );
+        store.set_light(ChunkPos::new(0, 0, 0), layer);
+
+        let due = store.take_dirty(ChunkPos::new(0, 0, 0), 8);
+        assert!(
+            due.contains(&ChunkPos::new(1, 0, 0)),
+            "the neighbour was not remeshed, so its seam still shows the old light: {due:?}"
+        );
+        assert!(
+            due.contains(&ChunkPos::new(0, 0, 0)),
+            "the chunk whose light changed was not remeshed either: {due:?}"
+        );
     }
 }

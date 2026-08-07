@@ -256,13 +256,16 @@ fn body_mesh() -> Mesh {
         occlusion: [3; 4],
     };
     let mut quads = Vec::with_capacity(6);
+    // A positive face sits at `w + 1` — see `Mesh::to_buffers` — so the far
+    // side of a box spanning cells `0..n` is quad `w = n - 1`, not `n`. Writing
+    // the extent there stretches the box a cell past itself on three sides.
     for (axis, positive, w, du, dv) in [
         (0u8, false, 0, HEIGHT, WIDTH),
-        (0, true, WIDTH, HEIGHT, WIDTH),
+        (0, true, WIDTH - 1, HEIGHT, WIDTH),
         (1, false, 0, WIDTH, WIDTH),
-        (1, true, HEIGHT, WIDTH, WIDTH),
+        (1, true, HEIGHT - 1, WIDTH, WIDTH),
         (2, false, 0, WIDTH, HEIGHT),
-        (2, true, WIDTH, WIDTH, HEIGHT),
+        (2, true, WIDTH - 1, WIDTH, HEIGHT),
     ] {
         quads.push(Quad {
             axis,

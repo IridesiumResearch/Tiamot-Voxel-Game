@@ -1614,16 +1614,18 @@ impl App {
         }
         let time = self.sky.time();
         let minutes = (time * 24.0 * 60.0) as u32;
+        // The sun's height above the horizon, which is what decides how long a
+        // shadow is — the intensity alone says how bright it is and not where
+        // it is, and "where is the sun" is the question somebody looking at
+        // shadows is actually asking.
+        let down = self.sky.sun_direction()[1];
         format!(
-            "{:02}:{:02} ({time:.3}) · sun {:.2}{}",
+            "{:02}:{:02} · sun {:.0}% up, {:.0}% bright{}",
             minutes / 60,
             minutes % 60,
-            self.renderer.sun_intensity(),
-            if self.time_override {
-                " · LOCAL CLOCK ([ ] to move, \\ to resync)"
-            } else {
-                ""
-            }
+            -down * 100.0,
+            self.renderer.sun_intensity() * 100.0,
+            if self.time_override { " · LOCAL" } else { "" }
         )
     }
 
@@ -1696,6 +1698,11 @@ impl App {
             // like a hitch — and working out which mode a reading came from
             // otherwise costs a round trip with whoever took it.
             self.clock_line(),
+            // The debug keys, on the screen rather than in a commit message.
+            // Every one of these was added for somebody to look at something
+            // with, and a key nobody can find is a feature nobody has.
+            "keys: L light · V third person · [ ] time · \\ resync · G blocks · T/H teleport"
+                .to_owned(),
             format!(
                 "{} on {} / {} · vsync {} · light {} (L)",
                 self.server_label,

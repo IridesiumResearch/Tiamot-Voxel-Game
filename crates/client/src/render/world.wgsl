@@ -198,10 +198,25 @@ fn fog_amount(distance: f32) -> f32 {
 // block light — above white means a wall beside a lamp blooms and a wall in
 // daylight does not, which is the distinction the effect is supposed to draw.
 //
-// Stylised rather than physical, as Task 10 asks: a real lamp is not 1.6 times
-// the sun. Charter rule 4 does not reach here; nothing about this feeds the
-// simulation.
-const EMISSIVE_GAIN: f32 = 1.6;
+// Stylised rather than physical, as Task 10 asks: a real lamp is not a third
+// again as bright as the sun. Charter rule 4 does not reach here; nothing about
+// this feeds the simulation.
+//
+// Was 1.6, which was reported from the window as about 40% too much glow — the
+// number is how far past white a lamp-lit surface goes, so it is the knob that
+// decides how much of a wall blooms rather than how bright the bloom is.
+const EMISSIVE_GAIN: f32 = 1.35;
+
+// How dark the neutral is that occlusion mixes toward, as a fraction of the
+// surface's own brightness. Half: dark enough to read as a corner, light enough
+// that the geometry in it is still visible.
+const AO_NEUTRAL: f32 = 0.5;
+
+// Perceived brightness, for the grey occlusion mixes toward. The green weight
+// dominates because the eye's does.
+fn luma(colour: vec3<f32>) -> f32 {
+    return dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
 
 fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     // Mode 1: face shading and occlusion only, which is Task 08's world. The
@@ -225,7 +240,23 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     // A floor under the darkest cave, so a dark room is legible rather than
     // pitch black. Presentation, not simulation — the stored light really is
     // zero down there.
-    return max(lit, vec3<f32>(globals.ambient)) * input.shade * input.occlusion;
+    let shaded = max(lit, vec3<f32>(globals.ambient)) * input.shade;
+
+    // **Occlusion darkens toward grey, not by scaling.**
+    //
+    // Multiplying was the obvious thing and it cannot work, for a reason worth
+    // writing down: multiplication is associative, so `texel * (light * ao)`
+    // and `(texel * light) * ao` are the same arithmetic — "apply occlusion to
+    // the colour rather than to the light" is a distinction with no difference,
+    // and an earlier attempt at this was exactly that. Scaling a warm colour
+    // keeps its hue precisely, so a corner beside a lamp came out dim orange
+    // and got reported, twice, as the ambient occlusion looking yellow.
+    //
+    // A real shadow takes the light away, and colour with it. Mixing toward a
+    // neutral grey of the same brightness removes the hue as it removes the
+    // light, which is what an eye expects a corner to do.
+    let neutral = vec3<f32>(luma(shaded) * AO_NEUTRAL);
+    return mix(neutral, shaded, input.occlusion);
 }
 
 // How much of the sun reaches this fragment, 0 fully shadowed to 1 open.

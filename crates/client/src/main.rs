@@ -334,9 +334,20 @@ impl ApplicationHandler for Client {
                         // an hour that is not the one the server is at. A
                         // twentieth of a day a press, so a full circuit is
                         // twenty presses and dawn is findable.
-                        KeyCode::BracketLeft if pressed => surface.app.nudge_time(-0.05),
-                        KeyCode::BracketRight if pressed => surface.app.nudge_time(0.05),
-                        KeyCode::Backslash if pressed => surface.app.resync_time(),
+                        // Page keys as well as brackets: bracket keys sit in
+                        // different places on different layouts and the failure
+                        // is silent — the key simply never arrives, which reads
+                        // as "the time control does not work". The same
+                        // reasoning as the teleport keys' letter fallbacks.
+                        KeyCode::BracketLeft | KeyCode::PageDown if pressed => {
+                            surface.app.nudge_time(-0.05);
+                        }
+                        KeyCode::BracketRight | KeyCode::PageUp if pressed => {
+                            surface.app.nudge_time(0.05);
+                        }
+                        KeyCode::Backslash | KeyCode::Home if pressed => {
+                            surface.app.resync_time();
+                        }
                         // Third person, so there is something in the frame that
                         // moves and casts a shadow. There is no player model
                         // until Task 12; this draws the collision box.

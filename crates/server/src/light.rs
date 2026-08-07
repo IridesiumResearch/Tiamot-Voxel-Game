@@ -579,4 +579,70 @@ mod tests {
         );
         assert_eq!(layer.memory_usage(), 0);
     }
+
+    #[test]
+    fn a_lamp_lights_across_a_chunk_boundary_and_stops_when_it_goes() {
+        // Reported from the window: placing a lamp beside a chunk boundary
+        // sometimes left the NEIGHBOUR dark, and removing one left the
+        // neighbour lit. Both directions, because they are different halves of
+        // the incremental path and only one of them was broken.
+        let mut world = world();
+        let mut light = lighting();
+
+        // Two chunks side by side, both resident and both lit, so this is the
+        // incremental path rather than a chunk arriving.
+        let here = ChunkPos::new(0, 0, 0);
+        let next = ChunkPos::new(1, 0, 0);
+        resident(&mut world, here);
+        resident(&mut world, next);
+        light.chunk_loaded(&world, here);
+        light.chunk_loaded(&world, next);
+
+        // A block just inside the first chunk's far edge, and one just over the
+        // line in the second.
+        let lamp = BlockPos::new(15, 8, 8);
+        let across = BlockPos::new(16, 8, 8);
+        assert_eq!(across.chunk(), next, "the test aims at the wrong chunk");
+
+        {
+            let chunk = world.chunk(here, &mut Empty).expect("chunk");
+            chunk.set_block_local(
+                tiamot_core::coords::LocalBlock::new(15, 8, 8),
+                BlockValue::Uniform(LAMP),
+            );
+        }
+        let touched = light.edited(&world, lamp);
+
+        assert!(
+            light.at(across).red() > 0,
+            "the lamp lit nothing across the chunk boundary: {:?}",
+            light.at(across)
+        );
+        assert!(
+            touched.contains(&next),
+            "the neighbour's light changed and was not reported, so a client never hears about \
+             it: {touched:?}"
+        );
+
+        // And now take it away again.
+        {
+            let chunk = world.chunk(here, &mut Empty).expect("chunk");
+            chunk.set_block_local(
+                tiamot_core::coords::LocalBlock::new(15, 8, 8),
+                BlockValue::AIR,
+            );
+        }
+        let touched = light.edited(&world, lamp);
+
+        assert_eq!(
+            light.at(across).red(),
+            0,
+            "the lamp went and its light stayed in the next chunk over: {:?}",
+            light.at(across)
+        );
+        assert!(
+            touched.contains(&next),
+            "the neighbour went dark and was not reported: {touched:?}"
+        );
+    }
 }

@@ -346,3 +346,68 @@ fn a_mod_can_read_the_light_where_something_happened() {
 
     assert!(server.stop());
 }
+
+#[test]
+fn a_lamp_at_a_chunk_boundary_lights_the_next_chunk_and_stops_when_it_goes() {
+    // Reported from the window: placing a lamp beside a chunk boundary
+    // sometimes left the NEIGHBOUR dark, and removing one left the neighbour
+    // lit. Over the wire, because that is where it was seen — the store's own
+    // test passes, so if this fails the answer is in what gets sent rather than
+    // in what gets computed.
+    let server = start("boundary");
+
+    block_on(async {
+        let mut bot = join(&server, "Boundary").await;
+
+        // Sitting in the air one block short of the boundary at x = 16, so its
+        // light has to cross into the chunk at (1, ...) to be seen there.
+        let lamp_at = BlockPos::new(15, 2, 0);
+        let across = BlockPos::new(17, 2, 0);
+        assert_ne!(
+            lamp_at.chunk(),
+            across.chunk(),
+            "the test aims at one chunk, so it proves nothing about crossing"
+        );
+
+        // The lamp's world id, learned rather than assumed.
+        bot.collect_chunks(8, Duration::from_secs(20))
+            .await
+            .expect("chunks");
+        let lamp = bot
+            .material_table()
+            .expect("material table")
+            .into_iter()
+            .find(|entry| entry.name.ends_with(":lamp"))
+            .map(|entry| entry.id)
+            .expect("the reference mods register a lamp");
+
+        bot.expect_light(across, |_| true, Duration::from_secs(20))
+            .await
+            .expect("light for the neighbour");
+        assert_eq!(
+            bot.light_at(across).expect("light").red(),
+            0,
+            "the neighbour is already lit before the lamp exists, so this proves nothing"
+        );
+
+        assert!(server.seed_block(lamp_at, lamp), "seed the lamp");
+        let lit = bot
+            .expect_light(across, |light| light.red() > 0, Duration::from_secs(20))
+            .await
+            .unwrap_or_else(|err| panic!("the lamp lit nothing across the boundary: {err}"));
+        assert!(lit.red() > 0);
+
+        // And away again.
+        assert!(
+            server.seed_block(lamp_at, tiamot_core::MaterialId::AIR.0),
+            "remove the lamp"
+        );
+        bot.expect_light(across, |light| light.red() == 0, Duration::from_secs(20))
+            .await
+            .unwrap_or_else(|err| {
+                panic!("the lamp went and its light stayed in the next chunk: {err}")
+            });
+    });
+
+    assert!(server.stop());
+}
