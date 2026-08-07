@@ -442,9 +442,14 @@ fn a_streamed_chunk_carries_generated_terrain() {
             .expect("collect");
         assert_eq!(received.len(), expected, "the neighbourhood should arrive");
 
-        // `core:white` is the only block the reference mods register.
+        // Every block the reference mods register, **in their registration
+        // order**, because that order is what assigns world ids — a registry
+        // missing one of them cannot translate the blob at all, and the error
+        // says "could not translate material ids" rather than naming the block
+        // that is absent.
         let mut registry = tiamot_core::Registry::new();
         let white = registry.register("core:white").expect("register");
+        registry.register("core:lamp").expect("register");
         let db = tiamot_core::WorldDb::open_in_memory(&mut registry).expect("id map");
 
         // Below the surface: solid.
@@ -524,8 +529,10 @@ fn generated_terrain_is_the_same_after_a_restart() {
             .await
             .expect("collect");
 
+        // As above: every reference block, in registration order.
         let mut registry = tiamot_core::Registry::new();
         let white = registry.register("core:white").expect("register");
+        registry.register("core:lamp").expect("register");
         let db = tiamot_core::WorldDb::open_in_memory(&mut registry).expect("id map");
 
         let underground = BlockPos::new(0, -4, 0);

@@ -117,6 +117,9 @@ pub const TELEPORT_CHUNKS: i32 = 3_125;
 const FLAT_DAYLIGHT: crate::shade::Uniform =
     crate::shade::Uniform(tiamot_core::light::Light::DAYLIGHT);
 
+/// How far behind the player the third-person camera sits, in blocks.
+const THIRD_PERSON_DISTANCE: f64 = 4.0;
+
 const INPUT_LEAD: u64 = 4;
 
 /// How many warnings the HUD keeps.
@@ -418,6 +421,21 @@ pub struct App {
     sky: crate::sky::Sky,
     /// The server's tick when it last said so.
     tick: u64,
+    /// Whether the camera sits behind the player rather than in their eyes.
+    ///
+    /// A debugging affordance for looking at shadows: the world holds still and
+    /// the only moving caster is the player, so a first-person camera can never
+    /// see the one shadow that shows whether the cascades follow anything.
+    third_person: bool,
+    /// Whether the clock has been scrubbed by hand.
+    ///
+    /// Presentation only, and it has to be: the sunlight the server stores is
+    /// always full daylight and the client scales it by time of day at draw
+    /// time (see `Globals::sun_intensity`), so moving the clock locally shows
+    /// exactly what that hour looks like without the world disagreeing about
+    /// anything. What it does NOT do is change when mobs spawn or anything else
+    /// the server decides — this is for looking at the sky, not for playing.
+    time_override: bool,
     /// What the connection reported about the server's certificate.
     server_label: String,
     /// The locally predicted body, once the world has been joined.
@@ -503,6 +521,8 @@ impl App {
             last_phases: Phases::default(),
             sky: crate::sky::Sky::none(),
             tick: 0,
+            third_person: false,
+            time_override: false,
             server_label: "connecting…".to_owned(),
             predictor: None,
             confirmed: None,
@@ -734,6 +754,54 @@ impl App {
         ])
     }
 
+    /// A row of one block of every material the server registered, laid out
+    /// from where the crosshair is pointing.
+    ///
+    /// # What this is for, and what it deliberately is not
+    ///
+    /// It is a **debug affordance for singleplayer**, and the only way it can
+    /// touch the world is through the embedded server's own handle — the same
+    /// `seed_block` the integration tests arrange worlds with. A client cannot
+    /// edit a world it is connected to (Task 09 retired `BlockDelta` for good
+    /// reasons) and this does not change that: on a remote server the caller
+    /// has no handle and the key does nothing.
+    ///
+    /// It names no material. The client cannot know which block a mod calls a
+    /// lamp — charter rule 1 puts that entirely in `game/` — so it lays out
+    /// ONE OF EACH and lets whoever asked look at them. That is more useful
+    /// anyway: "show me every block this server has" answers questions a
+    /// hard-coded lamp cannot.
+    ///
+    /// Returns the blocks to write, or nothing if the crosshair is on the sky.
+    #[must_use]
+    pub fn debug_material_row(&self) -> Vec<(tiamot_core::BlockPos, u16)> {
+        let Some(target) = self.place_target() else {
+            return Vec::new();
+        };
+        let start = target.block();
+        self.materials
+            .keys()
+            // Not air, which is a hole, and not the unknown placeholder, which
+            // is what a world shows where a mod that once registered a block is
+            // no longer loaded (charter rule 8). Neither is a sample of
+            // anything.
+            .filter(|id| {
+                **id != tiamot_core::MaterialId::AIR.0 && **id != tiamot_core::MaterialId::UNKNOWN.0
+            })
+            .enumerate()
+            .map(|(index, id)| {
+                (
+                    tiamot_core::BlockPos::new(
+                        start.x + i32::try_from(index).unwrap_or(0),
+                        start.y,
+                        start.z,
+                    ),
+                    *id,
+                )
+            })
+            .collect()
+    }
+
     /// Starts or re-aims a dig at whatever the crosshair is on.
     ///
     /// Re-sent every frame the button is held, which is what `StartDig`'s
@@ -868,6 +936,56 @@ impl App {
         }
         self.held_tool = (self.held_tool + 1) % self.tools.len();
         self.send_held_tool();
+    }
+
+    /// Puts the camera behind the player, or back in their eyes.
+    ///
+    /// Draws a box the size of the collision body while it is behind them —
+    /// there is no player model until Task 12, and a third-person view of an
+    /// invisible player would show the world moving around nothing.
+    pub const fn toggle_third_person(&mut self) {
+        self.third_person = !self.third_person;
+    }
+
+    /// Whether the camera is behind the player.
+    #[must_use]
+    pub const fn is_third_person(&self) -> bool {
+        self.third_person
+    }
+
+    /// Moves the time of day by hand, for looking at the sky and the shadows.
+    ///
+    /// **A debugging affordance, and the honest kind**: it moves the CLIENT's
+    /// clock, so what it shows is what that hour genuinely looks like, and it
+    /// says so on the HUD rather than pretending the world moved. The server
+    /// keeps its own time and keeps sending it; [`App::resync_time`] gives the
+    /// clock back.
+    ///
+    /// There is no mod-facing version of this and there should not be one yet:
+    /// charter rule 11 puts key bindings in the engine and named actions in
+    /// mods, and named actions are inert until Task 13. This is a key the
+    /// engine owns, for a thing only a developer needs.
+    pub fn nudge_time(&mut self, delta: f32) {
+        self.time_override = true;
+        let time = (self.sky.time() + delta).rem_euclid(1.0);
+        self.sky.set_time(time);
+    }
+
+    /// Gives the clock back to the server.
+    pub const fn resync_time(&mut self) {
+        self.time_override = false;
+    }
+
+    /// Whether the clock is being scrubbed by hand.
+    #[must_use]
+    pub const fn time_is_local(&self) -> bool {
+        self.time_override
+    }
+
+    /// Where the day stands, `0.0..1.0`.
+    #[must_use]
+    pub fn sky_time(&self) -> f32 {
+        self.sky.time()
     }
 
     /// Switches to the next lighting mode, live.
@@ -1064,7 +1182,15 @@ impl App {
 
                 Event::Sky(sky) => self.sky = sky,
 
-                Event::TimeOfDay(time) => self.sky.set_time(time),
+                // Ignored while the clock is being scrubbed by hand. The server
+                // is still the authority and still sending; a local override
+                // that the next broadcast undid a second later would be
+                // unusable for looking at anything.
+                Event::TimeOfDay(time) => {
+                    if !self.time_override {
+                        self.sky.set_time(time);
+                    }
+                }
 
                 Event::ChunkUnload(pos) => {
                     if self.store.remove(pos) {
@@ -1351,11 +1477,38 @@ impl App {
         // Cells to blocks, and the eye offset on top. Presentation arithmetic:
         // the division by three is exact enough for a camera and never feeds
         // back into the body.
-        self.camera.position = Position::from_world(
+        let eye = [
             f64::from(corner.x) + f64::from(local[0]) / cells,
             f64::from(corner.y) + f64::from(local[1] + phys::EYE_HEIGHT) / cells,
             f64::from(corner.z) + f64::from(local[2]) / cells,
-        );
+        ];
+
+        if self.third_person {
+            // Straight back along the view, which is the simplest thing that
+            // works and is deliberately not a real third-person camera: there
+            // is no collision on it, so it will happily sit inside a wall. It
+            // exists to look at the player from outside, not to play from.
+            let back = self.camera.forward();
+            self.camera.position = Position::from_world(
+                eye[0] - f64::from(back.x) * THIRD_PERSON_DISTANCE,
+                eye[1] - f64::from(back.y) * THIRD_PERSON_DISTANCE,
+                eye[2] - f64::from(back.z) * THIRD_PERSON_DISTANCE,
+            );
+            // The body, in the camera-relative blocks the renderer wants, with
+            // the box's corner offset so it stands centred on the feet rather
+            // than beside them.
+            let half = f64::from(crate::render::BODY_WIDTH_CELLS) / (2.0 * cells);
+            let feet = [
+                f64::from(corner.x) + f64::from(local[0]) / cells - half,
+                f64::from(corner.y) + f64::from(local[1]) / cells,
+                f64::from(corner.z) + f64::from(local[2]) / cells - half,
+            ];
+            let at = self.camera.position.offset_to(feet);
+            self.renderer.set_body(Some(at));
+        } else {
+            self.camera.position = Position::from_world(eye[0], eye[1], eye[2]);
+            self.renderer.set_body(None);
+        }
     }
 
     /// Jumps to the edge of the world, for the floating-origin check.
@@ -1462,10 +1615,15 @@ impl App {
         let time = self.sky.time();
         let minutes = (time * 24.0 * 60.0) as u32;
         format!(
-            "{:02}:{:02} ({time:.3}) · sun {:.2}",
+            "{:02}:{:02} ({time:.3}) · sun {:.2}{}",
             minutes / 60,
             minutes % 60,
-            self.renderer.sun_intensity()
+            self.renderer.sun_intensity(),
+            if self.time_override {
+                " · LOCAL CLOCK ([ ] to move, \\ to resync)"
+            } else {
+                ""
+            }
         )
     }
 

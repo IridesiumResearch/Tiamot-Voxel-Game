@@ -179,6 +179,106 @@ pub fn sky_colour() -> [f32; 3] {
     [SKY.r as f32, SKY.g as f32, SKY.b as f32]
 }
 
+/// Uploads a mesh into its own pair of buffers.
+///
+/// For geometry that is not a chunk and never changes — the debug body — so it
+/// does not go through the chunk pool, which exists to recycle buffers for
+/// meshes that are rebuilt constantly.
+fn upload_mesh(gpu: &Gpu, mesh: &Mesh) -> ChunkMesh {
+    let (vertices, indices) = mesh.to_buffers();
+    let vertex_bytes: &[u8] = bytemuck::cast_slice(&vertices);
+    let index_bytes: &[u8] = bytemuck::cast_slice(&indices);
+
+    let vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("body-vertices"),
+        size: vertex_bytes.len() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let index_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("body-indices"),
+        size: index_bytes.len() as u64,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    gpu.queue.write_buffer(&vertex_buffer, 0, vertex_bytes);
+    gpu.queue.write_buffer(&index_buffer, 0, index_bytes);
+
+    ChunkMesh {
+        vertices: vertex_buffer,
+        indices: index_buffer,
+        index_count: u32::try_from(indices.len()).unwrap_or(0),
+        used_bytes: (vertex_bytes.len() + index_bytes.len()) as u64,
+    }
+}
+
+/// How wide the debug body is, in cells.
+///
+/// Rounded from the real AABB: 1.8 cells wide becomes 2, because a quad's
+/// extents are whole cells. A tenth of a block wider than the body it stands
+/// in, which nothing depends on — it is a shadow caster, not a hitbox.
+pub const BODY_WIDTH_CELLS: u8 = 2;
+
+/// A box the size of a player, for third-person view and for casting a shadow.
+///
+/// # Why the engine draws this at all
+///
+/// Entities are Task 12 and there is no player model. But a world with nothing
+/// in it that MOVES has no moving shadow, and "do the cascades look right" is a
+/// question you cannot answer by looking at a static pillar — the artefacts
+/// that matter (edges crawling, the near cascade's bias, a caster leaving its
+/// own shadow behind) all need something walking about.
+///
+/// So: a box, in the shape of the collision AABB, drawn only in third person.
+/// It is not a placeholder for a player model and should not grow into one;
+/// when Task 12 brings real entities this goes.
+///
+/// # Why it is built from quads rather than meshed
+///
+/// The mesher's job is a chunk of voxels. This is six faces at known positions,
+/// and running it through a mesher would mean inventing a voxel grid to hold
+/// something already known.
+fn body_mesh() -> Mesh {
+    use crate::mesher::Quad;
+    use crate::shade::Shade;
+
+    const WIDTH: u8 = BODY_WIDTH_CELLS;
+    const HEIGHT: u8 = 5;
+    /// The atlas slot it is drawn with. Slot 2 is the first real material in
+    /// every world this ships with, and a body that used the placeholder would
+    /// be magenta.
+    const MATERIAL: u16 = 2;
+
+    let lit = Shade {
+        light: [tiamot_core::light::Light::DAYLIGHT; 4],
+        // Fully open: a floating box has nothing boxing it in, and giving it
+        // occlusion would darken its corners for no geometric reason.
+        occlusion: [3; 4],
+    };
+    let mut quads = Vec::with_capacity(6);
+    for (axis, positive, w, du, dv) in [
+        (0u8, false, 0, HEIGHT, WIDTH),
+        (0, true, WIDTH, HEIGHT, WIDTH),
+        (1, false, 0, WIDTH, WIDTH),
+        (1, true, HEIGHT, WIDTH, WIDTH),
+        (2, false, 0, WIDTH, HEIGHT),
+        (2, true, WIDTH, WIDTH, HEIGHT),
+    ] {
+        quads.push(Quad {
+            axis,
+            positive,
+            w,
+            u: 0,
+            v: 0,
+            du,
+            dv,
+            material: MATERIAL,
+            shade: lit,
+        });
+    }
+    Mesh { quads }
+}
+
 /// One chunk's camera-relative offset, as an instance attribute.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -486,6 +586,13 @@ pub struct Renderer {
     fog_end: f32,
     /// How many chunks the last frame actually drew.
     drawn: usize,
+    /// The debug body's mesh, built once, and where it is this frame.
+    ///
+    /// `None` in first person, which is every frame until somebody asks for
+    /// third — a box drawn around the camera is a box drawn inside the player's
+    /// head, and all you see is its inside faces.
+    body: ChunkMesh,
+    body_at: Option<[f32; 3]>,
     /// The outline pipeline, and the line segments it draws this frame.
     selection_pipeline: wgpu::RenderPipeline,
     selection: wgpu::Buffer,
@@ -521,6 +628,8 @@ impl Renderer {
             .create_shader_module(wgpu::include_wgsl!("selection.wgsl"));
         let selection_pipeline =
             build_selection_pipeline(&gpu, &selection_shader, &bind_layout, COLOUR_FORMAT);
+        let body_buffers = upload_mesh(&gpu, &body_mesh());
+
         let selection_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("selection"),
             size: (SELECTION_CAPACITY * size_of::<[f32; 3]>()) as u64,
@@ -603,6 +712,8 @@ impl Renderer {
             fog_start: f32::MAX,
             fog_end: f32::MAX,
             drawn: 0,
+            body: body_buffers,
+            body_at: None,
         })
     }
 
@@ -641,6 +752,15 @@ impl Renderer {
     #[must_use]
     pub const fn sun_intensity(&self) -> f32 {
         self.sun_intensity
+    }
+
+    /// Puts the debug body somewhere, or takes it away.
+    ///
+    /// The offset is camera-relative, in blocks, like a chunk's — the whole
+    /// renderer works that way (charter rule 7) and a body given a world
+    /// position would be the one thing in the frame that did not.
+    pub const fn set_body(&mut self, at: Option<[f32; 3]>) {
+        self.body_at = at;
     }
 
     /// Switches the lighting mode.
@@ -897,6 +1017,14 @@ impl Renderer {
         }
         self.drawn = visible.len();
 
+        // The body rides at the end of the same array, so drawing it is one
+        // more instance index rather than a second buffer and a second binding.
+        if let Some(at) = self.body_at {
+            instances.push(Instance {
+                offset: [at[0], at[1], at[2], 0.0],
+            });
+        }
+
         if instances.len() > self.instance_capacity {
             // Grown in powers of two rather than to the exact size, so a world
             // filling in does not reallocate on almost every frame.
@@ -995,6 +1123,15 @@ impl Renderer {
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let instance = index as u32;
                 pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
+            }
+            // And the body, which is the only thing in the world that moves and
+            // therefore the only way to see whether a moving shadow looks
+            // right. Its instance is the one after the last chunk's.
+            if self.body_at.is_some() {
+                let instance = visible.len() as u32;
+                pass.set_vertex_buffer(0, self.body.vertices.slice(..));
+                pass.set_index_buffer(self.body.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
             }
         });
     }
@@ -1102,6 +1239,13 @@ impl Renderer {
                 // chunk.
                 let instance = index as u32;
                 pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
+            }
+
+            if self.body_at.is_some() {
+                let instance = visible.len() as u32;
+                pass.set_vertex_buffer(0, self.body.vertices.slice(..));
+                pass.set_index_buffer(self.body.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
             }
 
             // Last, so it draws over the world it outlines. Its pipeline does

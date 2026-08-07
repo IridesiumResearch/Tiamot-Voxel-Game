@@ -330,6 +330,31 @@ impl ApplicationHandler for Client {
                         KeyCode::F5 | KeyCode::KeyL if pressed => {
                             surface.app.cycle_lighting_mode();
                         }
+                        // Scrubbing the sky by hand, for looking at shadows at
+                        // an hour that is not the one the server is at. A
+                        // twentieth of a day a press, so a full circuit is
+                        // twenty presses and dawn is findable.
+                        KeyCode::BracketLeft if pressed => surface.app.nudge_time(-0.05),
+                        KeyCode::BracketRight if pressed => surface.app.nudge_time(0.05),
+                        KeyCode::Backslash if pressed => surface.app.resync_time(),
+                        // Third person, so there is something in the frame that
+                        // moves and casts a shadow. There is no player model
+                        // until Task 12; this draws the collision box.
+                        KeyCode::F6 | KeyCode::KeyV if pressed => {
+                            surface.app.toggle_third_person();
+                        }
+                        // One of every block, laid out where you are looking.
+                        // Singleplayer only, and through the embedded server's
+                        // own handle rather than over the wire — a client
+                        // cannot edit a world it is a guest in, and this does
+                        // not make it one. See `App::debug_material_row`.
+                        KeyCode::KeyG if pressed => {
+                            if let Some(server) = self.embedded.as_ref() {
+                                for (pos, material) in surface.app.debug_material_row() {
+                                    server.seed_block(pos, material);
+                                }
+                            }
+                        }
                         // The hotbar's number keys. `Digit1` is slot 0.
                         KeyCode::Digit1
                         | KeyCode::Digit2

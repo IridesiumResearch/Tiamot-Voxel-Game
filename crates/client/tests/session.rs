@@ -673,3 +673,170 @@ fn the_lighting_mode_switches_without_a_restart() {
 
     assert!(server.stop());
 }
+
+#[test]
+fn third_person_puts_a_body_in_the_frame_that_first_person_does_not() {
+    // The debug view, end to end. There is no player model until Task 12, so
+    // what third person shows is the collision box — and the reason it exists
+    // is that a world of static terrain has no moving shadow to judge the
+    // cascades by.
+    let Some(gpu) = gpu() else {
+        eprintln!("no adapter; skipping");
+        return;
+    };
+    let server = embedded("third-person");
+    let mut app = client("third-person", &server, gpu);
+
+    assert!(
+        run_frames(&mut app, |app| app.joined() && app.pending_chunks() == 0),
+        "the world never finished meshing: {:?}",
+        app.warnings()
+    );
+    // Look level, so the body is in front of the camera rather than under it.
+    app.advance(Input::default(), 1.0 / 60.0);
+
+    let target = Offscreen::new(app.renderer().gpu(), WIDTH, HEIGHT);
+    let camera = *app.camera();
+    let first = target.capture(app.renderer(), &camera).expect("capture");
+
+    assert!(!app.is_third_person(), "first person is the default");
+    app.toggle_third_person();
+    assert!(app.is_third_person());
+    // One frame for the camera to move and the body to be placed.
+    app.advance(Input::default(), 1.0 / 60.0);
+
+    let camera = *app.camera();
+    let third = target.capture(app.renderer(), &camera).expect("capture");
+
+    assert_ne!(
+        perceptual_hash(&first),
+        perceptual_hash(&third),
+        "third person drew the same frame as first person, so neither the camera nor the body \
+         moved"
+    );
+    assert!(
+        shows_a_world(&third),
+        "third person drew an empty sky, so the camera went somewhere the world is not"
+    );
+
+    // And back, because a view you cannot leave is a trap rather than a tool.
+    app.toggle_third_person();
+    app.advance(Input::default(), 1.0 / 60.0);
+    assert!(!app.is_third_person());
+
+    assert!(server.stop());
+}
+
+#[test]
+fn a_scrubbed_clock_survives_the_servers_next_update() {
+    // The one thing a local time override has to do. The server broadcasts the
+    // time once a second, so an override that did not hold would be undone
+    // between one look at the sky and the next — and the symptom would be "the
+    // key does nothing", because a second is about how long it takes to notice
+    // anything.
+    let Some(gpu) = gpu() else {
+        eprintln!("no adapter; skipping");
+        return;
+    };
+    let server = embedded("clock");
+    let mut app = client("clock", &server, gpu);
+
+    assert!(
+        run_frames(&mut app, |app| app.joined()),
+        "never joined: {:?}",
+        app.warnings()
+    );
+
+    app.nudge_time(0.5);
+    assert!(app.time_is_local(), "scrubbing should take the clock over");
+    let scrubbed = app.sky_time();
+
+    // Long enough for at least one `TimeOfDay` from the server, which sends one
+    // every twenty ticks.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        assert!(app.pump_network(), "the connection ended");
+        app.advance(Input::default(), 1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    // The local clock keeps RUNNING — it is a scrub, not a freeze — so what
+    // must not have happened is a jump back to the server's time.
+    let drift = (app.sky_time() - scrubbed).rem_euclid(1.0);
+    assert!(
+        drift < 0.1,
+        "the clock jumped from {scrubbed} to {} , so the server's update overrode the scrub",
+        app.sky_time()
+    );
+
+    app.resync_time();
+    assert!(!app.time_is_local(), "resyncing should give the clock back");
+
+    assert!(server.stop());
+}
+
+#[test]
+fn the_debug_row_offers_one_of_every_material_and_nothing_when_aimed_at_sky() {
+    // The singleplayer affordance for looking at blocks you have not mined —
+    // lamps, most of all, which a player can otherwise only get by finding one.
+    // Asserted through the list it produces rather than by writing it, because
+    // what matters is that it names every material exactly once and never air.
+    let Some(gpu) = gpu() else {
+        eprintln!("no adapter; skipping");
+        return;
+    };
+    let server = embedded("debug-row");
+    let mut app = client("debug-row", &server, gpu);
+
+    // Before the world arrives there is nothing to aim at, and the row is
+    // empty rather than a guess. The same path covers looking at the sky.
+    assert!(
+        app.debug_material_row().is_empty(),
+        "a row was laid out before the player had a world to stand in"
+    );
+
+    assert!(
+        run_frames(&mut app, |app| app.joined() && app.pending_chunks() == 0),
+        "the world never finished meshing: {:?}",
+        app.warnings()
+    );
+
+    // Looking at the ground: one block per material, each at its own position,
+    // and none of them air or the unknown placeholder.
+    app.look_down_by(1.2);
+    app.advance(Input::default(), 1.0 / 60.0);
+    let row = app.debug_material_row();
+    assert!(
+        row.len() >= 2,
+        "the reference mods register more than one block, so a row of {} is short",
+        row.len()
+    );
+
+    let mut ids: Vec<u16> = row.iter().map(|(_, id)| *id).collect();
+    ids.sort_unstable();
+    let unique = ids.len();
+    ids.dedup();
+    assert_eq!(ids.len(), unique, "the row repeats a material");
+    assert!(
+        !ids.contains(&tiamot_core::MaterialId::AIR.0),
+        "the row includes air, which is a hole rather than a block"
+    );
+    assert!(
+        !ids.contains(&tiamot_core::MaterialId::UNKNOWN.0),
+        "the row includes the unknown-block placeholder, which is nothing a player wants a \
+         sample of"
+    );
+
+    let mut positions: Vec<(i32, i32, i32)> =
+        row.iter().map(|(pos, _)| (pos.x, pos.y, pos.z)).collect();
+    let placed = positions.len();
+    positions.sort_unstable();
+    positions.dedup();
+    assert_eq!(
+        positions.len(),
+        placed,
+        "two materials were laid out on the same block"
+    );
+
+    assert!(server.stop());
+}

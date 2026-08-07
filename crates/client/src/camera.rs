@@ -109,6 +109,23 @@ impl Position {
         )
     }
 
+    /// The offset from here to a world point, in blocks, ready for a shader.
+    ///
+    /// The same trick as [`Position::chunk_offset`] and for the same reason:
+    /// the subtraction happens in `f64`, where a world coordinate is exact, and
+    /// only the small difference is narrowed to `f32`. Narrowing first would
+    /// quantise a position fifty thousand blocks out to steps a body is smaller
+    /// than.
+    #[must_use]
+    pub fn offset_to(self, world: [f64; 3]) -> [f32; 3] {
+        let (x, y, z) = self.to_world();
+        [
+            (world[0] - x) as f32,
+            (world[1] - y) as f32,
+            (world[2] - z) as f32,
+        ]
+    }
+
     /// Moves by a delta in blocks, renormalising into the chunk grid.
     ///
     /// Renormalising on every move is what keeps `local` small. Letting it
