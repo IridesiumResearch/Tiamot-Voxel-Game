@@ -411,3 +411,39 @@ fn a_lamp_at_a_chunk_boundary_lights_the_next_chunk_and_stops_when_it_goes() {
 
     assert!(server.stop());
 }
+
+#[test]
+fn a_fresh_world_opens_in_daylight_rather_than_at_midnight() {
+    // Reported from the window as "I am no longer seeing any shadows", and the
+    // shadow code was fine: a world's clock started at zero, zero is midnight,
+    // and a world with the sun under it has nothing to cast one. Every graphics
+    // setting looked identical for the same reason, which is what "K does not
+    // seem to do anything" was.
+    //
+    // Which hour a world opens on is content — how long a day is and what
+    // colour it goes already are — so the sky mod says, and this asserts the
+    // reference sky's answer arrives over the wire.
+    let server = start("dawn");
+
+    block_on(async {
+        let mut bot = join(&server, "Riser").await;
+
+        let time = bot
+            .recv_until(|message| {
+                matches!(message, tiamot_core::proto::ServerMessage::TimeOfDay { .. })
+            })
+            .await
+            .expect("the server should send the time of day");
+
+        let tiamot_core::proto::ServerMessage::TimeOfDay { time } = time else {
+            panic!("expected a time");
+        };
+
+        assert!(
+            (0.2..0.8).contains(&time),
+            "a fresh world opened at {time}, which is a time with no sun in it"
+        );
+    });
+
+    assert!(server.stop());
+}

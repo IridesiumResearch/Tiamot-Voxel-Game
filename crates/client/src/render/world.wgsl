@@ -207,6 +207,12 @@ fn fog_amount(distance: f32) -> f32 {
 // decides how much of a wall blooms rather than how bright the bloom is.
 const EMISSIVE_GAIN: f32 = 1.2;
 
+// How much of the original brightness survives the steeper falloff, at the
+// source. Squaring a level in 0..1 only ever darkens, so without this a lamp
+// standing next to you is dimmer than it was; 1.35 puts its brightest ring back
+// where it started.
+const FALLOFF: f32 = 1.35;
+
 // How dark the neutral is that occlusion mixes toward, as a fraction of the
 // surface's own brightness. Half: dark enough to read as a corner, light enough
 // that the geometry in it is still visible.
@@ -253,7 +259,22 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     // colour to be what anyone is looking at.
     var block = input.block_light;
     let peak = max(block.r, max(block.g, block.b));
-    block = mix(vec3<f32>(peak), block, peak);
+
+    // Steeper than the stored falloff, which is linear because the flood
+    // subtracts one level a block. Light does not actually fall off linearly,
+    // and a lamp whose glow reaches fifteen blocks at an even rate reads as a
+    // flat pool rather than as a source. Squaring the level pulls the far half
+    // down and leaves the near half alone, which is where a lamp looks like a
+    // lamp.
+    let steep = peak * peak * FALLOFF;
+    block = block * select(0.0, steep / peak, peak > 0.0);
+
+    // And the hue fades as the level does, but not as fast as it did: the
+    // square root keeps a lamp's colour through the middle of its range and
+    // only lets go at the edge, where the stored channels have collapsed onto
+    // whichever one survived and the colour is an artefact rather than a
+    // choice. `mix` by `peak` directly was reported as a little washed out.
+    block = mix(vec3<f32>(steep), block, sqrt(peak));
     if (globals.lighting_mode == 2u) {
         block = block * EMISSIVE_GAIN;
     }

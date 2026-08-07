@@ -515,7 +515,7 @@ impl ServerHandle {
         let sky = host
             .as_ref()
             .and_then(|loaded| loaded.vm().registered_sky())
-            .map_or((0, Vec::new()), |sky| {
+            .map_or((0, Vec::new(), 0.0), |sky| {
                 let frames = sky
                     .keyframes
                     .iter()
@@ -526,7 +526,7 @@ impl ServerHandle {
                         intensity: frame.intensity,
                     })
                     .collect();
-                (sky.day_length_ticks, frames)
+                (sky.day_length_ticks, frames, sky.start_time)
             });
         if sky.0 > 0 {
             info!(
@@ -582,7 +582,13 @@ impl ServerHandle {
             tool_table,
             sky_day_length: sky.0,
             sky_keyframes: sky.1,
-            time_of_day: std::sync::atomic::AtomicU64::new(0),
+            // Where the mod said its day starts, in ticks. A counter left at
+            // zero opens every new world at midnight, which is the one hour
+            // with no sun, no shadows and nothing to tell two graphics settings
+            // apart.
+            time_of_day: std::sync::atomic::AtomicU64::new(
+                (f64::from(sky.2) * f64::from(sky.0)) as u64,
+            ),
             content: content_index,
             allowlist: std::sync::RwLock::new(settings.allowlist.clone()),
             max_players: settings.max_players,

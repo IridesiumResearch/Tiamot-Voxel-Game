@@ -165,7 +165,8 @@ function Stream:next_bool() end
 ---legitimate world rather than a missing feature.
 ---@class Tiamot.SkySpec
 ---@field day_length_ticks integer Required. Ticks in a full day, at 20 ticks a second. Must be at least 1.
----@field keyframes Tiamot.SkyKeyframe[] Required, and not empty. Need not be sorted — the engine sorts them, because an out-of-order list would make the sky walk backwards partway through the day.
+---@field keyframes Tiamot.SkyKeyframe[]
+---@field start_time number? Where a fresh world's clock starts, 0..1. Defaults to mid-morning: a counter left at zero opens every world at midnight, which is the one hour with no sun in it. Required, and not empty. Need not be sorted — the engine sorts them, because an out-of-order list would make the sky walk backwards partway through the day.
 
 ---One moment in your day.
 ---

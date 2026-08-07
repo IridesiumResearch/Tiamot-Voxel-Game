@@ -315,6 +315,15 @@ pub struct Sky {
     pub day_length_ticks: u32,
     /// Colour keyframes, sorted by time and never empty.
     pub keyframes: Vec<SkyKeyframe>,
+    /// Where a fresh world's clock starts, `0.0..1.0`.
+    ///
+    /// **A world used to begin at midnight**, because that is where a counter
+    /// starting at zero puts it, and the result was a first impression with no
+    /// sun in it: no shadows, no colour, and every graphics setting looking
+    /// identical because there was nothing lit to tell them apart. Which hour a
+    /// world opens on is content — how long the day is and what colour it goes
+    /// already are — so the mod says.
+    pub start_time: f32,
 }
 
 /// A tool a mod registered.

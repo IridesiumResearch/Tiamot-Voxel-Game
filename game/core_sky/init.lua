@@ -33,6 +33,12 @@ local DAY_LENGTH_TICKS = 24000
 -- dark at night while lamps keep working.
 game.register_sky{
     day_length_ticks = DAY_LENGTH_TICKS,
+    -- Where a fresh world's clock starts. Mid-morning, because the alternative
+    -- is what a counter starting at zero gives you: midnight, with no sun, no
+    -- shadows, and nothing on screen to tell one graphics setting from another.
+    -- The engine defaults to this same hour when a sky says nothing, but saying
+    -- it here is the point — which hour a world opens on is this mod's call.
+    start_time = 0.35,
     keyframes = {
         -- Midnight. Not black: a night nobody can see anything in is a night
         -- players spend indoors, and the moon is doing something.

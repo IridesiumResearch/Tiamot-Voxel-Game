@@ -215,6 +215,13 @@ pub struct MluaVm {
     light: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::light::LightSource>>>>,
 }
 
+/// Where a world's clock starts when the sky mod does not say.
+///
+/// Mid-morning: the sun is well up, so shadows have a direction and a length
+/// and the world has colour in it. Midnight — which is where a counter starting
+/// at zero lands — shows none of that.
+const DEFAULT_START_TIME: f32 = 0.35;
+
 impl MluaVm {
     /// The registry key under which a mod's `on_generate` callback is stored.
     fn generator_key(mod_id: &str) -> String {
@@ -851,6 +858,15 @@ impl ScriptVm for MluaVm {
             mod_id,
             day_length_ticks: entry.get("day_length_ticks").ok()?,
             keyframes,
+            // Morning unless the mod says otherwise. A counter left at zero
+            // opens every new world at midnight, which is the one hour with
+            // nothing in it to look at.
+            start_time: entry
+                .get::<Option<f32>>("start_time")
+                .ok()
+                .flatten()
+                .unwrap_or(DEFAULT_START_TIME)
+                .rem_euclid(1.0),
         })
     }
 
@@ -1680,7 +1696,15 @@ fn register_sky(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
 }
 
 /// Fields `register_sky` accepts.
-const SKY_FIELDS: [&str; 2] = ["day_length_ticks", "keyframes"];
+/// Every field `register_sky` accepts.
+///
+/// Checked rather than ignored, so a typo in a mod is an error at registration
+/// instead of a setting that silently does nothing. Adding a field to the Lua
+/// side without adding it here rejects the whole registration — the world then
+/// has no sky at all, which is exactly what happened when `start_time` was
+/// added: no day, no sun, no shadows, and every graphics setting looking the
+/// same because there was nothing lit to tell them apart.
+const SKY_FIELDS: [&str; 3] = ["day_length_ticks", "keyframes", "start_time"];
 
 /// Fields `register_tool` accepts.
 const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "default"];
