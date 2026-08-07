@@ -15,9 +15,27 @@
 //! would be noise — and noise gets muted, which is how a real regression
 //! eventually walks through unnoticed.
 //!
-//! Over 5× budget is a **hard failure**. Nothing the runner does to us
-//! accounts for a 250 ms tick; that is the server's own fault and worth
-//! stopping for.
+//! Over [`HARD_LIMIT`] is a **hard failure**: that is the server's own fault
+//! and worth stopping for.
+//!
+//! # Why the hard limit depends on the build profile
+//!
+//! **This test runs in whatever profile `cargo test` was given, and the two are
+//! not comparable.** The same workload that peaks at 23 ms of tick here in
+//! debug peaks at a few milliseconds in release; Task 09 measured `mesh_chunk`
+//! at 24× between the profiles, and the simulation is the same kind of code.
+//! One number cannot be a fair bound for both.
+//!
+//! So the limit is 5× the budget in release and 15× in debug — chosen because
+//! a debug build on a shared Windows runner has been seen at 257 ms on a
+//! workload that peaks at 23 ms on the reference machine, which is a runner and
+//! a profile rather than a server that stopped working. The 5× that matters is
+//! the one the release build has to meet, and nightly's swarm load runs it.
+//!
+//! What is NOT relaxed: `dropped`, `over_budget`, and the tick count. A server
+//! falling behind by dropping ticks or spending a whole run over budget fails
+//! in either profile, because those are counts rather than a single sample and
+//! no amount of scheduling noise produces them.
 
 use std::time::Duration;
 
@@ -31,6 +49,11 @@ use tiamot_server::{ServerHandle, Settings};
 const MATERIALS: [&str; 2] = ["test:stone", "test:dirt"];
 const BOTS: usize = 4;
 const TICKS: u64 = 200;
+
+/// How far over the tick budget one sample may go before it is the server's
+/// fault rather than the runner's. See the module docs for why this is not one
+/// number.
+const HARD_LIMIT: u32 = if cfg!(debug_assertions) { 15 } else { 5 };
 
 fn stone_id() -> u16 {
     let mut registry = tiamot_core::Registry::new();
@@ -142,11 +165,36 @@ fn two_hundred_ticks_under_four_bots_stays_within_budget() {
             "the server should have run at least {TICKS} ticks, ran {ran}"
         );
 
-        // Hard failure: nothing a shared runner does accounts for this.
+        // Hard failure: past this it is the server rather than the runner.
         assert!(
-            slowest < TICK_DURATION * 5,
-            "a tick took {slowest:?}, over 5x the {TICK_DURATION:?} budget — that is the \
-             server's own fault, not scheduling noise"
+            slowest < TICK_DURATION * HARD_LIMIT,
+            "a tick took {slowest:?}, over {HARD_LIMIT}x the {TICK_DURATION:?} budget in a {} \
+             build — that is the server's own fault, not scheduling noise. {over_budget} of \
+             {ran} ticks were over budget and {dropped} were dropped, which is the number to \
+             read next: a handful is a slow runner, and hundreds is a server that stopped \
+             keeping up.",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+
+        // A run that spends a tenth of itself over budget is a failure whatever
+        // the profile: that is not a runner losing a quantum, it is the server
+        // not keeping up.
+        //
+        // The threshold is measured rather than picked. Before the lighting fix
+        // in `324bbd9` this workload ran **48 of 204 ticks over budget** (23%);
+        // after it, **0 of 204**. The worst *runner* noise seen is 2 of 228
+        // (0.9%), on the Windows debug leg that motivated the split limit
+        // above. A tenth sits an order of magnitude clear of the noise and
+        // still catches a regression the single-worst-sample check let through:
+        // the old code passed that check on this machine every time.
+        assert!(
+            over_budget * 10 < ran,
+            "{over_budget} of {ran} ticks ran over the {TICK_DURATION:?} budget. A tenth of a \
+             run over budget is a server that cannot keep up, not a noisy runner."
         );
 
         // Soft: logged, because CI runners lose quanta to their neighbours and

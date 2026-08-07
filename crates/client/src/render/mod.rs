@@ -929,11 +929,6 @@ impl Renderer {
     }
 }
 
-/// Builds the world pipeline.
-///
-/// A function rather than more of [`Renderer::new`], which was long enough that
-/// the interesting decisions in it — winding, culling, depth comparison —
-/// were buried in the middle of resource creation.
 /// Appends the twelve edges of a unit cube at `corner`, as line-list vertices.
 ///
 /// Twelve segments, twenty-four vertices. A line *strip* would need degenerate
@@ -1083,6 +1078,11 @@ fn build_bind_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
         })
 }
 
+/// Builds the world pipeline.
+///
+/// A function rather than more of [`Renderer::new`], which was long enough that
+/// the interesting decisions in it — winding, culling, depth comparison — were
+/// buried in the middle of resource creation.
 fn build_pipeline(
     gpu: &Gpu,
     shader: &wgpu::ShaderModule,
