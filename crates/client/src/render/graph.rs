@@ -65,9 +65,23 @@ const BLOOM_INTENSITY: f32 = 0.35;
 const EXPOSURE: f32 = 1.0;
 
 /// What one post pass needs to know.
+///
+/// Field order matches `post.wgsl` exactly, and nothing checks that it does —
+/// the two are one memory layout written down twice. Getting it wrong in
+/// `Globals` made the world come out red; the same mistake here would make the
+/// fog wrong in a way that reads as "the sky colour is broken".
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
+    /// Clip back to camera-relative space, for reconstructing where a depth
+    /// sample is. Only the composite reads it.
+    inverse_view_projection: [[f32; 4]; 4],
+    /// Sky colour in `xyz`, where fog is total in `w`.
+    sky: [f32; 4],
+    /// Sun colour in `xyz`, scattering strength in `w`.
+    sun: [f32; 4],
+    /// Which way sunlight travels in `xyz`, where fog starts in `w`.
+    sun_direction: [f32; 4],
     /// One texel of the source, in UV.
     texel: [f32; 2],
     /// Threshold cutoff and knee, or blur direction.
@@ -76,6 +90,32 @@ struct Uniforms {
     exposure: f32,
     _pad: [f32; 2],
 }
+
+/// What the frame's sky is doing, as the composite needs it.
+///
+/// Passed in per frame rather than stored: the renderer owns these and they
+/// change every tick, and a copy here would be a second place for them to be
+/// stale.
+#[derive(Debug, Clone, Copy)]
+pub struct Frame {
+    /// Clip back to camera-relative space.
+    pub inverse_view_projection: glam::Mat4,
+    /// The sky's colour.
+    pub sky: [f32; 3],
+    /// The sun's colour.
+    pub sun: [f32; 3],
+    /// Which way its light travels.
+    pub sun_direction: [f32; 3],
+    /// Where fog begins, in blocks.
+    pub fog_start: f32,
+    /// Where it is total, in blocks.
+    pub fog_end: f32,
+}
+
+/// How much of the sun's colour the haze takes on where the view points at it.
+///
+/// Enough to see on a hazy horizon, not enough to make the fog a second sun.
+const SCATTERING: f32 = 0.6;
 
 /// A colour target and its view.
 struct Target {
@@ -156,6 +196,20 @@ fn post_bind_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // Depth, read with `textureLoad` and therefore never
+                        // filtered: the average of two surfaces at different
+                        // distances is a distance where neither of them is, and
+                        // across a silhouette that is every edge in the frame.
+                        sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -324,7 +378,7 @@ impl Post {
 
         Self {
             scene: Target::new(gpu, "post-scene", width, height, HDR_FORMAT),
-            depth: super::make_depth(gpu, width.max(1), height.max(1)),
+            depth: super::make_sampled_depth(gpu, width.max(1), height.max(1)),
             bloom: [
                 Target::new(gpu, "post-bloom-a", bloom_width, bloom_height, HDR_FORMAT),
                 Target::new(gpu, "post-bloom-b", bloom_width, bloom_height, HDR_FORMAT),
@@ -421,7 +475,13 @@ impl Post {
     ///
     /// The order is the whole graph. Each pass names what it reads and what it
     /// writes, and nothing else in the renderer needs to know the chain exists.
-    pub fn run(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+    pub fn run(
+        &self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        frame: &Frame,
+    ) {
         let full_texel = [1.0 / self.size.0 as f32, 1.0 / self.size.1 as f32];
         // The BLOOM buffer's texel, not the frame's. Stepping a blur by a
         // full-resolution texel over a half-resolution source samples the same
@@ -434,10 +494,10 @@ impl Post {
         // The chain, in order: bright parts out of the scene, blurred across,
         // blurred down, then added back over the scene and tonemapped. Adding
         // a pass — Task 11's reflections, say — is adding an entry here.
-        self.write(gpu, 0, full_texel, [BLOOM_CUTOFF, BLOOM_KNEE]);
-        self.write(gpu, 1, bloom_texel, [1.0, 0.0]);
-        self.write(gpu, 2, bloom_texel, [0.0, 1.0]);
-        self.write(gpu, 3, full_texel, [0.0, 0.0]);
+        self.write(gpu, 0, full_texel, [BLOOM_CUTOFF, BLOOM_KNEE], frame);
+        self.write(gpu, 1, bloom_texel, [1.0, 0.0], frame);
+        self.write(gpu, 2, bloom_texel, [0.0, 1.0], frame);
+        self.write(gpu, 3, full_texel, [0.0, 0.0], frame);
 
         for step in [
             Step {
@@ -477,11 +537,20 @@ impl Post {
         }
     }
 
-    fn write(&self, gpu: &Gpu, slot: usize, texel: [f32; 2], params: [f32; 2]) {
+    fn write(&self, gpu: &Gpu, slot: usize, texel: [f32; 2], params: [f32; 2], frame: &Frame) {
         gpu.queue.write_buffer(
             &self.uniforms[slot],
             0,
             bytemuck::bytes_of(&Uniforms {
+                inverse_view_projection: frame.inverse_view_projection.to_cols_array_2d(),
+                sky: [frame.sky[0], frame.sky[1], frame.sky[2], frame.fog_end],
+                sun: [frame.sun[0], frame.sun[1], frame.sun[2], SCATTERING],
+                sun_direction: [
+                    frame.sun_direction[0],
+                    frame.sun_direction[1],
+                    frame.sun_direction[2],
+                    frame.fog_start,
+                ],
                 texel,
                 params,
                 intensity: BLOOM_INTENSITY,
@@ -517,6 +586,10 @@ impl Post {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(step.bloom.unwrap_or(&self.black)),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&self.depth),
                 },
             ],
         });

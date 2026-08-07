@@ -16,6 +16,16 @@
 // viewport has neither problem and one fewer draw's worth of state.
 
 struct Post {
+    // Clip back to camera-relative space, for turning a depth sample into a
+    // position. Task 11's reflections need exactly the same reconstruction,
+    // which is why this is a matrix rather than a pair of plane distances.
+    inverse_view_projection: mat4x4<f32>,
+    // Sky colour in xyz, where fog becomes total in w.
+    sky: vec4<f32>,
+    // Sun colour in xyz, how strong the scattering is in w.
+    sun: vec4<f32>,
+    // Which way sunlight travels in xyz, where fog starts in w.
+    sun_direction: vec4<f32>,
     // One texel of the SOURCE texture, in UV. The blur steps along it, so a
     // blur reading a half-resolution source with a full-resolution texel size
     // samples the same texel nine times and does nothing at all.
@@ -33,6 +43,11 @@ struct Post {
 @group(0) @binding(1) var source: texture_2d<f32>;
 @group(0) @binding(2) var source_sampler: sampler;
 @group(0) @binding(3) var bloom: texture_2d<f32>;
+// The scene's depth, for fog that knows how far away things are. Read with
+// `textureLoad` at integer coordinates rather than sampled: depth is not a
+// colour, filtering it averages across silhouette edges, and the average of two
+// surfaces at different distances is a distance where neither of them is.
+@group(0) @binding(4) var scene_depth: texture_depth_2d;
 
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
@@ -126,7 +141,48 @@ fn tonemap(colour: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(shoulder(colour.r), shoulder(colour.g), shoulder(colour.b));
 }
 
-// The last pass: scene plus bloom, exposed and tonemapped, into the swapchain.
+// How far the surface under this pixel is, in blocks.
+//
+// Reconstructed from depth rather than carried through from the world pass,
+// because the fog has to apply to the SKY as well and the sky is a clear colour
+// with no geometry behind it. At the far plane this comes back enormous, which
+// is exactly right: sky is infinitely far away and infinitely fogged, and since
+// the fog colour is the sky colour that is a no-op except where the scattering
+// tints it.
+fn scene_distance(pixel: vec2<i32>, uv: vec2<f32>) -> f32 {
+    let depth = textureLoad(scene_depth, pixel, 0);
+    // Clip space: x and y across the viewport, z the depth as written.
+    let clip = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    let view = post.inverse_view_projection * clip;
+    // The camera is the origin (floating origin), so the reconstructed point IS
+    // the offset from the eye and its length is the distance.
+    return length(view.xyz / view.w);
+}
+
+// Sunlight scattered toward the eye by the air between it and the surface.
+//
+// A cheap approximation of what makes a hazy afternoon glow around the sun:
+// the closer the view ray is to pointing at the sun, the more of the sun's own
+// colour the haze takes on. Not a physical model of scattering — Task 10 asks
+// for stylised — but it has the property that matters, which is that fog is not
+// one flat colour across the whole sky.
+fn scattered_fog(uv: vec2<f32>) -> vec3<f32> {
+    // The view ray for this pixel, from the same reconstruction the distance
+    // uses, at the far plane.
+    let clip = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);
+    let far = post.inverse_view_projection * clip;
+    let ray = normalize(far.xyz / far.w);
+
+    // Sunlight travels along `sun_direction`, so looking INTO the sun means
+    // looking along its negation.
+    let toward_sun = max(dot(ray, -post.sun_direction.xyz), 0.0);
+    // Raised to a power so the glow is a halo around the sun rather than half
+    // the sky. Squared twice: cheap, and no `pow` for a shape nobody measures.
+    let halo = toward_sun * toward_sun * toward_sun * toward_sun;
+    return mix(post.sky.rgb, post.sun.rgb, halo * post.sun.w);
+}
+
+// The last pass: scene plus bloom, fogged, exposed and tonemapped.
 @fragment
 fn composite_main(input: VertexOut) -> @location(0) vec4<f32> {
     let scene = textureSample(source, source_sampler, input.uv).rgb;
@@ -135,5 +191,15 @@ fn composite_main(input: VertexOut) -> @location(0) vec4<f32> {
     // eye, so it arrives IN ADDITION to what the surface sent. Mixing would
     // dim the surface to make room for its own glow.
     let lit = (scene + glow * post.intensity) * post.exposure;
-    return vec4<f32>(tonemap(lit), 1.0);
+
+    // Fog here rather than in the world shader, for mode 3 only. Doing it from
+    // depth is what lets it reach the sky and take the sun's colour with it;
+    // the world shader's own fog is per-surface and cannot do either. The world
+    // shader skips its fog in this mode so the two do not stack.
+    let distance = scene_distance(vec2<i32>(input.clip.xy), input.uv);
+    let start = post.sun_direction.w;
+    let haze = clamp((distance - start) / max(post.sky.w - start, 0.001), 0.0, 1.0);
+    let fogged = mix(lit, scattered_fog(input.uv), haze);
+
+    return vec4<f32>(tonemap(fogged), 1.0);
 }

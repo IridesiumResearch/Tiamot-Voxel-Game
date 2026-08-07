@@ -947,6 +947,34 @@ impl Renderer {
         ));
     }
 
+    /// Runs the post chain, if this mode has one.
+    ///
+    /// It reads the scene texture the world pass wrote and lands on `target`,
+    /// so from outside the renderer a frame looks the same in every mode.
+    fn run_post(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        view_projection: glam::Mat4,
+    ) {
+        let Some(post) = self.post.as_ref() else {
+            return;
+        };
+        post.run(
+            &self.gpu,
+            encoder,
+            target,
+            &graph::Frame {
+                inverse_view_projection: view_projection.inverse(),
+                sky: self.sky_colour,
+                sun: [self.sun_colour[0], self.sun_colour[1], self.sun_colour[2]],
+                sun_direction: self.sun_direction,
+                fog_start: self.fog_start,
+                fog_end: self.fog_end,
+            },
+        );
+    }
+
     /// Draws the visible chunks into every shadow cascade.
     ///
     /// The same meshes and the same instance buffer as the world pass, drawn
@@ -1089,9 +1117,7 @@ impl Renderer {
         // The post chain, if this mode has one. It reads the scene texture the
         // pass above just wrote and lands on `target`, so from outside the
         // renderer a frame looks the same in every mode.
-        if let Some(post) = self.post.as_ref() {
-            post.run(&self.gpu, &mut encoder, target);
-        }
+        self.run_post(&mut encoder, target, view_projection);
 
         self.gpu.queue.submit(Some(encoder.finish()));
     }
@@ -1494,6 +1520,30 @@ fn make_bind_group(
 }
 
 fn make_depth(gpu: &Gpu, width: u32, height: u32) -> wgpu::TextureView {
+    make_depth_with(gpu, width, height, wgpu::TextureUsages::RENDER_ATTACHMENT)
+}
+
+/// A depth buffer that something else will read.
+///
+/// Mode 3's fog reconstructs where a surface is from its depth, so its depth
+/// buffer is a texture binding as well as an attachment. The direct path's is
+/// not — an attachment-only texture can live in memory a sampler cannot reach,
+/// and there is no reason to give that up in the modes that never sample it.
+fn make_sampled_depth(gpu: &Gpu, width: u32, height: u32) -> wgpu::TextureView {
+    make_depth_with(
+        gpu,
+        width,
+        height,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+    )
+}
+
+fn make_depth_with(
+    gpu: &Gpu,
+    width: u32,
+    height: u32,
+    usage: wgpu::TextureUsages,
+) -> wgpu::TextureView {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
         size: wgpu::Extent3d {
@@ -1505,7 +1555,7 @@ fn make_depth(gpu: &Gpu, width: u32, height: u32) -> wgpu::TextureView {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage,
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())

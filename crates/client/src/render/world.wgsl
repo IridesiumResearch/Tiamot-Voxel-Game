@@ -316,6 +316,14 @@ fn surface(input: VertexOut, shadow: f32) -> vec4<f32> {
     let texel = textureSampleGrad(atlas, atlas_sampler, uv, ddx, ddy);
     let lit = texel.rgb * lighting(input, shadow);
 
+    // Mode 3 fogs in the post chain instead, from the depth buffer — which is
+    // what lets its fog reach the sky and take the sun's colour with it. Doing
+    // it here as well would apply it twice, and the second application is over
+    // a colour that has already lost its contrast to the first.
+    if (globals.lighting_mode == 2u) {
+        return vec4<f32>(lit, texel.a);
+    }
+
     // Fog last, over the lit colour rather than under it: fog is between the
     // eye and the surface, so it is not something the surface's own light
     // shines through. Mixing before lighting would let a lamp brighten the air.

@@ -1008,3 +1008,49 @@ fn a_low_sun_casts_longer_shadows_than_a_high_one() {
          was shadowed by moving the sun"
     );
 }
+
+#[test]
+fn mode_three_tints_its_fog_toward_the_sun() {
+    // Depth fog in the post chain, and the reason it is there rather than in
+    // the world shader: it reaches the SKY, which has no geometry and therefore
+    // no per-surface fog to apply. The haze around the sun is what that buys.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    // Fog close in, so the whole frame is hazy rather than only its horizon.
+    renderer.set_sky(client::render::sky_colour(), 60.0);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Looking level, so the frame is mostly sky.
+    let mut camera = Camera {
+        position: Position::from_world(24.0, 12.0, 20.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, 0.0);
+
+    // A strongly coloured sun, straight ahead and low: the camera looks along
+    // +z at yaw 0, and light travelling toward -z is light coming from in front.
+    let orange = [1.0, 0.45, 0.1];
+    renderer.set_sun(1.0, orange, [0.0, -0.3, -0.954]);
+    let toward = target.capture(&mut renderer, &camera).expect("capture");
+
+    // The same sun, behind. Nothing else changes, so any difference in the sky
+    // is the scattering term and not the sun's colour reaching a surface.
+    renderer.set_sun(1.0, orange, [0.0, -0.3, 0.954]);
+    let away = target.capture(&mut renderer, &camera).expect("capture");
+
+    // The middle of the sky, where the sun is when it is in front.
+    let warmth = |frame: &Image| {
+        let colour = average(frame, WIDTH / 3, 0, WIDTH * 2 / 3, HEIGHT / 3);
+        colour[0] - colour[2]
+    };
+
+    assert!(
+        warmth(&toward) > warmth(&away) + 0.02,
+        "the sky is {} facing the sun and {} facing away, so the haze is not taking the sun's \
+         colour",
+        warmth(&toward),
+        warmth(&away)
+    );
+}
