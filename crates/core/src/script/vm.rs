@@ -472,6 +472,14 @@ pub trait ScriptVm: Sized {
     /// Whether the registration window has been closed.
     fn is_frozen(&self) -> bool;
 
+    /// Points `game.get_light` at the world's light.
+    ///
+    /// Called once, after the world exists and therefore after freeze. Until it
+    /// is, `game.get_light` answers darkness rather than failing: a mod reading
+    /// light during worldgen — before there is any — should not have to know
+    /// the engine's startup order.
+    fn set_light_source(&mut self, source: std::sync::Arc<dyn crate::light::LightSource>);
+
     /// Runs every registered `on_generate` callback for one chunk.
     ///
     /// # Errors

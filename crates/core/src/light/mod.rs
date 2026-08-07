@@ -86,6 +86,32 @@ pub const fn opposite(face: usize) -> usize {
     face ^ 1
 }
 
+/// Somewhere a light level can be read from.
+///
+/// # Why a trait and not the store itself
+///
+/// The store lives in the server and the script VM lives in core, which cannot
+/// depend on it (charter rule 3). This is the seam: the server hands the VM
+/// something that answers the question, and `game.get_light` asks it.
+///
+/// # What a mod sees
+///
+/// **The light as it stands right now**, not a snapshot taken at the top of the
+/// tick. A mod deciding whether a mob may spawn wants the light where the
+/// player just placed a lamp, and a mod that reads a value the engine has
+/// already superseded is a mod whose rules disagree with what the player can
+/// see. Every caller runs on the simulation thread, so "right now" is
+/// well-defined: the tick is not partway through a relight when a callback is
+/// running, because relights happen between callbacks and never around them.
+pub trait LightSource: Send + Sync {
+    /// The light at a block, or [`Light::DARK`] where nothing is loaded.
+    ///
+    /// Dark rather than an error for somewhere nobody is: a mod asking about
+    /// unloaded terrain gets the honest answer that there is no light there to
+    /// speak of, and an `Option` would push that judgement onto every caller.
+    fn light_at(&self, pos: crate::BlockPos) -> Light;
+}
+
 /// A light level: sunlight plus a colour, packed into 16 bits.
 ///
 /// # Layout

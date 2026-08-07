@@ -708,14 +708,31 @@ impl ServerHandle {
                     // because only the simulation thread may touch it: every
                     // read walks the chunk cache, and a second thread doing
                     // that would need a lock around the world itself.
-                    let mut lighting = crate::light::Lighting::new(emissions);
+                    //
+                    // Behind a lock ONLY so `game.get_light` can read it: a mod
+                    // callback runs on this thread, inside a tick, and cannot
+                    // borrow what the tick is holding. The lock is never
+                    // contended — both sides are this thread — and is never
+                    // held across a callback, which is what would deadlock.
+                    let lighting = std::sync::Arc::new(std::sync::RwLock::new(
+                        crate::light::Lighting::new(emissions),
+                    ));
 
                     // Either the mods generate terrain, or there are no mods
                     // and the world is air. Both are legitimate.
                     let mut source = match host {
-                        Some(host) => crate::world::Generator::Mods(Box::new(
-                            crate::world::ModGenerator::new(host),
-                        )),
+                        Some(mut host) => {
+                            // Point `game.get_light` at the world now that
+                            // there is one. Charter rule 1: a mod deciding
+                            // where something may spawn needs to be able to ask
+                            // how dark it is there.
+                            host.vm_mut().set_light_source(std::sync::Arc::new(
+                                crate::light::Shared::new(std::sync::Arc::clone(&lighting)),
+                            ));
+                            crate::world::Generator::Mods(Box::new(
+                                crate::world::ModGenerator::new(host),
+                            ))
+                        }
                         None => crate::world::Generator::Air(crate::world::Air),
                     };
 
@@ -1166,13 +1183,14 @@ impl ServerHandle {
                             // had already lit. The requester still needs the
                             // light itself, which is what the send below is.
                             if blob.is_some() {
-                                let touched = if lighting.holds(request.pos) {
+                                let mut light = lighting.write().expect("lighting lock");
+                                let touched = if light.holds(request.pos) {
                                     std::iter::once(request.pos).collect()
                                 } else {
                                     control.note_full_relight();
-                                    lighting.chunk_loaded(&world, request.pos)
+                                    light.chunk_loaded(&world, request.pos)
                                 };
-                                broadcast_light(&shared, &lighting, &touched);
+                                broadcast_light(&shared, &light, &touched);
                             }
                             // A failed send means the connection went away
                             // between asking and being answered, which is
@@ -1185,11 +1203,12 @@ impl ServerHandle {
                         // work twice for two edits in the same room, and the
                         // second answer is the only one anybody sees.
                         if !relight.is_empty() {
+                            let mut light = lighting.write().expect("lighting lock");
                             let mut touched = std::collections::BTreeSet::new();
                             for pos in relight.drain(..) {
-                                touched.extend(lighting.edited(&world, pos));
+                                touched.extend(light.edited(&world, pos));
                             }
-                            broadcast_light(&shared, &lighting, &touched);
+                            broadcast_light(&shared, &light, &touched);
                         }
 
                         // Chunks that arrived this tick, whatever brought
@@ -1199,10 +1218,11 @@ impl ServerHandle {
                         // adds is lit too, instead of being silently black.
                         let arrived = world.take_arrived();
                         if !arrived.is_empty() {
+                            let mut light = lighting.write().expect("lighting lock");
                             let mut touched = std::collections::BTreeSet::new();
                             let mut done = 0;
                             for pos in arrived {
-                                if lighting.holds(pos) {
+                                if light.holds(pos) {
                                     continue;
                                 }
                                 if done >= RELIGHTS_PER_TICK {
@@ -1215,12 +1235,12 @@ impl ServerHandle {
                                     continue;
                                 }
                                 control.note_full_relight();
-                                touched.extend(lighting.chunk_loaded(&world, pos));
+                                touched.extend(light.chunk_loaded(&world, pos));
                                 done += 1;
                             }
-                            broadcast_light(&shared, &lighting, &touched);
+                            broadcast_light(&shared, &light, &touched);
                         }
-                        control.note_lit_chunks(lighting.len());
+                        control.note_lit_chunks(lighting.read().expect("lighting lock").len());
 
                         // The day advances once per tick, and is broadcast at
                         // a rate a person can read rather than at the rate it

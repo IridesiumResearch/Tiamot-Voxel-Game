@@ -206,6 +206,13 @@ pub struct MluaVm {
     /// wrote to, so no callback ever ran. Registration state has exactly one
     /// home now, and it is the registry.
     next_material: u16,
+    /// Where `game.get_light` reads from, once the server has one.
+    ///
+    /// Behind a lock because the frozen API is installed before the world
+    /// exists — the closure captures this and reads whatever is in it at call
+    /// time, rather than needing the source to exist at freeze. Uncontended in
+    /// practice: both the setter and every reader are the simulation thread.
+    light: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::light::LightSource>>>>,
 }
 
 impl MluaVm {
@@ -454,6 +461,7 @@ impl ScriptVm for MluaVm {
             faulted: BTreeSet::new(),
             environments: BTreeMap::new(),
             next_material: 2,
+            light: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         // Installed here rather than in a second constructor the caller has to
         // remember. `ModHost` called `create` and got a VM with no registry
@@ -491,6 +499,12 @@ impl ScriptVm for MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         self.frozen = true;
         Ok(())
+    }
+
+    fn set_light_source(&mut self, source: std::sync::Arc<dyn crate::light::LightSource>) {
+        if let Ok(mut slot) = self.light.lock() {
+            *slot = Some(source);
+        }
     }
 
     fn is_frozen(&self) -> bool {
@@ -1062,6 +1076,50 @@ impl MluaVm {
         Ok(())
     }
 
+    /// The `game.get_light` function, built once per mod environment.
+    ///
+    /// Its own method because it is the only thing in the frozen API that
+    /// depends on something outside the VM — see [`MluaVm::light`] for why it
+    /// reads through a handle rather than capturing a store that does not exist
+    /// at freeze.
+    fn light_reader(&self) -> Result<mlua::Function, ScriptError> {
+        // Levels are 0..15 per channel, the range the engine stores and the
+        // same range `register_block{ light_emit }` takes. A mod that reads a
+        // level and writes it straight back into an emitter gets what it asked
+        // for.
+        let light = std::sync::Arc::clone(&self.light);
+        self.lua
+            .create_function(move |lua, position: Table| {
+                let x: i32 = position.get("x")?;
+                let y: i32 = position.get("y")?;
+                let z: i32 = position.get("z")?;
+
+                let level = light
+                    .lock()
+                    .map_err(|_| {
+                        mlua::Error::external(
+                            "the light store is poisoned; the simulation thread panicked",
+                        )
+                    })?
+                    .as_ref()
+                    // No world yet — during worldgen, or in a test with no
+                    // server behind the VM. Dark is the honest answer, and a
+                    // mod that had to handle an error here would be a mod
+                    // written around the engine's startup order.
+                    .map_or(crate::light::Light::DARK, |source| {
+                        source.light_at(crate::BlockPos::new(x, y, z))
+                    });
+
+                let out = lua.create_table()?;
+                out.set("sun", level.sun())?;
+                out.set("r", level.red())?;
+                out.set("g", level.green())?;
+                out.set("b", level.blue())?;
+                Ok(out)
+            })
+            .map_err(|err| self.vm_error(&err))
+    }
+
     /// Everything callable after freeze: lookups, bulk noise, streams, constants.
     fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- frozen-phase API ---------------------------------------------
@@ -1075,6 +1133,10 @@ impl MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("get_block_id", get_block_id)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let get_light = self.light_reader()?;
+        game.set("get_light", get_light)
             .map_err(|err| self.vm_error(&err))?;
 
         // The bulk noise entry point. Takes a whole region and returns a native

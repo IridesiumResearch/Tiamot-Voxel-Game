@@ -251,6 +251,34 @@ function game.register_on_generate(callback) end
 ---@param callback fun(dt_ticks: integer)
 function game.register_on_tick(callback) end
 
+---The light at a block, right now.
+---
+---**Frozen phase only** — there is no world during registration, and asking
+---then answers darkness rather than failing.
+---
+---Levels are 0..15 per channel, the same range `register_block{ light_emit }`
+---takes, so a level read here can be written straight back into an emitter.
+---`sun` is separate from the colour channels because it behaves differently:
+---the engine stores full daylight and scales it by time of day when it draws,
+---so a value of 15 means "open sky", not "bright right now". A mod deciding
+---whether it is dark enough for something to spawn wants `sun` and the colour
+---channels both.
+---
+---Coordinates are BLOCKS. A dig event gives you cells — divide by three.
+---
+---Somewhere unloaded answers darkness, which is the honest answer for a place
+---nobody is: an error would push that judgement onto every caller.
+---
+---```lua
+---local here = game.get_light{ x = 10, y = 64, z = -3 }
+---if here.sun == 0 and here.r + here.g + here.b < 4 then
+---    -- dark enough for something unpleasant
+---end
+---```
+---@param position { x: integer, y: integer, z: integer }
+---@return { sun: integer, r: integer, g: integer, b: integer }
+function game.get_light(position) end
+
 ---A dig about to happen.
 ---@class Tiamot.DigEvent
 ---@field player string Who is digging, as 64 hex characters. This is the canonical player UUID — key any per-player state on it, never on the display name, which a player can change and which is not unique across servers.

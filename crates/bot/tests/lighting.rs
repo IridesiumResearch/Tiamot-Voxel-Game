@@ -248,3 +248,101 @@ fn a_chunk_is_lit_once_however_many_players_ask_for_it() {
 
     assert!(server.stop());
 }
+
+/// A mod that refuses to break anything the sun can see.
+///
+/// A rule expressed entirely in terms of `game.get_light`, and one that reads
+/// like something a real mod would do — "you may only mine underground" is a
+/// perfectly ordinary game rule. What makes it a good test is that the answer
+/// is observable from outside: the block either goes or it does not.
+fn write_light_reader(name: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join("tiamot-light-reader").join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("watcher");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"watcher\"\nname = \"Watcher\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        "local ground = game.register_block{ id = \"ground\" }\n\
+         game.register_on_generate(function(buf, pos)\n\
+         \x20   buf:fill_below_heightmap(game.flat_heightmap(0), ground)\n\
+         end)\n\
+         game.register_tool{ id = \"hand\", brush = \"block\", speed_multiplier = 1.0, \
+         default = true }\n\
+         game.register_on_dig_complete(function(event)\n\
+         \x20   -- A dig event is in CELL coordinates, three per block, and\n\
+         \x20   -- `game.get_light` takes blocks. Getting this wrong reads the\n\
+         \x20   -- light three times too far out and the rule silently inverts.\n\
+         \x20   local bx, by, bz = event.x // 3, event.y // 3, event.z // 3\n\
+         \x20   local above = game.get_light{ x = bx, y = by + 1, z = bz }\n\
+         \x20   game.log(\"light above the dig: sun=\" .. above.sun)\n\
+         \x20   if above.sun > 0 then\n\
+         \x20       return false\n\
+         \x20   end\n\
+         end)\n",
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_mod_can_read_the_light_where_something_happened() {
+    // `game.get_light` over the real path: a mod callback, inside a tick, on a
+    // world whose light the server computed this tick. A mod deciding whether
+    // something may happen somewhere dark is the reason it exists.
+    //
+    // The assertion is the mod's RULE rather than the mod merely running: a
+    // surface block has daylight above it and survives, a buried one does not
+    // and goes. Both directions, because a `get_light` that returned darkness
+    // for everything would pass a test that only dug underground.
+    let mods = write_light_reader("dig");
+    let dir = std::env::temp_dir().join("tiamot-light-reader-world");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("world dir");
+
+    let server = ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: dir,
+        max_players: 4,
+        allowlist: Allowlist::open(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(mods),
+        seed: Some(11),
+        rcon: None,
+        materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
+    })
+    .expect("start");
+
+    block_on(async {
+        let mut bot = join(&server, "Digger").await;
+        // The surface, whose neighbour above is open sky.
+        let lit = BlockPos::new(2, -1, 0);
+        // Three blocks down, whose neighbour above is solid rock.
+        let buried = BlockPos::new(2, -4, 0);
+
+        bot.expect_light(lit, |_| true, Duration::from_secs(20))
+            .await
+            .expect("light should arrive for the ground");
+
+        // Refused: the mod read full daylight above it. `dig_block` waits for
+        // the block to become air and times out when it never does, which is
+        // the veto working.
+        let refused = bot.dig_block(lit).await;
+        assert!(
+            refused.is_err(),
+            "the surface block broke, so the mod saw no daylight above it"
+        );
+
+        // Allowed: rock above it, so the mod read darkness.
+        bot.dig_block(buried)
+            .await
+            .expect("a buried block should break, so the mod read darkness above it");
+    });
+
+    assert!(server.stop());
+}

@@ -42,6 +42,41 @@ use tiamot_core::{CHUNK_BLOCKS, MaterialId};
 
 use crate::world::World;
 
+/// The light store, as a mod may read it.
+///
+/// This is the whole of `game.get_light`'s implementation: the VM lives in
+/// core and cannot know about [`Lighting`] (charter rule 3), so it asks through
+/// [`tiamot_core::light::LightSource`] and this is what answers.
+///
+/// **Read-only, deliberately.** A mod that could write light would be writing a
+/// derived value — the next relight would overwrite it, and the disagreement in
+/// between would be invisible everywhere except in whatever the mod did next.
+/// If a mod wants somewhere to be brighter, the way to say so is a block that
+/// emits.
+#[derive(Debug)]
+pub struct Shared {
+    lighting: std::sync::Arc<std::sync::RwLock<Lighting>>,
+}
+
+impl Shared {
+    /// Wraps a store the simulation thread owns.
+    #[must_use]
+    pub const fn new(lighting: std::sync::Arc<std::sync::RwLock<Lighting>>) -> Self {
+        Self { lighting }
+    }
+}
+
+impl tiamot_core::light::LightSource for Shared {
+    fn light_at(&self, pos: BlockPos) -> Light {
+        // A poisoned lock means the simulation thread panicked, in which case
+        // there is no light and no world; darkness is the honest answer and
+        // panicking inside a mod callback would blame the mod.
+        self.lighting
+            .read()
+            .map_or(Light::DARK, |lighting| lighting.at(pos))
+    }
+}
+
 /// Every loaded chunk's light, and what the mods said glows.
 #[derive(Debug, Default)]
 pub struct Lighting {
