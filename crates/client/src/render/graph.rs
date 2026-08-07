@@ -261,6 +261,34 @@ fn post_pipeline(
         })
 }
 
+/// The shaders and layout mode 3 compiles its own pipelines from.
+///
+/// The same modules the other modes draw with — a second copy compiled from the
+/// same file would be a second thing to keep in step.
+#[derive(Debug, Clone, Copy)]
+pub struct Shaders<'a> {
+    /// The world shader.
+    pub world: &'a wgpu::ShaderModule,
+    /// The selection-outline shader.
+    pub selection: &'a wgpu::ShaderModule,
+    /// The bind group layout both of them use.
+    pub layout: &'a wgpu::BindGroupLayout,
+}
+
+/// What the chain is being built for.
+#[derive(Debug, Clone, Copy)]
+pub struct Setup {
+    /// Textured, flat or wireframe — the debugging axis, which mode 3's own
+    /// pipelines have to honour like everyone else's.
+    pub mode: super::RenderMode,
+    /// Frame width in pixels.
+    pub width: u32,
+    /// Frame height in pixels.
+    pub height: u32,
+    /// Texels per shadow cascade, or `None` for no shadows.
+    pub shadow_texels: Option<u32>,
+}
+
 /// One pass of the chain, as the graph describes it.
 struct Step<'a> {
     label: &'a str,
@@ -302,8 +330,9 @@ pub struct Post {
     black: wgpu::TextureView,
     size: (u32, u32),
     /// The cascades. Owned here so that everything mode 3 allocates is built
-    /// and dropped as one thing.
-    shadows: super::shadow::Shadows,
+    /// and dropped as one thing, and `None` when shadows are turned off — which
+    /// is a setting of its own rather than a reason to leave mode 3.
+    shadows: Option<super::shadow::Shadows>,
     /// The world and selection pipelines again, built for the float target.
     ///
     /// A pipeline is compiled against one output format, so mode 3 cannot reuse
@@ -321,15 +350,18 @@ impl Post {
     /// they are the SAME shaders the other modes draw with, and a second copy
     /// compiled from the same file would be a second thing to keep in step.
     #[must_use]
-    pub fn new(
-        gpu: &Gpu,
-        world_shader: &wgpu::ShaderModule,
-        selection_shader: &wgpu::ShaderModule,
-        world_layout: &wgpu::BindGroupLayout,
-        mode: super::RenderMode,
-        width: u32,
-        height: u32,
-    ) -> Self {
+    pub fn new(gpu: &Gpu, shaders: &Shaders<'_>, frame: Setup) -> Self {
+        let Shaders {
+            world: world_shader,
+            selection: selection_shader,
+            layout: world_layout,
+        } = *shaders;
+        let Setup {
+            mode,
+            width,
+            height,
+            shadow_texels,
+        } = frame;
         let shader = gpu
             .device
             .create_shader_module(wgpu::include_wgsl!("post.wgsl"));
@@ -374,7 +406,7 @@ impl Post {
 
         let bloom_width = (width / BLOOM_DIVISOR).max(1);
         let bloom_height = (height / BLOOM_DIVISOR).max(1);
-        let shadows = super::shadow::Shadows::new(gpu);
+        let shadows = shadow_texels.map(|size| super::shadow::Shadows::new(gpu, size));
 
         Self {
             scene: Target::new(gpu, "post-scene", width, height, HDR_FORMAT),
@@ -392,14 +424,20 @@ impl Post {
                 uniform("post-blur-v-uniforms"),
                 uniform("post-composite-uniforms"),
             ],
-            world: super::build_shadowed_pipeline(
-                gpu,
-                world_shader,
-                world_layout,
-                shadows.sample_layout(),
-                mode,
-                HDR_FORMAT,
-            ),
+            world: match shadows.as_ref() {
+                Some(shadows) => super::build_shadowed_pipeline(
+                    gpu,
+                    world_shader,
+                    world_layout,
+                    shadows.sample_layout(),
+                    mode,
+                    HDR_FORMAT,
+                ),
+                // No cascades to bind, so the pipeline that does not mention
+                // them: `fragment_main` leaves every surface unshadowed, which
+                // is what "shadows off" means.
+                None => super::build_pipeline(gpu, world_shader, world_layout, mode, HDR_FORMAT),
+            },
             selection: super::build_selection_pipeline(
                 gpu,
                 selection_shader,
@@ -433,13 +471,20 @@ impl Post {
 
     /// The cascades, for updating them and for drawing into them.
     #[must_use]
-    pub const fn shadows(&self) -> &super::shadow::Shadows {
-        &self.shadows
+    pub const fn shadows(&self) -> Option<&super::shadow::Shadows> {
+        self.shadows.as_ref()
     }
 
     /// The cascades, mutably, so the frame can move them with the camera.
-    pub const fn shadows_mut(&mut self) -> &mut super::shadow::Shadows {
-        &mut self.shadows
+    pub const fn shadows_mut(&mut self) -> Option<&mut super::shadow::Shadows> {
+        self.shadows.as_mut()
+    }
+
+    /// Texels per cascade, or `None` when shadows are off — so the frame can
+    /// tell whether the chain it has matches the setting it was asked for.
+    #[must_use]
+    pub fn shadow_texels(&self) -> Option<u32> {
+        self.shadows.as_ref().map(super::shadow::Shadows::size)
     }
 
     /// The world pipeline, compiled for the float target.
@@ -464,11 +509,14 @@ impl Post {
     ///
     /// For the HUD and for the test that mode 1 allocates none of it.
     #[must_use]
-    pub const fn bytes(&self) -> u64 {
+    pub fn bytes(&self) -> u64 {
         self.scene.bytes
             + self.bloom[0].bytes
             + self.bloom[1].bytes
-            + super::shadow::Shadows::bytes()
+            + self
+                .shadows
+                .as_ref()
+                .map_or(0, super::shadow::Shadows::bytes)
     }
 
     /// Runs threshold, blur, blur, composite — scene in, `target` out.

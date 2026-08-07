@@ -215,6 +215,78 @@ impl LightingMode {
     }
 }
 
+/// How sharp the shadows in lighting mode 3 are.
+///
+/// Four settings because shadow resolution is the one thing in this renderer
+/// where the right answer depends entirely on the card: the cascades are the
+/// largest textures the client allocates, and the difference between the
+/// cheapest and the dearest is a factor of sixteen in both memory and fill.
+///
+/// The numbers are texels per side per cascade, three cascades deep:
+///
+/// | setting | per cascade | total depth memory |
+/// |---|---|---|
+/// | `off` | — | none |
+/// | `low` | 1024 | 12 MiB |
+/// | `medium` | 2048 | 48 MiB |
+/// | `high` | 4096 | 192 MiB |
+///
+/// `medium` is the default. `low` was the only option when cascades landed and
+/// was reported as about a quarter of the resolution it wanted, which is
+/// exactly one step: each level doubles the texels per side.
+///
+/// `off` keeps everything else mode 3 does — the bloom, the tonemap, the depth
+/// fog — and allocates no shadow maps at all. Worth having as its own setting
+/// rather than making people drop to mode 2 for the frame rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ShadowQuality {
+    /// No shadow maps, and none allocated.
+    Off,
+    /// 1024 texels per cascade.
+    Low,
+    /// 2048 texels per cascade.
+    #[default]
+    Medium,
+    /// 4096 texels per cascade.
+    High,
+}
+
+impl ShadowQuality {
+    /// Texels per side of one cascade, or `None` when shadows are off.
+    #[must_use]
+    pub const fn texels(self) -> Option<u32> {
+        match self {
+            Self::Off => None,
+            Self::Low => Some(1024),
+            Self::Medium => Some(2048),
+            Self::High => Some(4096),
+        }
+    }
+
+    /// The next setting in the cycle, for the key that changes it live.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Low,
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Off,
+        }
+    }
+
+    /// What to call it on the HUD.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 /// Client configuration.
 ///
 /// Unknown fields are rejected rather than ignored, for the same reason the
@@ -258,6 +330,10 @@ pub struct Config {
     /// rather than the mode it stays in.
     #[serde(default)]
     pub lighting_mode: LightingMode,
+
+    /// How sharp mode 3's shadows are. Also switchable while running.
+    #[serde(default)]
+    pub shadow_quality: ShadowQuality,
 
     /// Whether to wait for vertical blank.
     ///
@@ -429,6 +505,7 @@ impl Default for Config {
             vertical_view_distance: Self::default_vertical_view_distance(),
             render_mode: RenderMode::default(),
             lighting_mode: LightingMode::default(),
+            shadow_quality: ShadowQuality::default(),
             vsync: Self::default_vsync(),
             fov_degrees: Self::default_fov_degrees(),
             mouse_sensitivity: Self::default_mouse_sensitivity(),

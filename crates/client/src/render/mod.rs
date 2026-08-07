@@ -555,6 +555,8 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     depth_size: (u32, u32),
     mode: RenderMode,
+    /// How sharp the cascades are, or whether there are any.
+    shadow_quality: crate::config::ShadowQuality,
     /// Which of Task 10's lighting modes is showing.
     ///
     /// Changed live by [`Renderer::set_lighting_mode`]. The pipeline does not
@@ -700,6 +702,7 @@ impl Renderer {
             // Classic until told otherwise: a client with no config gets the
             // mode the world was lit for.
             lighting: crate::config::LightingMode::default(),
+            shadow_quality: crate::config::ShadowQuality::default(),
             world_shader: shader,
             selection_shader,
             post: None,
@@ -788,6 +791,20 @@ impl Renderer {
     #[must_use]
     pub const fn lighting_mode(&self) -> crate::config::LightingMode {
         self.lighting
+    }
+
+    /// Sets how sharp mode 3's shadows are.
+    ///
+    /// Takes effect on the next frame: the cascades are rebuilt because their
+    /// resolution is the texture's, not a uniform.
+    pub const fn set_shadow_quality(&mut self, quality: crate::config::ShadowQuality) {
+        self.shadow_quality = quality;
+    }
+
+    /// How sharp mode 3's shadows are.
+    #[must_use]
+    pub const fn shadow_quality(&self) -> crate::config::ShadowQuality {
+        self.shadow_quality
     }
 
     /// Texture memory the post chain is holding, in bytes. Zero unless mode 3
@@ -982,13 +999,18 @@ impl Renderer {
                 self.sky_colour[2],
                 self.fog_end,
             ],
-            light_view_projection: self.post.as_ref().map_or(
+            light_view_projection: self.post.as_ref().and_then(graph::Post::shadows).map_or(
                 [glam::Mat4::IDENTITY.to_cols_array_2d(); shadow::CASCADES],
-                |post| post.shadows().matrices().map(|m| m.to_cols_array_2d()),
+                |s| s.matrices().map(|m| m.to_cols_array_2d()),
             ),
             cascade_far: {
                 let splits = shadow::Shadows::split_distances();
-                [splits[0], splits[1], splits[2], 1.0 / shadow::SIZE as f32]
+                let texels = self
+                    .post
+                    .as_ref()
+                    .and_then(graph::Post::shadow_texels)
+                    .unwrap_or(shadow::DEFAULT_SIZE);
+                [splits[0], splits[1], splits[2], 1.0 / texels as f32]
             },
         }
     }
@@ -1060,21 +1082,27 @@ impl Renderer {
             self.post = None;
             return;
         }
-        if self
-            .post
-            .as_ref()
-            .is_some_and(|post| post.fits(size.0, size.1))
-        {
+        // Rebuilt when the frame changes size OR when the shadow setting does:
+        // the cascades' resolution is baked into the textures, so a new quality
+        // needs new ones.
+        if self.post.as_ref().is_some_and(|post| {
+            post.fits(size.0, size.1) && post.shadow_texels() == self.shadow_quality.texels()
+        }) {
             return;
         }
         self.post = Some(graph::Post::new(
             &self.gpu,
-            &self.world_shader,
-            &self.selection_shader,
-            &self.bind_layout,
-            self.mode,
-            size.0,
-            size.1,
+            &graph::Shaders {
+                world: &self.world_shader,
+                selection: &self.selection_shader,
+                layout: &self.bind_layout,
+            },
+            graph::Setup {
+                mode: self.mode,
+                width: size.0,
+                height: size.1,
+                shadow_texels: self.shadow_quality.texels(),
+            },
         ));
     }
 
@@ -1113,10 +1141,10 @@ impl Renderer {
     /// shares this module's vertex layout rather than having one of its own.
     /// Nothing happens in the modes with no cascades to fill.
     fn fill_cascades(&self, encoder: &mut wgpu::CommandEncoder, visible: &[ChunkPos]) {
-        let Some(post) = self.post.as_ref() else {
+        let Some(shadows) = self.post.as_ref().and_then(graph::Post::shadows) else {
             return;
         };
-        post.shadows().render(encoder, |pass, _cascade| {
+        shadows.render(encoder, |pass, _cascade| {
             pass.set_vertex_buffer(1, self.instances.slice(..));
             for (index, pos) in visible.iter().enumerate() {
                 let Some(mesh) = self.chunks.get(pos) else {
@@ -1156,9 +1184,8 @@ impl Renderer {
         let view_projection = camera.view_projection(aspect);
 
         // Before the globals are written, because the matrices go in them.
-        if let Some(post) = self.post.as_mut() {
-            let sun = self.sun_direction;
-            post.shadows_mut().update(&self.gpu, camera, aspect, sun);
+        if let Some(shadows) = self.post.as_mut().and_then(graph::Post::shadows_mut) {
+            shadows.update(&self.gpu, camera, aspect, self.sun_direction);
         }
 
         self.gpu.queue.write_buffer(
@@ -1226,8 +1253,8 @@ impl Renderer {
 
             pass.set_pipeline(world_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            if let Some(post) = self.post.as_ref() {
-                pass.set_bind_group(1, post.shadows().sample_bind(), &[]);
+            if let Some(shadows) = self.post.as_ref().and_then(graph::Post::shadows) {
+                pass.set_bind_group(1, shadows.sample_bind(), &[]);
             }
             pass.set_vertex_buffer(1, self.instances.slice(..));
 

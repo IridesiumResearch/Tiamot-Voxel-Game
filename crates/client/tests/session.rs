@@ -708,15 +708,31 @@ fn third_person_puts_a_body_in_the_frame_that_first_person_does_not() {
     let camera = *app.camera();
     let third = target.capture(app.renderer(), &camera).expect("capture");
 
-    assert_ne!(
-        perceptual_hash(&first),
-        perceptual_hash(&third),
-        "third person drew the same frame as first person, so neither the camera nor the body \
-         moved"
-    );
+    // Counted pixels rather than the perceptual hash: the hash averages a frame
+    // into a 16x16 grid so that filtering differences cannot move it, and a
+    // camera stepping back four blocks over a flat white world does not move it
+    // either. The hash answers "did the world stop drawing"; this question is
+    // "did anything change at all".
+    let differing = (0..HEIGHT)
+        .step_by(2)
+        .flat_map(|y| (0..WIDTH).step_by(2).map(move |x| (x, y)))
+        .filter(|(x, y)| first.pixel(*x, *y) != third.pixel(*x, *y))
+        .count();
     assert!(
-        shows_a_world(&third),
-        "third person drew an empty sky, so the camera went somewhere the world is not"
+        differing > 8,
+        "only {differing} sampled pixels changed, so neither the camera nor the body moved"
+    );
+    // Ground in the frame, not the horizon: a level camera over a flat plain
+    // sees mostly distant terrain, and distant terrain is fogged to the sky's
+    // own colour on purpose — so "is there a world here" cannot be asked of it.
+    app.look_down_by(1.0);
+    app.advance(Input::default(), 1.0 / 60.0);
+    let camera = *app.camera();
+    let looking_down = target.capture(app.renderer(), &camera).expect("capture");
+    assert!(
+        shows_a_world(&looking_down),
+        "third person drew an empty sky with the camera pointed at the ground, so it went \
+         somewhere the world is not"
     );
 
     // And back, because a view you cannot leave is a trap rather than a tool.

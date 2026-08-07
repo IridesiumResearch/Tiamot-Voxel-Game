@@ -953,6 +953,22 @@ impl App {
         self.third_person
     }
 
+    /// Steps the shadow quality: off, low, medium, high, and round again.
+    ///
+    /// Live, like the lighting mode, and for the same reason — the difference
+    /// between two settings is a thing you judge by looking at them one after
+    /// the other, not by restarting between them.
+    pub fn cycle_shadow_quality(&mut self) {
+        self.config.shadow_quality = self.config.shadow_quality.next();
+        self.renderer.set_shadow_quality(self.config.shadow_quality);
+    }
+
+    /// How sharp mode 3's shadows are.
+    #[must_use]
+    pub const fn shadow_quality(&self) -> crate::config::ShadowQuality {
+        self.config.shadow_quality
+    }
+
     /// Moves the time of day by hand, for looking at the sky and the shadows.
     ///
     /// **A debugging affordance, and the honest kind**: it moves the CLIENT's
@@ -1701,15 +1717,17 @@ impl App {
             // The debug keys, on the screen rather than in a commit message.
             // Every one of these was added for somebody to look at something
             // with, and a key nobody can find is a feature nobody has.
-            "keys: L light · V third person · [ ] time · \\ resync · G blocks · T/H teleport"
+            "keys: L light · K shadows · V third person · [ ] time · \\ resync · G blocks · \
+             T/H teleport"
                 .to_owned(),
             format!(
-                "{} on {} / {} · vsync {} · light {} (L)",
+                "{} on {} / {} · vsync {} · light {} · shadows {}",
                 self.server_label,
                 self.renderer.gpu().adapter,
                 self.renderer.gpu().backend,
                 if self.config.vsync { "on" } else { "OFF" },
-                self.config.lighting_mode.name()
+                self.config.lighting_mode.name(),
+                self.config.shadow_quality.name()
             ),
             // The hotbar, such as it is. Names rather than ids: a player
             // debugging a placement needs to know it is stone, not that it is 2.

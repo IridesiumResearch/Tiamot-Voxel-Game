@@ -68,6 +68,15 @@ render_mode = "textured"
 #                 still to come; each pass is listed here as it lands.
 lighting_mode = "classic"
 
+# How sharp mode 3's shadows are. Switchable while playing with K.
+#   "off"    — no shadow maps and none allocated. The rest of mode 3 — bloom,
+#              the tonemap, the depth fog — is unaffected.
+#   "low"    — 1024 texels per cascade, 12 MiB of depth across the three.
+#   "medium" — 2048, 48 MiB. The default.
+#   "high"   — 4096, 192 MiB. Ask for this on a card that has the memory.
+# Each rung doubles the texels per side, so it is a factor of four in area.
+shadow_quality = "medium"
+
 # Wait for vertical blank. On by default: frame PACING is the metric this
 # project cares about, not average frame rate (charter rule 18), and an
 # unsynchronised loop trades the former for the latter.

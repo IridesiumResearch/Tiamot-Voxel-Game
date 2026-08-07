@@ -40,14 +40,12 @@ use super::{DEPTH_FORMAT, Gpu};
 /// distance fog is already dissolving.
 pub const CASCADES: usize = 3;
 
-/// Texels per side of one cascade.
+/// Texels per side of one cascade, when nothing says otherwise.
 ///
-/// 1024 is 4 MiB of depth across the three, which sits inside the VRAM bound
-/// charter rule 19 traded the geometry-inflation gate for. It is also the point
-/// where the near cascade's texel is smaller than a sub-node at arm's length,
-/// which is the resolution that decides whether a chiselled edge casts a
-/// recognisable shadow.
-pub const SIZE: u32 = 1024;
+/// A setting rather than a constant, because this is where the cost is: three
+/// cascades at 2048 are 48 MiB of depth, and at 4096 they are 192. See
+/// [`crate::config::ShadowQuality`] for the ladder and what each rung costs.
+pub const DEFAULT_SIZE: u32 = 2048;
 
 /// Where each cascade ends, as a fraction of the shadow range.
 ///
@@ -90,6 +88,8 @@ struct CascadeUniform {
 /// The three maps, the pipeline that fills them, and the sampler that reads
 /// them.
 pub struct Shadows {
+    /// Texels per side, from the quality setting.
+    size: u32,
     /// A view per layer, because a render pass attaches one layer at a time.
     layers: [wgpu::TextureView; CASCADES],
     pipeline: wgpu::RenderPipeline,
@@ -106,12 +106,12 @@ pub struct Shadows {
 impl Shadows {
     /// Builds the maps and both pipelines' worth of layout.
     #[must_use]
-    pub fn new(gpu: &Gpu) -> Self {
+    pub fn new(gpu: &Gpu, size: u32) -> Self {
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("shadow-cascades"),
             size: wgpu::Extent3d {
-                width: SIZE,
-                height: SIZE,
+                width: size,
+                height: size,
                 depth_or_array_layers: CASCADES as u32,
             },
             mip_level_count: 1,
@@ -191,6 +191,7 @@ impl Shadows {
             binds,
             sample_layout,
             matrices: [Mat4::IDENTITY; CASCADES],
+            size,
         }
     }
 
@@ -231,7 +232,7 @@ impl Shadows {
 
         let mut near = camera.near;
         for (index, far) in Self::split_distances().into_iter().enumerate() {
-            self.matrices[index] = cascade_matrix(camera, aspect, near, far, sun);
+            self.matrices[index] = cascade_matrix(camera, aspect, near, far, sun, self.size);
             gpu.queue.write_buffer(
                 &self.uniforms[index],
                 0,
@@ -274,10 +275,16 @@ impl Shadows {
         }
     }
 
+    /// Texels per side of one cascade.
+    #[must_use]
+    pub const fn size(&self) -> u32 {
+        self.size
+    }
+
     /// How much texture memory the cascades hold.
     #[must_use]
-    pub const fn bytes() -> u64 {
-        (SIZE as u64) * (SIZE as u64) * 4 * CASCADES as u64
+    pub const fn bytes(&self) -> u64 {
+        (self.size as u64) * (self.size as u64) * 4 * CASCADES as u64
     }
 }
 
@@ -342,7 +349,7 @@ fn sample_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
     clippy::disallowed_methods,
     reason = "charter rule 4 exempts rendering from the deterministic float subset; this tangent               decides where a shadow map looks, not what the world is"
 )]
-fn cascade_matrix(camera: &Camera, aspect: f32, near: f32, far: f32, sun: Vec3) -> Mat4 {
+fn cascade_matrix(camera: &Camera, aspect: f32, near: f32, far: f32, sun: Vec3, size: u32) -> Mat4 {
     let forward = camera.forward();
     let right = forward.cross(Vec3::Y).normalize_or_zero();
     let up = right.cross(forward).normalize_or_zero();
@@ -377,7 +384,7 @@ fn cascade_matrix(camera: &Camera, aspect: f32, near: f32, far: f32, sun: Vec3) 
     // moves by fractions of a texel as the player walks and the shadow edges
     // shimmer — the classic artefact, and the reason the sphere alone is not
     // enough to hold them still.
-    let texel = (radius * 2.0) / SIZE as f32;
+    let texel = (radius * 2.0) / size as f32;
     let eye = centre - sun * (radius + CASTER_MARGIN);
     let view = glam::camera::rh::view::look_to_mat4(eye, sun, Vec3::Y);
     let snapped_centre = {
@@ -491,8 +498,8 @@ mod tests {
         // table that flattened the distribution fails here rather than looking
         // fine until somebody notices soft shadows underfoot.
         let splits = Shadows::split_distances();
-        let near_density = f32::from(u16::try_from(SIZE).unwrap_or(u16::MAX)) / splits[0];
-        let far_density = f32::from(u16::try_from(SIZE).unwrap_or(u16::MAX)) / splits[2];
+        let near_density = f32::from(u16::try_from(DEFAULT_SIZE).unwrap_or(u16::MAX)) / splits[0];
+        let far_density = f32::from(u16::try_from(DEFAULT_SIZE).unwrap_or(u16::MAX)) / splits[2];
         assert!(
             near_density > far_density * 8.0,
             "the near cascade is only {}x denser than the far one",
@@ -508,7 +515,7 @@ mod tests {
         // is nearly right fails.
         let camera = Camera::default();
         let sun = Vec3::new(0.0, -1.0, 0.25).normalize();
-        let matrix = cascade_matrix(&camera, 16.0 / 9.0, 0.05, 20.0, sun);
+        let matrix = cascade_matrix(&camera, 16.0 / 9.0, 0.05, 20.0, sun, DEFAULT_SIZE);
 
         let forward = camera.forward();
         for distance in [1.0_f32, 10.0, 19.0] {
@@ -533,9 +540,9 @@ mod tests {
         // the world crawls while the player looks around.
         let sun = Vec3::new(0.2, -1.0, 0.3).normalize();
         let mut camera = Camera::default();
-        let first = cascade_matrix(&camera, 1.0, 0.05, 20.0, sun);
+        let first = cascade_matrix(&camera, 1.0, 0.05, 20.0, sun, DEFAULT_SIZE);
         camera.yaw += std::f32::consts::FRAC_PI_2;
-        let second = cascade_matrix(&camera, 1.0, 0.05, 20.0, sun);
+        let second = cascade_matrix(&camera, 1.0, 0.05, 20.0, sun, DEFAULT_SIZE);
 
         // The projections must be identical — same radius, same extent. The
         // views differ, because the slice really is somewhere else.

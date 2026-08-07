@@ -205,12 +205,18 @@ fn fog_amount(distance: f32) -> f32 {
 // Was 1.6, which was reported from the window as about 40% too much glow — the
 // number is how far past white a lamp-lit surface goes, so it is the knob that
 // decides how much of a wall blooms rather than how bright the bloom is.
-const EMISSIVE_GAIN: f32 = 1.35;
+const EMISSIVE_GAIN: f32 = 1.2;
 
 // How dark the neutral is that occlusion mixes toward, as a fraction of the
 // surface's own brightness. Half: dark enough to read as a corner, light enough
 // that the geometry in it is still visible.
 const AO_NEUTRAL: f32 = 0.5;
+
+// `normalize` makes a unit vector, whose components average about 0.58 rather
+// than 1, so the tint needs scaling back up or every occluded corner is darker
+// than it was meant to be. Written as a constant rather than folded in because
+// it is arithmetic bookkeeping and not a look.
+const SKY_TINT_SCALE: f32 = 1.732;
 
 // Perceived brightness, for the grey occlusion mixes toward. The green weight
 // dominates because the eye's does.
@@ -232,7 +238,22 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     // the sun can see a surface it does reach. Applying it to the total would
     // let a shadow put out a lamp.
     let daylight = input.sun * globals.sun_intensity * globals.sun_colour.rgb * shadow;
+
+    // **Block light loses its hue as it dims, on purpose.**
+    //
+    // Each channel is stored with its own falloff, one level a block, so the
+    // weakest channel reaches zero first and the hue slides toward the
+    // strongest as the light gets further from its source: a warm lamp goes
+    // orange, then red, then black. Reported from the window as "very yellow
+    // near the middle and very red at the edges", which is exactly that.
+    //
+    // Fading the colour out as the level falls puts the falloff back where it
+    // belongs — in the brightness — and turns a saturated red fringe into a
+    // dim one. The lamp keeps its colour where it is bright enough for the
+    // colour to be what anyone is looking at.
     var block = input.block_light;
+    let peak = max(block.r, max(block.g, block.b));
+    block = mix(vec3<f32>(peak), block, peak);
     if (globals.lighting_mode == 2u) {
         block = block * EMISSIVE_GAIN;
     }
@@ -240,7 +261,14 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     // A floor under the darkest cave, so a dark room is legible rather than
     // pitch black. Presentation, not simulation — the stored light really is
     // zero down there.
-    let shaded = max(lit, vec3<f32>(globals.ambient)) * input.shade;
+    // The floor under the darkest place is the SKY's colour, not grey.
+    //
+    // Whatever light reaches a shadowed surface with no lamp on it came from
+    // the sky, so it arrives the colour the sky is — bluish by day, and the
+    // reason a neutral grey floor read as yellow against a blue world. Scaled
+    // right down: this is a floor, not a second light source.
+    let ambient = globals.sky_colour.rgb * globals.ambient;
+    let shaded = max(lit, ambient) * input.shade;
 
     // **Occlusion darkens toward grey, not by scaling.**
     //
@@ -255,7 +283,12 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     // A real shadow takes the light away, and colour with it. Mixing toward a
     // neutral grey of the same brightness removes the hue as it removes the
     // light, which is what an eye expects a corner to do.
-    let neutral = vec3<f32>(luma(shaded) * AO_NEUTRAL);
+    // Toward the sky's colour at the same brightness, for the reason the
+    // ambient floor is: a corner is dark because the sky cannot see into it,
+    // and what little reaches it is skylight. A neutral grey was the first
+    // attempt and still read as yellow against a blue world.
+    let sky_tint = normalize(globals.sky_colour.rgb + vec3<f32>(0.0001));
+    let neutral = sky_tint * luma(shaded) * AO_NEUTRAL * SKY_TINT_SCALE;
     return mix(neutral, shaded, input.occlusion);
 }
 

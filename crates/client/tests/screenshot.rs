@@ -29,7 +29,7 @@
 
 use client::app::TELEPORT_CHUNKS;
 use client::camera::{Camera, Position};
-use client::config::{LightingMode, RenderMode};
+use client::config::{LightingMode, RenderMode, ShadowQuality};
 use client::mesher::{self, Absent, Neighbours};
 use client::render::offscreen::{hash_hex, perceptual_hash};
 use client::render::{Gpu, Offscreen, Renderer};
@@ -1228,5 +1228,65 @@ fn the_debug_body_is_actually_drawn_and_actually_casts() {
          but not the shadow pass",
         ground(&shadowed),
         ground(&unshadowed)
+    );
+}
+
+#[test]
+fn shadow_quality_changes_what_is_allocated_and_off_allocates_nothing() {
+    // Four settings because the cascades are the largest textures the client
+    // allocates and the right size depends entirely on the card. Asserted as
+    // memory rather than as sharpness: how sharp a shadow looks is a human
+    // gate, how much it costs is not.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    let mut previous = 0;
+    for quality in [
+        ShadowQuality::Off,
+        ShadowQuality::Low,
+        ShadowQuality::Medium,
+        ShadowQuality::High,
+    ] {
+        renderer.set_shadow_quality(quality);
+        let frame = target
+            .capture(&mut renderer, &viewpoint())
+            .expect("capture");
+        let ground = average(&frame, 0, HEIGHT * 3 / 4, WIDTH, HEIGHT);
+        assert!(
+            !is_sky(ground),
+            "{quality:?} drew no world at all, so the setting broke the frame rather than \
+             changing its shadows"
+        );
+
+        let bytes = renderer.post_bytes();
+        match quality {
+            ShadowQuality::Off => {
+                // The rest of mode 3 is still there — the float target and the
+                // bloom buffers — so this is not zero, only smaller than any
+                // setting that allocates cascades.
+                previous = bytes;
+            }
+            _ => {
+                assert!(
+                    bytes > previous,
+                    "{quality:?} allocated {bytes} against the previous setting's {previous}, so \
+                     the ladder does not climb"
+                );
+                previous = bytes;
+            }
+        }
+    }
+
+    // And back to off gives it all back.
+    renderer.set_shadow_quality(ShadowQuality::Off);
+    let _ = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    assert!(
+        renderer.post_bytes() < previous,
+        "turning shadows off kept their memory"
     );
 }

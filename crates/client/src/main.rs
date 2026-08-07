@@ -330,6 +330,11 @@ impl ApplicationHandler for Client {
                         KeyCode::F5 | KeyCode::KeyL if pressed => {
                             surface.app.cycle_lighting_mode();
                         }
+                        // Shadow resolution, off through high. Its own control
+                        // rather than part of the lighting mode: the cascades
+                        // are the largest thing the client allocates and the
+                        // right setting depends entirely on the card.
+                        KeyCode::KeyK if pressed => surface.app.cycle_shadow_quality(),
                         // Scrubbing the sky by hand, for looking at shadows at
                         // an hour that is not the one the server is at. A
                         // twentieth of a day a press, so a full circuit is
@@ -447,6 +452,7 @@ impl Client {
         );
         let mut renderer = Renderer::new(gpu, self.config.render_mode, size.0, size.1)?;
         renderer.set_lighting_mode(self.config.lighting_mode);
+        renderer.set_shadow_quality(self.config.shadow_quality);
 
         let egui = egui::Context::default();
         // egui is built without `default_fonts`, so it has no glyphs until this
