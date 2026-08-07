@@ -965,3 +965,46 @@ fn a_surface_brighter_than_white_bleeds_light_past_its_edge() {
          past the geometry and the bloom passes did nothing"
     );
 }
+
+#[test]
+fn a_low_sun_casts_longer_shadows_than_a_high_one() {
+    // The cascades, as pixels. The fixed scene has a block standing proud of
+    // its floor, so moving the sun down moves that block's shadow out across
+    // the floor and the floor gets darker overall.
+    //
+    // Compared against the SAME mode with the sun somewhere else, deliberately.
+    // Comparing mode 3 against mode 2 would also fold in the highlight
+    // shoulder, which darkens the brightest surfaces whether or not anything is
+    // shadowing them — a test that would pass with the shadow pass deleted.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Nearly overhead: a block's shadow is under the block.
+    renderer.set_sun(1.0, [1.0, 1.0, 1.0], [0.05, -0.99, 0.1]);
+    let overhead = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // Low and to one side: the same block throws its shadow across the floor.
+    renderer.set_sun(1.0, [1.0, 1.0, 1.0], [0.75, -0.35, 0.55]);
+    let low = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // The floor, which is the bottom of the frame — see `viewpoint`.
+    let floor = |frame: &Image| {
+        let colour = average(frame, 0, HEIGHT / 2, WIDTH, HEIGHT);
+        (colour[0] + colour[1] + colour[2]) / 3.0
+    };
+
+    let bright = floor(&overhead);
+    let shadowed = floor(&low);
+    assert!(
+        shadowed < bright - 0.01,
+        "the floor is {shadowed} under a low sun against {bright} under a high one, so nothing \
+         was shadowed by moving the sun"
+    );
+}

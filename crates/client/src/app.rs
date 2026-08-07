@@ -1233,7 +1233,8 @@ impl App {
         // is what stops it drifting.
         self.sky.advance(dt);
         let moment = self.sky.moment();
-        self.renderer.set_sun(moment.intensity, moment.sun);
+        self.renderer
+            .set_sun(moment.intensity, moment.sun, moment.sun_direction);
         self.renderer.set_sky(
             moment.sky,
             f32::from(self.config.view_distance) * tiamot_core::CHUNK_BLOCKS as f32,

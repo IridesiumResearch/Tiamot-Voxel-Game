@@ -42,11 +42,23 @@ struct Globals {
     sun_colour: vec4<f32>,
     // Sky colour in xyz, fog's far distance in w.
     sky_colour: vec4<f32>,
+    // World-to-light clip, one per shadow cascade. Only mode 3 reads these.
+    light_view_projection: array<mat4x4<f32>, 3>,
+    // Where each cascade ends, in blocks, in xyz; one shadow texel in UV in w.
+    cascade_far: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
+
+// Mode 3 only, and in its own bind group for exactly that reason: a binding
+// group is part of a pipeline's layout, so putting these in group 0 would make
+// every mode allocate shadow maps to have something to bind. `fragment_main`
+// does not mention them and `fragment_shadowed` does, which is what lets the
+// two pipelines have different layouts out of one shader file.
+@group(1) @binding(0) var shadow_map: texture_depth_2d_array;
+@group(1) @binding(1) var shadow_sampler: sampler_comparison;
 
 struct VertexIn {
     // x:6 | y:6 | z:6 | axis:2 | positive:1 | occlusion:2
@@ -73,6 +85,10 @@ struct VertexOut {
     @location(5) distance: f32,
     // Ambient occlusion, 0 darkest to 1 open, interpolated across the face.
     @location(6) occlusion: f32,
+    // Camera-relative position, which is where the shadow lookup happens. The
+    // renderer has no world-space coordinate to offer (floating origin), and
+    // the light matrices are built in the same space for that reason.
+    @location(7) world: vec3<f32>,
 };
 
 // Lighting mode 1: directional face shading, matching `mesher::face_shade`.
@@ -112,6 +128,7 @@ fn vertex_main(input: VertexIn) -> VertexOut {
     let camera_relative = local + input.chunk_offset.xyz;
     out.clip = globals.view_projection * vec4<f32>(camera_relative, 1.0);
     out.distance = length(camera_relative);
+    out.world = camera_relative;
 
     // The two coordinates that span this face's plane. Must match
     // `SubNodeGrid::cell`: axis 0 spans (y, z), axis 1 spans (x, z), axis 2
@@ -186,7 +203,7 @@ fn fog_amount(distance: f32) -> f32 {
 // simulation.
 const EMISSIVE_GAIN: f32 = 1.6;
 
-fn lighting(input: VertexOut) -> vec3<f32> {
+fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     // Mode 1: face shading and occlusion only, which is Task 08's world. The
     // vertices still carry light — the mesher was handed a flat daylight value
     // to bake, so they carry the same one everywhere and the branch is what
@@ -194,7 +211,12 @@ fn lighting(input: VertexOut) -> vec3<f32> {
     if (globals.lighting_mode == 0u) {
         return vec3<f32>(input.shade * input.occlusion);
     }
-    let daylight = input.sun * globals.sun_intensity * globals.sun_colour.rgb;
+    // **The shadow scales the SUN and nothing else.** A cave is dark because
+    // its stored sunlight channel is zero, which the server worked out and is
+    // true whether or not anything is drawing; the shadow map only says whether
+    // the sun can see a surface it does reach. Applying it to the total would
+    // let a shadow put out a lamp.
+    let daylight = input.sun * globals.sun_intensity * globals.sun_colour.rgb * shadow;
     var block = input.block_light;
     if (globals.lighting_mode == 2u) {
         block = block * EMISSIVE_GAIN;
@@ -206,8 +228,69 @@ fn lighting(input: VertexOut) -> vec3<f32> {
     return max(lit, vec3<f32>(globals.ambient)) * input.shade * input.occlusion;
 }
 
-@fragment
-fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
+// How much of the sun reaches this fragment, 0 fully shadowed to 1 open.
+//
+// # Picking a cascade
+//
+// By distance from the camera, which is what the cascades were split on. The
+// first one it fits into wins; past the last, everything is lit. That last case
+// is not a fallback — the shadow range stops well short of the far plane on
+// purpose, and beyond it distance fog is dissolving the geometry anyway.
+//
+// # PCF
+//
+// Nine comparison samples in a 3x3 around the point. `textureSampleCompare`
+// does the depth test in hardware and filters the RESULT, so each of these is
+// already a bilinear blend of four texels — nine taps behave like a 6x6 kernel.
+// A single tap gives a hard, stair-stepped edge along the shadow map's grid,
+// which on a voxel world reads as geometry that is not there.
+fn shadow_factor(input: VertexOut) -> f32 {
+    var cascade = 0;
+    if (input.distance > globals.cascade_far.z) {
+        return 1.0;
+    } else if (input.distance > globals.cascade_far.y) {
+        cascade = 2;
+    } else if (input.distance > globals.cascade_far.x) {
+        cascade = 1;
+    }
+
+    let clip = globals.light_view_projection[cascade] * vec4<f32>(input.world, 1.0);
+    // No perspective divide worth the name — the light's projection is
+    // orthographic, so w is 1 — but doing it costs nothing and means a future
+    // spotlight does not need this line rewritten.
+    let ndc = clip.xyz / clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+
+    // Outside the cascade, or behind the light's near plane: lit. A fragment
+    // that falls outside every cascade has no shadow information, and guessing
+    // "shadowed" would put a dark band around the edge of the map.
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+
+    let texel = globals.cascade_far.w;
+    var sum = 0.0;
+    for (var y = -1; y <= 1; y = y + 1) {
+        for (var x = -1; x <= 1; x = x + 1) {
+            let offset = vec2<f32>(f32(x), f32(y)) * texel;
+            sum = sum + textureSampleCompareLevel(
+                shadow_map,
+                shadow_sampler,
+                uv + offset,
+                cascade,
+                ndc.z
+            );
+        }
+    }
+    return sum / 9.0;
+}
+
+// One fragment, given how much sun reaches it.
+//
+// Shared by both entry points so the atlas lookup, the lighting and the fog
+// exist once. The only difference between a shadowed frame and an unshadowed
+// one is the number that arrives here.
+fn surface(input: VertexOut, shadow: f32) -> vec4<f32> {
     if (globals.render_mode == 1u) {
         // Flat: directional shading and occlusion, no propagated light.
         // **Mode 1 must keep Task 08's cost profile exactly**, and that
@@ -231,11 +314,23 @@ fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
     let uv = origin + fract(input.tile_uv) * extent;
 
     let texel = textureSampleGrad(atlas, atlas_sampler, uv, ddx, ddy);
-    let lit = texel.rgb * lighting(input);
+    let lit = texel.rgb * lighting(input, shadow);
 
     // Fog last, over the lit colour rather than under it: fog is between the
     // eye and the surface, so it is not something the surface's own light
     // shines through. Mixing before lighting would let a lamp brighten the air.
     let haze = fog_amount(input.distance);
     return vec4<f32>(mix(lit, globals.sky_colour.rgb, haze), texel.a);
+}
+
+// Modes 1 and 2: no shadow map exists, so nothing is in shadow.
+@fragment
+fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
+    return surface(input, 1.0);
+}
+
+// Mode 3: the same surface, with the cascades consulted.
+@fragment
+fn fragment_shadowed(input: VertexOut) -> @location(0) vec4<f32> {
+    return surface(input, shadow_factor(input));
 }

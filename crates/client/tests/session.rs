@@ -625,7 +625,6 @@ fn the_lighting_mode_switches_without_a_restart() {
         app.warnings()
     );
 
-    let held = app.store().len();
     assert_eq!(app.lighting_mode(), LightingMode::Classic, "the default");
 
     // Every mode in turn, and home again. Walking the whole cycle rather than
@@ -644,10 +643,15 @@ fn the_lighting_mode_switches_without_a_restart() {
             expected,
             "the renderer is still drawing the old mode, so the switch is invisible"
         );
+        // Against what is held NOW, not against a count taken before the
+        // switch. Chunks keep arriving while this runs, and CI caught the
+        // difference: 15 held against 10 counted a few frames earlier, which
+        // is the network working rather than the switch failing.
         assert_eq!(
             app.pending_chunks(),
-            held,
-            "switching to {expected:?} left the world meshed for the mode it is no longer in"
+            app.store().len(),
+            "switching to {expected:?} left part of the world meshed for the mode it is no \
+             longer in"
         );
 
         // And it draws. A mode that switches cleanly and then renders nothing

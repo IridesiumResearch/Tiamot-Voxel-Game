@@ -30,6 +30,7 @@
 pub mod frustum;
 pub mod graph;
 pub mod offscreen;
+pub mod shadow;
 
 use std::collections::BTreeMap;
 
@@ -107,7 +108,7 @@ struct Globals {
     tile: u32,
     padding: u32,
     render_mode: u32,
-    /// Task 10's lighting mode: 0 simple, 1 classic.
+    /// Task 10's lighting mode: 0 simple, 1 classic, 2 beautiful.
     ///
     /// Separate from `render_mode`, which says what *surface data* to draw
     /// (atlas, flat, wireframe) and is a debugging aid. This says how what is
@@ -141,6 +142,19 @@ struct Globals {
     /// the sky it is standing against, which is what hides the edge of the
     /// loaded world.
     sky_colour: [f32; 4],
+    /// One world-to-light matrix per shadow cascade. Written in every mode and
+    /// read only by mode 3 — 192 bytes in a uniform that is rewritten once a
+    /// frame, against a second buffer and a second write to avoid it.
+    ///
+    /// **These come after `sky_colour` because that is where `world.wgsl` has
+    /// them.** The two declarations are one memory layout written down twice
+    /// and nothing checks that they agree: putting these fields before the sky
+    /// colour made the shader read a matrix row as the fog colour, and the
+    /// distant world came out pure red. `distant_terrain_fades_into_the_sky`
+    /// is what caught it, within one test run of the mistake.
+    light_view_projection: [[[f32; 4]; 4]; shadow::CASCADES],
+    /// Where each cascade ends, in blocks, and one shadow texel in `w`.
+    cascade_far: [f32; 4],
 }
 
 /// How much light the darkest place still gets.
@@ -462,6 +476,9 @@ pub struct Renderer {
     sun_intensity: f32,
     /// The sun's colour now.
     sun_colour: [f32; 4],
+    /// Which way its light travels, for the cascades. Set by the sky with the
+    /// colour, and pointing sensibly downward until one arrives.
+    sun_direction: [f32; 3],
     /// The sky's colour now, which fog fades towards.
     sky_colour: [f32; 3],
     /// Where fog begins and where it is total, in blocks.
@@ -578,6 +595,7 @@ impl Renderer {
             // 08's scenes assumed and what a world with no sky mod gets.
             sun_intensity: 1.0,
             sun_colour: [1.0, 1.0, 1.0, 1.0],
+            sun_direction: [0.0, -0.970_142_5, 0.242_535_62],
             sky_colour: sky_colour(),
             // Far enough that nothing fogs until a view distance is set. A
             // client that fogged by default would hide geometry the Task 08
@@ -600,9 +618,10 @@ impl Renderer {
     /// is always full daylight, and this scales it at draw time. Anything else
     /// would dirty every chunk in the world twenty times a second and relight
     /// them all for a change nobody can distinguish from a multiply.
-    pub fn set_sun(&mut self, intensity: f32, colour: [f32; 3]) {
+    pub fn set_sun(&mut self, intensity: f32, colour: [f32; 3], direction: [f32; 3]) {
         self.sun_intensity = intensity.clamp(0.0, 1.0);
         self.sun_colour = [colour[0], colour[1], colour[2], 1.0];
+        self.sun_direction = direction;
     }
 
     /// Sets the sky's colour and where fog fades to it.
@@ -840,6 +859,14 @@ impl Renderer {
                 self.sky_colour[2],
                 self.fog_end,
             ],
+            light_view_projection: self.post.as_ref().map_or(
+                [glam::Mat4::IDENTITY.to_cols_array_2d(); shadow::CASCADES],
+                |post| post.shadows().matrices().map(|m| m.to_cols_array_2d()),
+            ),
+            cascade_far: {
+                let splits = shadow::Shadows::split_distances();
+                [splits[0], splits[1], splits[2], 1.0 / shadow::SIZE as f32]
+            },
         }
     }
 
@@ -920,6 +947,30 @@ impl Renderer {
         ));
     }
 
+    /// Draws the visible chunks into every shadow cascade.
+    ///
+    /// The same meshes and the same instance buffer as the world pass, drawn
+    /// from the sun instead of from the eye — which is why the shadow pipeline
+    /// shares this module's vertex layout rather than having one of its own.
+    /// Nothing happens in the modes with no cascades to fill.
+    fn fill_cascades(&self, encoder: &mut wgpu::CommandEncoder, visible: &[ChunkPos]) {
+        let Some(post) = self.post.as_ref() else {
+            return;
+        };
+        post.shadows().render(encoder, |pass, _cascade| {
+            pass.set_vertex_buffer(1, self.instances.slice(..));
+            for (index, pos) in visible.iter().enumerate() {
+                let Some(mesh) = self.chunks.get(pos) else {
+                    continue;
+                };
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                let instance = index as u32;
+                pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
+            }
+        });
+    }
+
     /// Renders one frame into `target`.
     ///
     /// `size` is the target's dimensions; the depth buffer is rebuilt when they
@@ -936,6 +987,12 @@ impl Renderer {
         let aspect = size.0 as f32 / size.1.max(1) as f32;
         let view_projection = camera.view_projection(aspect);
 
+        // Before the globals are written, because the matrices go in them.
+        if let Some(post) = self.post.as_mut() {
+            let sun = self.sun_direction;
+            post.shadows_mut().update(&self.gpu, camera, aspect, sun);
+        }
+
         self.gpu.queue.write_buffer(
             &self.globals,
             0,
@@ -950,6 +1007,8 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+
+        self.fill_cascades(&mut encoder, &visible);
 
         // Where the world goes: straight to the target in modes 1 and 2, and
         // into the float scene texture in mode 3 so the post chain has
@@ -999,6 +1058,9 @@ impl Renderer {
 
             pass.set_pipeline(world_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            if let Some(post) = self.post.as_ref() {
+                pass.set_bind_group(1, post.shadows().sample_bind(), &[]);
+            }
             pass.set_vertex_buffer(1, self.instances.slice(..));
 
             for (index, pos) in visible.iter().enumerate() {
@@ -1185,6 +1247,72 @@ fn build_bind_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
         })
 }
 
+/// The vertex and instance buffers a chunk mesh is drawn from.
+///
+/// Shared by the world pipeline and the shadow pipeline, which is the point:
+/// both draw the same uploaded buffers, and a layout that had drifted between
+/// them would put shadows somewhere the geometry is not.
+///
+/// Returned by value rather than as a constant because a `VertexBufferLayout`
+/// borrows its attribute slice, and a `const` one cannot be referenced from two
+/// pipelines without naming the lifetime everywhere.
+fn vertex_layout() -> [wgpu::VertexBufferLayout<'static>; 2] {
+    const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 4,
+            shader_location: 1,
+        },
+    ];
+    const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x4,
+        offset: 0,
+        shader_location: 2,
+    }];
+
+    [
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<PackedVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &VERTEX_ATTRIBUTES,
+        },
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Instance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &INSTANCE_ATTRIBUTES,
+        },
+    ]
+}
+
+/// The world pipeline with the shadow cascades bound as a second group.
+///
+/// A separate function and a separate entry point rather than a flag, because
+/// a bind group is part of a pipeline's layout: a single pipeline that could
+/// optionally read shadows would need the maps to exist in every mode, which is
+/// exactly the allocation Task 10 says mode 1 must not make.
+fn build_shadowed_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    bind_layout: &wgpu::BindGroupLayout,
+    shadow_layout: &wgpu::BindGroupLayout,
+    mode: RenderMode,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    build_world_pipeline(
+        gpu,
+        shader,
+        &[Some(bind_layout), Some(shadow_layout)],
+        "fragment_shadowed",
+        mode,
+        format,
+    )
+}
+
 /// Builds the world pipeline.
 ///
 /// A function rather than more of [`Renderer::new`], which was long enough that
@@ -1200,11 +1328,30 @@ fn build_pipeline(
     mode: RenderMode,
     format: wgpu::TextureFormat,
 ) -> wgpu::RenderPipeline {
+    build_world_pipeline(
+        gpu,
+        shader,
+        &[Some(bind_layout)],
+        "fragment_main",
+        mode,
+        format,
+    )
+}
+
+/// The world pipeline, whichever bind groups and fragment stage it wants.
+fn build_world_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    bind_layouts: &[Option<&wgpu::BindGroupLayout>],
+    fragment_entry: &str,
+    mode: RenderMode,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
     let layout = gpu
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world-pipeline-layout"),
-            bind_group_layouts: &[Some(bind_layout)],
+            bind_group_layouts: bind_layouts,
             immediate_size: 0,
         });
 
@@ -1225,37 +1372,11 @@ fn build_pipeline(
                 module: shader,
                 entry_point: Some("vertex_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[
-                    wgpu::VertexBufferLayout {
-                        array_stride: size_of::<PackedVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Uint32,
-                                offset: 0,
-                                shader_location: 0,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Uint32,
-                                offset: 4,
-                                shader_location: 1,
-                            },
-                        ],
-                    },
-                    wgpu::VertexBufferLayout {
-                        array_stride: size_of::<Instance>() as u64,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &[wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x4,
-                            offset: 0,
-                            shader_location: 2,
-                        }],
-                    },
-                ],
+                buffers: &vertex_layout(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: shader,
-                entry_point: Some("fragment_main"),
+                entry_point: Some(fragment_entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,

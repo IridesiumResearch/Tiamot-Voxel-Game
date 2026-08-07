@@ -41,6 +41,12 @@ pub struct Moment {
     pub sun: [f32; 3],
     /// How strong the sun is, `0.0..=1.0`.
     pub intensity: f32,
+    /// Which way the sunlight travels, normalised — from the sun towards the
+    /// world, so a surface facing `-direction` is the one facing the sun.
+    ///
+    /// Shadow maps need this and colour alone cannot supply it. See
+    /// [`Sky::sun_direction`] for the arc it walks and what is fixed about it.
+    pub sun_direction: [f32; 3],
 }
 
 impl Sky {
@@ -127,6 +133,10 @@ impl Sky {
                 sky: crate::render::sky_colour(),
                 sun: [1.0, 1.0, 1.0],
                 intensity: 1.0,
+                // A world with no day has the sun somewhere sensible rather
+                // than nowhere: straight down would make every shadow a
+                // vertical smear and every vertical face unlit.
+                sun_direction: NOON,
             };
         };
         let last = self.keyframes.last().unwrap_or(first);
@@ -163,8 +173,66 @@ impl Sky {
             sky: mix(before.sky, after.sky, blend),
             sun: mix(before.sun, after.sun, blend),
             intensity: before.intensity + (after.intensity - before.intensity) * blend,
+            sun_direction: self.sun_direction(),
         }
     }
+
+    /// Which way the sunlight travels at this moment, normalised.
+    ///
+    /// The sun rises in the east at 0.25, stands highest at noon, and sets in
+    /// the west at 0.75 — the convention the keyframes in `game/core_sky` are
+    /// written against. It never passes exactly overhead: a sun straight up
+    /// gives every vertical face the same light and every shadow zero length,
+    /// which reads as a mistake even though it is geometry. [`TILT`] is what
+    /// keeps a shadow on the ground at noon.
+    ///
+    /// **The arc is the client's, not the mod's.** A mod says how long a day is
+    /// and what colour it goes; where the sun sits is geometry the renderer
+    /// needs whether or not anyone described it. A mod-chosen axis is a
+    /// reasonable thing to add later and nothing here forecloses it.
+    ///
+    /// `sin` and `cos` are fine here and would not be in the simulation:
+    /// charter rule 4 is explicit that rendering is outside the deterministic
+    /// float subset. Nothing in this function reaches the tick or the hash gate.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "charter rule 4 exempts rendering from the deterministic float subset; where the                   sun is drawn never reaches the tick or the hash gate"
+    )]
+    #[must_use]
+    pub fn sun_direction(&self) -> [f32; 3] {
+        if !self.has_day() {
+            return NOON;
+        }
+        // Midnight is 0, so the sun is below the world; noon is 0.5 and it is
+        // above. The angle runs a full turn over the day.
+        let angle = (self.time - 0.25) * std::f32::consts::TAU;
+        let height = angle.sin();
+        let east = angle.cos();
+        normalise([east, -height, TILT])
+    }
+}
+
+/// How far the sun leans out of the east-west plane, as a fraction.
+///
+/// Without it the sun passes exactly overhead at noon, every shadow collapses
+/// to nothing, and the two vertical faces along its axis are lit identically.
+/// A quarter is enough to keep shadows on the ground all day without making
+/// noon look like afternoon.
+const TILT: f32 = 0.25;
+
+/// Where the sun sits in a world with no day, and at noon.
+///
+/// Down and a little to one side, normalised.
+const NOON: [f32; 3] = [0.0, -0.970_142_5, 0.242_535_62];
+
+/// A unit vector in the same direction, or [`NOON`] if there is no direction to
+/// speak of. Zero-length input is a caller's bug rather than a crash.
+fn normalise(v: [f32; 3]) -> [f32; 3] {
+    let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if length < f32::EPSILON {
+        return NOON;
+    }
+    [v[0] / length, v[1] / length, v[2] / length]
 }
 
 /// Linear blend between two colours.
@@ -179,6 +247,12 @@ fn mix(from: [f32; 3], to: [f32; 3], blend: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal two-keyframe day, for the tests that only need a sky to
+    /// exist rather than to be any particular colour.
+    fn frames() -> Vec<SkyFrame> {
+        vec![frame(0.0, 0.1, 0.1), frame(0.5, 1.0, 1.0)]
+    }
 
     fn frame(time: f32, value: f32, intensity: f32) -> SkyFrame {
         SkyFrame {
@@ -299,5 +373,87 @@ mod tests {
             sky.time() < 1e-4 || sky.time() > 1.0 - 1e-4,
             "the day did not wrap"
         );
+    }
+
+    #[test]
+    fn the_sun_rises_in_the_east_and_sets_in_the_west() {
+        // The convention `game/core_sky`'s keyframes are written against, and
+        // the one shadow directions depend on. Stated as a test because it is
+        // otherwise only recorded in the sign of a `cos`.
+        let mut sky = Sky::new(24_000, frames());
+
+        sky.set_time(0.25);
+        let dawn = sky.sun_direction();
+        sky.set_time(0.75);
+        let dusk = sky.sun_direction();
+
+        assert!(
+            dawn[0] > 0.5,
+            "at dawn the light should travel eastward, got {dawn:?}"
+        );
+        assert!(
+            dusk[0] < -0.5,
+            "at dusk it should travel westward, got {dusk:?}"
+        );
+
+        sky.set_time(0.5);
+        let noon = sky.sun_direction();
+        assert!(
+            noon[1] < -0.9,
+            "at noon the light should come from almost overhead, got {noon:?}"
+        );
+        assert!(
+            noon[1] > -1.0,
+            "but never exactly overhead, or every shadow has no length: {noon:?}"
+        );
+
+        sky.set_time(0.0);
+        assert!(
+            sky.sun_direction()[1] > 0.9,
+            "at midnight the sun is under the world, so its light travels upward"
+        );
+    }
+
+    #[test]
+    fn the_sun_direction_is_always_a_unit_vector() {
+        // Shadow maths assumes it. A direction that drifted off unit length
+        // would stretch the cascades by however much it drifted.
+        let mut sky = Sky::new(24_000, frames());
+        for step in 0..64 {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a test index, not a measurement"
+            )]
+            let time = step as f32 / 64.0;
+            sky.set_time(time);
+            let direction = sky.sun_direction();
+            let length = (direction[0] * direction[0]
+                + direction[1] * direction[1]
+                + direction[2] * direction[2])
+                .sqrt();
+            assert!(
+                (length - 1.0).abs() < 1e-5,
+                "at {time} the direction {direction:?} has length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_world_with_no_day_still_has_a_sun_to_cast_shadows_from() {
+        let direction = Sky::none().sun_direction();
+        assert!(
+            direction[1] < -0.5,
+            "the light should still come downward: {direction:?}"
+        );
+        // The moment and the direct call must agree: two ways to ask the same
+        // question, and a shadow map reading one while the shader reads the
+        // other would light the world from two different suns.
+        let from_moment = Sky::none().moment().sun_direction;
+        for axis in 0..3 {
+            assert!(
+                (direction[axis] - from_moment[axis]).abs() < f32::EPSILON,
+                "{direction:?} against {from_moment:?}"
+            );
+        }
     }
 }

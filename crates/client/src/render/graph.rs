@@ -165,6 +165,48 @@ fn post_bind_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
         })
 }
 
+/// One fullscreen pass's pipeline.
+///
+/// The four differ only in fragment entry point and output format, so they are
+/// one function called four times rather than four descriptors to keep in step.
+fn post_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    label: &str,
+    entry: &str,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vertex_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(entry),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            // No depth anywhere in the chain. Every pass covers the whole
+            // target exactly once, so there is nothing to sort.
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+}
+
 /// One pass of the chain, as the graph describes it.
 struct Step<'a> {
     label: &'a str,
@@ -205,6 +247,9 @@ pub struct Post {
     /// written would be a read-write hazard the validator rejects.
     black: wgpu::TextureView,
     size: (u32, u32),
+    /// The cascades. Owned here so that everything mode 3 allocates is built
+    /// and dropped as one thing.
+    shadows: super::shadow::Shadows,
     /// The world and selection pipelines again, built for the float target.
     ///
     /// A pipeline is compiled against one output format, so mode 3 cannot reuse
@@ -246,34 +291,7 @@ impl Post {
             });
 
         let build = |label: &str, entry: &str, format: wgpu::TextureFormat| {
-            gpu.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vertex_main"),
-                        buffers: &[],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some(entry),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    // No depth anywhere in the chain. Every pass covers the
-                    // whole target exactly once, so there is nothing to sort.
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                })
+            post_pipeline(gpu, &shader, &pipeline_layout, label, entry, format)
         };
 
         let uniform = |label: &str| {
@@ -302,6 +320,7 @@ impl Post {
 
         let bloom_width = (width / BLOOM_DIVISOR).max(1);
         let bloom_height = (height / BLOOM_DIVISOR).max(1);
+        let shadows = super::shadow::Shadows::new(gpu);
 
         Self {
             scene: Target::new(gpu, "post-scene", width, height, HDR_FORMAT),
@@ -319,13 +338,21 @@ impl Post {
                 uniform("post-blur-v-uniforms"),
                 uniform("post-composite-uniforms"),
             ],
-            world: super::build_pipeline(gpu, world_shader, world_layout, mode, HDR_FORMAT),
+            world: super::build_shadowed_pipeline(
+                gpu,
+                world_shader,
+                world_layout,
+                shadows.sample_layout(),
+                mode,
+                HDR_FORMAT,
+            ),
             selection: super::build_selection_pipeline(
                 gpu,
                 selection_shader,
                 world_layout,
                 HDR_FORMAT,
             ),
+            shadows,
             black: black.create_view(&wgpu::TextureViewDescriptor::default()),
             sampler: gpu.device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("post-sampler"),
@@ -348,6 +375,17 @@ impl Post {
     #[must_use]
     pub const fn scene_target(&self) -> (&wgpu::TextureView, &wgpu::TextureView) {
         (&self.scene.view, &self.depth)
+    }
+
+    /// The cascades, for updating them and for drawing into them.
+    #[must_use]
+    pub const fn shadows(&self) -> &super::shadow::Shadows {
+        &self.shadows
+    }
+
+    /// The cascades, mutably, so the frame can move them with the camera.
+    pub const fn shadows_mut(&mut self) -> &mut super::shadow::Shadows {
+        &mut self.shadows
     }
 
     /// The world pipeline, compiled for the float target.
@@ -373,7 +411,10 @@ impl Post {
     /// For the HUD and for the test that mode 1 allocates none of it.
     #[must_use]
     pub const fn bytes(&self) -> u64 {
-        self.scene.bytes + self.bloom[0].bytes + self.bloom[1].bytes
+        self.scene.bytes
+            + self.bloom[0].bytes
+            + self.bloom[1].bytes
+            + super::shadow::Shadows::bytes()
     }
 
     /// Runs threshold, blur, blur, composite — scene in, `target` out.
