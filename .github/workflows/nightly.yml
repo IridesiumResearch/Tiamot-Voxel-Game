@@ -60,6 +60,20 @@ jobs:
       - name: Twenty bots for sixty seconds
         run: cargo test -p bot --test swarm_load --release -- --ignored --nocapture
 
+  lamp-load:
+    name: lamp churn (20 bots)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Task 10's stated load test. Release for the same reason the swarm is:
+      # a debug build measures rustc's inlining decisions rather than the
+      # lighting, and lighting is the whole point of this one.
+      - name: Twenty bots placing and removing lamps
+        run: cargo test -p bot --test lamp_load --release -- --ignored --nocapture
+
   micro-bench:
     name: criterion micro-benchmarks
     runs-on: ubuntu-latest
