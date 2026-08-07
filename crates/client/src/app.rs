@@ -109,6 +109,14 @@ pub const TELEPORT_CHUNKS: i32 = 3_125;
 ///
 /// Comfortably inside `phys::input::MAX_LOOKAHEAD`, which is what the server
 /// refuses inputs *beyond*.
+/// The light mode 1 meshes against.
+///
+/// Full daylight everywhere, so every cell's shading key is identical and
+/// greedy merging is unaffected by light. Mode 1 is Task 08's world, and Task
+/// 08's world had no propagated light to split a quad on.
+const FLAT_DAYLIGHT: crate::shade::Uniform =
+    crate::shade::Uniform(tiamot_core::light::Light::DAYLIGHT);
+
 const INPUT_LEAD: u64 = 4;
 
 /// How many warnings the HUD keeps.
@@ -862,6 +870,37 @@ impl App {
         self.send_held_tool();
     }
 
+    /// Switches to the next lighting mode, live.
+    ///
+    /// Task 10's criterion is that this needs no restart, and it does not: the
+    /// mode is a uniform on the renderer's side and an argument to the mesher on
+    /// this one. Nothing is reallocated and no pipeline is rebuilt.
+    ///
+    /// The world *is* remeshed, and has to be. Light is baked into vertices at
+    /// mesh time — that is what makes it free to draw — so the geometry a mode
+    /// shows was built for that mode. The rebuild goes through the ordinary
+    /// dirty queue and `REMESH_TIME_BUDGET`, so a switch spreads over a few
+    /// frames near the camera outward instead of stalling one.
+    pub fn cycle_lighting_mode(&mut self) {
+        self.set_lighting_mode(self.config.lighting_mode.next());
+    }
+
+    /// Switches to a particular lighting mode, live.
+    pub fn set_lighting_mode(&mut self, mode: crate::config::LightingMode) {
+        if self.config.lighting_mode == mode {
+            return;
+        }
+        self.config.lighting_mode = mode;
+        self.renderer.set_lighting_mode(mode);
+        self.store.mark_all_dirty();
+    }
+
+    /// Which lighting mode is showing.
+    #[must_use]
+    pub const fn lighting_mode(&self) -> crate::config::LightingMode {
+        self.config.lighting_mode
+    }
+
     /// Selects the first tool with a sub-node brush, if the mods registered one.
     ///
     /// For tests, which need to pick a brush rather than a name — the engine
@@ -1132,8 +1171,21 @@ impl App {
             let neighbours = self.store.neighbours(*pos);
 
             let mesh_started = std::time::Instant::now();
-            let light = self.store.light_for(*pos);
-            let mesh = mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &light);
+            // Mode 1 meshes against a flat daylight value rather than the real
+            // one. Not a shortcut in the shader's sense — the mesher may only
+            // merge two faces whose corner light agrees, so real light splits
+            // quads along every shadow edge. Handing it a constant puts the
+            // merge rate, and therefore the vertex count and the meshing cost,
+            // back exactly where Task 08 left them.
+            let mesh = match self.config.lighting_mode {
+                crate::config::LightingMode::Simple => {
+                    mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &FLAT_DAYLIGHT)
+                }
+                crate::config::LightingMode::Classic => {
+                    let light = self.store.light_for(*pos);
+                    mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &light)
+                }
+            };
             meshing += mesh_started.elapsed();
 
             self.renderer.set_chunk(self.drawn_at(*pos), &mesh);
@@ -1489,11 +1541,12 @@ impl App {
             // otherwise costs a round trip with whoever took it.
             self.clock_line(),
             format!(
-                "{} on {} / {} · vsync {}",
+                "{} on {} / {} · vsync {} · light {} (L)",
                 self.server_label,
                 self.renderer.gpu().adapter,
                 self.renderer.gpu().backend,
-                if self.config.vsync { "on" } else { "OFF" }
+                if self.config.vsync { "on" } else { "OFF" },
+                self.config.lighting_mode.name()
             ),
             // The hotbar, such as it is. Names rather than ids: a player
             // debugging a placement needs to know it is stone, not that it is 2.

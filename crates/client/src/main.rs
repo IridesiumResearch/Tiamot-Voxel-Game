@@ -321,6 +321,15 @@ impl ApplicationHandler for Client {
                         // there are — charter rule 1 puts that entirely in the
                         // mods, and a server could register twenty.
                         KeyCode::KeyR if pressed => surface.app.next_tool(),
+                        // Cycles the lighting mode, live — Task 10's criterion
+                        // that switching needs no restart. On a letter as well
+                        // as a function key for the same reason the teleport
+                        // keys are: F5 is under a vendor overlay on plenty of
+                        // laptops, and a key that never arrives reads as a
+                        // broken feature.
+                        KeyCode::F5 | KeyCode::KeyL if pressed => {
+                            surface.app.cycle_lighting_mode();
+                        }
                         // The hotbar's number keys. `Digit1` is slot 0.
                         KeyCode::Digit1
                         | KeyCode::Digit2
@@ -400,7 +409,8 @@ impl Client {
                 ..Default::default()
             },
         );
-        let renderer = Renderer::new(gpu, self.config.render_mode, size.0, size.1)?;
+        let mut renderer = Renderer::new(gpu, self.config.render_mode, size.0, size.1)?;
+        renderer.set_lighting_mode(self.config.lighting_mode);
 
         let egui = egui::Context::default();
         // egui is built without `default_fonts`, so it has no glyphs until this

@@ -28,12 +28,17 @@ struct Globals {
     padding: u32,
     // 0 textured, 1 flat. Wireframe is a pipeline state, not a branch.
     render_mode: u32,
+    // Task 10's lighting mode: 0 simple, 1 classic. Orthogonal to render_mode,
+    // which says what surface data to draw rather than how to light it.
+    lighting_mode: u32,
     // Time of day scales the stored sunlight here rather than in the world, so
     // dusk dirties nothing. See `Globals` on the Rust side.
     sun_intensity: f32,
     ambient: f32,
     // Where fog starts, in blocks. It becomes total at `sky_colour.w`.
     fog_start: f32,
+    // The three words of padding the Rust side spells out are implicit here:
+    // WGSL aligns a vec4 to 16 bytes, so this lands at offset 112 either way.
     sun_colour: vec4<f32>,
     // Sky colour in xyz, fog's far distance in w.
     sky_colour: vec4<f32>,
@@ -169,6 +174,13 @@ fn fog_amount(distance: f32) -> f32 {
 // blows out to white wherever a lamp stands in daylight, which is most lamps
 // anyone places outdoors.
 fn lighting(input: VertexOut) -> vec3<f32> {
+    // Mode 1: face shading and occlusion only, which is Task 08's world. The
+    // vertices still carry light — the mesher was handed a flat daylight value
+    // to bake, so they carry the same one everywhere and the branch is what
+    // makes that visible rather than merely uniform.
+    if (globals.lighting_mode == 0u) {
+        return vec3<f32>(input.shade * input.occlusion);
+    }
     let daylight = input.sun * globals.sun_intensity * globals.sun_colour.rgb;
     let lit = max(daylight, input.block_light);
     // A floor under the darkest cave, so a dark room is legible rather than

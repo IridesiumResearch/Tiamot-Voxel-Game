@@ -126,6 +126,54 @@ pub enum RenderMode {
     Wireframe,
 }
 
+/// How the world is lit.
+///
+/// Task 10's presentation modes over one simulation-authoritative light value.
+/// **Modes are settings, not forks**: the server sends the same light whichever
+/// is selected, and nothing about the world changes when one is picked — only
+/// how it is drawn.
+///
+/// Mode 3, the one with shadow maps and post-processing, is not here yet. The
+/// variant will be added with the passes it names; a mode that could be selected
+/// and did nothing would be worse than one that is honestly absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LightingMode {
+    /// Mode 1. Directional face shading and ambient occlusion, no propagated
+    /// light — Task 08's look, and the baseline the other modes are measured
+    /// against.
+    ///
+    /// The mesher samples flat daylight in this mode rather than the real
+    /// value, which is not a detail: two faces may only merge when their corner
+    /// light agrees, so real light splits quads along every shadow edge.
+    /// Feeding it a constant restores Task 08's merge rate exactly, which is
+    /// what "mode 1's cost profile is unchanged" has to mean.
+    Simple,
+    /// Mode 2. Smooth propagated light, coloured, with sky-tinted distance fog.
+    #[default]
+    Classic,
+}
+
+impl LightingMode {
+    /// The next mode in the cycle, for the key that switches them live.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Simple => Self::Classic,
+            Self::Classic => Self::Simple,
+        }
+    }
+
+    /// What to call it on the HUD.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Simple => "1 simple",
+            Self::Classic => "2 classic",
+        }
+    }
+}
+
 /// Client configuration.
 ///
 /// Unknown fields are rejected rather than ignored, for the same reason the
@@ -162,6 +210,13 @@ pub struct Config {
     /// How the world is drawn.
     #[serde(default)]
     pub render_mode: RenderMode,
+
+    /// How the world is lit.
+    ///
+    /// Switchable while the game is running, so this is the mode it starts in
+    /// rather than the mode it stays in.
+    #[serde(default)]
+    pub lighting_mode: LightingMode,
 
     /// Whether to wait for vertical blank.
     ///
@@ -332,6 +387,7 @@ impl Default for Config {
             view_distance: Self::default_view_distance(),
             vertical_view_distance: Self::default_vertical_view_distance(),
             render_mode: RenderMode::default(),
+            lighting_mode: LightingMode::default(),
             vsync: Self::default_vsync(),
             fov_degrees: Self::default_fov_degrees(),
             mouse_sensitivity: Self::default_mouse_sensitivity(),
@@ -497,5 +553,44 @@ mod tests {
             .expect("client.example.toml should exist at the repo root");
 
         Config::load(&example).expect("shipped example config should be valid");
+    }
+
+    #[test]
+    fn a_lighting_mode_can_be_written_down_and_read_back() {
+        // The setting is a string in a file a player edits by hand, so the
+        // names matter as much as the variants do.
+        let config: Config =
+            toml::from_str("lighting_mode = \"simple\"").expect("simple should parse");
+        assert_eq!(config.lighting_mode, LightingMode::Simple);
+
+        let config: Config =
+            toml::from_str("lighting_mode = \"classic\"").expect("classic should parse");
+        assert_eq!(config.lighting_mode, LightingMode::Classic);
+
+        assert!(
+            toml::from_str::<Config>("lighting_mode = \"beautiful\"").is_err(),
+            "mode 3 does not exist yet, and naming it must fail rather than \
+             silently select something else"
+        );
+
+        // The default is what a config with no opinion gets, and it is the mode
+        // the world's light was computed for.
+        assert_eq!(Config::default().lighting_mode, LightingMode::Classic);
+    }
+
+    #[test]
+    fn cycling_the_lighting_mode_visits_every_mode_and_comes_back() {
+        let mut mode = LightingMode::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            seen.insert(format!("{mode:?}"));
+            mode = mode.next();
+        }
+        assert_eq!(seen.len(), 2, "the cycle skipped a mode: {seen:?}");
+        assert_eq!(
+            mode,
+            LightingMode::default(),
+            "cycling twice round must come home"
+        );
     }
 }

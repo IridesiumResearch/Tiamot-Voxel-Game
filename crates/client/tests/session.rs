@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use client::app::{App, Input, Teleport};
 use client::cache::ContentCache;
-use client::config::{Config, RenderMode};
+use client::config::{Config, LightingMode, RenderMode};
 use client::net::Connection;
 use client::render::offscreen::perceptual_hash;
 use client::render::{Gpu, Offscreen, Renderer};
@@ -602,5 +602,69 @@ fn holding_forward_actually_moves_the_player() {
     );
 
     app.shutdown();
+    assert!(server.stop());
+}
+
+#[test]
+fn the_lighting_mode_switches_without_a_restart() {
+    // Task 10's criterion, on the real client: no restart, no reconnection, no
+    // pipeline rebuilt — and the world rebuilt, because light is baked into
+    // vertices at mesh time and the geometry a mode shows was built for it.
+    let Some(gpu) = gpu() else {
+        eprintln!("no adapter; skipping");
+        return;
+    };
+    let server = embedded("lighting-switch");
+    let mut app = client("lighting-switch", &server, gpu);
+
+    assert!(
+        run_frames(&mut app, |app| {
+            app.store().len() > 8 && app.pending_chunks() == 0
+        }),
+        "the world never finished meshing: {:?}",
+        app.warnings()
+    );
+
+    let held = app.store().len();
+    assert_eq!(app.lighting_mode(), LightingMode::Classic, "the default");
+
+    app.cycle_lighting_mode();
+
+    assert_eq!(
+        app.lighting_mode(),
+        LightingMode::Simple,
+        "the switch did not take"
+    );
+    assert_eq!(
+        app.renderer().lighting_mode(),
+        LightingMode::Simple,
+        "the renderer is still drawing the old mode, so the switch is invisible"
+    );
+    assert_eq!(
+        app.pending_chunks(),
+        held,
+        "switching modes left the world meshed for the mode it is no longer in"
+    );
+
+    // And it draws. A mode that switches cleanly and then renders nothing is
+    // the failure this whole test would otherwise miss.
+    assert!(
+        run_frames(&mut app, |app| app.pending_chunks() == 0),
+        "the world never re-meshed after the switch"
+    );
+    let target = Offscreen::new(app.renderer().gpu(), WIDTH, HEIGHT);
+    let camera = *app.camera();
+    let frame = target
+        .capture(app.renderer(), &camera)
+        .expect("a frame in the new mode");
+    assert!(
+        shows_a_world(&frame),
+        "mode 1 drew an empty sky where the world used to be"
+    );
+
+    // Back again, because a switch that only goes one way is half a feature.
+    app.cycle_lighting_mode();
+    assert_eq!(app.lighting_mode(), LightingMode::Classic);
+
     assert!(server.stop());
 }

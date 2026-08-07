@@ -47,13 +47,24 @@ view_distance = 8
 # on purpose: players move horizontally far more than vertically.
 vertical_view_distance = 4
 
-# How the world is drawn.
-#   "textured"  — atlas-textured, with lighting mode 1 directional shading.
-#   "flat"      — directional shading only. If the world looks right here and
-#                 wrong in "textured", the problem is textures, not meshing.
+# How the world is drawn. A debugging aid, not a lighting setting — see
+# `lighting_mode` below for that.
+#   "textured"  — atlas-textured.
+#   "flat"      — no atlas sample. If the world looks right here and wrong in
+#                 "textured", the problem is textures, not meshing.
 #   "wireframe" — quad edges only. Needs the POLYGON_MODE_LINE device feature;
 #                 adapters without it fall back to "textured" with a warning.
 render_mode = "textured"
+
+# How the world is LIT. Switchable while playing with L (or F5), so this is
+# the mode the client starts in rather than the mode it stays in.
+#   "simple"  — mode 1: directional face shading and ambient occlusion only.
+#               The cheapest mode, and the one the others are measured against.
+#   "classic" — mode 2: smooth propagated light, coloured, with distance fog.
+# Mode 3, with shadow maps and post-processing, is not implemented yet and is
+# deliberately not listed: a mode you could select that did nothing would be
+# worse than one that is honestly absent.
+lighting_mode = "classic"
 
 # Wait for vertical blank. On by default: frame PACING is the metric this
 # project cares about, not average frame rate (charter rule 18), and an

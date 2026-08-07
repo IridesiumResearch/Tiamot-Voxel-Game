@@ -106,6 +106,12 @@ struct Globals {
     tile: u32,
     padding: u32,
     render_mode: u32,
+    /// Task 10's lighting mode: 0 simple, 1 classic.
+    ///
+    /// Separate from `render_mode`, which says what *surface data* to draw
+    /// (atlas, flat, wireframe) and is a debugging aid. This says how what is
+    /// drawn is lit, and is a player-facing setting.
+    lighting_mode: u32,
     /// How bright the sun is, `0.0..=1.0`.
     ///
     /// **The stored sunlight channel is always full daylight**, and this scales
@@ -118,6 +124,12 @@ struct Globals {
     ambient: f32,
     /// Where fog starts, in blocks from the camera.
     fog_start: f32,
+    /// Padding to the 16-byte boundary the `vec4`s below sit on.
+    ///
+    /// Not decorative. WGSL aligns a `vec4<f32>` to 16 bytes, so the shader
+    /// reads `sun_colour` from offset 112 whatever this side does; without the
+    /// three words the Rust struct ends at 108 and every colour arrives shifted.
+    _pad: [u32; 3],
     /// The sun's colour, which a mod sets through the sky (Task 10).
     sun_colour: [f32; 4],
     /// The sky's colour in `xyz`, and where fog reaches full strength in `w`.
@@ -425,6 +437,13 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     depth_size: (u32, u32),
     mode: RenderMode,
+    /// Which of Task 10's lighting modes is showing.
+    ///
+    /// Changed live by [`Renderer::set_lighting_mode`]. The pipeline does not
+    /// change with it: both modes are one shader and a uniform, because a mode
+    /// that swapped pipelines could not be switched without a stall and would
+    /// be two code paths to keep agreeing.
+    lighting: crate::config::LightingMode,
     /// How bright the sun is now, `0.0..=1.0`.
     ///
     /// Set by the sky each frame once time of day exists; full daylight until
@@ -465,39 +484,7 @@ impl Renderer {
             .device
             .create_shader_module(wgpu::include_wgsl!("world.wgsl"));
 
-        let bind_layout = gpu
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("world-bind-layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+        let bind_layout = build_bind_layout(&gpu);
 
         let pipeline = build_pipeline(&gpu, &shader, &bind_layout, mode);
 
@@ -569,6 +556,9 @@ impl Renderer {
             depth,
             depth_size: (width, height),
             mode,
+            // Classic until told otherwise: a client with no config gets the
+            // mode the world was lit for.
+            lighting: crate::config::LightingMode::default(),
             // Full daylight until a sky says otherwise, which is what Task
             // 08's scenes assumed and what a world with no sky mod gets.
             sun_intensity: 1.0,
@@ -617,6 +607,23 @@ impl Renderer {
     #[must_use]
     pub const fn sun_intensity(&self) -> f32 {
         self.sun_intensity
+    }
+
+    /// Switches the lighting mode.
+    ///
+    /// Takes effect on the next frame and allocates nothing: the mode is a
+    /// uniform, so there is no pipeline to rebuild and no surface to
+    /// reconfigure. The caller is responsible for remeshing — the mesher bakes
+    /// light into vertices, so the geometry drawn under the new mode has to be
+    /// rebuilt for it (see `App::set_lighting_mode`).
+    pub const fn set_lighting_mode(&mut self, mode: crate::config::LightingMode) {
+        self.lighting = mode;
+    }
+
+    /// Which lighting mode is showing.
+    #[must_use]
+    pub const fn lighting_mode(&self) -> crate::config::LightingMode {
+        self.lighting
     }
 
     /// How many chunk meshes are resident.
@@ -790,9 +797,11 @@ impl Renderer {
             tile: crate::texture::TILE,
             padding: crate::texture::PADDING,
             render_mode: u32::from(self.mode == RenderMode::Flat),
+            lighting_mode: u32::from(self.lighting == crate::config::LightingMode::Classic),
             sun_intensity: self.sun_intensity,
             ambient: AMBIENT_FLOOR,
             fog_start: self.fog_start,
+            _pad: [0; 3],
             sun_colour: self.sun_colour,
             // Fog's far distance rides in the sky colour's unused fourth
             // component rather than costing another sixteen bytes of padding.
@@ -1031,6 +1040,46 @@ fn build_selection_pipeline(
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
+        })
+}
+
+/// The one bind group every pipeline here shares: globals, atlas, sampler.
+///
+/// Extracted from [`Renderer::new`] because it is the same three entries for
+/// the world pass and the selection pass, and because a constructor is easier
+/// to read when the descriptor soup is somewhere else.
+fn build_bind_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
+    gpu.device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("world-bind-layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         })
 }
 
