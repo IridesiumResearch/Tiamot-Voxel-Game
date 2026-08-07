@@ -202,3 +202,49 @@ fn breaking_the_surface_lets_daylight_into_the_hole() {
 
     assert!(server.stop());
 }
+
+#[test]
+fn a_chunk_is_lit_once_however_many_players_ask_for_it() {
+    // Players who join together ask for the same chunks, and relighting one
+    // that already has light produces the answer it already had — at about
+    // 1.4 ms a chunk, measured, which is what turned four bots joining at once
+    // into 22 ms ticks in the macro benchmark.
+    //
+    // Counted rather than timed. A timing assertion on a shared CI runner is a
+    // coin toss; "every chunk was lit exactly once" is a property of the code
+    // and holds on any machine.
+    let server = start("lit-once");
+    let control = server.control().clone();
+
+    block_on(async {
+        let mut first = join(&server, "First").await;
+        first
+            .collect_chunks(24, Duration::from_secs(20))
+            .await
+            .expect("the first player's chunks");
+        let after_one = control.full_relights();
+        assert!(
+            after_one > 0,
+            "no chunk was lit at all, so this test is measuring nothing"
+        );
+
+        let mut second = join(&server, "Second").await;
+        second
+            .collect_chunks(24, Duration::from_secs(20))
+            .await
+            .expect("the second player's chunks");
+
+        // Give the tick a moment to finish anything the second join started.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            control.full_relights(),
+            control.lit_chunks(),
+            "chunks were relit that already had light: {} relights for {} lit chunks",
+            control.full_relights(),
+            control.lit_chunks()
+        );
+    });
+
+    assert!(server.stop());
+}

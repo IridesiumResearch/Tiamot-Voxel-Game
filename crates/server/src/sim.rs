@@ -95,6 +95,12 @@ struct ControlInner {
     over_budget: AtomicU64,
     /// Set when an operator asks for a save; cleared when the tick performs it.
     save_requested: AtomicBool,
+    /// Chunks relit from scratch since start, and chunks currently holding
+    /// light. Counted because relighting a chunk that already has light is
+    /// invisible in every other measurement — it produces the answer that was
+    /// already there, at about 1.4 ms a chunk.
+    full_relights: AtomicU64,
+    lit_chunks: AtomicU64,
     /// Per-tick durations in microseconds, for the macro benchmark.
     ///
     /// A bounded buffer: a server running for a week must not accumulate a
@@ -143,6 +149,34 @@ impl Control {
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Records that a chunk was lit from scratch.
+    pub fn note_full_relight(&self) {
+        self.inner.full_relights.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records how many chunks currently hold light.
+    pub fn note_lit_chunks(&self, chunks: usize) {
+        self.inner
+            .lit_chunks
+            .store(chunks as u64, Ordering::Relaxed);
+    }
+
+    /// Chunks lit from scratch since start.
+    ///
+    /// Against [`Control::lit_chunks`] this says whether the server is doing
+    /// the same work twice: nothing forgets a chunk in a short run, so a
+    /// relight count above the number of lit chunks is duplicated work.
+    #[must_use]
+    pub fn full_relights(&self) -> u64 {
+        self.inner.full_relights.load(Ordering::Relaxed)
+    }
+
+    /// Chunks currently holding light.
+    #[must_use]
+    pub fn lit_chunks(&self) -> u64 {
+        self.inner.lit_chunks.load(Ordering::Relaxed)
     }
 
     /// Every recorded tick duration, in microseconds, clearing the buffer.

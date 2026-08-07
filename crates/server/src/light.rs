@@ -10,15 +10,28 @@
 //! cache that can disagree with what it was derived from — and a world file
 //! whose light said "cave" where its blocks said "hillside" is a bug nobody
 //! would think to look for in the file format. A chunk is relit when it enters
-//! memory. Task 02b measured a full-chunk relight at about 30 µs, which is
-//! 0.06% of a 50 ms tick, so this is cheap enough to be the simple answer.
+//! memory.
+//!
+//! # What that costs, measured
+//!
+//! **1.38 ms** for the case that dominates a join — a chunk of air under open
+//! sky with its neighbours resident — and 0.24 ms for solid rock, on the
+//! reference machine. Task 02b's spike said 30 µs, which was the number the
+//! tick's cap was sized on until this was written down; see
+//! `handle::RELIGHTS_PER_TICK`. Charter rule 18 wants the share of a 50 ms
+//! tick, and one relight is 2.8% of one.
+//!
+//! Relighting a chunk that already has light is therefore never free and never
+//! useful: the tick skips it, and `bot`'s
+//! `a_chunk_is_lit_once_however_many_players_ask_for_it` holds that line.
 //!
 //! # Relighting a chunk needs its neighbours
 //!
 //! Light crosses chunk boundaries, so a chunk relit alone is dark down its
-//! edges until its neighbours arrive. That is why [`Lighting::chunk_loaded`]
-//! relights a region one block wider than the chunk in every direction and
-//! reports which other chunks it touched: the caller remeshes those too.
+//! edges until its neighbours arrive. The region is the chunk exactly, and the
+//! ring of blocks around it acts as a boundary condition: those keep their
+//! light and flood inward. [`Lighting::chunk_loaded`] reports every other chunk
+//! it touched on the way, so the caller can remesh and re-send them too.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -104,10 +117,8 @@ impl Lighting {
     /// Returns every chunk whose light changed, including this one — the caller
     /// needs that set to know what to remesh and what to re-send.
     ///
-    /// The region is one block wider than the chunk in every direction so that
-    /// light already in the neighbours flows in. Without the margin, a chunk
-    /// arriving next to a lit one is dark along the seam until something else
-    /// happens to disturb it.
+    /// Costly, and never worth doing twice: see the module docs for what it
+    /// measures and for the guard the tick keeps in front of it.
     pub fn chunk_loaded(&mut self, world: &World, pos: ChunkPos) -> BTreeSet<ChunkPos> {
         self.layers.entry(pos).or_insert_with(LightLayer::dark);
 
@@ -131,14 +142,9 @@ impl Lighting {
         // client cannot tell "dark" from "not arrived yet", and every
         // underground chunk goes unreported.
         touched.chunks.insert(pos);
-        {
-            let mut lit = Lit {
-                world,
-                lighting: self,
-                touched: &mut touched,
-            };
-            propagate::relight(&mut lit, region);
-        }
+        self.with_centre(world, pos, &mut touched, |lit| {
+            propagate::relight(lit, region);
+        });
         self.compact(&touched.chunks);
         touched.chunks
     }
@@ -148,16 +154,46 @@ impl Lighting {
     /// Returns every chunk whose light changed.
     pub fn edited(&mut self, world: &World, pos: BlockPos) -> BTreeSet<ChunkPos> {
         let mut touched = Touched::default();
-        {
-            let mut lit = Lit {
-                world,
-                lighting: self,
-                touched: &mut touched,
-            };
-            propagate::edited(&mut lit, pos);
-        }
+        self.with_centre(world, pos.chunk(), &mut touched, |lit| {
+            propagate::edited(lit, pos);
+        });
         self.compact(&touched.chunks);
         touched.chunks
+    }
+
+    /// Runs a propagation pass with `centre`'s layer held out of the map.
+    ///
+    /// Taking it out and putting it back is what lets [`Lit`] reach the layer
+    /// the flood spends its time in without a lookup per visit.
+    ///
+    /// A chunk that arrived here **without** a layer keeps none: writes to it go
+    /// nowhere and nothing is inserted, exactly as when the layer was looked up
+    /// and found missing. Creating one instead would quietly mark an unlit chunk
+    /// as done — [`Lighting::holds`] is what the tick's catch-up pass asks
+    /// before relighting, so the chunk would stay black for as long as it stayed
+    /// loaded.
+    fn with_centre(
+        &mut self,
+        world: &World,
+        centre: ChunkPos,
+        touched: &mut Touched,
+        pass: impl FnOnce(&mut Lit<'_>),
+    ) {
+        let held = self.layers.remove(&centre);
+        let lit_here = held.is_some();
+        let mut lit = Lit {
+            world,
+            lighting: self,
+            touched,
+            centre,
+            lit_here,
+            layer: held.unwrap_or_else(LightLayer::dark),
+        };
+        pass(&mut lit);
+        let layer = lit.layer;
+        if lit_here {
+            self.layers.insert(centre, layer);
+        }
     }
 
     /// Collapses layers that ended up uniform.
@@ -184,10 +220,47 @@ struct Touched {
 }
 
 /// The world and its light, as [`Neighbourhood`] wants to see them.
+///
+/// # Why the chunk being relit is held apart from the others
+///
+/// A flood spends nearly all of its visits inside one chunk, and every one of
+/// them used to hash a [`ChunkPos`] to find that chunk's layer — twice, once to
+/// read the level and once to write it. Holding the centre layer as a field
+/// turns those into a field access and leaves the map for the boundary, where
+/// the flood goes rarely.
+///
+/// Measured on the reference machine, relighting a chunk of air under open sky
+/// with its neighbours resident: **1.56 ms before, 1.38 ms after**. Worth
+/// keeping and not the win it looks like it should be — the lookups are 12% of
+/// this, and the propagation itself is the rest. Memoising the *world* chunk
+/// the same way was measured first and bought 3%, so it was not kept.
 struct Lit<'a> {
     world: &'a World,
     lighting: &'a mut Lighting,
     touched: &'a mut Touched,
+    /// The chunk this pass is centred on, taken out of the map for the
+    /// duration and put back by [`Lighting::with_centre`].
+    centre: ChunkPos,
+    /// Whether the centre chunk had light at all when the pass started.
+    ///
+    /// A chunk that had none keeps none — writes to it go nowhere, exactly as
+    /// they did when the layer was looked up and found missing.
+    lit_here: bool,
+    /// Its light. Owned here, so reaching it costs nothing.
+    layer: LightLayer,
+}
+
+impl Lit<'_> {
+    /// The light at a block, from the centre layer where it lives there.
+    fn level(&self, pos: BlockPos) -> Light {
+        if pos.chunk() == self.centre {
+            if !self.lit_here {
+                return Light::DARK;
+            }
+            return self.layer.get(pos.local());
+        }
+        self.lighting.at(pos)
+    }
 }
 
 impl Neighbourhood for Lit<'_> {
@@ -210,17 +283,25 @@ impl Neighbourhood for Lit<'_> {
     }
 
     fn light(&self, pos: BlockPos) -> Light {
-        self.lighting.at(pos)
+        self.level(pos)
     }
 
     fn set_light(&mut self, pos: BlockPos, level: Light) {
         let chunk = pos.chunk();
+        let local = pos.local();
+        if chunk == self.centre {
+            if !self.lit_here || self.layer.get(local) == level {
+                return;
+            }
+            self.layer.set(local, level);
+            self.touched.chunks.insert(chunk);
+            return;
+        }
         // Only where a chunk is actually loaded. A flood reaching the edge of
         // the loaded region has nowhere to write, and that is the bound working.
         let Some(layer) = self.lighting.layers.get_mut(&chunk) else {
             return;
         };
-        let local = pos.local();
         if layer.get(local) == level {
             return;
         }

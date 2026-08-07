@@ -154,14 +154,26 @@ const SAVE_INTERVAL_TICKS: u64 = 40;
 
 /// How many chunks may be relit from scratch in one tick.
 ///
-/// A full-chunk relight was measured at about 30 µs in Task 02b, so 32 of them
-/// is roughly 1 ms — 2% of the 50 ms budget (charter rule 18), and that is with
-/// every one of them being the pathological chiselled case. The cap exists
-/// because a player teleporting or a server starting can make thousands of
-/// chunks resident at once, and an unbounded pass would spend the whole tick on
-/// terrain nobody is looking at yet. What it does not reach this tick it reaches
-/// on the next.
-const RELIGHTS_PER_TICK: usize = 32;
+/// The cap exists because a player teleporting or a server starting can make
+/// thousands of chunks resident at once, and an unbounded pass would spend the
+/// whole tick on terrain nobody is looking at yet. What it does not reach this
+/// tick it reaches on the next.
+///
+/// **Four, from a measurement rather than an estimate.** This was 32, on the
+/// strength of Task 02b's spike putting a full-chunk relight at about 30 µs.
+/// The real thing costs **1.38 ms** for the case that dominates a join — a
+/// chunk of air under open sky, with its neighbours resident — so the old
+/// number was not a cap on anything: 32 of them is 44 ms of a 50 ms tick.
+/// Four is 5.5 ms, 11% of the budget, which is a bound worth having.
+///
+/// Honest about what this did and did not fix: the macro benchmark's 22 ms
+/// ticks were **not** this. Setting the cap to 4 and back to 32 moves its p99
+/// by 12 µs, because the chunks a joining player waits on are relit by the
+/// request path rather than by this catch-up pass. What fixed the benchmark was
+/// not relighting a chunk that is already lit. This number matters for the case
+/// the benchmark does not cover — a teleport, or a mod making unexplored
+/// terrain resident — where nothing else bounds the work.
+const RELIGHTS_PER_TICK: usize = 4;
 
 /// How often the time of day goes out, in ticks.
 ///
@@ -1142,8 +1154,24 @@ impl ServerHandle {
                             // the world black until something happened to
                             // relight it, so this is not an optimisation to
                             // defer.
+                            //
+                            // **Only if it is not already lit.** A chunk's
+                            // light is kept current by every edit, so relighting
+                            // one that has a layer produces the answer it
+                            // already had — at 1.38 ms a chunk (measured, see
+                            // `light::Lit`). It is not a rare case either: the
+                            // players who join together are the ones who ask for
+                            // the same chunks, so the second and third of them
+                            // were each paying full price for a chunk the first
+                            // had already lit. The requester still needs the
+                            // light itself, which is what the send below is.
                             if blob.is_some() {
-                                let touched = lighting.chunk_loaded(&world, request.pos);
+                                let touched = if lighting.holds(request.pos) {
+                                    std::iter::once(request.pos).collect()
+                                } else {
+                                    control.note_full_relight();
+                                    lighting.chunk_loaded(&world, request.pos)
+                                };
                                 broadcast_light(&shared, &lighting, &touched);
                             }
                             // A failed send means the connection went away
@@ -1186,11 +1214,13 @@ impl ServerHandle {
                                     world.defer_arrival(pos);
                                     continue;
                                 }
+                                control.note_full_relight();
                                 touched.extend(lighting.chunk_loaded(&world, pos));
                                 done += 1;
                             }
                             broadcast_light(&shared, &lighting, &touched);
                         }
+                        control.note_lit_chunks(lighting.len());
 
                         // The day advances once per tick, and is broadcast at
                         // a rate a person can read rather than at the rate it
