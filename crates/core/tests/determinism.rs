@@ -95,7 +95,13 @@ fn golden_fingerprints_match() {
 /// number that says a client's prediction and a server's simulation are the
 /// same computation — if they were not, reconciliation would correct every
 /// tick and the player would never stop being dragged.
-const PHYSICS_GOLDEN: u64 = 8_510_785_279_271_553_158;
+/// Regenerated once, deliberately, when a horizontal collision stopped zeroing
+/// the velocity of a body that was rising — the fix for a stepped passage
+/// costing a jump's worth of speed at every riser. Case 3 in the module docs:
+/// the recipe changed, so the constant moves in the same commit that changed
+/// it. The worldgen and light goldens are untouched, which is what says the
+/// change was confined to `phys`.
+const PHYSICS_GOLDEN: u64 = 4_187_361_711_655_454_807;
 
 /// Runs the fixed physics scenario and hashes every tick of it.
 ///

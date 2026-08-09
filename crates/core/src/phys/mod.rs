@@ -325,7 +325,35 @@ fn resolve_horizontal(
     }
 
     body.position[axis] += swept.distance;
-    body.velocity[axis] = 0.0;
+
+    // **Stopping is not the same as losing your momentum, and in the air it
+    // must not be.**
+    //
+    // Contract §2 resolves X before Y, so a horizontal move is always tested at
+    // the height the body had at the START of the tick. A body rising past a
+    // step therefore meets the riser one tick before it clears it — and zeroing
+    // the velocity there threw away a whole tick of speed that the very next
+    // tick would have been free to use. With `air_acceleration` a fifteenth of
+    // the ground figure, getting it back takes half a second.
+    //
+    // Reported from the window as a tunnel staircase being "close to impossible
+    // it is so jumpy". Traced: climbing three-cell steps in a nine-cell
+    // passage, the body's x froze for three and four ticks at a time at every
+    // riser and then crawled forward at a twelfth of walking pace.
+    //
+    // Standing on the ground it still zeroes, because there stopping IS the
+    // answer: a body walking into a wall should not keep a speed it is not
+    // using, or it leaves the wall like a released spring.
+    //
+    // **`was_on_ground` alone is not the right test, because the tick a jump
+    // starts is a tick that begins on the ground.** The jump has already been
+    // applied to the vertical velocity by the time this runs — see [`step`] —
+    // so a body pressed against a riser and pushing off it was having exactly
+    // the tick of speed it most needed taken away. Rising means climbing past
+    // the thing in the way, not resting against it.
+    if was_on_ground && body.velocity[1] <= 0.0 {
+        body.velocity[axis] = 0.0;
+    }
 }
 
 /// Moves the body vertically and recomputes ground contact.

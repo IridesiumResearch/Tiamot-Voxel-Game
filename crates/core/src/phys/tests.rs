@@ -358,3 +358,138 @@ proptest! {
         }
     }
 }
+
+/// A rising passage: the floor steps up every `run` cells and the ceiling rises
+/// with it, which is what digging a staircase actually produces.
+///
+/// Deliberately not a [`Scene`]: filling a `BTreeSet` with a hundred blocks of
+/// tunnel is slower than answering the question arithmetically, and the
+/// arithmetic is what says what the scene *is*.
+struct Staircase {
+    /// Cells the floor rises at each step.
+    rise: i32,
+    /// Cells of level ground between one riser and the next.
+    run: i32,
+    /// Clear cells between the floor and the ceiling above it.
+    headroom: i32,
+}
+
+impl Staircase {
+    /// The first solid cell's height at this column.
+    fn floor_at(&self, x: i32) -> i32 {
+        if x < 0 { 0 } else { (x / self.run) * self.rise }
+    }
+}
+
+impl Solid for Staircase {
+    fn solid(&self, x: i32, y: i32, _z: i32) -> bool {
+        let floor = self.floor_at(x);
+        y < floor || y >= floor + self.headroom
+    }
+}
+
+#[test]
+fn climbing_a_stepped_passage_does_not_cost_a_walking_pace() {
+    // **Reported from the window: "climbing a tunnel staircase is close to
+    // impossible it is so jumpy."**
+    //
+    // Contract §2 resolves X before Y, so a horizontal move is tested at the
+    // height the body had when the tick began. A body jumping a riser therefore
+    // meets it one tick before it clears it, and zeroing the velocity there
+    // spent the whole jump: with `air_acceleration` a fifteenth of the ground
+    // figure, the body then crawled up the next step at a twelfth of walking
+    // pace rather than stopping and carrying on.
+    //
+    // One-block risers every two blocks in a three-block passage, which is a
+    // staircase somebody would really dig. Measured over the same 200 ticks:
+    // 67.0 cells before, 81.5 after. The bound sits between them.
+    let scene = Staircase {
+        rise: 3,
+        run: 6,
+        headroom: 9,
+    };
+    let tuning = Tuning::DEFAULT;
+    let mut body = Body::at([0.5, 0.0, 0.5]);
+    let intent = Intent {
+        walk: [1.0, 0.0],
+        jump: true,
+        gait: Gait::Walk,
+    };
+    for _ in 0..200 {
+        body = step(&scene, body, intent, &tuning);
+    }
+
+    assert!(
+        body.position[0] > 75.0,
+        "a body holding forward and jump for 200 ticks got {} cells up a stepped passage; \
+         it was 67 when every riser cost it a jump's worth of speed",
+        body.position[0]
+    );
+    // And it actually climbed, rather than running along a floor this scene
+    // failed to raise — which is the reading that would make the distance above
+    // easy and meaningless.
+    assert!(
+        body.position[1] > 30.0,
+        "the body is at height {} after 200 ticks, so it went along rather than up",
+        body.position[1]
+    );
+}
+
+#[test]
+fn a_body_pushing_off_a_riser_keeps_the_speed_it_jumped_with() {
+    // The mechanism under the test above, on one tick rather than two hundred.
+    //
+    // The tick a jump starts is a tick that BEGAN on the ground, so
+    // `was_on_ground` alone cannot tell "pushing off" from "leaning on". The
+    // jump has already reached the vertical velocity by the time the horizontal
+    // axes resolve — see `step` — which is what makes rising the honest test.
+    let scene = Scene::new(0).with_step(6, 3);
+    let tuning = Tuning::DEFAULT;
+
+    // Pressed against the riser at x = 6, at a walking clip, standing.
+    let placed = Body {
+        position: [5.0, 0.0, 0.5],
+        velocity: [tuning.walk_speed, 0.0, 0.0],
+        on_ground: true,
+    };
+
+    let jumping = step(
+        &scene,
+        placed,
+        Intent {
+            walk: [1.0, 0.0],
+            jump: true,
+            gait: Gait::Walk,
+        },
+        &tuning,
+    );
+    assert!(
+        jumping.velocity[0] > tuning.walk_speed * 0.5,
+        "a body jumping into a riser kept {} of its {} cells a tick, so the jump it is about \
+         to take will start from a standstill",
+        jumping.velocity[0],
+        tuning.walk_speed
+    );
+
+    // The counter-example, and the behaviour that must survive: standing
+    // against the same riser with no jump, the speed goes. A body leaning on a
+    // wall that kept its velocity would leave it like a released spring.
+    let leaning = step(
+        &scene,
+        placed,
+        Intent {
+            walk: [1.0, 0.0],
+            jump: false,
+            gait: Gait::Walk,
+        },
+        &tuning,
+    );
+    // Not `assert_eq!` against `0.0`: the value really is assigned zero and the
+    // comparison really would be exact, but `clippy::float_cmp` is deny-level
+    // here and an exemption for a test is a precedent this crate does not want.
+    assert!(
+        leaning.velocity[0].abs() < f32::EPSILON,
+        "a body walking into a wall kept {} of its horizontal speed",
+        leaning.velocity[0]
+    );
+}
