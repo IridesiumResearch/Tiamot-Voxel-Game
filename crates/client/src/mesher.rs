@@ -412,7 +412,12 @@ pub const fn face_shade(axis: u8, positive: bool) -> f32 {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PackedVertex {
-    /// x:6 | y:6 | z:6 | axis:2 | positive:1 | occlusion:2
+    /// x:6 | y:6 | z:6 | axis:2 | positive:1 | occlusion:2 | fine light:8
+    ///
+    /// The fine half is two more bits per light channel — quarter levels — in
+    /// the same channel order as [`tiamot_core::light::Light`]. See
+    /// [`crate::shade`] for why four bits alone cannot describe a gradient of
+    /// one level per block, and note that this still leaves one bit spare.
     pub packed: u32,
     /// material:16 | light:16
     ///
@@ -439,6 +444,7 @@ impl PackedVertex {
             material,
             crate::shade::Corner {
                 light: tiamot_core::light::Light::DAYLIGHT,
+                fine: 0,
                 occlusion: 3,
             },
         )
@@ -470,7 +476,8 @@ impl PackedVertex {
                 | (z << 12)
                 | ((axis as u32) << 18)
                 | ((positive as u32) << 20)
-                | (((corner.occlusion & 0x3) as u32) << 21),
+                | (((corner.occlusion & 0x3) as u32) << 21)
+                | ((corner.fine as u32) << 23),
             material: (material as u32) | ((corner.light.0 as u32) << 16),
         }
     }
@@ -1091,12 +1098,23 @@ mod tests {
         // values worked out by hand rather than recorded from a run.
         //
         // The scene: one solid block at the chunk's origin, with the block
-        // above it lit and every other block dark. The block's top face is
-        // three cells across, and each of its cell faces looks up into block
-        // (0, 1, 0). A corner in the middle of that face has all four of its
-        // sampled blocks equal to (0, 1, 0), so it takes that level exactly;
-        // a corner on the block's outer edge averages one lit block with three
-        // dark ones and comes to a quarter of it.
+        // above it lit and every other block dark.
+        //
+        // A block's light sits at the block's CENTRE, which in cells is 1.5,
+        // and the lattice points along a block's own face are at 1 and 2 — a
+        // sixth of a block either side of that centre. So the brightest corner
+        // of the face carries `5/6 × 5/6 = 100/144` of the lit block and takes
+        // the rest from its dark neighbours: `15 × 100/144`, which is 10.42, or
+        // ten levels and a quarter-level remainder of two.
+        //
+        // **It used to be 15 exactly**, and that was the bug rather than the
+        // specification: averaging the four blocks touching a corner samples
+        // the same block four times everywhere except on a block boundary, so
+        // the interior of every face was flat and the whole of each level
+        // change landed on one cell. See [`crate::shade`] for the measurement.
+        // An isolated lit block having its peak rounded off is what smoothing
+        // means; a lamp's falloff is close to linear, and bilinear
+        // interpolation of a linear field is exact.
         use crate::shade::BlockLight;
         use tiamot_core::light::{Light, MAX_LEVEL};
 
@@ -1136,14 +1154,31 @@ mod tests {
             .min()
             .unwrap_or(0);
 
+        // 15 × 100/144 = 10.42: ten whole levels.
         assert_eq!(
-            brightest, MAX_LEVEL,
-            "the corner surrounded by the lit block should take its level whole"
+            u32::from(brightest),
+            u32::from(MAX_LEVEL) * 100 / 144,
+            "the corner over the middle of the lit block should carry 100/144 of it"
         );
+        // And the quarter-level remainder on that same corner is really there,
+        // which is the half of this that four bits alone could not have said.
+        // Paired with its level rather than maximised separately: the maximum
+        // remainder anywhere is 3, on some dimmer corner, and comparing it with
+        // this corner's expected 2 measures nothing.
+        let fine_sun = top
+            .iter()
+            .flat_map(|quad| quad.shade.light.iter().zip(quad.shade.fine.iter()))
+            .filter(|(level, _)| level.sun() == brightest)
+            .map(|(_, fine)| (fine >> 6) & 0x3)
+            .max()
+            .unwrap_or(0);
         assert_eq!(
-            u32::from(dimmest),
-            (u32::from(MAX_LEVEL) + 2) / 4,
-            "an outer corner averages one lit block with three dark ones"
+            fine_sun, 2,
+            "the quarter levels never reached the brightest corner"
+        );
+        assert!(
+            dimmest < brightest,
+            "every corner of the face came to {brightest}, so there is no gradient across it"
         );
 
         // And the light reaches the vertex buffer, which is the half a shade
@@ -1156,7 +1191,7 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert_eq!(
-            lit, MAX_LEVEL,
+            lit, brightest,
             "the corner light never made it into the packed vertex"
         );
     }

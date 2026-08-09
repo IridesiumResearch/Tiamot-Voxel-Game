@@ -266,6 +266,9 @@ fn body_mesh() -> Mesh {
 
     let lit = Shade {
         light: [tiamot_core::light::Light::DAYLIGHT; 4],
+        // Full daylight lands exactly on a level, so there is no quarter of one
+        // left over.
+        fine: [0; 4],
         // Fully open: a floating box has nothing boxing it in, and giving it
         // occlusion would darken its corners for no geometric reason.
         occlusion: [3; 4],

@@ -68,7 +68,7 @@ struct Globals {
 @group(1) @binding(1) var shadow_sampler: sampler_comparison;
 
 struct VertexIn {
-    // x:6 | y:6 | z:6 | axis:2 | positive:1 | occlusion:2
+    // x:6 | y:6 | z:6 | axis:2 | positive:1 | occlusion:2 | fine light:8
     @location(0) packed: u32,
     // material:16 | light:16, the light half a packed `core::light::Light`
     @location(1) material: u32,
@@ -172,12 +172,28 @@ fn vertex_main(input: VertexIn) -> VertexOut {
     // dividing by 16 leaves a fully lit surface at 94% and the whole world
     // very slightly grey.
     let packed_light = (input.material >> 16u) & 0xFFFFu;
-    let levels = vec4<f32>(
+    let coarse = vec4<f32>(
         f32((packed_light >> 12u) & 0xFu),
         f32((packed_light >> 8u) & 0xFu),
         f32((packed_light >> 4u) & 0xFu),
         f32(packed_light & 0xFu),
-    ) / 15.0;
+    );
+    // **And two more bits a channel, from the position word's spare room.**
+    //
+    // A level is four bits, so light falling one level per block has nothing
+    // between one level and the next to say, and a lamp's gradient came out as
+    // a hard band at every block boundary however the corners were sampled.
+    // Quarter levels are what make it a ramp. See `crate::shade`.
+    let fine_bits = (input.packed >> 23u) & 0xFFu;
+    let fine = vec4<f32>(
+        f32((fine_bits >> 6u) & 0x3u),
+        f32((fine_bits >> 4u) & 0x3u),
+        f32((fine_bits >> 2u) & 0x3u),
+        f32(fine_bits & 0x3u),
+    );
+    // Four bits is 0..15, so the divisor is 15 rather than 16 — dividing by 16
+    // leaves a fully lit surface at 94% and the whole world very slightly grey.
+    let levels = (coarse + fine * 0.25) / 15.0;
 
     out.shade = face_shade(axis, positive);
     out.normal = face_normal(axis, positive);

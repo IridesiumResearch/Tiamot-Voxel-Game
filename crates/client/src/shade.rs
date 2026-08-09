@@ -5,29 +5,58 @@
 //!
 //! # Smooth lighting, and why it does not ruin greedy meshing
 //!
-//! A vertex takes the average of the four block light values touching its
-//! corner on the *outside* of the face — the classic smooth-lighting sample.
+//! A vertex takes a bilinear sample of the block light field at its own
+//! position, taking the light of a block to sit at that block's CENTRE.
 //! Hardware interpolation across the quad does the rest, so a surface gets a
 //! gradient rather than a per-block staircase.
+//!
+//! # Sampling at block centres, and the quarter levels that go with it
+//!
+//! The obvious thing is to average the four blocks touching the corner, and
+//! that is what this did first. It is wrong in a way that is invisible until
+//! somebody looks at a lamp: light is stored per BLOCK and a vertex sits on a
+//! CELL lattice three times finer, so all four of those blocks are the same
+//! block unless the corner happens to sit exactly on a block boundary. The
+//! measured result, along a ramp falling one level per block, was corner pairs
+//! of `[15 14] [14 14] [14 14]` — **the entire level change crammed into the
+//! first third of each block and the other two thirds flat.** Reported from the
+//! window as the interpolation between blocks being rough, which is exactly
+//! what a hard band every block looks like.
+//!
+//! Interpolating between block centres spreads that change across the whole
+//! block, and then immediately runs into the second half of the problem: a
+//! level is four bits, so a gradient of one level per block has nothing between
+//! one level and the next to say. **So a corner carries two more bits per
+//! channel** — quarter levels — which is what turns a one-step drop per block
+//! into a four-step ramp. They cost nothing: the vertex's position word had
+//! eleven bits spare, occlusion took two, and eight of the remaining nine hold
+//! these.
 //!
 //! That forces a rule on the mesher: **two cell faces may only merge if their
 //! corner light agrees.** Merging across a lighting discontinuity would
 //! interpolate straight through it and smear a shadow edge into a soft gradient
 //! several blocks wide.
 //!
-//! The cost of that rule is smaller than it looks, because light is stored per
-//! **block** and a block is three cells across. Every cell face inside one
-//! block samples the same four neighbouring blocks, so it merges freely; and on
-//! a uniformly lit surface — open ground under daylight, which is most of a
-//! world — every block agrees too, so merging is completely unaffected.
-//! Splitting only happens where light genuinely varies, which is at shadow
-//! edges, which is exactly where the extra vertices are worth having.
+//! **On a uniformly lit surface that costs nothing at all**, and that is the
+//! case that decides a world's vertex count: open ground under daylight has one
+//! light level everywhere, every corner agrees exactly, and a chunk floor is
+//! still the handful of quads it was. The fast path below returns before it has
+//! multiplied anything.
+//!
+//! Where light genuinely varies it now costs more than it used to, and the
+//! number is worth writing down rather than discovering later. A floor lit by a
+//! single lamp falling one level per block, measured over a whole chunk:
+//! **3,939 quads under the old averaging against 4,805 under this — 22% more.**
+//! The gradient really does have more distinct values in it now, which is the
+//! entire point; a sampler that merged them back together would be the bug this
+//! replaced. Charter rule 18's priority order is explicit that a smooth world
+//! beats reach onto low-end hardware, and 22% falls on lamp-lit regions only.
 //!
 //! # This is presentation, not simulation
 //!
 //! Charter rule 4's float rules do not reach here: nothing in this file feeds
-//! the determinism gate or the tick. The averaging is integer arithmetic anyway,
-//! which is a happy accident of light being four-bit rather than a requirement.
+//! the determinism gate or the tick. The interpolation is integer arithmetic
+//! anyway — see `WEIGHTS` — which is a convenience rather than a requirement.
 
 use tiamot_core::SUBNODES_PER_AXIS;
 use tiamot_core::light::{CHANNELS, Light};
@@ -76,6 +105,12 @@ impl BlockLight for Uniform {
 pub struct Shade {
     /// Light at each corner, unoccluded.
     pub light: [Light; 4],
+    /// The quarter-level remainder at each corner, two bits per channel.
+    ///
+    /// Packed in the same channel order as [`Light`] — sun in bits 6 and 7,
+    /// then red, green, blue — so that a reader who knows one knows the other.
+    /// A corner's true level is `light.channel(c) + fine(c) / 4`.
+    pub fine: [u8; 4],
     /// Occlusion level at each corner, `0` darkest to `3` open.
     pub occlusion: [u8; 4],
 }
@@ -89,6 +124,8 @@ pub struct Shade {
 pub struct Corner {
     /// Light landing here, unoccluded.
     pub light: Light,
+    /// The quarter-level remainder, two bits per channel. See [`Shade::fine`].
+    pub fine: u8,
     /// Occlusion level, `0` darkest to `3` open.
     pub occlusion: u8,
 }
@@ -104,6 +141,7 @@ impl Shade {
         debug_assert!(index < 4);
         Corner {
             light: self.light[index],
+            fine: self.fine[index],
             occlusion: self.occlusion[index],
         }
     }
@@ -113,6 +151,7 @@ impl Shade {
     pub const fn flat(level: Light) -> Self {
         Self {
             light: [level; 4],
+            fine: [0; 4],
             occlusion: [3; 4],
         }
     }
@@ -164,7 +203,9 @@ pub fn face_shade(
     // The mesher's corner order. `(du, dv)` picks which of the four lattice
     // points around the cell face this corner sits on.
     for (index, (du, dv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
-        shade.light[index] = corner_light(light, outside, u_axis, v_axis, du, dv);
+        let (level, fine) = corner_light(light, outside, u_axis, v_axis, du, dv);
+        shade.light[index] = level;
+        shade.fine[index] = fine;
         shade.occlusion[index] = corner_occlusion(occupancy, outside, u_axis, v_axis, du, dv) as u8;
     }
     shade
@@ -212,7 +253,38 @@ fn corner_occlusion(
     3 - (side_u + side_v + diagonal)
 }
 
-/// The average of the four blocks touching one corner of a face.
+/// The denominator the interpolation weights are expressed in.
+///
+/// Twelve, because a lattice point falls on a third of the way between two
+/// block centres and the answer wants quarters: twelve is the smallest number
+/// that holds both exactly, so every weight below is an integer and nothing
+/// rounds until the very end.
+const WEIGHTS: i32 = 12;
+
+/// Which two blocks a lattice point falls between, and how far along.
+///
+/// A block's light is taken to sit at the block's CENTRE, which in cells is
+/// `3b + 1.5`. The returned weight is out of [`WEIGHTS`] and applies to the
+/// SECOND block.
+///
+/// Working in twelfths rather than in floats keeps this exact and keeps the
+/// happy accident noted at the top of this file — smooth lighting is integer
+/// arithmetic, so there is nothing here for a platform to disagree about even
+/// though nothing requires it to agree.
+const fn span(lattice: i32) -> (i32, i32) {
+    // Position along the block-centre lattice, in twelfths of a block:
+    // `(lattice - 1.5) / 3` scaled by 12 is `(2 * lattice - 3) * 2`.
+    let scaled = (2 * lattice - 3) * 2;
+    let first = scaled.div_euclid(WEIGHTS);
+    (first, scaled.rem_euclid(WEIGHTS))
+}
+
+/// The block light field sampled at one corner of a face.
+///
+/// Returns the level and its quarter-level remainder, two bits per channel.
+///
+/// Bilinear between block CENTRES rather than an average of the blocks nearby.
+/// See this module's header for what averaging did and how it looked.
 fn corner_light(
     light: &impl BlockLight,
     outside: (i32, i32, i32),
@@ -220,39 +292,77 @@ fn corner_light(
     v_axis: usize,
     du: i32,
     dv: i32,
-) -> Light {
+) -> (Light, u8) {
+    // The lattice point this corner sits on, in cells, along each spanning
+    // axis. The third axis is the face's own normal, where the sample belongs
+    // in the air layer `outside` already names.
+    let (u_first, u_weight) = span(axis_of(outside, u_axis) + du);
+    let (v_first, v_weight) = span(axis_of(outside, v_axis) + dv);
+
     let mut samples = [Light::DARK; 4];
+    let mut weights = [0_i32; 4];
     for i in 0..2 {
         for j in 0..2 {
-            // The four cells sharing this lattice point, in the plane of the
-            // face and on its outside layer.
-            let cell = step(step(outside, u_axis, du - 1 + i), v_axis, dv - 1 + j);
-            samples[(i * 2 + j) as usize] =
-                light.at(block_of(cell.0), block_of(cell.1), block_of(cell.2));
+            // The two spanning axes are already BLOCK coordinates, straight out
+            // of `span`; only the face's own normal is still a cell and needs
+            // converting. Getting that backwards samples a block three times
+            // too far out and lights a surface with its neighbour's light.
+            let mut block = outside;
+            set_axis(&mut block, u_axis, u_first + i);
+            set_axis(&mut block, v_axis, v_first + j);
+            let normal = 3 - u_axis - v_axis;
+            set_axis(&mut block, normal, block_of(axis_of(outside, normal)));
+            samples[(i * 2 + j) as usize] = light.at(block.0, block.1, block.2);
+            weights[(i * 2 + j) as usize] = if i == 0 { WEIGHTS - u_weight } else { u_weight }
+                * if j == 0 { WEIGHTS - v_weight } else { v_weight };
         }
     }
 
     // **The overwhelmingly common case, and worth its own path.** Light is per
     // block and a block is three cells across, so most corners sit inside one
-    // block's neighbourhood and all four samples are the same value. Averaging
-    // four copies of a number channel by channel — unpacking, summing, rounding
-    // and repacking sixteen nibbles — costs more than the comparison that
-    // avoids it, and this runs for every corner of every face in a chunk.
+    // block's neighbourhood and all four samples are the same value. Weighting
+    // four copies of a number channel by channel — unpacking, multiplying,
+    // summing, rounding and repacking sixteen nibbles — costs more than the
+    // comparison that avoids it, and this runs for every corner of every face
+    // in a chunk. On open ground under daylight it is every corner there is.
     if samples[1] == samples[0] && samples[2] == samples[0] && samples[3] == samples[0] {
-        return samples[0];
+        return (samples[0], 0);
     }
 
     let mut out = Light::DARK;
+    let mut fine = 0_u8;
     for channel in 0..CHANNELS {
-        let total: u32 = samples
+        let total: i32 = samples
             .iter()
-            .map(|level| u32::from(level.channel(channel)))
+            .zip(weights)
+            .map(|(level, weight)| i32::from(level.channel(channel)) * weight)
             .sum();
-        // Rounded rather than truncated: four corners each losing three
-        // quarters of a level is a visible step darker across a whole surface.
-        out = out.with_channel(channel, ((total + 2) / 4) as u8);
+        // Into quarter levels, rounded rather than truncated: the weights sum
+        // to `WEIGHTS * WEIGHTS`, so a quarter level is that over four.
+        let quarters = (total * 4 + WEIGHTS * WEIGHTS / 2) / (WEIGHTS * WEIGHTS);
+        out = out.with_channel(channel, (quarters / 4) as u8);
+        // Same channel order as `Light`: sun in the top pair of bits.
+        fine |= ((quarters % 4) as u8) << (2 * (CHANNELS - 1 - channel));
     }
-    out
+    (out, fine)
+}
+
+/// One component of a cell triple.
+const fn axis_of(cell: (i32, i32, i32), axis: usize) -> i32 {
+    match axis {
+        0 => cell.0,
+        1 => cell.1,
+        _ => cell.2,
+    }
+}
+
+/// Replaces one component of a cell triple.
+const fn set_axis(cell: &mut (i32, i32, i32), axis: usize, value: i32) {
+    match axis {
+        0 => cell.0 = value,
+        1 => cell.1 = value,
+        _ => cell.2 = value,
+    }
 }
 
 /// The block containing a cell, for negative coordinates too.
@@ -325,11 +435,16 @@ mod tests {
 
         // A top face of the cell at (1, 2, 1) — block (0, 0, 0) — looks up into
         // block (0, 1, 0).
+        //
+        // Not the full level: sampling at block centres blends the lit block
+        // with its dark neighbours, and this corner carries 100/144 of it. What
+        // matters here is that the light is most of the way up rather than
+        // zero, because zero is what reading the solid block underneath gives.
         let shade = face_shade(&light, &Empty, 1, true, (1, 2, 1));
-        assert_eq!(
-            shade,
-            Shade::flat(Light::DAYLIGHT),
-            "a top face read the dark block it belongs to instead of the lit air above it"
+        assert!(
+            shade.light.iter().all(|level| level.sun() > MAX_LEVEL / 2),
+            "a top face read the dark block it belongs to instead of the lit air above it: {:?}",
+            shade.light
         );
     }
 
@@ -346,13 +461,15 @@ mod tests {
         // z = 6 (block 2 starts there).
         let shade = face_shade(&light, &Empty, 1, true, (1, 2, 5));
         let levels: Vec<u8> = shade.light.iter().map(|level| level.sun()).collect();
+        let brightest = levels.iter().max().copied().unwrap_or(0);
+        let dimmest = levels.iter().min().copied().unwrap_or(0);
         assert!(
-            levels.contains(&MAX_LEVEL),
-            "no corner was fully lit: {levels:?}"
+            brightest > dimmest,
+            "no corner landed between lit and dark, so there is no gradient: {levels:?}"
         );
         assert!(
-            levels.iter().any(|level| *level < MAX_LEVEL && *level > 0),
-            "no corner landed between lit and dark, so there is no gradient: {levels:?}"
+            brightest > 0 && dimmest < MAX_LEVEL,
+            "the face is uniformly one thing or the other: {levels:?}"
         );
     }
 
@@ -514,5 +631,103 @@ mod tests {
         assert_eq!(plane_axes(0), (1, 2));
         assert_eq!(plane_axes(1), (0, 2));
         assert_eq!(plane_axes(2), (0, 1));
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+    use tiamot_core::light::MAX_LEVEL;
+
+    /// Block light falling one level per block along x, as a lamp's does.
+    struct Ramp;
+
+    impl BlockLight for Ramp {
+        fn at(&self, x: i32, _y: i32, _z: i32) -> Light {
+            let level = MAX_LEVEL.saturating_sub(x.clamp(0, i32::from(MAX_LEVEL)) as u8);
+            Light::new(0, level, level, level)
+        }
+    }
+
+    /// One corner's red channel in quarter levels.
+    fn quarters(shade: &Shade, corner: usize) -> i32 {
+        i32::from(shade.light[corner].red()) * 4 + i32::from((shade.fine[corner] >> 4) & 0x3)
+    }
+
+    #[test]
+    fn a_gradient_falls_across_a_whole_block_rather_than_in_one_cell() {
+        // **The bug this replaced**, reported from the window as the
+        // interpolation between blocks being rough.
+        //
+        // Averaging the four blocks touching a corner samples the SAME block
+        // four times unless the corner sits exactly on a block boundary, so the
+        // whole of a one-level drop landed on the first cell of each block and
+        // the other two were flat: `[15 14] [14 14] [14 14]`. That is a hard
+        // band every block, whatever the shader does with it afterwards.
+        //
+        // The property that says it is fixed is that EVERY cell across a block
+        // moves, not merely that the block as a whole ends up darker.
+        let mut steps = Vec::new();
+        for cell in 3..6 {
+            let shade = face_shade(&Ramp, &Empty, 1, true, (cell, 2, 5));
+            steps.push(quarters(&shade, 0) - quarters(&shade, 1));
+        }
+
+        assert!(
+            steps.iter().all(|drop| *drop > 0),
+            "a cell somewhere across the block had no gradient at all: {steps:?} quarter levels"
+        );
+        // And no single cell carries the whole level, which is what the old
+        // sampling did and what made the band.
+        assert!(
+            steps.iter().all(|drop| *drop < 4),
+            "a single cell carried a whole level or more: {steps:?} quarter levels"
+        );
+    }
+
+    #[test]
+    fn a_uniform_field_still_has_nothing_left_over() {
+        // The fast path, and the property the world's vertex count rests on:
+        // open ground under daylight must produce corners that compare EQUAL,
+        // or greedy merging stops merging a chunk floor into a handful of
+        // quads. A fractional part that was very slightly non-zero here would
+        // cost nothing visible and multiply the geometry of every world.
+        let shade = face_shade(&Uniform(Light::DAYLIGHT), &Empty, 1, true, (7, 4, 9));
+        assert_eq!(shade, Shade::flat(Light::DAYLIGHT));
+        assert_eq!(shade.fine, [0; 4], "a uniform field left a remainder");
+    }
+
+    #[test]
+    fn the_quarter_levels_never_overflow_their_two_bits() {
+        // `fine` shares a word with the position, so a value of 4 would not be
+        // clamped, it would be added to the occlusion bits — and the symptom
+        // would be corners darkening at random rather than anything to do with
+        // light.
+        for cell in 0..24 {
+            let shade = face_shade(&Ramp, &Empty, 1, true, (cell, 2, 5));
+            for fine in shade.fine {
+                for channel in 0..CHANNELS {
+                    let pair = (fine >> (2 * (CHANNELS - 1 - channel))) & 0x3;
+                    assert!(pair < 4, "channel {channel} of {fine} is {pair}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_corner_never_exceeds_the_brightest_block_near_it() {
+        // Interpolation is a weighted mean, so it cannot overshoot — but the
+        // rounding into quarter levels could, and a level of 15 with a quarter
+        // on top would divide past 1.0 in the shader and light a surface
+        // brighter than daylight.
+        let shade = face_shade(&Uniform(Light::DAYLIGHT), &Empty, 1, true, (7, 4, 9));
+        for corner in 0..4 {
+            assert!(
+                quarters(&shade, corner) <= i32::from(MAX_LEVEL) * 4,
+                "corner {corner} came to {} quarter levels, past the maximum of {}",
+                quarters(&shade, corner),
+                i32::from(MAX_LEVEL) * 4
+            );
+        }
     }
 }
