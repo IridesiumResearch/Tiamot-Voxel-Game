@@ -175,6 +175,15 @@ fn prepare(gpu: Gpu, chunks: &[Chunk], mode: RenderMode) -> Renderer {
 /// a wall of faces at every shared plane, and the frame would be full of
 /// z-fighting quads that no assertion here would notice.
 fn upload(renderer: &mut Renderer, chunks: &[Chunk]) {
+    upload_lit(renderer, chunks, &DAY);
+}
+
+/// The same, with a chosen stored light rather than full daylight.
+///
+/// For the tests that are about what the shader does with a light level, which
+/// need one the server would really have produced — a sealed room's zero, above
+/// all, which no scene built out of daylight can offer.
+fn upload_lit(renderer: &mut Renderer, chunks: &[Chunk], light: &impl client::shade::BlockLight) {
     let by_pos: std::collections::BTreeMap<ChunkPos, &Chunk> =
         chunks.iter().map(|chunk| (chunk.pos(), chunk)).collect();
 
@@ -196,7 +205,7 @@ fn upload(renderer: &mut Renderer, chunks: &[Chunk]) {
                 .get(&ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz))
                 .copied();
         }
-        let mesh = mesher::mesh_chunk(chunk, &neighbours, Absent::Air, &DAY);
+        let mesh = mesher::mesh_chunk(chunk, &neighbours, Absent::Air, light);
         renderer.set_chunk(pos, &mesh);
     }
 }
@@ -1006,6 +1015,207 @@ fn a_low_sun_casts_longer_shadows_than_a_high_one() {
         shadowed < bright - 0.01,
         "the floor is {shadowed} under a low sun against {bright} under a high one, so nothing \
          was shadowed by moving the sun"
+    );
+}
+
+/// The fixed scene with a stone canopy floating over the middle chunk.
+///
+/// Somewhere to stand with nothing but an underside overhead, which the fixed
+/// scene has nowhere: its only downward faces are the rim of one hole, too few
+/// pixels to average honestly.
+fn canopy_scene() -> Vec<Chunk> {
+    let mut chunks = scene_at(ChunkPos::new(0, 0, 0));
+    for chunk in &mut chunks {
+        let pos = chunk.pos();
+        if (pos.x, pos.z) != (1, 1) {
+            continue;
+        }
+        let corner = BlockPos::from_chunk_corner(pos);
+        for x in 0..16 {
+            for z in 0..16 {
+                chunk
+                    .set_block(
+                        BlockPos::new(corner.x + x, corner.y + 12, corner.z + z),
+                        BlockValue::Uniform(STONE),
+                    )
+                    .expect("in chunk");
+            }
+        }
+    }
+    chunks
+}
+
+#[test]
+fn the_underside_of_an_overhang_is_not_lit_as_though_the_sun_were_under_it() {
+    // **Reported from the window: "the underside of blocks, when lit at all,
+    // are completely lit, which is odd."** It was, and the reason was that the
+    // depth pass culled front faces — so the depth recorded for an underside
+    // was the underside, which compares equal to itself and passes every test.
+    // A surface the sun is behind is in shadow because of where it points, and
+    // no depth map can say otherwise.
+    //
+    // The stored light is full daylight everywhere in this scene, deliberately:
+    // that removes the server's propagated light from the question and leaves
+    // only what the shader does with a face's direction.
+    let Some(gpu) = gpu() else { return };
+    let chunks = canopy_scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Under the canopy at y = 12, above the floor at y = 8, looking up.
+    let mut below = Camera {
+        position: Position::from_world(24.0, 10.0, 24.0),
+        ..Camera::default()
+    };
+    below.look(0.0, 1.3);
+
+    // And the floor from above, as the thing to measure the underside against.
+    let above = viewpoint();
+
+    // Nearly overhead, so the canopy's underside is as far from the sun as a
+    // face can be and the floor's top is square on to it.
+    let sun = [0.05_f32, -0.99, 0.1];
+
+    let luminance = |frame: &Image| {
+        let colour = average(frame, WIDTH / 4, HEIGHT / 4, WIDTH * 3 / 4, HEIGHT * 3 / 4);
+        (colour[0] + colour[1] + colour[2]) / 3.0
+    };
+
+    let ratio = |renderer: &mut Renderer| {
+        renderer.set_sun(1.0, [1.0, 1.0, 1.0], sun);
+        let under = luminance(&target.capture(renderer, &below).expect("capture"));
+        let top = luminance(&target.capture(renderer, &above).expect("capture"));
+        under / top
+    };
+
+    // Mode 2 has no shadow map, so its underside keeps `face_shade`'s half and
+    // nothing else. This is the counter-example that makes the assertion below
+    // non-vacuous: without it, a test that mode 3's underside is dark would
+    // also pass if every mode had always drawn it dark.
+    renderer.set_lighting_mode(LightingMode::Classic);
+    let classic = ratio(&mut renderer);
+
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let beautiful = ratio(&mut renderer);
+
+    assert!(
+        beautiful < classic * 0.75,
+        "an overhang's underside is {beautiful} of the floor's brightness in mode 3 and \
+         {classic} in mode 2 — the sun is still reaching a face that points away from it"
+    );
+}
+
+#[test]
+fn a_face_the_sun_is_behind_is_no_brighter_than_the_shadow_it_casts() {
+    // **Reported from the window: shadows "fall just short of the corner
+    // between two blocks and the light bleeds".**
+    //
+    // The bleed was not the shadow being short. It was the caster's own
+    // shadowed side being fully lit: with front faces culled in the depth pass,
+    // the depth recorded for a face pointing away from the sun was that face
+    // itself, so it compared equal to its own depth and passed. A block under a
+    // low sun therefore had a bright north side sitting directly on top of the
+    // dark ground it was shadowing, and the corner between them read as light
+    // getting in where it could not.
+    //
+    // Measured, on this scene, before and after: the north face went from 0.75
+    // against a 0.14 shadow — five times brighter than the shadow it was
+    // casting — to 0.52 against 0.56, which is a corner rather than a seam.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // The block standing proud of the floor at (20, 8, 20), close up, with the
+    // sun low and to the south so it throws its shadow north toward the camera
+    // rather than behind itself where nothing could see it.
+    let mut camera = Camera {
+        position: Position::from_world(20.5, 11.0, 25.0),
+        ..Camera::default()
+    };
+    camera.look(std::f32::consts::PI, -0.62);
+    renderer.set_sun(1.0, [1.0, 1.0, 1.0], [0.0, -0.45, 0.89]);
+    let frame = target.capture(&mut renderer, &camera).expect("capture");
+
+    let luminance = |x0, y0, x1, y1| {
+        let colour = average(&frame, x0, y0, x1, y1);
+        (colour[0] + colour[1] + colour[2]) / 3.0
+    };
+
+    // Windows well inside each region rather than at its edge, so that a
+    // driver's rasterisation landing half a pixel elsewhere cannot move them
+    // onto the boundary between the two.
+    let face = luminance(150, 92, 176, 112);
+    let shadow = luminance(150, 130, 176, 165);
+    let floor = luminance(40, 150, 90, 190);
+
+    assert!(
+        face < shadow * 1.6,
+        "the block's shadowed side reads {face} above a shadow of {shadow} — the sun is \
+         reaching a face it stands behind, which is what puts a bright seam in the corner"
+    );
+    // Both of them really are in shadow, and this is really mode 3. Without
+    // this the assertion above would also hold on a frame where nothing was
+    // shadowed at all and every reading was the same bright number.
+    assert!(
+        shadow < floor * 0.8,
+        "the shadowed ground reads {shadow} against open floor at {floor}, so there is no \
+         shadow here to have been continuous with"
+    );
+}
+
+#[test]
+fn a_sealed_room_does_not_get_brighter_when_the_sky_does() {
+    // **Reported from the window: "when in a cave as day comes the ambient
+    // light makes even a completely enclosed space brighter."**
+    //
+    // The floor under the darkest place was `sky_colour * AMBIENT_FLOOR`, and a
+    // sky colour carries the sky's brightness as well as its hue — so the floor
+    // rose and fell with the sun in a room the sun could not reach. Charter
+    // rule 19 puts that decision in the stored sunlight channel, which the
+    // server had already worked out to be zero down there.
+    //
+    // Built with a stored light of zero everywhere rather than with geometry
+    // that encloses something: what is under test is the shader's floor, and
+    // zero is zero however a room came by it.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Classic);
+    upload_lit(
+        &mut renderer,
+        &chunks,
+        &client::shade::Uniform(tiamot_core::light::Light::DARK),
+    );
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Fog pushed far beyond the scene. Left where it is, `set_sky` would mix
+    // the sky's own colour into every surface and the test would measure the
+    // fog rather than the floor.
+    let sunless = |renderer: &mut Renderer, sky: [f32; 3]| {
+        renderer.set_sky(sky, 10_000.0);
+        renderer.set_sun(1.0, [1.0, 1.0, 1.0], [0.05, -0.99, 0.1]);
+        let frame = target.capture(renderer, &viewpoint()).expect("capture");
+        // The bottom of the frame is the floor — see `viewpoint`.
+        let colour = average(&frame, 0, HEIGHT * 3 / 4, WIDTH, HEIGHT);
+        (colour[0] + colour[1] + colour[2]) / 3.0
+    };
+
+    let midnight = sunless(&mut renderer, [0.02, 0.03, 0.06]);
+    let noon = sunless(&mut renderer, [0.53, 0.81, 0.92]);
+
+    assert!(
+        noon < midnight * 1.25,
+        "an unlit floor reads {noon} under a bright sky and {midnight} under a dark one, so the \
+         sky is lighting a place its light never reached"
+    );
+    // And the floor is genuinely being drawn at the ambient level rather than
+    // black or missing, which is the reading that would make the comparison
+    // above true by having nothing in it.
+    assert!(
+        midnight > 0.01,
+        "the unlit floor reads {midnight}, which is not a floor anyone could see by"
     );
 }
 

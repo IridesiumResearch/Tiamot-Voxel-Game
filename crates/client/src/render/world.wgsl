@@ -46,6 +46,13 @@ struct Globals {
     light_view_projection: array<mat4x4<f32>, 3>,
     // Where each cascade ends, in blocks, in xyz; one shadow texel in UV in w.
     cascade_far: vec4<f32>,
+    // The direction the sun's light TRAVELS, in xyz — so a surface faces the
+    // sun when its normal opposes this. Unit length. w unused.
+    sun_direction: vec4<f32>,
+    // The world size of one shadow texel, in blocks, per cascade in xyz. The
+    // normal-offset bias is measured in these: a bias smaller than a texel
+    // cannot fix a texel-sized quantisation error. w unused.
+    shadow_texel: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -89,7 +96,23 @@ struct VertexOut {
     // renderer has no world-space coordinate to offer (floating origin), and
     // the light matrices are built in the same space for that reason.
     @location(7) world: vec3<f32>,
+    // Which way this face points. Flat, because a voxel face is one of six
+    // directions over its whole area and interpolating between two of them
+    // would invent normals no geometry has.
+    @location(8) @interpolate(flat) normal: vec3<f32>,
 };
+
+// The outward normal of a face, from the two bits that describe it.
+//
+// The mesher winds every face so that this is the direction back-face culling
+// keeps, which is what lets the shadow pass cull backs and record exactly the
+// surfaces the light lands on.
+fn face_normal(axis: u32, positive: bool) -> vec3<f32> {
+    let sign = select(-1.0, 1.0, positive);
+    if (axis == 0u) { return vec3<f32>(sign, 0.0, 0.0); }
+    if (axis == 1u) { return vec3<f32>(0.0, sign, 0.0); }
+    return vec3<f32>(0.0, 0.0, sign);
+}
 
 // Lighting mode 1: directional face shading, matching `mesher::face_shade`.
 // Flat-lit voxels are unreadable — every edge disappears and the world is one
@@ -157,6 +180,7 @@ fn vertex_main(input: VertexIn) -> VertexOut {
     ) / 15.0;
 
     out.shade = face_shade(axis, positive);
+    out.normal = face_normal(axis, positive);
 
     // **Occlusion is applied to the colour, not to the light.** Scaling the
     // stored light would keep its hue, so a corner shadowed under a low sun
@@ -224,6 +248,22 @@ const AO_NEUTRAL: f32 = 0.5;
 // it is arithmetic bookkeeping and not a look.
 const SKY_TINT_SCALE: f32 = 1.732;
 
+// How much of its daylight a surface keeps when the sun cannot reach it.
+//
+// **This is the dial for how dark mode 3's shadows are.** A shadow on a sunny
+// day is blue, not black: the sun is one light and the sky is another, and only
+// the first of them can be stood in front of. Before this existed, a shadowed
+// surface fell all the way to the ambient floor — a thirtieth of full — which
+// is why the underside of a block had to be left fully lit to be visible at
+// all.
+//
+// It is a FLOOR rather than a share, which matters: an open surface in full sun
+// takes the sun's own value unchanged, so modes 1 and 2 — which have no shadow
+// map and pass 1.0 — render exactly what they did before. Written as a share
+// first, and every lit surface in the world went faintly blue, which the
+// screenshot gates caught by noticing that stone had become bluer than red.
+const SKY_FLOOR: f32 = 0.3;
+
 // Perceived brightness, for the grey occlusion mixes toward. The green weight
 // dominates because the eye's does.
 fn luma(colour: vec3<f32>) -> f32 {
@@ -238,12 +278,34 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     if (globals.lighting_mode == 0u) {
         return vec3<f32>(input.shade * input.occlusion);
     }
-    // **The shadow scales the SUN and nothing else.** A cave is dark because
-    // its stored sunlight channel is zero, which the server worked out and is
-    // true whether or not anything is drawing; the shadow map only says whether
-    // the sun can see a surface it does reach. Applying it to the total would
-    // let a shadow put out a lamp.
-    let daylight = input.sun * globals.sun_intensity * globals.sun_colour.rgb * shadow;
+    // The sky's own colour at unit brightness. Used for the skylight below and
+    // for the two floors further down, all of which want the hue of the sky
+    // without its brightness — see `AMBIENT_FLOOR` for why that distinction is
+    // load-bearing.
+    let sky_hue = normalize(globals.sky_colour.rgb + vec3<f32>(0.0001)) * SKY_TINT_SCALE;
+
+    // **Daylight is two things, and only one of them casts a shadow.**
+    //
+    // The sun is a point and something can stand in front of it; the sky is a
+    // dome and nothing can. Splitting them is what stops the underside of a
+    // block — which the sun can never see — from coming out either fully lit
+    // (it was, before there was a facing test) or black (it would be, if the
+    // shadow gated everything). An underside in the open is lit by the sky,
+    // which is exactly what it looks like.
+    //
+    // Both are scaled by the STORED sunlight channel, which the server worked
+    // out and which is zero inside a cave. That is charter rule 19's gate: a
+    // shadow map may darken what the sun reaches and may never brighten what
+    // the sky does not.
+    //
+    // Combined with `max` rather than added, the same way daylight and block
+    // light are below and for the same reason: adding a second light source to
+    // every outdoor surface washes the world out. The sky is the floor the sun
+    // is measured against, so full sun is exactly full sun.
+    let sky_reach = input.sun * globals.sun_intensity;
+    let direct = sky_reach * globals.sun_colour.rgb * shadow;
+    let skylight = sky_reach * sky_hue * SKY_FLOOR;
+    let daylight = max(direct, skylight);
 
     // **Block light loses its hue as it dims, on purpose.**
     //
@@ -282,13 +344,19 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     // A floor under the darkest cave, so a dark room is legible rather than
     // pitch black. Presentation, not simulation — the stored light really is
     // zero down there.
-    // The floor under the darkest place is the SKY's colour, not grey.
     //
-    // Whatever light reaches a shadowed surface with no lamp on it came from
-    // the sky, so it arrives the colour the sky is — bluish by day, and the
-    // reason a neutral grey floor read as yellow against a blue world. Scaled
-    // right down: this is a floor, not a second light source.
-    let ambient = globals.sky_colour.rgb * globals.ambient;
+    // **Its brightness is fixed and only its hue follows the sky.** It used to
+    // be `sky_colour * ambient`, and the sky's colour carries the sky's
+    // brightness, so the floor rose and fell with the sun — reported from the
+    // window as a sealed cave getting brighter as day came, which is the one
+    // thing stored sunlight exists to prevent. Taking the direction of the sky
+    // colour and none of its length keeps the floor the tint it should be
+    // (bluish, which is why a neutral grey read as yellow against a blue world)
+    // at a brightness nothing outside can move.
+    //
+    // Anything that SHOULD brighten with the day is daylight above, gated by
+    // the stored sunlight channel, and a sealed cave has none of that.
+    let ambient = sky_hue * globals.ambient;
     let shaded = max(lit, ambient) * input.shade;
 
     // **Occlusion darkens toward grey, not by scaling.**
@@ -308,12 +376,46 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     // ambient floor is: a corner is dark because the sky cannot see into it,
     // and what little reaches it is skylight. A neutral grey was the first
     // attempt and still read as yellow against a blue world.
-    let sky_tint = normalize(globals.sky_colour.rgb + vec3<f32>(0.0001));
-    let neutral = sky_tint * luma(shaded) * AO_NEUTRAL * SKY_TINT_SCALE;
+    let neutral = sky_hue * luma(shaded) * AO_NEUTRAL;
     return mix(neutral, shaded, input.occlusion);
 }
 
+// How wide the band is, in `dot(normal, sunward)`, over which a face turns from
+// facing the sun to facing away.
+//
+// Zero would be physically right and reads as a switch: every wall of one
+// orientation in view flips from lit to unlit on the same frame as the sun
+// crosses its plane. A narrow band spreads that over a few minutes of the
+// cycle, which is what a terminator looks like.
+const TERMINATOR: f32 = 0.12;
+
+// How many shadow texels the sample point is pushed along the surface normal.
+//
+// **This is what replaced culling front faces in the depth pass.** Recording
+// the far side of a caster does move acne off the lit surface, and it does it
+// by putting the recorded depth a whole block deep, which shortens every shadow
+// by the thickness of the thing casting it — reported from the window as
+// shadows falling short of the corner between two blocks and light bleeding in.
+// Offsetting along the normal instead fixes the same quantisation at its
+// source: the error is that a sample lands in a texel whose depth was taken
+// somewhere else on the surface, and moving the sample off the surface by more
+// than a texel is worth means it cannot land behind it.
+//
+// Just over one texel, scaled by how obliquely the light strikes: a face the
+// sun grazes spans many texels of depth and needs the most.
+const NORMAL_BIAS_TEXELS: f32 = 1.5;
+
 // How much of the sun reaches this fragment, 0 fully shadowed to 1 open.
+//
+// # Facing comes first, and no depth map can overrule it
+//
+// A surface the sun is behind is not lit by the sun, whatever the shadow map
+// says. This used to be missing entirely, and the symptom was the underside of
+// every block coming out fully lit: with front faces culled, the depth recorded
+// for an underside was the underside itself, so it compared equal to its own
+// depth and passed. Testing the normal answers it without a texture read, and
+// removes the acne on grazing faces as a side effect — those are the fragments
+// where a depth comparison is least able to be right.
 //
 // # Picking a cascade
 //
@@ -330,16 +432,36 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
 // A single tap gives a hard, stair-stepped edge along the shadow map's grid,
 // which on a voxel world reads as geometry that is not there.
 fn shadow_factor(input: VertexOut) -> f32 {
+    let sunward = -globals.sun_direction.xyz;
+    let facing = dot(input.normal, sunward);
+    if (facing <= 0.0) {
+        return 0.0;
+    }
+    // The most sun this fragment can receive whatever the map says. Every
+    // path out of this function is multiplied by it, including the two that
+    // leave before a texture is ever read — a face at the terminator beyond
+    // the last cascade is still at the terminator.
+    let band = smoothstep(0.0, TERMINATOR, facing);
+
     var cascade = 0;
     if (input.distance > globals.cascade_far.z) {
-        return 1.0;
+        return band;
     } else if (input.distance > globals.cascade_far.y) {
         cascade = 2;
     } else if (input.distance > globals.cascade_far.x) {
         cascade = 1;
     }
 
-    let clip = globals.light_view_projection[cascade] * vec4<f32>(input.world, 1.0);
+    // Along the normal, by more than one texel of the cascade doing the
+    // looking, and by more again the more obliquely the sun strikes. `facing`
+    // is the cosine, so `1 / facing` is how far a texel's worth of surface
+    // travels in depth; clamped because it runs away at the terminator, where
+    // the band below is taking over anyway.
+    let slope = min(1.0 / max(facing, 0.05), 4.0);
+    let bias = globals.shadow_texel[cascade] * NORMAL_BIAS_TEXELS * slope;
+    let sample_at = input.world + input.normal * bias;
+
+    let clip = globals.light_view_projection[cascade] * vec4<f32>(sample_at, 1.0);
     // No perspective divide worth the name — the light's projection is
     // orthographic, so w is 1 — but doing it costs nothing and means a future
     // spotlight does not need this line rewritten.
@@ -350,7 +472,7 @@ fn shadow_factor(input: VertexOut) -> f32 {
     // that falls outside every cascade has no shadow information, and guessing
     // "shadowed" would put a dark band around the edge of the map.
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0) {
-        return 1.0;
+        return band;
     }
 
     let texel = globals.cascade_far.w;
@@ -367,7 +489,11 @@ fn shadow_factor(input: VertexOut) -> f32 {
             );
         }
     }
-    return sum / 9.0;
+    // The terminator last, over the map's answer rather than instead of it: a
+    // face nearly edge-on to the sun is both barely lit and barely able to be
+    // sampled correctly, and fading it out covers the second as well as the
+    // first.
+    return (sum / 9.0) * smoothstep(0.0, TERMINATOR, facing);
 }
 
 // One fragment, given how much sun reaches it.

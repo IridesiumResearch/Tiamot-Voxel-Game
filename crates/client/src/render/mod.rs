@@ -155,6 +155,21 @@ struct Globals {
     light_view_projection: [[[f32; 4]; 4]; shadow::CASCADES],
     /// Where each cascade ends, in blocks, and one shadow texel in `w`.
     cascade_far: [f32; 4],
+    /// The direction the sun's light travels, and a spare word.
+    ///
+    /// The world shader needs it to ask whether a face points at the sun at
+    /// all, which is a question no depth map can answer — see `shadow_factor`.
+    /// **Appended rather than slotted in beside the other sun fields**, for the
+    /// reason `light_view_projection` documents above: every field after an
+    /// insertion moves, and the shader finds out by reading the wrong sixteen
+    /// bytes.
+    sun_direction: [f32; 4],
+    /// The world size of one shadow texel, in blocks, per cascade.
+    ///
+    /// The normal-offset bias is measured in these. Computed here rather than
+    /// in the shader because the cascade radius lives on this side and the
+    /// alternative is recovering it from the length of a matrix row.
+    shadow_texel: [f32; 4],
 }
 
 /// How much light the darkest place still gets.
@@ -1011,6 +1026,22 @@ impl Renderer {
                     .and_then(graph::Post::shadow_texels)
                     .unwrap_or(shadow::DEFAULT_SIZE);
                 [splits[0], splits[1], splits[2], 1.0 / texels as f32]
+            },
+            sun_direction: [
+                self.sun_direction[0],
+                self.sun_direction[1],
+                self.sun_direction[2],
+                0.0,
+            ],
+            shadow_texel: {
+                // A block per texel until a cascade has been fitted, which is
+                // every frame in modes 1 and 2. Nothing reads it there.
+                let world = self
+                    .post
+                    .as_ref()
+                    .and_then(graph::Post::shadows)
+                    .map_or([1.0; shadow::CASCADES], |s| *s.texel_world());
+                [world[0], world[1], world[2], 0.0]
             },
         }
     }

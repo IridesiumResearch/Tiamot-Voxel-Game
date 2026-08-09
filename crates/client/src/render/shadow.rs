@@ -71,12 +71,16 @@ const CASTER_MARGIN: f32 = 64.0;
 /// A depth bias, in units of the depth buffer's resolution.
 ///
 /// Shadow acne is a surface shadowing itself because its depth in the light's
-/// map is quantised to a texel that slopes away from it. The constant term
-/// handles a flat surface and the slope-scaled term handles a steep one; a
-/// world of axis-aligned faces needs less of both than a smooth one, which is
-/// why these are small.
-const DEPTH_BIAS: i32 = 2;
-const DEPTH_BIAS_SLOPE: f32 = 2.0;
+/// map is quantised to a texel that slopes away from it. **The main defence is
+/// the normal-offset bias in `world.wgsl`**, which moves the sample off the
+/// surface rather than moving the whole map away from the light; this is the
+/// small remainder, for the flat case a normal offset does nothing for.
+///
+/// Kept low on purpose. A depth bias shortens every shadow — it is the second
+/// of the two mechanisms that were making shadows fall short of a corner — so
+/// the least that works is the right amount.
+const DEPTH_BIAS: i32 = 1;
+const DEPTH_BIAS_SLOPE: f32 = 1.5;
 
 /// One cascade's matrix, as the shader wants it.
 #[repr(C)]
@@ -101,6 +105,14 @@ pub struct Shadows {
     sample_bind: wgpu::BindGroup,
     /// The matrices the last [`Shadows::update`] computed, for the world pass.
     matrices: [Mat4; CASCADES],
+    /// The world size of one texel, in blocks, in each of those matrices.
+    ///
+    /// Kept beside them because it falls out of the same fit — the cascade
+    /// covers a sphere of some radius across `size` texels — and the world
+    /// shader's normal-offset bias is measured in it. Recovering it there from
+    /// the length of a matrix row is possible and is a puzzle rather than a
+    /// value.
+    texel_world: [f32; CASCADES],
 }
 
 impl Shadows {
@@ -191,6 +203,11 @@ impl Shadows {
             binds,
             sample_layout,
             matrices: [Mat4::IDENTITY; CASCADES],
+            // Until the first `update`, one texel of an identity matrix, which
+            // is meaningless — and harmless, because the identity matrices it
+            // sits beside put every lookup outside the map, where the shadow
+            // factor returns lit without reading the bias at all.
+            texel_world: [RANGE / size as f32; CASCADES],
             size,
         }
     }
@@ -213,6 +230,15 @@ impl Shadows {
         &self.matrices
     }
 
+    /// The world size of one texel, in blocks, in each cascade.
+    ///
+    /// What the world shader's normal-offset bias is measured in: an offset
+    /// smaller than a texel cannot undo a texel-sized quantisation.
+    #[must_use]
+    pub const fn texel_world(&self) -> &[f32; CASCADES] {
+        &self.texel_world
+    }
+
     /// Where each cascade ends, in blocks from the camera.
     #[must_use]
     pub fn split_distances() -> [f32; CASCADES] {
@@ -232,7 +258,9 @@ impl Shadows {
 
         let mut near = camera.near;
         for (index, far) in Self::split_distances().into_iter().enumerate() {
-            self.matrices[index] = cascade_matrix(camera, aspect, near, far, sun, self.size);
+            let (matrix, texel) = cascade_matrix(camera, aspect, near, far, sun, self.size);
+            self.matrices[index] = matrix;
+            self.texel_world[index] = texel;
             gpu.queue.write_buffer(
                 &self.uniforms[index],
                 0,
@@ -349,7 +377,14 @@ fn sample_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
     clippy::disallowed_methods,
     reason = "charter rule 4 exempts rendering from the deterministic float subset; this tangent               decides where a shadow map looks, not what the world is"
 )]
-fn cascade_matrix(camera: &Camera, aspect: f32, near: f32, far: f32, sun: Vec3, size: u32) -> Mat4 {
+fn cascade_matrix(
+    camera: &Camera,
+    aspect: f32,
+    near: f32,
+    far: f32,
+    sun: Vec3,
+    size: u32,
+) -> (Mat4, f32) {
     let forward = camera.forward();
     let right = forward.cross(Vec3::Y).normalize_or_zero();
     let up = right.cross(forward).normalize_or_zero();
@@ -413,7 +448,7 @@ fn cascade_matrix(camera: &Camera, aspect: f32, near: f32, far: f32, sun: Vec3, 
         0.0,
         radius * 2.0 + CASTER_MARGIN,
     );
-    projection * view
+    (projection * view, texel)
 }
 
 /// The depth-only pipeline the cascades are drawn with.
@@ -442,12 +477,22 @@ fn build_pipeline(gpu: &Gpu, layout: &wgpu::BindGroupLayout) -> wgpu::RenderPipe
             // No fragment stage at all. Depth is the entire output.
             fragment: None,
             primitive: wgpu::PrimitiveState {
-                // **Front faces culled, not back.** Drawing only the far side
-                // of a caster puts the depth the shadow test compares against
-                // inside the object rather than on the surface the light hits,
-                // which moves acne off the lit face entirely and lets the bias
-                // stay small.
-                cull_mode: Some(wgpu::Face::Front),
+                // **Back faces culled, so the map records the surfaces the
+                // light actually lands on.**
+                //
+                // This used to cull fronts, which does move acne off the lit
+                // face — by recording a depth a whole block further away, so
+                // every shadow was short by the thickness of the thing casting
+                // it. Reported from the window as shadows stopping before the
+                // corner between two blocks with light bleeding into it, and as
+                // the underside of every block coming out fully lit: an
+                // underside was the surface being recorded, so it compared
+                // equal to itself and passed.
+                //
+                // The acne that culling fronts was hiding is handled where it
+                // belongs now — a facing test and a normal-offset bias in
+                // `world.wgsl`, neither of which distorts what is in the map.
+                cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -515,7 +560,7 @@ mod tests {
         // is nearly right fails.
         let camera = Camera::default();
         let sun = Vec3::new(0.0, -1.0, 0.25).normalize();
-        let matrix = cascade_matrix(&camera, 16.0 / 9.0, 0.05, 20.0, sun, DEFAULT_SIZE);
+        let (matrix, _) = cascade_matrix(&camera, 16.0 / 9.0, 0.05, 20.0, sun, DEFAULT_SIZE);
 
         let forward = camera.forward();
         for distance in [1.0_f32, 10.0, 19.0] {
@@ -540,9 +585,9 @@ mod tests {
         // the world crawls while the player looks around.
         let sun = Vec3::new(0.2, -1.0, 0.3).normalize();
         let mut camera = Camera::default();
-        let first = cascade_matrix(&camera, 1.0, 0.05, 20.0, sun, DEFAULT_SIZE);
+        let (first, first_texel) = cascade_matrix(&camera, 1.0, 0.05, 20.0, sun, DEFAULT_SIZE);
         camera.yaw += std::f32::consts::FRAC_PI_2;
-        let second = cascade_matrix(&camera, 1.0, 0.05, 20.0, sun, DEFAULT_SIZE);
+        let (second, second_texel) = cascade_matrix(&camera, 1.0, 0.05, 20.0, sun, DEFAULT_SIZE);
 
         // The projections must be identical — same radius, same extent. The
         // views differ, because the slice really is somewhere else.
@@ -552,6 +597,31 @@ mod tests {
             "the cascade changed size when the camera turned: {} then {}",
             scale(&first),
             scale(&second)
+        );
+        // And so must the texel size, which the sphere's radius decides. The
+        // world shader's normal-offset bias is measured in it, so a texel that
+        // changed with the camera's heading would make the bias — and with it
+        // the exact edge of every shadow — breathe as the player looked around.
+        assert!(
+            (first_texel - second_texel).abs() < 1e-4,
+            "one texel covered {first_texel} blocks and then {second_texel}"
+        );
+    }
+
+    #[test]
+    fn a_texel_of_the_near_cascade_covers_less_world_than_a_far_one() {
+        // The bias is measured in texels, so this is what makes it small where
+        // the detail is. A flat or inverted ladder here would mean the near
+        // cascade — the one under the player's feet — carrying the far
+        // cascade's bias, which reads as shadows detaching from their casters.
+        let sun = Vec3::new(0.2, -1.0, 0.3).normalize();
+        let camera = Camera::default();
+        let splits = Shadows::split_distances();
+        let near = cascade_matrix(&camera, 1.0, 0.05, splits[0], sun, DEFAULT_SIZE).1;
+        let far = cascade_matrix(&camera, 1.0, splits[1], splits[2], sun, DEFAULT_SIZE).1;
+        assert!(
+            near < far,
+            "a near texel covers {near} blocks and a far one {far}"
         );
     }
 }
