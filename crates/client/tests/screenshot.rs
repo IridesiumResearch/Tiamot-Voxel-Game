@@ -1963,9 +1963,30 @@ fn every_scene_draws_a_world_in_every_lighting_mode() {
 #[test]
 #[ignore = "debugging aid: writes PNGs rather than asserting anything"]
 fn dump_the_mode_matrix() {
-    let Some(gpu) = gpu() else { return };
-    let dir = std::env::temp_dir().join("tiamot-mode-matrix");
+    // Into the repo's own `target/`, not the system temp directory. The first
+    // version wrote to `std::env::temp_dir()` and the answer that came back was
+    // "I could not find the temp folder" — on Windows that is a hidden path
+    // under `AppData\Local`, which is a poor place to send somebody to look at
+    // nine pictures. `target/` is a directory they are already standing in, and
+    // the absolute path is printed either way.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/mode-matrix")
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            let fallback =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/mode-matrix");
+            std::fs::create_dir_all(&fallback).expect("output dir");
+            fallback.canonicalize().expect("output dir")
+        });
     std::fs::create_dir_all(&dir).expect("output dir");
+    println!("writing nine PNGs to {}", dir.display());
+
+    // After the directory, so a run with no adapter still says where the
+    // pictures WOULD have gone rather than printing nothing and exiting 0.
+    let Some(gpu) = gpu() else {
+        println!("no adapter, so nothing was written");
+        return;
+    };
 
     let mut gpu = Some(gpu);
     for scene in scenes() {
