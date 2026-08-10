@@ -1661,3 +1661,333 @@ fn a_still_sky_bakes_its_grading_table_once() {
         "a grade that moved by 0.2 did not re-bake"
     );
 }
+
+/// One of the three scenes the mode matrix walks.
+///
+/// Three, because one scene cannot exercise three modes. Daylit terrain says
+/// nothing about how a mode handles coloured lamplight, and neither says
+/// anything about a surface the sun cannot reach — and those are the three cases
+/// the modes differ in most.
+struct Scene {
+    label: &'static str,
+    chunks: Vec<Chunk>,
+    /// What the world is lit by. `None` means full daylight.
+    ///
+    /// Lamplight needs stored BLOCK light and no sun, which is the one lighting
+    /// state no scene built out of daylight can offer — and the state mode 3's
+    /// `EMISSIVE_GAIN` and bloom exist for.
+    lit: Option<tiamot_core::light::Light>,
+    camera: Camera,
+    /// Whether the top of this frame can be recognised as sky *by hue*.
+    ///
+    /// A weaker claim than "there is sky in it", and deliberately: `is_sky` asks
+    /// whether blue leads red, which only answers the question for an open scene
+    /// under neutral light. Under the overhang the top of the frame is roof, and
+    /// in the lamplit scene the warm light on the distant geometry pulls the top
+    /// band's blue back below its red — sky is up there, the hue test just
+    /// cannot say so. Those two lean on `spread` instead.
+    sky_above: bool,
+}
+
+/// The three scenes, in a fixed order.
+fn scenes() -> Vec<Scene> {
+    vec![
+        Scene {
+            label: "terrain",
+            chunks: scene(),
+            lit: None,
+            camera: viewpoint(),
+            sky_above: true,
+        },
+        Scene {
+            label: "overhang",
+            chunks: canopy_scene(),
+            lit: None,
+            camera: {
+                // Under the canopy, looking along it: the frame is roof above and
+                // floor below, which is what makes an overhang a different test
+                // from open terrain rather than the same one from further away.
+                let mut camera = Camera {
+                    position: Position::from_world(24.0, 10.0, 18.0),
+                    ..Camera::default()
+                };
+                camera.look(0.0, -0.25);
+                camera
+            },
+            sky_above: false,
+        },
+        Scene {
+            label: "lamplit",
+            chunks: scene(),
+            // The same terrain, lit by a warm lamp at a bit over half strength
+            // with no sun at all — a colour daylight never takes. Not enclosed:
+            // what is under test is what the modes do with coloured block light,
+            // and geometry that hid it from the camera would test less.
+            //
+            // **Mid-level rather than full, and that is not a detail.** At full
+            // block light modes 2 and 3 draw the SAME picture, and this test
+            // caught it: mode 3 multiplies block light by `EMISSIVE_GAIN` and
+            // then rolls the highlight off, so 15/15 goes to 1.6 and lands back
+            // at 0.996 — indistinguishable from mode 2's 1.0, with the bloom on
+            // top of it clipped as well. A saturated scene cannot tell two
+            // tonemaps apart. Ten of fifteen leaves both modes room to differ.
+            lit: Some(tiamot_core::light::Light::new(0, 10, 8, 5)),
+            camera: viewpoint(),
+            sky_above: false,
+        },
+    ]
+}
+
+/// What one (scene, mode) render came out as.
+///
+/// A struct rather than a tuple because four fields of two different string-ish
+/// types is exactly the shape that gets indexed in the wrong order.
+struct Rendered {
+    scene: &'static str,
+    mode: LightingMode,
+    hash: String,
+    post_bytes: u64,
+}
+
+/// How much the frame varies across a grid of regions.
+///
+/// **The one "something was drawn" check that holds in every mode.** The obvious
+/// test — that the bottom of the frame is not sky-coloured — is wrong under an
+/// overhang in mode 3, where a fully shadowed floor takes the SKY's colour on
+/// purpose (`8ff08a3`) and reads as sky to any hue test. What cannot be argued
+/// with is uniformity: a frame that drew nothing is the clear colour everywhere,
+/// whatever the post chain then does to it, so a frame that VARIES has geometry
+/// in it.
+fn spread(image: &Image) -> f32 {
+    let mut lowest = [f32::MAX; 3];
+    let mut highest = [f32::MIN; 3];
+    for row in 0..4 {
+        for column in 0..4 {
+            let region = average(
+                image,
+                column * WIDTH / 4,
+                row * HEIGHT / 4,
+                (column + 1) * WIDTH / 4,
+                (row + 1) * HEIGHT / 4,
+            );
+            for channel in 0..3 {
+                lowest[channel] = lowest[channel].min(region[channel]);
+                highest[channel] = highest[channel].max(region[channel]);
+            }
+        }
+    }
+    (0..3)
+        .map(|channel| highest[channel] - lowest[channel])
+        .fold(0.0, f32::max)
+}
+
+/// Every lighting mode, in the order the settings cycle them.
+const MODES: [LightingMode; 3] = [
+    LightingMode::Simple,
+    LightingMode::Classic,
+    LightingMode::Beautiful,
+];
+
+/// Renders one scene in one mode, on a renderer that already holds it.
+///
+/// **Re-meshes on every mode change, exactly as `App::set_lighting_mode` does.**
+/// Mode 1 meshes against flat daylight so its greedy merging returns to Task
+/// 08's rate, so the geometry itself differs between modes — a matrix that
+/// switched the uniform without rebuilding would be comparing three shaders over
+/// one mode's vertices.
+fn render_scene(renderer: &mut Renderer, scene: &Scene, mode: LightingMode) -> Image {
+    renderer.set_lighting_mode(mode);
+    match scene.lit {
+        Some(light) => upload_lit(renderer, &scene.chunks, &client::shade::Uniform(light)),
+        None => upload(renderer, &scene.chunks),
+    }
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    target.capture(renderer, &scene.camera).expect("capture")
+}
+
+#[test]
+fn every_scene_draws_a_world_in_every_lighting_mode() {
+    // Task 10's screenshot matrix: three scenes by three modes.
+    //
+    // **Not committed hash values, deliberately.** A golden hash is a golden for
+    // one driver, and this file's whole premise (see the module docs) is that two
+    // drivers never agree on pixels — a committed lavapipe hash would fail on
+    // every real GPU, which is worse than no gate at all. What a golden would
+    // actually catch is asserted directly instead: every combination draws a
+    // world rather than a blank, each mode's picture DIFFERS from the other two
+    // in the same scene, and each combination is stable when rendered again.
+    //
+    // The third of those is what catches a mode silently falling back — mode 3
+    // failing to build its post chain and drawing mode 1's frame would pass any
+    // "is there a world on screen" check ever written.
+    let Some(gpu) = gpu() else { return };
+
+    let mut gpu = Some(gpu);
+    let mut matrix: Vec<Rendered> = Vec::new();
+    for scene in scenes() {
+        // One renderer per scene, switching modes on it — which is what the
+        // client does when a player presses L, and therefore the path worth
+        // testing. A fresh renderer per mode would test nine cold starts.
+        let mut renderer = prepare(
+            gpu.take()
+                .unwrap_or_else(|| Gpu::headless().expect("adapter")),
+            &scene.chunks,
+            RenderMode::Textured,
+        );
+        let mut hashes = Vec::new();
+        for mode in MODES {
+            let frame = render_scene(&mut renderer, &scene, mode);
+
+            let variation = spread(&frame);
+            assert!(
+                variation > 0.05,
+                "{}/{mode:?}: the frame varies by only {variation}, so it is one flat colour and \
+                 nothing was drawn",
+                scene.label
+            );
+            assert!(
+                renderer.drawn() > 0,
+                "{}/{mode:?}: the frustum culled every chunk",
+                scene.label
+            );
+            if scene.sky_above {
+                // Only where the sky is actually visible. Under the overhang the
+                // top of the frame is roof, and in mode 3 the floor beneath it is
+                // lit by the sky's own colour — so neither end of that frame can
+                // be told apart by hue.
+                let top = average(&frame, 0, 0, WIDTH, HEIGHT / 8);
+                let bottom = average(&frame, 0, HEIGHT * 3 / 4, WIDTH, HEIGHT);
+                assert!(
+                    is_sky(top),
+                    "{}/{mode:?}: the top of the frame should be open sky, got {top:?}",
+                    scene.label
+                );
+                assert!(
+                    !is_sky(bottom),
+                    "{}/{mode:?}: the bottom of the frame is sky, so the world is missing: \
+                     {bottom:?}",
+                    scene.label
+                );
+            }
+
+            // Stable: the same scene and mode twice is the same picture. A frame
+            // that varied would make every other assertion here a coin toss.
+            let again = render_scene(&mut renderer, &scene, mode);
+            assert_eq!(
+                perceptual_hash(&frame),
+                perceptual_hash(&again),
+                "{}/{mode:?} rendered two different pictures: {} then {}",
+                scene.label,
+                hash_hex(&frame),
+                hash_hex(&again)
+            );
+
+            hashes.push(Rendered {
+                scene: scene.label,
+                mode,
+                hash: hash_hex(&frame),
+                post_bytes: renderer.post_bytes(),
+            });
+        }
+
+        // Every mode differs from every other, in every scene. Modes are
+        // settings rather than forks (Task 10's framing), and a setting that
+        // changes nothing is a setting nobody should be offered.
+        for (index, one) in hashes.iter().enumerate() {
+            for other in &hashes[index + 1..] {
+                assert_ne!(
+                    one.hash, other.hash,
+                    "{}: {:?} and {:?} drew the same picture, so one of them is silently falling \
+                     back to the other",
+                    scene.label, one.mode, other.mode
+                );
+            }
+        }
+
+        // And only mode 3 allocates the post chain, in every scene rather than
+        // only in the one `only_mode_three_allocates_the_post_chain` uses.
+        for rendered in &hashes {
+            assert_eq!(
+                rendered.post_bytes > 0,
+                rendered.mode == LightingMode::Beautiful,
+                "{}/{:?} allocated {} bytes of post targets",
+                scene.label,
+                rendered.mode,
+                rendered.post_bytes
+            );
+            println!(
+                "{}/{:?}: {} ({} bytes of post targets)",
+                rendered.scene, rendered.mode, rendered.hash, rendered.post_bytes
+            );
+        }
+        matrix.extend(hashes);
+    }
+
+    // The terrain and lamplit scenes are the SAME geometry under different
+    // stored light, so mode 1 — which meshes against flat daylight and ignores
+    // what the server sent — has to draw them identically. Anything else means
+    // light is reaching a mode whose whole definition is that it does not use
+    // it, and the vertex count that Task 08's cost profile depends on with it.
+    let hash_of = |scene: &str, mode: LightingMode| -> &str {
+        matrix
+            .iter()
+            .find(|rendered| rendered.scene == scene && rendered.mode == mode)
+            .map(|rendered| rendered.hash.as_str())
+            .expect("every scene rendered in every mode")
+    };
+    assert_eq!(
+        hash_of("terrain", LightingMode::Simple),
+        hash_of("lamplit", LightingMode::Simple),
+        "mode 1 drew two different pictures for one scene under two different lights, so it is \
+         reading stored light after all"
+    );
+
+    // And the modes that DO use light must tell those two apart, or the
+    // comparison above is true for the boring reason.
+    assert_ne!(
+        hash_of("terrain", LightingMode::Classic),
+        hash_of("lamplit", LightingMode::Classic),
+        "mode 2 drew the same picture for daylight and for a warm lamp"
+    );
+}
+
+/// Writes the whole three-by-three matrix out as PNGs, for the human gate.
+///
+/// Ignored by default, like `dump_the_fixed_scene`: this asserts nothing. It
+/// exists because Task 10's remaining criterion is "[H] it looks good in all 3
+/// modes", and the fastest way to answer that is nine pictures side by side
+/// rather than nine sessions of flying around pressing L.
+///
+/// `cargo test -p client --test screenshot -- --ignored dump_the_mode_matrix
+/// --nocapture`
+#[test]
+#[ignore = "debugging aid: writes PNGs rather than asserting anything"]
+fn dump_the_mode_matrix() {
+    let Some(gpu) = gpu() else { return };
+    let dir = std::env::temp_dir().join("tiamot-mode-matrix");
+    std::fs::create_dir_all(&dir).expect("output dir");
+
+    let mut gpu = Some(gpu);
+    for scene in scenes() {
+        let mut renderer = prepare(
+            gpu.take()
+                .unwrap_or_else(|| Gpu::headless().expect("adapter")),
+            &scene.chunks,
+            RenderMode::Textured,
+        );
+        for mode in MODES {
+            let frame = render_scene(&mut renderer, &scene, mode);
+            let path = dir.join(format!("{}-{mode:?}.png", scene.label));
+            let mut bytes = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut bytes, frame.width, frame.height);
+                encoder.set_color(png::ColorType::Rgba);
+                encoder.set_depth(png::BitDepth::Eight);
+                let mut writer = encoder.write_header().expect("header");
+                writer.write_image_data(&frame.rgba).expect("data");
+            }
+            std::fs::write(&path, &bytes).expect("write");
+            println!("wrote {} ({})", path.display(), hash_hex(&frame));
+        }
+    }
+}
