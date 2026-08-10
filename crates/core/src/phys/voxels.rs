@@ -49,12 +49,37 @@ pub struct Voxels<'a, S: ChunkLookup> {
     source: &'a S,
     /// The chunk whose corner is cell `[0, 0, 0]` in this frame.
     origin: ChunkPos,
+    /// Whether any query has landed on a chunk that is not resident.
+    ///
+    /// **Purely diagnostic, and it changes no answer.** An absent chunk reads as
+    /// solid either way; this only records that it happened, so a caller can
+    /// tell "the body was stopped by the world" from "the body was stopped by
+    /// part of the world that has not arrived". On a client those are very
+    /// different: the second one is a wall the server does not have, and the
+    /// divergence it causes arrives as a correction the player sees.
+    absent: std::cell::Cell<bool>,
 }
 
 impl<'a, S: ChunkLookup> Voxels<'a, S> {
     /// Views `source` with the frame anchored at `origin`'s corner.
     pub const fn new(source: &'a S, origin: ChunkPos) -> Self {
-        Self { source, origin }
+        Self {
+            source,
+            origin,
+            absent: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Whether any query since construction touched a chunk that is not
+    /// resident.
+    ///
+    /// A client asks this after replaying a tick: if prediction consulted
+    /// geometry it does not have, whatever it decided about being blocked is not
+    /// what the server decided, and the correction that follows is explained
+    /// rather than mysterious.
+    #[must_use]
+    pub fn touched_absent(&self) -> bool {
+        self.absent.get()
     }
 
     /// The world sub-node position of a cell in this frame.
@@ -89,7 +114,13 @@ impl<'a, S: ChunkLookup> Voxels<'a, S> {
             world.y.div_euclid(span),
             world.z.div_euclid(span),
         );
-        self.source.chunk(chunk)?.get_subnode(world)
+        let Some(chunk) = self.source.chunk(chunk) else {
+            // Recorded, not acted on — see the field's docs. The answer this
+            // produces is identical to what it always was.
+            self.absent.set(true);
+            return None;
+        };
+        chunk.get_subnode(world)
     }
 }
 
@@ -206,6 +237,36 @@ mod tests {
             (body.position[1] - 3.0).abs() < 0.01,
             "landed at {} rather than on the floor at cell 3",
             body.position[1]
+        );
+    }
+
+    #[test]
+    fn an_absent_chunk_is_reported_and_a_resident_one_is_not() {
+        // The instrument behind the HUD's "(predicted into unloaded chunks)".
+        // A correction with this set is the client having invented a wall the
+        // server does not have; without it, the two simulations genuinely
+        // disagree. They want opposite fixes, so the flag has to be right.
+        let mut loaded = Loaded::default();
+        let pos = ChunkPos::new(0, 0, 0);
+        loaded.0.insert(pos, Chunk::new(pos, MaterialId::AIR));
+
+        // Inside the one resident chunk: nothing to report.
+        let voxels = Voxels::new(&loaded, pos);
+        assert!(!voxels.solid(1, 1, 1), "air in a loaded chunk");
+        assert!(
+            !voxels.touched_absent(),
+            "a query inside a resident chunk reported the world missing"
+        );
+
+        // One cell past its top face is the chunk above, which is not resident.
+        let span = crate::CHUNK_SUBNODES as i32;
+        assert!(
+            voxels.solid(1, span, 1),
+            "an absent chunk must still read as solid, or a body falls out of the world"
+        );
+        assert!(
+            voxels.touched_absent(),
+            "a query that landed in an absent chunk went unreported"
         );
     }
 

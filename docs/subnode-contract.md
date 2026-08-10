@@ -85,6 +85,22 @@ enterable; the shape you see is the shape you collide with.
 - **Step-up height is one sub-node (1/3 yard).** A body blocked horizontally
   retries the move one sub-node higher; if that is clear and it was on the
   ground, it steps. A two-sub-node lip stops it.
+- **Step-down is the same height, and is not optional.** A body that began its
+  tick on the ground, is not rising, and would end it airborne looks one
+  sub-node below its feet; if there is ground there it is placed on it and stays
+  on the ground. A drop of more than one sub-node is a fall and is left alone.
+
+  This is the mirror of step-up and the two only make sense together. Without
+  it, sub-node terrain is not walkable in practice: a body skims the tops of
+  raised cells, drops through the gaps between them, and while airborne it both
+  loses ground acceleration — a fifteenth of the grounded figure — and gets
+  stopped by the side of the next cell it meets, which it cannot step over until
+  it lands. Measured before this rule existed, walking over cells raised every
+  third cell: **forward motion froze for three ticks at a time and the body
+  bobbed a full sub-node**, once per gap. Reported from the window as "when
+  walking over single subnodes I also glitch; when walking around full blocks on
+  the surface I am fine" — full blocks are three sub-nodes and are never stepped
+  at all, which is why they behaved.
 - Movement resolves one axis at a time (X, then Y, then Z), which is what makes
   a body slide along a wall rather than stick to it.
 - **A body must never be left inside geometry.** This is the invariant that

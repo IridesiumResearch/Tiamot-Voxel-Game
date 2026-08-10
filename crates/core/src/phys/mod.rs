@@ -274,6 +274,10 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
     // ceiling is exactly what it takes: without one, nothing zeroes the vertical
     // velocity mid-tick and the two axes happen to agree.
     let stops_dead = was_on_ground && body.velocity[1] <= 0.0;
+    // Whether this tick is climbing. A jump is the only way to be rising while
+    // starting on the ground, and it is the case step-down must keep its hands
+    // off — see [`step_down`].
+    let was_rising = body.velocity[1] > 0.0;
 
     resolve_horizontal(
         solid,
@@ -294,6 +298,10 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
         sneaking,
         tuning,
     );
+
+    // After BOTH horizontal axes, because a body leaves a lip sideways and how
+    // far it has to fall is only known once it has finished moving.
+    step_down(solid, &mut body, was_on_ground, was_rising, tuning);
 
     debug_assert!(
         body.position.iter().all(|v| v.is_finite()) && body.velocity.iter().all(|v| v.is_finite()),
@@ -393,6 +401,64 @@ fn resolve_horizontal(
     if stops_dead {
         body.velocity[axis] = 0.0;
     }
+}
+
+/// Puts a body back on the ground when it has walked off something small.
+///
+/// Contract §2: "Step-down is the same height, and is not optional. A body that
+/// began its tick on the ground, is not rising, and would end it airborne looks
+/// one sub-node below its feet; if there is ground there it is placed on it and
+/// stays on the ground."
+///
+/// # Why this is not cosmetic
+///
+/// Step-up without step-down does not make sub-node terrain walkable, it makes
+/// it *skimmable*. A body crosses the tops of raised cells, drops through every
+/// gap wider than its own footprint, and while airborne it loses ground
+/// acceleration — a fifteenth of the grounded figure — AND is stopped by the
+/// side of the next raised cell, which it may not step over until it lands
+/// again. Measured over cells raised every third cell, before this existed:
+/// **forward motion froze for three ticks at a time** and the body bobbed a full
+/// sub-node, once per gap.
+///
+/// # The three guards, and what each one is for
+///
+/// * `was_on_ground` — a body already in mid-air is falling and must keep
+///   falling. Without this, every fall would be caught a sub-node above every
+///   surface it passed.
+/// * `!was_rising` — a jump starts on the ground and must be allowed to leave
+///   it. Without this, the tick a jump began would be undone by the tick that
+///   began it.
+/// * The sweep — a drop of more than one sub-node is a fall, and is left alone.
+///   This is the same height as step-up on purpose: what a body can climb is
+///   exactly what it can be glued to, which is what makes a lip feel like part
+///   of the floor rather than like a cliff.
+fn step_down(
+    solid: &impl Solid,
+    body: &mut Body,
+    was_on_ground: bool,
+    was_rising: bool,
+    tuning: &Tuning,
+) {
+    if !was_on_ground || was_rising || body.on_ground {
+        return;
+    }
+
+    // Downward, so a blocked sweep is ground within reach and its distance is
+    // how far to place the body. The sweep is what keeps this from ever putting
+    // a body inside geometry — contract §2's overriding invariant — because it
+    // stops a skin short of the surface exactly as landing does.
+    let reach = sweep(solid, &body.aabb(), 1, -tuning.step_height);
+    if !reach.blocked {
+        return;
+    }
+
+    body.position[1] += reach.distance;
+    body.on_ground = true;
+    // Zeroed, because the body is resting on something. Left alone, the tick of
+    // gravity it had already accumulated would still be there next tick and the
+    // body would read as falling while standing still.
+    body.velocity[1] = 0.0;
 }
 
 /// Moves the body vertically and recomputes ground contact.

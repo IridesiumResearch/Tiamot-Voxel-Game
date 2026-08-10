@@ -636,3 +636,159 @@ fn a_jump_into_a_ceiling_keeps_the_speed_it_was_taken_at() {
         previous = body.velocity[0];
     }
 }
+
+/// A floor with a one-cell lip every `spacing` cells along x.
+///
+/// The lips are what a chiselled world is made of, and `spacing` wider than the
+/// body's 1.8 cells is the interesting case: the footprint then fits entirely
+/// between two lips and has nothing to rest on.
+fn bumpy_floor(spacing: i32) -> Scene {
+    let mut scene = Scene::new(0);
+    for x in 0..40 {
+        if x % spacing == 0 {
+            for z in -SPAN..SPAN {
+                scene.solid.insert((x, 0, z));
+            }
+        }
+    }
+    scene
+}
+
+#[test]
+fn walking_over_single_subnodes_never_leaves_the_ground_or_stalls() {
+    // **Reported from the window: "when walking over single subnodes I also
+    // glitch. when walking around full blocks on the surface I am fine."**
+    //
+    // A single cell is exactly `step_height`, so it is the one obstacle the
+    // step-up path fires on; a full block is three cells and simply stops the
+    // body, which is why full blocks behaved.
+    //
+    // Contract §2's step-down rule is what makes this walkable. Measured before
+    // it existed, over lips every third cell: the body skimmed their tops, fell
+    // through the gaps, and **forward motion froze for three ticks at a time**
+    // while it was airborne and blocked by the side of the next lip — which it
+    // could not step over until it landed. Two of thirty ticks airborne, x stuck
+    // at 8.099 for two of them.
+    let scene = bumpy_floor(3);
+    let mut body = Body {
+        position: [0.5, 1.0, 0.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    let intent = Intent {
+        walk: [1.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+    };
+    let tuning = Tuning::DEFAULT;
+
+    // Skipping the first few ticks: the body starts from rest, and what is under
+    // test is walking rather than accelerating.
+    for _ in 0..6 {
+        body = step(&scene, body, intent, &tuning);
+    }
+
+    let mut previous_x = body.position[0];
+    for tick in 0..40 {
+        body = step(&scene, body, intent, &tuning);
+
+        assert!(
+            body.on_ground,
+            "tick {tick}: walked off the ground at y {} while crossing single-cell lips, which \
+             costs a fifteenth of ground acceleration and blocks the next lip until it lands",
+            body.position[1]
+        );
+
+        // Forward progress every tick, not merely overall: a stall of a few ticks
+        // averages out over forty and is exactly what was reported as a glitch.
+        let advanced = body.position[0] - previous_x;
+        assert!(
+            advanced > tuning.walk_speed * 0.9,
+            "tick {tick}: advanced {advanced} against a walk speed of {}, so forward motion \
+             stalled at x {}",
+            tuning.walk_speed,
+            body.position[0]
+        );
+        previous_x = body.position[0];
+    }
+}
+
+#[test]
+fn step_down_glues_a_body_to_a_lip_and_not_to_a_cliff() {
+    // The height that makes step-down safe: what a body can climb is exactly what
+    // it can be glued to. A sub-node lip is part of the floor; a block-high drop
+    // is a fall, and a body that stuck to the top of one could not leave a ledge
+    // at all.
+    let tuning = Tuning::DEFAULT;
+    let intent = Intent {
+        walk: [1.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+    };
+
+    // Ground everywhere below y = 0, plus a shelf of `height` cells that ends at
+    // x = 6. Walking east off the shelf either sticks to it or falls.
+    let shelf = |height: i32| -> Scene {
+        let mut scene = Scene::new(0);
+        for y in 0..height {
+            for x in -SPAN..6 {
+                for z in -SPAN..SPAN {
+                    scene.solid.insert((x, y, z));
+                }
+            }
+        }
+        scene
+    };
+
+    for (height, glued) in [(1, true), (3, false)] {
+        let mut body = Body {
+            position: [2.0, height as f32, 0.5],
+            velocity: [0.0; 3],
+            on_ground: true,
+        };
+        // Long enough to walk past x = 6 and, if it is going to fall, to land.
+        for _ in 0..20 {
+            body = step(&shelf(height), body, intent, &tuning);
+        }
+        assert!(
+            body.position[0] > 6.0,
+            "never reached the edge at all: {body:?}"
+        );
+        if glued {
+            assert!(
+                (body.position[1] - 0.0).abs() < 1.0,
+                "a one-cell lip should be stepped down onto the floor, not fallen off: {body:?}"
+            );
+        } else {
+            assert!(
+                body.position[1] < 1.0,
+                "a three-cell drop should be a fall, and this body is still up at {}",
+                body.position[1]
+            );
+        }
+    }
+}
+
+#[test]
+fn step_down_does_not_cancel_the_jump_that_started_this_tick() {
+    // The guard that matters most: a jump begins on the ground, so without
+    // `was_rising` step-down would catch the body on the tick it pushed off and a
+    // player could never leave the floor at all.
+    let scene = Scene::new(0);
+    let tuning = Tuning::DEFAULT;
+    let mut body = Body {
+        position: [0.5, 0.0, 0.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    let intent = Intent {
+        walk: [0.0, 0.0],
+        jump: true,
+        gait: Gait::Walk,
+    };
+    body = step(&scene, body, intent, &tuning);
+    assert!(
+        body.position[1] > 1.0 && !body.on_ground,
+        "the jump was cancelled by step-down: {body:?}"
+    );
+}

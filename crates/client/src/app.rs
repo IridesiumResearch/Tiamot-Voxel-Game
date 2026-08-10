@@ -280,6 +280,16 @@ pub struct Pacing {
     worst_phases: Phases,
     /// Largest prediction correction seen in the window, in cells.
     worst_correction: f32,
+    /// Whether prediction consulted a chunk it does not have this window.
+    ///
+    /// **The instrument for a correction nobody can explain.** The client's
+    /// collision treats an absent chunk as solid, because the alternative is
+    /// falling out of the world — but the server has that chunk and walks
+    /// straight through where the client hit a wall. The two then disagree for as
+    /// long as the chunk is late, and the disagreement arrives as a correction
+    /// the player feels. Guessing at that from "1,044 chunks held" is what the
+    /// frame-pacing chase did with one number for a week; this measures it.
+    predicted_into_the_unloaded: bool,
     /// The last completed window's worst frame, in milliseconds.
     ///
     /// Reported rather than the live figure so the readout holds still long
@@ -293,6 +303,9 @@ pub struct Pacing {
     reported_remesh_chunks: usize,
     /// The last completed window's largest correction, in cells.
     reported_correction: f32,
+    /// Whether that window's prediction reached into chunks that had not
+    /// arrived.
+    reported_unloaded: bool,
     /// Where that window's worst frame spent its time.
     reported_phases: Phases,
 }
@@ -322,6 +335,7 @@ impl Pacing {
                 reported_remesh_meshing: self.worst_remesh_meshing,
                 reported_remesh_chunks: self.worst_remesh_chunks,
                 reported_correction: self.worst_correction,
+                reported_unloaded: self.predicted_into_the_unloaded,
                 reported_phases: self.worst_phases,
                 ..Self::default()
             };
@@ -331,6 +345,11 @@ impl Pacing {
     /// Folds in how far this frame's prediction was corrected, in cells.
     fn correction(&mut self, cells: f32) {
         self.worst_correction = self.worst_correction.max(cells);
+    }
+
+    /// Notes that prediction collided against a chunk that has not arrived.
+    const fn predicted_into_the_unloaded(&mut self) {
+        self.predicted_into_the_unloaded = true;
     }
 
     /// Folds one remesh's duration in, and how much of it was meshing.
@@ -373,6 +392,19 @@ impl Pacing {
     #[must_use]
     pub const fn worst_correction_cells(&self) -> f32 {
         self.reported_correction
+    }
+
+    /// Whether the last window's prediction collided against chunks that had
+    /// not arrived.
+    ///
+    /// **Read this beside the correction.** A non-zero correction with this set
+    /// is the client having invented a wall the server does not have, which is a
+    /// streaming problem; a non-zero correction WITHOUT it is the two simulations
+    /// genuinely disagreeing, which is a physics problem. They want opposite
+    /// fixes and the number alone cannot tell them apart.
+    #[must_use]
+    pub const fn predicted_into_unloaded(&self) -> bool {
+        self.reported_unloaded
     }
 
     /// How that worst remesh split between meshing and uploading, in
@@ -662,6 +694,26 @@ impl App {
     #[must_use]
     pub const fn joined(&self) -> bool {
         self.joined
+    }
+
+    /// The buffer-pool and prediction line of the HUD.
+    ///
+    /// Its own method because `hud` is at the line limit and because this line
+    /// carries the one readout that needs a caveat attached to it: a correction
+    /// is only a physics disagreement if prediction was working from geometry it
+    /// actually had. See [`Pacing::predicted_into_unloaded`].
+    fn prediction_line(&self, created: u64, reused: u64, correction: f32) -> String {
+        format!(
+            "{created} mesh buffers created, {reused} reused from the pool · worst correction \
+             {correction:.2} cells{}",
+            // Only when it happened, so the line stays short in the normal case
+            // and the words appear exactly when they explain something.
+            if self.pacing.predicted_into_unloaded() {
+                " (predicted into unloaded chunks)"
+            } else {
+                ""
+            }
+        )
     }
 
     /// Frame pacing over the last completed second.
@@ -1234,6 +1286,13 @@ impl App {
                     {
                         let voxels = phys::Voxels::new(&self.store, predictor.origin());
                         predictor.reconcile(&voxels, &state, &Tuning::DEFAULT);
+                        // Asked after the replay rather than before: what matters
+                        // is whether the ticks being re-simulated consulted
+                        // geometry the client does not have, because those are
+                        // the ticks whose answer cannot match the server's.
+                        if voxels.touched_absent() {
+                            self.pacing.predicted_into_the_unloaded();
+                        }
                     }
                 }
 
@@ -1687,10 +1746,7 @@ impl App {
                 phases.present,
                 (worst - phases.total()).max(0.0),
             ),
-            format!(
-                "{created} mesh buffers created, {reused} reused from the pool · worst \
-                 correction {correction:.2} cells",
-            ),
+            self.prediction_line(created, reused, correction),
             format!("{x:.1}, {y:.1}, {z:.1}  ({facing})"),
             format!(
                 "chunk {}, {}, {}",
