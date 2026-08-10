@@ -234,8 +234,21 @@ pub fn apply(grade: &SkyGrade, colour: [f32; 3]) -> [f32; 3] {
     // Clamped before the power, not after: a negative channel — which `offset`
     // can produce, and contrast can too — raised to a fractional power is NaN,
     // and a NaN here is a black pixel that moves when the sun does.
+    //
+    // A gamma of exactly 1 skips the `powf` rather than raising to the first
+    // power. Gamma is the knob a keyframe least often sets — none of the
+    // reference sky's do — and this is 4,096 calls per bake: measured
+    // interleaved, 0.149 ms per bake without it against 0.173 ms with, so 14%.
+    // (Measured across separate `cargo test` runs it came out *slower*, which is
+    // what run-to-run noise on a 0.17 ms figure looks like. Interleave.)
+    let exponent = 1.0 / grade.gamma;
     for channel in &mut out {
-        *channel = clamp_unit(*channel).powf(1.0 / grade.gamma);
+        let clamped = clamp_unit(*channel);
+        *channel = if (grade.gamma - 1.0).abs() < f32::EPSILON {
+            clamped
+        } else {
+            clamped.powf(exponent)
+        };
     }
 
     out
