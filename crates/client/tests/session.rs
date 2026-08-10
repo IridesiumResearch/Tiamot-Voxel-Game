@@ -131,16 +131,45 @@ fn run_frames(app: &mut App, done: impl Fn(&App) -> bool) -> bool {
 }
 
 /// Whether a frame has anything other than sky in it.
+///
+/// # Why this is not a hue test any more
+///
+/// It used to ask whether any pixel had red close to blue, on the reasoning that
+/// the sky is the clear colour and nothing else is that blue. **That reasoning is
+/// wrong, and it cost a whole investigation.** Three tests in this file failed
+/// intermittently with "the frame is entirely sky", about one run in nine, and
+/// the diagnostic added to chase it printed `5 meshed, 1 pending, 3 drawn` —
+/// geometry WAS drawn. The frame was never empty. Its surfaces were simply blue:
+/// a surface with little stored sunlight falls to the shader's ambient floor,
+/// and that floor carries the sky's own hue so that a cave stays legible rather
+/// than going grey. Newly streamed chunks pass through exactly that state while
+/// the server's flood settles across their neighbours, and in mode 3 a fully
+/// shadowed floor takes the sky's colour permanently and by design (`8ff08a3`).
+///
+/// So: a frame that drew nothing is the clear colour EVERYWHERE, whatever the
+/// lighting then does to it, and a frame that varies has geometry in it. The same
+/// conclusion `screenshot.rs`'s mode matrix reached for the same reason on the
+/// same day. This is stricter where it counts — a uniform frame fails even if it
+/// happens to be the right hue — and no longer asks a question about colour that
+/// the renderer is entitled to answer either way.
 fn shows_a_world(frame: &client::texture::Image) -> bool {
-    // The sky is the clear colour and nothing else is that blue. A frame with
-    // any pixel where red is close to blue has geometry in it.
-    (0..frame.height).step_by(4).any(|y| {
-        (0..frame.width).step_by(4).any(|x| {
-            frame
-                .pixel(x, y)
-                .is_some_and(|pixel| i32::from(pixel[2]) - i32::from(pixel[0]) < 20)
-        })
-    })
+    let mut lowest = [f32::MAX; 3];
+    let mut highest = [f32::MIN; 3];
+    for y in (0..frame.height).step_by(4) {
+        for x in (0..frame.width).step_by(4) {
+            let Some(pixel) = frame.pixel(x, y) else {
+                continue;
+            };
+            for channel in 0..3 {
+                let value = f32::from(pixel[channel]);
+                lowest[channel] = lowest[channel].min(value);
+                highest[channel] = highest[channel].max(value);
+            }
+        }
+    }
+    // Sixteen of 255, comfortably above a driver's dithering and far below the
+    // difference between a lit surface and the sky it stands against.
+    (0..3).any(|channel| highest[channel] - lowest[channel] > 16.0)
 }
 
 #[test]
@@ -161,6 +190,26 @@ fn singleplayer_joins_its_own_server_and_draws_the_world() {
     let target = Offscreen::new(app.renderer().gpu(), WIDTH, HEIGHT);
     let camera = *app.camera();
     let frame = target.capture(app.renderer(), &camera).expect("capture");
+
+    // **The check checks itself first.** A "did the world draw" test that cannot
+    // fail is worse than none, and the heuristic this file used before was
+    // replaced precisely because it answered the wrong question — so the
+    // replacement is made to say NO about a frame that genuinely has no world in
+    // it, on this machine, this driver and this frame size, before it is trusted
+    // to say yes about one that does.
+    //
+    // Straight up: nothing is above the player at spawn, so the frame is the
+    // clear colour and nothing else. `look_down_by` takes a downward angle, so a
+    // negative one aims at the sky.
+    app.look_down_by(-1.5);
+    let upward = *app.camera();
+    let sky_only = target.capture(app.renderer(), &upward).expect("capture");
+    assert!(
+        !shows_a_world(&sky_only),
+        "looking straight up at an empty sky still reads as a world, so this test cannot fail \
+         and proves nothing"
+    );
+    app.look_down_by(0.0);
 
     assert!(
         shows_a_world(&frame),
