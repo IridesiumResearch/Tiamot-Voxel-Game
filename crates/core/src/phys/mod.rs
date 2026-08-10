@@ -258,9 +258,42 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
     let was_on_ground = body.on_ground;
     let sneaking = intent.gait == Gait::Sneak && was_on_ground;
 
-    resolve_horizontal(solid, &mut body, 0, was_on_ground, sneaking, tuning);
+    // **Decided once, before anything moves, and for both axes.**
+    //
+    // Whether being blocked costs a body its horizontal speed is a question
+    // about the tick: a body resting on the ground and walking into a wall
+    // should stop dead, and a body climbing past something should keep the speed
+    // it took the climb at (see [`resolve_horizontal`]).
+    //
+    // It must not be re-derived per axis from `velocity[1]`, because
+    // `resolve_vertical` runs BETWEEN the two horizontal resolves and zeroes
+    // that velocity on a head bump. X asked before the bump and kept its speed;
+    // Z asked after it and lost all of it — from identical input, in a scene
+    // symmetric in both. Reported from the window as physics being "very glitchy
+    // when I am in a tight area (blocks above or messy all around me)", and a
+    // ceiling is exactly what it takes: without one, nothing zeroes the vertical
+    // velocity mid-tick and the two axes happen to agree.
+    let stops_dead = was_on_ground && body.velocity[1] <= 0.0;
+
+    resolve_horizontal(
+        solid,
+        &mut body,
+        0,
+        was_on_ground,
+        stops_dead,
+        sneaking,
+        tuning,
+    );
     resolve_vertical(solid, &mut body);
-    resolve_horizontal(solid, &mut body, 2, was_on_ground, sneaking, tuning);
+    resolve_horizontal(
+        solid,
+        &mut body,
+        2,
+        was_on_ground,
+        stops_dead,
+        sneaking,
+        tuning,
+    );
 
     debug_assert!(
         body.position.iter().all(|v| v.is_finite()) && body.velocity.iter().all(|v| v.is_finite()),
@@ -286,6 +319,7 @@ fn resolve_horizontal(
     body: &mut Body,
     axis: usize,
     was_on_ground: bool,
+    stops_dead: bool,
     sneaking: bool,
     tuning: &Tuning,
 ) {
@@ -351,7 +385,12 @@ fn resolve_horizontal(
     // so a body pressed against a riser and pushing off it was having exactly
     // the tick of speed it most needed taken away. Rising means climbing past
     // the thing in the way, not resting against it.
-    if was_on_ground && body.velocity[1] <= 0.0 {
+    //
+    // Which is why the answer arrives as an argument rather than being read from
+    // `body.velocity[1]` here: this function runs once per horizontal axis with
+    // the vertical resolve between the two, and that resolve zeroes the velocity
+    // this rule used to consult. See [`step`].
+    if stops_dead {
         body.velocity[axis] = 0.0;
     }
 }

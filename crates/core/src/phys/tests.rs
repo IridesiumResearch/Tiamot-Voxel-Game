@@ -493,3 +493,146 @@ fn a_body_pushing_off_a_riser_keeps_the_speed_it_jumped_with() {
         leaning.velocity[0]
     );
 }
+
+/// A ceiling: everything from `ceiling_y` up is solid.
+///
+/// Cell-aligned, like everything else in the grid, which is why the tightest
+/// real headroom is 0.6 of a cell: a body is 5.4 cells tall and always rests on
+/// a cell boundary, so a two-block gap leaves exactly 0.6 and a smaller one does
+/// not admit a body at all.
+fn with_ceiling(mut scene: Scene, ceiling_y: i32) -> Scene {
+    for y in ceiling_y..(ceiling_y + 4) {
+        for x in -SPAN..SPAN {
+            for z in -SPAN..SPAN {
+                scene.solid.insert((x, y, z));
+            }
+        }
+    }
+    scene
+}
+
+#[test]
+fn a_body_wedged_in_a_corner_loses_the_same_speed_on_both_axes() {
+    // **Reported from the window: physics "very glitchy when I am in a tight
+    // area (blocks above or messy all around me). jumping and falling is quite
+    // glitchy."**
+    //
+    // The scene is symmetric under swapping x and z, and so is the input, so the
+    // two velocities must be equal on every tick — anything else is the solver
+    // treating one axis differently from the other, which is felt as a lurch in
+    // one direction and not the other.
+    //
+    // They were not equal. Contract §2 resolves X, then Y, then Z, and the rule
+    // deciding whether a blocked move keeps its speed consulted `velocity[1]` —
+    // which the vertical resolve zeroes on a head bump, in between the two. So a
+    // body jumping into a ceiling in a corner kept ALL of its x speed and lost
+    // ALL of its z. Measured before the fix: `vel [0.3843, 0.0, 0.0000]` from
+    // input of `[1.0, 1.0]`.
+    //
+    // A ceiling is what it takes to see this: with headroom, nothing zeroes the
+    // vertical velocity mid-tick and the two axes agree by luck.
+    let mut scene = with_ceiling(Scene::new(0), 6).with_wall(4, 8);
+    for y in 0..8 {
+        for x in -SPAN..SPAN {
+            scene.solid.insert((x, y, 4));
+        }
+    }
+
+    let mut body = Body {
+        position: [2.0, 0.0, 2.0],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    let intent = Intent {
+        walk: [1.0, 1.0],
+        jump: true,
+        gait: Gait::Walk,
+    };
+    let tuning = Tuning::DEFAULT;
+
+    for tick in 0..20 {
+        body = step(&scene, body, intent, &tuning);
+        // Bit equality, because the two axes run identical arithmetic over a
+        // scene that is identical under the swap. A tolerance here would accept
+        // a solver that had drifted apart for a reason nobody had noticed.
+        assert_eq!(
+            body.velocity[0].to_bits(),
+            body.velocity[2].to_bits(),
+            "tick {tick}: x is moving at {} and z at {}, from the same input into the same corner",
+            body.velocity[0],
+            body.velocity[2]
+        );
+        assert_eq!(
+            body.position[0].to_bits(),
+            body.position[2].to_bits(),
+            "tick {tick}: ended at x {} and z {}",
+            body.position[0],
+            body.position[2]
+        );
+    }
+}
+
+#[test]
+fn a_jump_into_a_ceiling_keeps_the_speed_it_was_taken_at() {
+    // The other half of the same rule, and the reason it is not simply
+    // "`was_on_ground` stops you dead": `a0db90c` made a jump up a step keep its
+    // speed, and a head bump must not quietly take it back.
+    //
+    // Compared against jumping in the OPEN rather than against walking, and that
+    // is not a detail. An airborne body accelerates at a fifteenth of the ground
+    // figure and converges on 0.607 cells a tick against walking's 0.645, so
+    // hopping is legitimately a little slower than walking whatever the ceiling
+    // does — measured at 89.7% of walking distance, which read as a failure the
+    // first time this test was written. Holding the hop constant and changing
+    // only whether it hits a ceiling is what isolates the head bump.
+    let tuning = Tuning::DEFAULT;
+    let travel = |scene: &Scene| -> f32 {
+        let mut body = Body {
+            position: [0.5, 0.0, 0.5],
+            velocity: [0.0; 3],
+            on_ground: true,
+        };
+        let intent = Intent {
+            walk: [1.0, 0.0],
+            jump: true,
+            gait: Gait::Walk,
+        };
+        for _ in 0..20 {
+            body = step(scene, body, intent, &tuning);
+        }
+        body.position[0]
+    };
+
+    let bumping = travel(&with_ceiling(Scene::new(0), 6));
+    let clear = travel(&Scene::new(0));
+    assert!(
+        bumping > clear * 0.95,
+        "hopping under a low ceiling covered {bumping} against {clear} hopping in the open, so \
+         bumping its head is costing a body its run"
+    );
+
+    // And the bump itself must not zero the horizontal velocity on the tick it
+    // happens — the assertion above would still pass if it did and the next tick
+    // gave it all back.
+    let low = with_ceiling(Scene::new(0), 6);
+    let mut body = Body {
+        position: [0.5, 0.0, 0.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    let intent = Intent {
+        walk: [1.0, 0.0],
+        jump: true,
+        gait: Gait::Walk,
+    };
+    let mut previous = 0.0;
+    for tick in 0..12 {
+        body = step(&low, body, intent, &tuning);
+        assert!(
+            body.velocity[0] >= previous,
+            "tick {tick}: speed fell from {previous} to {} while running under a ceiling",
+            body.velocity[0]
+        );
+        previous = body.velocity[0];
+    }
+}
