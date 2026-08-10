@@ -447,3 +447,72 @@ fn a_fresh_world_opens_in_daylight_rather_than_at_midnight() {
 
     assert!(server.stop());
 }
+
+#[test]
+fn the_reference_skys_grade_arrives_over_the_wire() {
+    // Task 10's fourth criterion, for the last piece of sky content: the grading
+    // that mode 3 applies is a mod's, not the engine's. The engine has no
+    // opinion about what dusk should look like — it interpolates six numbers a
+    // mod chose and bakes them into a lookup table.
+    //
+    // Asserted on the wire rather than in the client, because the wire is where
+    // the claim is falsifiable: delete `game/core_sky` and this arrives ungraded.
+    let server = start("grading");
+
+    block_on(async {
+        let bot = join(&server, "Colourist").await;
+
+        // From what the join already received, rather than by waiting for one:
+        // the sky table arrives BEFORE `JoinWorld` — a client that was told the
+        // world before the sky would draw one frame of whatever it guessed — so
+        // waiting for it after joining waits for a message that has been and
+        // gone. `join_flow` pins that ordering; this reads the record it leaves.
+        let received = bot.received();
+        let keyframes = received
+            .iter()
+            .find_map(|message| match message {
+                tiamot_core::proto::ServerMessage::SkyTable { keyframes, .. } => Some(keyframes),
+                _ => None,
+            })
+            .expect("the join flow includes a sky table");
+
+        // The reference sky grades night and leaves noon alone, so both of those
+        // have to survive the trip: a wire format that dropped the field would
+        // arrive as all-identity, and one that mangled it would not have a noon.
+        let graded = keyframes
+            .iter()
+            .filter(|frame| frame.grade != tiamot_core::proto::SkyGrade::NONE)
+            .count();
+        assert!(
+            graded > 0,
+            "every keyframe arrived ungraded, so `grade` did not survive the wire: {keyframes:?}"
+        );
+        assert!(
+            keyframes
+                .iter()
+                .any(|frame| frame.grade == tiamot_core::proto::SkyGrade::NONE),
+            "the reference sky leaves noon ungraded on purpose; nothing here is: {keyframes:?}"
+        );
+
+        // And what arrived is usable: the client hands these to a `powf`.
+        for frame in keyframes {
+            let grade = &frame.grade;
+            assert!(
+                grade.gamma > 0.0,
+                "a gamma of {} is a divide by nothing",
+                grade.gamma
+            );
+            assert!(grade.exposure.is_finite() && grade.saturation.is_finite());
+            assert!(
+                grade
+                    .tint
+                    .iter()
+                    .chain(&grade.offset)
+                    .all(|v| v.is_finite()),
+                "{grade:?}"
+            );
+        }
+    });
+
+    assert!(server.stop());
+}

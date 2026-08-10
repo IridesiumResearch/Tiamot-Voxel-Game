@@ -31,6 +31,14 @@ local DAY_LENGTH_TICKS = 24000
 -- towards; `sun` tints the stored sunlight; `intensity` scales it. Setting
 -- intensity to zero at midnight is what makes caves and the surface equally
 -- dark at night while lamps keep working.
+--
+-- `grade` is the optional one, and lighting mode 3 is the only mode that applies
+-- it: how the finished picture is graded, rather than how the world is lit. The
+-- values below are deliberately restrained — a reference implementation exists to
+-- prove the mechanism reaches the screen, and a mod that wants a look can push
+-- every one of these much further. Noon is left as an exact identity on purpose,
+-- so there is one hour in the day where mode 3 grades nothing and any difference
+-- from mode 2 must be the shadows, bloom and fog rather than the grade.
 game.register_sky{
     day_length_ticks = DAY_LENGTH_TICKS,
     -- Where a fresh world's clock starts. Mid-morning, because the alternative
@@ -42,25 +50,38 @@ game.register_sky{
     keyframes = {
         -- Midnight. Not black: a night nobody can see anything in is a night
         -- players spend indoors, and the moon is doing something.
-        { time = 0.00, sky = {0.02, 0.03, 0.08}, sun = {0.35, 0.45, 0.80}, intensity = 0.08 },
+        --
+        -- The grade is what makes moonlight read as moonlight: the eye loses
+        -- colour in the dark, so night is desaturated and cool, and opened up a
+        -- little so the shapes are still legible at an intensity of 0.08.
+        { time = 0.00, sky = {0.02, 0.03, 0.08}, sun = {0.35, 0.45, 0.80}, intensity = 0.08,
+          grade = { exposure = 1.15, saturation = 0.55, tint = {0.92, 0.96, 1.12}, contrast = 0.95 } },
         -- The hour before dawn, still blue.
-        { time = 0.20, sky = {0.05, 0.07, 0.15}, sun = {0.40, 0.45, 0.75}, intensity = 0.10 },
+        { time = 0.20, sky = {0.05, 0.07, 0.15}, sun = {0.40, 0.45, 0.75}, intensity = 0.10,
+          grade = { exposure = 1.12, saturation = 0.60, tint = {0.94, 0.97, 1.10}, contrast = 0.96 } },
         -- Sunrise, warm and low.
-        { time = 0.27, sky = {0.85, 0.50, 0.35}, sun = {1.00, 0.65, 0.40}, intensity = 0.55 },
+        { time = 0.27, sky = {0.85, 0.50, 0.35}, sun = {1.00, 0.65, 0.40}, intensity = 0.55,
+          grade = { saturation = 1.10, tint = {1.05, 1.00, 0.95}, contrast = 1.05 } },
         -- Full morning.
-        { time = 0.35, sky = {0.55, 0.72, 0.95}, sun = {1.00, 0.96, 0.90}, intensity = 0.95 },
-        -- Noon, the brightest and the flattest.
+        { time = 0.35, sky = {0.55, 0.72, 0.95}, sun = {1.00, 0.96, 0.90}, intensity = 0.95,
+          grade = { saturation = 1.03, contrast = 1.02 } },
+        -- Noon, the brightest and the flattest. Ungraded, deliberately — see the
+        -- note above the list.
         { time = 0.50, sky = {0.50, 0.70, 1.00}, sun = {1.00, 1.00, 1.00}, intensity = 1.00 },
         -- Afternoon, on the way down.
-        { time = 0.65, sky = {0.55, 0.70, 0.95}, sun = {1.00, 0.95, 0.88}, intensity = 0.95 },
+        { time = 0.65, sky = {0.55, 0.70, 0.95}, sun = {1.00, 0.95, 0.88}, intensity = 0.95,
+          grade = { saturation = 1.04, contrast = 1.02 } },
         -- Sunset, warmer than sunrise because it reads better against terrain.
-        { time = 0.73, sky = {0.90, 0.45, 0.28}, sun = {1.00, 0.55, 0.30}, intensity = 0.50 },
+        { time = 0.73, sky = {0.90, 0.45, 0.28}, sun = {1.00, 0.55, 0.30}, intensity = 0.50,
+          grade = { saturation = 1.15, tint = {1.07, 1.00, 0.94}, contrast = 1.06 } },
         -- Dusk falling.
-        { time = 0.80, sky = {0.15, 0.12, 0.25}, sun = {0.55, 0.45, 0.70}, intensity = 0.18 },
+        { time = 0.80, sky = {0.15, 0.12, 0.25}, sun = {0.55, 0.45, 0.70}, intensity = 0.18,
+          grade = { exposure = 1.08, saturation = 0.75, tint = {0.97, 0.98, 1.08}, contrast = 0.98 } },
         -- And back to midnight. **The last keyframe must restate the first's
-        -- colours**, or the day ends on a hard cut back to 0.00 at the moment
-        -- the clock wraps.
-        { time = 1.00, sky = {0.02, 0.03, 0.08}, sun = {0.35, 0.45, 0.80}, intensity = 0.08 },
+        -- colours** — and its grade, for the same reason — or the day ends on a
+        -- hard cut back to 0.00 at the moment the clock wraps.
+        { time = 1.00, sky = {0.02, 0.03, 0.08}, sun = {0.35, 0.45, 0.80}, intensity = 0.08,
+          grade = { exposure = 1.15, saturation = 0.55, tint = {0.92, 0.96, 1.12}, contrast = 0.95 } },
     },
 }
 

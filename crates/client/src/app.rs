@@ -1381,6 +1381,7 @@ impl App {
             moment.sky,
             f32::from(self.config.view_distance) * tiamot_core::CHUNK_BLOCKS as f32,
         );
+        self.renderer.set_grade(moment.grade);
 
         let sensitivity = self.config.mouse_sensitivity;
         self.camera

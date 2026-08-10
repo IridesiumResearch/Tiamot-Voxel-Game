@@ -34,9 +34,14 @@ struct Post {
     params: vec2<f32>,
     // How much bloom to add back in the composite.
     intensity: f32,
-    // Exposure applied before the tonemap.
+    // Exposure applied before the tonemap. The sky's, so a mod can open the
+    // frame up at dusk and keep it from clipping at noon.
     exposure: f32,
-    _pad: vec2<f32>,
+    // Above 0.5, look the tonemapped colour up in `grade_lut`. Off for a sky
+    // that grades nothing, because an eight-bit table of the identity is not
+    // exactly the identity — see `render::grade`.
+    graded: f32,
+    _pad: f32,
 };
 
 @group(0) @binding(0) var<uniform> post: Post;
@@ -48,6 +53,10 @@ struct Post {
 // colour, filtering it averages across silhouette edges, and the average of two
 // surfaces at different distances is a distance where neither of them is.
 @group(0) @binding(4) var scene_depth: texture_depth_2d;
+// The time-of-day grading table: a colour cube the composite looks its finished
+// pixels up in. sRGB-encoded, so this sample comes back linear. Bound by every
+// pass and read by the composite alone.
+@group(0) @binding(5) var grade_lut: texture_3d<f32>;
 
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
@@ -182,7 +191,27 @@ fn scattered_fog(uv: vec2<f32>) -> vec3<f32> {
     return mix(post.sky.rgb, post.sun.rgb, halo * post.sun.w);
 }
 
-// The last pass: scene plus bloom, fogged, exposed and tonemapped.
+// How many samples per axis the grading table has. Must match
+// `render::grade::SIZE`; a mismatch is a subtle contrast error, not a failure.
+const GRADE_SIZE: f32 = 16.0;
+
+// The time-of-day grade: one trilinear lookup.
+//
+// **The coordinate scaling is the whole trick and the classic place to get it
+// wrong.** A texture coordinate of 0 lands on the *edge* of the first texel, not
+// its centre, so feeding the colour in raw samples half a texel outside the
+// table at both ends and clamps there — which shows up as slightly crushed
+// blacks and whites that no amount of staring at the grade explains. The table's
+// first entry sits at 0.5/N and its last at (N-0.5)/N, so a colour of 0..1 maps
+// onto that range.
+fn graded(colour: vec3<f32>) -> vec3<f32> {
+    let scale = (GRADE_SIZE - 1.0) / GRADE_SIZE;
+    let offset = 0.5 / GRADE_SIZE;
+    let uvw = clamp(colour, vec3<f32>(0.0), vec3<f32>(1.0)) * scale + offset;
+    return textureSample(grade_lut, source_sampler, uvw).rgb;
+}
+
+// The last pass: scene plus bloom, fogged, exposed, tonemapped and graded.
 @fragment
 fn composite_main(input: VertexOut) -> @location(0) vec4<f32> {
     let scene = textureSample(source, source_sampler, input.uv).rgb;
@@ -201,5 +230,14 @@ fn composite_main(input: VertexOut) -> @location(0) vec4<f32> {
     let haze = clamp((distance - start) / max(post.sky.w - start, 0.001), 0.0, 1.0);
     let fogged = mix(lit, scattered_fog(input.uv), haze);
 
-    return vec4<f32>(tonemap(fogged), 1.0);
+    // Graded last, on the display-referred result. The table's domain is 0..1
+    // and this is where the frame first lives in it: grading before the tonemap
+    // would ask the table about values above white, which it has no entries for.
+    //
+    // Sampled unconditionally and selected between, rather than sampled inside
+    // an `if`: the condition is uniform so a branch would be legal, but a select
+    // needs no argument about that and costs one fetch in the pass that runs
+    // once per pixel per frame.
+    let display = tonemap(fogged);
+    return vec4<f32>(select(display, graded(display), post.graded > 0.5), 1.0);
 }

@@ -33,8 +33,8 @@ use crate::coords::{ChunkPos, LocalBlock};
 use crate::detgen::{ChunkBuffer, FractalParams, Region2d, StreamRng, fill_2d};
 use crate::material::MaterialId;
 use crate::script::vm::{
-    Backend, BlockRules, BlockTexture, Brush, HookOutcome, ScriptError, ScriptVm, Sky, SkyKeyframe,
-    Tool, VmLimits,
+    Backend, BlockRules, BlockTexture, Brush, HookOutcome, ScriptError, ScriptVm, Sky, SkyGrade,
+    SkyKeyframe, Tool, VmLimits,
 };
 
 /// Registry key holding the mods that registered `on_dig_complete`.
@@ -843,6 +843,14 @@ impl ScriptVm for MluaVm {
                     sky: colour("sky")?,
                     sun: colour("sun")?,
                     intensity: frame.get("intensity").ok()?,
+                    // Validated in `register_sky`; absent means no grading, which
+                    // is a keyframe saying nothing rather than an error.
+                    grade: frame
+                        .get::<Option<Table>>("grade")
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        .map_or(SkyGrade::NONE, read_grade),
                 })
             })
             .collect();
@@ -1679,6 +1687,9 @@ fn register_sky(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
                 )));
             }
         }
+        if let Some(grade) = frame.get::<Option<Table>>("grade")? {
+            validate_grade(&grade)?;
+        }
         count += 1;
     }
     if count == 0 {
@@ -1694,6 +1705,113 @@ fn register_sky(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     registry.set(owner.to_owned(), entry)?;
     Ok(())
 }
+
+/// Checks a keyframe's `grade` table, so a mistake in it is a registration
+/// error rather than a colour nobody can explain.
+///
+/// Every field is optional and every bound is generous — this is a stylised
+/// look, not a calibrated pipeline — but they are bounds all the same: a
+/// `gamma` of zero is a divide by nothing, and a `tint` of 500 is a white
+/// screen with a bug report attached.
+fn validate_grade(grade: &Table) -> mlua::Result<()> {
+    for pair in grade.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !GRADE_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "register_sky: unknown `grade` field `{name}`"
+                )));
+            }
+        }
+    }
+
+    for (key, low, high) in [
+        ("exposure", 0.0, GRADE_MAX),
+        ("contrast", 0.0, GRADE_MAX),
+        ("saturation", 0.0, GRADE_MAX),
+        // Never zero: the bake raises each channel to this power, and a zero
+        // exponent maps every colour in the frame to white.
+        ("gamma", GRADE_MIN_GAMMA, GRADE_MAX),
+    ] {
+        if let Some(value) = grade.get::<Option<f32>>(key)?
+            && (!value.is_finite() || value < low || value > high)
+        {
+            return Err(mlua::Error::external(format!(
+                "register_sky: `grade.{key}` must be {low}..={high}, got {value}"
+            )));
+        }
+    }
+
+    for (key, low, high) in [("tint", 0.0, GRADE_MAX), ("offset", -1.0, 1.0)] {
+        if let Some(colour) = grade.get::<Option<Table>>(key)? {
+            if colour.len()? != 3 {
+                return Err(mlua::Error::external(format!(
+                    "register_sky: `grade.{key}` must be three numbers, {{r, g, b}}"
+                )));
+            }
+            for channel in 1..=3 {
+                let value: f32 = colour.get(channel)?;
+                if !value.is_finite() || value < low || value > high {
+                    return Err(mlua::Error::external(format!(
+                        "register_sky: `grade.{key}` must be {low}..={high}, got {value}"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Reads a `grade` table that [`validate_grade`] has already accepted.
+///
+/// Absent fields keep their identity, so a keyframe may set one knob without
+/// restating the other five.
+fn read_grade(grade: &Table) -> SkyGrade {
+    let scalar = |key: &str, fallback: f32| -> f32 {
+        grade
+            .get::<Option<f32>>(key)
+            .ok()
+            .flatten()
+            .unwrap_or(fallback)
+    };
+    let colour = |key: &str, fallback: [f32; 3]| -> [f32; 3] {
+        grade
+            .get::<Option<Table>>(key)
+            .ok()
+            .flatten()
+            .and_then(|table| Some([table.get(1).ok()?, table.get(2).ok()?, table.get(3).ok()?]))
+            .unwrap_or(fallback)
+    };
+    SkyGrade {
+        exposure: scalar("exposure", SkyGrade::NONE.exposure),
+        tint: colour("tint", SkyGrade::NONE.tint),
+        offset: colour("offset", SkyGrade::NONE.offset),
+        contrast: scalar("contrast", SkyGrade::NONE.contrast),
+        saturation: scalar("saturation", SkyGrade::NONE.saturation),
+        gamma: scalar("gamma", SkyGrade::NONE.gamma),
+    }
+}
+
+/// Keys a keyframe's `grade` sub-table accepts.
+const GRADE_FIELDS: [&str; 6] = [
+    "exposure",
+    "tint",
+    "offset",
+    "contrast",
+    "saturation",
+    "gamma",
+];
+
+/// The largest multiplier any grading knob may take.
+///
+/// Four. Enough for a strong stylised look and far short of the values that
+/// only ever mean a mod meant to write a fraction.
+const GRADE_MAX: f32 = 4.0;
+
+/// The smallest `gamma`. Not zero — see [`validate_grade`].
+const GRADE_MIN_GAMMA: f32 = 0.1;
 
 /// Fields `register_sky` accepts.
 /// Every field `register_sky` accepts.
@@ -2714,6 +2832,121 @@ mod dig_rules_tests {
             detail_of(&err).contains("time"),
             "the error should name the field: {err:?}"
         );
+    }
+
+    #[test]
+    fn a_keyframe_that_says_nothing_about_grading_is_graded_not_at_all() {
+        // The whole reason grading is additive: every world that predates it, and
+        // every sky that does not care, must come out exactly as before.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core_sky",
+            r"game.register_sky{ day_length_ticks = 100, keyframes = {
+                { time = 0.5, sky = {0.5, 0.7, 1.0}, sun = {1, 1, 1}, intensity = 1.0 },
+            } }",
+        )
+        .expect("load");
+
+        let sky = vm.registered_sky().expect("a sky");
+        assert_eq!(sky.keyframes[0].grade, SkyGrade::NONE);
+        assert!(sky.keyframes[0].grade.is_none());
+    }
+
+    #[test]
+    fn a_keyframe_can_grade_one_knob_without_restating_the_others() {
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core_sky",
+            r"game.register_sky{ day_length_ticks = 100, keyframes = {
+                { time = 0.0, sky = {0,0,0}, sun = {0,0,0}, intensity = 0,
+                  grade = { saturation = 0.5, tint = {0.9, 1.0, 1.2} } },
+            } }",
+        )
+        .expect("load");
+
+        let grade = vm.registered_sky().expect("a sky").keyframes[0].grade;
+        assert!((grade.saturation - 0.5).abs() < 1e-6);
+        assert!((grade.tint[2] - 1.2).abs() < 1e-6);
+        // The five it did not mention keep their identities rather than zeroing.
+        assert!((grade.exposure - 1.0).abs() < 1e-6);
+        assert!((grade.contrast - 1.0).abs() < 1e-6);
+        assert!((grade.gamma - 1.0).abs() < 1e-6);
+        assert!(grade.offset.iter().all(|channel| channel.abs() < 1e-6));
+        assert!(
+            !grade.is_none(),
+            "a grade that sets something is not the identity"
+        );
+    }
+
+    #[test]
+    fn a_gamma_of_zero_is_refused() {
+        // It is a divide by nothing in the bake, and the frame comes out one
+        // flat colour with nothing on screen to say why.
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core_sky",
+            r"game.register_sky{ day_length_ticks = 100, keyframes = {
+                { time = 0, sky = {0,0,0}, sun = {0,0,0}, intensity = 0,
+                  grade = { gamma = 0 } },
+            } }",
+        )
+        .expect_err("should refuse");
+        assert!(
+            detail_of(&err).contains("gamma"),
+            "the error should name the field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_misspelt_grade_field_is_refused_rather_than_ignored() {
+        // The lesson `start_time` taught, one level down: a field the engine
+        // silently ignores is a mod author staring at a setting that does
+        // nothing.
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "core_sky",
+            r"game.register_sky{ day_length_ticks = 100, keyframes = {
+                { time = 0, sky = {0,0,0}, sun = {0,0,0}, intensity = 0,
+                  grade = { saturaton = 0.5 } },
+            } }",
+        )
+        .expect_err("should refuse");
+        assert!(
+            detail_of(&err).contains("saturaton"),
+            "the error should quote the typo: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_grade_outside_its_bounds_is_refused_rather_than_clamped() {
+        // Same reasoning as hardness, light_emit and keyframe time: clamping
+        // leaves a mod believing it set something.
+        let mut vm = vm();
+        for (field, spec) in [
+            ("contrast", "grade = { contrast = 99 }"),
+            ("tint", "grade = { tint = {0, 0, 99} }"),
+            ("offset", "grade = { offset = {0, 0, -9} }"),
+            ("tint", "grade = { tint = {1, 1} }"),
+        ] {
+            let err = load(
+                &mut vm,
+                "core_sky",
+                &format!(
+                    r"game.register_sky{{ day_length_ticks = 100, keyframes = {{
+                        {{ time = 0, sky = {{0,0,0}}, sun = {{0,0,0}}, intensity = 0, {spec} }},
+                    }} }}"
+                ),
+            )
+            .expect_err("should refuse");
+            assert!(
+                detail_of(&err).contains(field),
+                "the error for `{spec}` should name `{field}`: {err:?}"
+            );
+        }
     }
 
     #[test]

@@ -278,6 +278,72 @@ impl BlockRules {
     }
 }
 
+/// How a moment's finished picture is graded.
+///
+/// Every field is an identity by default, so a keyframe that says nothing about
+/// grading is graded not at all — which is what makes this additive rather than
+/// a change to how existing skies look.
+///
+/// # What each one does, and in what order
+///
+/// `exposure` scales the scene BEFORE the highlight roll-off, so it decides how
+/// much of the picture reaches the shoulder. The rest run afterwards, on the
+/// finished display-referred image, in this order: contrast about a mid-grey
+/// pivot, saturation towards luma, `tint` multiplying and `offset` adding, then
+/// `gamma`. The order is fixed and the client's LUT bake is its only
+/// implementation — see `client::render::grade`.
+///
+/// # Why so few knobs
+///
+/// A full grading stack is content-authoring machinery, and the engine's job is
+/// to make a look expressible rather than to be a colourist. These six describe
+/// "cooler and flatter at night, warm and contrasty at dusk" — which is what a
+/// day cycle actually needs — and every one of them has an obvious identity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyGrade {
+    /// Multiplies the scene before the tonemap. 1.0 is none.
+    pub exposure: f32,
+    /// Multiplies each channel of the graded image. `[1, 1, 1]` is none.
+    pub tint: [f32; 3],
+    /// Added to each channel after `tint`. `[0, 0, 0]` is none.
+    pub offset: [f32; 3],
+    /// Pushes each channel away from mid grey. 1.0 is none.
+    pub contrast: f32,
+    /// Blends towards luma at 0 and away from it above 1. 1.0 is none.
+    pub saturation: f32,
+    /// Applied last, per channel. 1.0 is none.
+    pub gamma: f32,
+}
+
+impl SkyGrade {
+    /// No grading at all: what a keyframe with no `grade` table gets.
+    pub const NONE: Self = Self {
+        exposure: 1.0,
+        tint: [1.0; 3],
+        offset: [0.0; 3],
+        contrast: 1.0,
+        saturation: 1.0,
+        gamma: 1.0,
+    };
+
+    /// Whether this grade would leave the picture exactly as it found it.
+    ///
+    /// **The client skips the LUT entirely when this holds**, so an ungraded
+    /// world is not merely close to what it was before grading existed but
+    /// identical to it — an 8-bit LUT of the identity is not quite the identity,
+    /// and Task 08's screenshot hashes are asserted on exact values.
+    #[must_use]
+    pub fn is_none(&self) -> bool {
+        *self == Self::NONE
+    }
+}
+
+impl Default for SkyGrade {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
 /// One moment in a mod's day, as a set of colours.
 ///
 /// The sky is a list of these and the client interpolates between them, which
@@ -296,6 +362,12 @@ pub struct SkyKeyframe {
     /// day/night cycle free: the world's sunlight is always full daylight, so
     /// dusk dirties no chunks and relights nothing.
     pub intensity: f32,
+    /// How the finished picture is graded at this moment.
+    ///
+    /// Interpolated between keyframes like the colours are, and only lighting
+    /// mode 3 applies it — grading is a property of the post chain, and modes 1
+    /// and 2 have no post chain to put it in.
+    pub grade: SkyGrade,
 }
 
 /// The sky a mod registered.

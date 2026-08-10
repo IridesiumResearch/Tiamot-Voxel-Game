@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -66,6 +66,11 @@ pub const PROTOCOL_VERSION: u32 = 9;
 // because it is state. Two messages rather than one for exactly that reason —
 // re-sending a mod's whole keyframe list twenty times a second to carry one
 // float would be absurd.
+// v10 (Task 10): `SkyFrame` grew a `grade`. **A field on an existing struct, not
+// an appended variant** — the one shape of change this format does not make
+// safe, because postcard is not self-describing and an old client would read the
+// next keyframe's bytes as this one's grade. That is what the version check is
+// for: v9 and v10 refuse each other before either reads a keyframe.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -717,6 +722,51 @@ pub struct SkyFrame {
     pub sun: [f32; 3],
     /// How strong the sun is, `0.0..=1.0`.
     pub intensity: f32,
+    /// How the finished frame is graded at this moment.
+    pub grade: SkyGrade,
+}
+
+/// How a moment's finished picture is graded, on the wire.
+///
+/// The protocol's own copy of [`crate::script::SkyGrade`], for the reason
+/// [`SkyFrame`] is: a mod API edit must not be able to change what peers agree
+/// on by accident.
+///
+/// **Every field is validated by the server before it reaches here** and again
+/// by the client, because this arrives from a peer (charter rule 14) and a
+/// `gamma` of zero or a `NaN` `tint` would come out as a frame of one colour.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SkyGrade {
+    /// Multiplies the scene before the tonemap.
+    pub exposure: f32,
+    /// Multiplies each channel of the graded image.
+    pub tint: [f32; 3],
+    /// Added to each channel after `tint`.
+    pub offset: [f32; 3],
+    /// Pushes each channel away from mid grey.
+    pub contrast: f32,
+    /// Blends towards luma below 1 and away from it above.
+    pub saturation: f32,
+    /// Applied last, per channel.
+    pub gamma: f32,
+}
+
+impl SkyGrade {
+    /// No grading at all.
+    pub const NONE: Self = Self {
+        exposure: 1.0,
+        tint: [1.0; 3],
+        offset: [0.0; 3],
+        contrast: 1.0,
+        saturation: 1.0,
+        gamma: 1.0,
+    };
+}
+
+impl Default for SkyGrade {
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 /// A message could not be encoded or decoded.

@@ -164,7 +164,15 @@ fn singleplayer_joins_its_own_server_and_draws_the_world() {
 
     assert!(
         shows_a_world(&frame),
-        "the frame is entirely sky; the client joined but drew nothing"
+        "the frame is entirely sky; the client joined but drew nothing. \
+         camera {:?} pitch {:.2} yaw {:.2}, {} meshed, {} pending, {} drawn, predicting {}",
+        camera.position,
+        camera.pitch,
+        camera.yaw,
+        app.meshed_chunks(),
+        app.pending_chunks(),
+        app.renderer().drawn(),
+        app.predicting(),
     );
 
     app.shutdown();

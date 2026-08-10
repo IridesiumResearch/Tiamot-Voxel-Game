@@ -28,6 +28,7 @@
 //! test is worth having.
 
 pub mod frustum;
+pub mod grade;
 pub mod graph;
 pub mod offscreen;
 pub mod shadow;
@@ -604,6 +605,12 @@ pub struct Renderer {
     sun_direction: [f32; 3],
     /// The sky's colour now, which fog fades towards.
     sky_colour: [f32; 3],
+    /// How the finished frame is graded now.
+    ///
+    /// Mode 3 only — grading lives in the post chain, and the other two modes
+    /// have no post chain to put it in. [`grade::Grading`] holds the baked table;
+    /// this is the six numbers it was baked from.
+    grade: tiamot_core::proto::SkyGrade,
     /// Where fog begins and where it is total, in blocks.
     fog_start: f32,
     fog_end: f32,
@@ -730,6 +737,9 @@ impl Renderer {
             sun_colour: [1.0, 1.0, 1.0, 1.0],
             sun_direction: [0.0, -0.970_142_5, 0.242_535_62],
             sky_colour: sky_colour(),
+            // Ungraded until a sky says otherwise, which keeps a world with no
+            // sky mod exactly what it was before grading existed.
+            grade: tiamot_core::proto::SkyGrade::NONE,
             // Far enough that nothing fogs until a view distance is set. A
             // client that fogged by default would hide geometry the Task 08
             // scenes assert on.
@@ -770,6 +780,15 @@ impl Renderer {
         self.sky_colour = colour;
         self.fog_end = far.max(1.0);
         self.fog_start = self.fog_end * FOG_START_FRACTION;
+    }
+
+    /// Sets how the finished frame is graded, for the frames that follow.
+    ///
+    /// Takes effect in mode 3 only. Nothing is baked here — [`Renderer::render`]
+    /// re-bakes the table when this has moved far enough to reach a pixel, so a
+    /// caller may set it every frame at no cost.
+    pub const fn set_grade(&mut self, grade: tiamot_core::proto::SkyGrade) {
+        self.grade = grade;
     }
 
     /// The sun's current strength, for tests and the HUD.
@@ -1164,6 +1183,7 @@ impl Renderer {
                 sun_direction: self.sun_direction,
                 fog_start: self.fog_start,
                 fog_end: self.fog_end,
+                grade: self.grade,
             },
         );
     }
@@ -1220,6 +1240,16 @@ impl Renderer {
         // Before the globals are written, because the matrices go in them.
         if let Some(shadows) = self.post.as_mut().and_then(graph::Post::shadows_mut) {
             shadows.update(&self.gpu, camera, aspect, self.sun_direction);
+        }
+
+        // And before the chain runs, because baking uploads a texture the
+        // composite is about to read. Cheap when the sky has not moved: the
+        // table is rebuilt only when the grade changes by enough to reach a
+        // pixel, which over a twenty-minute day is a few times a second rather
+        // than sixty.
+        if let Some(post) = self.post.as_mut() {
+            let grade = self.grade;
+            post.bake_grade(&self.gpu, &grade);
         }
 
         self.gpu.queue.write_buffer(

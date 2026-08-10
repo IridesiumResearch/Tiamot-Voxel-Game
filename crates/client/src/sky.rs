@@ -19,7 +19,7 @@
 //! doing the presenting. What the server owns is the *clock*, because two
 //! players standing together must see the same sky.
 
-use tiamot_core::proto::SkyFrame;
+use tiamot_core::proto::{SkyFrame, SkyGrade};
 
 /// A sky's colours, and the clock that walks them.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +47,13 @@ pub struct Moment {
     /// Shadow maps need this and colour alone cannot supply it. See
     /// [`Sky::sun_direction`] for the arc it walks and what is fixed about it.
     pub sun_direction: [f32; 3],
+    /// How the finished picture is graded now.
+    ///
+    /// Interpolated between keyframes like the colours are, and **sanitised** on
+    /// the way through: this arrives from a peer, and a grade that came in as
+    /// `NaN` would leave the whole frame one colour. See
+    /// [`crate::render::grade`].
+    pub grade: SkyGrade,
 }
 
 impl Sky {
@@ -137,6 +144,11 @@ impl Sky {
                 // than nowhere: straight down would make every shadow a
                 // vertical smear and every vertical face unlit.
                 sun_direction: NOON,
+                // Ungraded, and it matters that this is exact rather than
+                // near-identity: mode 3 skips the LUT entirely for this value,
+                // which is what keeps a world with no sky mod pixel-for-pixel
+                // what it was before grading existed.
+                grade: SkyGrade::NONE,
             };
         };
         let last = self.keyframes.last().unwrap_or(first);
@@ -174,6 +186,7 @@ impl Sky {
             sun: mix(before.sun, after.sun, blend),
             intensity: before.intensity + (after.intensity - before.intensity) * blend,
             sun_direction: self.sun_direction(),
+            grade: mix_grade(&before.grade, &after.grade, blend),
         }
     }
 
@@ -235,6 +248,51 @@ fn normalise(v: [f32; 3]) -> [f32; 3] {
     [v[0] / length, v[1] / length, v[2] / length]
 }
 
+/// Linear blend between two grades, sanitised.
+///
+/// **The sanitising is not defensive tidiness.** These numbers come from a
+/// server the client has no reason to trust (charter rule 14). A `NaN` `gamma`
+/// or a `tint` of `1e30` reaches a `powf` in the LUT bake and comes out as a
+/// frame of one flat colour, with nothing on screen to say why — so out-of-range
+/// values are clamped to the same bounds `register_sky` enforces, and anything
+/// non-finite falls back to the identity for that field.
+fn mix_grade(from: &SkyGrade, to: &SkyGrade, blend: f32) -> SkyGrade {
+    let scalar = |from: f32, to: f32, identity: f32, low: f32| -> f32 {
+        if !from.is_finite() || !to.is_finite() {
+            return identity;
+        }
+        (from + (to - from) * blend).clamp(low, GRADE_MAX)
+    };
+    let colour = |from: [f32; 3], to: [f32; 3], identity: [f32; 3], low: f32| -> [f32; 3] {
+        let mixed = mix(from, to, blend);
+        let mut out = identity;
+        for channel in 0..3 {
+            if mixed[channel].is_finite() {
+                out[channel] = mixed[channel].clamp(low, GRADE_MAX);
+            }
+        }
+        out
+    };
+    SkyGrade {
+        exposure: scalar(from.exposure, to.exposure, 1.0, 0.0),
+        tint: colour(from.tint, to.tint, SkyGrade::NONE.tint, 0.0),
+        offset: colour(from.offset, to.offset, SkyGrade::NONE.offset, -1.0),
+        contrast: scalar(from.contrast, to.contrast, 1.0, 0.0),
+        saturation: scalar(from.saturation, to.saturation, 1.0, 0.0),
+        // Never zero: the bake raises each channel to this power, and a zero
+        // exponent maps every colour in the frame to white.
+        gamma: scalar(from.gamma, to.gamma, 1.0, GRADE_MIN_GAMMA),
+    }
+}
+
+/// The bounds a graded value is held to, matching `register_sky`'s.
+///
+/// Restated here rather than shared, because these two checks answer different
+/// questions: that one tells a mod author they made a mistake, and this one
+/// stops a hostile or buggy server from painting the screen one colour.
+const GRADE_MAX: f32 = 4.0;
+const GRADE_MIN_GAMMA: f32 = 0.1;
+
 /// Linear blend between two colours.
 fn mix(from: [f32; 3], to: [f32; 3], blend: f32) -> [f32; 3] {
     [
@@ -260,6 +318,18 @@ mod tests {
             sky: [value; 3],
             sun: [value; 3],
             intensity,
+            grade: SkyGrade::NONE,
+        }
+    }
+
+    /// A keyframe that grades, for the tests about grading.
+    fn graded(time: f32, saturation: f32) -> SkyFrame {
+        SkyFrame {
+            grade: SkyGrade {
+                saturation,
+                ..SkyGrade::NONE
+            },
+            ..frame(time, 0.5, 0.5)
         }
     }
 
@@ -435,6 +505,70 @@ mod tests {
                 (length - 1.0).abs() < 1e-5,
                 "at {time} the direction {direction:?} has length {length}"
             );
+        }
+    }
+
+    #[test]
+    fn the_grade_interpolates_between_keyframes_like_the_colours_do() {
+        // A grade that jumped at each keyframe would be a visible step in the
+        // middle of a fade the rest of the sky is doing smoothly.
+        let mut sky = Sky::new(100, vec![graded(0.0, 0.0), graded(1.0, 1.0)]);
+        sky.set_time(0.5);
+        let saturation = sky.moment().grade.saturation;
+        assert!(
+            (saturation - 0.5).abs() < 1e-5,
+            "halfway between 0 and 1 should be 0.5, got {saturation}"
+        );
+    }
+
+    #[test]
+    fn a_sky_that_grades_nothing_reports_the_exact_identity() {
+        // Mode 3 skips the grading table on exactly this comparison, and the
+        // skip is what keeps an ungraded world pixel-for-pixel what it was. A
+        // grade that arrived as 0.999999 would grade every frame for ever.
+        let mut sky = Sky::new(100, frames());
+        for step in 0..16 {
+            sky.set_time(step as f32 / 16.0);
+            assert_eq!(
+                sky.moment().grade,
+                SkyGrade::NONE,
+                "an ungraded sky graded at {}",
+                sky.time()
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostile_grade_cannot_reach_the_bake() {
+        // Charter rule 14: this arrives from a server the client has no reason
+        // to trust. A NaN gamma reaches a `powf` and comes out as a frame of one
+        // flat colour with nothing on screen to say why.
+        let poison = SkyFrame {
+            grade: SkyGrade {
+                exposure: f32::NAN,
+                tint: [f32::INFINITY; 3],
+                offset: [-9.0; 3],
+                contrast: 1e30,
+                saturation: f32::NAN,
+                gamma: 0.0,
+            },
+            ..frame(0.0, 0.5, 0.5)
+        };
+        let mut sky = Sky::new(100, vec![poison, frame(1.0, 0.5, 0.5)]);
+        sky.set_time(0.0);
+        let grade = sky.moment().grade;
+
+        assert!(grade.exposure.is_finite() && grade.exposure > 0.0);
+        assert!(grade.saturation.is_finite());
+        assert!(grade.contrast.is_finite() && grade.contrast <= GRADE_MAX);
+        assert!(
+            grade.gamma >= GRADE_MIN_GAMMA,
+            "a gamma of {} maps the whole frame to white",
+            grade.gamma
+        );
+        for channel in 0..3 {
+            assert!(grade.tint[channel].is_finite() && grade.tint[channel] <= GRADE_MAX);
+            assert!(grade.offset[channel] >= -1.0, "{:?}", grade.offset);
         }
     }
 

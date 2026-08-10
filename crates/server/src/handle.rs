@@ -524,6 +524,14 @@ impl ServerHandle {
                         sky: frame.sky,
                         sun: frame.sun,
                         intensity: frame.intensity,
+                        grade: tiamot_core::proto::SkyGrade {
+                            exposure: frame.grade.exposure,
+                            tint: frame.grade.tint,
+                            offset: frame.grade.offset,
+                            contrast: frame.grade.contrast,
+                            saturation: frame.grade.saturation,
+                            gamma: frame.grade.gamma,
+                        },
                     })
                     .collect();
                 (sky.day_length_ticks, frames, sky.start_time)

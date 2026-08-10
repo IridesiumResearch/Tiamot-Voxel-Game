@@ -56,14 +56,6 @@ const BLOOM_KNEE: f32 = 0.6;
 /// How much of the blurred image is added back.
 const BLOOM_INTENSITY: f32 = 0.35;
 
-/// Exposure applied before the tonemap.
-///
-/// One, i.e. none, until there is a reason for it to be otherwise. It is a
-/// uniform rather than a constant in the shader because time-of-day grading
-/// will want it, and a value the sky can reach is worth having in place before
-/// the code that reaches it.
-const EXPOSURE: f32 = 1.0;
-
 /// What one post pass needs to know.
 ///
 /// Field order matches `post.wgsl` exactly, and nothing checks that it does —
@@ -87,8 +79,19 @@ struct Uniforms {
     /// Threshold cutoff and knee, or blur direction.
     params: [f32; 2],
     intensity: f32,
+    /// Exposure, applied before the tonemap.
+    ///
+    /// The sky's, so a mod can open up the frame at dusk and stop it clipping at
+    /// noon. It multiplies before the highlight roll-off on purpose — after it,
+    /// exposure would only slide an already-compressed picture up and down.
     exposure: f32,
-    _pad: [f32; 2],
+    /// Whether to look the tonemapped colour up in the grading table.
+    ///
+    /// A flag rather than an always-on lookup, because an eight-bit table of the
+    /// identity is not exactly the identity and an ungraded world has to be
+    /// untouched — see [`super::grade`].
+    graded: f32,
+    _pad: f32,
 }
 
 /// What the frame's sky is doing, as the composite needs it.
@@ -110,6 +113,9 @@ pub struct Frame {
     pub fog_start: f32,
     /// Where it is total, in blocks.
     pub fog_end: f32,
+    /// How the finished frame is graded, already interpolated and sanitised by
+    /// `crate::sky`.
+    pub grade: tiamot_core::proto::SkyGrade,
 }
 
 /// How much of the sun's colour the haze takes on where the view points at it.
@@ -211,6 +217,20 @@ fn post_bind_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
                         // across a silhouette that is every edge in the frame.
                         sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // The grading table. Filterable and filtered: the whole
+                        // point of a 16-sample axis is that the hardware
+                        // interpolates between entries, and a nearest-sampled
+                        // LUT is sixteen visible bands per channel.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
                         multisampled: false,
                     },
                     count: None,
@@ -328,6 +348,10 @@ pub struct Post {
     /// to read. A binding cannot be left empty, and binding the target being
     /// written would be a read-write hazard the validator rejects.
     black: wgpu::TextureView,
+    /// The time-of-day grading table. Bound by every pass and read by the
+    /// composite alone, which is cheaper than a second bind layout for the sake
+    /// of three passes that ignore it.
+    grading: super::grade::Grading,
     size: (u32, u32),
     /// The cascades. Owned here so that everything mode 3 allocates is built
     /// and dropped as one thing, and `None` when shadows are turned off — which
@@ -445,6 +469,7 @@ impl Post {
                 HDR_FORMAT,
             ),
             shadows,
+            grading: super::grade::Grading::new(gpu),
             black: black.create_view(&wgpu::TextureViewDescriptor::default()),
             sampler: gpu.device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("post-sampler"),
@@ -513,10 +538,23 @@ impl Post {
         self.scene.bytes
             + self.bloom[0].bytes
             + self.bloom[1].bytes
+            + super::grade::BYTES
             + self
                 .shadows
                 .as_ref()
                 .map_or(0, super::shadow::Shadows::bytes)
+    }
+
+    /// Re-bakes the grading table if the sky has moved far enough to matter.
+    ///
+    /// Separate from [`Post::run`] and called before it, because baking uploads
+    /// a texture and `run` takes `&self` — and because the frame that decides
+    /// what the grade is should be the frame that pays for it.
+    ///
+    /// Returns whether anything was uploaded, for the test that a still sky
+    /// bakes once rather than every frame.
+    pub fn bake_grade(&mut self, gpu: &Gpu, grade: &tiamot_core::proto::SkyGrade) -> bool {
+        self.grading.bake(gpu, grade)
     }
 
     /// Runs threshold, blur, blur, composite — scene in, `target` out.
@@ -602,8 +640,12 @@ impl Post {
                 texel,
                 params,
                 intensity: BLOOM_INTENSITY,
-                exposure: EXPOSURE,
-                _pad: [0.0; 2],
+                exposure: frame.grade.exposure,
+                // The identity is skipped rather than looked up. See
+                // [`super::grade`] for why "nearly unchanged" is not good
+                // enough for an ungraded world.
+                graded: f32::from(u8::from(frame.grade != tiamot_core::proto::SkyGrade::NONE)),
+                _pad: 0.0,
             }),
         );
     }
@@ -638,6 +680,10 @@ impl Post {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&self.depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(self.grading.view()),
                 },
             ],
         });

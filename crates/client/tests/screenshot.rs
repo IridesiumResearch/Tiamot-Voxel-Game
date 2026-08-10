@@ -34,6 +34,7 @@ use client::mesher::{self, Absent, Neighbours};
 use client::render::offscreen::{hash_hex, perceptual_hash};
 use client::render::{Gpu, Offscreen, Renderer};
 use client::texture::{Atlas, Image};
+use tiamot_core::proto::SkyGrade;
 use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId};
 
 /// Full daylight, so these scenes measure what they are about rather than the
@@ -1498,5 +1499,165 @@ fn shadow_quality_changes_what_is_allocated_and_off_allocates_nothing() {
     assert!(
         renderer.post_bytes() < previous,
         "turning shadows off kept their memory"
+    );
+}
+
+#[test]
+fn the_grading_table_leaves_an_ungraded_frame_exactly_alone() {
+    // **The test that catches the classic LUT bug.** A 3D lookup table is
+    // addressed by texture coordinate, and a coordinate of 0 lands on the EDGE
+    // of the first texel rather than its centre — so the obvious mapping samples
+    // half a texel outside the table at both ends and clamps there, which reads
+    // as slightly crushed blacks and whites that no amount of staring at the
+    // grade explains. An identity grade run through the table is the one case
+    // where that error is unambiguous: any difference from the ungraded frame is
+    // the mapping, because the grade itself is doing nothing.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // `SkyGrade::NONE` skips the table entirely, so it cannot be what proves the
+    // mapping. A grade that is the identity in every field EXCEPT one set to a
+    // value that changes nothing — a gamma of exactly 1 is the identity, but it
+    // is not `NONE` and therefore does go through the table.
+    let ungraded = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    renderer.set_grade(SkyGrade {
+        // Off the identity by less than a quantisation step, so the table is
+        // built and sampled while grading nothing anyone could see.
+        exposure: 1.0 + 1e-7,
+        ..SkyGrade::NONE
+    });
+    let through_the_table = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // Every sampled region has to agree, not merely the average: the mapping
+    // error is largest at the ends of the range, so a whole-frame mean would
+    // cancel a crushed black against a crushed white.
+    for (y0, y1) in [
+        (0, HEIGHT / 4),
+        (HEIGHT / 4, HEIGHT / 2),
+        (HEIGHT / 2, HEIGHT),
+    ] {
+        let before = average(&ungraded, 0, y0, WIDTH, y1);
+        let after = average(&through_the_table, 0, y0, WIDTH, y1);
+        for channel in 0..3 {
+            let drift = (before[channel] - after[channel]).abs();
+            assert!(
+                drift < 0.01,
+                "rows {y0}..{y1} channel {channel} moved by {drift} ({} to {}) through a table \
+                 that grades nothing — the lookup coordinates are wrong",
+                before[channel],
+                after[channel]
+            );
+        }
+    }
+}
+
+#[test]
+fn a_graded_sky_changes_the_picture_in_the_direction_it_asked_for() {
+    // Grading, as pixels: the six knobs reach the frame, and reach it the right
+    // way round. Asserted per knob rather than as one hash, because a table with
+    // its channels transposed or its contrast inverted would still change the
+    // picture — and "the picture changed" is what a hash can tell you.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // The ground, which is lit and mid-bright — the part of the frame every knob
+    // has room to move in either direction.
+    let ground = |renderer: &mut Renderer| {
+        let frame = target.capture(renderer, &viewpoint()).expect("capture");
+        average(&frame, 0, HEIGHT * 3 / 4, WIDTH, HEIGHT)
+    };
+    let plain = ground(&mut renderer);
+
+    // A blue tint must move blue up and leave red where it was.
+    renderer.set_grade(SkyGrade {
+        tint: [1.0, 1.0, 1.4],
+        ..SkyGrade::NONE
+    });
+    let tinted = ground(&mut renderer);
+    assert!(
+        tinted[2] > plain[2] + 0.02,
+        "a blue tint left blue at {} against {}",
+        tinted[2],
+        plain[2]
+    );
+    assert!(
+        (tinted[0] - plain[0]).abs() < 0.02,
+        "a blue tint moved red from {} to {}, so the table's axes are transposed",
+        plain[0],
+        tinted[0]
+    );
+
+    // Greyscale must land every channel on the same value.
+    renderer.set_grade(SkyGrade {
+        saturation: 0.0,
+        ..SkyGrade::NONE
+    });
+    let grey = ground(&mut renderer);
+    assert!(
+        (grey[0] - grey[2]).abs() < 0.02,
+        "saturation 0 left {grey:?}, which is not grey"
+    );
+
+    // And gamma must lift the midtones without touching the ends. The ground is
+    // brighter than mid grey here, so a gamma above 1 raises it.
+    renderer.set_grade(SkyGrade {
+        gamma: 2.0,
+        ..SkyGrade::NONE
+    });
+    let lifted = ground(&mut renderer);
+    assert!(
+        lifted[1] > plain[1] + 0.02,
+        "a gamma of 2 left the ground at {} against {}",
+        lifted[1],
+        plain[1]
+    );
+}
+
+#[test]
+fn a_still_sky_bakes_its_grading_table_once() {
+    // The table is 4,096 entries and every one of them costs a `powf` for the
+    // sRGB encode. Re-baking it per frame for a sky that moves by a millionth
+    // would be a per-frame cost for no per-frame difference — so the bake is
+    // gated on the grade having moved far enough to reach a pixel, and this is
+    // the assertion that the gate is real.
+    let Some(gpu) = gpu() else { return };
+    let gpu = std::sync::Arc::new(gpu);
+    let mut grading = client::render::grade::Grading::new(&gpu);
+
+    let grade = SkyGrade {
+        saturation: 0.8,
+        ..SkyGrade::NONE
+    };
+    assert!(
+        grading.bake(&gpu, &grade),
+        "the first bake has to happen; there is nothing in the texture yet"
+    );
+    assert!(!grading.bake(&gpu, &grade), "the same grade baked twice");
+
+    // A change too small to survive eight bits is not a reason to re-bake.
+    let imperceptible = SkyGrade {
+        saturation: 0.8 + 1.0 / 8192.0,
+        ..SkyGrade::NONE
+    };
+    assert!(!grading.bake(&gpu, &imperceptible));
+
+    // One that can reach a pixel is.
+    let visible = SkyGrade {
+        saturation: 0.6,
+        ..SkyGrade::NONE
+    };
+    assert!(
+        grading.bake(&gpu, &visible),
+        "a grade that moved by 0.2 did not re-bake"
     );
 }

@@ -178,6 +178,31 @@ function Stream:next_bool() end
 ---@field sky number[] Required. `{r, g, b}` for the sky itself. Distance fog fades towards this, so it is also the horizon.
 ---@field sun number[] Required. `{r, g, b}` tinting the sunlight stored in the world.
 ---@field intensity number Required, 0 to 1. Scales stored sunlight at DRAW time — which is why a day/night cycle costs nothing: the world's sunlight is always full daylight and never needs relighting.
+---@field grade Tiamot.SkyGrade? Optional. How the finished picture is graded at this moment. Omit it and nothing is graded.
+
+---How a moment's finished picture is graded.
+---
+---**Lighting mode 3 only.** Grading happens in the post chain, and modes 1 and
+---2 have no post chain to put it in — so a grade is polish on the highest
+---setting rather than something the other modes will look wrong without.
+---
+---Every field is optional and defaults to doing nothing, so a keyframe can set
+---one knob without restating the rest. The client interpolates these between
+---keyframes like the colours, bakes the result into a lookup table once, and
+---applies it with a single texture read per pixel — nothing here costs per-pixel
+---maths, however many knobs you set.
+---
+---They apply in a fixed order: `exposure` multiplies the scene BEFORE the
+---highlight roll-off (which is what makes it decide how much of the picture
+---rolls off at all), then, on the finished image, `contrast` about mid grey,
+---`saturation`, `tint` then `offset`, and `gamma` last.
+---@class Tiamot.SkyGrade
+---@field exposure number? 0 to 4, default 1. Multiplies the scene before the tonemap.
+---@field tint number[]? `{r, g, b}`, each 0 to 4, default `{1, 1, 1}`. Multiplies the graded image.
+---@field offset number[]? `{r, g, b}`, each -1 to 1, default `{0, 0, 0}`. Added after `tint`.
+---@field contrast number? 0 to 4, default 1. Pushes each channel away from mid grey.
+---@field saturation number? 0 to 4, default 1. Zero is greyscale of the same brightness; above 1 exaggerates.
+---@field gamma number? 0.1 to 4, default 1. Applied last, per channel. Never 0 — a zero exponent maps the whole frame to white.
 
 ---Fields accepted by `game.register_action`.
 ---@class Tiamot.ActionSpec
