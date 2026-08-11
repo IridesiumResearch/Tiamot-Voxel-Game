@@ -850,3 +850,137 @@ fn probe_walking_off_a_lip_edge() {
         );
     }
 }
+
+#[test]
+fn a_body_caught_inside_geometry_is_pushed_out_upward() {
+    // **Requested from the window: "when half inside a block you should gently
+    // be pushed out ONLY when inside a block you should be able to stand on the
+    // block below you to prevent falling out of the world."**
+    //
+    // Every sweep assumes the body started outside geometry, so an overlapping
+    // body was neither in nor out: measured before this rule, a buried body's
+    // horizontal velocity was zeroed on the second tick and it stayed at one x
+    // for as long as it was held there — and then jumped straight UP through the
+    // slab, because the face leading that move was already above it.
+    let mut scene = Scene::new(0);
+    for x in -SPAN..SPAN {
+        for y in 0..3 {
+            for z in -SPAN..SPAN {
+                scene.solid.insert((x, y, z));
+            }
+        }
+    }
+
+    let tuning = Tuning::DEFAULT;
+    let mut body = Body {
+        position: [4.5, 1.0, 4.5],
+        velocity: [0.0; 3],
+        on_ground: false,
+    };
+
+    let mut previous = body.position[1];
+    for tick in 0..6 {
+        body = step(&scene, body, Intent::default(), &tuning);
+
+        // Gently: never more than a sub-node in a tick, so being caught by a
+        // placed block reads as a shove rather than as a teleport.
+        let moved = body.position[1] - previous;
+        assert!(
+            moved <= DEPENETRATION_PER_TICK + SKIN,
+            "tick {tick}: shoved {moved} cells at once"
+        );
+        // And never downward, which would post the body through the floor it is
+        // trying to climb out of.
+        assert!(
+            moved >= 0.0,
+            "tick {tick}: pushed DOWN by {moved} into the slab"
+        );
+        previous = body.position[1];
+    }
+
+    assert!(
+        (body.position[1] - 3.0).abs() < SKIN * 4.0,
+        "ended at {} rather than standing on top of the slab at 3.0",
+        body.position[1]
+    );
+    assert!(body.on_ground, "surfaced but not standing: {body:?}");
+    assert!(
+        !scene.overlaps(&body.aabb()),
+        "still inside the slab after six ticks: {body:?}"
+    );
+}
+
+#[test]
+fn a_body_in_a_world_that_has_not_arrived_is_left_where_it_is() {
+    // **The regression this rule nearly shipped with.** An unloaded chunk reads
+    // as solid so a player cannot fall out of a world still in flight — which
+    // means a player standing in one reads as buried in every direction. The
+    // first version of step-out duly shoved them a sub-node east every tick,
+    // and a freshly spawned bot walked out of its own spawn block before the
+    // chunk arrived. `replay_applies_a_recording_against_a_live_server` caught
+    // it, by then failing to place a block where the drifting bot had gone.
+    //
+    // A body with nothing free anywhere inside it is not "half inside a block".
+    // Standing still is the answer, here and for a body genuinely entombed.
+    struct Everything;
+    impl Solid for Everything {
+        fn solid(&self, _x: i32, _y: i32, _z: i32) -> bool {
+            true
+        }
+    }
+
+    let start = Body {
+        position: [1.5, 3.0, 1.5],
+        velocity: [0.0; 3],
+        on_ground: false,
+    };
+    let mut body = start;
+    for _ in 0..10 {
+        body = step(&Everything, body, Intent::default(), &Tuning::DEFAULT);
+    }
+
+    for axis in 0..3 {
+        assert!(
+            (body.position[axis] - start.position[axis]).abs() < SKIN * 4.0,
+            "a body in unloaded space drifted from {:?} to {:?}",
+            start.position,
+            body.position
+        );
+    }
+}
+
+#[test]
+fn a_body_barely_inside_a_wall_is_pushed_sideways_not_upward() {
+    // Upward wins TIES; it does not win outright. A body a sliver inside a wall
+    // is a step away from being outside it, and lifting it a whole body height
+    // instead would be a worse answer than the one the geometry is offering.
+    let mut scene = Scene::new(0);
+    for y in 0..12 {
+        for z in -SPAN..SPAN {
+            scene.solid.insert((6, y, z));
+        }
+    }
+
+    // Overlapping the wall's near face by a tenth of a cell.
+    let mut body = Body {
+        position: [6.0 - PLAYER_WIDTH / 2.0 + 0.1, 0.0, 4.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    let before = body.position[1];
+    body = step(&scene, body, Intent::default(), &Tuning::DEFAULT);
+
+    assert!(
+        (body.position[1] - before).abs() < SKIN * 4.0,
+        "a body a tenth of a cell inside a wall was lifted to {} from {before}",
+        body.position[1]
+    );
+    assert!(
+        body.position[0] < 6.0 - PLAYER_WIDTH / 2.0,
+        "not pushed clear of the wall: {body:?}"
+    );
+    assert!(
+        !scene.overlaps(&body.aabb()),
+        "still inside the wall: {body:?}"
+    );
+}

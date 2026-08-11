@@ -105,6 +105,24 @@ enterable; the shape you see is the shape you collide with.
   a body slide along a wall rather than stick to it.
 - **A body must never be left inside geometry.** This is the invariant that
   outranks every performance concern in Task 09.
+- **A body that BEGINS a tick inside geometry is eased out of it.** The rule
+  above is about what movement may leave behind; this is about what the world
+  may do to a body that was standing still — a block placed where it stands, a
+  chunk arriving around it, a mod rewriting the ground under it.
+
+  Every sweep assumes the body started outside, so an overlapping body was
+  neither in nor out: it could not walk (each axis reads as blocked at zero
+  distance) and it could pass *upward* through solid cells, because the face
+  leading the move was already above them. Measured before this rule: a buried
+  body's horizontal velocity was zeroed on the second tick and it stayed at one
+  x for as long as it was held there, then jumped straight up through the slab.
+
+  The escape is along the **shortest** axis out, capped at one sub-node per tick
+  so it reads as being pushed rather than teleported, and **upward when two axes
+  are equally short**. Upward is not arbitrary: a body half inside the floor
+  must end up standing on it, and pushing it down instead would post it through
+  the world. While it is still overlapping it keeps its footing for the same
+  reason.
 
 Task 09 implements this. Task 02b's prototype measured 0.0136 ms/tick for 100
 bodies.
