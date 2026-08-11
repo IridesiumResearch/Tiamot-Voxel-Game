@@ -913,3 +913,76 @@ fn the_debug_row_offers_one_of_every_material_and_nothing_when_aimed_at_sky() {
 
     assert!(server.stop());
 }
+
+#[test]
+fn holding_the_jump_key_gives_exactly_one_hop() {
+    // **Requested from the window: "make it so only one hop per key press is
+    // done."** Holding the key used to jump again the instant the body touched
+    // down, which in a tunnel with a sub-node of headroom is a hop every three
+    // ticks — felt as bouncing rather than as jumping.
+    //
+    // Driven through `advance` with the key HELD, so what is under test is the
+    // edge detection rather than a caller politely sending one frame of jump.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("one-hop");
+    let mut app = client("one-hop", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+
+    // Settled on the ground first, or the first jump is measured against a body
+    // that is still falling to it.
+    for _ in 0..40 {
+        app.pump_network();
+        app.advance(Input::default(), 1.0 / 60.0);
+    }
+    let resting = app.camera().position.to_world().1;
+
+    let held = Input {
+        jump: true,
+        ..Input::default()
+    };
+
+    // Two seconds of holding it. One hop rises about 1.25 blocks and takes well
+    // under a second, so a key that re-fires would show several separate rises.
+    let mut peaks = 0;
+    let mut airborne = false;
+    for _ in 0..120 {
+        app.pump_network();
+        app.advance(held, 1.0 / 60.0);
+        let height = app.camera().position.to_world().1 - resting;
+        if height > 0.35 && !airborne {
+            airborne = true;
+            peaks += 1;
+        } else if height < 0.1 {
+            airborne = false;
+        }
+    }
+    assert_eq!(
+        peaks, 1,
+        "holding jump produced {peaks} hops; one press is one hop"
+    );
+
+    // And releasing lets the next press through, or the key would work once per
+    // session.
+    for _ in 0..40 {
+        app.pump_network();
+        app.advance(Input::default(), 1.0 / 60.0);
+    }
+    let mut hopped_again = false;
+    for _ in 0..60 {
+        app.pump_network();
+        app.advance(held, 1.0 / 60.0);
+        if app.camera().position.to_world().1 - resting > 0.35 {
+            hopped_again = true;
+        }
+    }
+    assert!(
+        hopped_again,
+        "a fresh press after releasing did not jump, so the edge never re-armed"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}

@@ -108,6 +108,12 @@ pub struct Predictor {
     /// See [`Predictor::smooth_step`]. Presentation only: it never reaches the
     /// body, so reconciliation replays exactly what it would have anyway.
     step_lag: f32,
+    /// How fast the lag is being eased away, in cells per second.
+    ///
+    /// Recorded when the step is, so the ease is a constant-rate ramp that
+    /// finishes in exactly [`STEP_SMOOTHING`] whatever the step's size or the
+    /// frame rate. See [`Predictor::smooth_step`].
+    step_rate: f32,
     /// The last tick predicted.
     tick: u64,
 }
@@ -127,12 +133,14 @@ const STEP_SMOOTHING: f32 = 0.1;
 /// out of the floor.
 const MAX_STEP_LAG: f32 = 3.0;
 
-/// The slowest the camera catches up, in cells per [`STEP_SMOOTHING`].
-///
-/// A purely proportional decay approaches zero and never arrives, leaving a
-/// permanent fraction of a cell of offset that shows as the world sitting
-/// slightly low. This floor makes the last of it finish.
-const MIN_STEP_CATCHUP: f32 = 0.5;
+// A proportional decay with a floor under it used to do this work. It was
+// replaced because it did not do what its own constant said: `STEP_SMOOTHING` is
+// 0.1 s and a one-cell step took **167 ms** to disappear, measured at 60, 240 and
+// 1200 fps. That matters exactly when steps come close together — walking over
+// ground with single raised cells in it steps about every 200 ms — because an
+// ease that outlasts the gap never finishes, and the camera is then permanently
+// mid-catch-up in one direction or the other. Reported from the window as being
+// "vibrated up and down very aggressively" while walking off a one-sub-node lip.
 
 impl Predictor {
     /// A predictor starting from a spawn position.
@@ -145,6 +153,7 @@ impl Predictor {
             error: [0.0; 3],
             last_step: [0.0; 3],
             step_lag: 0.0,
+            step_rate: 0.0,
             tick,
         }
     }
@@ -331,14 +340,27 @@ impl Predictor {
         // way rather than as two branches because the two directions must catch
         // up at exactly the same rate — an eye reading a rise and a fall at
         // different speeds is the artefact this whole function exists to remove.
-        let decay = dt / STEP_SMOOTHING;
-        let magnitude = self.step_lag.abs();
-        let remaining = (magnitude - magnitude.max(MIN_STEP_CATCHUP) * decay).max(0.0);
+        // Self-healing: a lag that arrived without a rate — a test setting the
+        // field, or any future caller — still eases away in one window rather
+        // than sticking for ever at whatever it was.
+        if self.step_rate <= 0.0 {
+            self.step_rate = self.step_lag.abs() / STEP_SMOOTHING;
+        }
+
+        // A constant-rate ramp, not a decay. Linear means it arrives — an
+        // exponential approaches zero and needs a floor bolted under it to
+        // finish, which is what used to overrun the window — and it means the
+        // camera moves at one speed through the whole ease rather than lurching
+        // at the start and crawling at the end.
+        let remaining = (self.step_lag.abs() - self.step_rate * dt).max(0.0);
         self.step_lag = if self.step_lag < 0.0 {
             -remaining
         } else {
             remaining
         };
+        if remaining == 0.0 {
+            self.step_rate = 0.0;
+        }
     }
 
     /// How far the drawn camera currently trails the body, in cells.
@@ -379,6 +401,12 @@ impl Predictor {
             self.step_lag = (self.step_lag + rise).min(MAX_STEP_LAG);
         } else if stepped_down {
             self.step_lag = (self.step_lag + rise).max(-MAX_STEP_LAG);
+        }
+        if stepped_up || stepped_down {
+            // Re-derived from whatever is now outstanding rather than added to,
+            // so a step taken while the previous one is still easing still
+            // finishes within one window instead of extending it.
+            self.step_rate = self.step_lag.abs() / STEP_SMOOTHING;
         }
 
         // **And the step leaves the tick interpolation, or it is applied twice.**
@@ -543,6 +571,45 @@ mod tests {
 
     fn predictor() -> Predictor {
         Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 0)
+    }
+
+    #[test]
+    fn a_step_eases_away_in_exactly_the_window_it_documents() {
+        // **`STEP_SMOOTHING` said 0.1 s and the ease took 167 ms**, measured at
+        // 60, 240 and 1200 fps. The old shape was a proportional decay with a
+        // floor bolted under it to make it finish, and the two together overran
+        // the window by two thirds.
+        //
+        // That is not a rounding error, it is the difference between an ease
+        // that finishes between steps and one that does not. Walking over ground
+        // with single raised cells in it steps about every 200 ms, so an ease
+        // outlasting its own window leaves the camera permanently mid-catch-up
+        // — reported from the window as being "vibrated up and down very
+        // aggressively" while walking off a one-sub-node lip.
+        for fps in [20.0f32, 60.0, 240.0, 1200.0] {
+            let mut predictor = Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 0);
+            predictor.step_lag = 1.0;
+
+            let dt = 1.0 / fps;
+            let mut elapsed = 0.0;
+            while predictor.step_lag() != 0.0 && elapsed < 1.0 {
+                predictor.smooth_step(dt);
+                elapsed += dt;
+            }
+
+            // One frame of slack, because the last frame of the ramp can only
+            // land on a frame boundary.
+            assert!(
+                elapsed <= STEP_SMOOTHING + dt,
+                "at {fps} fps a one-cell step took {elapsed} s to ease away, against a window of \
+                 {STEP_SMOOTHING} s"
+            );
+            assert!(
+                elapsed >= STEP_SMOOTHING - dt,
+                "at {fps} fps the ease finished in {elapsed} s, faster than the window it is \
+                 supposed to spread the step over"
+            );
+        }
     }
 
     #[test]

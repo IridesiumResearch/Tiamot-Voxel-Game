@@ -792,3 +792,61 @@ fn step_down_does_not_cancel_the_jump_that_started_this_tick() {
         "the jump was cancelled by step-down: {body:?}"
     );
 }
+
+#[test]
+fn probe_walking_off_a_lip_edge() {
+    // "I can stand on the subnode fine and jumping up and down on it works but
+    // walking off of it is not smooth at all." A raised platform one cell high
+    // whose edge is at x = 10; the body starts on it and walks west off it.
+    let mut scene = Scene::new(0);
+    for x in 10..40 {
+        for z in -SPAN..SPAN {
+            scene.solid.insert((x, 0, z));
+        }
+    }
+
+    let tuning = Tuning::DEFAULT;
+    let mut body = Body {
+        position: [13.0, 1.0, 0.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    let intent = Intent {
+        walk: [-1.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+    };
+
+    println!("--- walking WEST off a one-cell lip whose edge is at x=10");
+    for tick in 0..18 {
+        let before = body.position[1];
+        body = step(&scene, body, intent, &tuning);
+        println!(
+            "  tick {tick}: x {:.3} y {:.3} (dy {:+.3}) vy {:+.4} on_ground {}",
+            body.position[0],
+            body.position[1],
+            body.position[1] - before,
+            body.velocity[1],
+            body.on_ground
+        );
+    }
+
+    println!("--- and walking EAST back onto it");
+    let intent = Intent {
+        walk: [1.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+    };
+    for tick in 0..18 {
+        let before = body.position[1];
+        body = step(&scene, body, intent, &tuning);
+        println!(
+            "  tick {tick}: x {:.3} y {:.3} (dy {:+.3}) vy {:+.4} on_ground {}",
+            body.position[0],
+            body.position[1],
+            body.position[1] - before,
+            body.velocity[1],
+            body.on_ground
+        );
+    }
+}

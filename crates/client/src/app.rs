@@ -492,6 +492,13 @@ pub struct App {
     /// so frames and ticks are decoupled here: a fast machine predicts the same
     /// ticks a slow one does, just with more frames between them.
     tick_carry: f32,
+    /// The keys as they stood at the previous simulation tick.
+    ///
+    /// For edge detection: "was this pressed" and "is this newly pressed" are
+    /// different questions, and only the second one can express one hop per
+    /// press. Kept as a whole [`Input`] rather than one flag per action because
+    /// the next action wanting an edge should not need another field.
+    previous_input: Input,
     /// What the server says the player is carrying, in ascending material
     /// order and in **units** (charter rule 5).
     ///
@@ -561,6 +568,7 @@ impl App {
             confirmed_tick: 0,
             dig: None,
             tick_carry: 0.0,
+            previous_input: Input::default(),
             carried: Vec::new(),
             selected: 0,
             tools: Vec::new(),
@@ -1488,12 +1496,34 @@ impl App {
             spent += 1;
             self.tick += 1;
 
-            let intent = self.intent_from(input);
+            let mut intent = self.intent_from(input);
+
+            // **One hop per press.** Holding the key used to jump again the
+            // instant the body touched down, which in a tunnel with a sub-node
+            // of headroom is a hop every three ticks — reported from the window
+            // as bouncing. Requested as "make it so only one hop per key press
+            // is done".
+            //
+            // Edge-detected HERE, on the tick, rather than on the frame: at 1,200
+            // fps a frame-level edge would let one press through on one frame
+            // and the tick that consumed it might be sixty frames away. And it
+            // is done on the way INTO the tick, so the input the server is sent
+            // (`report_input`, below) carries the same single jump the client
+            // predicted — anything else would be a disagreement by construction.
+            intent.jump = input.jump && !self.previous_input.jump;
+            self.previous_input = input;
+
             if let Some(predictor) = self.predictor.as_mut() {
                 let voxels = phys::Voxels::new(&self.store, predictor.origin());
                 predictor.predict(&voxels, self.tick, intent, &Tuning::DEFAULT);
             }
-            self.report_input(input, intent);
+            self.report_input(
+                Input {
+                    jump: intent.jump,
+                    ..input
+                },
+                intent,
+            );
         }
         if spent == MAX_CATCH_UP {
             self.tick_carry = 0.0;
