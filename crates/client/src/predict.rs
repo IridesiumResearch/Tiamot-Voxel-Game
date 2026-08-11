@@ -99,6 +99,12 @@ pub struct Predictor {
     last_step: [f32; 3],
     /// How far the drawn camera trails the body after a step, in cells.
     ///
+    /// **Signed.** Positive after a step UP, so the camera is drawn below the
+    /// body and rises to meet it; negative after a step DOWN, so it is drawn
+    /// above and sinks. Both are teleports of the same size in the same
+    /// machinery, and easing only one of them is what makes walking over
+    /// chiselled ground read as jerking rather than as undulating.
+    ///
     /// See [`Predictor::smooth_step`]. Presentation only: it never reaches the
     /// body, so reconciliation replays exactly what it would have anyway.
     step_lag: f32,
@@ -296,20 +302,43 @@ impl Predictor {
     /// presentation, charter rule 4 exempts it, and nothing here re-enters what
     /// gets replayed for reconciliation.
     ///
-    /// Only upward steps are smoothed. Falling is a real acceleration the
-    /// player should feel, and easing it would make every drop feel like a
-    /// float.
+    /// # Steps are smoothed in both directions; falls are not smoothed at all
+    ///
+    /// This once eased upward steps only, on the reasoning that "falling is a
+    /// real acceleration the player should feel". That reasoning is sound for a
+    /// FALL and wrong for a step DOWN, and the contract now has both: contract
+    /// §2's step-down places a body a sub-node lower **in one tick with no
+    /// vertical velocity**, which is the same teleport as a step-up with the
+    /// sign flipped. Left unsmoothed it pops, and walking over ground with
+    /// raised cells in it — which alternates up-step and down-step every few
+    /// ticks — came out eased on the way up and hard on the way down. Reported
+    /// from the window as "extremely unstable physics collision where I am
+    /// bouncing and jerking around".
+    ///
+    /// A real fall is still felt in full. The two are told apart by whether the
+    /// body was on the ground when the tick began: a step-down starts and ends
+    /// on the ground, and a landing does not — see [`Predictor::step`].
     /// **Decay only.** The step itself is recorded once, by the tick that made
     /// it — see [`Predictor::step`]. Recording it here instead was the first
     /// version and it was wrong: this runs once per FRAME and a tick lasts
     /// several frames, so one step was counted three times at 60 fps and the
     /// camera sank further with every stair.
     pub fn smooth_step(&mut self, dt: f32) {
-        if self.step_lag <= 0.0 {
+        if self.step_lag == 0.0 {
             return;
         }
+        // Symmetric: the magnitude decays and the sign is put back. Written this
+        // way rather than as two branches because the two directions must catch
+        // up at exactly the same rate — an eye reading a rise and a fall at
+        // different speeds is the artefact this whole function exists to remove.
         let decay = dt / STEP_SMOOTHING;
-        self.step_lag = (self.step_lag - self.step_lag.max(MIN_STEP_CATCHUP) * decay).max(0.0);
+        let magnitude = self.step_lag.abs();
+        let remaining = (magnitude - magnitude.max(MIN_STEP_CATCHUP) * decay).max(0.0);
+        self.step_lag = if self.step_lag < 0.0 {
+            -remaining
+        } else {
+            remaining
+        };
     }
 
     /// How far the drawn camera currently trails the body, in cells.
@@ -327,6 +356,7 @@ impl Predictor {
     /// subtract two coordinates from different frames and report a 48-cell step.
     fn step(&mut self, solid: &impl Solid, intent: Intent, tuning: &Tuning) {
         let before = self.body.position;
+        let was_on_ground = self.body.on_ground;
         self.body = phys::step(solid, self.body, intent, tuning);
         self.last_step = [
             self.body.position[0] - before[0],
@@ -338,8 +368,33 @@ impl Predictor {
         // jump has velocity and should be felt immediately. Recorded here, once
         // per tick, and eased away per frame by `smooth_step`.
         let rise = self.last_step[1];
-        if rise > 0.0 && self.body.velocity[1] <= 0.0 {
+        let stepped_up = rise > 0.0 && self.body.velocity[1] <= 0.0;
+        // The mirror of it. **A step-down is not a fall**: it begins and ends on
+        // the ground, which is exactly what tells the two apart — a body that
+        // lands from a fall was airborne when the tick began, and its landing is
+        // an acceleration the player should feel in full.
+        let stepped_down = rise < 0.0 && was_on_ground && self.body.on_ground;
+
+        if stepped_up {
             self.step_lag = (self.step_lag + rise).min(MAX_STEP_LAG);
+        } else if stepped_down {
+            self.step_lag = (self.step_lag + rise).max(-MAX_STEP_LAG);
+        }
+
+        // **And the step leaves the tick interpolation, or it is applied twice.**
+        //
+        // `render_local_at` walks the body back along `last_step` to find where
+        // it was at the start of the tick, and `step_lag` walks it back again by
+        // the same sub-node — so the drawn camera dived a full TWO cells on the
+        // frame a step landed and then climbed out of it. Measured over ground
+        // that steps every few ticks: 0.583 cells of movement in a single frame,
+        // which is most of the jerk the easing was supposed to remove.
+        //
+        // The vertical part of the step now belongs to the easing alone. Every
+        // other kind of vertical movement — falling, jumping, being pushed —
+        // still interpolates, because none of them is a teleport.
+        if stepped_up || stepped_down {
+            self.last_step[1] = 0.0;
         }
 
         self.settle();
@@ -408,7 +463,7 @@ mod tests {
             predictor.smooth_step(1.0 / 60.0);
         }
         assert!(
-            predictor.step_lag() <= 0.0,
+            predictor.step_lag() == 0.0,
             "the camera never finished catching up: {} cells behind",
             predictor.step_lag()
         );
@@ -423,9 +478,11 @@ mod tests {
         predictor.body.velocity[1] = -2.0;
 
         // Nothing recorded it, because only a tick records a step and a fall is
-        // not one.
+        // not one. Compared against zero exactly rather than `<= 0`: the lag is
+        // signed now, and a step DOWN is legitimately negative, so "no lag" and
+        // "eased downward" would otherwise be the same assertion.
         assert!(
-            predictor.step_lag() <= 0.0,
+            predictor.step_lag() == 0.0,
             "a fall was smoothed: {} cells of lag",
             predictor.step_lag()
         );
@@ -440,7 +497,7 @@ mod tests {
         predictor.body.velocity[1] = 1.5;
 
         assert!(
-            predictor.step_lag() <= 0.0,
+            predictor.step_lag() == 0.0,
             "a jump was smoothed: {} cells of lag",
             predictor.step_lag()
         );
@@ -486,6 +543,64 @@ mod tests {
 
     fn predictor() -> Predictor {
         Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 0)
+    }
+
+    #[test]
+    fn the_drawn_camera_never_jerks_over_ground_that_makes_the_body_bounce() {
+        // **Reported from the window: "extremely unstable physics collision
+        // where I am bouncing and jerking around ... when walking over subnodes
+        // or nodes missing subnodes and when jumping in a tunnel."**
+        //
+        // The body genuinely does go up and down here, and it should: a floor
+        // with single raised cells in it is a floor with single raised cells in
+        // it. Searching every 9-cell pattern for the worst case found cells at
+        // x = 2 and x = 6, where the body's 1.8-cell footprint gains and loses
+        // support every few ticks — **eleven vertical reversals in forty ticks**,
+        // each one a full sub-node.
+        //
+        // What must not happen is that the CAMERA takes those in one frame. The
+        // up-steps were eased and the down-steps were not, so the same walk read
+        // as smooth on the way up and a hard drop on the way down.
+        // Three frames a tick, which is what 60 fps against a 20 Hz tick gives.
+        const FRAMES: usize = 3;
+
+        let mut ground = Ground::flat();
+        for x in [2, 6, 11, 15, 20, 24, 29, 33] {
+            for z in -64..64 {
+                ground.0.insert((x, 0, z));
+            }
+        }
+
+        let mut client = predictor();
+        client.body.position = [0.5, 1.0, 24.0];
+        client.body.on_ground = true;
+        let mut previous = client.render_local_at(0.0)[1];
+        let mut worst: f32 = 0.0;
+        for tick in 1..=40 {
+            client.predict(&ground, tick, walking(), &Tuning::DEFAULT);
+            for frame in 1..=FRAMES {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a frame index, not a measurement"
+                )]
+                let alpha = frame as f32 / FRAMES as f32;
+                client.smooth_step(1.0 / (20.0 * FRAMES as f32));
+                let drawn = client.render_local_at(alpha)[1];
+                worst = worst.max((drawn - previous).abs());
+                previous = drawn;
+            }
+        }
+
+        // A full sub-node is 1.0. Unsmoothed, a step-down delivers all of it in
+        // the single frame the tick landed on; eased over `STEP_SMOOTHING` at 60
+        // fps it arrives about a sixth at a time. A third of a cell is
+        // comfortably between the two, and is an eighth of a block — below what
+        // reads as a jolt.
+        assert!(
+            worst < 0.34,
+            "the drawn camera moved {worst} cells in one frame over ground the body bounces on, \
+             which is the jerk this easing exists to remove"
+        );
     }
 
     #[test]
