@@ -138,6 +138,21 @@ pub trait Solid {
     /// not fall through a world that has not arrived yet.
     fn solid(&self, x: i32, y: i32, z: i32) -> bool;
 
+    /// Whether the world actually knows what is at this cell.
+    ///
+    /// **Absence and solidity are different questions, and only one of them is a
+    /// fact.** A cell in a chunk that has not arrived reads as solid from
+    /// [`Solid::solid`] so that a body cannot fall out of a world still in
+    /// flight — a deliberate guess, and the right one, because it fails by
+    /// standing a player still rather than by losing them.
+    ///
+    /// Anything that MOVES a body rather than merely stopping it has to know the
+    /// difference. Defaults to `true`: a caller with the whole world in hand —
+    /// every test scene here — is never guessing.
+    fn loaded(&self, _x: i32, _y: i32, _z: i32) -> bool {
+        true
+    }
+
     /// Whether any solid cell overlaps a box.
     fn overlaps(&self, aabb: &Aabb) -> bool {
         let (min_x, max_x) = aabb.cell_span(0);
@@ -486,6 +501,23 @@ fn depenetrate(solid: &impl Solid, body: &mut Body) -> bool {
                     anywhere_free = true;
                     continue;
                 }
+                // **Never shove a body out of geometry that might not exist.**
+                //
+                // A body standing at a chunk boundary reaches into the chunk
+                // across it, and an absent chunk reads as solid — so a boundary
+                // whose neighbour has not arrived looks exactly like being half
+                // inside a wall, and this pushed the body a sub-node a tick to
+                // "escape" it. Reported from the window as "it almost feels like
+                // chunk boundaries have their own collision", with a log full of
+                // pushes at local coordinates of 0.x and 47.x: the two edges of
+                // a chunk, over and over.
+                //
+                // Stopping a body against geometry that may not be there is a
+                // guess that costs a moment standing still. MOVING it on the same
+                // guess is a guess that costs a player their position.
+                if !solid.loaded(x, y, z) {
+                    return false;
+                }
                 for (axis, cell) in [x, y, z].into_iter().enumerate() {
                     low[axis] = low[axis].min(cell);
                     high[axis] = high[axis].max(cell);
@@ -537,10 +569,6 @@ fn depenetrate(solid: &impl Solid, body: &mut Body) -> bool {
     }
 
     let capped = best_push.clamp(-DEPENETRATION_PER_TICK, DEPENETRATION_PER_TICK);
-    eprintln!(
-        "  >> DEPEN axis {best_axis} push {capped:+.3} at {:?}",
-        body.position
-    );
     body.position[best_axis] += capped;
     true
 }

@@ -138,6 +138,22 @@ impl<S: ChunkLookup> Solid for Voxels<'_, S> {
         self.material(x, y, z)
             .is_none_or(|material| !material.is_air())
     }
+
+    /// Whether the chunk holding this cell is resident.
+    ///
+    /// The honest half of [`Solid::solid`]'s answer above: that one reports an
+    /// absent chunk as solid on purpose, and this is how a caller that needs to
+    /// know the difference finds out.
+    fn loaded(&self, x: i32, y: i32, z: i32) -> bool {
+        let world = self.to_world(x, y, z);
+        let span = crate::CHUNK_SUBNODES as i32;
+        let chunk = ChunkPos::new(
+            world.x.div_euclid(span),
+            world.y.div_euclid(span),
+            world.z.div_euclid(span),
+        );
+        self.source.chunk(chunk).is_some()
+    }
 }
 
 /// Moves a body's frame so its local coordinates stay inside one chunk.
@@ -238,6 +254,64 @@ mod tests {
             "landed at {} rather than on the floor at cell 3",
             body.position[1]
         );
+    }
+
+    #[test]
+    fn a_body_at_a_chunk_boundary_is_not_shoved_by_the_chunk_next_door() {
+        // **Reported from the window: "it almost feels like chunk boundaries have
+        // their own collision", with a log full of pushes at local coordinates of
+        // 0.x and 47.x — the two edges of a chunk, over and over, a full sub-node
+        // each.**
+        //
+        // A body standing at a boundary reaches into the chunk across it, and an
+        // absent chunk reads as solid so nobody falls out of a world in flight.
+        // So a boundary whose neighbour has not arrived looks exactly like being
+        // half inside a wall, and step-out obligingly shoved the body a sub-node
+        // a tick to escape geometry that does not exist.
+        //
+        // Stopping a body against a chunk that may not be there costs a moment
+        // standing still. MOVING it on the same guess costs a player their
+        // position.
+        let mut loaded = Loaded::default();
+        let here = ChunkPos::new(0, 0, 0);
+        let mut chunk = Chunk::new(here, MaterialId::AIR);
+        // A floor across the bottom of the resident chunk, so the body has
+        // something honest to stand on.
+        for x in 0..crate::CHUNK_BLOCKS {
+            for z in 0..crate::CHUNK_BLOCKS {
+                chunk
+                    .set_block(
+                        BlockPos::new(x as i32, 0, z as i32),
+                        BlockValue::Uniform(STONE),
+                    )
+                    .expect("in chunk");
+            }
+        }
+        loaded.0.insert(here, chunk);
+        // The chunk to the east is NOT inserted: it is still in flight.
+
+        let span = crate::CHUNK_SUBNODES as f32;
+        let voxels = Voxels::new(&loaded, here);
+        let start = Body {
+            // Hard against the eastern edge, exactly where the log's 47.x
+            // positions sat, standing on the floor.
+            position: [span - 0.5, 3.0, 24.0],
+            velocity: [0.0; 3],
+            on_ground: true,
+        };
+
+        let mut body = start;
+        for tick in 0..8 {
+            body = step(&voxels, body, Intent::default(), &Tuning::DEFAULT);
+            for axis in 0..3 {
+                assert!(
+                    (body.position[axis] - start.position[axis]).abs() < crate::phys::SKIN * 4.0,
+                    "tick {tick}: shoved from {:?} to {:?} by a chunk that has not arrived",
+                    start.position,
+                    body.position
+                );
+            }
+        }
     }
 
     #[test]
