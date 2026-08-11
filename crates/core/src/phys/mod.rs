@@ -507,6 +507,10 @@ fn depenetrate(solid: &impl Solid, body: &mut Body) -> bool {
     }
 
     let capped = best_push.clamp(-DEPENETRATION_PER_TICK, DEPENETRATION_PER_TICK);
+    eprintln!(
+        "  >> DEPEN axis {best_axis} push {capped:+.3} at {:?}",
+        body.position
+    );
     body.position[best_axis] += capped;
     true
 }

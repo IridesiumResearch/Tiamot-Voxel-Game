@@ -422,7 +422,19 @@ impl Predictor {
         // jump has velocity and should be felt immediately. Recorded here, once
         // per tick, and eased away per frame by `smooth_step`.
         let rise = self.last_step[1];
-        let stepped_up = rise > 0.0 && self.body.velocity[1] <= 0.0;
+        // **A step-up begins and ends on the ground.** Testing "rose, and has no
+        // upward velocity now" instead caught a jump that bumped its head: the
+        // body rose, the ceiling zeroed the velocity, and the two are
+        // indistinguishable after the fact. The camera then eased a rise the
+        // player had felt as a jump, and eased it just as the body started
+        // falling again — reported from the window as jerking "up and down only
+        // for a split second" while jumping past a floating block, which is
+        // exactly a body with 0.6 cells of headroom under it.
+        //
+        // Ending airborne is what a truncated jump does and what a step-up never
+        // does: a step lifts onto something and `resolve_vertical` finds it
+        // there in the same tick.
+        let stepped_up = rise > 0.0 && was_on_ground && self.body.on_ground;
         // The mirror of it. **A step-down is not a fall**: it begins and ends on
         // the ground, which is exactly what tells the two apart — a body that
         // lands from a fall was airborne when the tick began, and its landing is
@@ -549,6 +561,53 @@ mod tests {
             predictor.step_lag() == 0.0,
             "a fall was smoothed: {} cells of lag",
             predictor.step_lag()
+        );
+    }
+
+    #[test]
+    fn a_jump_that_bumps_its_head_is_not_eased_like_a_step() {
+        // **Reported from the window: jerking "up and down only for a split
+        // second" while jumping past a floating block.** A body with 0.6 cells
+        // of headroom rises into the block and the bump zeroes its vertical
+        // velocity, which after the fact is indistinguishable from a step-up —
+        // rose, no upward velocity — so the camera eased a rise the player had
+        // felt as a jump, right as the body began falling again.
+        //
+        // A step-up ends ON the ground; a truncated jump ends airborne.
+        let mut ground = Ground::flat();
+        // A ceiling 6 cells up: a standing body is 5.4 tall, so this leaves the
+        // 0.6 cells that made the report reproducible.
+        for x in -64..64 {
+            for y in 6..9 {
+                for z in -64..64 {
+                    ground.0.insert((x, y, z));
+                }
+            }
+        }
+
+        let mut client = predictor();
+        client.body.on_ground = true;
+        let jumping = Intent {
+            walk: [0.0, 0.0],
+            jump: true,
+            gait: Gait::Walk,
+        };
+        client.predict(&ground, 1, jumping, &Tuning::DEFAULT);
+
+        assert!(
+            client.body().position[1] > 0.0,
+            "the jump never left the floor, so this proves nothing: {:?}",
+            client.body()
+        );
+        assert!(
+            !client.body().on_ground,
+            "the jump ended on the ground, so it was not truncated in mid-air"
+        );
+        assert_eq!(
+            client.step_lag().to_bits(),
+            0.0f32.to_bits(),
+            "a jump into a ceiling was eased as though it were a step: {} cells of lag",
+            client.step_lag()
         );
     }
 
