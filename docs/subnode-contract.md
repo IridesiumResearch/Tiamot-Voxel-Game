@@ -89,6 +89,21 @@ enterable; the shape you see is the shape you collide with.
   tick on the ground, is not rising, and would end it airborne looks one
   sub-node below its feet; if there is ground there it is placed on it and stays
   on the ground. A drop of more than one sub-node is a fall and is left alone.
+- **A body strides over a gap narrower than its own footprint.** Before stepping
+  down, it looks one footprint ahead along the way it is moving; if there is
+  ground at the height it is already at, it stays there and keeps walking.
+
+  Without this, a body crossing chiselled ground **fell a whole sub-node and
+  climbed straight back out on the very next tick** — a 30 cm spike lasting 50
+  ms, once per gap, which is what a floor of scattered sub-node lips is made of.
+  Measured over random rubble: five such spikes in forty ticks. A foot 1.8 cells
+  wide does not fall into a crack narrower than itself, and this is the rule that
+  says so.
+
+  It cannot make a body hover off a ledge: the look is **ahead**, in the
+  direction of travel, so at a real edge there is nothing to stride to and the
+  body falls exactly as before. Only a gap with ground on its far side is
+  bridged.
 
   This is the mirror of step-up and the two only make sense together. Without
   it, sub-node terrain is not walkable in practice: a body skims the tops of

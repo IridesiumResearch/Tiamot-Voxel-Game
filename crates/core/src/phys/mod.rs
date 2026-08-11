@@ -290,6 +290,9 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
     // starting on the ground, and it is the case step-down must keep its hands
     // off — see [`step_down`].
     let was_rising = body.velocity[1] > 0.0;
+    // Where the feet were before anything moved, so a stride can be put back at
+    // the height it started from rather than a tick of gravity below it.
+    let entry_height = body.position[1];
 
     resolve_horizontal(
         solid,
@@ -313,7 +316,14 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
 
     // After BOTH horizontal axes, because a body leaves a lip sideways and how
     // far it has to fall is only known once it has finished moving.
-    step_down(solid, &mut body, was_on_ground, was_rising, tuning);
+    step_down(
+        solid,
+        &mut body,
+        was_on_ground,
+        was_rising,
+        entry_height,
+        tuning,
+    );
 
     debug_assert!(
         body.position.iter().all(|v| v.is_finite()) && body.velocity.iter().all(|v| v.is_finite()),
@@ -550,9 +560,37 @@ fn step_down(
     body: &mut Body,
     was_on_ground: bool,
     was_rising: bool,
+    entry_height: f32,
     tuning: &Tuning,
 ) {
     if !was_on_ground || was_rising || body.on_ground {
+        return;
+    }
+
+    // **Stride over a gap narrower than the footprint before considering a drop.**
+    //
+    // Contract §2: "A body strides over a gap narrower than its own footprint."
+    // Without it, crossing chiselled ground fell a whole sub-node and climbed
+    // back out on the NEXT tick — a 30 cm spike lasting 50 ms, five times in
+    // forty ticks over random rubble. A foot 1.8 cells wide does not fall into a
+    // crack narrower than itself.
+    //
+    // The look is ahead, along the way the body is going, so a real ledge has
+    // nothing to stride to and still drops: only a gap with ground on its far
+    // side is bridged.
+    if strides_over_a_gap(solid, body) {
+        // Back to the height the tick began at. The vertical resolve has already
+        // applied a tick of gravity by now, and leaving that in place turned a
+        // 30 cm spike into an 8 cm one rather than removing it — the body still
+        // sagged into every crack, just less. Swept rather than assigned, so
+        // this can never push the body into something that has come between it
+        // and where it stood.
+        let recover = entry_height - body.position[1];
+        if recover > 0.0 {
+            body.position[1] += sweep(solid, &body.aabb(), 1, recover).distance;
+        }
+        body.on_ground = true;
+        body.velocity[1] = 0.0;
         return;
     }
 
@@ -571,6 +609,30 @@ fn step_down(
     // gravity it had already accumulated would still be there next tick and the
     // body would read as falling while standing still.
     body.velocity[1] = 0.0;
+}
+
+/// Whether there is ground at the body's own height one footprint ahead.
+///
+/// Contract §2's stride rule. A body with no horizontal motion has no "ahead"
+/// and strides nowhere — standing still at the edge of a crack, it drops into
+/// it, which is what standing still over a hole should do.
+fn strides_over_a_gap(solid: &impl Solid, body: &Body) -> bool {
+    let [x, _, z] = body.velocity;
+    let speed = (x * x + z * z).sqrt();
+    if speed <= 0.0 {
+        return false;
+    }
+
+    // One footprint, because that is the span a body's own feet cover: the
+    // question this asks is whether the far side of the gap is within the
+    // stance, not whether the body could reach it eventually.
+    let reach = PLAYER_WIDTH / speed;
+    let ahead = [
+        body.position[0] + x * reach,
+        body.position[1],
+        body.position[2] + z * reach,
+    ];
+    standing_on_ground(solid, ahead)
 }
 
 /// Moves the body vertically and recomputes ground contact.

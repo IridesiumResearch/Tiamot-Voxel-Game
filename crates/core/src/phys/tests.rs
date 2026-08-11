@@ -926,3 +926,135 @@ fn a_body_barely_inside_a_wall_is_pushed_sideways_not_upward() {
         "still inside the wall: {body:?}"
     );
 }
+
+/// A floor with a one-cell lip on some columns, chosen by a fixed xorshift so
+/// the pattern is scattered but identical on every machine and every run.
+fn scattered_lips() -> Scene {
+    let mut scene = Scene::new(0);
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    for x in 0..48 {
+        for z in -SPAN..SPAN {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            if seed.is_multiple_of(5) {
+                scene.solid.insert((x, 0, z));
+            }
+        }
+    }
+    scene
+}
+
+#[test]
+fn walking_over_scattered_lips_never_dips() {
+    // **Reported from the window: "stepping over a cluster of randomly placed
+    // subnodes is still buggy and that needs to be smooth as terrain gen will
+    // smooth everything eventually so that most travel will be across partial
+    // blocks."**
+    //
+    // The measurement that made it a bug rather than a preference: the body fell
+    // a whole sub-node into a gap and climbed back out on the VERY NEXT TICK —
+    // a 30 cm spike lasting 50 ms, five times in forty ticks. A foot 1.8 cells
+    // wide does not fall into a crack narrower than itself.
+    //
+    // Contract §2's stride rule. Asserted as "the feet never move at all",
+    // because over ground whose lips are all one cell high there is nothing a
+    // walking body should be doing vertically.
+    let scene = scattered_lips();
+    let mut body = Body {
+        position: [0.5, 1.0, 0.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    let intent = Intent {
+        walk: [1.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+    };
+
+    for tick in 0..40 {
+        let before = body.position[1];
+        body = step(&scene, body, intent, &Tuning::DEFAULT);
+        assert!(
+            (body.position[1] - before).abs() < 0.01,
+            "tick {tick}: the feet moved {} cells crossing scattered lips",
+            body.position[1] - before
+        );
+        assert!(body.on_ground, "tick {tick}: left the ground: {body:?}");
+    }
+    assert!(
+        body.position[0] > 20.0,
+        "barely moved, so this proves nothing: {body:?}"
+    );
+}
+
+#[test]
+fn a_stride_does_not_carry_a_body_off_a_ledge() {
+    // The guard that keeps the stride rule honest. It looks AHEAD, so a real
+    // edge has nothing to stride to — a body that walked off one and kept going
+    // would be hovering, which is a far worse bug than the dip it replaced.
+    let mut scene = Scene::new(-20);
+    for x in -SPAN..8 {
+        for y in -20..0 {
+            for z in -SPAN..SPAN {
+                scene.solid.insert((x, y, z));
+            }
+        }
+    }
+
+    let mut body = Body {
+        position: [4.0, 0.0, 0.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    let intent = Intent {
+        walk: [1.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+    };
+    for _ in 0..14 {
+        body = step(&scene, body, intent, &Tuning::DEFAULT);
+    }
+
+    assert!(body.position[0] > 8.0, "never reached the edge: {body:?}");
+    assert!(
+        body.position[1] < -2.0,
+        "walked off a ledge and hovered at {} instead of falling",
+        body.position[1]
+    );
+}
+
+#[test]
+fn a_body_standing_still_over_a_crack_drops_into_it() {
+    // A stride needs somewhere to be going. Standing still on the edge of a
+    // one-cell crack is not striding over it, and a body that hovered there
+    // would be resting on nothing.
+    let mut scene = Scene::new(0);
+    // A floor of lips with one column missing right under the body.
+    for x in -SPAN..SPAN {
+        for z in -SPAN..SPAN {
+            if x != 4 {
+                scene.solid.insert((x, 0, z));
+            }
+        }
+    }
+
+    // Balanced over the missing column with no horizontal velocity at all.
+    let mut body = Body {
+        position: [4.5, 1.0, 0.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    for _ in 0..4 {
+        body = step(&scene, body, Intent::default(), &Tuning::DEFAULT);
+    }
+    // The footprint is 1.8 wide and the gap one cell, so it still rests on the
+    // lips either side — what must NOT happen is it being held up by a stride it
+    // is not taking. Its height is decided by geometry, and geometry says 1.0.
+    assert!(
+        (body.position[1] - 1.0).abs() < SKIN * 4.0,
+        "a body standing still ended at {} rather than on the lips it straddles",
+        body.position[1]
+    );
+    assert!(body.on_ground, "{body:?}");
+}
