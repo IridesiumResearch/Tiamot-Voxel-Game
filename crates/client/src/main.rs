@@ -436,7 +436,7 @@ impl Client {
 
         let physical = window.inner_size();
         let size = (physical.width.max(1), physical.height.max(1));
-        configure_surface(&surface, &gpu, size, self.config.vsync);
+        let present_mode = configure_surface(&surface, &gpu, size, self.config.vsync);
 
         let egui_renderer = egui_wgpu::Renderer::new(
             &gpu.device,
@@ -475,7 +475,13 @@ impl Client {
         Ok(Surface {
             window,
             surface,
-            app: App::new(self.config.clone(), connection, renderer),
+            app: {
+                let mut app = App::new(self.config.clone(), connection, renderer);
+                // So the HUD reports the mode in force rather than the flag that
+                // asked for one. See `configure_surface`.
+                app.set_present_mode(present_mode);
+                app
+            },
             egui,
             egui_state,
             egui_renderer,
@@ -705,8 +711,33 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     }
 }
 
-/// Configures the swap chain.
-fn configure_surface(surface: &wgpu::Surface<'static>, gpu: &Gpu, size: (u32, u32), vsync: bool) {
+/// Configures the swap chain, and reports the present mode it actually asked for.
+///
+/// # Why the mode is named rather than left to `Auto`
+///
+/// It used to ask for `AutoVsync`, which resolves to **FifoRelaxed** where that
+/// exists and only falls back to `Fifo`. FifoRelaxed is vsync that is allowed to
+/// present immediately when a frame arrives late — which for a renderer drawing
+/// far faster than the display is most of the time, so it paces nothing. That is
+/// the shape of the anomaly the HUD kept reporting: "vsync on" beside 1,200 fps,
+/// which strict vsync cannot produce, and worst frames of 19–25 ms sitting almost
+/// entirely in `acquire` — a queue saturated by frames nobody asked for.
+///
+/// `Fifo` is the one mode every backend must support, so naming it costs no
+/// portability. And the name is returned so the HUD can report what is in force
+/// instead of what was requested: the two disagreeing is exactly the thing that
+/// took a week of frame-pacing guesses to notice.
+fn configure_surface(
+    surface: &wgpu::Surface<'static>,
+    gpu: &Gpu,
+    size: (u32, u32),
+    vsync: bool,
+) -> &'static str {
+    let present_mode = if vsync {
+        wgpu::PresentMode::Fifo
+    } else {
+        wgpu::PresentMode::AutoNoVsync
+    };
     surface.configure(
         &gpu.device,
         &wgpu::SurfaceConfiguration {
@@ -714,19 +745,17 @@ fn configure_surface(surface: &wgpu::Surface<'static>, gpu: &Gpu, size: (u32, u3
             format: COLOUR_FORMAT,
             width: size.0,
             height: size.1,
-            // FIFO is vsync and is the only mode every backend must support.
-            // Immediate is not guaranteed, so a client that required it would
-            // fail to start on hardware that simply cannot tear.
-            present_mode: if vsync {
-                wgpu::PresentMode::AutoVsync
-            } else {
-                wgpu::PresentMode::AutoNoVsync
-            },
+            present_mode,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         },
     );
+
+    // Named for the HUD. `AutoNoVsync` is still an Auto — it picks between
+    // Immediate and Mailbox on availability — so it is reported as the request it
+    // is rather than as a mode that may not be the one in force.
+    if vsync { "on (Fifo)" } else { "OFF (auto)" }
 }
 
 /// Grabs or releases the cursor, reporting whether it is now grabbed.

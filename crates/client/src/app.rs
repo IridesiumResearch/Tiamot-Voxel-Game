@@ -492,6 +492,14 @@ pub struct App {
     /// so frames and ticks are decoupled here: a fast machine predicts the same
     /// ticks a slow one does, just with more frames between them.
     tick_carry: f32,
+    /// The present mode the swapchain is actually using, once the window has
+    /// told us.
+    ///
+    /// **Reported instead of the `vsync` config flag**, because the two spent a
+    /// week disagreeing: the HUD said "vsync on" beside 1,200 fps, which strict
+    /// vsync cannot produce, and nothing on screen could tell a requested mode
+    /// from an effective one. A headless `App` has no swapchain and says so.
+    present_mode: Option<&'static str>,
     /// The keys as they stood at the previous simulation tick.
     ///
     /// For edge detection: "was this pressed" and "is this newly pressed" are
@@ -568,6 +576,7 @@ impl App {
             confirmed_tick: 0,
             dig: None,
             tick_carry: 0.0,
+            present_mode: None,
             previous_input: Input::default(),
             carried: Vec::new(),
             selected: 0,
@@ -722,6 +731,14 @@ impl App {
                 ""
             }
         )
+    }
+
+    /// Records which present mode the swapchain ended up with, for the HUD.
+    ///
+    /// Called by whatever owns the surface — a headless `App` never calls it and
+    /// falls back to reporting the request.
+    pub const fn set_present_mode(&mut self, mode: &'static str) {
+        self.present_mode = Some(mode);
     }
 
     /// Frame pacing over the last completed second.
@@ -1812,7 +1829,8 @@ impl App {
                 self.server_label,
                 self.renderer.gpu().adapter,
                 self.renderer.gpu().backend,
-                if self.config.vsync { "on" } else { "OFF" },
+                self.present_mode
+                    .unwrap_or(if self.config.vsync { "on" } else { "OFF" }),
                 self.config.lighting_mode.name(),
                 self.config.shadow_quality.name()
             ),
