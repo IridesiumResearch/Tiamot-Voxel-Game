@@ -101,7 +101,15 @@ fn golden_fingerprints_match() {
 /// the recipe changed, so the constant moves in the same commit that changed
 /// it. The worldgen and light goldens are untouched, which is what says the
 /// change was confined to `phys`.
-const PHYSICS_GOLDEN: u64 = 4_187_361_711_655_454_807;
+///
+/// Regenerated a second time, also case 3, when the sneak edge guard stopped
+/// keeping the velocity it was suppressing. A body held at a brink accumulated
+/// the speed it was not being allowed to use, and releasing sneak set it free —
+/// a player standing on the lip of a hole with nothing pressed slid forward and
+/// fell in. The script this hash covers walks, sprints AND sneaks, so its
+/// trajectory legitimately moves. The worldgen and light goldens pass unchanged
+/// again, which is the check that says the change stayed inside `phys`.
+const PHYSICS_GOLDEN: u64 = 3_534_023_337_547_755_370;
 
 /// Runs the fixed physics scenario and hashes every tick of it.
 ///

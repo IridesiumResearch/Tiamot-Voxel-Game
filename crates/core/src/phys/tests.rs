@@ -1119,3 +1119,78 @@ fn a_one_block_hole_dug_two_deep_swallows_a_walking_body() {
         body.position[1]
     );
 }
+
+#[test]
+fn letting_go_of_sneak_at_a_brink_does_not_tip_a_body_in() {
+    // **Reported from the window: "standing on the edge with shift and letting go
+    // makes me glitch as I fall in."** Pressing nothing, and falling anyway.
+    //
+    // The edge guard held the body's POSITION and kept the velocity it was
+    // suppressing, tick after tick, on the reasoning that zeroing it would make a
+    // player release and re-press before they could move along the edge. Steering
+    // re-accelerates from the intent every tick, so that cost was imaginary; the
+    // cost of keeping it was that the stored shove came free the instant sneak
+    // was released. Measured: 0.117 cells forward on the first ungated tick, with
+    // no input at all, and then a fall.
+    let mut scene = Scene::new(-30);
+    for x in -SPAN..SPAN {
+        for y in -30..0 {
+            for z in -SPAN..SPAN {
+                scene.solid.insert((x, y, z));
+            }
+        }
+    }
+    // A one-block hole, two deep, dug into flat ground.
+    for x in 9..12 {
+        for y in -6..0 {
+            for z in -SPAN..SPAN {
+                scene.solid.remove(&(x, y, z));
+            }
+        }
+    }
+
+    let tuning = Tuning::DEFAULT;
+    let mut body = Body {
+        position: [6.0, 0.0, 1.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+
+    // Sneak east until the guard has been holding for several ticks.
+    for _ in 0..22 {
+        body = step(
+            &scene,
+            body,
+            Intent {
+                walk: [1.0, 0.0],
+                jump: false,
+                gait: Gait::Sneak,
+            },
+            &tuning,
+        );
+    }
+    let brink = body.position;
+    assert!(
+        body.on_ground,
+        "the sneak never reached a supported brink: {body:?}"
+    );
+    assert!(
+        (6.0..12.0).contains(&brink[0]),
+        "expected to be stopped at the hole's near edge, got {brink:?}"
+    );
+
+    // Release, and press nothing whatsoever.
+    for tick in 0..12 {
+        body = step(&scene, body, Intent::default(), &tuning);
+        assert!(
+            body.on_ground,
+            "tick {tick}: fell in after letting go of sneak without pressing anything: {body:?}"
+        );
+        assert!(
+            (body.position[0] - brink[0]).abs() < SKIN * 4.0,
+            "tick {tick}: slid from {} to {} on its own",
+            brink[0],
+            body.position[0]
+        );
+    }
+}

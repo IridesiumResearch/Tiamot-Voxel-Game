@@ -363,10 +363,30 @@ fn resolve_horizontal(
         let supported = longest_supported_move(solid, body.position, axis, swept.distance);
         if supported.blocked {
             // Stopped by the ledge rather than by a wall: move as far as the
-            // edge allows, but leave the velocity alone. Zeroing it would make
-            // a player holding sneak against an edge release and re-press
-            // before they could move along it.
+            // edge allows.
             body.position[axis] += supported.distance;
+
+            // **And lose the speed, which an earlier version deliberately kept.**
+            //
+            // The reasoning for keeping it was that zeroing would make a player
+            // holding sneak against an edge release and re-press before they
+            // could move along it. That is not so — steering re-accelerates from
+            // the intent every tick, and the perpendicular axis is resolved
+            // separately and never touched here — and the cost of keeping it was
+            // far worse than the imagined cost of losing it.
+            //
+            // A body held at the brink accumulates the speed the guard is
+            // suppressing, tick after tick. Release sneak and that speed is
+            // suddenly free: measured, a body sneaked to the edge of a hole and
+            // then given NO input at all slid forward 0.117 cells on the first
+            // ungated tick and fell straight in. Reported from the window as
+            // "standing on the edge with shift and letting go makes me glitch as
+            // I fall in" — pressing nothing, and falling anyway.
+            //
+            // Stopping dead at a ledge is the same answer walking into a wall
+            // gets, and for the same reason: a body that is not moving should not
+            // be storing a shove.
+            body.velocity[axis] = 0.0;
             return;
         }
     }
