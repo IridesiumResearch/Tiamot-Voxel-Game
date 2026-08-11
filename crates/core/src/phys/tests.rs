@@ -1058,3 +1058,64 @@ fn a_body_standing_still_over_a_crack_drops_into_it() {
     );
     assert!(body.on_ground, "{body:?}");
 }
+
+#[test]
+fn a_one_block_hole_dug_two_deep_swallows_a_walking_body() {
+    // **Reported from the window: "if I dig a hole straight down two I can
+    // currently walk right across it without falling in which makes me think
+    // maybe my collision bounds are for some reason the full width of a block."**
+    //
+    // The bounds were right — 1.8 cells, not 3 — and the stride rule was wrong.
+    // It asked only whether there was ground a footprint ahead, and it probes
+    // with a footprint of its own, so it could see support 2.7 cells beyond the
+    // body's centre. A one-block hole is three cells across, so the far rim was
+    // always within sight and the body walked over the top of it.
+    //
+    // Width cannot separate a rut from a hole: the gaps between rubble lips are
+    // the same three cells. **Depth can.** A rut has its floor within a sub-node
+    // of the feet; a hole does not.
+    let mut scene = Scene::new(-30);
+    for x in -SPAN..SPAN {
+        for y in -30..0 {
+            for z in -SPAN..SPAN {
+                scene.solid.insert((x, y, z));
+            }
+        }
+    }
+    // One block wide, two deep: cells x 9..12, z 0..3, from y = -6 up.
+    for x in 9..12 {
+        for y in -6..0 {
+            for z in 0..3 {
+                scene.solid.remove(&(x, y, z));
+            }
+        }
+    }
+
+    let mut body = Body {
+        position: [4.0, 0.0, 1.5],
+        velocity: [0.0; 3],
+        on_ground: true,
+    };
+    let intent = Intent {
+        walk: [1.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+    };
+
+    let mut lowest = body.position[1];
+    for _ in 0..24 {
+        body = step(&scene, body, intent, &Tuning::DEFAULT);
+        lowest = lowest.min(body.position[1]);
+    }
+
+    assert!(
+        lowest < -2.0,
+        "walked clean over a one-block hole two deep, never dropping below {lowest}"
+    );
+    // And it is IN the hole rather than through the world: the floor is at -6.
+    assert!(
+        body.position[1] > -6.0 - SKIN * 4.0,
+        "fell through the bottom of the hole to {}",
+        body.position[1]
+    );
+}

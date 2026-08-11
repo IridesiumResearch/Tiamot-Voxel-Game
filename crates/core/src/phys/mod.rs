@@ -567,17 +567,31 @@ fn step_down(
         return;
     }
 
-    // **Stride over a gap narrower than the footprint before considering a drop.**
+    // Downward, so a blocked sweep is ground within reach and its distance is
+    // how far to place the body. The sweep is what keeps this from ever putting
+    // a body inside geometry — contract §2's overriding invariant — because it
+    // stops a skin short of the surface exactly as landing does.
+    let reach = sweep(solid, &body.aabb(), 1, -tuning.step_height);
+    if !reach.blocked {
+        // Nothing within a sub-node: this is a hole, not a rut. Fall.
+        return;
+    }
+
+    // **Stride over it rather than dipping into it — but only because the drop
+    // is shallow, which the sweep above has just established.**
     //
     // Contract §2: "A body strides over a gap narrower than its own footprint."
     // Without it, crossing chiselled ground fell a whole sub-node and climbed
     // back out on the NEXT tick — a 30 cm spike lasting 50 ms, five times in
-    // forty ticks over random rubble. A foot 1.8 cells wide does not fall into a
-    // crack narrower than itself.
+    // forty ticks over random rubble.
     //
-    // The look is ahead, along the way the body is going, so a real ledge has
-    // nothing to stride to and still drops: only a gap with ground on its far
-    // side is bridged.
+    // **Depth is what separates a rut from a hole, and width cannot do it.** The
+    // first version asked only whether there was ground a footprint ahead, and a
+    // one-block hole dug two deep is three cells across — the same span as the
+    // gaps between rubble lips. A body walking at it found the far rim within
+    // reach and strode straight over the top, reported from the window as "if I
+    // dig a hole straight down two I can currently walk right across it without
+    // falling in". A rut has its floor within a sub-node; a hole does not.
     if strides_over_a_gap(solid, body) {
         // Back to the height the tick began at. The vertical resolve has already
         // applied a tick of gravity by now, and leaving that in place turned a
@@ -591,15 +605,6 @@ fn step_down(
         }
         body.on_ground = true;
         body.velocity[1] = 0.0;
-        return;
-    }
-
-    // Downward, so a blocked sweep is ground within reach and its distance is
-    // how far to place the body. The sweep is what keeps this from ever putting
-    // a body inside geometry — contract §2's overriding invariant — because it
-    // stops a skin short of the surface exactly as landing does.
-    let reach = sweep(solid, &body.aabb(), 1, -tuning.step_height);
-    if !reach.blocked {
         return;
     }
 

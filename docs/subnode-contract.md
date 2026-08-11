@@ -89,9 +89,17 @@ enterable; the shape you see is the shape you collide with.
   tick on the ground, is not rising, and would end it airborne looks one
   sub-node below its feet; if there is ground there it is placed on it and stays
   on the ground. A drop of more than one sub-node is a fall and is left alone.
-- **A body strides over a gap narrower than its own footprint.** Before stepping
-  down, it looks one footprint ahead along the way it is moving; if there is
-  ground at the height it is already at, it stays there and keeps walking.
+- **A body strides over a RUT narrower than its own footprint — never over a
+  hole.** A rut has its floor within one sub-node of the feet; anything deeper is
+  a hole and is fallen into. Only once the drop is known to be shallow does the
+  body look one footprint ahead along the way it is moving, and stay at its
+  current height if there is ground there.
+
+  **Depth is the test, and width cannot be.** A one-block hole is three cells
+  across and so is the gap between two rubble lips; the first version of this
+  rule looked only for ground ahead, and since it probes with a footprint of its
+  own it could see support 2.7 cells past the body's centre. A player who dug
+  straight down two blocks then walked over the top of the hole.
 
   Without this, a body crossing chiselled ground **fell a whole sub-node and
   climbed straight back out on the very next tick** — a 30 cm spike lasting 50
