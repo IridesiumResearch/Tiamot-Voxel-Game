@@ -118,6 +118,20 @@ pub struct Predictor {
     tick: u64,
 }
 
+/// Whether a tick should record the camera's step ease.
+///
+/// A tick is simulated twice: once when it is predicted, and again on every
+/// reconcile until the server confirms it. The BODY must be identical both times
+/// — that is what reconciliation is — but the ease is a one-off visual event and
+/// recording it on every replay pumps it twenty times a second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ease {
+    /// A tick being lived through for the first time.
+    Record,
+    /// A tick being re-simulated, whose ease has already been recorded.
+    Replay,
+}
+
 /// How long the camera takes to catch up after a step, in seconds.
 ///
 /// A tenth of a second: long enough to turn a one-tick teleport into a rise the
@@ -189,7 +203,7 @@ impl Predictor {
 
     /// Advances one tick locally and records the input for replay.
     pub fn predict(&mut self, solid: &impl Solid, tick: u64, intent: Intent, tuning: &Tuning) {
-        self.step(solid, intent, tuning);
+        self.step(solid, intent, tuning, Ease::Record);
         self.pending.push_back((tick, intent));
         self.tick = tick;
 
@@ -221,7 +235,25 @@ impl Predictor {
         // at all — it would throw away every input still in flight.
         let replay: Vec<(u64, Intent)> = self.pending.iter().copied().collect();
         for (_, intent) in replay {
-            self.step(solid, intent, tuning);
+            // **`Ease::Replay`, and this is the bug that made the world shake.**
+            //
+            // A reconcile re-simulates every input the server has not confirmed,
+            // which is up to `MAX_LOOKAHEAD` ticks, and it happens on every
+            // server state message — twenty times a second. Recording the step
+            // ease here as well meant a single step-up was counted again on
+            // every reconcile for as long as its tick sat unconfirmed, pumping
+            // `step_lag` to its `MAX_STEP_LAG` ceiling of three cells — a whole
+            // block — while the ease pulled the other way.
+            //
+            // Reported from the window, and described exactly: "an up force is
+            // being applied and that makes our body want to enter the block
+            // above and the block above is rejecting us and as the two forces
+            // collide we vibrate". Two forces, and this was one of them.
+            //
+            // The body is untouched by any of it — which is why the correction
+            // read 0.00 throughout and every trace of the simulation came back
+            // clean. Only what was DRAWN was moving.
+            self.step(solid, intent, tuning, Ease::Replay);
         }
 
         let corrected = self.world_position();
@@ -376,7 +408,7 @@ impl Predictor {
     /// [`Predictor::settle`], while both positions are still anchored to the
     /// same origin — after it, a body that crossed a chunk boundary would
     /// subtract two coordinates from different frames and report a 48-cell step.
-    fn step(&mut self, solid: &impl Solid, intent: Intent, tuning: &Tuning) {
+    fn step(&mut self, solid: &impl Solid, intent: Intent, tuning: &Tuning, ease: Ease) {
         let before = self.body.position;
         let was_on_ground = self.body.on_ground;
         self.body = phys::step(solid, self.body, intent, tuning);
@@ -397,16 +429,20 @@ impl Predictor {
         // an acceleration the player should feel in full.
         let stepped_down = rise < 0.0 && was_on_ground && self.body.on_ground;
 
-        if stepped_up {
-            self.step_lag = (self.step_lag + rise).min(MAX_STEP_LAG);
-        } else if stepped_down {
-            self.step_lag = (self.step_lag + rise).max(-MAX_STEP_LAG);
+        if ease == Ease::Record {
+            if stepped_up {
+                self.step_lag = (self.step_lag + rise).min(MAX_STEP_LAG);
+            } else if stepped_down {
+                self.step_lag = (self.step_lag + rise).max(-MAX_STEP_LAG);
+            }
         }
         if stepped_up || stepped_down {
             // Re-derived from whatever is now outstanding rather than added to,
             // so a step taken while the previous one is still easing still
             // finishes within one window instead of extending it.
-            self.step_rate = self.step_lag.abs() / STEP_SMOOTHING;
+            if ease == Ease::Record {
+                self.step_rate = self.step_lag.abs() / STEP_SMOOTHING;
+            }
         }
 
         // **And the step leaves the tick interpolation, or it is applied twice.**
@@ -545,6 +581,17 @@ mod tests {
             Self(BTreeSet::new())
         }
 
+        /// A one-cell lip filling everything from `x` eastward, which a walking
+        /// body steps up onto.
+        fn with_step(mut self, x: i32) -> Self {
+            for at in x..64 {
+                for z in -64..64 {
+                    self.0.insert((at, 0, z));
+                }
+            }
+            self
+        }
+
         fn with_wall(mut self, x: i32) -> Self {
             for y in 0..8 {
                 for z in -64..64 {
@@ -571,6 +618,67 @@ mod tests {
 
     fn predictor() -> Predictor {
         Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 0)
+    }
+
+    #[test]
+    fn a_reconcile_does_not_re_record_the_steps_it_replays() {
+        // **The bug that made the world shake.** A reconcile re-simulates every
+        // unconfirmed input, on every server message — twenty times a second —
+        // and the step ease was recorded by the same function. So one step-up
+        // was counted again on every reconcile for as long as its tick sat
+        // unconfirmed, driving `step_lag` to its three-cell ceiling — a whole
+        // block — while the ease pulled the other way.
+        //
+        // Reported from the window as the body "vibrating up and down violently"
+        // in third person, with the right instinct about it: "an up force is
+        // being applied ... and as the two forces collide we vibrate."
+        //
+        // The server here AGREES exactly, so the correction is zero and the body
+        // is untouched: what is under test is purely what gets drawn.
+        // The lip is east of where the body starts, so it is walked INTO rather
+        // than stood inside — `predictor()`'s spawn at x = 24 sits within any
+        // step built from there, which is how the first version of this test
+        // came to pass against both the bug and the fix.
+        let ground = Ground::flat().with_step(28);
+        let mut client = Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 0);
+        client.body.on_ground = true;
+
+        // Walk up to the lip but not over it, and remember the world as the
+        // server would last have seen it — BEFORE the step.
+        for tick in 1..=4 {
+            client.predict(&ground, tick, walking(), &Tuning::DEFAULT);
+        }
+        let confirmed = Authoritative {
+            last_processed_input: 4,
+            chunk: client.origin(),
+            local: client.body().position,
+            velocity: client.body().velocity,
+            on_ground: client.body().on_ground,
+        };
+
+        // Then step up. These ticks are unconfirmed, so every reconcile until
+        // the server catches up replays them — step and all.
+        for tick in 5..=12 {
+            client.predict(&ground, tick, walking(), &Tuning::DEFAULT);
+        }
+        let once = client.step_lag();
+        assert!(
+            once > 0.0,
+            "the walk never climbed the lip, so this test proves nothing"
+        );
+
+        // Five server messages that confirm nothing new — which is what arriving
+        // twenty times a second with inputs in flight looks like.
+        for _ in 0..5 {
+            client.reconcile(&ground, &confirmed, &Tuning::DEFAULT);
+        }
+
+        assert!(
+            client.step_lag() <= once,
+            "five reconciles grew the camera's step lag from {once} to {} cells while the body \
+             ended up in exactly the same place",
+            client.step_lag()
+        );
     }
 
     #[test]
