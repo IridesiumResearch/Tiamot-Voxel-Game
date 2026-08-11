@@ -280,6 +280,16 @@ pub struct Pacing {
     worst_phases: Phases,
     /// Largest prediction correction seen in the window, in cells.
     worst_correction: f32,
+    /// How often the body changed its mind about being on the ground.
+    ///
+    /// **The number that says "jolting" out loud.** A body walking over even
+    /// ground is on it every tick and a body falling is off it every tick; a body
+    /// alternating is one whose support is flickering, and no amount of camera
+    /// smoothing makes that feel right. Counted per tick rather than per frame,
+    /// because it is a question about the simulation.
+    footing_changes: u32,
+    /// What the footing was on the previous tick, to notice the changes.
+    last_footing: bool,
     /// Whether prediction consulted a chunk it does not have this window.
     ///
     /// **The instrument for a correction nobody can explain.** The client's
@@ -306,6 +316,8 @@ pub struct Pacing {
     /// Whether that window's prediction reached into chunks that had not
     /// arrived.
     reported_unloaded: bool,
+    /// The last completed window's count of footing changes.
+    reported_footing_changes: u32,
     /// Where that window's worst frame spent its time.
     reported_phases: Phases,
 }
@@ -336,6 +348,10 @@ impl Pacing {
                 reported_remesh_chunks: self.worst_remesh_chunks,
                 reported_correction: self.worst_correction,
                 reported_unloaded: self.predicted_into_the_unloaded,
+                reported_footing_changes: self.footing_changes,
+                // Carried across the window boundary, or the first tick of every
+                // window would read as a change.
+                last_footing: self.last_footing,
                 reported_phases: self.worst_phases,
                 ..Self::default()
             };
@@ -350,6 +366,14 @@ impl Pacing {
     /// Notes that prediction collided against a chunk that has not arrived.
     const fn predicted_into_the_unloaded(&mut self) {
         self.predicted_into_the_unloaded = true;
+    }
+
+    /// Folds in this tick's footing, counting the changes.
+    const fn footing(&mut self, on_ground: bool) {
+        if on_ground != self.last_footing {
+            self.footing_changes += 1;
+            self.last_footing = on_ground;
+        }
     }
 
     /// Folds one remesh's duration in, and how much of it was meshing.
@@ -392,6 +416,17 @@ impl Pacing {
     #[must_use]
     pub const fn worst_correction_cells(&self) -> f32 {
         self.reported_correction
+    }
+
+    /// How many times the body changed between standing and airborne in the
+    /// last completed window.
+    ///
+    /// Two is a jump. Twenty is a body being held up and dropped twenty times a
+    /// second, which is what a player means by jolting — and it distinguishes
+    /// that from a camera artefact, because this counts the SIMULATION's answer.
+    #[must_use]
+    pub const fn footing_changes_last_second(&self) -> u32 {
+        self.reported_footing_changes
     }
 
     /// Whether the last window's prediction collided against chunks that had
@@ -722,7 +757,8 @@ impl App {
     fn prediction_line(&self, created: u64, reused: u64, correction: f32) -> String {
         format!(
             "{created} mesh buffers created, {reused} reused from the pool · worst correction \
-             {correction:.2} cells{}",
+             {correction:.2} cells · footing {}x{}",
+            self.pacing.footing_changes_last_second(),
             // Only when it happened, so the line stays short in the normal case
             // and the words appear exactly when they explain something.
             if self.pacing.predicted_into_unloaded() {
@@ -1530,9 +1566,23 @@ impl App {
             intent.jump = input.jump && !self.previous_input.jump;
             self.previous_input = input;
 
+            let mut touched_absent = false;
+            let mut ground = None;
             if let Some(predictor) = self.predictor.as_mut() {
                 let voxels = phys::Voxels::new(&self.store, predictor.origin());
                 predictor.predict(&voxels, self.tick, intent, &Tuning::DEFAULT);
+                // **Asked on the PREDICTION path, not only on the replay.** The
+                // first version of this instrument watched `reconcile` alone, so
+                // "I never saw the marker" ruled out nothing about the ticks a
+                // player actually lives through — which are these.
+                touched_absent = voxels.touched_absent();
+                ground = Some(predictor.body().on_ground);
+            }
+            if touched_absent {
+                self.pacing.predicted_into_the_unloaded();
+            }
+            if let Some(ground) = ground {
+                self.pacing.footing(ground);
             }
             self.report_input(
                 Input {

@@ -986,3 +986,62 @@ fn holding_the_jump_key_gives_exactly_one_hop() {
     app.shutdown();
     assert!(server.stop());
 }
+
+#[test]
+fn the_hud_counts_footing_changes_and_a_still_player_has_none() {
+    // **The instrument for "I jolt around".** A body walking over even ground is
+    // on it every tick; a body falling is off it every tick; a body ALTERNATING
+    // is one whose support is flickering, and no amount of camera smoothing makes
+    // that feel right. The count distinguishes those, and it counts the
+    // simulation's answer rather than anything about the picture.
+    //
+    // Tested from both ends, because a counter that only ever reads zero is
+    // indistinguishable from one that is not wired up — which is the failure mode
+    // every readout on this HUD has to be defended against.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("footing");
+    let mut app = client("footing", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+
+    // Settle, then let a whole reporting window pass while standing still.
+    let settle = |app: &mut App, seconds: f32| {
+        let frames = (seconds * 60.0) as usize;
+        for _ in 0..frames {
+            app.pump_network();
+            app.advance(Input::default(), 1.0 / 60.0);
+        }
+    };
+    settle(&mut app, 1.5);
+    settle(&mut app, 1.2);
+
+    assert_eq!(
+        app.pacing().footing_changes_last_second(),
+        0,
+        "a player standing still on flat ground changed footing; if that is real it is a bug, \
+         and if it is not the counter is wrong"
+    );
+
+    // And a jump is a change of footing in each direction, so the count must
+    // notice it. One press, held or not, is one hop.
+    let jump = Input {
+        jump: true,
+        ..Input::default()
+    };
+    for _ in 0..3 {
+        app.pump_network();
+        app.advance(jump, 1.0 / 60.0);
+    }
+    settle(&mut app, 1.4);
+
+    assert!(
+        app.pacing().footing_changes_last_second() > 0,
+        "a jump left the ground and landed again without the counter noticing, so it cannot \
+         report jolting either"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}
