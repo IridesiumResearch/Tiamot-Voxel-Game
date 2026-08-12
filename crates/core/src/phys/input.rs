@@ -143,7 +143,27 @@ impl InputQueue {
             // instruction — see MAX_REPEAT_TICKS.
             self.last_intent = Intent::default();
         }
-        self.last_intent
+
+        // **A jump is an edge, and only the movement around it is a state.**
+        //
+        // Repeating the last intent is what makes a dropped packet invisible for
+        // walking: a player holding forward through a lost tick should keep
+        // walking. Repeating a JUMP re-presses the key — so a client that sends
+        // one jump gets a server that jumps again on the next tick nobody spoke
+        // for, and the two simulations part company at exactly the moment the
+        // player is in the air.
+        //
+        // It became reachable the day the client started sending one jump per
+        // press instead of one per tick held. Before that the repeat was covered
+        // by the client sending the same thing anyway, which is why it sat here
+        // unnoticed: the bug was latent in this file and armed from another.
+        //
+        // Cleared after it is answered rather than filtered out of the repeat, so
+        // there is one place where a jump can be consumed and it cannot be
+        // reached twice.
+        let intent = self.last_intent;
+        self.last_intent.jump = false;
+        intent
     }
 
     /// The last tick this queue answered for.
@@ -161,6 +181,63 @@ impl InputQueue {
 
 #[cfg(test)]
 mod tests {
+
+    /// A jump, and the walk that carries on around it.
+    fn jumping() -> Intent {
+        Intent {
+            walk: [1.0, 0.0],
+            jump: true,
+            gait: Gait::Walk,
+        }
+    }
+
+    #[test]
+    fn a_repeated_input_keeps_walking_but_does_not_jump_again() {
+        // **A jump is an edge; the movement around it is a state.** Repeating the
+        // last intent is what makes a dropped packet invisible for walking. Doing
+        // it for a jump re-presses the key, so a client that sends one jump gets
+        // a server that jumps again on the next tick nobody spoke for — and the
+        // two part company while the player is in the air.
+        //
+        // Reported from the window as a jolt right after a jump, with the client's
+        // own footing counter reading 5 changes where a jump is 2.
+        let mut queue = InputQueue::new(0);
+        assert!(queue.offer(1, jumping()));
+
+        let first = queue.take(1);
+        assert!(first.jump, "the tick the input arrived for must jump");
+
+        // Nothing arrives for the next few ticks: a dropped packet, or a client
+        // whose frame hitched.
+        for tick in 2..=5 {
+            let repeated = queue.take(tick);
+            assert!(
+                !repeated.jump,
+                "tick {tick} jumped again from a repeat; one press is one jump"
+            );
+            assert!(
+                (repeated.walk[0] - 1.0).abs() < 1e-6,
+                "tick {tick} stopped walking; only the jump is an edge: {repeated:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_press_still_jumps() {
+        // The other half: clearing the edge must not make the queue deaf to the
+        // next one.
+        let mut queue = InputQueue::new(0);
+        assert!(queue.offer(1, jumping()));
+        assert!(queue.take(1).jump);
+        assert!(!queue.take(2).jump);
+
+        assert!(queue.offer(3, jumping()));
+        assert!(
+            queue.take(3).jump,
+            "a fresh press after a repeat did not reach the body"
+        );
+    }
+
     use super::*;
     use crate::phys::Gait;
 
