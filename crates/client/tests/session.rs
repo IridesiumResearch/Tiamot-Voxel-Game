@@ -1100,60 +1100,76 @@ fn the_hud_counts_footing_changes_and_a_still_player_has_none() {
     assert!(server.stop());
 }
 
+/// Runs frames in REAL time, so the client and the server advance together.
+///
+/// **The distinction this exists for.** `advance` takes the frame's `dt`, so a
+/// loop calling it with 1/60 as fast as the CPU allows fast-forwards the client
+/// through simulated time while the server's own thread ticks at 20 Hz on the
+/// clock. Measured: a test doing that reached `tick 75` while the server had
+/// confirmed `tick 3` — a lead of 72 against an `INPUT_LEAD` of 4, with every
+/// input past `MAX_LOOKAHEAD` refused.
+///
+/// Anything about TIMING — corrections, tick alignment, input lateness — is
+/// untestable that way, and reads as passing because the two sides are never in
+/// the same conversation. Sleeping is what makes them contemporaries.
+fn run_real_time(app: &mut App, seconds: f32, input: Input) {
+    let frame = Duration::from_millis(16);
+    let deadline = Instant::now() + Duration::from_secs_f32(seconds);
+    let mut last = Instant::now();
+    while Instant::now() < deadline {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        let now = Instant::now();
+        app.advance(input, now.duration_since(last).as_secs_f32());
+        last = now;
+        std::thread::sleep(frame);
+    }
+}
+
 #[test]
-fn a_long_stall_while_falling_does_not_leave_a_correction_behind() {
-    // **Reported from the window: a jolt at every landing, with `worst correction
-    // 5.86 cells (89% vertical)`.** A vertical-only divergence of five or six
-    // cells is four or five ticks of falling, which is the shape of the client and
-    // the server disagreeing about WHEN rather than about where.
+fn jumping_in_real_time_leaves_no_correction_behind() {
+    // **Reported from the window: `worst correction 5.79 cells (89% vertical)` at
+    // a landing, intermittently, with the tick lead steady at 5.**
     //
-    // `resynchronise_tick` takes the server's tick and stays a fixed margin in
-    // front of it, moving the client's counter FORWARD when it has fallen behind.
-    // The counter is not the body: the server simulates every tick between, and
-    // if the client renumbers without simulating them too, the two part company by
-    // however many ticks were skipped — invisibly while walking at a constant
-    // speed, and by a growing amount while accelerating.
+    // Measured against the two things that could produce that magnitude: one tick
+    // of jump offset is worth 1.34 cells (`phys::input`'s
+    // `a_jump_applied_a_tick_late_costs_a_whole_arc_by_the_landing`), so five or
+    // six cells is four or five ticks — which is the input lead, not a lost press.
     //
-    // A frame long enough to trip `MAX_CATCH_UP` is what makes the client fall
-    // behind, so this stalls one deliberately, in mid-air, where the disagreement
-    // is largest.
+    // Run in real time, because the first version of this test ran a tight loop
+    // and reached a lead of 72 against the server's 4: a client that far ahead has
+    // every input refused and is not in the conversation this test is about.
     let Some(gpu) = gpu() else { return };
-    let server = embedded("stall-falling");
-    let mut app = client("stall-falling", &server, gpu);
+    let server = embedded("real-time-jump");
+    let mut app = client("real-time-jump", &server, gpu);
 
     assert!(run_frames(&mut app, |app| app.joined()
         && app.predicting()
         && app.meshed_chunks() >= 4));
-    for _ in 0..40 {
-        app.pump_network();
-        app.advance(Input::default(), 1.0 / 60.0);
-    }
 
-    // Jump, so the body is accelerating when the stall lands.
+    // Settle, and let the lead reach its steady state.
+    run_real_time(&mut app, 1.5, Input::default());
+    let (tick, confirmed) = app.tick_pair();
+    let lead = tick as i64 - confirmed as i64;
+    assert!(
+        (1..=16).contains(&lead),
+        "the lead is {lead} ticks ({tick} against {confirmed}), so this test is not measuring \
+         what it claims — see `run_real_time`"
+    );
+
+    // Jump, then keep running while it rises, falls and lands.
     let jump = Input {
         jump: true,
         ..Input::default()
     };
-    app.pump_network();
-    app.advance(jump, 1.0 / 60.0);
-
-    // A frame that took half a second: an alt-tab, a shader compile, a chunk
-    // upload. Well past `MAX_CATCH_UP`'s four ticks.
-    app.pump_network();
-    app.advance(Input::default(), 0.5);
-
-    // Then run normally for long enough that the server has spoken several times
-    // and any disagreement has been reconciled and reported.
-    for _ in 0..150 {
-        app.pump_network();
-        app.advance(Input::default(), 1.0 / 60.0);
-    }
+    run_real_time(&mut app, 0.1, jump);
+    run_real_time(&mut app, 2.5, Input::default());
 
     let correction = app.pacing().worst_correction_cells();
     assert!(
         correction < 1.0,
-        "a single long frame while airborne left a correction of {correction} cells \
-         ({}% vertical): the client renumbered its tick without simulating what it skipped",
+        "a jump in real time left a correction of {correction} cells ({}% vertical) with the \
+         lead at {lead}",
         app.pacing().worst_correction_vertical_percent()
     );
 

@@ -182,6 +182,15 @@ impl InputQueue {
 #[cfg(test)]
 mod tests {
 
+    /// A floor at cell 0 and open air above it.
+    struct Flat;
+
+    impl crate::phys::Solid for Flat {
+        fn solid(&self, _x: i32, y: i32, _z: i32) -> bool {
+            y < 0
+        }
+    }
+
     /// A jump, and the walk that carries on around it.
     fn jumping() -> Intent {
         Intent {
@@ -220,6 +229,62 @@ mod tests {
                 "tick {tick} stopped walking; only the jump is an edge: {repeated:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_jump_applied_a_tick_late_costs_a_whole_arc_by_the_landing() {
+        // **The mechanism behind `worst correction 5.79 cells (89% vertical)` at a
+        // landing**, measured rather than argued.
+        //
+        // A press is stamped with the tick it happened on, and `offer` refuses one
+        // whose tick the server has already passed. If the first copy is refused
+        // and the second is taken, the server jumps ONE TICK later than the client
+        // did — and a one-tick shift in a trajectory is worth whatever the body's
+        // speed is at the moment you compare, which by the end of a fall is
+        // nearly three cells a tick.
+        //
+        // This is not a bug in the queue: applying the press late is better than
+        // losing it. It is the cost of an action stamped to a tick that can be
+        // missed, and it is written down here so the number is not a mystery next
+        // time it appears on a HUD.
+        let scene = Flat;
+        let tuning = crate::phys::Tuning::DEFAULT;
+        let start = crate::phys::Body {
+            // ON the floor, or neither body ever jumps: a press is honoured from
+            // the ground, and one starting in mid-air is airborne by the tick the
+            // press arrives. The first version of this test made exactly that
+            // mistake and reported a gap of zero.
+            position: [1.5, 0.0, 1.5],
+            velocity: [0.0; 3],
+            on_ground: true,
+        };
+
+        // Two bodies, identical but for which tick the press landed on, compared
+        // at every tick rather than at the end — by the end both are resting on
+        // the same floor, which is why the difference has to be caught while it
+        // exists.
+        let mut on_time = start;
+        let mut a_tick_late = start;
+        let mut worst = 0.0f32;
+        for tick in 0..40u64 {
+            let press = |at: u64| crate::phys::Intent {
+                walk: [0.0, 0.0],
+                jump: tick == at,
+                gait: Gait::Walk,
+            };
+            on_time = crate::phys::step(&scene, on_time, press(1), &tuning);
+            a_tick_late = crate::phys::step(&scene, a_tick_late, press(2), &tuning);
+            worst = worst.max((on_time.position[1] - a_tick_late.position[1]).abs());
+        }
+
+        // Measured at 2.9 cells — one tick of fall speed near the bottom of an
+        // arc, and very close to half the `5.79 cells (89% vertical)` a landing
+        // reported. Two ticks of offset accounts for the whole of it.
+        assert!(
+            worst > 1.0,
+            "a one-tick difference in when a jump was applied should be worth cells while the \
+             two are in the air, and the worst gap found was {worst}"
+        );
     }
 
     #[test]
