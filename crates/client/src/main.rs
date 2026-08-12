@@ -597,6 +597,10 @@ impl Client {
         let phase = std::time::Instant::now();
         frame.present();
         phases.present = elapsed_ms(phase);
+        // Only here, at the one place a frame becomes a picture. Every early
+        // return above has already done the frame's work and is about to discard
+        // it, and the gap between this count and the frame rate is how that shows.
+        surface.app.note_presented();
 
         // Paired with the `dt` measured at the top of the NEXT frame, which is
         // what actually measures this one.

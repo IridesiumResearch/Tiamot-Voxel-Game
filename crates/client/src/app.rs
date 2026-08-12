@@ -296,6 +296,15 @@ pub struct Pacing {
     /// How much of that correction was vertical — see
     /// `predict::Predictor::vertical_share`.
     worst_correction_vertical: f32,
+    /// Frames that reached the screen this window.
+    ///
+    /// **Counted separately from frames STARTED, and the gap is the diagnostic.**
+    /// Everything a frame does — pumping the network, remeshing, advancing the
+    /// simulation and the camera — happens before the swapchain is asked for an
+    /// image, so a frame that cannot get one has already done all of that and
+    /// throws it away. With vsync pacing presents to the display and nothing
+    /// pacing the loop, "fps" counts the attempts and this counts the results.
+    presented: u32,
     /// How often the body changed its mind about being on the ground.
     ///
     /// **The number that says "jolting" out loud.** A body walking over even
@@ -336,6 +345,8 @@ pub struct Pacing {
     reported_unloaded: bool,
     /// The last completed window's count of footing changes.
     reported_footing_changes: u32,
+    /// The last completed window's count of frames that reached the screen.
+    reported_presented: u32,
     /// Where that window's worst frame spent its time.
     reported_phases: Phases,
 }
@@ -368,6 +379,7 @@ impl Pacing {
                 reported_correction_vertical: self.worst_correction_vertical,
                 reported_unloaded: self.predicted_into_the_unloaded,
                 reported_footing_changes: self.footing_changes,
+                reported_presented: self.presented,
                 // Carried across the window boundary, or the first tick of every
                 // window would read as a change.
                 last_footing: self.last_footing,
@@ -388,6 +400,11 @@ impl Pacing {
     /// Notes that prediction collided against a chunk that has not arrived.
     const fn predicted_into_the_unloaded(&mut self) {
         self.predicted_into_the_unloaded = true;
+    }
+
+    /// Notes that a frame reached the screen.
+    const fn presented(&mut self) {
+        self.presented += 1;
     }
 
     /// Folds in this tick's footing, counting the changes.
@@ -455,6 +472,17 @@ impl Pacing {
     )]
     pub fn worst_correction_vertical_percent(&self) -> u32 {
         (self.reported_correction_vertical * 100.0 + 0.5) as u32
+    }
+
+    /// How many frames reached the screen in the last completed window.
+    ///
+    /// Read it against the frame rate. Equal means every frame the client built
+    /// was shown. Far below means the loop is building frames the swapchain
+    /// cannot take — each one having already pumped the network, remeshed and
+    /// advanced the world before finding out.
+    #[must_use]
+    pub const fn presented_last_second(&self) -> u32 {
+        self.reported_presented
     }
 
     /// How many times the body changed between standing and airborne in the
@@ -792,6 +820,18 @@ impl App {
         self.joined
     }
 
+    /// The frame-rate line: frames built, and frames that became pictures.
+    ///
+    /// Its own method because `hud` is at the line limit, and the two numbers
+    /// belong together: apart they invite the reading that a big one is good.
+    fn frame_rate_line(&self) -> String {
+        format!(
+            "{:.0} fps · {} presented",
+            self.fps,
+            self.pacing.presented_last_second()
+        )
+    }
+
     /// The buffer-pool and prediction line of the HUD.
     ///
     /// Its own method because `hud` is at the line limit and because this line
@@ -820,6 +860,14 @@ impl App {
                 ""
             }
         )
+    }
+
+    /// Notes that a frame reached the screen, for the HUD.
+    ///
+    /// Called by whatever owns the swapchain, because only it knows whether the
+    /// frame it started ever became a picture.
+    pub const fn note_presented(&mut self) {
+        self.pacing.presented();
     }
 
     /// Records which present mode the swapchain ended up with, for the HUD.
@@ -1892,7 +1940,7 @@ impl App {
         let correction = self.pacing.worst_correction_cells();
 
         vec![
-            format!("{:.0} fps", self.fps),
+            self.frame_rate_line(),
             // The average above is the reassuring number; this is the honest
             // one. Charter rule 18 measures pacing, and a 900 fps average with
             // an 11 ms worst frame is a hitch the average cannot express.
