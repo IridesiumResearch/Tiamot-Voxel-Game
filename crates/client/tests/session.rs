@@ -72,6 +72,28 @@ fn gpu() -> Option<Gpu> {
     }
 }
 
+/// The same, with a view distance a player would actually use.
+///
+/// `embedded` uses `MINIMUM` so tests stream a handful of chunks instead of a
+/// thousand. That is the right default for speed and the wrong one for anything
+/// about RESIDENCY: at a radius of one chunk a player is always at the edge of
+/// what has arrived, so "the client does not have that chunk" is true by
+/// construction rather than by bug.
+fn embedded_with_view(name: &str, view: ViewDistance) -> ServerHandle {
+    ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: scratch(&format!("{name}-world")),
+        max_players: 1,
+        allowlist: Allowlist::open(),
+        view_distance: view,
+        mods_path: Some(reference_mods()),
+        seed: Some(7),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("the embedded server must start")
+}
+
 /// Starts an embedded server exactly as `server = "embedded"` does.
 fn embedded(name: &str) -> ServerHandle {
     ServerHandle::start(&Settings {
@@ -1265,4 +1287,58 @@ fn the_divergence_measure_and_its_trace_report_a_real_session() {
              {first}"
         );
     }
+}
+
+#[test]
+fn walking_across_chunk_boundaries_never_touches_a_chunk_it_does_not_have() {
+    // **Reported from the window with the border overlay on: "if I run into a
+    // chunk corner, I often glitch ... if I am within a chunk I am completely
+    // fine."**
+    //
+    // The core adapter is not the problem — `solid()` agrees with the world on
+    // every cell across a corner where four chunks meet, when all four are
+    // resident. So the question is residency, and this is the pair of numbers
+    // that answers it: whether prediction ever consulted a chunk the client does
+    // not have, and whether the two simulations then disagreed.
+    //
+    // Real time, because a client racing ahead of its server is not walking
+    // across a boundary in any sense the server would recognise.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded_with_view("boundaries", ViewDistance::DEFAULT);
+    let mut app = client("boundaries", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+    run_real_time(&mut app, 1.0, Input::default());
+
+    let start = app.camera().position.chunk;
+    // Diagonally, so corners are crossed rather than faces.
+    let diagonally = Input {
+        forward: 1.0,
+        right: 1.0,
+        sprint: true,
+        ..Input::default()
+    };
+    run_real_time(&mut app, 6.0, diagonally);
+    let finished = app.camera().position.chunk;
+
+    assert_ne!(
+        (start.x, start.z),
+        (finished.x, finished.z),
+        "never left the chunk it started in, so no boundary was crossed: {start:?}"
+    );
+    assert!(
+        !app.pacing().predicted_into_unloaded(),
+        "prediction collided against a chunk the client does not have while crossing a \
+         boundary — an invisible wall at the seam, which is exactly the report"
+    );
+    let diverged = app.pacing().worst_divergence_cells();
+    assert!(
+        diverged < 1.0,
+        "the two simulations disagreed by {diverged} cells while crossing a chunk boundary"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
 }
