@@ -728,9 +728,7 @@ impl App {
             confirmed_tick: 0,
             dig: None,
             tick_carry: 0.0,
-            trace: std::env::var_os("TIAMOT_TRACE_PHYSICS")
-                .and_then(|path| std::fs::File::create(path).ok())
-                .map(|file| std::cell::RefCell::new(std::io::BufWriter::new(file))),
+            trace: None,
             present_mode: None,
             jump_edge: 0,
             previous_intent: Intent::default(),
@@ -998,6 +996,25 @@ impl App {
         self.trace(divergence.as_ref(), state);
         if touched_absent {
             self.pacing.predicted_into_the_unloaded();
+        }
+    }
+
+    /// Starts writing a per-tick physics trace to `path`.
+    ///
+    /// Returns whether the file could be opened. **Asked for explicitly rather
+    /// than read from the environment here**: the binary reads
+    /// `TIAMOT_TRACE_PHYSICS` and calls this, so a test can turn tracing on for
+    /// its own client without touching process-global state. Doing it the other
+    /// way round cost a red CI run — the test binary runs its cases on parallel
+    /// threads, so one test's `set_var` and another's `remove_var` raced, and the
+    /// trace came out empty on the machine that lost.
+    pub fn trace_physics_to(&mut self, path: &std::path::Path) -> bool {
+        match std::fs::File::create(path) {
+            Ok(file) => {
+                self.trace = Some(std::cell::RefCell::new(std::io::BufWriter::new(file)));
+                true
+            }
+            Err(_) => false,
         }
     }
 

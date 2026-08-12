@@ -484,6 +484,18 @@ impl Client {
                 // So the HUD reports the mode in force rather than the flag that
                 // asked for one. See `configure_surface`.
                 app.set_present_mode(present_mode);
+                // The environment belongs to the binary, not to `App`: a library
+                // reading it would be process-global state a caller cannot
+                // control, which is a poor thing for tests and a worse one for an
+                // embedded server.
+                if let Some(path) = std::env::var_os("TIAMOT_TRACE_PHYSICS") {
+                    let path = std::path::PathBuf::from(path);
+                    if app.trace_physics_to(&path) {
+                        tracing::info!(path = %path.display(), "tracing physics per tick");
+                    } else {
+                        tracing::warn!(path = %path.display(), "could not open the physics trace");
+                    }
+                }
                 app
             },
             egui,

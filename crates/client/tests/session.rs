@@ -1213,11 +1213,16 @@ fn the_divergence_measure_and_its_trace_report_a_real_session() {
     // that say so.
     let Some(gpu) = gpu() else { return };
     let trace_path = scratch("divergence-trace").join("physics.log");
-    // SAFETY: single-threaded test setup, before the client is built.
-    unsafe { std::env::set_var("TIAMOT_TRACE_PHYSICS", &trace_path) };
-
     let server = embedded("divergence");
     let mut app = client("divergence", &server, gpu);
+    // Asked for on this client, not through the environment: these cases run on
+    // parallel threads, so a `set_var` here and a `remove_var` in another test
+    // raced and the trace came out empty on whichever machine lost.
+    assert!(
+        app.trace_physics_to(&trace_path),
+        "could not open {}",
+        trace_path.display()
+    );
 
     assert!(run_frames(&mut app, |app| app.joined()
         && app.predicting()
@@ -1268,9 +1273,6 @@ fn the_divergence_measure_and_its_trace_report_a_real_session() {
 
     app.shutdown();
     assert!(server.stop());
-
-    // SAFETY: single-threaded teardown.
-    unsafe { std::env::remove_var("TIAMOT_TRACE_PHYSICS") };
 
     let written = std::fs::read_to_string(&trace_path).expect("the trace file should exist");
     // A handful, not a rate. How many server messages land in a few seconds
