@@ -524,6 +524,58 @@ impl Client {
         // it cannot say what the worst frame was doing.
         let mut phases = Phases::default();
 
+        // **The image is acquired BEFORE any work is done for it.**
+        //
+        // It used to be asked for last, which is the conventional order — hold
+        // the swapchain image for as short a time as possible. That order costs
+        // nothing when every frame presents, and this one did not: measured from
+        // the window, `211 fps · 103 presented`, so half the frames pumped the
+        // network, spent a full `REMESH_TIME_BUDGET` meshing and advanced the
+        // world, then found no image and threw all of it away. During a streaming
+        // burst — 24 chunks queued, `acquire 42.6 ms` of a 43.0 ms frame — that
+        // is the client spending its budget twice over on frames nobody sees,
+        // while the frame that DOES present reports `remesh 0.0` because the
+        // discarded attempts already drained the queue.
+        //
+        // Acquiring first also paces the loop: with `Fifo` this blocks until the
+        // display is ready, so the work below happens once per presented frame
+        // rather than as fast as the CPU can spin. `acquire` is therefore the
+        // vsync wait now, and a large number there is the display doing its job
+        // rather than a hitch — read `present`, `world` and `remesh` for work.
+        let phase = std::time::Instant::now();
+        let frame = match surface.surface.get_current_texture() {
+            // Suboptimal still hands over a usable texture. Reconfiguring is
+            // recommended, not required, and doing it mid-frame would drop a
+            // frame every time the window was being dragged.
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+
+            // The surface no longer matches the window. Reconfiguring and
+            // skipping this frame is the whole remedy — and skipping it now
+            // costs nothing, which is the point of asking first.
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                configure_surface(
+                    &surface.surface,
+                    surface.app.renderer().gpu(),
+                    surface.size,
+                    self.config.vsync,
+                );
+                return true;
+            }
+
+            // Minimised, or the compositor is busy. Not an error, and not worth
+            // a log line every frame while a window sits in the dock.
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+                return true;
+            }
+
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.error = Some("the surface rejected a frame request".into());
+                return false;
+            }
+        };
+        phases.acquire = elapsed_ms(phase);
+
         let phase = std::time::Instant::now();
         if !surface.app.pump_network() {
             return false;
@@ -552,51 +604,6 @@ impl Client {
         }
         phases.advance = elapsed_ms(phase);
 
-        // Acquire and present are timed separately from the drawing between
-        // them because they measure something different in kind: both block on
-        // the swapchain, so time here is the GPU or the compositor holding the
-        // frame rather than work this process is doing. Optimising client code
-        // against a hitch that lives in these two would be chasing the wrong
-        // machine entirely.
-        let phase = std::time::Instant::now();
-        let frame = match surface.surface.get_current_texture() {
-            // Suboptimal still hands over a usable texture. Reconfiguring is
-            // recommended, not required, and doing it mid-frame would drop a
-            // frame every time the window was being dragged.
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-
-            // The surface no longer matches the window. Reconfiguring and
-            // skipping this frame is the whole remedy.
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                configure_surface(
-                    &surface.surface,
-                    surface.app.renderer().gpu(),
-                    surface.size,
-                    self.config.vsync,
-                );
-                return true;
-            }
-
-            // Minimised, or the compositor is busy. Not an error, and not
-            // worth a log line every frame while a window sits in the dock.
-            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
-                return true;
-            }
-
-            wgpu::CurrentSurfaceTexture::Validation => {
-                self.error = Some("the surface rejected a frame request".into());
-                return false;
-            }
-        };
-
-        // One acquisition, two passes into the same view: the world clears and
-        // draws, the HUD loads and composites over it. Acquiring twice is not a
-        // shortcut that happens to work — the second call fails, and on a
-        // backend where it does not, the two passes render into different
-        // buffers and the HUD is never seen.
-        phases.acquire = elapsed_ms(phase);
-
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -613,9 +620,10 @@ impl Client {
         let phase = std::time::Instant::now();
         frame.present();
         phases.present = elapsed_ms(phase);
-        // Only here, at the one place a frame becomes a picture. Every early
-        // return above has already done the frame's work and is about to discard
-        // it, and the gap between this count and the frame rate is how that shows.
+        // Only here, at the one place a frame becomes a picture. Now that the
+        // image is acquired first, the count should track the frame rate closely
+        // — a gap means frames are still being built and dropped, which is the
+        // thing this was added to catch.
         surface.app.note_presented();
 
         // Paired with the `dt` measured at the top of the NEXT frame, which is

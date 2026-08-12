@@ -313,11 +313,12 @@ pub struct Pacing {
     /// Frames that reached the screen this window.
     ///
     /// **Counted separately from frames STARTED, and the gap is the diagnostic.**
-    /// Everything a frame does — pumping the network, remeshing, advancing the
-    /// simulation and the camera — happens before the swapchain is asked for an
-    /// image, so a frame that cannot get one has already done all of that and
-    /// throws it away. With vsync pacing presents to the display and nothing
-    /// pacing the loop, "fps" counts the attempts and this counts the results.
+    /// It found its bug: with the swapchain asked for LAST, a frame that could
+    /// not get an image had already pumped the network, spent a full remesh
+    /// budget and advanced the world, and threw all of it away — measured at
+    /// `211 fps · 103 presented` during a streaming burst. The image is now
+    /// acquired first, so these two should track each other; a gap that reopens
+    /// means frames are being built and dropped again.
     presented: u32,
     /// How often the body changed its mind about being on the ground.
     ///
