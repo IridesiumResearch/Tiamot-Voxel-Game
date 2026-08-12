@@ -135,6 +135,13 @@ const INPUT_LEAD: u64 = 4;
 /// arc — the `worst correction 5.37 cells` reported at a landing.
 const JUMP_EDGE_TICKS: u8 = 2;
 
+/// How many skipped ticks a resynchronise will simulate rather than renumber.
+///
+/// Four, matching `walk`'s own catch-up bound and for the same reason: past this
+/// the client was not lagging, it was away, and replaying seconds of movement in
+/// one frame would fast-forward the player through the world.
+const MAX_RESYNC_CATCH_UP: u32 = 4;
+
 /// How many warnings the HUD keeps.
 const WARNING_HISTORY: usize = 5;
 
@@ -639,6 +646,12 @@ pub struct App {
     ///
     /// See [`JUMP_EDGE_TICKS`].
     jump_edge: u8,
+    /// The intent applied on the previous simulation tick.
+    ///
+    /// What a resynchronise repeats for the ticks it has to catch up on — the
+    /// same thing `InputQueue::take` repeats server-side for a tick nobody spoke
+    /// for, so the two agree about what happened while nobody was talking.
+    previous_intent: Intent,
     /// The keys as they stood at the previous simulation tick.
     ///
     /// For edge detection: "was this pressed" and "is this newly pressed" are
@@ -720,6 +733,7 @@ impl App {
                 .map(|file| std::cell::RefCell::new(std::io::BufWriter::new(file))),
             present_mode: None,
             jump_edge: 0,
+            previous_intent: Intent::default(),
             previous_input: Input::default(),
             carried: Vec::new(),
             selected: 0,
@@ -804,9 +818,42 @@ impl App {
     /// fixed margin in front of it.
     fn resynchronise_tick(&mut self, server_tick: u64) {
         let want = server_tick + INPUT_LEAD;
-        if self.tick < want {
-            self.tick = want;
+        if self.tick >= want {
+            return;
         }
+
+        // **The counter is not the body, and moving one without the other is what
+        // made a landing jolt.**
+        //
+        // Renumbering alone left the body short of its own tick label: the server
+        // simulates every tick between, so its state for tick N had one more step
+        // in it than the client's memory of N. Traced, at a jump:
+        //
+        //     tick 50 d +0.0000 -1.0584 +0.0000 dv +0.0000 -0.2400 +0.0000
+        //     tick 51 d +0.0000 -1.2984 +0.0000 dv +0.0000 -0.2400 +0.0000
+        //
+        // `-0.2400` is exactly `Tuning::gravity` — one tick of it, every tick,
+        // which is a body one step behind rather than one in the wrong place. The
+        // gap only shows while accelerating, which is why walking looked perfect
+        // and every landing did not.
+        //
+        // So the skipped ticks are simulated rather than skipped, with the intent
+        // the server uses for a tick nobody spoke for: the last one, minus the
+        // jump, exactly as `InputQueue::take` repeats it. Bounded, because a
+        // client that has been away for a minute must not replay a minute.
+        let gap = (want - self.tick).min(u64::from(MAX_RESYNC_CATCH_UP));
+        let mut intent = self.previous_intent;
+        intent.jump = false;
+        for _ in 0..gap {
+            self.tick += 1;
+            if let Some(predictor) = self.predictor.as_mut() {
+                let voxels = phys::Voxels::new(&self.store, predictor.origin());
+                predictor.predict(&voxels, self.tick, intent, &Tuning::DEFAULT);
+            }
+        }
+        // Whatever is left after the bound is a renumber, as before: past that
+        // distance the client was not lagging, it was absent.
+        self.tick = want;
     }
 
     /// The tick the client is predicting, and the last one the server applied.
@@ -1778,6 +1825,7 @@ impl App {
             intent.jump = self.jump_edge > 0;
             self.jump_edge = self.jump_edge.saturating_sub(1);
             self.previous_input = input;
+            self.previous_intent = intent;
 
             let mut touched_absent = false;
             let mut ground = None;
