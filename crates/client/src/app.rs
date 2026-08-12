@@ -994,8 +994,8 @@ impl App {
 
         if let Some(divergence) = divergence {
             self.pacing.divergence(divergence.distance);
-            self.trace(&divergence, state);
         }
+        self.trace(divergence.as_ref(), state);
         if touched_absent {
             self.pacing.predicted_into_the_unloaded();
         }
@@ -1008,7 +1008,7 @@ impl App {
     /// and a frame is not a tick.
     fn trace(
         &self,
-        divergence: &crate::predict::Divergence,
+        divergence: Option<&crate::predict::Divergence>,
         state: &crate::predict::Authoritative,
     ) {
         use std::io::Write as _;
@@ -1017,6 +1017,24 @@ impl App {
             return;
         };
         let Ok(mut out) = trace.try_borrow_mut() else {
+            return;
+        };
+
+        // **A line either way, and the missing case is the interesting one.**
+        //
+        // A comparison needs the client to remember the tick the server is
+        // talking about. When it does not, the first version wrote nothing — so a
+        // client skipping the very ticks the server was applying produced a
+        // SHORTER trace, which is the opposite of what a diagnostic should do.
+        // It also made the test flaky: macOS CI wrote four lines where this box
+        // wrote seventy.
+        let Some(divergence) = divergence else {
+            let _ = writeln!(
+                out,
+                "tick {} client_tick {} unmatched — no memory of this tick",
+                state.last_processed_input, self.tick
+            );
+            let _ = out.flush();
             return;
         };
         let [dx, dy, dz] = divergence.offset;
