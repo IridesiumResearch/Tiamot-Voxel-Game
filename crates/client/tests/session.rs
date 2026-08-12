@@ -1099,3 +1099,64 @@ fn the_hud_counts_footing_changes_and_a_still_player_has_none() {
     app.shutdown();
     assert!(server.stop());
 }
+
+#[test]
+fn a_long_stall_while_falling_does_not_leave_a_correction_behind() {
+    // **Reported from the window: a jolt at every landing, with `worst correction
+    // 5.86 cells (89% vertical)`.** A vertical-only divergence of five or six
+    // cells is four or five ticks of falling, which is the shape of the client and
+    // the server disagreeing about WHEN rather than about where.
+    //
+    // `resynchronise_tick` takes the server's tick and stays a fixed margin in
+    // front of it, moving the client's counter FORWARD when it has fallen behind.
+    // The counter is not the body: the server simulates every tick between, and
+    // if the client renumbers without simulating them too, the two part company by
+    // however many ticks were skipped — invisibly while walking at a constant
+    // speed, and by a growing amount while accelerating.
+    //
+    // A frame long enough to trip `MAX_CATCH_UP` is what makes the client fall
+    // behind, so this stalls one deliberately, in mid-air, where the disagreement
+    // is largest.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("stall-falling");
+    let mut app = client("stall-falling", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+    for _ in 0..40 {
+        app.pump_network();
+        app.advance(Input::default(), 1.0 / 60.0);
+    }
+
+    // Jump, so the body is accelerating when the stall lands.
+    let jump = Input {
+        jump: true,
+        ..Input::default()
+    };
+    app.pump_network();
+    app.advance(jump, 1.0 / 60.0);
+
+    // A frame that took half a second: an alt-tab, a shader compile, a chunk
+    // upload. Well past `MAX_CATCH_UP`'s four ticks.
+    app.pump_network();
+    app.advance(Input::default(), 0.5);
+
+    // Then run normally for long enough that the server has spoken several times
+    // and any disagreement has been reconciled and reported.
+    for _ in 0..150 {
+        app.pump_network();
+        app.advance(Input::default(), 1.0 / 60.0);
+    }
+
+    let correction = app.pacing().worst_correction_cells();
+    assert!(
+        correction < 1.0,
+        "a single long frame while airborne left a correction of {correction} cells \
+         ({}% vertical): the client renumbered its tick without simulating what it skipped",
+        app.pacing().worst_correction_vertical_percent()
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}

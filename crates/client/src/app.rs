@@ -801,9 +801,17 @@ impl App {
     fn prediction_line(&self, created: u64, reused: u64, correction: f32) -> String {
         format!(
             "{created} mesh buffers created, {reused} reused from the pool · worst correction \
-             {correction:.2} cells ({}% vertical) · footing {}x{}",
+             {correction:.2} cells ({}% vertical) · footing {}x · tick {}/{} (lead {}){}",
             self.pacing.worst_correction_vertical_percent(),
             self.pacing.footing_changes_last_second(),
+            self.tick,
+            self.confirmed_tick,
+            // Signed, because behind and ahead are different bugs: the server
+            // refuses an input whose tick it has passed, so a lead that has gone
+            // to zero or negative means inputs are being thrown away, while a
+            // lead far above `INPUT_LEAD` means the client is predicting into a
+            // future the server has not been told about.
+            self.tick as i64 - self.confirmed_tick as i64,
             // Only when it happened, so the line stays short in the normal case
             // and the words appear exactly when they explain something.
             if self.pacing.predicted_into_unloaded() {
