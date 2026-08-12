@@ -201,6 +201,24 @@ impl Predictor {
         (x * x + y * y + z * z).sqrt()
     }
 
+    /// How much of the outstanding correction is vertical, `0.0..=1.0`.
+    ///
+    /// **The half of a correction that says what kind it is.** A disagreement
+    /// about a JUMP is almost entirely vertical — losing the tick that carried a
+    /// press moves a body by a whole arc and nothing sideways — while one about
+    /// walking into geometry is mostly horizontal. The magnitude alone cannot
+    /// tell those apart, and a 5.37 that could have been either cost a round trip
+    /// to find out.
+    #[must_use]
+    pub fn vertical_share(&self) -> f32 {
+        let [x, y, z] = self.error;
+        let total = (x * x + y * y + z * z).sqrt();
+        if total <= 0.0 {
+            return 0.0;
+        }
+        y.abs() / total
+    }
+
     /// Advances one tick locally and records the input for replay.
     pub fn predict(&mut self, solid: &impl Solid, tick: u64, intent: Intent, tuning: &Tuning) {
         self.step(solid, intent, tuning, Ease::Record);

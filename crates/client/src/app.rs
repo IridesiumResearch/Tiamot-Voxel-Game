@@ -122,6 +122,19 @@ const THIRD_PERSON_DISTANCE: f64 = 4.0;
 
 const INPUT_LEAD: u64 = 4;
 
+/// How many consecutive ticks one jump press is sent for.
+///
+/// Two, and the ceiling on it is physical rather than chosen: a jump is only
+/// honoured from the ground, so an extra copy is a no-op while the body is
+/// airborne — but the shortest airtime in the game is the three-tick hop under a
+/// low ceiling, and a window that reached it would let one press jump twice.
+///
+/// One tick was not enough. `InputQueue::offer` refuses an input whose tick the
+/// server has already passed, so a single late packet lost the whole jump while
+/// the client had already taken it, and the two simulations diverged by a jump's
+/// arc — the `worst correction 5.37 cells` reported at a landing.
+const JUMP_EDGE_TICKS: u8 = 2;
+
 /// How many warnings the HUD keeps.
 const WARNING_HISTORY: usize = 5;
 
@@ -280,6 +293,9 @@ pub struct Pacing {
     worst_phases: Phases,
     /// Largest prediction correction seen in the window, in cells.
     worst_correction: f32,
+    /// How much of that correction was vertical — see
+    /// `predict::Predictor::vertical_share`.
+    worst_correction_vertical: f32,
     /// How often the body changed its mind about being on the ground.
     ///
     /// **The number that says "jolting" out loud.** A body walking over even
@@ -313,6 +329,8 @@ pub struct Pacing {
     reported_remesh_chunks: usize,
     /// The last completed window's largest correction, in cells.
     reported_correction: f32,
+    /// How much of it was vertical.
+    reported_correction_vertical: f32,
     /// Whether that window's prediction reached into chunks that had not
     /// arrived.
     reported_unloaded: bool,
@@ -347,6 +365,7 @@ impl Pacing {
                 reported_remesh_meshing: self.worst_remesh_meshing,
                 reported_remesh_chunks: self.worst_remesh_chunks,
                 reported_correction: self.worst_correction,
+                reported_correction_vertical: self.worst_correction_vertical,
                 reported_unloaded: self.predicted_into_the_unloaded,
                 reported_footing_changes: self.footing_changes,
                 // Carried across the window boundary, or the first tick of every
@@ -359,8 +378,11 @@ impl Pacing {
     }
 
     /// Folds in how far this frame's prediction was corrected, in cells.
-    fn correction(&mut self, cells: f32) {
-        self.worst_correction = self.worst_correction.max(cells);
+    fn correction(&mut self, cells: f32, vertical_share: f32) {
+        if cells > self.worst_correction {
+            self.worst_correction = cells;
+            self.worst_correction_vertical = vertical_share;
+        }
     }
 
     /// Notes that prediction collided against a chunk that has not arrived.
@@ -416,6 +438,23 @@ impl Pacing {
     #[must_use]
     pub const fn worst_correction_cells(&self) -> f32 {
         self.reported_correction
+    }
+
+    /// How much of the worst correction was vertical, as a percentage.
+    ///
+    /// Read it beside the magnitude: a disagreement about a jump is nearly all
+    /// vertical, and one about walking into geometry is not.
+    /// `+ 0.5` and a truncating cast rather than `round`, which the determinism
+    /// lint bans workspace-wide. This is a HUD readout and could have taken an
+    /// exemption; not needing one is better than explaining one.
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a share of 0..=1 scaled to a percentage, for a HUD line"
+    )]
+    pub fn worst_correction_vertical_percent(&self) -> u32 {
+        (self.reported_correction_vertical * 100.0 + 0.5) as u32
     }
 
     /// How many times the body changed between standing and airborne in the
@@ -535,6 +574,10 @@ pub struct App {
     /// vsync cannot produce, and nothing on screen could tell a requested mode
     /// from an effective one. A headless `App` has no swapchain and says so.
     present_mode: Option<&'static str>,
+    /// Ticks left to keep sending the current jump press.
+    ///
+    /// See [`JUMP_EDGE_TICKS`].
+    jump_edge: u8,
     /// The keys as they stood at the previous simulation tick.
     ///
     /// For edge detection: "was this pressed" and "is this newly pressed" are
@@ -612,6 +655,7 @@ impl App {
             dig: None,
             tick_carry: 0.0,
             present_mode: None,
+            jump_edge: 0,
             previous_input: Input::default(),
             carried: Vec::new(),
             selected: 0,
@@ -757,7 +801,8 @@ impl App {
     fn prediction_line(&self, created: u64, reused: u64, correction: f32) -> String {
         format!(
             "{created} mesh buffers created, {reused} reused from the pool · worst correction \
-             {correction:.2} cells · footing {}x{}",
+             {correction:.2} cells ({}% vertical) · footing {}x{}",
+            self.pacing.worst_correction_vertical_percent(),
             self.pacing.footing_changes_last_second(),
             // Only when it happened, so the line stays short in the normal case
             // and the words appear exactly when they explain something.
@@ -1563,7 +1608,28 @@ impl App {
             // is done on the way INTO the tick, so the input the server is sent
             // (`report_input`, below) carries the same single jump the client
             // predicted — anything else would be a disagreement by construction.
-            intent.jump = input.jump && !self.previous_input.jump;
+            // **One press, sent for a few ticks.**
+            //
+            // A press is an edge, so it is detected once — but a single tick
+            // carrying it is a single packet, and `InputQueue::offer` refuses any
+            // input whose tick the server has already passed. Lose that one and
+            // the server never jumps while the client already has: the two part
+            // company by a whole jump arc, which is the `worst correction 5.37
+            // cells` reported at a landing.
+            //
+            // Repeating it is safe because a jump is only honoured from the
+            // ground: the copies land while the body is already airborne and do
+            // nothing. That idempotence is what makes redundancy free here, and
+            // it is why the window must stay SHORTER than the shortest possible
+            // airtime — the 0.6-cell hop under a low ceiling is three ticks, and
+            // `a_hop_under_a_ceiling_is_still_one_hop` holds the two apart.
+            if input.jump && !self.previous_input.jump {
+                self.jump_edge = JUMP_EDGE_TICKS;
+            } else if !input.jump {
+                self.jump_edge = 0;
+            }
+            intent.jump = self.jump_edge > 0;
+            self.jump_edge = self.jump_edge.saturating_sub(1);
             self.previous_input = input;
 
             let mut touched_absent = false;
@@ -1606,7 +1672,8 @@ impl App {
         // is otherwise almost impossible to notice: no single frame looks
         // wrong, the world is just subtly not where it was left.
         if let Some(predictor) = self.predictor.as_ref() {
-            self.pacing.correction(predictor.error());
+            self.pacing
+                .correction(predictor.error(), predictor.vertical_share());
         }
 
         // Whatever time did not buy a whole tick is how far through the current

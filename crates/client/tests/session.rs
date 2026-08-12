@@ -988,6 +988,60 @@ fn holding_the_jump_key_gives_exactly_one_hop() {
 }
 
 #[test]
+fn a_press_is_sent_for_more_than_one_tick_but_is_still_one_hop() {
+    // **The fragility a single-tick edge has, and the ceiling on the cure.**
+    //
+    // `InputQueue::offer` refuses an input whose tick the server has already
+    // passed, so one late packet lost a whole jump while the client had taken it
+    // — reported as `worst correction 5.37 cells` at a landing, which is a jump's
+    // arc. The press is now sent for `JUMP_EDGE_TICKS` ticks so losing one packet
+    // costs nothing.
+    //
+    // The copies are only safe because a jump is honoured from the ground alone,
+    // so this asserts the thing that would break if the window ever grew: one
+    // press is still ONE hop. Held for a long time, too — the edge must not
+    // re-arm itself.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("jump-edge");
+    let mut app = client("jump-edge", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+    for _ in 0..40 {
+        app.pump_network();
+        app.advance(Input::default(), 1.0 / 60.0);
+    }
+    let resting = app.camera().position.to_world().1;
+
+    let held = Input {
+        jump: true,
+        ..Input::default()
+    };
+    let mut peaks = 0;
+    let mut airborne = false;
+    for _ in 0..140 {
+        app.pump_network();
+        app.advance(held, 1.0 / 60.0);
+        let height = app.camera().position.to_world().1 - resting;
+        if height > 0.35 && !airborne {
+            airborne = true;
+            peaks += 1;
+        } else if height < 0.1 {
+            airborne = false;
+        }
+    }
+    assert_eq!(
+        peaks, 1,
+        "a press held for two seconds produced {peaks} hops; the redundancy window has grown \
+         past the shortest airtime, or the edge is re-arming itself"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}
+
+#[test]
 fn the_hud_counts_footing_changes_and_a_still_player_has_none() {
     // **The instrument for "I jolt around".** A body walking over even ground is
     // on it every tick; a body falling is off it every tick; a body ALTERNATING
