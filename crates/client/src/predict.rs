@@ -80,6 +80,42 @@ pub struct Authoritative {
     pub on_ground: bool,
 }
 
+/// What the client believed at the end of one tick.
+///
+/// Kept so the server's word about that same tick can be compared against it
+/// DIRECTLY. The blended `error` cannot do that job: it is the gap between the
+/// client's newest position and a replay, so it mixes a real disagreement with
+/// however many ticks of replay stood between — which is why three rounds of
+/// readings could say "5.79 cells" without saying which tick went wrong, or how.
+#[derive(Debug, Clone, Copy)]
+struct Remembered {
+    tick: u64,
+    origin: ChunkPos,
+    position: [f32; 3],
+    velocity: [f32; 3],
+    on_ground: bool,
+}
+
+/// A divergence between what the client predicted for a tick and what the server
+/// said about it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Divergence {
+    /// The tick both sides were describing.
+    pub tick: u64,
+    /// Server minus client, per axis, in cells.
+    pub offset: [f64; 3],
+    /// How far apart they were, in cells.
+    pub distance: f32,
+    /// Server minus client velocity, per axis, in cells per tick.
+    ///
+    /// Position can agree while velocity does not — a body stopped by geometry
+    /// on one side and still moving on the other is about to diverge, and this
+    /// says so a tick before the positions do.
+    pub velocity_offset: [f32; 3],
+    /// Whether the two agreed about standing on the ground.
+    pub footing_agreed: bool,
+}
+
 /// A locally predicted body, and the inputs the server has not confirmed.
 #[derive(Debug, Clone)]
 pub struct Predictor {
@@ -116,6 +152,13 @@ pub struct Predictor {
     step_rate: f32,
     /// The last tick predicted.
     tick: u64,
+    /// What was believed at the end of each recent tick, oldest first.
+    ///
+    /// Bounded by the same lookahead the server accepts: nothing older can still
+    /// be the subject of a message.
+    remembered: VecDeque<Remembered>,
+    /// The last disagreement found, for the HUD and the trace.
+    divergence: Option<Divergence>,
 }
 
 /// Whether a tick should record the camera's step ease.
@@ -168,6 +211,8 @@ impl Predictor {
             last_step: [0.0; 3],
             step_lag: 0.0,
             step_rate: 0.0,
+            remembered: VecDeque::new(),
+            divergence: None,
             tick,
         }
     }
@@ -225,6 +270,19 @@ impl Predictor {
         self.pending.push_back((tick, intent));
         self.tick = tick;
 
+        // What this tick ended as, so the server's word about the same tick has
+        // something exact to be compared with.
+        self.remembered.push_back(Remembered {
+            tick,
+            origin: self.origin,
+            position: self.body.position,
+            velocity: self.body.velocity,
+            on_ground: self.body.on_ground,
+        });
+        while self.remembered.len() > phys::input::MAX_LOOKAHEAD as usize * 2 {
+            self.remembered.pop_front();
+        }
+
         // Bounded by the same lookahead the server accepts. Anything older than
         // that will never be confirmed because the server would refuse it.
         while self.pending.len() > phys::input::MAX_LOOKAHEAD as usize {
@@ -232,14 +290,84 @@ impl Predictor {
         }
     }
 
+    /// The last disagreement found between a predicted tick and the server's
+    /// word about it, if any.
+    #[must_use]
+    pub const fn divergence(&self) -> Option<Divergence> {
+        self.divergence
+    }
+
+    /// Compares the server's word about a tick with what was predicted for it.
+    ///
+    /// **This is the measurement the correction cannot make.** A correction is
+    /// the gap between the newest prediction and a replay, so it grows with the
+    /// lead and says nothing about which tick was wrong. This compares like with
+    /// like: one tick, both answers, per axis.
+    fn compare(&mut self, state: &Authoritative) {
+        let Some(mine) = self
+            .remembered
+            .iter()
+            .find(|remembered| remembered.tick == state.last_processed_input)
+        else {
+            // The tick is older than anything kept, which happens after a stall
+            // and is not a disagreement.
+            return;
+        };
+
+        let span = f64::from(tiamot_core::CHUNK_SUBNODES);
+        let axis = |server_chunk: i32, server_local: f32, chunk: i32, local: f32| -> f64 {
+            (f64::from(server_chunk) * span + f64::from(server_local))
+                - (f64::from(chunk) * span + f64::from(local))
+        };
+        let offset = [
+            axis(
+                state.chunk.x,
+                state.local[0],
+                mine.origin.x,
+                mine.position[0],
+            ),
+            axis(
+                state.chunk.y,
+                state.local[1],
+                mine.origin.y,
+                mine.position[1],
+            ),
+            axis(
+                state.chunk.z,
+                state.local[2],
+                mine.origin.z,
+                mine.position[2],
+            ),
+        ];
+        let [x, y, z] = offset;
+        let distance = (x * x + y * y + z * z).sqrt() as f32;
+
+        self.divergence = Some(Divergence {
+            tick: state.last_processed_input,
+            offset,
+            distance,
+            velocity_offset: [
+                state.velocity[0] - mine.velocity[0],
+                state.velocity[1] - mine.velocity[1],
+                state.velocity[2] - mine.velocity[2],
+            ],
+            footing_agreed: state.on_ground == mine.on_ground,
+        });
+    }
+
     /// Takes the server's answer and replays what it has not seen.
     pub fn reconcile(&mut self, solid: &impl Solid, state: &Authoritative, tuning: &Tuning) {
+        // Before the body is replaced, while the memory of that tick still means
+        // something.
+        self.compare(state);
         // Where we thought we were, before adopting the server's answer. The
         // difference between this and the replayed result IS the correction.
         let predicted = self.world_position();
 
         self.pending
             .retain(|(tick, _)| *tick > state.last_processed_input);
+        self.remembered
+            .retain(|remembered| remembered.tick > state.last_processed_input);
 
         self.origin = state.chunk;
         self.body = Body {

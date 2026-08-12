@@ -296,6 +296,13 @@ pub struct Pacing {
     /// How much of that correction was vertical — see
     /// `predict::Predictor::vertical_share`.
     worst_correction_vertical: f32,
+    /// The largest per-tick disagreement this window, in cells.
+    ///
+    /// Not the same number as the correction: a correction is the gap between
+    /// the newest prediction and a replay, which grows with the input lead. This
+    /// compares ONE tick's two answers, so it is the honest measure of whether
+    /// the two simulations agree.
+    worst_divergence: f32,
     /// Frames that reached the screen this window.
     ///
     /// **Counted separately from frames STARTED, and the gap is the diagnostic.**
@@ -347,6 +354,8 @@ pub struct Pacing {
     reported_footing_changes: u32,
     /// The last completed window's count of frames that reached the screen.
     reported_presented: u32,
+    /// The last completed window's largest per-tick disagreement.
+    reported_divergence: f32,
     /// Where that window's worst frame spent its time.
     reported_phases: Phases,
 }
@@ -380,6 +389,7 @@ impl Pacing {
                 reported_unloaded: self.predicted_into_the_unloaded,
                 reported_footing_changes: self.footing_changes,
                 reported_presented: self.presented,
+                reported_divergence: self.worst_divergence,
                 // Carried across the window boundary, or the first tick of every
                 // window would read as a change.
                 last_footing: self.last_footing,
@@ -400,6 +410,11 @@ impl Pacing {
     /// Notes that prediction collided against a chunk that has not arrived.
     const fn predicted_into_the_unloaded(&mut self) {
         self.predicted_into_the_unloaded = true;
+    }
+
+    /// Folds in one tick's disagreement with the server.
+    fn divergence(&mut self, cells: f32) {
+        self.worst_divergence = self.worst_divergence.max(cells);
     }
 
     /// Notes that a frame reached the screen.
@@ -472,6 +487,15 @@ impl Pacing {
     )]
     pub fn worst_correction_vertical_percent(&self) -> u32 {
         (self.reported_correction_vertical * 100.0 + 0.5) as u32
+    }
+
+    /// The largest per-tick disagreement with the server in the last window.
+    ///
+    /// **Read this rather than the correction when asking whether the two
+    /// simulations agree.** A correction includes the replay; this does not.
+    #[must_use]
+    pub const fn worst_divergence_cells(&self) -> f32 {
+        self.reported_divergence
     }
 
     /// How many frames reached the screen in the last completed window.
@@ -594,6 +618,15 @@ pub struct App {
     /// so frames and ticks are decoupled here: a fast machine predicts the same
     /// ticks a slow one does, just with more frames between them.
     tick_carry: f32,
+    /// Where a per-tick physics trace is being written, if one was asked for.
+    ///
+    /// **The tool for a disagreement that will not reproduce.** A HUD reports a
+    /// maximum over a second; this writes one line per tick, so the exact tick
+    /// two simulations part company on can be read off afterwards rather than
+    /// guessed at from a sampled number. Opened once, from
+    /// `TIAMOT_TRACE_PHYSICS`, and silently absent otherwise — a diagnostic that
+    /// could refuse to start a session would be a poor one.
+    trace: Option<std::cell::RefCell<std::io::BufWriter<std::fs::File>>>,
     /// The present mode the swapchain is actually using, once the window has
     /// told us.
     ///
@@ -682,6 +715,9 @@ impl App {
             confirmed_tick: 0,
             dig: None,
             tick_carry: 0.0,
+            trace: std::env::var_os("TIAMOT_TRACE_PHYSICS")
+                .and_then(|path| std::fs::File::create(path).ok())
+                .map(|file| std::cell::RefCell::new(std::io::BufWriter::new(file))),
             present_mode: None,
             jump_edge: 0,
             previous_input: Input::default(),
@@ -841,8 +877,10 @@ impl App {
     fn prediction_line(&self, created: u64, reused: u64, correction: f32) -> String {
         format!(
             "{created} mesh buffers created, {reused} reused from the pool · worst correction \
-             {correction:.2} cells ({}% vertical) · footing {}x · tick {}/{} (lead {}){}",
+             {correction:.2} cells ({}% vertical) · diverge {:.2} · footing {}x · tick {}/{} \
+             (lead {}){}",
             self.pacing.worst_correction_vertical_percent(),
+            self.pacing.worst_divergence_cells(),
             self.pacing.footing_changes_last_second(),
             self.tick,
             self.confirmed_tick,
@@ -860,6 +898,80 @@ impl App {
                 ""
             }
         )
+    }
+
+    /// Takes the server's word on where this player is.
+    ///
+    /// Its own method because `pump_network` is at the line limit, and because
+    /// everything here is one thought: adopt the server's answer, measure how far
+    /// it was from ours, and say so.
+    fn accept_player_state(&mut self, state: &crate::predict::Authoritative) {
+        self.confirmed = Some((state.chunk, state.local));
+        self.confirmed_tick = state.last_processed_input;
+        self.resynchronise_tick(state.last_processed_input);
+
+        // Not while the debug teleport is displacing the world: the server does
+        // not know about it, so every state would drag the camera back and the
+        // floating-origin check could not be looked at.
+        if self.displacement != [0, 0, 0] {
+            return;
+        }
+        let Some(predictor) = self.predictor.as_mut() else {
+            return;
+        };
+
+        let voxels = phys::Voxels::new(&self.store, predictor.origin());
+        predictor.reconcile(&voxels, state, &Tuning::DEFAULT);
+        let divergence = predictor.divergence();
+        // Asked after the replay rather than before: what matters is whether the
+        // ticks being re-simulated consulted geometry the client does not have,
+        // because those are the ticks whose answer cannot match the server's.
+        let touched_absent = voxels.touched_absent();
+
+        if let Some(divergence) = divergence {
+            self.pacing.divergence(divergence.distance);
+            self.trace(&divergence, state);
+        }
+        if touched_absent {
+            self.pacing.predicted_into_the_unloaded();
+        }
+    }
+
+    /// Writes one line of the physics trace, if one was asked for.
+    ///
+    /// Deliberately one line per server message rather than per frame: the
+    /// question it exists to answer is which TICK the two sides disagreed about,
+    /// and a frame is not a tick.
+    fn trace(
+        &self,
+        divergence: &crate::predict::Divergence,
+        state: &crate::predict::Authoritative,
+    ) {
+        use std::io::Write as _;
+
+        let Some(trace) = self.trace.as_ref() else {
+            return;
+        };
+        let Ok(mut out) = trace.try_borrow_mut() else {
+            return;
+        };
+        let [dx, dy, dz] = divergence.offset;
+        // Ignored deliberately: a diagnostic that could take a session down by
+        // failing to write to a file would be worse than no diagnostic.
+        let _ = writeln!(
+            out,
+            "tick {} client_tick {} d {dx:+.4} {dy:+.4} {dz:+.4} dist {:.4} \
+             dv {:+.4} {:+.4} {:+.4} footing_agreed {} server_ground {}",
+            divergence.tick,
+            self.tick,
+            divergence.distance,
+            divergence.velocity_offset[0],
+            divergence.velocity_offset[1],
+            divergence.velocity_offset[2],
+            divergence.footing_agreed,
+            state.on_ground,
+        );
+        let _ = out.flush();
     }
 
     /// Notes that a frame reached the screen, for the HUD.
@@ -1435,28 +1547,7 @@ impl App {
                     self.store.apply(&edit);
                 }
 
-                Event::PlayerState(state) => {
-                    self.confirmed = Some((state.chunk, state.local));
-                    self.confirmed_tick = state.last_processed_input;
-                    self.resynchronise_tick(state.last_processed_input);
-                    // Not while the debug teleport is displacing the world: the
-                    // server does not know about it, so every state would drag
-                    // the camera back and the floating-origin check could not
-                    // be looked at.
-                    if self.displacement == [0, 0, 0]
-                        && let Some(predictor) = self.predictor.as_mut()
-                    {
-                        let voxels = phys::Voxels::new(&self.store, predictor.origin());
-                        predictor.reconcile(&voxels, &state, &Tuning::DEFAULT);
-                        // Asked after the replay rather than before: what matters
-                        // is whether the ticks being re-simulated consulted
-                        // geometry the client does not have, because those are
-                        // the ticks whose answer cannot match the server's.
-                        if voxels.touched_absent() {
-                            self.pacing.predicted_into_the_unloaded();
-                        }
-                    }
-                }
+                Event::PlayerState(state) => self.accept_player_state(&state),
 
                 Event::DigProgress { target, progress } => {
                     self.dig = Some((target, progress));

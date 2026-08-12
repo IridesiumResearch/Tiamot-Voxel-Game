@@ -1176,3 +1176,77 @@ fn jumping_in_real_time_leaves_no_correction_behind() {
     app.shutdown();
     assert!(server.stop());
 }
+
+#[test]
+fn the_divergence_measure_and_its_trace_report_a_real_session() {
+    // **The tool for a disagreement that will not reproduce.** A correction is
+    // the gap between the newest prediction and a replay, so it grows with the
+    // input lead and cannot say WHICH tick went wrong. This compares one tick's
+    // two answers — the client's memory of what it predicted, against the
+    // server's word about that same tick.
+    //
+    // Asserted from both ends, because an instrument that only ever reads zero is
+    // indistinguishable from one that is not wired up: on a quiet loopback
+    // session the two must agree, and the trace must still have written the lines
+    // that say so.
+    let Some(gpu) = gpu() else { return };
+    let trace_path = scratch("divergence-trace").join("physics.log");
+    // SAFETY: single-threaded test setup, before the client is built.
+    unsafe { std::env::set_var("TIAMOT_TRACE_PHYSICS", &trace_path) };
+
+    let server = embedded("divergence");
+    let mut app = client("divergence", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+
+    // Real time, so the client and server are contemporaries — see
+    // `run_real_time`. Walk and jump, so the trace has something to describe.
+    run_real_time(&mut app, 1.5, Input::default());
+    run_real_time(
+        &mut app,
+        0.1,
+        Input {
+            jump: true,
+            ..Input::default()
+        },
+    );
+    run_real_time(
+        &mut app,
+        2.0,
+        Input {
+            forward: 1.0,
+            ..Input::default()
+        },
+    );
+
+    let diverged = app.pacing().worst_divergence_cells();
+    assert!(
+        diverged < 1.0,
+        "the client and the server disagreed by {diverged} cells about a tick they both \
+         simulated, on loopback with nothing in the way"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+
+    // SAFETY: single-threaded teardown.
+    unsafe { std::env::remove_var("TIAMOT_TRACE_PHYSICS") };
+
+    let written = std::fs::read_to_string(&trace_path).expect("the trace file should exist");
+    let lines = written.lines().count();
+    assert!(
+        lines > 10,
+        "the trace wrote {lines} lines for three and a half seconds of play, so it is not \
+         recording the ticks it claims to"
+    );
+    let first = written.lines().next().unwrap_or_default();
+    for field in ["tick ", "dist ", "dv ", "footing_agreed "] {
+        assert!(
+            first.contains(field),
+            "the trace line is missing `{field}`, so it cannot answer what it exists for: \
+             {first}"
+        );
+    }
+}
