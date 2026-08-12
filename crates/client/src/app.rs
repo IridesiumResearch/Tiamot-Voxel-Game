@@ -903,6 +903,23 @@ impl App {
         self.joined
     }
 
+    /// The key reminders, with the state of the settings that have one.
+    ///
+    /// Its own method because `hud` is at the line limit. Every key here was
+    /// added for somebody to look at something with, and a key nobody can find is
+    /// a feature nobody has.
+    fn keys_line(&self) -> String {
+        format!(
+            "keys: L light · K shadows · V third person · B borders {} · [ ] time · \\ resync \
+             · G blocks · T/H teleport",
+            if self.renderer.chunk_borders() {
+                "ON"
+            } else {
+                "off"
+            }
+        )
+    }
+
     /// The frame-rate line: frames built, and frames that became pictures.
     ///
     /// Its own method because `hud` is at the line limit, and the two numbers
@@ -1328,6 +1345,19 @@ impl App {
 
     /// Steps the shadow quality: off, low, medium, high, and round again.
     ///
+    /// Turns the chunk-border overlay on or off, and reports the new state.
+    ///
+    /// A debugging view: it draws the cage every visible chunk occupies, which is
+    /// how you tell a seam that follows chunk boundaries from one that merely
+    /// happens to be near one. This session spent a long evening on "it almost
+    /// feels like chunk boundaries have their own collision" with no way to see
+    /// where they were.
+    pub fn toggle_chunk_borders(&mut self) -> bool {
+        let show = !self.renderer.chunk_borders();
+        self.renderer.set_chunk_borders(show);
+        show
+    }
+
     /// Live, like the lighting mode, and for the same reason — the difference
     /// between two settings is a thing you judge by looking at them one after
     /// the other, not by restarting between them.
@@ -2133,9 +2163,7 @@ impl App {
             // The debug keys, on the screen rather than in a commit message.
             // Every one of these was added for somebody to look at something
             // with, and a key nobody can find is a feature nobody has.
-            "keys: L light · K shadows · V third person · [ ] time · \\ resync · G blocks · \
-             T/H teleport"
-                .to_owned(),
+            self.keys_line(),
             format!(
                 "{} on {} / {} · vsync {} · light {} · shadows {}",
                 self.server_label,

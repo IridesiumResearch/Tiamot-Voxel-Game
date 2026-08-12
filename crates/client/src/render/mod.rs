@@ -325,6 +325,14 @@ struct ChunkMesh {
 /// time the crosshair moves is the churn `BufferPool` exists to avoid.
 const SELECTION_CAPACITY: usize = 32 * 12 * 2;
 
+/// Line-segment vertices the chunk-border buffer holds without growing.
+///
+/// A box is 12 segments, so this is 512 chunks — more than a default view
+/// distance puts in front of the camera at once, and the overflow is dropped
+/// rather than grown for the same reason the selection's is: a debug overlay is
+/// not worth a reallocation on a frame where the view happens to be wide.
+const CHUNK_BORDER_CAPACITY: usize = 512 * 12 * 2;
+
 /// The smallest buffer the pool hands out, in bytes.
 ///
 /// Chunk meshes in open terrain are startlingly small — a flat surface greedily
@@ -625,6 +633,15 @@ pub struct Renderer {
     body_at: Option<[f32; 3]>,
     /// The outline pipeline, and the line segments it draws this frame.
     selection_pipeline: wgpu::RenderPipeline,
+    /// The chunk-border overlay: the same line pipeline, its own buffer.
+    ///
+    /// Separate from the selection because the two change on different clocks —
+    /// the outline follows the crosshair every frame, and the borders follow
+    /// which chunks are visible.
+    borders: wgpu::Buffer,
+    border_vertices: u32,
+    /// Whether to draw them at all. Off by default: it is a debugging view.
+    show_borders: bool,
     selection: wgpu::Buffer,
     /// Vertices actually written, which is twice the segment count.
     selection_vertices: u32,
@@ -663,6 +680,13 @@ impl Renderer {
         let selection_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("selection"),
             size: (SELECTION_CAPACITY * size_of::<[f32; 3]>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let border_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("chunk-borders"),
+            size: (CHUNK_BORDER_CAPACITY * size_of::<[f32; 3]>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -716,6 +740,9 @@ impl Renderer {
             chunks: BTreeMap::new(),
             pool: BufferPool::default(),
             selection_pipeline,
+            borders: border_buffer,
+            border_vertices: 0,
+            show_borders: false,
             selection: selection_buffer,
             selection_vertices: 0,
             selection_capacity: SELECTION_CAPACITY,
@@ -948,7 +975,7 @@ impl Renderer {
     pub fn set_selection(&mut self, cells: &[[f32; 3]]) {
         let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(cells.len() * 24);
         for cell in cells {
-            push_box_edges(&mut vertices, *cell);
+            push_box_edges(&mut vertices, *cell, 1.0);
             if vertices.len() >= self.selection_capacity {
                 vertices.truncate(self.selection_capacity);
                 break;
@@ -959,6 +986,67 @@ impl Renderer {
             self.gpu
                 .queue
                 .write_buffer(&self.selection, 0, bytemuck::cast_slice(&vertices));
+        }
+    }
+
+    /// Turns the chunk-border overlay on or off.
+    ///
+    /// Costs nothing while off: the geometry is built during the frame that
+    /// draws it, from the chunks the culler has already decided are visible.
+    pub const fn set_chunk_borders(&mut self, show: bool) {
+        self.show_borders = show;
+    }
+
+    /// Whether the chunk-border overlay is on.
+    #[must_use]
+    pub const fn chunk_borders(&self) -> bool {
+        self.show_borders
+    }
+
+    /// How many line vertices the border overlay drew last frame.
+    ///
+    /// For the test that ties it to the culled set: a cage that draws the wrong
+    /// number of boxes is a cage around the wrong thing, and no screenshot of a
+    /// grid-textured floor will say so.
+    #[must_use]
+    pub const fn chunk_border_vertices(&self) -> u32 {
+        self.border_vertices
+    }
+
+    /// Builds the border boxes for the chunks about to be drawn.
+    ///
+    /// In CELLS, like everything the selection shader takes — it divides by three
+    /// on the way to clip space — so a chunk is `CHUNK_SUBNODES` on a side rather
+    /// than `CHUNK_BLOCKS`. Getting that wrong draws a cage a third of the size
+    /// of the thing it is supposed to be outlining, which looks like a bug in the
+    /// culler rather than in a constant.
+    fn upload_chunk_borders(&mut self, camera: &Camera, visible: &[ChunkPos]) {
+        if !self.show_borders {
+            self.border_vertices = 0;
+            return;
+        }
+
+        let side = f32::from(u16::try_from(tiamot_core::CHUNK_SUBNODES).unwrap_or(48));
+        let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(visible.len() * 24);
+        for pos in visible {
+            let offset = camera.position.chunk_offset(*pos);
+            let cells = tiamot_core::SUBNODES_PER_AXIS as f32;
+            push_box_edges(
+                &mut vertices,
+                [offset.x * cells, offset.y * cells, offset.z * cells],
+                side,
+            );
+            if vertices.len() >= CHUNK_BORDER_CAPACITY {
+                vertices.truncate(CHUNK_BORDER_CAPACITY);
+                break;
+            }
+        }
+
+        self.border_vertices = u32::try_from(vertices.len()).unwrap_or(0);
+        if !vertices.is_empty() {
+            self.gpu
+                .queue
+                .write_buffer(&self.borders, 0, bytemuck::cast_slice(&vertices));
         }
     }
 
@@ -1188,6 +1276,38 @@ impl Renderer {
         );
     }
 
+    /// Where the world pass draws, and with which pipelines.
+    ///
+    /// Straight to the target in modes 1 and 2, and into the float scene texture
+    /// in mode 3 so the post chain has something with headroom in it to read.
+    fn world_pass_target<'a>(
+        &'a self,
+        target: &'a wgpu::TextureView,
+    ) -> (
+        &'a wgpu::TextureView,
+        &'a wgpu::TextureView,
+        &'a wgpu::RenderPipeline,
+        &'a wgpu::RenderPipeline,
+    ) {
+        match self.post.as_ref() {
+            Some(post) => {
+                let (scene, depth) = post.scene_target();
+                (
+                    scene,
+                    depth,
+                    post.world_pipeline(),
+                    post.selection_pipeline(),
+                )
+            }
+            None => (
+                target,
+                &self.depth,
+                &self.pipeline,
+                &self.selection_pipeline,
+            ),
+        }
+    }
+
     /// Draws the visible chunks into every shadow cascade.
     ///
     /// The same meshes and the same instance buffer as the world pass, drawn
@@ -1259,6 +1379,7 @@ impl Renderer {
         );
 
         let visible = self.cull_and_upload(camera, view_projection);
+        self.upload_chunk_borders(camera, &visible);
 
         let mut encoder = self
             .gpu
@@ -1269,26 +1390,7 @@ impl Renderer {
 
         self.fill_cascades(&mut encoder, &visible);
 
-        // Where the world goes: straight to the target in modes 1 and 2, and
-        // into the float scene texture in mode 3 so the post chain has
-        // something with headroom in it to read.
-        let (colour, depth, world_pipeline, selection_pipeline) = match self.post.as_ref() {
-            Some(post) => {
-                let (scene, depth) = post.scene_target();
-                (
-                    scene,
-                    depth,
-                    post.world_pipeline(),
-                    post.selection_pipeline(),
-                )
-            }
-            None => (
-                target,
-                &self.depth,
-                &self.pipeline,
-                &self.selection_pipeline,
-            ),
-        };
+        let (colour, depth, world_pipeline, selection_pipeline) = self.world_pass_target(target);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1350,6 +1452,13 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.selection.slice(..));
                 pass.draw(0..self.selection_vertices, 0..1);
             }
+
+            // And the chunk cage over that, when it is asked for.
+            if self.border_vertices > 0 {
+                pass.set_pipeline(selection_pipeline);
+                pass.set_vertex_buffer(0, self.borders.slice(..));
+                pass.draw(0..self.border_vertices, 0..1);
+            }
         }
 
         // The post chain, if this mode has one. It reads the scene texture the
@@ -1366,7 +1475,7 @@ impl Renderer {
 /// Twelve segments, twenty-four vertices. A line *strip* would need degenerate
 /// segments to jump between the disconnected edges of a cube, and those show up
 /// as stray diagonals the moment anything upstream reorders them.
-fn push_box_edges(out: &mut Vec<[f32; 3]>, corner: [f32; 3]) {
+fn push_box_edges(out: &mut Vec<[f32; 3]>, corner: [f32; 3], size: f32) {
     // Bottom face, top face, then the four uprights joining them.
     const EDGES: [(usize, usize); 12] = [
         (0, 1),
@@ -1386,13 +1495,13 @@ fn push_box_edges(out: &mut Vec<[f32; 3]>, corner: [f32; 3]) {
     let [x, y, z] = corner;
     let corners = [
         [x, y, z],
-        [x + 1.0, y, z],
-        [x + 1.0, y, z + 1.0],
-        [x, y, z + 1.0],
-        [x, y + 1.0, z],
-        [x + 1.0, y + 1.0, z],
-        [x + 1.0, y + 1.0, z + 1.0],
-        [x, y + 1.0, z + 1.0],
+        [x + size, y, z],
+        [x + size, y, z + size],
+        [x, y, z + size],
+        [x, y + size, z],
+        [x + size, y + size, z],
+        [x + size, y + size, z + size],
+        [x, y + size, z + size],
     ];
     for (from, to) in EDGES {
         out.push(corners[from]);

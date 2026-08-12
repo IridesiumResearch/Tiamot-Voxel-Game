@@ -2012,3 +2012,57 @@ fn dump_the_mode_matrix() {
         }
     }
 }
+
+#[test]
+fn the_chunk_border_overlay_draws_only_when_it_is_asked_for() {
+    // A debugging view, and one this session wanted badly: "it almost feels like
+    // chunk boundaries have their own collision", with no way to see where they
+    // were. Asserted from both ends, because an overlay that never draws and one
+    // that always draws both look like "it works" from one screenshot.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    assert!(
+        !renderer.chunk_borders(),
+        "a debugging overlay must be off until asked for"
+    );
+    let plain = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    renderer.set_chunk_borders(true);
+    let caged = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    assert_ne!(
+        perceptual_hash(&plain),
+        perceptual_hash(&caged),
+        "turning the borders on changed nothing on screen"
+    );
+
+    // One box per chunk the culler kept, and a box is twelve segments of two
+    // vertices. The pixels alone cannot check this — the fixed scene's floor
+    // texture is itself a grid, so a cage of the wrong size or in the wrong place
+    // still looks like lines on a grid.
+    assert_eq!(
+        renderer.chunk_border_vertices(),
+        renderer.drawn() as u32 * 24,
+        "the overlay drew {} vertices for {} visible chunks",
+        renderer.chunk_border_vertices(),
+        renderer.drawn()
+    );
+
+    // And back off again, to exactly what it was: an overlay that leaves
+    // something behind is worse than one that never drew.
+    renderer.set_chunk_borders(false);
+    let plain_again = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    assert_eq!(
+        perceptual_hash(&plain),
+        perceptual_hash(&plain_again),
+        "turning the borders off left some of them on screen"
+    );
+}

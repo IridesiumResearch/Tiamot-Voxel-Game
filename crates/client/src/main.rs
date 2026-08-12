@@ -335,6 +335,10 @@ impl ApplicationHandler for Client {
                         // are the largest thing the client allocates and the
                         // right setting depends entirely on the card.
                         KeyCode::KeyK if pressed => surface.app.cycle_shadow_quality(),
+                        KeyCode::KeyB if pressed => {
+                            let on = surface.app.toggle_chunk_borders();
+                            tracing::info!(on, "chunk borders");
+                        }
                         // Scrubbing the sky by hand, for looking at shadows at
                         // an hour that is not the one the server is at. A
                         // twentieth of a day a press, so a full circuit is
