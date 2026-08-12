@@ -122,6 +122,19 @@ const THIRD_PERSON_DISTANCE: f64 = 4.0;
 
 const INPUT_LEAD: u64 = 4;
 
+/// One frame's row in the per-frame log, and where it is going.
+struct FrameLog {
+    writer: std::io::BufWriter<std::fs::File>,
+    frame: u64,
+    started: std::time::Instant,
+}
+
+/// Rows the per-frame log will write before it stops.
+///
+/// A minute at a thousand frames a second. Bounded because the log exists to be
+/// read, and a file too large to open is a file that answers nothing.
+const MAX_LOGGED_FRAMES: u64 = 60_000;
+
 /// How many consecutive ticks one jump press is sent for.
 ///
 /// Two, and the ceiling on it is physical rather than chosen: a jump is only
@@ -574,6 +587,11 @@ pub struct App {
     warnings: Vec<String>,
     /// A smoothed frame rate, for the HUD.
     fps: f32,
+    /// The most recent frame's duration, in seconds, for the per-frame log.
+    ///
+    /// The smoothed rate above is the readable number and the wrong one for a
+    /// log: a hitch is one row, and an average hides it.
+    last_dt: f32,
     /// Frame pacing over the last second, and what the remesh cost during it.
     pacing: Pacing,
     /// Where the frame that just ended spent its time, waiting to be paired
@@ -626,6 +644,15 @@ pub struct App {
     /// so frames and ticks are decoupled here: a fast machine predicts the same
     /// ticks a slow one does, just with more frames between them.
     tick_carry: f32,
+    /// Where a per-FRAME log is being written, if one was asked for.
+    ///
+    /// The physics trace above records one line per server message, which is the
+    /// right grain for "did the two simulations agree". This is the other grain:
+    /// one line per frame, with the phase timings, the streaming counters and the
+    /// body all on the same row, so a hitch can be lined up against what the
+    /// client was doing when it happened. Bounded, because a thousand frames a
+    /// second fills a disk faster than it fills a diagnosis.
+    frames: Option<std::cell::RefCell<FrameLog>>,
     /// Where a per-tick physics trace is being written, if one was asked for.
     ///
     /// **The tool for a disagreement that will not reproduce.** A HUD reports a
@@ -717,6 +744,7 @@ impl App {
             joined: false,
             warnings: Vec::new(),
             fps: 0.0,
+            last_dt: 0.0,
             pacing: Pacing::default(),
             last_phases: Phases::default(),
             sky: crate::sky::Sky::none(),
@@ -730,6 +758,7 @@ impl App {
             dig: None,
             tick_carry: 0.0,
             trace: None,
+            frames: None,
             present_mode: None,
             jump_edge: 0,
             previous_intent: Intent::default(),
@@ -998,6 +1027,106 @@ impl App {
         if touched_absent {
             self.pacing.predicted_into_the_unloaded();
         }
+    }
+
+    /// Starts writing a per-frame log to `path`, as CSV.
+    ///
+    /// Returns whether the file could be opened. Asked for explicitly, like the
+    /// physics trace, and for the same reason — see [`App::trace_physics_to`].
+    pub fn log_frames_to(&mut self, path: &std::path::Path) -> bool {
+        use std::io::Write as _;
+
+        let Ok(file) = std::fs::File::create(path) else {
+            return false;
+        };
+        let mut writer = std::io::BufWriter::new(file);
+        // Named in full: a column nobody can identify is a column nobody reads.
+        let header = "frame,elapsed_ms,dt_ms,presented,net_ms,remesh_ms,advance_ms,acquire_ms,\
+                      world_ms,hud_ms,present_ms,fps,chunks_held,meshed,drawn,queued,\
+                      buffers_created,buffers_reused,tick,confirmed,lead,worst_correction,\
+                      vertical_pct,worst_divergence,footing_changes,unloaded,body_x,body_y,\
+                      body_z,vel_x,vel_y,vel_z,on_ground,step_lag,camera_y\n";
+        if writer.write_all(header.as_bytes()).is_err() {
+            return false;
+        }
+        self.frames = Some(std::cell::RefCell::new(FrameLog {
+            writer,
+            frame: 0,
+            started: std::time::Instant::now(),
+        }));
+        true
+    }
+
+    /// Writes one frame's row, if a log was asked for.
+    ///
+    /// `presented` is the fact the phase timings cannot supply: a frame that did
+    /// everything and never reached the screen looks identical in every other
+    /// column.
+    pub fn log_frame(&self, phases: &Phases, presented: bool) {
+        use std::io::Write as _;
+
+        let Some(log) = self.frames.as_ref() else {
+            return;
+        };
+        let Ok(mut log) = log.try_borrow_mut() else {
+            return;
+        };
+        if log.frame >= MAX_LOGGED_FRAMES {
+            return;
+        }
+        log.frame += 1;
+        // Read out before the write borrows the writer mutably.
+        let frame = log.frame;
+        let elapsed = log.started.elapsed().as_secs_f32() * 1000.0;
+
+        let (tick, confirmed) = self.tick_pair();
+        let (created, reused) = self.renderer.buffer_stats();
+        let body = self.predictor.as_ref().map(super::predict::Predictor::body);
+        let position = body.map_or([0.0; 3], |body| body.position);
+        let velocity = body.map_or([0.0; 3], |body| body.velocity);
+        let on_ground = body.is_some_and(|body| body.on_ground);
+        let step_lag = self
+            .predictor
+            .as_ref()
+            .map_or(0.0, super::predict::Predictor::step_lag);
+
+        let _ = writeln!(
+            log.writer,
+            "{},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.0},{},{},{},{},\
+             {created},{reused},{tick},{confirmed},{},{:.4},{},{:.4},{},{},{:.4},{:.4},{:.4},\
+             {:.4},{:.4},{:.4},{},{:.4},{:.4}",
+            frame,
+            elapsed,
+            self.last_dt * 1000.0,
+            u8::from(presented),
+            phases.network,
+            phases.remesh,
+            phases.advance,
+            phases.acquire,
+            phases.world,
+            phases.hud,
+            phases.present,
+            self.fps,
+            self.store.len(),
+            self.renderer.chunk_count(),
+            self.renderer.drawn(),
+            self.store.dirty_len(),
+            tick as i64 - confirmed as i64,
+            self.pacing.worst_correction_cells(),
+            self.pacing.worst_correction_vertical_percent(),
+            self.pacing.worst_divergence_cells(),
+            self.pacing.footing_changes_last_second(),
+            u8::from(self.pacing.predicted_into_unloaded()),
+            position[0],
+            position[1],
+            position[2],
+            velocity[0],
+            velocity[1],
+            velocity[2],
+            u8::from(on_ground),
+            step_lag,
+            self.camera.position.to_world().1,
+        );
     }
 
     /// Starts writing a per-tick physics trace to `path`.
@@ -1779,6 +1908,7 @@ impl App {
 
     /// Moves the camera and records the frame time.
     pub fn advance(&mut self, input: Input, dt: f32) {
+        self.last_dt = dt;
         // Smoothed rather than instantaneous. A per-frame number is unreadable,
         // and charter rule 18 cares about pacing — which a jittering readout
         // actively hides.

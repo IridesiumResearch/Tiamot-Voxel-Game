@@ -488,6 +488,14 @@ impl Client {
                 // reading it would be process-global state a caller cannot
                 // control, which is a poor thing for tests and a worse one for an
                 // embedded server.
+                if let Some(path) = std::env::var_os("TIAMOT_TRACE_FRAMES") {
+                    let path = std::path::PathBuf::from(path);
+                    if app.log_frames_to(&path) {
+                        tracing::info!(path = %path.display(), "logging every frame");
+                    } else {
+                        tracing::warn!(path = %path.display(), "could not open the frame log");
+                    }
+                }
                 if let Some(path) = std::env::var_os("TIAMOT_TRACE_PHYSICS") {
                     let path = std::path::PathBuf::from(path);
                     if app.trace_physics_to(&path) {
@@ -560,12 +568,18 @@ impl Client {
                     surface.size,
                     self.config.vsync,
                 );
+                phases.acquire = elapsed_ms(phase);
+                surface.app.log_frame(&phases, false);
                 return true;
             }
 
             // Minimised, or the compositor is busy. Not an error, and not worth
-            // a log line every frame while a window sits in the dock.
+            // a log line every frame while a window sits in the dock — but it IS
+            // worth a row in the frame log, because a frame that produced no
+            // picture is exactly what the log exists to count.
             wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+                phases.acquire = elapsed_ms(phase);
+                surface.app.log_frame(&phases, false);
                 return true;
             }
 
@@ -625,6 +639,7 @@ impl Client {
         // — a gap means frames are still being built and dropped, which is the
         // thing this was added to catch.
         surface.app.note_presented();
+        surface.app.log_frame(&phases, true);
 
         // Paired with the `dt` measured at the top of the NEXT frame, which is
         // what actually measures this one.

@@ -1352,3 +1352,103 @@ fn walking_across_chunk_boundaries_never_touches_a_chunk_it_does_not_have() {
     app.shutdown();
     assert!(server.stop());
 }
+
+#[test]
+fn the_frame_log_records_every_column_it_promises() {
+    // **The log a scripted session will be read from.** It will be looked at
+    // once, offline, by someone who cannot re-run it — so a missing column or a
+    // row that never arrives is not an inconvenience, it is the whole session
+    // wasted.
+    //
+    // So: the header names every field the writer writes, every row has as many
+    // values as the header has names, and the numbers that should move during a
+    // jump actually move.
+    let Some(gpu) = gpu() else { return };
+    let log_path = scratch("frame-log").join("frames.csv");
+    let server = embedded("frame-log");
+    let mut app = client("frame-log", &server, gpu);
+    assert!(
+        app.log_frames_to(&log_path),
+        "could not open {}",
+        log_path.display()
+    );
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+
+    // A headless client has no swapchain, so the frames are logged by hand here
+    // exactly as `main` logs them — which is also what proves the columns line up
+    // without a window.
+    let phases = client::app::Phases::default();
+    run_real_time(&mut app, 0.6, Input::default());
+    for _ in 0..30 {
+        app.pump_network();
+        app.advance(Input::default(), 1.0 / 60.0);
+        app.log_frame(&phases, true);
+    }
+    let jump = Input {
+        jump: true,
+        ..Input::default()
+    };
+    for tick in 0..90 {
+        app.pump_network();
+        app.advance(if tick < 4 { jump } else { Input::default() }, 1.0 / 60.0);
+        app.log_frame(&phases, tick % 3 != 0);
+    }
+
+    app.shutdown();
+    assert!(server.stop());
+
+    let written = std::fs::read_to_string(&log_path).expect("the frame log should exist");
+    let mut lines = written.lines();
+    let header = lines.next().expect("a header");
+    let columns = header.split(',').count();
+    assert!(
+        columns > 30,
+        "the header names only {columns} columns, which is fewer than the log writes"
+    );
+
+    let rows: Vec<&str> = lines.collect();
+    assert!(rows.len() >= 100, "only {} rows were written", rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(
+            row.split(',').count(),
+            columns,
+            "row {index} has a different number of values than the header names: {row}"
+        );
+    }
+
+    // The body must be doing something across a jump, or the log is a column of
+    // zeroes that would look like a perfectly still player.
+    let column = |name: &str| -> usize {
+        header
+            .split(',')
+            .position(|field| field == name)
+            .unwrap_or_else(|| panic!("no `{name}` column in: {header}"))
+    };
+    let body_y = column("body_y");
+    let heights: Vec<f32> = rows
+        .iter()
+        .filter_map(|row| row.split(',').nth(body_y)?.parse().ok())
+        .collect();
+    let lowest = heights.iter().copied().fold(f32::MAX, f32::min);
+    let highest = heights.iter().copied().fold(f32::MIN, f32::max);
+    assert!(
+        highest - lowest > 1.0,
+        "the body never moved across a jump ({lowest} to {highest}), so the log is recording \
+         something other than the player"
+    );
+
+    // And the presented column has both answers in it, or it is not a fact.
+    let presented = column("presented");
+    let shown = rows
+        .iter()
+        .filter(|row| row.split(',').nth(presented) == Some("1"))
+        .count();
+    assert!(
+        shown > 0 && shown < rows.len(),
+        "{shown} of {} rows say presented, which cannot distinguish a dropped frame",
+        rows.len()
+    );
+}
