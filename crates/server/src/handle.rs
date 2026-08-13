@@ -717,6 +717,10 @@ impl ServerHandle {
                     };
                     info!(seed = world.seed(), "world seed");
 
+                    // One per server, opened on the simulation thread because
+                    // that is the only thread that writes to it.
+                    let trace = crate::trace::Trace::from_environment();
+
                     // Light is derived and lives only in memory — see
                     // `crate::light`. It is built here rather than in `Shared`
                     // because only the simulation thread may touch it: every
@@ -844,12 +848,31 @@ impl ServerHandle {
                             for player in bodies.values_mut() {
                                 let intent = player.inputs.take(tick);
                                 let voxels = tiamot_core::phys::Voxels::new(&world, player.origin);
+                                let before = player.body;
                                 player.body = tiamot_core::phys::step(
                                     &voxels,
                                     player.body,
                                     intent,
                                     &tiamot_core::phys::Tuning::DEFAULT,
                                 );
+                                // **The server's half of the picture.** A client
+                                // log established that the two simulations part
+                                // company by cells while the PLAYER IS STANDING
+                                // STILL and the server is loading chunks hard —
+                                // so the body that moves is this one, and only
+                                // this side can say what it was standing on when
+                                // it did.
+                                if let Some(trace) = trace.as_ref() {
+                                    trace.tick(&crate::trace::Moment {
+                                        tick,
+                                        origin: player.origin,
+                                        before: &before,
+                                        after: &player.body,
+                                        intent,
+                                        touched_absent: voxels.touched_absent(),
+                                        chunks_cached: world.cached(),
+                                    });
+                                }
                                 // Charter rule 7: keep the local part inside
                                 // one chunk so it never becomes a world-space
                                 // f32 that loses precision as the player walks.
