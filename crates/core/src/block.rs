@@ -333,6 +333,31 @@ impl BlockValue {
 }
 
 impl BlockView<'_> {
+    /// Whether the block is entirely air.
+    ///
+    /// **Sub-Node Contract §4's whole predicate.** A block accepts fluid iff its
+    /// occupancy is empty; `Partial` and `Mixed` blocks are fluid-solid however
+    /// little of them is occupied, which is why this asks about *emptiness*
+    /// rather than about how much room is left. There is no partially flooded
+    /// carved block, by design, and this is the line that says so.
+    ///
+    /// A `Partial` with a zero mask and a `Mixed` of nothing but air are both
+    /// forms the canonicaliser collapses to `Uniform(AIR)`, so in practice only
+    /// the first arm ever answers true — but the other two are written out
+    /// rather than assumed, because a predicate this load-bearing should not
+    /// depend on an invariant enforced somewhere else.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Uniform(material) => material.is_air(),
+            Self::Partial {
+                material,
+                occupancy,
+            } => *occupancy == 0 || material.is_air(),
+            Self::Mixed(cells) => cells.iter().all(|material| material.is_air()),
+        }
+    }
+
     /// The material at a sub-node index.
     ///
     /// # Panics
