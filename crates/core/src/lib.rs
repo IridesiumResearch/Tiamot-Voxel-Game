@@ -66,6 +66,7 @@ pub mod content;
 pub mod coords;
 pub mod detgen;
 pub mod dig;
+pub mod fluid;
 pub mod identity;
 pub mod interest;
 pub mod inventory;
