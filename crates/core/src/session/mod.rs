@@ -197,6 +197,14 @@ pub struct JoinContext<'a> {
     /// means the engine has no tools of its own, so a client that was not told
     /// could not offer a way to pick one. See [`crate::proto::ToolDef`].
     pub tools: &'a [crate::proto::ToolDef],
+    /// Every fluid the loaded mods registered, in ascending id order.
+    ///
+    /// Sent with the other tables and for the same reason: a chunk's fluid
+    /// names its fluid by a per-session number, so a client that was not told
+    /// what those numbers mean would know a block held something and have
+    /// nothing to draw it as. Empty is a world with no fluid, which is most of
+    /// them. See [`crate::proto::FluidDef`].
+    pub fluids: &'a [crate::proto::FluidDef],
     /// The sky a mod registered: how long a day is, and its keyframes.
     ///
     /// A day length of zero with no keyframes means no mod registered one,
@@ -588,6 +596,9 @@ impl Session {
                 ServerMessage::ToolTable {
                     tools: context.tools.to_vec(),
                 },
+                ServerMessage::FluidTable {
+                    fluids: context.fluids.to_vec(),
+                },
                 // The sky travels with the other registration tables rather
                 // than after the join, so a client has it before the first
                 // frame it draws. Arriving later would show one frame of
@@ -763,6 +774,7 @@ mod tests {
             mods,
             mod_set_fingerprint: 0xCAFE,
             materials: &[],
+            fluids: &[],
             tools: &[],
             sky: (0, &[]),
             allowlist,
@@ -849,11 +861,15 @@ mod tests {
         // the engine has no tools of its own (charter rule 1), so a client that
         // was not told this could not offer a way to choose one.
         assert!(matches!(sent[4], ServerMessage::ToolTable { .. }));
-        // And the sky, for the third instance of the same reason: the engine
-        // has no day of its own, so a client not told this would draw one
-        // frame of whatever it guessed before being corrected.
-        assert!(matches!(sent[5], ServerMessage::SkyTable { .. }));
-        assert!(matches!(sent[6], ServerMessage::JoinWorld { .. }));
+        // And the fluids, third instance: a chunk's fluid names its fluid by a
+        // per-session number, so a client not told what those mean would know a
+        // block held something and have nothing to draw it as.
+        assert!(matches!(sent[5], ServerMessage::FluidTable { .. }));
+        // And the sky, for the fourth: the engine has no day of its own, so a
+        // client not told this would draw one frame of whatever it guessed
+        // before being corrected.
+        assert!(matches!(sent[6], ServerMessage::SkyTable { .. }));
+        assert!(matches!(sent[7], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]

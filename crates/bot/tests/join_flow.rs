@@ -106,7 +106,12 @@ fn a_bot_completes_the_whole_join_flow() {
             // engine has no tools of its own (charter rule 1), so a client that
             // was not told this could not offer a way to choose one.
             "ToolTable",
-            // Protocol v9, and the same reason a third time: the engine has no
+            // Protocol v11, and the same reason a third time: a chunk's fluid
+            // names its fluid by a per-session number, so a client not told
+            // what those mean would know a block held something and have
+            // nothing to draw it as.
+            "FluidTable",
+            // Protocol v9, and the same reason a fourth time: the engine has no
             // sky of its own, so a client not told this would draw one frame of
             // whatever it guessed.
             "SkyTable",
@@ -503,6 +508,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::ModManifest { .. } => "ModManifest",
         ServerMessage::MaterialTable { .. } => "MaterialTable",
         ServerMessage::ToolTable { .. } => "ToolTable",
+        ServerMessage::FluidTable { .. } => "FluidTable",
         ServerMessage::SkyTable { .. } => "SkyTable",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",

@@ -529,6 +529,27 @@ impl ServerHandle {
             },
         );
 
+        // The same registry, as the wire carries it. Built here rather than in
+        // the tick because the join tables are assembled once, before the
+        // simulation thread starts, and a client needs this before its first
+        // chunk rather than after its first pond.
+        let fluid_table: Vec<tiamot_core::proto::FluidDef> = fluids
+            .iter()
+            .map(|(id, registered)| {
+                let mut depths = [0u8; 8];
+                for (level, depth) in depths.iter_mut().enumerate() {
+                    *depth =
+                        tiamot_core::fluid::Fluid::flowing(id, level as u8).depth_units() as u8;
+                }
+                tiamot_core::proto::FluidDef {
+                    id: id.0,
+                    name: registered.name.clone(),
+                    material: registered.material.get(),
+                    depths,
+                }
+            })
+            .collect();
+
         // The sky, as the wire carries it. Absent is legitimate: a world whose
         // mods register no sky has no day, and the client holds its colours
         // fixed rather than being given one the engine invented.
@@ -608,6 +629,7 @@ impl ServerHandle {
             mods,
             materials,
             tool_table,
+            fluid_table,
             sky_day_length: sky.0,
             sky_keyframes: sky.1,
             // Where the mod said its day starts, in ticks. A counter left at

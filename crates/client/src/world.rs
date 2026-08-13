@@ -73,6 +73,19 @@ pub struct ChunkStore {
     /// the map holds what there is milk in, so a world with one pond has one
     /// entry however far anybody walks.
     fluid: BTreeMap<ChunkPos, FluidLayer>,
+    /// What each registered fluid is drawn as, indexed by fluid id.
+    ///
+    /// Zero means "no fluid registered under that id", which is both the
+    /// untouched state and the honest answer for a payload naming a fluid this
+    /// client was never told about.
+    fluid_materials: [u16; tiamot_core::fluid::MAX_FLUIDS + 1],
+    /// How deep each level of each fluid sits, in twenty-sevenths.
+    ///
+    /// Sent by the server rather than recomputed here — see
+    /// `tiamot_core::proto::FluidDef`. Two sides disagreeing about where a
+    /// surface is would show as milk at one height on screen and another under
+    /// your feet.
+    fluid_depths: [[u8; 8]; tiamot_core::fluid::MAX_FLUIDS + 1],
 }
 
 impl ChunkStore {
@@ -134,6 +147,61 @@ impl ChunkStore {
         // already dirty stays one entry, and during streaming the neighbours
         // are arriving and being marked anyway.
         self.mark_neighbours(pos);
+    }
+
+    /// Takes the fluid table the server sent on join.
+    ///
+    /// Everything already meshed is marked dirty, because until this arrives a
+    /// chunk holding milk has no idea what to draw it as and meshed it dry. In
+    /// practice the table lands before the first chunk, so this marks nothing —
+    /// which is the point of doing it anyway rather than relying on the order.
+    pub fn set_fluid_table(&mut self, fluids: &[tiamot_core::proto::FluidDef]) {
+        self.fluid_materials = [0; tiamot_core::fluid::MAX_FLUIDS + 1];
+        self.fluid_depths = [[0; 8]; tiamot_core::fluid::MAX_FLUIDS + 1];
+        for def in fluids {
+            let Some(slot) = usize::from(def.id).checked_sub(0) else {
+                continue;
+            };
+            if slot >= self.fluid_materials.len() {
+                continue;
+            }
+            self.fluid_materials[slot] = def.material;
+            self.fluid_depths[slot] = def.depths;
+        }
+        if !self.fluid.is_empty() {
+            self.mark_all_dirty();
+        }
+    }
+
+    /// The fluid in one chunk, as the mesher wants it.
+    ///
+    /// Returns something that answers per block, so a remesh does one map
+    /// lookup rather than 4,096.
+    #[must_use]
+    pub fn fluid_for(&self, pos: ChunkPos) -> ChunkFluid<'_> {
+        ChunkFluid { store: self, pos }
+    }
+
+    /// What one block of fluid is drawn as, and how deep it sits.
+    ///
+    /// `None` for an empty block, and for a fluid this client was never told
+    /// about — which is a server sending a fluid it did not register, and is
+    /// drawn as nothing rather than guessed at.
+    #[must_use]
+    pub fn fluid_fill(&self, value: tiamot_core::fluid::Fluid) -> Option<(u16, u8)> {
+        if value.is_empty() {
+            return None;
+        }
+        let slot = usize::from(value.fluid().0);
+        let material = *self.fluid_materials.get(slot)?;
+        if material == 0 {
+            return None;
+        }
+        let depth = *self
+            .fluid_depths
+            .get(slot)?
+            .get(usize::from(value.level()))?;
+        (depth > 0).then_some((material, depth))
     }
 
     /// Takes a chunk's fluid, as a whole layer.
@@ -477,6 +545,43 @@ impl crate::shade::BlockLight for ChunkLight<'_> {
     }
 }
 
+/// One chunk's fluid, as [`crate::mesher::FluidFill`] asks for it.
+///
+/// Borrows the store rather than copying a layer: a remesh is on the frame
+/// loop, and 4 KiB memcpy per chunk per remesh is a cost with nothing to show
+/// for it.
+pub struct ChunkFluid<'a> {
+    store: &'a ChunkStore,
+    pos: ChunkPos,
+}
+
+impl crate::mesher::FluidFill for ChunkFluid<'_> {
+    fn fill(&self, local: tiamot_core::coords::LocalBlock) -> Option<(u16, u8)> {
+        let span = tiamot_core::CHUNK_BLOCKS as i32;
+        let at = tiamot_core::BlockPos::new(
+            self.pos.x * span + local.x as i32,
+            self.pos.y * span + local.y as i32,
+            self.pos.z * span + local.z as i32,
+        );
+        let (material, depth) = self.store.fluid_fill(self.store.fluid_at(at))?;
+
+        // **A block with fluid above it is FULL, whatever its own level says.**
+        //
+        // Without this a column of milk draws as a stack of slabs with an air
+        // gap between each — the surface rule applied to a block that has no
+        // surface, because the block above is milk too. The same rule every
+        // fluid renderer has, and the reason a waterfall reads as a column.
+        let above = tiamot_core::BlockPos::new(at.x, at.y + 1, at.z);
+        if !self.store.fluid_at(above).is_empty() {
+            return Some((
+                material,
+                u8::try_from(tiamot_core::UNITS_PER_BLOCK).unwrap_or(u8::MAX),
+            ));
+        }
+        Some((material, depth))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,6 +804,7 @@ mod tests {
             &store.neighbours(ChunkPos::new(0, 0, 0)),
             ABSENT_POLICY,
             &crate::shade::Uniform(Light::DAYLIGHT),
+            &crate::mesher::NoFluid,
         );
         assert!(
             mesh.is_empty(),

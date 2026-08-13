@@ -140,7 +140,7 @@ impl Fluid {
         self.level() == 0 || self.fluid().is_none()
     }
 
-    /// How much of the block's height this fills, in twenty-sevenths.
+    /// How much of the block's HEIGHT this fills, in twenty-sevenths.
     ///
     /// **In sub-node units even though fluid is block-resolution**, because the
     /// only things that ask are the renderer's surface height and the physics'
@@ -153,7 +153,10 @@ impl Fluid {
         if self.is_empty() {
             return 0;
         }
-        // level 7 -> 24 cells, level 1 -> 3 cells (one sub-node), linear between.
+        // Level 7 is 24/27, about 0.9 of a block; level 1 is 3/27, a ninth.
+        // A fraction rather than a cell count: a block is only three sub-nodes
+        // tall, and the whole point of this number is to express surface
+        // heights the lattice cannot.
         (self.level() as u32) * 24 / (MAX_LEVEL as u32)
     }
 }

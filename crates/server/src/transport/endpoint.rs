@@ -93,6 +93,8 @@ pub struct Shared {
     /// order a client shows tools in should be a property of the mod set rather
     /// than of a map's iteration.
     pub tool_table: Vec<tiamot_core::proto::ToolDef>,
+    /// Every fluid the mods registered, for the join tables.
+    pub fluid_table: Vec<tiamot_core::proto::FluidDef>,
 
     /// Ticks in a full day, or 0 if no mod registered a sky.
     pub sky_day_length: u32,
@@ -1198,6 +1200,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 mod_set_fingerprint: shared.mod_set_fingerprint,
                 materials: &shared.materials,
                 tools: &shared.tool_table,
+                fluids: &shared.fluid_table,
                 sky: (shared.sky_day_length, &shared.sky_keyframes),
                 allowlist: &allowlist,
                 max_players: shared.max_players,
@@ -1456,6 +1459,7 @@ mod tests {
             mod_set_fingerprint: 0,
             materials: Vec::new(),
             tool_table: Vec::new(),
+            fluid_table: Vec::new(),
             sky_day_length: 0,
             sky_keyframes: Vec::new(),
             time_of_day: std::sync::atomic::AtomicU64::new(0),

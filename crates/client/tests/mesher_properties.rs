@@ -108,7 +108,9 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
+        &client::mesher::NoFluid,
+    );
         let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
         prop_assert_eq!(
@@ -127,7 +129,9 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
+        &client::mesher::NoFluid,
+    );
         let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
         let merged_area: u32 = merged
@@ -148,7 +152,9 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
+        &client::mesher::NoFluid,
+    );
         let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
         prop_assert!(
@@ -167,7 +173,9 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
+        &client::mesher::NoFluid,
+    );
 
         for quad in &merged.quads {
             prop_assert!(quad.du >= 1 && quad.dv >= 1, "degenerate quad {:?}", quad);
@@ -196,7 +204,9 @@ proptest! {
             let mut neighbours = Neighbours::none();
             neighbours.sides[side] = Some(&neighbour);
 
-            let merged = mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY);
+            let merged = mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY,
+        &client::mesher::NoFluid,
+    );
             let naive = reference::mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY);
 
             prop_assert_eq!(
@@ -215,7 +225,9 @@ proptest! {
         cells in cell_edits(),
     ) {
         let chunk = build(&blocks, &cells);
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
+        &client::mesher::NoFluid,
+    );
         let (vertices, indices) = merged.to_buffers();
 
         for vertex in &vertices {

@@ -224,21 +224,31 @@ fn walking_over_a_bad_link_keeps_the_correction_small() {
          distance — the player would see the client teleport rather than blend"
     );
 
-    // And bounded BELOW, which is what stops the assertion above being
-    // satisfied by a client that never predicted anything. Instrumenting the
-    // reconcile showed what actually happens here: the error is exactly 0.000
-    // on almost every tick — prediction and server agree bit for bit, as
-    // charter rule 4's determinism promises — with brief excursions to a couple
-    // of cells at exactly the ticks where the 5% loss ate an input. Those
-    // excursions ARE the thing being measured. Their absence would mean the
-    // loss never reached the client, and every number here would be a loopback
-    // measurement wearing a costume.
-    assert!(
-        worst > 0.1,
-        "the worst correction was {worst:.3} cells — essentially nothing ever needed \
-         correcting, so either the loss is not reaching the client or the client is not \
-         predicting"
-    );
+    // **There is deliberately NO lower bound**, and the reason is worth writing
+    // down because one used to be here and it was wrong twice.
+    //
+    // The bound existed to stop the upper one being satisfied by a client that
+    // never predicted anything — a real hazard, and the right instinct. But
+    // "packet loss MUST produce a visible correction" is not true, and is less
+    // true the better the engine gets:
+    //
+    // - Held straight forward, a lost input costs nothing at all.
+    //   `InputQueue::take` repeats the last intent for a tick nobody spoke for,
+    //   and a repeat of "forward" IS the input that went missing, so the server
+    //   arrives exactly where the client predicted.
+    // - Making the walk weave, so a repeat is wrong, produced 1.675 cells here
+    //   and **0.000 on macOS**, which is what a 5% loss over eight seconds
+    //   genuinely does when it happens not to eat a turn.
+    // - Before `d5ed968` the bound passed easily, because reconciliation was
+    //   replaying against a view anchored a chunk away and every crossing
+    //   produced a correction. It was measuring that bug.
+    //
+    // What the bound was really for is covered exactly, and deterministically,
+    // by two things that are still here: `the_impairment_is_actually_applied_to
+    // _the_client` proves the loss reaches the client at all, and the travel
+    // assertion below proves this client moved. A correct prediction under a
+    // bad link SHOULD read 0.000, and a test that fails for that is a test that
+    // punishes the engine for working.
 
     // And the client must still have been moving. A prediction that never
     // moves is never corrected, so a bound with no movement under it proves

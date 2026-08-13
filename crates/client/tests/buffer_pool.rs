@@ -81,7 +81,13 @@ fn streaming_chunks_reuses_buffers_instead_of_allocating_new_ones() {
 
     let mesh_of = |pos: ChunkPos, height: u32| {
         let chunk = surfaced(pos, height);
-        mesh_chunk(&chunk, &Neighbours::default(), Absent::Air, &DAY)
+        mesh_chunk(
+            &chunk,
+            &Neighbours::default(),
+            Absent::Air,
+            &DAY,
+            &client::mesher::NoFluid,
+        )
     };
 
     // Warm up: fill the resident set once. These are honest allocations — the
@@ -146,7 +152,13 @@ fn remeshing_a_chunk_in_place_allocates_nothing() {
     let chunk = surfaced(pos, 8);
     renderer.set_chunk(
         pos,
-        &mesh_chunk(&chunk, &Neighbours::default(), Absent::Air, &DAY),
+        &mesh_chunk(
+            &chunk,
+            &Neighbours::default(),
+            Absent::Air,
+            &DAY,
+            &client::mesher::NoFluid,
+        ),
     );
     let (baseline, _) = renderer.buffer_stats();
     assert!(baseline > 0, "the first upload allocated nothing");
@@ -154,7 +166,13 @@ fn remeshing_a_chunk_in_place_allocates_nothing() {
     for _ in 0..50 {
         renderer.set_chunk(
             pos,
-            &mesh_chunk(&chunk, &Neighbours::default(), Absent::Air, &DAY),
+            &mesh_chunk(
+                &chunk,
+                &Neighbours::default(),
+                Absent::Air,
+                &DAY,
+                &client::mesher::NoFluid,
+            ),
         );
     }
 
@@ -191,8 +209,20 @@ fn a_mesh_that_outgrows_its_buffer_gets_a_bigger_one() {
         }
     }
 
-    let small_mesh = mesh_chunk(&small, &Neighbours::default(), Absent::Air, &DAY);
-    let large_mesh = mesh_chunk(&large, &Neighbours::default(), Absent::Air, &DAY);
+    let small_mesh = mesh_chunk(
+        &small,
+        &Neighbours::default(),
+        Absent::Air,
+        &DAY,
+        &client::mesher::NoFluid,
+    );
+    let large_mesh = mesh_chunk(
+        &large,
+        &Neighbours::default(),
+        Absent::Air,
+        &DAY,
+        &client::mesher::NoFluid,
+    );
     assert!(
         large_mesh.to_buffers().0.len() > small_mesh.to_buffers().0.len() * 4,
         "the two scenes are not different enough in size to exercise a grow"

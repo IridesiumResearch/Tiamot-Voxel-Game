@@ -133,6 +133,33 @@ impl SubNodeGrid {
     /// is where the two disagree and a seam appears.
     #[must_use]
     pub fn from_chunk(chunk: &Chunk, neighbours: &Neighbours<'_>, absent: Absent) -> Self {
+        Self::from_chunk_with_fluid(chunk, neighbours, absent, &NoFluid)
+    }
+
+    /// The same, with fluid filled in.
+    ///
+    /// # Why fluid needs no render path of its own
+    ///
+    /// A fluid block's surface height is already ON the sub-node lattice: a
+    /// level of `n` fills `n × 24 / 7` of a block's 27 cells, which is always a
+    /// whole number of cells. So milk can be laid into the same grid as
+    /// terrain, as a slab of the fluid's material occupying the bottom of the
+    /// block — and greedy meshing, corner lighting, face culling and the atlas
+    /// all work on it unchanged.
+    ///
+    /// The alternative was a second pass with its own buffers, its own
+    /// lighting, and its own merge rules, which is a great deal of machinery to
+    /// draw a box.
+    ///
+    /// **Only in blocks that are empty**, which is Sub-Node Contract §4 and not
+    /// an optimisation: a block that holds terrain does not hold fluid, so the
+    /// two can never contend for the same cell.
+    pub fn from_chunk_with_fluid(
+        chunk: &Chunk,
+        neighbours: &Neighbours<'_>,
+        absent: Absent,
+        fluid: &impl FluidFill,
+    ) -> Self {
         let mut materials = vec![0u16; CELLS];
         let mut columns = [vec![0u64; N * N], vec![0u64; N * N], vec![0u64; N * N]];
 
@@ -144,6 +171,11 @@ impl SubNodeGrid {
             // contributes nothing; skipping it early is most of why a flat
             // scene is fast.
             if view.is_air() {
+                // Empty of terrain, so it may hold fluid. Contract §4: those
+                // are exactly the blocks that can.
+                if let Some((material, depth)) = fluid.fill(local) {
+                    fill_fluid(&mut materials, &mut columns, local, material, depth);
+                }
                 continue;
             }
 
@@ -271,6 +303,78 @@ pub struct Quad {
     /// see [`crate::shade`]. Interpolating across a quad whose corners came
     /// from different lighting would blur a shadow edge over the whole quad.
     pub shade: Shade,
+}
+
+/// Where a mesher asks what fluid a block holds.
+///
+/// A trait rather than a table so the mesher does not have to know how a client
+/// stores its fluid, and so a test can flood one block without building a
+/// registry.
+pub trait FluidFill {
+    /// The material and depth of the fluid in a block, in cells of 27.
+    ///
+    /// `None` for a dry block, and for a fluid the caller cannot draw — a
+    /// server naming a fluid it never registered is drawn as nothing rather
+    /// than guessed at.
+    fn fill(&self, local: LocalBlock) -> Option<(u16, u8)>;
+}
+
+/// A world with no fluid in it, which is most of them.
+pub struct NoFluid;
+
+impl FluidFill for NoFluid {
+    fn fill(&self, _local: LocalBlock) -> Option<(u16, u8)> {
+        None
+    }
+}
+
+/// Lays a fluid slab into the bottom `depth` cells of a block.
+///
+/// The cells are ordinary occupancy, so everything downstream treats milk as
+/// geometry: it merges, it occludes, it takes corner light. The one thing it is
+/// NOT is collision — the physics reads fluid from the fluid layer, never from
+/// a mesh.
+fn fill_fluid(
+    materials: &mut [u16],
+    columns: &mut [Vec<u64>; 3],
+    local: LocalBlock,
+    material: u16,
+    depth: u8,
+) {
+    let base_x = local.x as usize * SUBNODES_PER_AXIS as usize;
+    let base_y = local.y as usize * SUBNODES_PER_AXIS as usize;
+    let base_z = local.z as usize * SUBNODES_PER_AXIS as usize;
+
+    // **Seven levels onto three layers, and this is the coarse step.**
+    //
+    // `depth` is the fraction of the block's HEIGHT that is full, in
+    // twenty-sevenths — level 7 is 24/27, about 0.9 of a block, which is what
+    // gives a brim-full block a visible surface. A block is only three
+    // sub-nodes tall, so laying that into the lattice quantises seven levels
+    // into three heights: `depth / 9`.
+    //
+    // Clamped to at least one layer, because a level of 1 is 3/27 and would
+    // floor to nothing — a puddle that exists to the physics and to `get_fluid`
+    // and cannot be seen is worse than one drawn a little too deep.
+    //
+    // This is the honest limit of drawing fluid as lattice geometry, and it is
+    // the step before per-vertex surface heights rather than a substitute for
+    // them: smooth surfaces need heights BETWEEN cells, which is a vertex
+    // attribute rather than an occupancy bit.
+    let layers = (usize::from(depth) / 9).clamp(1, SUBNODES_PER_AXIS as usize);
+    for cy in 0..layers {
+        for cz in 0..SUBNODES_PER_AXIS as usize {
+            for cx in 0..SUBNODES_PER_AXIS as usize {
+                let x = base_x + cx;
+                let y = base_y + cy;
+                let z = base_z + cz;
+                materials[x + N * y + N * N * z] = material;
+                columns[0][y * N + z] |= 1 << (x as u32 + FIRST);
+                columns[1][x * N + z] |= 1 << (y as u32 + FIRST);
+                columns[2][x * N + y] |= 1 << (z as u32 + FIRST);
+            }
+        }
+    }
 }
 
 /// A meshed chunk.
@@ -590,8 +694,12 @@ pub fn mesh_chunk(
     neighbours: &Neighbours<'_>,
     absent: Absent,
     light: &impl BlockLight,
+    fluid: &impl FluidFill,
 ) -> Mesh {
-    mesh(&SubNodeGrid::from_chunk(chunk, neighbours, absent), light)
+    mesh(
+        &SubNodeGrid::from_chunk_with_fluid(chunk, neighbours, absent, fluid),
+        light,
+    )
 }
 
 impl crate::shade::CellOccupancy for SubNodeGrid {
@@ -859,7 +967,7 @@ mod tests {
             .set_block(BlockPos::new(5, 5, 5), BlockValue::Uniform(STONE))
             .expect("in chunk");
 
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
         assert_eq!(mesh.quads.len(), 6, "one block should merge to six quads");
 
         // And each covers a full 3x3 block face.
@@ -878,7 +986,7 @@ mod tests {
             .set_block(BlockPos::new(6, 5, 5), BlockValue::Uniform(STONE))
             .expect("in chunk");
 
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
         let expanded = faces(&mesh.quads);
 
         // Two blocks: 2 * 27 = 54 cells. The shared plane is 3x3 = 9 cells,
@@ -896,7 +1004,8 @@ mod tests {
         solid
             .set_block(BlockPos::new(5, 5, 5), BlockValue::Uniform(STONE))
             .expect("in chunk");
-        let before = faces(&mesh_chunk(&solid, &Neighbours::open(), Absent::Air, &DAY).quads);
+        let before =
+            faces(&mesh_chunk(&solid, &Neighbours::open(), Absent::Air, &DAY, &NoFluid).quads);
 
         let mut chiselled = solid.clone();
         // A corner cell of the block: removing it exposes three inward faces
@@ -904,7 +1013,8 @@ mod tests {
         chiselled
             .set_subnode(SubNodePos::new(15, 15, 15), MaterialId::AIR)
             .expect("in chunk");
-        let after = faces(&mesh_chunk(&chiselled, &Neighbours::open(), Absent::Air, &DAY).quads);
+        let after =
+            faces(&mesh_chunk(&chiselled, &Neighbours::open(), Absent::Air, &DAY, &NoFluid).quads);
 
         assert_ne!(before, after, "chiselling must change the surface");
         assert_eq!(
@@ -927,7 +1037,7 @@ mod tests {
             }
         }
 
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
         let top = mesh
             .quads
             .iter()
@@ -951,7 +1061,7 @@ mod tests {
             }
         }
 
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
         let top: Vec<_> = mesh
             .quads
             .iter()
@@ -975,7 +1085,7 @@ mod tests {
             .set_subnode(SubNodePos::new(8, 8, 8), STONE)
             .expect("in chunk");
 
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
         let reference = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
         assert_eq!(
@@ -1007,8 +1117,8 @@ mod tests {
             }
         }
 
-        let open = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
-        let closed = mesh_chunk(&chunk, &Neighbours::none(), Absent::Solid, &DAY);
+        let open = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let closed = mesh_chunk(&chunk, &Neighbours::none(), Absent::Solid, &DAY, &NoFluid);
 
         assert_eq!(open.quads.len(), 6, "a solid chunk in the open is a cube");
         assert!(
@@ -1043,8 +1153,8 @@ mod tests {
         let mut right_neighbours = Neighbours::none();
         right_neighbours.sides[0] = Some(&left); // -x
 
-        let left_mesh = mesh_chunk(&left, &left_neighbours, Absent::Air, &DAY);
-        let right_mesh = mesh_chunk(&right, &right_neighbours, Absent::Air, &DAY);
+        let left_mesh = mesh_chunk(&left, &left_neighbours, Absent::Air, &DAY, &NoFluid);
+        let right_mesh = mesh_chunk(&right, &right_neighbours, Absent::Air, &DAY, &NoFluid);
 
         // Neither chunk may emit a face on the shared plane.
         let left_border = left_mesh
@@ -1066,7 +1176,7 @@ mod tests {
 
         // And without the neighbour, it WOULD have — proving the test is
         // testing the culling rather than an accident of the geometry.
-        let unaware = mesh_chunk(&left, &Neighbours::open(), Absent::Air, &DAY);
+        let unaware = mesh_chunk(&left, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
         assert!(
             unaware
                 .quads
@@ -1131,7 +1241,13 @@ mod tests {
 
         let mut chunk = Chunk::air(ChunkPos::new(0, 0, 0));
         chunk.set_block_local(LocalBlock::new(0, 0, 0), BlockValue::Uniform(STONE));
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &OneLitBlock);
+        let mesh = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &OneLitBlock,
+            &NoFluid,
+        );
 
         // Top faces only: the sides look sideways into darkness.
         let top: Vec<&Quad> = mesh
@@ -1223,8 +1339,8 @@ mod tests {
             }
         }
 
-        let split = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &HalfLit);
-        let uniform = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let split = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &HalfLit, &NoFluid);
+        let uniform = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
 
         let tops = |mesh: &Mesh| {
             mesh.quads
@@ -1276,7 +1392,7 @@ mod tests {
         chunk
             .set_block(BlockPos::new(5, 5, 5), BlockValue::Uniform(STONE))
             .expect("in chunk");
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
+        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
         let (vertices, indices) = mesh.to_buffers();
 
         assert_eq!(vertices.len(), mesh.quads.len() * 4);
@@ -1291,7 +1407,7 @@ mod tests {
 
     #[test]
     fn an_empty_chunk_meshes_to_nothing() {
-        let mesh = mesh_chunk(&empty(), &Neighbours::open(), Absent::Air, &DAY);
+        let mesh = mesh_chunk(&empty(), &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
         assert!(mesh.is_empty());
         assert_eq!(mesh.gpu_bytes(), 0);
     }

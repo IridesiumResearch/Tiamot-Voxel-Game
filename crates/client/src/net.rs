@@ -179,6 +179,15 @@ pub enum Event {
     /// missed the last one is repaired by this one.
     ChunkFluid(ChunkPos, Box<tiamot_core::fluid::FluidLayer>),
 
+    /// Every fluid the server's mods registered, sent once on join.
+    ///
+    /// Without it a chunk's fluid names a number the client cannot draw — see
+    /// `ServerMessage::FluidTable`.
+    Fluids {
+        /// In ascending id order.
+        fluids: Vec<tiamot_core::proto::FluidDef>,
+    },
+
     /// The sky a mod registered, sent once on join.
     Sky(crate::sky::Sky),
 
@@ -919,6 +928,10 @@ async fn session(
 
             ServerMessage::ToolTable { tools } => {
                 let _ = events.send(Event::Tools { tools });
+            }
+
+            ServerMessage::FluidTable { fluids } => {
+                let _ = events.send(Event::Fluids { fluids });
             }
 
             ServerMessage::HelloAck { .. }

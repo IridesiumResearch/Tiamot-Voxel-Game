@@ -737,6 +737,44 @@ pub enum ServerMessage {
         /// Run-length encoded states — see [`crate::fluid::codec::decode`].
         fluid: Vec<u8>,
     },
+
+    /// Every fluid the server's mods registered, sent once on join.
+    ///
+    /// **Appended at the end** (protocol v11).
+    ///
+    /// A chunk's fluid names its fluid by a numeric id, and numeric ids are per
+    /// session (charter rule 8) — so without this a client would know a block
+    /// held *something* and have nothing to draw it as. Sent alongside
+    /// [`ServerMessage::MaterialTable`] and for the same reason.
+    ///
+    /// Empty is legitimate and common: a mod set that registers no fluid is a
+    /// world with no fluid, not an error. The engine ships none of its own.
+    FluidTable {
+        /// Every fluid, in ascending id order.
+        fluids: Vec<FluidDef>,
+    },
+}
+
+/// One registered fluid, as the wire carries it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FluidDef {
+    /// The per-session numeric id a chunk's fluid layer refers to.
+    pub id: u8,
+    /// The canonical string id, `"core_milk:milk"`.
+    ///
+    /// Carried even though nothing draws with it, because a client that could
+    /// not name what it is standing in could not report it either — and every
+    /// diagnostic anybody writes about fluid will want the name rather than the
+    /// number.
+    pub name: String,
+    /// The world material id a full block of it is drawn as.
+    pub material: u16,
+    /// How full a block at each level is, in twenty-sevenths.
+    ///
+    /// Sent rather than recomputed so a client and a server cannot disagree
+    /// about where a surface sits — which would show as milk at one height on
+    /// screen and a different one under your feet.
+    pub depths: [u8; 8],
 }
 
 /// One moment in a mod's day, on the wire.
@@ -1050,6 +1088,7 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::ToolTable { .. }
         | ServerMessage::ChunkLight { .. }
         | ServerMessage::ChunkFluid { .. }
+        | ServerMessage::FluidTable { .. }
         | ServerMessage::SkyTable { .. }
         | ServerMessage::TimeOfDay { .. } => {}
     }
@@ -1654,6 +1693,9 @@ mod tests {
         })
         .expect("encode");
         assert_eq!(fluid[0], 19);
+
+        let table = encode(&ServerMessage::FluidTable { fluids: Vec::new() }).expect("encode");
+        assert_eq!(table[0], 20);
     }
 
     #[test]

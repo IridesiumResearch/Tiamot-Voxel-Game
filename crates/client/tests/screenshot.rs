@@ -206,7 +206,7 @@ fn upload_lit(renderer: &mut Renderer, chunks: &[Chunk], light: &impl client::sh
                 .get(&ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz))
                 .copied();
         }
-        let mesh = mesher::mesh_chunk(chunk, &neighbours, Absent::Air, light);
+        let mesh = mesher::mesh_chunk(chunk, &neighbours, Absent::Air, light, &mesher::NoFluid);
         renderer.set_chunk(pos, &mesh);
     }
 }
@@ -939,7 +939,7 @@ fn a_surface_brighter_than_white_bleeds_light_past_its_edge() {
         }
         renderer.set_chunk(
             pos,
-            &mesher::mesh_chunk(chunk, &neighbours, Absent::Air, &Lamplit),
+            &mesher::mesh_chunk(chunk, &neighbours, Absent::Air, &Lamplit, &mesher::NoFluid),
         );
     }
 
@@ -1313,7 +1313,13 @@ fn an_occluded_corner_loses_its_colour_rather_than_keeping_it_dimly() {
         }
         renderer.set_chunk(
             pos,
-            &mesher::mesh_chunk(chunk, &neighbours, Absent::Air, &WarmLamps),
+            &mesher::mesh_chunk(
+                chunk,
+                &neighbours,
+                Absent::Air,
+                &WarmLamps,
+                &mesher::NoFluid,
+            ),
         );
     }
 

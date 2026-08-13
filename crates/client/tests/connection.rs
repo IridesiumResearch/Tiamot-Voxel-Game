@@ -181,6 +181,7 @@ impl Seen {
             Event::Chunk(chunk) => self.store.insert(*chunk),
             Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
             Event::ChunkFluid(pos, layer) => self.store.set_fluid(pos, *layer),
+            Event::Fluids { fluids } => self.store.set_fluid_table(&fluids),
             Event::Sky(sky) => self.sky = Some(sky),
             Event::TimeOfDay(time) => self.time_of_day = Some(time),
             Event::ChunkUnload(pos) => {

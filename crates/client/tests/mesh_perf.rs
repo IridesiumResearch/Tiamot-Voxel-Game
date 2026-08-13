@@ -254,12 +254,24 @@ fn skip_unless_optimised(name: &str) -> bool {
 /// not decide a gate, and the median is the statistic that ignores it.
 fn median_mesh_time(chunk: &Chunk, runs: usize) -> Duration {
     // One warm-up pass, so the first run's page faults are not measured.
-    let _ = mesh_chunk(chunk, &Neighbours::open(), Absent::Air, &DAY);
+    let _ = mesh_chunk(
+        chunk,
+        &Neighbours::open(),
+        Absent::Air,
+        &DAY,
+        &client::mesher::NoFluid,
+    );
 
     let mut samples: Vec<Duration> = (0..runs)
         .map(|_| {
             let started = Instant::now();
-            let mesh = mesh_chunk(chunk, &Neighbours::open(), Absent::Air, &DAY);
+            let mesh = mesh_chunk(
+                chunk,
+                &Neighbours::open(),
+                Absent::Air,
+                &DAY,
+                &client::mesher::NoFluid,
+            );
             let elapsed = started.elapsed();
             // Keep the result observable so the optimiser cannot delete the
             // work being measured.
@@ -348,11 +360,23 @@ fn border_aware_meshing_does_not_cost_more_than_the_spike_measured() {
         neighbours.sides[side] = Some(&neighbour);
     }
 
-    let _ = mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY);
+    let _ = mesh_chunk(
+        &chunk,
+        &neighbours,
+        Absent::Air,
+        &DAY,
+        &client::mesher::NoFluid,
+    );
     let mut samples: Vec<Duration> = (0..25)
         .map(|_| {
             let started = Instant::now();
-            let mesh = mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY);
+            let mesh = mesh_chunk(
+                &chunk,
+                &neighbours,
+                Absent::Air,
+                &DAY,
+                &client::mesher::NoFluid,
+            );
             let elapsed = started.elapsed();
             std::hint::black_box(mesh.quads.len());
             elapsed
