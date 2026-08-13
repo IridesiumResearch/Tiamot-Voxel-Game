@@ -202,6 +202,16 @@ jobs:
             --target x86_64-unknown-linux-gnu \
             -- -max_total_time=60 -rss_limit_mb=2048
 
+      # And Task 11's fluid payloads, which are the same shape of format and the
+      # same class of hazard. Kept a separate step rather than folded into the
+      # one above so a failure names which decoder broke without anyone reading
+      # the log.
+      - name: Fuzz the fluid payload decoder (smoke)
+        run: |
+          cargo +nightly fuzz run fluid_decode \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=60 -rss_limit_mb=2048
+
       # From Task 07 onward this is how every task's `game/` mods are validated.
       # It boots no world and binds no socket: a mod API that cannot be checked
       # without a running server is an API with a usability bug.

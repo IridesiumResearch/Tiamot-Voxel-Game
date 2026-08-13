@@ -43,4 +43,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fluid_decode"
+path = "fuzz_targets/fluid_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

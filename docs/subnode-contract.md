@@ -219,6 +219,29 @@ sub-node resolution would multiply fluid state by 27 for a visual effect nobody
 asked for. Task 11 is block-resolution throughout and needs no sub-node
 awareness beyond "is this block empty".
 
+### Implemented by
+
+`crates/core/src/fluid/` — `Neighbourhood::accepts_fluid` is the whole of the
+rule above, and the solver consults nothing else about geometry. A block that
+stops accepting fluid loses whatever was in it on the next fluid tick, which is
+what "no partially flooded carved block" means when somebody chisels into a
+pond.
+
+### Depth, in sub-node units
+
+Fluid is stored per block, but two systems need to know how *full* a block is in
+the same units everything else speaks (charter rule 5): the mesher's surface
+height and the physics' submerged fraction. `Fluid::depth_units` is that bridge.
+
+- Level `n` of 7 fills `n × 24 / 7` cells of the block's 27.
+- **A full block is 24 cells, not 27.** A brim-full block still shows a surface
+  below the block above it; filling all 27 would make a waterfall read as a
+  solid column of milk rather than as falling milk.
+
+This is a presentation and physics convenience derived from the level. It is not
+sub-node fluid state — there is still exactly one level per block, and nothing
+writes a partial cell mask for fluid.
+
 ---
 
 ## 5. Worldgen — block resolution by default, sub-node opt-in
