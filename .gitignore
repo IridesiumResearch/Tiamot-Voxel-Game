@@ -45,3 +45,10 @@ Thumbs.db
 # seconds by `cargo run -p subnode-spike --release -- collision` and one of them
 # is nearly a megabyte, so they stay out of history.
 /spikes/subnode/out/*.obj
+
+# Session traces. `TIAMOT_TRACE_FRAMES`, `TIAMOT_TRACE_PHYSICS` and
+# `TIAMOT_TRACE_SERVER` write these, and a run of them is tens of thousands of
+# lines about one machine on one afternoon. The findings belong in a commit
+# message; the logs do not belong in history. The chunk-frame bug (d5ed968) was
+# read out of a set that lived here.
+/Frames-Physics/
