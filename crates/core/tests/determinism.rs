@@ -655,3 +655,234 @@ fn detgen_contains_no_terrain_policy() {
         offences.join("\n")
     );
 }
+
+/// The golden fluid fingerprint.
+///
+/// **Regenerate ONLY with a deliberate change to the flow rule**, exactly as
+/// with the two goldens above. Fluid is integer arithmetic throughout, so this
+/// is not guarding a float subset violation — it guards the other half of
+/// charter rule 4, that the *order* of a computation must not vary between
+/// platforms. The solver's active set is a `BTreeSet` for precisely this
+/// reason, and a `HashSet` swapped in would fail here on every platform and for
+/// a different value on each run.
+const FLUID_GOLDEN: u64 = 2_475_015_662_132_210_838;
+
+/// Runs the three scenarios the task names and hashes what settled.
+///
+/// A **spring on a slope**, a **pool filling**, and a **channel draining** —
+/// chosen because each exercises a different rule. The slope is the lateral
+/// spread and the hole preference; the pool is falling and the level gradient
+/// meeting a wall; the drained channel is decay, which is the only rule that
+/// runs when nothing is being added.
+///
+/// All three are hashed together into one constant. Separate constants would
+/// say which scenario diverged, which sounds useful and is not: a divergence is
+/// an ordering bug in one shared solver, and the first thing anyone would do is
+/// run all three anyway.
+fn fluid_fingerprint() -> u64 {
+    use std::collections::{BTreeMap, BTreeSet};
+    use tiamot_core::coords::BlockPos;
+    use tiamot_core::fluid::{Fluid, FluidId, Neighbourhood, Solver, Tuning};
+
+    const MILK: FluidId = FluidId(1);
+
+    #[derive(Default)]
+    struct Scene {
+        solid: BTreeSet<(i32, i32, i32)>,
+        fluid: BTreeMap<(i32, i32, i32), Fluid>,
+    }
+
+    impl Neighbourhood for Scene {
+        fn accepts_fluid(&self, pos: BlockPos) -> bool {
+            // Walled at the edges so nothing escapes the scenario. A fixture
+            // that leaked would hash the leak rather than the rule.
+            if pos.x.abs() > 12 || pos.z.abs() > 12 || pos.y < 0 || pos.y > 12 {
+                return false;
+            }
+            !self.solid.contains(&(pos.x, pos.y, pos.z))
+        }
+
+        fn fluid(&self, pos: BlockPos) -> Fluid {
+            self.fluid
+                .get(&(pos.x, pos.y, pos.z))
+                .copied()
+                .unwrap_or(Fluid::EMPTY)
+        }
+
+        fn set_fluid(&mut self, pos: BlockPos, value: Fluid) {
+            if value.is_empty() {
+                self.fluid.remove(&(pos.x, pos.y, pos.z));
+            } else {
+                self.fluid.insert((pos.x, pos.y, pos.z), value);
+            }
+        }
+    }
+
+    /// Settles a scene and folds every block of it into the hash.
+    fn run(hasher: &mut blake3::Hasher, mut scene: Scene, mut solver: Solver, ticks: usize) {
+        for _ in 0..ticks {
+            solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX);
+        }
+        // Sorted by construction — a `BTreeMap` — so the hash does not depend
+        // on the order the blocks happened to be written in.
+        for ((x, y, z), value) in &scene.fluid {
+            hasher.update(&x.to_le_bytes());
+            hasher.update(&y.to_le_bytes());
+            hasher.update(&z.to_le_bytes());
+            hasher.update(&[value.0]);
+        }
+        // And how much work is outstanding, so a scenario that settles on one
+        // platform and not on another is a difference this notices.
+        hasher.update(&(solver.active() as u64).to_le_bytes());
+    }
+
+    let mut hasher = blake3::Hasher::new();
+
+    // 1. A spring on a slope: a staircase of solid blocks with a source at the
+    //    top, so milk spreads, finds the drop, and falls to the next step.
+    let mut scene = Scene::default();
+    for step in 0..6 {
+        for z in -6..=6 {
+            for x in -6..=(step * 2 - 6) {
+                scene.solid.insert((x, step, z));
+            }
+        }
+    }
+    let mut solver = Solver::new();
+    scene.set_fluid(BlockPos::new(-6, 6, 0), Fluid::source(MILK));
+    solver.touch(BlockPos::new(-6, 6, 0));
+    run(&mut hasher, scene, solver, 120);
+
+    // 2. A pool filling: a walled basin with a source above its middle, so the
+    //    column falls, hits the floor, and spreads to the walls.
+    let mut scene = Scene::default();
+    for x in -4..=4 {
+        for z in -4..=4 {
+            scene.solid.insert((x, 0, z));
+        }
+    }
+    for x in -4..=4 {
+        for y in 1..=3 {
+            scene.solid.insert((x, y, -4));
+            scene.solid.insert((x, y, 4));
+            scene.solid.insert((-4, y, x));
+            scene.solid.insert((4, y, x));
+        }
+    }
+    let mut solver = Solver::new();
+    scene.set_fluid(BlockPos::new(0, 6, 0), Fluid::source(MILK));
+    solver.touch(BlockPos::new(0, 6, 0));
+    run(&mut hasher, scene, solver, 120);
+
+    // 3. A drained channel: a trench filled from a source, which is then taken
+    //    away, so what is hashed is the state decay left behind.
+    let mut scene = Scene::default();
+    for x in -8..=8 {
+        for z in -1..=1 {
+            scene.solid.insert((x, 0, z));
+        }
+        scene.solid.insert((x, 1, -1));
+        scene.solid.insert((x, 1, 1));
+    }
+    let mut solver = Solver::new();
+    scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::source(MILK));
+    solver.touch(BlockPos::new(0, 1, 0));
+    for _ in 0..60 {
+        solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX);
+    }
+    scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::EMPTY);
+    solver.touch(BlockPos::new(0, 1, 0));
+    // Deliberately stopped MID-DRAIN rather than after it finishes. A fully
+    // drained channel hashes an empty map, which is the same value whatever the
+    // decay rule did on the way there.
+    run(&mut hasher, scene, solver, 3);
+
+    u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("BLAKE3 output is 32 bytes"),
+    )
+}
+
+#[test]
+fn settled_milk_hashes_to_its_golden() {
+    // **Task 11's cross-platform determinism criterion.** The CI matrix runs
+    // this on Linux, Windows and macOS against the same constant.
+    assert_eq!(
+        fluid_fingerprint(),
+        FLUID_GOLDEN,
+        "the same scenarios settled to a different result. Do NOT update the constant to match \
+         unless the flow rule changed deliberately — a difference here means the solver's visit \
+         order varies between builds, which is the one thing the active set being ordered exists \
+         to prevent."
+    );
+}
+
+#[test]
+fn the_fluid_golden_is_stable_across_repeated_calls() {
+    // The counter-example that makes the constant mean something: scenarios not
+    // reproducible in one process could not be reproducible across three
+    // platforms.
+    assert_eq!(fluid_fingerprint(), fluid_fingerprint());
+}
+
+#[test]
+fn the_fluid_scenarios_actually_hold_milk() {
+    // **The trap the light golden's sibling test exists for**, and it is worth
+    // repeating here: a fingerprint over three empty scenes is perfectly stable
+    // and perfectly meaningless. This asserts the scenarios did something.
+    use std::collections::{BTreeMap, BTreeSet};
+    use tiamot_core::coords::BlockPos;
+    use tiamot_core::fluid::{Fluid, FluidId, Neighbourhood, Solver, Tuning};
+
+    #[derive(Default)]
+    struct Basin {
+        solid: BTreeSet<(i32, i32, i32)>,
+        fluid: BTreeMap<(i32, i32, i32), Fluid>,
+    }
+    impl Neighbourhood for Basin {
+        fn accepts_fluid(&self, pos: BlockPos) -> bool {
+            if pos.x.abs() > 12 || pos.z.abs() > 12 || pos.y < 0 || pos.y > 12 {
+                return false;
+            }
+            !self.solid.contains(&(pos.x, pos.y, pos.z))
+        }
+        fn fluid(&self, pos: BlockPos) -> Fluid {
+            self.fluid
+                .get(&(pos.x, pos.y, pos.z))
+                .copied()
+                .unwrap_or(Fluid::EMPTY)
+        }
+        fn set_fluid(&mut self, pos: BlockPos, value: Fluid) {
+            if value.is_empty() {
+                self.fluid.remove(&(pos.x, pos.y, pos.z));
+            } else {
+                self.fluid.insert((pos.x, pos.y, pos.z), value);
+            }
+        }
+    }
+
+    let mut scene = Basin::default();
+    for x in -4..=4 {
+        for z in -4..=4 {
+            scene.solid.insert((x, 0, z));
+        }
+    }
+    let mut solver = Solver::new();
+    scene.set_fluid(BlockPos::new(0, 3, 0), Fluid::source(FluidId(1)));
+    solver.touch(BlockPos::new(0, 3, 0));
+    for _ in 0..120 {
+        solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX);
+    }
+
+    assert!(
+        scene.fluid.len() > 20,
+        "only {} blocks hold milk, so the golden is hashing almost nothing",
+        scene.fluid.len()
+    );
+    let levels: BTreeSet<u8> = scene.fluid.values().map(|value| value.level()).collect();
+    assert!(
+        levels.len() > 1,
+        "every block is at the same level, so the gradient the golden should cover is absent"
+    );
+}
