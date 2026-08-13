@@ -1,0 +1,15 @@
+# The engine's reference fluid.
+#
+# The directory is `core_milk` and the mod id is `core_milk`, unlike
+# `core_blocks` whose id is `core`: that one owns the reserved `core` namespace
+# because the engine's own reference blocks live there. A fluid does not need
+# to, and a mod that claims no more namespace than it uses is the better
+# example to copy.
+id = "core_milk"
+name = "Core Milk"
+version = "0.1.0"
+description = "Reference fluid registration. A test fixture, not a game."
+license = "GPL-3.0-only"
+
+# The block this fluid is drawn as lives here too, so the mod is self-contained
+# and a reader has one directory to look at rather than two.

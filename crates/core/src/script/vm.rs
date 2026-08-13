@@ -601,6 +601,12 @@ pub trait ScriptVm: Sized {
     /// the engine's startup order.
     fn set_light_source(&mut self, source: std::sync::Arc<dyn crate::light::LightSource>);
 
+    /// Points `game.get_fluid` and `game.set_fluid` at the world's fluid.
+    ///
+    /// Called once, after the world exists. Until then both answer as though
+    /// there is no fluid anywhere, which is true — see [`crate::fluid::Access`].
+    fn set_fluid_access(&mut self, access: std::sync::Arc<dyn crate::fluid::Access>);
+
     /// Runs every registered `on_generate` callback for one chunk.
     ///
     /// # Errors

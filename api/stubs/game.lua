@@ -305,6 +305,72 @@ function game.register_on_tick(callback) end
 ---@return { sun: integer, r: integer, g: integer, b: integer }
 function game.get_light(position) end
 
+---Fields accepted by `game.register_fluid`.
+---@class Tiamot.FluidSpec
+---@field id string Unqualified id. `"milk"` from mod `core_milk` becomes `"core_milk:milk"`.
+---@field material string The registered block a full block of it is drawn as. REQUIRED — a fluid with no material cannot be drawn, and the engine does not get to decide what your fluid looks like (charter rule 1). Qualified against your own mod, so a fluid can name its own block.
+---@field flow_range? integer How far a source spreads sideways on flat ground, in blocks. 1..=7, default 7. The level a block holds IS how far the fluid has travelled, which is why seven is the ceiling — a shorter range is a fluid that thins out faster.
+---@field tick_rate? integer Simulation ticks between updates. Default 1, which is every fluid tick (10 Hz). Larger is slower and more viscous, and costs proportionally less to simulate.
+
+---Registers a fluid.
+---
+---Registration only, during the loading window — see charter rule 9. The engine
+---keeps what it must simulate and draw with; everything else a fluid might do,
+---like hurting you or making a sound, is yours and needs no engine support
+---beyond the hooks that already exist.
+---
+---Fluid is BLOCK resolution, not sub-node. A block holds fluid only if it is
+---entirely empty — Sub-Node Contract §4 — so there is no such thing as a
+---partially flooded chiselled block, and you do not have to think about one.
+---
+---```lua
+---game.register_block{ id = "milk", texture = "milk.png" }
+---game.register_fluid{ id = "milk", material = "milk", flow_range = 7 }
+---```
+---@param spec Tiamot.FluidSpec
+function game.register_fluid(spec) end
+
+---What a block holds.
+---
+---`level` is 0..7, where 7 is a source or a block directly fed by one and each
+---block of lateral travel costs one. `source` says the block sustains itself
+---rather than draining — the two differ, and that difference is what makes a
+---channel empty when you take its spring away.
+---
+---Coordinates are BLOCKS. A dig event gives you cells — divide by three.
+---
+---Somewhere unloaded answers empty, which is the honest answer for a place
+---nobody is.
+---
+---```lua
+---local here = game.get_fluid{ x = 10, y = 64, z = -3 }
+---if not here.empty and here.level > 4 then
+---    -- deep enough to swim in
+---end
+---```
+---@param position { x: integer, y: integer, z: integer }
+---@return { level: integer, source: boolean, empty: boolean }
+function game.get_fluid(position) end
+
+---Puts fluid in a block, or takes it away.
+---
+---Returns whether anything changed. Writing to a block that cannot accept fluid
+---is not refused: the next fluid tick clears it, which is the same answer the
+---engine gives when a player builds in a pond. One rule rather than two.
+---
+---`level = 0` clears the block whatever `fluid` names. `source = true` places a
+---spring, which sustains itself until something removes it; anything else
+---places flowing fluid that drains once nothing is feeding it.
+---
+---```lua
+---game.set_fluid({ x = 10, y = 64, z = -3 }, { fluid = "core_milk:milk", source = true })
+---game.set_fluid({ x = 10, y = 64, z = -3 }, { level = 0 })  -- scoop it up
+---```
+---@param position { x: integer, y: integer, z: integer }
+---@param spec { fluid: string, level?: integer, source?: boolean }
+---@return boolean changed
+function game.set_fluid(position, spec) end
+
 ---A dig about to happen.
 ---@class Tiamot.DigEvent
 ---@field player string Who is digging, as 64 hex characters. This is the canonical player UUID — key any per-player state on it, never on the display name, which a player can change and which is not unique across servers.

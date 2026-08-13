@@ -213,6 +213,12 @@ pub struct MluaVm {
     /// time, rather than needing the source to exist at freeze. Uncontended in
     /// practice: both the setter and every reader are the simulation thread.
     light: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::light::LightSource>>>>,
+    /// Where `game.get_fluid` and `game.set_fluid` reach, once there is a world.
+    ///
+    /// Behind the same lock as `light` and for the same reason: the frozen API
+    /// is installed before the world exists, so the closures capture this and
+    /// read whatever is in it at call time.
+    fluid: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::fluid::Access>>>>,
 }
 
 /// Where a world's clock starts when the sky mod does not say.
@@ -469,6 +475,7 @@ impl ScriptVm for MluaVm {
             environments: BTreeMap::new(),
             next_material: 2,
             light: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            fluid: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         // Installed here rather than in a second constructor the caller has to
         // remember. `ModHost` called `create` and got a VM with no registry
@@ -511,6 +518,12 @@ impl ScriptVm for MluaVm {
     fn set_light_source(&mut self, source: std::sync::Arc<dyn crate::light::LightSource>) {
         if let Ok(mut slot) = self.light.lock() {
             *slot = Some(source);
+        }
+    }
+
+    fn set_fluid_access(&mut self, access: std::sync::Arc<dyn crate::fluid::Access>) {
+        if let Ok(mut slot) = self.fluid.lock() {
+            *slot = Some(access);
         }
     }
 
@@ -1176,6 +1189,94 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))
     }
 
+    /// The `game.get_fluid` and `game.set_fluid` pair, built once per mod
+    /// environment.
+    ///
+    /// Its own method for the reason `light_reader` is: these are the part of
+    /// the frozen API that depends on something outside the VM.
+    fn fluid_functions(&self) -> Result<(mlua::Function, mlua::Function), ScriptError> {
+        let reader = std::sync::Arc::clone(&self.fluid);
+        let get = self
+            .lua
+            .create_function(move |lua, position: Table| {
+                let x: i32 = position.get("x")?;
+                let y: i32 = position.get("y")?;
+                let z: i32 = position.get("z")?;
+
+                let value = reader
+                    .lock()
+                    .map_err(|_| {
+                        mlua::Error::external(
+                            "the fluid store is poisoned; the simulation thread panicked",
+                        )
+                    })?
+                    .as_ref()
+                    // No world yet — during worldgen, or in a test with no
+                    // server behind the VM. Nothing is the honest answer.
+                    .map_or(crate::fluid::Fluid::EMPTY, |source| {
+                        source.fluid_at(crate::BlockPos::new(x, y, z))
+                    });
+
+                let out = lua.create_table()?;
+                // `level` and `source` rather than the packed byte: a mod that
+                // had to know the bit layout would be a mod that breaks when
+                // the layout changes.
+                out.set("level", value.level())?;
+                out.set("source", value.is_source())?;
+                out.set("empty", value.is_empty())?;
+                Ok(out)
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        let writer = std::sync::Arc::clone(&self.fluid);
+        let set = self
+            .lua
+            .create_function(move |_, (position, spec): (Table, Table)| {
+                let x: i32 = position.get("x")?;
+                let y: i32 = position.get("y")?;
+                let z: i32 = position.get("z")?;
+
+                let guard = writer.lock().map_err(|_| {
+                    mlua::Error::external(
+                        "the fluid store is poisoned; the simulation thread panicked",
+                    )
+                })?;
+                let Some(store) = guard.as_ref() else {
+                    // Called before there is a world — during worldgen, say.
+                    // Silently doing nothing beats an error a mod would have to
+                    // write code around, and matches how `get_fluid` answers.
+                    return Ok(false);
+                };
+
+                let name: Option<String> = spec.get("fluid").ok();
+                let Some(name) = name else {
+                    return Err(mlua::Error::external(
+                        "set_fluid: missing required field `fluid`. Name the registered fluid \
+                         to place, or pass `level = 0` to clear.",
+                    ));
+                };
+                let Some(id) = store.fluid_id(&name) else {
+                    return Err(mlua::Error::external(format!(
+                        "set_fluid: no fluid registered as `{name}`"
+                    )));
+                };
+
+                let level: u8 = spec.get("level").unwrap_or(crate::fluid::MAX_LEVEL);
+                let is_source: bool = spec.get("source").unwrap_or(false);
+                let value = if level == 0 {
+                    crate::fluid::Fluid::EMPTY
+                } else if is_source {
+                    crate::fluid::Fluid::source(id)
+                } else {
+                    crate::fluid::Fluid::flowing(id, level)
+                };
+                Ok(store.set_fluid_at(crate::BlockPos::new(x, y, z), value))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        Ok((get, set))
+    }
+
     /// Everything callable after freeze: lookups, bulk noise, streams, constants.
     fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- frozen-phase API ---------------------------------------------
@@ -1189,6 +1290,12 @@ impl MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("get_block_id", get_block_id)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let (get_fluid, set_fluid) = self.fluid_functions()?;
+        game.set("get_fluid", get_fluid)
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("set_fluid", set_fluid)
             .map_err(|err| self.vm_error(&err))?;
 
         let get_light = self.light_reader()?;

@@ -58,8 +58,15 @@ fn the_reference_mods_load_in_dependency_order() {
     // thinking about load order.
     assert_eq!(
         host.resolved().ids(),
-        vec!["core", "core_sky", "core_tools", "core_worldgen"],
-        "core_worldgen depends on core and must load after it"
+        vec![
+            "core",
+            "core_milk",
+            "core_sky",
+            "core_tools",
+            "core_worldgen"
+        ],
+        "core_worldgen depends on core and must load after it; core_milk depends on nothing \
+         and registers its own block, so it sorts by name like the rest"
     );
     assert!(
         host.failed().is_empty(),

@@ -55,6 +55,49 @@ pub const TICKS_PER_FLUID_TICK: u64 = 2;
 /// isolation. Blocks past it are carried, not dropped.
 pub const VISITS_PER_TICK: usize = 4_096;
 
+/// A handle on the fluid store, for the mod API.
+///
+/// The same arrangement `light::Shared` uses, and behind a lock for the same
+/// reason: `game.set_fluid` runs inside a tick, on the simulation thread, and
+/// cannot borrow what the tick is holding. Uncontended in practice — both sides
+/// are that one thread — and never held across a mod callback, which is the
+/// arrangement that would deadlock.
+pub struct Shared {
+    fluidics: std::sync::Arc<std::sync::RwLock<Fluidics>>,
+}
+
+impl Shared {
+    /// Wraps a store the simulation thread owns.
+    #[must_use]
+    pub const fn new(fluidics: std::sync::Arc<std::sync::RwLock<Fluidics>>) -> Self {
+        Self { fluidics }
+    }
+}
+
+impl tiamot_core::fluid::Access for Shared {
+    fn fluid_at(&self, pos: BlockPos) -> Fluid {
+        // A poisoned lock means the simulation thread panicked, in which case
+        // there is no world to have milk in. Empty is the honest answer, and
+        // panicking inside a mod callback would blame the mod.
+        self.fluidics
+            .read()
+            .map_or(Fluid::EMPTY, |fluidics| fluidics.at(pos))
+    }
+
+    fn set_fluid_at(&self, pos: BlockPos, value: Fluid) -> bool {
+        self.fluidics
+            .write()
+            .is_ok_and(|mut fluidics| fluidics.set(pos, value))
+    }
+
+    fn fluid_id(&self, name: &str) -> Option<tiamot_core::fluid::FluidId> {
+        self.fluidics
+            .read()
+            .ok()
+            .and_then(|fluidics| fluidics.fluids().id_of(name))
+    }
+}
+
 /// Every loaded chunk's fluid, and what the mods registered.
 #[derive(Debug, Default)]
 pub struct Fluidics {

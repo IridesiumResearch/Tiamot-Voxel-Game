@@ -158,6 +158,48 @@ impl Fluid {
     }
 }
 
+/// Somewhere a mod can read and write fluid.
+///
+/// # Why a trait, and why it writes
+///
+/// The same seam [`crate::light::LightSource`] is: the store lives in the
+/// server and the script VM lives in core, which cannot depend on it (charter
+/// rule 3). This one also *writes*, because `game.set_fluid` is how a mod pours
+/// anything at all — a read-only view would leave the reference mod unable to
+/// do the one thing it exists to demonstrate.
+///
+/// # Interior mutability, and why it is not a hazard here
+///
+/// `&self` rather than `&mut self`, because the VM hands the same handle to
+/// every mod environment and cannot lend it out mutably. Every caller is the
+/// simulation thread inside a tick — a mod callback runs there and nowhere else
+/// — so the lock behind this is uncontended and is never held across a
+/// callback, which is the arrangement that would deadlock.
+pub trait Access: Send + Sync {
+    /// What a block holds, or [`Fluid::EMPTY`] where nothing is loaded.
+    ///
+    /// Empty rather than an error for somewhere nobody is, exactly as light
+    /// answers dark: a mod asking about unloaded terrain gets the honest answer
+    /// that there is no milk there, and an `Option` would push that judgement
+    /// onto every caller.
+    fn fluid_at(&self, pos: crate::BlockPos) -> Fluid;
+
+    /// Records what a block holds and wakes the flow around it.
+    ///
+    /// Returns whether anything changed. A write to a block that cannot accept
+    /// fluid is not refused here — the next fluid tick clears it, which is the
+    /// same answer the solver gives when somebody builds in a pond, and having
+    /// one rule rather than two is worth more than the early error.
+    fn set_fluid_at(&self, pos: crate::BlockPos, value: Fluid) -> bool;
+
+    /// The id registered under a string name, or `None`.
+    ///
+    /// String ids are canonical and numeric ones are per session (charter rule
+    /// 8), so a mod names its fluid and the engine resolves it — never the
+    /// other way round.
+    fn fluid_id(&self, name: &str) -> Option<FluidId>;
+}
+
 /// Everything registered about one fluid.
 ///
 /// The engine holds only what it must simulate and draw with. Anything that is

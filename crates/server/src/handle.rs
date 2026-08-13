@@ -756,12 +756,14 @@ impl ServerHandle {
                         crate::light::Lighting::new(emissions),
                     ));
 
-                    // Fluid needs no lock: nothing outside this thread reads it,
-                    // because `game.get_fluid` runs on this thread inside a tick
-                    // exactly as the rest of the mod API does. Light needs one
-                    // only because `game.get_light` is also reachable from the
-                    // generator, which runs re-entrantly.
-                    let mut fluidics = crate::fluid::Fluidics::new(fluids);
+                    // Behind a lock for the same reason lighting is, and not
+                    // for a different one: `game.set_fluid` runs on this thread
+                    // inside a tick and cannot borrow what the tick is holding.
+                    // Never contended — both sides are this thread — and never
+                    // held across a callback, which is what would deadlock.
+                    let fluidics = std::sync::Arc::new(std::sync::RwLock::new(
+                        crate::fluid::Fluidics::new(fluids),
+                    ));
 
                     // Either the mods generate terrain, or there are no mods
                     // and the world is air. Both are legitimate.
@@ -773,6 +775,13 @@ impl ServerHandle {
                             // how dark it is there.
                             host.vm_mut().set_light_source(std::sync::Arc::new(
                                 crate::light::Shared::new(std::sync::Arc::clone(&lighting)),
+                            ));
+                            // And the fluid, so a mod can pour as well as read.
+                            // This is the only writable handle in the frozen
+                            // API, which is why `Access` takes `&self` and the
+                            // store sits behind the lock above.
+                            host.vm_mut().set_fluid_access(std::sync::Arc::new(
+                                crate::fluid::Shared::new(std::sync::Arc::clone(&fluidics)),
                             ));
                             crate::world::Generator::Mods(Box::new(
                                 crate::world::ModGenerator::new(host),
@@ -823,7 +832,10 @@ impl ServerHandle {
                                     // even though its fluid has not: a wall
                                     // knocked out is how a pond finds out there
                                     // is somewhere new to go.
-                                    fluidics.touch(edited_block(&edit));
+                                    fluidics
+                                        .write()
+                                        .expect("fluid lock")
+                                        .touch(edited_block(&edit));
                                     shared.broadcast(ServerMessage::BlockDelta {
                                         edit,
                                         actor: None,
@@ -1268,6 +1280,8 @@ impl ServerHandle {
                             // only once something disturbs it.
                             if blob.is_some() {
                                 let layer = fluidics
+                                    .read()
+                                    .expect("fluid lock")
                                     .layer(request.pos)
                                     .cloned()
                                     .unwrap_or_else(tiamot_core::fluid::FluidLayer::empty);
@@ -1336,14 +1350,15 @@ impl ServerHandle {
                         // A settled world returns here immediately: the solver
                         // checks an empty active set and allocates nothing.
                         if tick.is_multiple_of(crate::fluid::TICKS_PER_FLUID_TICK) {
-                            let changes = fluidics.tick(&world);
+                            let mut fluid = fluidics.write().expect("fluid lock");
+                            let changes = fluid.tick(&world);
                             if !changes.is_empty() {
                                 // The whole layer, per touched chunk, rather
                                 // than a delta per block — see
                                 // `ServerMessage::ChunkFluid` for why that is
                                 // both smaller and safer.
                                 for pos in crate::fluid::Fluidics::touched_chunks(&changes) {
-                                    let Some(layer) = fluidics.layer(pos) else {
+                                    let Some(layer) = fluid.layer(pos) else {
                                         // The chunk drained completely, so it
                                         // has no layer any more. Clients still
                                         // have to be told, or the milk they can
