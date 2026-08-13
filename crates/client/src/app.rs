@@ -353,6 +353,26 @@ pub struct Pacing {
     /// the player feels. Guessing at that from "1,044 chunks held" is what the
     /// frame-pacing chase did with one number for a week; this measures it.
     predicted_into_the_unloaded: bool,
+    /// Ticks this window where the client's own world contradicted the server's
+    /// answer about the ground.
+    ///
+    /// **The instrument that tells a physics bug from a streaming one.** Every
+    /// other number here measures the two simulations against each other, and
+    /// they can only ever say "these disagree". This asks a different question:
+    /// given where the server says the body is, does the client's copy of the
+    /// world even have ground there? If it does not — and it holds the chunk, so
+    /// it is not guessing — the two are not simulating the same world, and no
+    /// amount of input bookkeeping will make them agree.
+    terrain_conflicts: u32,
+    /// Every terrain contradiction since the client started.
+    ///
+    /// **Carried across the window boundary, unlike everything else here.** The
+    /// windowed figures exist to be read off a screen, which means they forget;
+    /// a test asking "did this ever happen" cannot use a number that is only
+    /// true for a second. Summing the windowed one per frame is worse than
+    /// useless — it counts one event sixty times and reported forty for a
+    /// session whose trace held none.
+    terrain_conflicts_total: u32,
     /// The last completed window's worst frame, in milliseconds.
     ///
     /// Reported rather than the live figure so the readout holds still long
@@ -377,6 +397,8 @@ pub struct Pacing {
     reported_presented: u32,
     /// The last completed window's largest per-tick disagreement.
     reported_divergence: f32,
+    /// The last completed window's count of terrain contradictions.
+    reported_terrain_conflicts: u32,
     /// Where that window's worst frame spent its time.
     reported_phases: Phases,
 }
@@ -411,9 +433,13 @@ impl Pacing {
                 reported_footing_changes: self.footing_changes,
                 reported_presented: self.presented,
                 reported_divergence: self.worst_divergence,
+                reported_terrain_conflicts: self.terrain_conflicts,
                 // Carried across the window boundary, or the first tick of every
                 // window would read as a change.
                 last_footing: self.last_footing,
+                // Carried for the opposite reason: it is the one figure here
+                // that is about the whole session rather than this second.
+                terrain_conflicts_total: self.terrain_conflicts_total,
                 reported_phases: self.worst_phases,
                 ..Self::default()
             };
@@ -436,6 +462,12 @@ impl Pacing {
     /// Folds in one tick's disagreement with the server.
     fn divergence(&mut self, cells: f32) {
         self.worst_divergence = self.worst_divergence.max(cells);
+    }
+
+    /// Notes a tick where the client's world contradicted the server's ground.
+    const fn terrain_conflict(&mut self) {
+        self.terrain_conflicts += 1;
+        self.terrain_conflicts_total += 1;
     }
 
     /// Notes that a frame reached the screen.
@@ -552,6 +584,26 @@ impl Pacing {
     #[must_use]
     pub const fn predicted_into_unloaded(&self) -> bool {
         self.reported_unloaded
+    }
+
+    /// Ticks in the last window where the client's world had no ground where
+    /// the server says the body is standing.
+    ///
+    /// Zero is the only acceptable value. Anything else means the client is
+    /// holding a stale copy of a chunk, and the corrections that follow are a
+    /// symptom rather than the fault.
+    #[must_use]
+    pub const fn terrain_conflicts_last_second(&self) -> u32 {
+        self.reported_terrain_conflicts
+    }
+
+    /// Every terrain contradiction since the client started.
+    ///
+    /// The figure to assert on: the windowed one above forgets, and a crossing
+    /// is over in three ticks.
+    #[must_use]
+    pub const fn terrain_conflicts_total(&self) -> u32 {
+        self.terrain_conflicts_total
     }
 
     /// How that worst remesh split between meshing and uploading, in
@@ -989,7 +1041,20 @@ impl App {
             } else {
                 ""
             }
-        )
+        ) + &self.terrain_conflict_note()
+    }
+
+    /// The words that appear only when the two sides hold different worlds.
+    ///
+    /// Silent in the normal case, on purpose. A HUD that always shows a zero
+    /// teaches the eye to skip the place the number will appear.
+    fn terrain_conflict_note(&self) -> String {
+        let conflicts = self.pacing.terrain_conflicts_last_second();
+        if conflicts == 0 {
+            String::new()
+        } else {
+            format!(" · STALE TERRAIN {conflicts}x")
+        }
     }
 
     /// Takes the server's word on where this player is.
@@ -1022,6 +1087,9 @@ impl App {
 
         if let Some(divergence) = divergence {
             self.pacing.divergence(divergence.distance);
+            if divergence.terrain_contradicted() {
+                self.pacing.terrain_conflict();
+            }
         }
         self.trace(divergence.as_ref(), state);
         if touched_absent {
@@ -1044,8 +1112,8 @@ impl App {
         let header = "frame,elapsed_ms,dt_ms,presented,net_ms,remesh_ms,advance_ms,acquire_ms,\
                       world_ms,hud_ms,present_ms,fps,chunks_held,meshed,drawn,queued,\
                       buffers_created,buffers_reused,tick,confirmed,lead,worst_correction,\
-                      vertical_pct,worst_divergence,footing_changes,unloaded,body_x,body_y,\
-                      body_z,vel_x,vel_y,vel_z,on_ground,step_lag,camera_y\n";
+                      vertical_pct,worst_divergence,footing_changes,unloaded,terrain_conflicts,\
+                      body_x,body_y,body_z,vel_x,vel_y,vel_z,on_ground,step_lag,camera_y\n";
         if writer.write_all(header.as_bytes()).is_err() {
             return false;
         }
@@ -1093,7 +1161,7 @@ impl App {
         let _ = writeln!(
             log.writer,
             "{},{:.3},{:.3},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.0},{},{},{},{},\
-             {created},{reused},{tick},{confirmed},{},{:.4},{},{:.4},{},{},{:.4},{:.4},{:.4},\
+             {created},{reused},{tick},{confirmed},{},{:.4},{},{:.4},{},{},{},{:.4},{:.4},{:.4},\
              {:.4},{:.4},{:.4},{},{:.4},{:.4}",
             frame,
             elapsed,
@@ -1117,6 +1185,7 @@ impl App {
             self.pacing.worst_divergence_cells(),
             self.pacing.footing_changes_last_second(),
             u8::from(self.pacing.predicted_into_unloaded()),
+            self.pacing.terrain_conflicts_last_second(),
             position[0],
             position[1],
             position[2],
@@ -1190,7 +1259,8 @@ impl App {
         let _ = writeln!(
             out,
             "tick {} client_tick {} d {dx:+.4} {dy:+.4} {dz:+.4} dist {:.4} \
-             dv {:+.4} {:+.4} {:+.4} footing_agreed {} server_ground {}",
+             dv {:+.4} {:+.4} {:+.4} footing_agreed {} server_ground {} \
+             there loaded {} ground {} inside {}",
             divergence.tick,
             self.tick,
             divergence.distance,
@@ -1199,6 +1269,9 @@ impl App {
             divergence.velocity_offset[2],
             divergence.footing_agreed,
             state.on_ground,
+            divergence.there.loaded,
+            divergence.there.ground,
+            divergence.there.inside,
         );
         let _ = out.flush();
     }

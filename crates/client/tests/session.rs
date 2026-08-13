@@ -1354,6 +1354,118 @@ fn walking_across_chunk_boundaries_never_touches_a_chunk_it_does_not_have() {
 }
 
 #[test]
+fn jumping_across_a_chunk_plane_does_not_replay_against_the_wrong_chunk() {
+    // **The chunk-border glitch, at the seam it was actually felt on.** Walking
+    // crosses the vertical planes; jumping crosses the horizontal one, and that
+    // is the case the window reported — "jumping into a hole is still rough",
+    // "climbing out of a hole ... jerking and sliding".
+    //
+    // A reconcile adopts a state from several ticks ago, so its origin is the
+    // one the body held BEFORE the crossing, while the client has already
+    // renormalised past it. The replay then ran against a view anchored a whole
+    // chunk away: from the session log, the body fell 3.6 cells through solid
+    // ground with `vy` at exactly five ticks of gravity.
+    //
+    // Two numbers say it did not happen. The divergence is the two simulations
+    // measured against each other; the terrain conflict is the client's own
+    // world asked whether it even has ground where the server is standing —
+    // which is the half that tells a replay bug from a streaming one.
+    //
+    // **This is the broad invariant, not the regression test.** Measured on this
+    // world it does NOT fail against the bug: hopping across a flat plain
+    // crosses the vertical planes, and a view offset by a chunk on x still finds
+    // flat ground under the body, so the disagreement stays small. What made the
+    // reported glitch violent was terrain the player had dug. The case that
+    // fails cleanly against the bug is
+    // `predict::tests::a_replay_across_a_chunk_plane_still_has_ground_under_it`,
+    // which stages the crossing exactly and watches the body fall through the
+    // floor. Keep both: that one holds the fix in place, this one would notice a
+    // whole class of ordinary-play disagreements neither of us has thought of.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded_with_view("plane-jumps", ViewDistance::DEFAULT);
+    let mut app = client("plane-jumps", &server, gpu);
+
+    // Traced unconditionally, and from before the join, because the failure is a
+    // claim about geometry and the count alone cannot be argued with.
+    let trace = scratch("plane-jumps").join("physics.log");
+    assert!(
+        app.trace_physics_to(&trace),
+        "could not open {}",
+        trace.display()
+    );
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+    // **Two seconds, not one, and the second one is not padding.** `Pacing`
+    // publishes the worst of each one-second window, so a reading taken at the
+    // end of the first window still carries the join in it — the client holds no
+    // terrain for a moment while the server is already falling to the ground,
+    // which traced as `dv -0.4800, -0.7200, -0.9600`, gravity three ticks
+    // running. Nothing about crossing a chunk plane, and enough to fail the
+    // measurement below on its own.
+    run_real_time(&mut app, 2.0, Input::default());
+
+    // Held down: one hop per press is enforced on the tick, so this is a body
+    // that jumps, lands, and jumps again for as long as the test runs — and a
+    // jump is the only thing that crosses a horizontal plane on its own.
+    let hopping = Input {
+        forward: 1.0,
+        jump: true,
+        sprint: true,
+        ..Input::default()
+    };
+
+    // **Sampled every frame, not read at the end.** `Pacing` publishes the worst
+    // of each one-second window, so a single bad crossing is gone from the
+    // readout a second later — and a crossing is over in three ticks. Reading it
+    // once after the run is how the first version of this test passed against
+    // the very bug it was written for.
+    // **Measured from here, not from the client's first tick.** The very first
+    // reconcile after a join lands before any chunk has arrived — traced as
+    // `tick 1 ... server_ground true ... ground false` — and a client with no
+    // world yet cannot be said to disagree with the server about one. What this
+    // test is about starts once there is terrain to cross.
+    let settled = app.pacing().terrain_conflicts_total();
+    let start = app.camera().position.chunk;
+    let mut crossed = start;
+    let mut diverged: f32 = 0.0;
+    let frame = Duration::from_millis(16);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut last = Instant::now();
+    while Instant::now() < deadline {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        let now = Instant::now();
+        app.advance(hopping, now.duration_since(last).as_secs_f32());
+        last = now;
+        diverged = diverged.max(app.pacing().worst_divergence_cells());
+        crossed = app.camera().position.chunk;
+        std::thread::sleep(frame);
+    }
+
+    assert_ne!(
+        (start.x, start.y, start.z),
+        (crossed.x, crossed.y, crossed.z),
+        "never crossed a chunk plane, so the test proved nothing: still at {start:?}"
+    );
+    assert_eq!(
+        app.pacing().terrain_conflicts_total() - settled,
+        0,
+        "the client's world had no ground where the server was standing — the replay is \
+         colliding against the wrong chunk. Trace: {}",
+        trace.display()
+    );
+    assert!(
+        diverged < 1.0,
+        "the two simulations disagreed by {diverged} cells while jumping across chunk planes"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}
+
+#[test]
 fn the_frame_log_records_every_column_it_promises() {
     // **The log a scripted session will be read from.** It will be looked at
     // once, offline, by someone who cannot re-run it — so a missing column or a

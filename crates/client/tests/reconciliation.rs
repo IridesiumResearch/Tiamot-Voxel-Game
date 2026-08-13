@@ -170,14 +170,31 @@ fn walking_over_a_bad_link_keeps_the_correction_small() {
 
     let mut worst = 0.0f32;
     let mut samples = 0;
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(8);
     let mut last = Instant::now();
     while Instant::now() < deadline {
         assert!(app.pump_network(), "the connection ended");
         app.remesh();
         let dt = last.elapsed().as_secs_f32().min(0.1);
         last = Instant::now();
-        app.advance(forward, dt);
+        // **Changing direction, and that is the whole point of the scenario.**
+        // Held forward, a lost input costs nothing: `InputQueue::take` repeats
+        // the last intent for a tick nobody spoke for, and a repeat of "forward"
+        // IS the input that went missing, so the server arrives exactly where
+        // the client predicted. Measured — with the walk held straight this
+        // reads 0.000 cells over 8 seconds of 5% loss.
+        //
+        // A repeat is only wrong when the input changed, so the walk turns. Now
+        // a dropped packet leaves the server strafing the way the player has
+        // stopped strafing, the two part company, and the correction being
+        // bounded is a real one.
+        let phase = (started.elapsed().as_secs_f32() * 2.5) as u32 % 2;
+        let weaving = Input {
+            right: if phase == 0 { 1.0 } else { -1.0 },
+            ..forward
+        };
+        app.advance(weaving, dt);
 
         let correction = app.pacing().worst_correction_cells();
         if correction > 0.0 {

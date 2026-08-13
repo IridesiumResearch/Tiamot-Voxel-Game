@@ -49,7 +49,7 @@
 use std::collections::VecDeque;
 
 use tiamot_core::ChunkPos;
-use tiamot_core::phys::{self, Body, Intent, Solid, Tuning, voxels::renormalise};
+use tiamot_core::phys::{self, Aabb, Body, Intent, Solid, Tuning, voxels::renormalise};
 
 /// How long a correction takes to blend away, in ticks.
 ///
@@ -114,6 +114,59 @@ pub struct Divergence {
     pub velocity_offset: [f32; 3],
     /// Whether the two agreed about standing on the ground.
     pub footing_agreed: bool,
+    /// Whether the server had the body standing on the ground.
+    pub server_on_ground: bool,
+    /// What the client's own world says about where the server put the body.
+    pub there: Terrain,
+}
+
+impl Divergence {
+    /// Whether the client's copy of the world contradicts the server's answer.
+    ///
+    /// One direction only, and deliberately. "The server says standing, the
+    /// client's world has nothing there" cannot happen unless the two hold
+    /// different terrain. The mirror — the client's world has ground where the
+    /// server is airborne — happens constantly and means nothing: a body that
+    /// has just jumped is off the ground it is still directly above.
+    #[must_use]
+    pub const fn terrain_contradicted(&self) -> bool {
+        self.there.loaded && self.server_on_ground && !self.there.ground
+    }
+}
+
+/// The client's world, asked about a place the client is not.
+///
+/// **This is the question that separates the two ways a prediction can be
+/// wrong.** A disagreement about position can mean the two sides simulated the
+/// same world differently — a lost input, a repeated one — or that they are not
+/// simulating the same world at all, because the client's copy of a chunk is
+/// stale. Those have opposite fixes, and the numbers alone cannot tell them
+/// apart: both read as "the server has me somewhere else".
+///
+/// So ask the client's own chunks about the server's answer. If the server says
+/// it is standing on ground and the client's world has nothing under that spot
+/// — and does hold the chunk, so it is not merely guessing — the two worlds
+/// differ, and no amount of input bookkeeping will reconcile them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Terrain {
+    /// Whether the client holds the chunk the server's feet are in.
+    ///
+    /// False makes the other two meaningless: unloaded cells read as solid.
+    pub loaded: bool,
+    /// Whether the client's world has anything solid within a block below the
+    /// server's feet.
+    ///
+    /// **A block, not a skin, and the difference is what makes this a fact.**
+    /// The simulation sets `on_ground` in two places where nothing is directly
+    /// underfoot on purpose — a body being eased out of geometry it began the
+    /// tick inside, and a body striding across a rut on the ground ahead of it
+    /// (Contract §2). Asking whether the cell immediately below is solid calls
+    /// both of those a contradiction, and a session of sprinting over sub-node
+    /// rubble reported forty. Nothing within a whole block below is not a
+    /// near miss in either case: it is a body somewhere else entirely.
+    pub ground: bool,
+    /// Whether the client's world has the server's body inside solid.
+    pub inside: bool,
 }
 
 /// A locally predicted body, and the inputs the server has not confirmed.
@@ -303,7 +356,44 @@ impl Predictor {
     /// the gap between the newest prediction and a replay, so it grows with the
     /// lead and says nothing about which tick was wrong. This compares like with
     /// like: one tick, both answers, per axis.
-    fn compare(&mut self, state: &Authoritative) {
+    /// Asks the client's own chunks about the position the server reported.
+    ///
+    /// The frame is this predictor's origin, which is the frame `solid` was
+    /// built in, so the server's `(chunk, local)` has to be brought into it.
+    /// The chunk difference is a handful at most — a body cannot be more than a
+    /// chunk or two from where it was predicted without far worse having gone
+    /// wrong — so this stays well inside `f32`.
+    fn probe(&self, solid: &impl Solid, state: &Authoritative) -> Terrain {
+        solid.rebase(self.origin);
+        let span = tiamot_core::CHUNK_SUBNODES as f32;
+        let feet = [
+            (state.chunk.x - self.origin.x) as f32 * span + state.local[0],
+            (state.chunk.y - self.origin.y) as f32 * span + state.local[1],
+            (state.chunk.z - self.origin.z) as f32 * span + state.local[2],
+        ];
+        let box_here = Aabb::player_at(feet);
+        let (min_x, _) = box_here.cell_span(0);
+        let (min_y, _) = box_here.cell_span(1);
+        let (min_z, _) = box_here.cell_span(2);
+        // One block deep, ending a skin short of the feet so a body standing
+        // flush on a surface is looking below it rather than at itself.
+        let half = phys::PLAYER_WIDTH / 2.0;
+        let support = Aabb {
+            min: [
+                feet[0] - half,
+                feet[1] - tiamot_core::SUBNODES_PER_AXIS as f32,
+                feet[2] - half,
+            ],
+            max: [feet[0] + half, feet[1] - phys::SKIN, feet[2] + half],
+        };
+        Terrain {
+            loaded: solid.loaded(min_x, min_y, min_z),
+            ground: solid.overlaps(&support),
+            inside: solid.overlaps(&box_here),
+        }
+    }
+
+    fn compare(&mut self, solid: &impl Solid, state: &Authoritative) {
         let Some(mine) = self
             .remembered
             .iter()
@@ -341,6 +431,7 @@ impl Predictor {
         ];
         let [x, y, z] = offset;
         let distance = (x * x + y * y + z * z).sqrt() as f32;
+        let there = self.probe(solid, state);
 
         self.divergence = Some(Divergence {
             tick: state.last_processed_input,
@@ -352,6 +443,8 @@ impl Predictor {
                 state.velocity[2] - mine.velocity[2],
             ],
             footing_agreed: state.on_ground == mine.on_ground,
+            server_on_ground: state.on_ground,
+            there,
         });
     }
 
@@ -359,7 +452,7 @@ impl Predictor {
     pub fn reconcile(&mut self, solid: &impl Solid, state: &Authoritative, tuning: &Tuning) {
         // Before the body is replaced, while the memory of that tick still means
         // something.
-        self.compare(state);
+        self.compare(solid, state);
         // Where we thought we were, before adopting the server's answer. The
         // difference between this and the replayed result IS the correction.
         let predicted = self.world_position();
@@ -555,6 +648,12 @@ impl Predictor {
     /// same origin — after it, a body that crossed a chunk boundary would
     /// subtract two coordinates from different frames and report a 48-cell step.
     fn step(&mut self, solid: &impl Solid, intent: Intent, tuning: &Tuning, ease: Ease) {
+        // **Before every step, not once per call.** A reconcile adopts the
+        // server's origin and then replays every unconfirmed input, and a body
+        // can cross a chunk plane part-way through that — so a frame anchored
+        // once, by the caller, is wrong for the rest of the replay. Wrong by a
+        // whole chunk, which reads as the ground vanishing.
+        solid.rebase(self.origin);
         let before = self.body.position;
         let was_on_ground = self.body.on_ground;
         self.body = phys::step(solid, self.body, intent, tuning);
@@ -777,6 +876,80 @@ mod tests {
     use tiamot_core::phys::Gait;
 
     use super::*;
+
+    #[test]
+    fn a_replay_across_a_chunk_plane_still_has_ground_under_it() {
+        // **The chunk-border bug, and the whole of it.** Reported from the
+        // window with the border overlay on: "if I run into a chunk corner, I
+        // often glitch ... if I am within a chunk I am completely fine", and
+        // again as jumping into a hole.
+        //
+        // The two sides renormalise on their own ticks, so for the tick or two
+        // it takes both to cross a plane, the server's origin and the client's
+        // differ by one chunk. Reconciliation adopted the server's origin and
+        // then replayed against a view the CALLER had anchored to the origin the
+        // client held a moment earlier — so every collision query in the replay
+        // asked about somewhere 48 cells away.
+        //
+        // From the session log that found it: the client crossed y=0 on tick
+        // 168 and renormalised, the server crossed on 169, and the body replayed
+        // from 45.0010 down to 41.4010 with `vy` at −1.2000 — exactly five ticks
+        // of gravity, a body falling through a floor that was never queried.
+        let mut store = crate::world::ChunkStore::new();
+        // Solid stone up to world y = 0, air above: a floor whose surface is
+        // exactly the plane between chunk y −1 and chunk y 0.
+        store.insert(tiamot_core::Chunk::new(
+            ChunkPos::new(0, -1, 0),
+            tiamot_core::MaterialId(1),
+        ));
+        store.insert(tiamot_core::Chunk::new(
+            ChunkPos::new(0, 0, 0),
+            tiamot_core::MaterialId::AIR,
+        ));
+
+        // Standing on that surface, described in the origin ABOVE it — which is
+        // what the client holds the moment after it renormalises.
+        let mut predictor = Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 10);
+        let store_view = |predictor: &Predictor| phys::Voxels::new(&store, predictor.origin());
+        for tick in 11..=14 {
+            let view = store_view(&predictor);
+            predictor.predict(&view, tick, Intent::default(), &Tuning::DEFAULT);
+        }
+        assert!(
+            predictor.body().on_ground,
+            "the staging is wrong: never stood on the floor to begin with"
+        );
+
+        // The server's word about tick 10, describing the SAME place in the
+        // origin below — which is what it holds until its own crossing.
+        let state = Authoritative {
+            last_processed_input: 11,
+            chunk: ChunkPos::new(0, -1, 0),
+            local: [24.0, 48.0, 24.0],
+            velocity: [0.0; 3],
+            on_ground: true,
+        };
+        let view = store_view(&predictor);
+        predictor.reconcile(&view, &state, &Tuning::DEFAULT);
+
+        assert!(
+            predictor.body().on_ground,
+            "the replay lost the floor: {:?} at origin {:?}",
+            predictor.body(),
+            predictor.origin()
+        );
+        let divergence = predictor.divergence().expect("a comparison was made");
+        assert!(
+            !divergence.terrain_contradicted(),
+            "the client's own world has no ground where the server is standing: {:?}",
+            divergence.there
+        );
+        assert!(
+            divergence.distance < 0.01,
+            "the two described the same place and disagreed by {} cells",
+            divergence.distance
+        );
+    }
 
     /// A floor at cell 0 and nothing else.
     struct Ground(BTreeSet<(i32, i32, i32)>);

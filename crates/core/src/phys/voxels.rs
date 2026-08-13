@@ -48,7 +48,13 @@ pub trait ChunkLookup {
 pub struct Voxels<'a, S: ChunkLookup> {
     source: &'a S,
     /// The chunk whose corner is cell `[0, 0, 0]` in this frame.
-    origin: ChunkPos,
+    ///
+    /// A `Cell` because the frame MOVES: a body that crosses a chunk plane is
+    /// renormalised into the next origin, and every query after that is asking
+    /// about a different anchor. Collision queries are `&self`, so the only
+    /// honest way to follow the body is interior mutability — see
+    /// [`Solid::rebase`], which is what moves it.
+    origin: std::cell::Cell<ChunkPos>,
     /// Whether any query has landed on a chunk that is not resident.
     ///
     /// **Purely diagnostic, and it changes no answer.** An absent chunk reads as
@@ -65,7 +71,7 @@ impl<'a, S: ChunkLookup> Voxels<'a, S> {
     pub const fn new(source: &'a S, origin: ChunkPos) -> Self {
         Self {
             source,
-            origin,
+            origin: std::cell::Cell::new(origin),
             absent: std::cell::Cell::new(false),
         }
     }
@@ -87,9 +93,9 @@ impl<'a, S: ChunkLookup> Voxels<'a, S> {
     pub const fn to_world(&self, x: i32, y: i32, z: i32) -> SubNodePos {
         let span = crate::CHUNK_SUBNODES as i32;
         SubNodePos::new(
-            self.origin.x * span + x,
-            self.origin.y * span + y,
-            self.origin.z * span + z,
+            self.origin.get().x * span + x,
+            self.origin.get().y * span + y,
+            self.origin.get().z * span + z,
         )
     }
 
@@ -98,9 +104,9 @@ impl<'a, S: ChunkLookup> Voxels<'a, S> {
     pub const fn from_world(&self, pos: SubNodePos) -> [i32; 3] {
         let span = crate::CHUNK_SUBNODES as i32;
         [
-            pos.x - self.origin.x * span,
-            pos.y - self.origin.y * span,
-            pos.z - self.origin.z * span,
+            pos.x - self.origin.get().x * span,
+            pos.y - self.origin.get().y * span,
+            pos.z - self.origin.get().z * span,
         ]
     }
 
@@ -137,6 +143,15 @@ impl<S: ChunkLookup> Solid for Voxels<'_, S> {
     fn solid(&self, x: i32, y: i32, z: i32) -> bool {
         self.material(x, y, z)
             .is_none_or(|material| !material.is_air())
+    }
+
+    /// Follows the body into its new origin.
+    ///
+    /// The frame is only meaningful next to the origin a body's coordinates are
+    /// measured from, so a caller that renormalises the body has to say so, or
+    /// every query after it asks about somewhere else.
+    fn rebase(&self, origin: ChunkPos) {
+        self.origin.set(origin);
     }
 
     /// Whether the chunk holding this cell is resident.

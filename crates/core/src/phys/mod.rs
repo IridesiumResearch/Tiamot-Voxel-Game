@@ -116,7 +116,8 @@ impl Aabb {
     /// The high end is pulled in by [`SKIN`] so that a box whose face lies
     /// exactly on a cell boundary does not claim the cell beyond it. Without
     /// that, a body standing flush against a wall reads as already inside it.
-    fn cell_span(&self, axis: usize) -> (i32, i32) {
+    #[must_use]
+    pub fn cell_span(&self, axis: usize) -> (i32, i32) {
         (
             floor_to_i32(self.min[axis]),
             floor_to_i32(self.max[axis] - SKIN),
@@ -152,6 +153,33 @@ pub trait Solid {
     fn loaded(&self, _x: i32, _y: i32, _z: i32) -> bool {
         true
     }
+
+    /// Re-anchors the frame this view answers in.
+    ///
+    /// **A body's coordinates only mean something next to the origin they are
+    /// measured from** (charter rule 7), so a view built for one origin answers
+    /// a different question once the body has been renormalised into another.
+    /// Any caller that steps a body more than once — a client replaying the
+    /// inputs the server has not confirmed — has to say when that happened.
+    ///
+    /// Defaults to nothing, which is right for a view with no frame: a test grid
+    /// in absolute coordinates answers the same question whatever the body's
+    /// origin is. [`voxels::Voxels`] overrides it.
+    ///
+    /// # The bug this exists for
+    ///
+    /// Reconciliation adopted the server's `(chunk, local)` and then replayed
+    /// against a view still anchored to the origin the client had a moment
+    /// earlier. The two differ for exactly as long as it takes both sides to
+    /// cross a chunk plane — a tick or two, every crossing — and in that window
+    /// the replay collided against a world displaced by a whole chunk. Measured
+    /// from a session log: the client crossed y=0 on tick 168 and renormalised,
+    /// the server crossed on 169, and the replay in between fell 3.6 cells
+    /// through solid ground with `vy` at exactly five ticks of gravity, because
+    /// there was nothing under it 48 cells up. Reported as "if I run into a
+    /// chunk corner, I often glitch ... if I am within a chunk I am completely
+    /// fine".
+    fn rebase(&self, _origin: crate::coords::ChunkPos) {}
 
     /// Whether any solid cell overlaps a box.
     fn overlaps(&self, aabb: &Aabb) -> bool {
@@ -746,7 +774,14 @@ fn longest_supported_move(
 }
 
 /// Whether there is solid ground immediately below a body's feet.
-fn standing_on_ground(solid: &impl Solid, position: [f32; 3]) -> bool {
+///
+/// Public because a client needs to ask it about a position that is not its
+/// own: given where the server says a body is, does *this* copy of the world
+/// have anything under it? Asking with a slightly different probe than the
+/// simulation uses would answer a slightly different question, which is exactly
+/// what a diagnostic must not do.
+#[must_use]
+pub fn standing_on_ground(solid: &impl Solid, position: [f32; 3]) -> bool {
     let probe = Aabb::player_at(position).translated([0.0, -SKIN * 2.0, 0.0]);
     let (min_x, max_x) = probe.cell_span(0);
     let (min_z, max_z) = probe.cell_span(2);
