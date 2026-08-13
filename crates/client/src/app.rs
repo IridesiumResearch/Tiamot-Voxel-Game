@@ -1837,6 +1837,8 @@ impl App {
 
                 Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
 
+                Event::ChunkFluid(pos, layer) => self.store.set_fluid(pos, *layer),
+
                 Event::Sky(sky) => self.sky = sky,
 
                 // Ignored while the clock is being scrubbed by hand. The server

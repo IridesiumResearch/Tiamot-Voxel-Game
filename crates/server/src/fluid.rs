@@ -3,12 +3,20 @@
 
 //! The server's fluid: where it is kept, and what runs it.
 //!
-//! # Derived, and persisted anyway
+//! # Not derived, so it has to be saved
 //!
 //! Light is derived state — thrown away on shutdown and recomputed on load,
 //! because recomputing it gives the same answer. **Fluid is not.** A pond is a
 //! record of what somebody poured, and there is no function from terrain back to
-//! "there was milk here". So a fluid layer is saved with its chunk.
+//! "there was milk here", so a fluid layer has to be written with its chunk or
+//! every pond in the world empties on restart.
+//!
+//! [`Fluidics::chunk_loaded`] and [`Fluidics::layer`] are the two ends of that
+//! and are used by the network path today. **The database side is not wired
+//! yet** — see the task's remaining work — so a pond currently survives a chunk
+//! leaving memory only for as long as the server runs. Written here rather than
+//! left to be discovered: an unwired half of a round trip is the kind of thing
+//! that reads as finished from either end alone.
 //!
 //! # Two clocks
 //!
@@ -236,6 +244,45 @@ impl Neighbourhood for Wet<'_> {
             self.layers.remove(&chunk);
         }
     }
+}
+
+/// Builds the fluid registry from what the mods registered.
+///
+/// `id_of` maps a block id to its **world** material id, exactly as light's
+/// equivalent does and for the same reason: a world that has seen a different
+/// mod set numbers its materials differently, and a table of this session's
+/// runtime ids would name every fluid's material one number out (charter rule
+/// 8).
+///
+/// A fluid naming a block nothing registered is dropped with a warning rather
+/// than refused. The alternative is a server that will not start because one
+/// mod misspelled a block name, and a fluid nobody can see is a far smaller
+/// problem than a world nobody can join.
+#[must_use]
+pub fn fluids_from_rules(
+    rules: &[tiamot_core::script::FluidRules],
+    id_of: impl Fn(&str) -> Option<tiamot_core::MaterialId>,
+) -> Fluids {
+    let mut fluids = Fluids::new();
+    for rule in rules {
+        let Some(material) = id_of(&rule.material) else {
+            tracing::warn!(
+                fluid = %rule.fluid,
+                material = %rule.material,
+                "a fluid names a block nothing registered; it will not be drawn"
+            );
+            continue;
+        };
+        if let Err(err) = fluids.register(tiamot_core::fluid::Registered {
+            name: rule.fluid.clone(),
+            flow_range: rule.flow_range,
+            tick_rate: rule.tick_rate,
+            material,
+        }) {
+            tracing::warn!(fluid = %rule.fluid, "could not register a fluid: {err}");
+        }
+    }
+    fluids
 }
 
 /// The block at a flat index within a chunk.

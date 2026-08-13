@@ -33,8 +33,8 @@ use crate::coords::{ChunkPos, LocalBlock};
 use crate::detgen::{ChunkBuffer, FractalParams, Region2d, StreamRng, fill_2d};
 use crate::material::MaterialId;
 use crate::script::vm::{
-    Backend, BlockRules, BlockTexture, Brush, HookOutcome, ScriptError, ScriptVm, Sky, SkyGrade,
-    SkyKeyframe, Tool, VmLimits,
+    Backend, BlockRules, BlockTexture, Brush, FluidRules, HookOutcome, ScriptError, ScriptVm, Sky,
+    SkyGrade, SkyKeyframe, Tool, VmLimits,
 };
 
 /// Registry key holding the mods that registered `on_dig_complete`.
@@ -790,6 +790,30 @@ impl ScriptVm for MluaVm {
         all.into_iter().map(|(_, rules)| rules).collect()
     }
 
+    fn registered_fluids(&self) -> Vec<FluidRules> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.fluids") else {
+            return Vec::new();
+        };
+
+        let mut fluids: Vec<FluidRules> = registry
+            .pairs::<String, Table>()
+            .filter_map(Result::ok)
+            .filter_map(|(fluid, entry)| {
+                Some(FluidRules {
+                    fluid,
+                    material: entry.get("material").ok()?,
+                    flow_range: entry.get("flow_range").ok()?,
+                    tick_rate: entry.get("tick_rate").ok()?,
+                })
+            })
+            .collect();
+        // Sorted, because a Lua table's pair order is not defined and the fluid
+        // ids handed out downstream are positional. Two servers disagreeing
+        // about which id is milk is charter rule 4 broken on the wire.
+        fluids.sort_by(|a, b| a.fluid.cmp(&b.fluid));
+        fluids
+    }
+
     fn registered_tools(&self) -> Vec<Tool> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.tools") else {
             return Vec::new();
@@ -1044,6 +1068,14 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
 
         let owner = mod_id.to_owned();
+        let register_fluid = self
+            .lua
+            .create_function(move |lua, spec: Table| register_fluid(lua, &owner, &spec))
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_fluid", register_fluid)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
         let register_sky = self
             .lua
             .create_function(move |lua, spec: Table| register_sky(lua, &owner, &spec))
@@ -1270,6 +1302,10 @@ impl MluaVm {
         let tools = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.tools", tools)
+            .map_err(|err| self.vm_error(&err))?;
+        let fluids = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.fluids", fluids)
             .map_err(|err| self.vm_error(&err))?;
         let skies = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
@@ -1555,6 +1591,87 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
 /// coded rule. Sub-node resolution is only a real feature if a mod can reach
 /// it, and `brush = "subnode"` is how — `core:chisel` in the reference mods is
 /// nothing more than a mod using this.
+/// `game.register_fluid{ id, material, flow_range, tick_rate }`.
+///
+/// The whole of what the engine needs to simulate and draw a fluid. Everything
+/// else a fluid might do — hurt you, make a sound, be drinkable — is the
+/// registering mod's business and needs no engine support beyond the hooks that
+/// already exist.
+fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
+    let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+    if frozen {
+        return Err(mlua::Error::external(format!(
+            "mod `{owner}`: registration is closed"
+        )));
+    }
+
+    let id: String = spec
+        .get("id")
+        .map_err(|_| mlua::Error::external("register_fluid: missing required field `id`"))?;
+
+    for pair in spec.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !FLUID_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "register_fluid(\"{id}\"): unknown field `{name}`"
+                )));
+            }
+        }
+    }
+
+    let qualified = qualify_id(owner, &id).map_err(mlua::Error::external)?;
+
+    // **Required, and deliberately not defaulted.** A fluid with no material is
+    // a fluid the mesher cannot draw, and inventing one here would mean the
+    // engine picking what milk looks like — charter rule 1 says it does not get
+    // to. Qualified against the same mod, so a fluid can name its own block.
+    let material: String = spec.get("material").map_err(|_| {
+        mlua::Error::external(format!(
+            "register_fluid(\"{qualified}\"): missing required field `material`. A fluid is \
+             drawn as a registered block; name the one it should look like."
+        ))
+    })?;
+    let material = qualify_id(owner, &material).map_err(mlua::Error::external)?;
+
+    let flow_range: u8 = spec
+        .get("flow_range")
+        .unwrap_or(FluidRules::DEFAULT_FLOW_RANGE);
+    if flow_range == 0 || flow_range > crate::fluid::MAX_LEVEL {
+        return Err(mlua::Error::external(format!(
+            "register_fluid(\"{qualified}\"): flow_range must be 1..={}, got {flow_range}. The \
+             level a block holds IS how far the fluid has travelled, and there are only that \
+             many levels.",
+            crate::fluid::MAX_LEVEL
+        )));
+    }
+
+    let tick_rate: u8 = spec
+        .get("tick_rate")
+        .unwrap_or(FluidRules::DEFAULT_TICK_RATE);
+    if tick_rate == 0 {
+        return Err(mlua::Error::external(format!(
+            "register_fluid(\"{qualified}\"): tick_rate must be at least 1, got 0. A fluid that \
+             updates every zeroth tick never moves, which reads as the engine ignoring the mod."
+        )));
+    }
+
+    let registry: Table = lua.named_registry_value("tiamot.fluids")?;
+    if registry.contains_key(qualified.clone())? {
+        return Err(mlua::Error::external(format!(
+            "fluid `{qualified}` is already registered"
+        )));
+    }
+
+    let entry = lua.create_table()?;
+    entry.set("material", material)?;
+    entry.set("flow_range", flow_range)?;
+    entry.set("tick_rate", tick_rate)?;
+    registry.set(qualified, entry)?;
+    Ok(())
+}
+
 fn register_tool(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
     if frozen {
@@ -1826,6 +1943,10 @@ const SKY_FIELDS: [&str; 3] = ["day_length_ticks", "keyframes", "start_time"];
 
 /// Fields `register_tool` accepts.
 const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "default"];
+
+/// Fields `register_fluid` accepts. Anything else is a typo, and a typo that is
+/// silently ignored is a mod whose author cannot tell why nothing happened.
+const FLUID_FIELDS: [&str; 4] = ["id", "material", "flow_range", "tick_rate"];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
 const BLOCK_FIELDS: [&str; 8] = [

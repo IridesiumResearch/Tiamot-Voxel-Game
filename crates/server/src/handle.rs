@@ -509,6 +509,26 @@ impl ServerHandle {
             },
         );
 
+        // The fluids the mods registered, keyed by world material id for the
+        // same reason emissions are.
+        let fluids = crate::fluid::fluids_from_rules(
+            &host
+                .as_ref()
+                .map(|loaded| loaded.vm().registered_fluids())
+                .unwrap_or_default(),
+            |block| {
+                let runtime = registry
+                    .iter()
+                    .find(|(_, name)| *name == block)
+                    .map(|(id, _)| id)?;
+                world
+                    .materials()
+                    .to_world(runtime)
+                    .ok()
+                    .map(tiamot_core::MaterialId)
+            },
+        );
+
         // The sky, as the wire carries it. Absent is legitimate: a world whose
         // mods register no sky has no day, and the client holds its colours
         // fixed rather than being given one the engine invented.
@@ -736,6 +756,13 @@ impl ServerHandle {
                         crate::light::Lighting::new(emissions),
                     ));
 
+                    // Fluid needs no lock: nothing outside this thread reads it,
+                    // because `game.get_fluid` runs on this thread inside a tick
+                    // exactly as the rest of the mod API does. Light needs one
+                    // only because `game.get_light` is also reachable from the
+                    // generator, which runs re-entrantly.
+                    let mut fluidics = crate::fluid::Fluidics::new(fluids);
+
                     // Either the mods generate terrain, or there are no mods
                     // and the world is air. Both are legitimate.
                     let mut source = match host {
@@ -792,6 +819,11 @@ impl ServerHandle {
                             match world.apply(&edit, &mut source) {
                                 Ok(_) => {
                                     relight.push(edited_block(&edit));
+                                    // What the block will ACCEPT has changed,
+                                    // even though its fluid has not: a wall
+                                    // knocked out is how a pond finds out there
+                                    // is somewhere new to go.
+                                    fluidics.touch(edited_block(&edit));
                                     shared.broadcast(ServerMessage::BlockDelta {
                                         edit,
                                         actor: None,
@@ -1229,6 +1261,22 @@ impl ServerHandle {
                                 };
                                 broadcast_light(&shared, &light, &touched);
                             }
+                            // Fluid travels with the chunk, and always — an
+                            // empty layer is ONE byte, so telling a client
+                            // there is no milk here costs less than making it
+                            // wonder. Without this a joining player sees a pond
+                            // only once something disturbs it.
+                            if blob.is_some() {
+                                let layer = fluidics
+                                    .layer(request.pos)
+                                    .cloned()
+                                    .unwrap_or_else(tiamot_core::fluid::FluidLayer::empty);
+                                shared.broadcast(ServerMessage::ChunkFluid {
+                                    pos: request.pos,
+                                    fluid: tiamot_core::fluid::codec::encode(&layer),
+                                });
+                            }
+
                             // A failed send means the connection went away
                             // between asking and being answered, which is
                             // ordinary rather than an error.
@@ -1278,6 +1326,43 @@ impl ServerHandle {
                             broadcast_light(&shared, &light, &touched);
                         }
                         control.note_lit_chunks(lighting.read().expect("lighting lock").len());
+
+                        // **Fluid, at half the simulation's rate.** Nobody can
+                        // see the difference between milk moving ten times a
+                        // second and twenty, and it halves the cost of the one
+                        // system whose work is proportional to how much of the
+                        // world is MOVING rather than to how much is loaded.
+                        //
+                        // A settled world returns here immediately: the solver
+                        // checks an empty active set and allocates nothing.
+                        if tick.is_multiple_of(crate::fluid::TICKS_PER_FLUID_TICK) {
+                            let changes = fluidics.tick(&world);
+                            if !changes.is_empty() {
+                                // The whole layer, per touched chunk, rather
+                                // than a delta per block — see
+                                // `ServerMessage::ChunkFluid` for why that is
+                                // both smaller and safer.
+                                for pos in crate::fluid::Fluidics::touched_chunks(&changes) {
+                                    let Some(layer) = fluidics.layer(pos) else {
+                                        // The chunk drained completely, so it
+                                        // has no layer any more. Clients still
+                                        // have to be told, or the milk they can
+                                        // see never goes away.
+                                        shared.broadcast(ServerMessage::ChunkFluid {
+                                            pos,
+                                            fluid: tiamot_core::fluid::codec::encode(
+                                                &tiamot_core::fluid::FluidLayer::empty(),
+                                            ),
+                                        });
+                                        continue;
+                                    };
+                                    shared.broadcast(ServerMessage::ChunkFluid {
+                                        pos,
+                                        fluid: tiamot_core::fluid::codec::encode(layer),
+                                    });
+                                }
+                            }
+                        }
 
                         // The day advances once per tick, and is broadcast at
                         // a rate a person can read rather than at the rate it

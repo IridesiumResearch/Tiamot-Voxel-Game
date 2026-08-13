@@ -278,6 +278,46 @@ impl BlockRules {
     }
 }
 
+/// What a mod said about a fluid.
+///
+/// Registered during the loading window and frozen with everything else
+/// (charter rule 9). The engine keeps only what it must simulate and draw with;
+/// how fast the fluid hurts, and what it sounds like landing on stone, are the
+/// registering mod's business.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FluidRules {
+    /// The qualified fluid id, `"core:milk"`.
+    pub fluid: String,
+    /// The block material a full block of it is drawn as.
+    ///
+    /// A fluid has no material of its own in the block store — a block holds
+    /// terrain and fluid independently — so this is what the mesher and the
+    /// texture atlas look up. It names a registered block, which is what lets a
+    /// mod give its fluid a texture without the engine growing a second,
+    /// nearly-identical texture path.
+    pub material: String,
+    /// How far a source spreads sideways on flat ground, in blocks.
+    ///
+    /// Capped at [`crate::fluid::MAX_LEVEL`], because the level IS the distance
+    /// travelled and there are only seven of them. A shorter range is a fluid
+    /// that thins out faster.
+    pub flow_range: u8,
+    /// Simulation ticks between updates of this fluid.
+    ///
+    /// One means every fluid tick. Larger is slower and more viscous, and costs
+    /// proportionally less to simulate — which is a real lever for a mod adding
+    /// a fluid it expects to cover a lot of world.
+    pub tick_rate: u8,
+}
+
+impl FluidRules {
+    /// How far a fluid spreads if its mod said nothing.
+    pub const DEFAULT_FLOW_RANGE: u8 = crate::fluid::MAX_LEVEL;
+
+    /// How often a fluid updates if its mod said nothing.
+    pub const DEFAULT_TICK_RATE: u8 = 1;
+}
+
 /// How a moment's finished picture is graded.
 ///
 /// Every field is an identity by default, so a keyframe that says nothing about
@@ -646,6 +686,13 @@ pub trait ScriptVm: Sized {
     /// the defaults are the engine's answer, and making a caller distinguish
     /// "no entry" from "default entry" is how one of them ends up unbreakable.
     fn registered_block_rules(&self) -> Vec<BlockRules>;
+
+    /// Fluids registered during the loading window, ordered by fluid id.
+    ///
+    /// Empty for a mod set that registers none, which is most of them and is
+    /// not a failure: a world with no fluid simply has no fluid, and the engine
+    /// ships none of its own (charter rule 1).
+    fn registered_fluids(&self) -> Vec<FluidRules>;
 
     /// Tools registered during the loading window, ordered by id.
     fn registered_tools(&self) -> Vec<Tool>;

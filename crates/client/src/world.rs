@@ -27,6 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use tiamot_core::fluid::FluidLayer;
 use tiamot_core::light::{Light, LightLayer};
 use tiamot_core::proto::Edit;
 use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId, SubNodePos};
@@ -66,6 +67,12 @@ pub struct ChunkStore {
     /// is its own message (protocol v8), and a lamp placed next door relights a
     /// chunk whose blocks did not change.
     light: BTreeMap<ChunkPos, LightLayer>,
+    /// Fluid, for the chunks that have any.
+    ///
+    /// Absent rather than empty for a dry chunk, which is almost all of them:
+    /// the map holds what there is milk in, so a world with one pond has one
+    /// entry however far anybody walks.
+    fluid: BTreeMap<ChunkPos, FluidLayer>,
 }
 
 impl ChunkStore {
@@ -127,6 +134,52 @@ impl ChunkStore {
         // already dirty stays one entry, and during streaming the neighbours
         // are arriving and being marked anyway.
         self.mark_neighbours(pos);
+    }
+
+    /// Takes a chunk's fluid, as a whole layer.
+    ///
+    /// Every update is a full layer rather than a delta (see
+    /// `ServerMessage::ChunkFluid`), so this replaces rather than merges — and
+    /// an empty layer is the server saying the pond drained, which has to
+    /// replace what is held or the milk never goes away.
+    ///
+    /// Neighbours are marked for the same reason light marks them: a fluid
+    /// surface takes its corner heights from the blocks across a chunk
+    /// boundary, so a pond that ends at a seam would otherwise be smooth on one
+    /// side of it and a step on the other.
+    pub fn set_fluid(&mut self, pos: ChunkPos, layer: FluidLayer) {
+        if layer.is_empty() {
+            self.fluid.remove(&pos);
+        } else {
+            self.fluid.insert(pos, layer);
+        }
+        self.mark(pos);
+        self.mark_neighbours(pos);
+    }
+
+    /// What a block holds, or nothing where no layer has arrived.
+    ///
+    /// Nothing rather than an error for the absent case: a chunk whose fluid
+    /// has not arrived draws dry for a frame, which is the right way round —
+    /// inventing milk that is not there would be visible and wrong, and the
+    /// keyframe that follows corrects it either way.
+    #[must_use]
+    pub fn fluid_at(&self, pos: tiamot_core::BlockPos) -> tiamot_core::fluid::Fluid {
+        self.fluid
+            .get(&pos.chunk())
+            .map_or(tiamot_core::fluid::Fluid::EMPTY, |layer| {
+                layer.get(pos.local())
+            })
+    }
+
+    /// Whether any chunk holds fluid at all.
+    ///
+    /// A world with no milk in it should cost the mesher nothing, and this is
+    /// what lets it skip the fluid pass entirely rather than walking every
+    /// block to discover there is none.
+    #[must_use]
+    pub fn has_fluid(&self) -> bool {
+        !self.fluid.is_empty()
     }
 
     /// The light level at a block, or [`Light::DARK`] where nothing is held.

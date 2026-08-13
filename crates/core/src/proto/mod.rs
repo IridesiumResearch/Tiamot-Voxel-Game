@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -704,6 +704,39 @@ pub enum ServerMessage {
         /// Position in the day, `0.0..1.0`, midnight to midnight.
         time: f32,
     },
+
+    /// A chunk's fluid.
+    ///
+    /// **Appended at the end** (protocol v11).
+    ///
+    /// # Every update is a keyframe, on purpose
+    ///
+    /// The obvious design is a stream of per-block deltas with an occasional
+    /// full state for late joiners and loss recovery. This is the whole layer,
+    /// every time, and it is both smaller and safer for the same two reasons
+    /// [`ServerMessage::ChunkLight`] is:
+    ///
+    /// - **Fluid changes as a region, not as a block.** A spreading front moves
+    ///   tens of blocks in a chunk per fluid tick, and the run-length form of
+    ///   the whole layer is smaller than the deltas describing the front —
+    ///   exactly in the case where bandwidth matters. A settled pond sends
+    ///   nothing at all, because nothing changed.
+    /// - **Loss recovery becomes the normal path rather than a rare one.** A
+    ///   client that drops one of these is repaired by the next, with no
+    ///   sequence numbers, no gap detection, and no code that runs once a month
+    ///   in production and never in a test.
+    ///
+    /// The payload is [`crate::fluid::codec`]'s run-length form, which is ONE
+    /// byte for a chunk with no fluid in it — which is almost every chunk, so
+    /// the initial send costs a client nothing to be told there is no milk
+    /// here. **It is hostile input** (charter rule 14): the decoder bounds every
+    /// run before writing and has a fuzz target.
+    ChunkFluid {
+        /// Which chunk.
+        pos: ChunkPos,
+        /// Run-length encoded states — see [`crate::fluid::codec::decode`].
+        fluid: Vec<u8>,
+    },
 }
 
 /// One moment in a mod's day, on the wire.
@@ -1016,6 +1049,7 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::MaterialTable { .. }
         | ServerMessage::ToolTable { .. }
         | ServerMessage::ChunkLight { .. }
+        | ServerMessage::ChunkFluid { .. }
         | ServerMessage::SkyTable { .. }
         | ServerMessage::TimeOfDay { .. } => {}
     }
@@ -1610,6 +1644,16 @@ mod tests {
         })
         .expect("encode");
         assert_eq!(dig[0], 14);
+
+        // Protocol v11, appended after TimeOfDay and currently the newest.
+        // Pinned here rather than in the list above only because that test is
+        // at its line limit; the hazard is identical and so is the check.
+        let fluid = encode(&ServerMessage::ChunkFluid {
+            pos: ChunkPos::new(0, 0, 0),
+            fluid: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(fluid[0], 19);
     }
 
     #[test]

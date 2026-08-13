@@ -171,6 +171,14 @@ pub enum Event {
     /// dense layer is 8 KiB and every other variant is a handful of bytes.
     ChunkLight(ChunkPos, Box<tiamot_core::light::LightLayer>),
 
+    /// A chunk's fluid, as a whole layer.
+    ///
+    /// Boxed like the light layer, and for the same reason. Every update is a
+    /// full layer rather than a delta — see `ServerMessage::ChunkFluid` — so
+    /// applying one is a replacement rather than a merge, and a client that
+    /// missed the last one is repaired by this one.
+    ChunkFluid(ChunkPos, Box<tiamot_core::fluid::FluidLayer>),
+
     /// The sky a mod registered, sent once on join.
     Sky(crate::sky::Sky),
 
@@ -842,6 +850,22 @@ async fn session(
 
             ServerMessage::TimeOfDay { time } => {
                 let _ = events.send(Event::TimeOfDay(time));
+            }
+
+            ServerMessage::ChunkFluid { pos, fluid } => {
+                // **Decoded here, on the network task, and not on the frame
+                // loop.** Charter rule 14: this is hostile input, and the
+                // decoder is where the bounds are. Doing it here also keeps a
+                // malformed payload from costing a frame — a warning and a
+                // dropped message rather than a hitch.
+                match tiamot_core::fluid::codec::decode(&fluid) {
+                    Ok(layer) => {
+                        let _ = events.send(Event::ChunkFluid(pos, Box::new(layer)));
+                    }
+                    Err(err) => say(format!(
+                        "the server sent fluid for {pos:?} that would not decode: {err}"
+                    )),
+                }
             }
 
             ServerMessage::ChunkUnload { pos } => {
