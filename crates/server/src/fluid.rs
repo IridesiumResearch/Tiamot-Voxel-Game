@@ -104,6 +104,44 @@ impl tiamot_core::fluid::Access for Shared {
     }
 }
 
+/// A mod's runtime block writes, queued for the tick.
+///
+/// Rides the same queue an operator's edits use — see `Shared::queue_seed` —
+/// which is what lets a mod change the world without a lock on it and without
+/// the tick having to be re-entrant. The edit lands on the next tick.
+pub struct Edits {
+    shared: std::sync::Arc<crate::transport::Shared>,
+    /// Block name to WORLD material id, resolved once at startup.
+    ///
+    /// Names rather than numbers at the API boundary — charter rule 8 makes
+    /// runtime and world ids different numbers, and handing a mod either one
+    /// gives it a value it cannot safely compare or store. This is the table
+    /// that keeps that decision from costing a lookup per call.
+    by_name: std::collections::BTreeMap<String, u16>,
+}
+
+impl Edits {
+    /// Wraps the shared queue with a name table.
+    #[must_use]
+    pub const fn new(
+        shared: std::sync::Arc<crate::transport::Shared>,
+        by_name: std::collections::BTreeMap<String, u16>,
+    ) -> Self {
+        Self { shared, by_name }
+    }
+}
+
+impl tiamot_core::script::WorldEdit for Edits {
+    fn set_block(&self, pos: BlockPos, block: &str) -> bool {
+        let Some(&material) = self.by_name.get(block) else {
+            tracing::debug!(block, "a mod asked to place a block nothing registered");
+            return false;
+        };
+        self.shared
+            .queue_seed(tiamot_core::proto::Edit::Block { pos, material })
+    }
+}
+
 /// Every loaded chunk's fluid, and what the mods registered.
 #[derive(Debug, Default)]
 pub struct Fluidics {

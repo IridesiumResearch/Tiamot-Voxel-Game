@@ -371,6 +371,33 @@ function game.get_fluid(position) end
 ---@return boolean changed
 function game.set_fluid(position, spec) end
 
+---Replaces a whole block, at runtime.
+---
+---**The way a mod changes the world after worldgen.** `register_on_generate`
+---writes terrain while a chunk is being made; this writes it while people are
+---standing on it — a block that changes when fluid reaches it, a crop that
+---grows, a fire that spreads.
+---
+---Blocks are NAMED, not numbered, and that is not a convenience. Numeric ids
+---come in two flavours — the runtime ids registration hands out and the world
+---ids the database keeps — and they are different numbers. A mod given the
+---wrong one gets a comparison that works whenever the two happen to coincide.
+---Names have one meaning.
+---
+---The edit is QUEUED and lands on the next tick, so this returns whether it was
+---accepted rather than whether it landed — look next tick to find that out.
+---`false` means the queue is full or nothing is registered under that name.
+---
+---Pass `"engine:air"` to clear a block.
+---
+---```lua
+---game.set_block({ x = 10, y = 64, z = -3 }, "core_milk:waterlogged")
+---```
+---@param position { x: integer, y: integer, z: integer }
+---@param block string A registered block id, qualified.
+---@return boolean queued
+function game.set_block(position, block) end
+
 ---A dig about to happen.
 ---@class Tiamot.DigEvent
 ---@field player string Who is digging, as 64 hex characters. This is the canonical player UUID — key any per-player state on it, never on the display name, which a player can change and which is not unique across servers.

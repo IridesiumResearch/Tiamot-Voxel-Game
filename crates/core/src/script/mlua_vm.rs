@@ -219,6 +219,8 @@ pub struct MluaVm {
     /// is installed before the world exists, so the closures capture this and
     /// read whatever is in it at call time.
     fluid: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::fluid::Access>>>>,
+    /// Where `game.set_block` sends its edits, once there is a world.
+    edits: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::script::WorldEdit>>>>,
 }
 
 /// Where a world's clock starts when the sky mod does not say.
@@ -476,6 +478,7 @@ impl ScriptVm for MluaVm {
             next_material: 2,
             light: std::sync::Arc::new(std::sync::Mutex::new(None)),
             fluid: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            edits: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         // Installed here rather than in a second constructor the caller has to
         // remember. `ModHost` called `create` and got a VM with no registry
@@ -524,6 +527,12 @@ impl ScriptVm for MluaVm {
     fn set_fluid_access(&mut self, access: std::sync::Arc<dyn crate::fluid::Access>) {
         if let Ok(mut slot) = self.fluid.lock() {
             *slot = Some(access);
+        }
+    }
+
+    fn set_world_edit(&mut self, edit: std::sync::Arc<dyn crate::script::WorldEdit>) {
+        if let Ok(mut slot) = self.edits.lock() {
+            *slot = Some(edit);
         }
     }
 
@@ -1189,6 +1198,34 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))
     }
 
+    /// The `game.set_block` function, built once per mod environment.
+    ///
+    /// Its own method for the reason `light_reader` is: it is part of the frozen
+    /// API that depends on something outside the VM.
+    fn block_writer(&self) -> Result<mlua::Function, ScriptError> {
+        let edits = std::sync::Arc::clone(&self.edits);
+        self.lua
+            .create_function(move |_, (position, block): (Table, String)| {
+                let x: i32 = position.get("x")?;
+                let y: i32 = position.get("y")?;
+                let z: i32 = position.get("z")?;
+                let guard = edits.lock().map_err(|_| {
+                    mlua::Error::external(
+                        "the edit queue is poisoned; the simulation thread panicked",
+                    )
+                })?;
+                // No world yet — during worldgen, or in a test with no server
+                // behind the VM. Dropped rather than an error, the same way
+                // `get_fluid` answers empty: a mod handling an error here would
+                // be a mod written around the engine's startup order.
+                let Some(edits) = guard.as_ref() else {
+                    return Ok(false);
+                };
+                Ok(edits.set_block(crate::BlockPos::new(x, y, z), &block))
+            })
+            .map_err(|err| self.vm_error(&err))
+    }
+
     /// The `game.get_fluid` and `game.set_fluid` pair, built once per mod
     /// environment.
     ///
@@ -1303,6 +1340,10 @@ impl MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("get_block_id", get_block_id)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let set_block = self.block_writer()?;
+        game.set("set_block", set_block)
             .map_err(|err| self.vm_error(&err))?;
 
         let (get_fluid, set_fluid) = self.fluid_functions()?;
@@ -2200,6 +2241,60 @@ mod tests {
         fn fluid_id(&self, name: &str) -> Option<crate::fluid::FluidId> {
             (name == "test:milk").then_some(crate::fluid::FluidId(1))
         }
+    }
+
+    /// An edit queue a test can look inside.
+    #[derive(Default)]
+    struct Slate {
+        written: std::sync::Mutex<Vec<(crate::BlockPos, String)>>,
+    }
+
+    impl crate::script::WorldEdit for Slate {
+        fn set_block(&self, pos: crate::BlockPos, block: &str) -> bool {
+            // Refuses one name, so the test can see a rejection travel back to
+            // Lua rather than assuming it does.
+            if block == "nobody:registered" {
+                return false;
+            }
+            self.written
+                .lock()
+                .map(|mut written| written.push((pos, block.to_owned())))
+                .is_ok()
+        }
+    }
+
+    #[test]
+    fn a_mod_can_change_the_world_after_worldgen() {
+        // **The gap this closed.** A mod could write terrain during worldgen and
+        // never again, which made a block that reacts to anything — fluid
+        // arriving, a crop growing, a fire spreading — inexpressible through the
+        // only API the engine is supposed to have (charter rule 1).
+        let mut vm = vm();
+        let slate = std::sync::Arc::new(Slate::default());
+        vm.set_world_edit(
+            std::sync::Arc::clone(&slate) as std::sync::Arc<dyn crate::script::WorldEdit>
+        );
+        load(
+            &mut vm,
+            "mason",
+            "ok = nil\n\
+             refused = nil\n\
+             game.register_on_tick(function()\n\
+               ok = game.set_block({x=4,y=5,z=6}, 'core:white')\n\
+               refused = game.set_block({x=0,y=0,z=0}, 'nobody:registered')\n\
+             end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+        let faults = vm.tick(1).expect("tick");
+        assert!(faults.is_empty(), "setting a block raised: {faults:?}");
+
+        let written = slate.written.lock().expect("slate");
+        assert_eq!(
+            written.as_slice(),
+            &[(crate::BlockPos::new(4, 5, 6), "core:white".to_owned())],
+            "the edit did not reach the queue, or an unregistered name did"
+        );
     }
 
     #[test]

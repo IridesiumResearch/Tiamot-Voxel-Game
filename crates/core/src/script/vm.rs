@@ -278,6 +278,39 @@ impl BlockRules {
     }
 }
 
+/// Somewhere a mod can change the world at runtime.
+///
+/// # The gap this fills
+///
+/// A mod could write terrain during worldgen and never again. Everything else
+/// it might want to do to the world — a block that changes when fluid reaches
+/// it, a crop that grows, a fire that spreads — was inexpressible, which made
+/// the mod API smaller than the engine it is supposed to be the only API for
+/// (charter rule 1).
+///
+/// # Blocks are named, not numbered
+///
+/// `block` is a string id, and that is not a convenience. Numeric ids come in
+/// two flavours — the RUNTIME ids registration hands out and the WORLD ids the
+/// database keeps — and charter rule 8 makes them different numbers. A mod
+/// given the wrong one gets a comparison that works whenever the two coincide;
+/// that exact bug reached a play session. Names have one meaning.
+///
+/// # Writes are queued, not applied
+///
+/// The implementation puts the edit on the same queue an operator's edits use
+/// and the tick drains it. So a mod cannot write the world out from under the
+/// system that is mid-tick reading it, and it needs no lock on the world to do
+/// anything at all.
+pub trait WorldEdit: Send + Sync {
+    /// Replaces a whole block with `block`, or clears it if `block` is air.
+    ///
+    /// Returns whether the edit was accepted onto the queue — NOT whether it
+    /// landed, which the caller finds out by looking next tick. `false` means
+    /// the queue is full or the block name is not registered.
+    fn set_block(&self, pos: crate::BlockPos, block: &str) -> bool;
+}
+
 /// What a mod said about a fluid.
 ///
 /// Registered during the loading window and frozen with everything else
@@ -600,6 +633,14 @@ pub trait ScriptVm: Sized {
     /// light during worldgen — before there is any — should not have to know
     /// the engine's startup order.
     fn set_light_source(&mut self, source: std::sync::Arc<dyn crate::light::LightSource>);
+
+    /// Points `game.set_block` at the world.
+    ///
+    /// Called once, after the world exists. Until then writes are dropped, the
+    /// same way fluid reads answer empty — a mod calling this during worldgen is
+    /// early rather than wrong, and `register_on_generate` is where terrain
+    /// belongs at that point anyway.
+    fn set_world_edit(&mut self, edit: std::sync::Arc<dyn crate::script::WorldEdit>);
 
     /// Points `game.get_fluid` and `game.set_fluid` at the world's fluid.
     ///
