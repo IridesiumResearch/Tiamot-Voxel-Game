@@ -201,8 +201,11 @@ impl Tuning {
         // v × (1 − f) / f, as on the ground: 0.3 × 0.2 / 0.8.
         swim_acceleration: 0.075,
         fluid_terminal_velocity: speed(6.0),
-        // The jump speed, so leaving the water costs what leaving a step costs.
-        surface_leap: 1.341_640_8,
+        // **Four fifths of the jump speed**, from the window rather than from a
+        // derivation: at the full jump it was reported as "about 20% too
+        // strong", which is a judgement only a person can make and is exactly
+        // what this constant is for. 1.341_640_8 × 0.8.
+        surface_leap: 1.073_312_6,
     };
 }
 
@@ -322,6 +325,28 @@ mod tests {
             submerged < super::super::EYE_HEIGHT,
             "a floating body sits {submerged} cells under with its eyes at {}",
             super::super::EYE_HEIGHT
+        );
+    }
+
+    #[test]
+    fn climbing_out_of_milk_is_easier_than_a_standing_jump_but_not_free() {
+        // The leap has to clear a bank, or a pool has no exit — and it has to
+        // stay under a jump, or milk is a trampoline. Reported from the window
+        // at the full jump speed as "about 20% too strong", which is the kind of
+        // judgement only a person makes and exactly what this constant is for.
+        let tuning = Tuning::DEFAULT;
+        assert!(
+            tuning.surface_leap < tuning.jump_speed,
+            "leaving the water ({}) should not beat jumping off the ground ({})",
+            tuning.surface_leap,
+            tuning.jump_speed
+        );
+        // And well clear of the sustained swim, or holding jump underwater
+        // would be indistinguishable from breaking the surface.
+        assert!(
+            tuning.surface_leap > tuning.swim_speed * 2.0,
+            "the leap {} is not decisively more than swimming",
+            tuning.surface_leap
         );
     }
 
