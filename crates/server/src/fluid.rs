@@ -323,6 +323,18 @@ impl Fluidics {
     }
 }
 
+/// Lets a player's physics float in the milk the server is holding.
+///
+/// The counterpart to [`World`]'s `ChunkLookup`, and separate from it because
+/// the two are separately owned here: geometry is the tick thread's, fluid is
+/// behind [`Shared`]'s lock. `phys::Voxels::with_fluid` puts them back together
+/// for the length of one step.
+impl tiamot_core::phys::FluidLookup for Fluidics {
+    fn fluid_layer(&self, pos: ChunkPos) -> Option<&FluidLayer> {
+        self.layer(pos)
+    }
+}
+
 /// The world plus its fluid, as the solver needs to see it.
 struct Wet<'a> {
     world: &'a World,
@@ -441,6 +453,70 @@ mod tests {
         assert!(
             bench.contains(&declared),
             "the benchmark does not declare `{declared}`, so its numbers are not this server's"
+        );
+    }
+
+    #[test]
+    fn a_player_standing_in_a_pond_reads_as_submerged_wherever_the_pond_is() {
+        // **The seam this test exists for.** The physics works in cells of a
+        // frame anchored to the player's origin chunk; the fluid is stored in
+        // world blocks keyed by chunk. `Voxels::with_fluid` converts between
+        // them, and a conversion that was off by a chunk would be invisible at
+        // the origin and wrong everywhere else — which is exactly the bug that
+        // cost this project a session once already (the chunk-frame bug), so it
+        // gets tested at a negative, non-zero origin rather than at 0,0,0.
+        use tiamot_core::phys::{Body, Solid, Voxels};
+
+        let milk = FluidId(1);
+        let mut fluidics = Fluidics::new(Fluids::new());
+
+        // Four blocks of milk in a column, in a chunk a long way from spawn.
+        let origin = ChunkPos::new(-3, 5, 7);
+        let corner = BlockPos::new(
+            origin.x * tiamot_core::CHUNK_BLOCKS as i32,
+            origin.y * tiamot_core::CHUNK_BLOCKS as i32,
+            origin.z * tiamot_core::CHUNK_BLOCKS as i32,
+        );
+        for y in 0..4 {
+            fluidics.set(
+                BlockPos::new(corner.x + 2, corner.y + y, corner.z + 2),
+                Fluid::source(milk),
+            );
+        }
+
+        // No chunks resident at all: this is testing the fluid half of the
+        // view, and absent geometry reads as solid without affecting what the
+        // milk says.
+        struct NoChunks;
+
+        impl tiamot_core::phys::ChunkLookup for NoChunks {
+            fn chunk(&self, _pos: ChunkPos) -> Option<&tiamot_core::Chunk> {
+                None
+            }
+        }
+
+        let voxels = Voxels::with_fluid(&NoChunks, &fluidics, origin);
+
+        // Frame block (2, 0, 2) is the bottom of that column, and the frame's
+        // origin IS the chunk, so the local block coordinates are the frame's.
+        assert_eq!(
+            voxels.fluid(2, 0, 2).fluid(),
+            milk,
+            "the milk did not survive the frame conversion at origin {origin:?}"
+        );
+        assert!(
+            voxels.fluid(2, 4, 2).is_empty(),
+            "found milk above the column"
+        );
+        assert!(voxels.fluid(3, 0, 2).is_empty(), "found milk beside it");
+
+        // And a body standing in it floats. Frame block 2 spans cells 6..9.
+        let wet = tiamot_core::phys::submersion(&voxels, &Body::at([7.0, 0.0, 7.0]).aabb());
+        assert_eq!(wet.fluid, milk);
+        assert!(
+            wet.fraction > 0.9,
+            "a body inside four blocks of milk read {} submerged",
+            wet.fraction
         );
     }
 

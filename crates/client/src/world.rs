@@ -554,6 +554,20 @@ impl tiamot_core::phys::ChunkLookup for ChunkStore {
     }
 }
 
+/// And lets it float in the milk it has been sent.
+///
+/// A second trait rather than a method on the first because the server keeps
+/// its geometry and its fluid in different places behind different locks. The
+/// client keeps both here, so it implements both on the one store and hands it
+/// to `phys::Voxels::with_fluid` twice — which is the arrangement that makes a
+/// client's prediction of a swim agree with the server's answer instead of
+/// approximating it.
+impl tiamot_core::phys::FluidLookup for ChunkStore {
+    fn fluid_layer(&self, pos: ChunkPos) -> Option<&FluidLayer> {
+        self.fluid.get(&pos)
+    }
+}
+
 /// One chunk's view of the light field, in chunk-local block coordinates.
 ///
 /// Coordinates outside `0..16` reach into the neighbours, which is ordinary:

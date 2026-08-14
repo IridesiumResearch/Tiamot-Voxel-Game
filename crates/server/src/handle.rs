@@ -918,10 +918,23 @@ impl ServerHandle {
                         // Collision reads only RESIDENT chunks (`World::resident`),
                         // so walking into unloaded terrain stops a player rather
                         // than generating a chunk inside the tick budget.
+                        //
+                        // The fluid is read alongside the geometry so a player
+                        // floats in milk the server can see. **The guard is
+                        // scoped to this block deliberately**: the digging loop
+                        // below runs mod callbacks, and `game.set_fluid` takes
+                        // the same lock for writing — a read guard held across
+                        // one would deadlock the tick thread against itself.
+                        // Nothing inside this loop enters a mod.
                         if let Ok(mut bodies) = shared.bodies.lock() {
+                            let fluid = fluidics.read().expect("fluid lock");
                             for player in bodies.values_mut() {
                                 let intent = player.inputs.take(tick);
-                                let voxels = tiamot_core::phys::Voxels::new(&world, player.origin);
+                                let voxels = tiamot_core::phys::Voxels::with_fluid(
+                                    &world,
+                                    &*fluid,
+                                    player.origin,
+                                );
                                 let before = player.body;
                                 player.body = tiamot_core::phys::step(
                                     &voxels,

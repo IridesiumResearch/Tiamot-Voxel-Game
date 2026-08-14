@@ -939,7 +939,7 @@ impl App {
         for _ in 0..gap {
             self.tick += 1;
             if let Some(predictor) = self.predictor.as_mut() {
-                let voxels = phys::Voxels::new(&self.store, predictor.origin());
+                let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin());
                 predictor.predict(&voxels, self.tick, intent, &Tuning::DEFAULT);
             }
         }
@@ -1090,7 +1090,12 @@ impl App {
             return;
         };
 
-        let voxels = phys::Voxels::new(&self.store, predictor.origin());
+        // **With the fluid, because the replay must be the same simulation the
+        // server ran.** Reconciliation re-steps the unconfirmed ticks; replaying
+        // them against a world with no milk in it would put a swimming player
+        // back where a falling one would have been, and the correction would
+        // arrive as a lurch every time the server's state message landed.
+        let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin());
         predictor.reconcile(&voxels, state, &Tuning::DEFAULT);
         let divergence = predictor.divergence();
         // Asked after the replay rather than before: what matters is whether the
@@ -2138,7 +2143,7 @@ impl App {
             let mut touched_absent = false;
             let mut ground = None;
             if let Some(predictor) = self.predictor.as_mut() {
-                let voxels = phys::Voxels::new(&self.store, predictor.origin());
+                let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin());
                 predictor.predict(&voxels, self.tick, intent, &Tuning::DEFAULT);
                 // **Asked on the PREDICTION path, not only on the replay.** The
                 // first version of this instrument watched `reconcile` alone, so
