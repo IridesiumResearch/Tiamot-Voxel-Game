@@ -119,8 +119,27 @@ pub enum Absent {
 pub struct SubNodeGrid {
     /// Material of every cell, `x + N*y + N*N*z`.
     materials: Vec<u16>,
-    /// Occupancy columns per axis. See the module docs for the bit layout.
+    /// Occupancy columns per axis — terrain AND fluid. See the module docs for
+    /// the bit layout.
     columns: [Vec<u64>; 3],
+    /// The fluid half of that occupancy, or `None` for a chunk with no fluid.
+    ///
+    /// # Why the two have to be separable
+    ///
+    /// Face culling is "occupied next to not-occupied", so as long as milk and
+    /// stone shared one occupancy set, **the stone face behind a pond did not
+    /// exist**. From outside that is invisible — opaque milk covers it — and
+    /// from inside the milk it is a hole straight through the world. Reported
+    /// from the window as "when under water I just see through the world".
+    ///
+    /// So terrain is culled against terrain alone, and fluid against
+    /// everything: the milk's face where it meets stone is the one that goes,
+    /// because the stone's is the one you can end up looking at.
+    ///
+    /// `None` rather than zeroed columns for a dry chunk, which is nearly all
+    /// of them: it skips both the allocation and the second mask per column,
+    /// so a world with no milk in it meshes exactly as it did.
+    fluid: Option<[Vec<u64>; 3]>,
 }
 
 impl SubNodeGrid {
@@ -162,6 +181,7 @@ impl SubNodeGrid {
     ) -> Self {
         let mut materials = vec![0u16; CELLS];
         let mut columns = [vec![0u64; N * N], vec![0u64; N * N], vec![0u64; N * N]];
+        let mut wet: Option<[Vec<u64>; 3]> = None;
 
         for index in 0..BLOCKS_PER_CHUNK {
             let local = LocalBlock::from_index(index);
@@ -173,7 +193,14 @@ impl SubNodeGrid {
             if view.is_air() {
                 // Empty of terrain, so it may hold fluid.
                 if let Some((material, depth)) = fluid.fill(local) {
-                    fill_fluid(&mut materials, &mut columns, local, material, depth);
+                    fill_fluid(
+                        &mut materials,
+                        &mut columns,
+                        &mut wet,
+                        local,
+                        material,
+                        depth,
+                    );
                 }
                 continue;
             }
@@ -209,11 +236,22 @@ impl SubNodeGrid {
             }
 
             if let Some((material, depth)) = flooded {
-                fill_fluid(&mut materials, &mut columns, local, material, depth);
+                fill_fluid(
+                    &mut materials,
+                    &mut columns,
+                    &mut wet,
+                    local,
+                    material,
+                    depth,
+                );
             }
         }
 
-        let mut grid = Self { materials, columns };
+        let mut grid = Self {
+            materials,
+            columns,
+            fluid: wet,
+        };
         grid.seed_padding(neighbours, absent);
         grid
     }
@@ -347,6 +385,7 @@ impl FluidFill for NoFluid {
 fn fill_fluid(
     materials: &mut [u16],
     columns: &mut [Vec<u64>; 3],
+    wet: &mut Option<[Vec<u64>; 3]>,
     local: LocalBlock,
     material: u16,
     depth: u8,
@@ -388,6 +427,15 @@ fn fill_fluid(
                 columns[0][y * N + z] |= 1 << (x as u32 + FIRST);
                 columns[1][x * N + z] |= 1 << (y as u32 + FIRST);
                 columns[2][x * N + y] |= 1 << (z as u32 + FIRST);
+
+                // The same bits again, fluid only. Allocated on the first drop
+                // of milk in the chunk and never for a dry one.
+                let wet = wet.get_or_insert_with(|| {
+                    [vec![0u64; N * N], vec![0u64; N * N], vec![0u64; N * N]]
+                });
+                wet[0][y * N + z] |= 1 << (x as u32 + FIRST);
+                wet[1][x * N + z] |= 1 << (y as u32 + FIRST);
+                wet[2][x * N + y] |= 1 << (z as u32 + FIRST);
             }
         }
     }
@@ -656,15 +704,52 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
         // cells at once — including the two padding bits, which is what makes
         // border culling free rather than a special case.
         let columns = &grid.columns[axis];
+        let wet = grid.fluid.as_ref().map(|fluid| &fluid[axis]);
         plane.fill(0);
 
         for u in 0..N {
             for v in 0..N {
                 let column = columns[u * N + v];
+                // **Terrain is culled against terrain, fluid against
+                // everything**, and the asymmetry is the whole point.
+                //
+                // While the two shared one occupancy set, a face between milk
+                // and stone was interior and neither side drew it — so the
+                // stone behind a pond did not exist. Opaque milk hides that
+                // from outside and it is a hole straight through the world from
+                // inside, which is what "under water I just see through the
+                // world" was.
+                //
+                // The milk's face against the stone is the one that goes, since
+                // the stone's is the one a swimmer can end up looking at. The
+                // cost is drawing terrain a pond covers; it is behind opaque
+                // geometry, so it is overdraw rather than anything visible.
+                //
+                // The two masks are disjoint by construction — a cell holds
+                // terrain or fluid, never both, because terrain wins the cell in
+                // `fill_fluid` — so OR-ing them is exactly the set of faces to
+                // draw, and everything downstream reads the material per cell as
+                // it always did.
+                let solid = match wet {
+                    Some(wet) => column & !wet[u * N + v],
+                    None => column,
+                };
                 let faces = if positive {
-                    column & !(column >> 1)
+                    solid & !(solid >> 1)
                 } else {
-                    column & !(column << 1)
+                    solid & !(solid << 1)
+                };
+                let faces = match wet {
+                    Some(wet) => {
+                        let wet = wet[u * N + v];
+                        faces
+                            | if positive {
+                                wet & !(column >> 1)
+                            } else {
+                                wet & !(column << 1)
+                            }
+                    }
+                    None => faces,
                 };
                 // Scatter the column's faces into per-slice planes.
                 let mut remaining = faces >> FIRST;
@@ -972,6 +1057,102 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Milk in one named block, at a level, and nothing anywhere else.
+    struct Pond {
+        block: LocalBlock,
+        depth: u8,
+        material: u16,
+    }
+
+    impl FluidFill for Pond {
+        fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
+            (local.x == self.block.x && local.y == self.block.y && local.z == self.block.z)
+                .then_some((self.material, self.depth))
+        }
+    }
+
+    #[test]
+    fn the_ground_under_a_pond_still_has_a_surface() {
+        // **The face that was not there, and the hole it left.**
+        //
+        // Face culling is "occupied next to not-occupied". While milk and stone
+        // shared one occupancy set, the boundary between them was interior and
+        // neither side drew it — so the top of the ground under a pond did not
+        // exist as geometry. Opaque milk hides that from above; from inside the
+        // milk it is a hole straight through the world, reported from the
+        // window as "under water I just see through the world".
+        const MILK: u16 = 9;
+
+        let mut chunk = empty();
+        chunk
+            .set_block(BlockPos::new(1, 0, 1), BlockValue::Uniform(STONE))
+            .expect("in chunk");
+        let pond = Pond {
+            block: LocalBlock::new(1, 1, 1),
+            // Brim full: 24 of 27, which lays two of the block's three cell
+            // layers, so the milk sits on the stone with air above it.
+            depth: 24,
+            material: MILK,
+        };
+
+        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &pond);
+        let faces = faces(&mesh.quads);
+
+        // The stone block is cells y 0..=2, the milk cells y 3..=4.
+        // Axis 1, positive, w = 2 is the ground's top surface.
+        assert!(
+            faces.iter().any(|(axis, positive, _, _, w, material)| {
+                *axis == 1 && *positive && *w == 2 && *material == STONE.get()
+            }),
+            "the ground under the pond has no top face, so a swimmer looks \
+             straight through it"
+        );
+
+        // And the milk's underside against that stone is the face that goes
+        // instead — it is the one nobody can ever be on the far side of.
+        assert!(
+            !faces.iter().any(|(axis, positive, _, _, w, material)| {
+                *axis == 1 && !*positive && *w == 3 && *material == MILK
+            }),
+            "the milk drew a face against the stone it is resting on"
+        );
+
+        // The milk's own surface is still there, or there is no pond to see.
+        assert!(
+            faces.iter().any(|(axis, positive, _, _, w, material)| {
+                *axis == 1 && *positive && *w == 4 && *material == MILK
+            }),
+            "the pond has no surface"
+        );
+    }
+
+    #[test]
+    fn a_chunk_with_no_fluid_meshes_exactly_as_it_did() {
+        // The other half of the change: separating the two occupancy sets must
+        // cost a dry chunk nothing at all, in faces or in allocation. Nearly
+        // every chunk in a world is dry.
+        let mut chunk = empty();
+        chunk
+            .set_block(BlockPos::new(2, 2, 2), BlockValue::Uniform(STONE))
+            .expect("in chunk");
+        chunk
+            .set_block(BlockPos::new(2, 3, 2), BlockValue::Uniform(STONE))
+            .expect("in chunk");
+
+        let grid = SubNodeGrid::from_chunk(&chunk, &Neighbours::open(), Absent::Air);
+        assert!(
+            grid.fluid.is_none(),
+            "a dry chunk allocated fluid occupancy columns"
+        );
+
+        let dry = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        assert_eq!(
+            dry.quads.len(),
+            6,
+            "two stacked blocks should still merge to six quads"
+        );
     }
 
     #[test]
