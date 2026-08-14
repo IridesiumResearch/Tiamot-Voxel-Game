@@ -171,13 +171,19 @@ impl SubNodeGrid {
             // contributes nothing; skipping it early is most of why a flat
             // scene is fast.
             if view.is_air() {
-                // Empty of terrain, so it may hold fluid. Contract §4: those
-                // are exactly the blocks that can.
+                // Empty of terrain, so it may hold fluid.
                 if let Some((material, depth)) = fluid.fill(local) {
                     fill_fluid(&mut materials, &mut columns, local, material, depth);
                 }
                 continue;
             }
+            // **And a block with SOME terrain in it may hold fluid too**, which
+            // is Contract §4's threshold rather than an extra case: under it a
+            // block is more air than anything and the fluid runs through, so
+            // milk on a sub-node-smoothed slope sits INSIDE the thinning ground
+            // rather than floating on top of it. The fluid is laid down after
+            // the terrain below, into whatever cells the terrain left.
+            let flooded = fluid.fill(local);
 
             let base_x = local.x as usize * SUBNODES_PER_AXIS as usize;
             let base_y = local.y as usize * SUBNODES_PER_AXIS as usize;
@@ -200,6 +206,10 @@ impl SubNodeGrid {
                         columns[2][x * N + y] |= 1 << (z as u32 + FIRST);
                     }
                 }
+            }
+
+            if let Some((material, depth)) = flooded {
+                fill_fluid(&mut materials, &mut columns, local, material, depth);
             }
         }
 
@@ -368,6 +378,12 @@ fn fill_fluid(
                 let x = base_x + cx;
                 let y = base_y + cy;
                 let z = base_z + cz;
+                // **Terrain wins the cell.** A block below the threshold holds
+                // both, and milk drawn over the stone that is holding it up
+                // would be milk you can see through the hill.
+                if materials[x + N * y + N * N * z] != 0 {
+                    continue;
+                }
                 materials[x + N * y + N * N * z] = material;
                 columns[0][y * N + z] |= 1 << (x as u32 + FIRST);
                 columns[1][x * N + z] |= 1 << (y as u32 + FIRST);
