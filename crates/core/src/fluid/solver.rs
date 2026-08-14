@@ -55,16 +55,18 @@ const LATERAL: [[i32; 3]; 4] = [[-1, 0, 0], [1, 0, 0], [0, 0, -1], [0, 0, 1]];
 /// client has a map of streamed chunks, and one update rule has to run over
 /// both or the client cannot predict what the server will do.
 pub trait Neighbourhood {
-    /// Whether a block can hold fluid.
+    /// How full a block is, in cells of 27.
     ///
-    /// **Sub-Node Contract §4**: a block accepts fluid iff its occupancy is
-    /// empty. Partial and Mixed blocks are fluid-solid — there is no such thing
-    /// as a partially flooded carved block.
+    /// **Sub-Node Contract §4.** The world reports a fact and the fluid decides
+    /// what it means: a block is floor iff this is at or above the registering
+    /// fluid's `waterlogs_at`. Two fluids in one world may disagree about what
+    /// counts as floor, which is why the threshold lives with the fluid and this
+    /// does not.
     ///
-    /// `false` for anything not loaded, which is what stops a flood from
-    /// running off the edge of the loaded world and what keeps a pond from
-    /// silently draining into a chunk that has not arrived.
-    fn accepts_fluid(&self, pos: BlockPos) -> bool;
+    /// `None` for anything not loaded — NOT zero, and the difference matters.
+    /// Zero would let a flood run off the edge of the loaded world and a pond
+    /// drain silently into a chunk that has not arrived.
+    fn occupancy(&self, pos: BlockPos) -> Option<u32>;
 
     /// What a block holds now.
     fn fluid(&self, pos: BlockPos) -> Fluid;
@@ -91,6 +93,19 @@ pub struct Tuning {
     /// of spreading into a disc and reaching it by accident. Zero disables the
     /// preference, which makes a fluid spread evenly in all directions.
     pub hole_search: u8,
+    /// How full a block has to be before this fluid treats it as floor, in
+    /// cells of 27.
+    ///
+    /// **The number that makes fluid work on smoothed terrain.** Before it,
+    /// §4 read "accepts fluid iff empty", which made a single chiselled cell
+    /// waterproof — defensible on blocky terrain and wrong on the terrain this
+    /// engine is for. A sub-node-smoothed hillside is a ramp INSIDE blocks, so
+    /// every column's top block is `Partial`, nothing below any of them was a
+    /// drop, and the solver saw a perfectly flat floor: milk spread as a disc
+    /// across a hillside, floating above ground that was smooth beneath it.
+    ///
+    /// A mod that wants the old behaviour registers `waterlogs_at = 1`.
+    pub waterlogs_at: u32,
     /// Fluid ticks between updates of this fluid.
     ///
     /// One is every fluid tick. Larger is slower and thicker — and it is the
@@ -104,6 +119,10 @@ impl Tuning {
     pub const DEFAULT: Self = Self {
         flow_range: MAX_LEVEL,
         hole_search: 4,
+        // Fourteen of 27 — over half. Under it the block is more air than
+        // anything and fluid runs through; at or above it, it is more solid
+        // than not and holds the fluid up.
+        waterlogs_at: 14,
         tick_rate: 1,
     };
 }
@@ -415,6 +434,14 @@ fn feeds(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos, direction: u
         return true;
     }
     Solver::preferred(world, tuning, pos)[direction]
+}
+
+/// Whether a block is floor for this fluid — Contract §4's threshold.
+///
+/// Unloaded counts as floor, which is what stops a flood running off the edge
+/// of the world.
+fn is_floor(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos) -> bool {
+    world.occupancy(pos).is_none_or(|filled| filled >= tuning.waterlogs_at)
 }
 
 /// Whether the fluid at `pos` is falling rather than resting.
