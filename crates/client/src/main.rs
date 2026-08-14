@@ -339,6 +339,14 @@ impl ApplicationHandler for Client {
                             let on = surface.app.toggle_chunk_borders();
                             tracing::info!(on, "chunk borders");
                         }
+                        // Temporary, for tracking sources while Task 11 is
+                        // built: a source and a full flow block look identical,
+                        // so from inside a pond there is no telling which block
+                        // is feeding it.
+                        KeyCode::KeyN if pressed => {
+                            let on = surface.app.toggle_fluid_sources();
+                            tracing::info!(on, "fluid source outlines");
+                        }
                         // Scrubbing the sky by hand, for looking at shadows at
                         // an hour that is not the one the server is at. A
                         // twentieth of a day a press, so a full circuit is

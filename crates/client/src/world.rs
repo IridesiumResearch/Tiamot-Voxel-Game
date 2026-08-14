@@ -173,6 +173,33 @@ impl ChunkStore {
         }
     }
 
+    /// Every fluid source the client holds, in world blocks.
+    ///
+    /// **Temporary, for tracking sources while Task 11 is built.** A source and
+    /// a full flow block are the same colour and the same height, so from
+    /// inside a pond there is no way to see which block is feeding it. Walks
+    /// every held fluid layer, which is cheap only because dry chunks hold no
+    /// layer at all — a world with one pond walks one chunk.
+    #[must_use]
+    pub fn fluid_sources(&self) -> Vec<tiamot_core::BlockPos> {
+        let span = tiamot_core::CHUNK_BLOCKS as i32;
+        let mut out = Vec::new();
+        for (pos, layer) in &self.fluid {
+            for (index, value) in layer.blocks().enumerate() {
+                if !value.is_source() {
+                    continue;
+                }
+                let local = tiamot_core::coords::LocalBlock::from_index(index);
+                out.push(tiamot_core::BlockPos::new(
+                    pos.x * span + local.x as i32,
+                    pos.y * span + local.y as i32,
+                    pos.z * span + local.z as i32,
+                ));
+            }
+        }
+        out
+    }
+
     /// The fluid in one chunk, as the mesher wants it.
     ///
     /// Returns something that answers per block, so a remesh does one map

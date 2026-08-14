@@ -876,6 +876,14 @@ impl ServerHandle {
                             match world.apply(&edit, &mut source) {
                                 Ok((_, removed)) => {
                                     relight.push(edited_block(&edit));
+                                    // A pond finds out there is somewhere new
+                                    // to go the same way it finds out a wall
+                                    // came down: every edit wakes it, whichever
+                                    // path the edit arrived by.
+                                    fluidics
+                                        .write()
+                                        .expect("fluid lock")
+                                        .touch(edited_block(&edit));
                                     // Charter rule 5: what the edit took out,
                                     // in units. 27 for a block, 1 for a
                                     // sub-node.
@@ -1047,6 +1055,14 @@ impl ServerHandle {
                             match world.apply(&edit, &mut source) {
                                 Ok((_, removed)) => {
                                     relight.push(edited_block(&edit));
+                                    // A pond finds out there is somewhere new
+                                    // to go the same way it finds out a wall
+                                    // came down: every edit wakes it, whichever
+                                    // path the edit arrived by.
+                                    fluidics
+                                        .write()
+                                        .expect("fluid lock")
+                                        .touch(edited_block(&edit));
                                     shared.credit(uuid, removed);
                                     shared.broadcast(ServerMessage::BlockDelta {
                                         edit,
@@ -1232,6 +1248,14 @@ impl ServerHandle {
                             match world.apply(&edit, &mut source) {
                                 Ok(_) => {
                                     relight.push(edited_block(&edit));
+                                    // A pond finds out there is somewhere new
+                                    // to go the same way it finds out a wall
+                                    // came down: every edit wakes it, whichever
+                                    // path the edit arrived by.
+                                    fluidics
+                                        .write()
+                                        .expect("fluid lock")
+                                        .touch(edited_block(&edit));
                                     shared.broadcast(ServerMessage::BlockDelta {
                                         edit,
                                         actor: Some(*request.actor.as_bytes()),

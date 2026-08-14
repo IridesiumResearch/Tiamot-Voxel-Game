@@ -642,6 +642,8 @@ pub struct Renderer {
     border_vertices: u32,
     /// Whether to draw them at all. Off by default: it is a debugging view.
     show_borders: bool,
+    /// Fluid sources to outline — see `set_fluid_sources`. Temporary.
+    sources: Vec<tiamot_core::BlockPos>,
     selection: wgpu::Buffer,
     /// Vertices actually written, which is twice the segment count.
     selection_vertices: u32,
@@ -743,6 +745,7 @@ impl Renderer {
             borders: border_buffer,
             border_vertices: 0,
             show_borders: false,
+            sources: Vec::new(),
             selection: selection_buffer,
             selection_vertices: 0,
             selection_capacity: SELECTION_CAPACITY,
@@ -1021,16 +1024,49 @@ impl Renderer {
     /// of the thing it is supposed to be outlining, which looks like a bug in the
     /// culler rather than in a constant.
     fn upload_chunk_borders(&mut self, camera: &Camera, visible: &[ChunkPos]) {
-        if !self.show_borders {
+        if !self.show_borders && self.sources.is_empty() {
             self.border_vertices = 0;
             return;
         }
 
         let side = f32::from(u16::try_from(tiamot_core::CHUNK_SUBNODES).unwrap_or(48));
         let mut vertices: Vec<[f32; 3]> = Vec::with_capacity(visible.len() * 24);
+
+        // **Fluid sources, cased in the same wireframe.** A source and a full
+        // flow block are the same colour and the same height, so from inside a
+        // pond there is no way to see which block is feeding it — which is the
+        // one thing you want to know while building the rest of this. Shares
+        // the border overlay's buffer and shader rather than growing a second
+        // of each for a temporary aid.
+        let cells = tiamot_core::SUBNODES_PER_AXIS as f32;
+        for at in &self.sources {
+            // Chunk offset plus the block's position inside it, both in cells,
+            // which is what the selection shader takes.
+            let chunk = at.chunk();
+            let base = camera.position.chunk_offset(chunk);
+            let local = at.local();
+            push_box_edges(
+                &mut vertices,
+                [
+                    base.x + local.x as f32 * cells,
+                    base.y + local.y as f32 * cells,
+                    base.z + local.z as f32 * cells,
+                ],
+                cells,
+            );
+        }
+
+        if !self.show_borders {
+            self.border_vertices = u32::try_from(vertices.len()).unwrap_or(0);
+            if !vertices.is_empty() {
+                self.gpu
+                    .queue
+                    .write_buffer(&self.borders, 0, bytemuck::cast_slice(&vertices));
+            }
+            return;
+        }
         for pos in visible {
             let offset = camera.position.chunk_offset(*pos);
-            let cells = tiamot_core::SUBNODES_PER_AXIS as f32;
             push_box_edges(
                 &mut vertices,
                 [offset.x * cells, offset.y * cells, offset.z * cells],
@@ -1048,6 +1084,14 @@ impl Renderer {
                 .queue
                 .write_buffer(&self.borders, 0, bytemuck::cast_slice(&vertices));
         }
+    }
+
+    /// The fluid sources to outline, in world blocks.
+    ///
+    /// Temporary, and deliberately shaped so removing it is deleting a field:
+    /// it is a tracking aid for building the rest of Task 11, not a feature.
+    pub fn set_fluid_sources(&mut self, sources: Vec<tiamot_core::BlockPos>) {
+        self.sources = sources;
     }
 
     /// How many GPU buffers this renderer has created, and how many requests

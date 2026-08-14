@@ -623,6 +623,13 @@ impl Pacing {
 }
 
 /// The client, between frames.
+///
+/// Several independent debug toggles, which clippy counts as too many bools.
+/// They ARE independent — borders, source outlines and the time override answer
+/// unrelated questions and are turned on and off separately — so folding them
+/// into an enum or a bitflags type would be obeying the lint rather than the
+/// reason for it.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     config: Config,
     connection: Connection,
@@ -672,6 +679,10 @@ pub struct App {
     /// anything. What it does NOT do is change when mobs spawn or anything else
     /// the server decides — this is for looking at the sky, not for playing.
     time_override: bool,
+    /// Whether to outline fluid sources — see `toggle_fluid_sources`.
+    ///
+    /// Temporary: a tracking aid for building Task 11, not a feature.
+    show_sources: bool,
     /// What the connection reported about the server's certificate.
     server_label: String,
     /// The locally predicted body, once the world has been joined.
@@ -803,6 +814,7 @@ impl App {
             tick: 0,
             third_person: false,
             time_override: false,
+            show_sources: false,
             server_label: "connecting…".to_owned(),
             predictor: None,
             confirmed: None,
@@ -990,7 +1002,8 @@ impl App {
     /// a feature nobody has.
     fn keys_line(&self) -> String {
         format!(
-            "keys: L light · K shadows · V third person · B borders {} · [ ] time · \\ resync \
+            "keys: L light · K shadows · V third person · B borders {} · N sources · [ ] time \
+             · \\ resync \
              · G blocks · T/H teleport",
             if self.renderer.chunk_borders() {
                 "ON"
@@ -1590,6 +1603,24 @@ impl App {
     /// happens to be near one. This session spent a long evening on "it almost
     /// feels like chunk boundaries have their own collision" with no way to see
     /// where they were.
+    /// Outlines every fluid source the client holds.
+    ///
+    /// **Temporary, and shaped so removing it is deleting a method.** A source
+    /// and a full flow block are the same colour and height, so from inside a
+    /// pond there is no telling which block feeds it — which is exactly what
+    /// you want to watch while the rest of the fluid work is being built.
+    pub fn toggle_fluid_sources(&mut self) -> bool {
+        self.show_sources = !self.show_sources;
+        if !self.show_sources {
+            self.renderer.set_fluid_sources(Vec::new());
+        }
+        self.show_sources
+    }
+
+    /// Shows or hides the cage every visible chunk occupies.
+    ///
+    /// How you tell a seam that follows chunk boundaries from one that merely
+    /// happens to be near one.
     pub fn toggle_chunk_borders(&mut self) -> bool {
         let show = !self.renderer.chunk_borders();
         self.renderer.set_chunk_borders(show);
@@ -1937,6 +1968,9 @@ impl App {
         let mut meshing = std::time::Duration::ZERO;
         let mut rebuilt = 0;
 
+        if self.show_sources {
+            self.renderer.set_fluid_sources(self.store.fluid_sources());
+        }
         for (index, pos) in due.iter().enumerate() {
             let Some(chunk) = self.store.get(*pos) else {
                 continue;
