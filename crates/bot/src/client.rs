@@ -1046,6 +1046,42 @@ impl Bot {
             .map(|layer| layer.get(pos.local()))
     }
 
+    /// The fluid layer the server has most recently reported for a chunk.
+    ///
+    /// `None` until a `ChunkFluid` arrives for it. **The last one wins**, and
+    /// that is the whole recovery story: every `ChunkFluid` is a keyframe rather
+    /// than a delta, so a client that missed one is corrected by the next
+    /// instead of drifting. A scenario asserting the client agrees with the
+    /// server is asserting exactly that.
+    ///
+    /// Decoded here rather than stored raw, for the reason [`Bot::light_at`]
+    /// gives: a payload that will not decode fails the test that cares instead
+    /// of being silently treated as an empty pond.
+    #[must_use]
+    pub fn fluid_layer(
+        &self,
+        pos: tiamot_core::ChunkPos,
+    ) -> Option<tiamot_core::fluid::FluidLayer> {
+        self.received()
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ServerMessage::ChunkFluid { pos: at, fluid } if *at == pos => {
+                    tiamot_core::fluid::codec::decode(fluid).ok()
+                }
+                _ => None,
+            })
+    }
+
+    /// What the server has most recently reported at one block.
+    #[must_use]
+    pub fn fluid_at(&self, pos: tiamot_core::BlockPos) -> tiamot_core::fluid::Fluid {
+        self.fluid_layer(pos.chunk())
+            .map_or(tiamot_core::fluid::Fluid::EMPTY, |layer| {
+                layer.get(pos.local())
+            })
+    }
+
     /// Waits until the server reports light at `pos` satisfying `wanted`.
     ///
     /// # Errors
