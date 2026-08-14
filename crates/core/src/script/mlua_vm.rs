@@ -1248,27 +1248,40 @@ impl MluaVm {
                     return Ok(false);
                 };
 
-                let name: Option<String> = spec.get("fluid").ok();
-                let Some(name) = name else {
-                    return Err(mlua::Error::external(
-                        "set_fluid: missing required field `fluid`. Name the registered fluid \
-                         to place, or pass `level = 0` to clear.",
-                    ));
-                };
-                let Some(id) = store.fluid_id(&name) else {
-                    return Err(mlua::Error::external(format!(
-                        "set_fluid: no fluid registered as `{name}`"
-                    )));
-                };
-
                 let level: u8 = spec.get("level").unwrap_or(crate::fluid::MAX_LEVEL);
-                let is_source: bool = spec.get("source").unwrap_or(false);
+
+                // **Clearing needs no fluid named, and demanding one was a bug
+                // with teeth.** The stub documents `set_fluid(pos, {level = 0})`
+                // to scoop; the implementation refused it as a missing field, so
+                // the reference mod's scoop raised an error, and a hook that
+                // errors disables its mod (charter rule 10). One attempt to pick
+                // milk up therefore killed `core_milk` outright and every
+                // placement after it silently did nothing.
+                //
+                // Reported from the window as two separate things — "no way to
+                // destroy the source" and "after a certain amount of placements
+                // it just stops working, like it gives up" — which were one bug
+                // wearing both faces.
                 let value = if level == 0 {
                     crate::fluid::Fluid::EMPTY
-                } else if is_source {
-                    crate::fluid::Fluid::source(id)
                 } else {
-                    crate::fluid::Fluid::flowing(id, level)
+                    let name: Option<String> = spec.get("fluid").ok();
+                    let Some(name) = name else {
+                        return Err(mlua::Error::external(
+                            "set_fluid: missing required field `fluid`. Name the registered \
+                             fluid to place, or pass `level = 0` to clear.",
+                        ));
+                    };
+                    let Some(id) = store.fluid_id(&name) else {
+                        return Err(mlua::Error::external(format!(
+                            "set_fluid: no fluid registered as `{name}`"
+                        )));
+                    };
+                    if spec.get("source").unwrap_or(false) {
+                        crate::fluid::Fluid::source(id)
+                    } else {
+                        crate::fluid::Fluid::flowing(id, level)
+                    }
                 };
                 Ok(store.set_fluid_at(crate::BlockPos::new(x, y, z), value))
             })
@@ -2156,6 +2169,90 @@ mod tests {
 
     fn load(vm: &mut MluaVm, id: &str, source: &str) -> Result<(), ScriptError> {
         vm.load_mod(id, source, Path::new("."))
+    }
+
+    /// A fluid store a test can watch, and the smallest one that can be.
+    #[derive(Default)]
+    struct Bucket {
+        held: std::sync::Mutex<std::collections::BTreeMap<(i32, i32, i32), crate::fluid::Fluid>>,
+    }
+
+    impl crate::fluid::Access for Bucket {
+        fn fluid_at(&self, pos: crate::BlockPos) -> crate::fluid::Fluid {
+            self.held
+                .lock()
+                .ok()
+                .and_then(|held| held.get(&(pos.x, pos.y, pos.z)).copied())
+                .unwrap_or(crate::fluid::Fluid::EMPTY)
+        }
+
+        fn set_fluid_at(&self, pos: crate::BlockPos, value: crate::fluid::Fluid) -> bool {
+            let Ok(mut held) = self.held.lock() else {
+                return false;
+            };
+            if value.is_empty() {
+                held.remove(&(pos.x, pos.y, pos.z)).is_some()
+            } else {
+                held.insert((pos.x, pos.y, pos.z), value) != Some(value)
+            }
+        }
+
+        fn fluid_id(&self, name: &str) -> Option<crate::fluid::FluidId> {
+            (name == "test:milk").then_some(crate::fluid::FluidId(1))
+        }
+    }
+
+    #[test]
+    fn clearing_fluid_needs_no_fluid_named() {
+        // **The bug this exists for cost a whole play session.** The stubs
+        // document `set_fluid(pos, {level = 0})` as the way to scoop, and the
+        // implementation refused it as a missing `fluid` field. A hook that
+        // errors disables its mod (charter rule 10), so the reference mod's
+        // scoop killed `core_milk` on its first use and every placement
+        // afterwards silently did nothing — reported as "no way to destroy the
+        // source" AND "after a while it just gives up", which were one bug.
+        //
+        // One mod doing both, because registration closes at freeze and a
+        // second mod cannot be loaded after it.
+        let mut vm = vm();
+        let bucket = std::sync::Arc::new(Bucket::default());
+        vm.set_fluid_access(
+            std::sync::Arc::clone(&bucket) as std::sync::Arc<dyn crate::fluid::Access>
+        );
+        load(
+            &mut vm,
+            "pourer",
+            "turn = 0\n\
+             game.register_on_tick(function()\n\
+               turn = turn + 1\n\
+               if turn == 1 then\n\
+                 game.set_fluid({x=1,y=2,z=3}, {fluid='test:milk', source=true})\n\
+               else\n\
+                 game.set_fluid({x=1,y=2,z=3}, {level=0})\n\
+               end\n\
+             end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        let faults = vm.tick(1).expect("tick");
+        assert!(faults.is_empty(), "pouring raised: {faults:?}");
+        let at = crate::BlockPos::new(1, 2, 3);
+        assert!(
+            !crate::fluid::Access::fluid_at(&*bucket, at).is_empty(),
+            "the pour did not land, so the clear below would prove nothing"
+        );
+
+        // And now the call the stubs promise works.
+        let faults = vm.tick(1).expect("tick");
+        assert!(
+            crate::fluid::Access::fluid_at(&*bucket, at).is_empty(),
+            "clearing without naming a fluid did nothing, which is the bug"
+        );
+        assert!(
+            faults.is_empty(),
+            "clearing raised an error, which is what disables a mod: {faults:?}"
+        );
     }
 
     #[test]
