@@ -328,7 +328,10 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
         // routing it through the swim branch would turn it into a feeble drift.
         body.velocity[1] = tuning.jump_speed;
     } else if wet > 0.0 {
-        swim::vertical(&mut body.velocity[1], wet, intent, tuning);
+        // Asked only when there is fluid to be in, so a dry tick pays nothing
+        // for a question about milk.
+        let head_clear = swim::head_is_clear(solid, &body.aabb());
+        swim::vertical(&mut body.velocity[1], wet, head_clear, intent, tuning);
     } else {
         body.velocity[1] -= tuning.gravity;
         if body.velocity[1] < -tuning.terminal_velocity {

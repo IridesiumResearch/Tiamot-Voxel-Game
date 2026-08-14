@@ -220,6 +220,25 @@ fn surface_height(solid: &impl Solid, x: i32, y: i32, z: i32, fluid: crate::flui
     fluid.depth_units() as f32 / UNITS_PER_CELL
 }
 
+/// Whether the top of a box is out of the fluid.
+///
+/// "Can this body see over the water" — which is what decides whether it can
+/// push itself up out of it. A point query at the top face rather than anything
+/// derived from the submerged fraction, because the fraction cannot tell a body
+/// floating with its head out from one wedged under a ledge with a bubble of air
+/// against its feet.
+#[must_use]
+pub fn head_is_clear(solid: &impl Solid, aabb: &Aabb) -> bool {
+    // A skin below the top face: exactly on a boundary is the one place the
+    // block lookup could land on the block above and answer about the wrong one.
+    let head = [
+        aabb.min[0] + (aabb.max[0] - aabb.min[0]) / 2.0,
+        aabb.max[1] - super::SKIN,
+        aabb.min[2] + (aabb.max[2] - aabb.min[2]) / 2.0,
+    ];
+    fluid_at(solid, head).is_none()
+}
+
 /// The blocks a box touches on one axis, as an inclusive range.
 ///
 /// Derived from [`Aabb::cell_span`] rather than from a second float division,
@@ -288,6 +307,7 @@ pub fn buoyant_acceleration(fraction: f32, tuning: &super::Tuning) -> f32 {
 pub(super) fn vertical(
     velocity: &mut f32,
     fraction: f32,
+    head_clear: bool,
     intent: super::Intent,
     tuning: &super::Tuning,
 ) {
@@ -305,6 +325,32 @@ pub(super) fn vertical(
     // Drag, blended from the body's dry state so that ankle-deep milk barely
     // slows a walk. `fluid_drag` is a fraction KEPT, like `air_drag`.
     *velocity *= 1.0 + (tuning.fluid_drag - 1.0) * fraction;
+
+    // **The kick out of the water, or a pool has no exit.**
+    //
+    // Swimming up is an acceleration fighting buoyancy and drag, so it settles
+    // exactly where the body stops being submerged — the waterline. A swimmer
+    // holding jump therefore rises to the surface and stays there, and the lip
+    // of a pool at that same waterline is unclimbable, because the one place the
+    // rise weakens to nothing is the place they need to leave from. Measured
+    // before this existed: a body swimming at a bank stalled 0.33 cells below
+    // the top of it, and stayed there.
+    //
+    // **At full strength, not scaled by how submerged the body is.** Scaling was
+    // the first attempt and it failed for the same reason `swim_up` does — the
+    // kick fades to nothing exactly as the body nears the surface, which is
+    // where it is needed. `head_clear` carries the physical story instead: a
+    // swimmer can push themselves up out of water they can see over and cannot
+    // do it from underneath, so this never fires on a submerged body and is not
+    // a way to swim upward faster in open water.
+    //
+    // **After the drag, so `surface_leap` IS the speed the body leaves at**
+    // rather than a number the drag then takes a fifth of. A floor under the
+    // velocity rather than a term added to it, because the point is to reach a
+    // speed; adding would compound tick after tick into a launch.
+    if intent.jump && head_clear && *velocity < tuning.surface_leap {
+        *velocity = tuning.surface_leap;
+    }
 
     // **The clamp that makes deep milk break a fall.** A body arriving at
     // terminal velocity carries 11.76 cells/tick, and drag alone would take
@@ -581,6 +627,123 @@ mod tests {
             "holding sneak sank only to {} from {}",
             down.position[1],
             start.position[1]
+        );
+    }
+
+    #[test]
+    fn a_swimmer_can_climb_out_of_a_pool_onto_its_edge() {
+        // **What the surface leap is for, tested as the thing somebody actually
+        // wants to do rather than as the constant.** Reported from the window:
+        // "I would like to be pushed up out of the water quite a bit when
+        // surfacing so I can step up out of a pool."
+        //
+        // Before the leap this was impossible in principle, not just hard:
+        // swimming up is an acceleration fighting buoyancy, so it settles
+        // exactly at the waterline, and a lip at the waterline is the one height
+        // a swimmer can never reach.
+        //
+        // The scene: milk filling x < 0 to a surface at cell 12, and solid
+        // ground from x >= 0 up to that same height. Swim at the bank holding
+        // jump and end up standing on it.
+        struct Pool;
+
+        impl Solid for Pool {
+            fn solid(&self, x: i32, y: i32, _z: i32) -> bool {
+                // The bank: solid ground east of x=0, up to the waterline.
+                y < 0 || (x >= 0 && y < 12)
+            }
+
+            fn fluid(&self, x: i32, y: i32, _z: i32) -> Fluid {
+                // Blocks are three cells; the water occupies block y 0..4,
+                // which is cells 0..12, west of the bank.
+                if x < 0 && (0..4).contains(&y) {
+                    Fluid::flowing(MILK, MAX_LEVEL)
+                } else {
+                    Fluid::EMPTY
+                }
+            }
+        }
+
+        // Floating in the milk, a little way from the bank, swimming at it.
+        let start = Body::at([-4.0, 8.0, 24.0]);
+        let swimming = Intent {
+            walk: [1.0, 0.0],
+            jump: true,
+            gait: Gait::Walk,
+        };
+        let out = simulate(&Pool, start, swimming, 60);
+        assert!(
+            out.position[0] > 0.0,
+            "never reached the bank: ended at {:?}",
+            out.position
+        );
+
+        // Jump released, and a moment to settle. Held, it would bunny-hop east
+        // along the bank forever and "on the ground" would be a coin flip about
+        // which tick the sample landed on.
+        let standing = simulate(
+            &Pool,
+            out,
+            Intent {
+                walk: [0.0, 0.0],
+                jump: false,
+                gait: Gait::Walk,
+            },
+            40,
+        );
+
+        assert!(
+            standing.on_ground,
+            "never came to rest on the bank: ended at {:?}",
+            standing.position
+        );
+        assert!(
+            (standing.position[1] - 12.0).abs() < 0.1,
+            "settled at {} rather than on the bank at 12",
+            standing.position[1]
+        );
+        assert_eq!(
+            submersion(&Pool, &standing.aabb()),
+            Submersion::DRY,
+            "standing on the bank but still reading as wet"
+        );
+    }
+
+    #[test]
+    fn the_leap_needs_a_head_above_the_water() {
+        // The guard that keeps this from being a way to swim up faster: a
+        // swimmer can push themselves up out of water they can see over, and
+        // cannot do it from underneath.
+        let pool = Pool::new(10);
+
+        let deep = Body::at([24.0, 6.0, 24.0]);
+        assert!(
+            !head_is_clear(&pool, &deep.aabb()),
+            "the staging is wrong: this body's head is not under"
+        );
+        let floating = Body::at([24.0, 26.0, 24.0]);
+        assert!(
+            head_is_clear(&pool, &floating.aabb()),
+            "a body at the surface read as having its head under"
+        );
+
+        let intent = Intent {
+            jump: true,
+            ..Intent::default()
+        };
+
+        let mut under = 0.0;
+        vertical(&mut under, 1.0, false, intent, &Tuning::DEFAULT);
+        assert!(
+            under < Tuning::DEFAULT.surface_leap * 0.5,
+            "a submerged body got the surface kick: {under} cells/tick"
+        );
+
+        let mut surfacing = 0.0;
+        vertical(&mut surfacing, 0.8, true, intent, &Tuning::DEFAULT);
+        assert!(
+            surfacing >= Tuning::DEFAULT.surface_leap,
+            "a body with its head out did not get the kick: {surfacing} cells/tick"
         );
     }
 

@@ -147,6 +147,26 @@ pub struct Tuning {
     /// Far below [`terminal_velocity`](Self::terminal_velocity), and that gap is
     /// the whole mechanism behind milk breaking a fall.
     pub fluid_terminal_velocity: f32,
+
+    /// Upward velocity from holding jump while breaking the surface, cells/tick.
+    ///
+    /// **A velocity, not an acceleration, and that is the point.** Swimming up
+    /// is an acceleration that fights buoyancy and drag, and it asymptotes
+    /// exactly where a body stops being submerged — which is the surface. So a
+    /// swimmer holding jump rises to the waterline and stays there forever, and
+    /// cannot get out of a pool whose lip is at the waterline, because the one
+    /// place the rise weakens to nothing is the place they need to leave from.
+    ///
+    /// This is the kick that gets them over it: while any part of the body is
+    /// out of the fluid, jump sets a floor under the vertical velocity instead
+    /// of adding to it. Scaled by how much of the body is still IN the fluid,
+    /// because a swimmer with their shoulders clear has less to push against —
+    /// so it fades as the body leaves rather than firing at full strength on
+    /// the last tick and launching them.
+    ///
+    /// [`jump_speed`](Self::jump_speed)'s own value, so climbing out of milk
+    /// costs the same effort as climbing the equivalent step on land.
+    pub surface_leap: f32,
 }
 
 impl Tuning {
@@ -181,6 +201,8 @@ impl Tuning {
         // v × (1 − f) / f, as on the ground: 0.3 × 0.2 / 0.8.
         swim_acceleration: 0.075,
         fluid_terminal_velocity: speed(6.0),
+        // The jump speed, so leaving the water costs what leaving a step costs.
+        surface_leap: 1.341_640_8,
     };
 }
 
