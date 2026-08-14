@@ -825,6 +825,7 @@ impl ScriptVm for MluaVm {
                     fluid,
                     material: entry.get("material").ok()?,
                     flow_range: entry.get("flow_range").ok()?,
+                    waterlogs_at: entry.get("waterlogs_at").ok()?,
                     tick_rate: entry.get("tick_rate").ok()?,
                 })
             })
@@ -1808,6 +1809,21 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
         )));
     }
 
+    // Contract §4's threshold, as the registering mod's decision rather than the
+    // engine's. Zero would make every block floor and the fluid would never move
+    // at all, which reads as the engine ignoring the mod.
+    let waterlogs_at: u32 = spec
+        .get("waterlogs_at")
+        .unwrap_or(FluidRules::DEFAULT_WATERLOGS_AT);
+    if waterlogs_at == 0 || waterlogs_at > crate::UNITS_PER_BLOCK {
+        return Err(mlua::Error::external(format!(
+            "register_fluid(\"{qualified}\"): waterlogs_at must be 1..={}, got {waterlogs_at}. \
+             It is how many of a block's 27 cells must be filled before this fluid treats it as \
+             floor.",
+            crate::UNITS_PER_BLOCK
+        )));
+    }
+
     let tick_rate: u8 = spec
         .get("tick_rate")
         .unwrap_or(FluidRules::DEFAULT_TICK_RATE);
@@ -1828,6 +1844,7 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     let entry = lua.create_table()?;
     entry.set("material", material)?;
     entry.set("flow_range", flow_range)?;
+    entry.set("waterlogs_at", waterlogs_at)?;
     entry.set("tick_rate", tick_rate)?;
     registry.set(qualified, entry)?;
     Ok(())
@@ -2107,7 +2124,7 @@ const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "defa
 
 /// Fields `register_fluid` accepts. Anything else is a typo, and a typo that is
 /// silently ignored is a mod whose author cannot tell why nothing happened.
-const FLUID_FIELDS: [&str; 4] = ["id", "material", "flow_range", "tick_rate"];
+const FLUID_FIELDS: [&str; 5] = ["id", "material", "flow_range", "waterlogs_at", "tick_rate"];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
 const BLOCK_FIELDS: [&str; 8] = [

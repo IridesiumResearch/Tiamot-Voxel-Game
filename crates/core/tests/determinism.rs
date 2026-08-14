@@ -699,13 +699,17 @@ fn fluid_fingerprint() -> u64 {
     }
 
     impl Neighbourhood for Scene {
-        fn accepts_fluid(&self, pos: BlockPos) -> bool {
+        fn occupancy(&self, pos: BlockPos) -> Option<u32> {
             // Walled at the edges so nothing escapes the scenario. A fixture
             // that leaked would hash the leak rather than the rule.
             if pos.x.abs() > 12 || pos.z.abs() > 12 || pos.y < 0 || pos.y > 12 {
-                return false;
+                return None;
             }
-            !self.solid.contains(&(pos.x, pos.y, pos.z))
+            Some(if self.solid.contains(&(pos.x, pos.y, pos.z)) {
+                tiamot_core::UNITS_PER_BLOCK
+            } else {
+                0
+            })
         }
 
         fn fluid(&self, pos: BlockPos) -> Fluid {
@@ -847,11 +851,15 @@ fn the_fluid_scenarios_actually_hold_milk() {
         fluid: BTreeMap<(i32, i32, i32), Fluid>,
     }
     impl Neighbourhood for Basin {
-        fn accepts_fluid(&self, pos: BlockPos) -> bool {
+        fn occupancy(&self, pos: BlockPos) -> Option<u32> {
             if pos.x.abs() > 12 || pos.z.abs() > 12 || pos.y < 0 || pos.y > 12 {
-                return false;
+                return None;
             }
-            !self.solid.contains(&(pos.x, pos.y, pos.z))
+            Some(if self.solid.contains(&(pos.x, pos.y, pos.z)) {
+                tiamot_core::UNITS_PER_BLOCK
+            } else {
+                0
+            })
         }
         fn fluid(&self, pos: BlockPos) -> Fluid {
             self.fluid

@@ -217,6 +217,9 @@ pub struct Registered {
     /// Seven for milk, which is [`MAX_LEVEL`]: each block of travel costs a
     /// level, so a shorter range is a fluid that thins out faster.
     pub flow_range: u8,
+    /// How full a block must be before this fluid treats it as floor, in cells
+    /// of 27. See [`Tuning::waterlogs_at`].
+    pub waterlogs_at: u32,
     /// Simulation ticks between updates of this fluid.
     ///
     /// One means every fluid tick. Larger is a slower, more viscous fluid, and
@@ -381,6 +384,7 @@ mod tests {
             .register(Registered {
                 name: "core:milk".into(),
                 flow_range: 7,
+                waterlogs_at: 14,
                 tick_rate: 1,
                 material: MaterialId(4),
             })
@@ -397,6 +401,7 @@ mod tests {
         let entry = || Registered {
             name: "core:milk".into(),
             flow_range: 7,
+            waterlogs_at: 14,
             tick_rate: 1,
             material: MaterialId(4),
         };
@@ -415,6 +420,7 @@ mod tests {
                 .register(Registered {
                     name: format!("test:fluid{index}"),
                     flow_range: 7,
+                    waterlogs_at: 14,
                     tick_rate: 1,
                     material: MaterialId(1),
                 })
@@ -424,6 +430,7 @@ mod tests {
             fluids.register(Registered {
                 name: "test:one-too-many".into(),
                 flow_range: 7,
+                waterlogs_at: 14,
                 tick_rate: 1,
                 material: MaterialId(1),
             }),

@@ -250,8 +250,8 @@ impl Solver {
     /// Whether the fluid in a block is on its way down rather than resting.
     ///
     /// A block whose floor accepts fluid is falling: its contents are leaving.
-    fn drains_into(world: &impl Neighbourhood, pos: BlockPos) -> bool {
-        world.accepts_fluid(BlockPos::new(pos.x, pos.y - 1, pos.z))
+    fn drains_into(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos) -> bool {
+        !is_floor(world, tuning, BlockPos::new(pos.x, pos.y - 1, pos.z))
     }
 
     /// Which lateral directions a block should feed, given the hole preference.
@@ -273,7 +273,7 @@ impl Solver {
         let mut open = [false; LATERAL.len()];
         for (index, offset) in LATERAL.iter().enumerate() {
             let at = BlockPos::new(pos.x + offset[0], pos.y + offset[1], pos.z + offset[2]);
-            open[index] = world.accepts_fluid(at);
+            open[index] = !is_floor(world, tuning, at);
         }
         if tuning.hole_search == 0 {
             return open;
@@ -288,7 +288,7 @@ impl Solver {
                 continue;
             }
             let start = BlockPos::new(pos.x + offset[0], pos.y + offset[1], pos.z + offset[2]);
-            if let Some(steps) = drop_within(world, start, tuning.hole_search) {
+            if let Some(steps) = drop_within(world, tuning, start) {
                 distance[index] = Some(steps);
                 shortest = shortest.min(steps);
             }
@@ -312,7 +312,7 @@ fn settle_one(world: &mut impl Neighbourhood, tuning: Tuning, pos: BlockPos) -> 
     // A block that stopped accepting fluid — somebody built in the pond —
     // loses whatever was in it. Checked first, because everything below
     // assumes the block can hold something.
-    if !world.accepts_fluid(pos) {
+    if is_floor(world, tuning, pos) {
         if was.is_empty() {
             return None;
         }
@@ -346,7 +346,7 @@ fn supplied(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos, was: Flui
     // **Rule 2, and it comes before spreading.** Anything above pours
     // straight through at full level rather than thinning on the way down,
     // which is what makes a waterfall a column instead of a cone.
-    if !falling.is_empty() && world.accepts_fluid(pos) {
+    if !falling.is_empty() && !is_floor(world, tuning, pos) {
         return Fluid::flowing(falling.fluid(), MAX_LEVEL);
     }
 
@@ -363,7 +363,7 @@ fn supplied(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos, was: Flui
         // A neighbour that is itself falling does not feed sideways: it is
         // on its way down and its level belongs to the column, not to the
         // floor beside it.
-        if is_falling(world, neighbour) {
+        if is_falling(world, tuning, neighbour) {
             continue;
         }
         // **And it only feeds the way it is running.** Contract §4's flow
@@ -430,7 +430,7 @@ fn feeds(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos, direction: u
     if tuning.hole_search == 0 {
         return true;
     }
-    if drop_within(world, pos, tuning.hole_search).is_none() {
+    if drop_within(world, tuning, pos).is_none() {
         return true;
     }
     Solver::preferred(world, tuning, pos)[direction]
@@ -441,12 +441,14 @@ fn feeds(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos, direction: u
 /// Unloaded counts as floor, which is what stops a flood running off the edge
 /// of the world.
 fn is_floor(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos) -> bool {
-    world.occupancy(pos).is_none_or(|filled| filled >= tuning.waterlogs_at)
+    world
+        .occupancy(pos)
+        .is_none_or(|filled| filled >= tuning.waterlogs_at)
 }
 
 /// Whether the fluid at `pos` is falling rather than resting.
-fn is_falling(world: &impl Neighbourhood, pos: BlockPos) -> bool {
-    !world.fluid(pos).is_empty() && Solver::drains_into(world, pos)
+fn is_falling(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos) -> bool {
+    !world.fluid(pos).is_empty() && Solver::drains_into(world, tuning, pos)
 }
 
 /// Steps from `start` to the nearest block that would drop, up to `limit`.
@@ -455,8 +457,9 @@ fn is_falling(world: &impl Neighbourhood, pos: BlockPos) -> bool {
 /// `limit` and therefore by a few dozen visits — Minecraft's four gives at most
 /// forty-one blocks. Deliberately not a full path search: the preference exists
 /// to make milk look like it knows where the hole is, not to be a router.
-fn drop_within(world: &impl Neighbourhood, start: BlockPos, limit: u8) -> Option<u8> {
-    if !world.accepts_fluid(start) {
+fn drop_within(world: &impl Neighbourhood, tuning: Tuning, start: BlockPos) -> Option<u8> {
+    let limit = tuning.hole_search;
+    if is_floor(world, tuning, start) {
         return None;
     }
     let mut seen = BTreeSet::from([start]);
@@ -467,7 +470,7 @@ fn drop_within(world: &impl Neighbourhood, start: BlockPos, limit: u8) -> Option
         }
         let mut next = Vec::new();
         for pos in frontier {
-            if world.accepts_fluid(BlockPos::new(pos.x, pos.y - 1, pos.z)) {
+            if !is_floor(world, tuning, BlockPos::new(pos.x, pos.y - 1, pos.z)) {
                 return Some(steps);
             }
             if steps == limit {
@@ -475,7 +478,7 @@ fn drop_within(world: &impl Neighbourhood, start: BlockPos, limit: u8) -> Option
             }
             for offset in LATERAL {
                 let at = BlockPos::new(pos.x + offset[0], pos.y + offset[1], pos.z + offset[2]);
-                if world.accepts_fluid(at) && seen.insert(at) {
+                if !is_floor(world, tuning, at) && seen.insert(at) {
                     next.push(at);
                 }
             }
@@ -504,6 +507,11 @@ mod tests {
     #[derive(Debug, Default)]
     struct Scene {
         solid: std::collections::BTreeSet<(i32, i32, i32)>,
+        /// Blocks that are partly filled, in cells of 27.
+        ///
+        /// What a sub-node-smoothed hillside is made of, and the case the
+        /// whole-block `solid` set above cannot express.
+        partial: BTreeMap<(i32, i32, i32), u32>,
         fluid: BTreeMap<(i32, i32, i32), Fluid>,
     }
 
@@ -548,8 +556,19 @@ mod tests {
     }
 
     impl Neighbourhood for Scene {
-        fn accepts_fluid(&self, pos: BlockPos) -> bool {
-            !self.solid.contains(&Self::key(pos))
+        fn occupancy(&self, pos: BlockPos) -> Option<u32> {
+            // **Walled, and it took two tests failing to learn why.** An
+            // unbounded fixture is a drain to infinity: milk spilling off the
+            // edge of a test's floor falls forever and the scene never settles,
+            // so the failure reads as a solver bug rather than as a world with
+            // no bottom.
+            if pos.x.abs() > 40 || pos.z.abs() > 40 || pos.y < -8 || pos.y > 40 {
+                return Some(crate::UNITS_PER_BLOCK);
+            }
+            if self.solid.contains(&Self::key(pos)) {
+                return Some(crate::UNITS_PER_BLOCK);
+            }
+            Some(self.partial.get(&Self::key(pos)).copied().unwrap_or(0))
         }
 
         fn fluid(&self, pos: BlockPos) -> Fluid {
@@ -763,6 +782,91 @@ mod tests {
     }
 
     #[test]
+    fn milk_runs_down_a_sub_node_smoothed_slope() {
+        // **The case §4's old rule got wrong, and it is the COMMON case.**
+        //
+        // A smoothed hillside is a ramp INSIDE blocks: every column's top block
+        // is `Partial`. Under "accepts fluid iff empty" every one of those was
+        // fluid-solid, so nothing below any of them was a drop, the solver saw a
+        // perfectly flat floor, and milk spread as a disc across the hill —
+        // floating above ground that was smooth beneath it.
+        //
+        // Blocky terrain hides this completely, because a blocky hillside is a
+        // staircase and every step is a real drop. That is why every test above
+        // this one passed while the behaviour was wrong.
+        let mut scene = Scene::default();
+        // A solid floor under everything, so nothing drains out of the scene —
+        // the first version of this test had none west of the ramp and the milk
+        // ran off that cliff instead, which was the solver being right about a
+        // world that was wrong.
+        for x in -10..=10 {
+            for z in -5..=5 {
+                scene.solid.insert((x, -1, z));
+            }
+        }
+        // A plateau west of the spring so there is only one way down.
+        for x in -10..=-1 {
+            for z in -5..=5 {
+                scene.solid.insert((x, 0, z));
+            }
+        }
+        // The ramp itself, descending eastward: 24 cells full at x=0 down to 3
+        // at x=7. Above the threshold at first, below it from x=4 on, so the
+        // milk runs along the top and then sinks INTO the thinning ground.
+        for x in 0..=7 {
+            for z in -5..=5 {
+                let filled = 24u32.saturating_sub(x as u32 * 3);
+                scene.partial.insert((x, 0, z), filled);
+            }
+        }
+        let mut solver = Solver::new();
+        // The spring sits at the top of the ramp, in the air above it.
+        scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::source(MILK));
+        solver.touch(BlockPos::new(0, 1, 0));
+        scene.settle(&mut solver);
+
+        // It reached the bottom of the slope, which under the old rule it could
+        // not do at all — every block of the ramp read as floor.
+        assert!(
+            scene.level(7, 0, 0) > 0,
+            "milk never ran down the slope: {:?}",
+            scene.fluid
+        );
+        // And it is INSIDE the ramp blocks rather than floating on top of them,
+        // which is the half that makes it look right.
+        assert!(
+            scene.level(5, 0, 0) > 0,
+            "milk sat above the slope instead of in it"
+        );
+    }
+
+    #[test]
+    fn a_block_more_than_half_full_still_holds_fluid_up() {
+        // The other side of the threshold, so this is not just "everything is
+        // permeable now". Sixteen of 27 is above the default of fourteen.
+        let mut scene = Scene::default();
+        for x in -4..=4 {
+            for z in -4..=4 {
+                scene.partial.insert((x, 0, z), 16);
+            }
+        }
+        let mut solver = Solver::new();
+        scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::source(MILK));
+        solver.touch(BlockPos::new(0, 1, 0));
+        scene.settle(&mut solver);
+
+        assert_eq!(
+            scene.level(0, 0, 0),
+            0,
+            "milk sank through a block that is more solid than not"
+        );
+        assert!(
+            scene.level(1, 1, 0) > 0,
+            "milk did not spread across the floor it should have been held up by"
+        );
+    }
+
+    #[test]
     fn with_no_hole_in_range_milk_spreads_evenly() {
         let scene = Scene::default().with_floor(16);
         let preferred = Solver::preferred(&scene, Tuning::DEFAULT, BlockPos::new(0, 1, 0));
@@ -854,14 +958,18 @@ mod properties {
     }
 
     impl Neighbourhood for Scene {
-        fn accepts_fluid(&self, pos: BlockPos) -> bool {
+        fn occupancy(&self, pos: BlockPos) -> Option<u32> {
             // **Walled in on every side.** A test box with open edges lets milk
             // pour out of the world, and then "no floating milk" holds for the
             // uninteresting reason that there is no milk.
             if pos.x.abs() > SPAN || pos.z.abs() > SPAN || pos.y < 0 || pos.y > SPAN {
-                return false;
+                return None;
             }
-            !self.solid.contains(&(pos.x, pos.y, pos.z))
+            Some(if self.solid.contains(&(pos.x, pos.y, pos.z)) {
+                crate::UNITS_PER_BLOCK
+            } else {
+                0
+            })
         }
 
         fn fluid(&self, pos: BlockPos) -> Fluid {
@@ -910,7 +1018,7 @@ mod properties {
                 scene.solid.remove(&(x, y, z));
             }
             Edit::Pour(x, y, z) => {
-                if scene.accepts_fluid(BlockPos::new(x, y, z)) {
+                if !is_floor(&*scene, Tuning::DEFAULT, BlockPos::new(x, y, z)) {
                     scene.set_fluid(BlockPos::new(x, y, z), Fluid::source(MILK));
                 }
             }
@@ -964,7 +1072,7 @@ mod properties {
             for (&(x, y, z), &value) in &scene.fluid {
                 let pos = BlockPos::new(x, y, z);
                 prop_assert!(
-                    scene.accepts_fluid(pos),
+                    !is_floor(&scene, Tuning::DEFAULT, pos),
                     "{pos:?} holds milk and does not accept fluid"
                 );
                 if value.is_source() {
