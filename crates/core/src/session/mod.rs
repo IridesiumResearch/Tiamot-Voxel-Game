@@ -311,6 +311,17 @@ impl Session {
                 // place.
                 Response::none()
             }
+            (Phase::InWorld, ClientMessage::ViewDistance { .. }) => {
+                // Served by the transport layer, which owns the streamer, and
+                // accepted here for the same reason content requests are: the
+                // phase check lives in one place.
+                //
+                // **In world only.** The streamer does not exist until a player
+                // reaches the world, so a request before that has nothing to
+                // resize — and an arm that accepted it earlier would be
+                // silently doing nothing.
+                Response::none()
+            }
             // Gameplay, accepted ONLY in world. The phase is the access
             // control: there is no flag to forget to check, because reaching
             // these arms at all requires having got through the handshake.
@@ -871,6 +882,64 @@ mod tests {
         // before being corrected.
         assert!(matches!(sent[6], ServerMessage::SkyTable { .. }));
         assert!(matches!(sent[7], ServerMessage::JoinWorld { .. }));
+    }
+
+    #[test]
+    fn a_view_distance_request_is_accepted_in_world_and_refused_before_it() {
+        // **The test that was missing when this shipped broken.**
+        //
+        // `ViewDistance` is served by the transport layer, which owns the
+        // streamer — but every message passes through this state machine first,
+        // and a message with no accepting arm is a disconnect. So the server
+        // answered the request AND closed the connection for sending it, and the
+        // real client died on join with "ViewDistance is not valid in phase
+        // InWorld" while the integration tests, which read the answer and never
+        // checked the connection, stayed green.
+        //
+        // The lesson is about where the rule lives: the phase check belongs
+        // here, in the pure state machine that is tested without a socket, and
+        // any message the transport serves needs an arm here saying so.
+        let alice = Identity::generate().expect("generate");
+        let mut registry = registry_with(&alice);
+        let allowlist = Allowlist::open();
+        let mods = Vec::new();
+        let context = context(&allowlist, &mods);
+        let auth = SelfSovereign;
+
+        let (mut session, _) = join(&alice, "Alice", &mut registry, &allowlist);
+        assert_eq!(session.phase(), Phase::InWorld);
+
+        let response = session.handle(
+            &ClientMessage::ViewDistance {
+                horizontal: 4,
+                vertical: 2,
+            },
+            &context,
+            &auth,
+            &mut registry,
+        );
+        assert!(
+            !response.close,
+            "a player in the world was disconnected for asking how far they see"
+        );
+        assert_eq!(session.phase(), Phase::InWorld);
+
+        // And refused before the world, where there is no streamer to resize —
+        // an arm that accepted it earlier would be silently doing nothing.
+        let mut fresh = Session::new();
+        let response = fresh.handle(
+            &ClientMessage::ViewDistance {
+                horizontal: 4,
+                vertical: 2,
+            },
+            &context,
+            &auth,
+            &mut registry,
+        );
+        assert!(
+            response.close,
+            "a peer that has not authenticated was allowed to ask for a view distance"
+        );
     }
 
     #[test]

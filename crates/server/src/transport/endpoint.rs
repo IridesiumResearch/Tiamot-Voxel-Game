@@ -1267,10 +1267,19 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
         // owns no streamer. Charter rule 2 keeps the decision on the server —
         // this is a request, and the answer is what the server is willing to
         // send rather than what the client asked for.
-        if let ClientMessage::ViewDistance {
-            horizontal,
-            vertical,
-        } = &message
+        //
+        // **`!response.close` is not belt-and-braces.** `close` is honoured at
+        // the BOTTOM of this loop, so without the guard every transport-served
+        // message is still acted on once after the session has refused it. That
+        // is exactly how this shipped broken: the session had no accepting arm
+        // for `ViewDistance`, so the server answered the request and
+        // disconnected the client for sending it — and the bot tests, which read
+        // the answer and never looked at the connection, went green.
+        if !response.close
+            && let ClientMessage::ViewDistance {
+                horizontal,
+                vertical,
+            } = &message
             && let Some(streamer) = streamer.as_mut()
         {
             // Capped by the server's configured radius on both axes, then by

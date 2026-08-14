@@ -96,6 +96,27 @@ fn granted(bot: &Bot) -> Option<(u8, u8)> {
         })
 }
 
+/// Panics if the server has closed the connection.
+///
+/// **The assertion every one of these tests was missing, and it cost a broken
+/// build.** The session state machine gates every message by phase, and
+/// `ViewDistance` was served by the transport layer without ever being given an
+/// accepting arm — so the server answered the request AND disconnected the
+/// client for sending it. The grant arrived, these tests read it and passed, and
+/// the real client died on join with "ViewDistance is not valid in phase
+/// InWorld".
+///
+/// A test that reads one message and ignores the connection it arrived on is
+/// only testing half of what happened.
+fn assert_still_connected(bot: &Bot, what: &str) {
+    if let Some(reason) = bot.received().iter().find_map(|message| match message {
+        ServerMessage::Disconnect { reason } => Some(reason),
+        _ => None,
+    }) {
+        panic!("the server disconnected the client after {what}: {reason:?}");
+    }
+}
+
 /// Waits for a condition, driving the connection while it waits.
 async fn until(bot: &mut Bot, timeout: Duration, done: impl Fn(&Bot) -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -130,6 +151,7 @@ fn the_server_states_its_view_distance_without_being_asked() {
             )),
             "the unprompted answer should be the server's own configured radius"
         );
+        assert_still_connected(&bot, "joining");
         bot.disconnect().await;
     });
 
@@ -189,6 +211,7 @@ fn asking_for_less_is_granted_and_costs_the_server_less() {
             "asking for less was not granted, got {:?}",
             granted(&bot)
         );
+        assert_still_connected(&bot, "asking for a smaller view distance");
 
         // **And it has to actually cost less.** A grant that changed a number
         // and streamed the same neighbourhood would be worse than no feature at
@@ -258,6 +281,7 @@ fn asking_for_more_than_the_server_allows_is_capped() {
             )),
             "a client asking for 255 chunks was not capped to the server's own radius"
         );
+        assert_still_connected(&bot, "asking for an absurd view distance");
 
         // And nothing outside the server's radius was actually sent.
         let spawn = bot
