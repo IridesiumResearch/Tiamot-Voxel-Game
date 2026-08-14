@@ -104,6 +104,49 @@ pub struct Tuning {
     /// surface is climbable and a two-cell lip is not. Changing it means
     /// editing the contract first.
     pub step_height: f32,
+
+    /// How much of a body's weight a full submersion carries.
+    ///
+    /// **Above one on purpose.** At exactly one a body is weightless wherever it
+    /// happens to be and never finds a surface; below one it sinks like a stone.
+    /// Above one it rises until it is `1 / buoyancy` submerged and settles
+    /// there, which is what "floating" is. 1.25 puts the equilibrium at 80% of
+    /// the box under — for a player, the eyes 0.54 cells clear of the surface.
+    pub buoyancy: f32,
+
+    /// Fraction of velocity kept per tick while fully submerged.
+    ///
+    /// Between [`ground_friction`](Self::ground_friction) and
+    /// [`air_drag`](Self::air_drag), and it applies to all three axes rather
+    /// than the horizontal pair: it is what damps the bob at the surface into a
+    /// settle instead of an oscillation that never ends.
+    pub fluid_drag: f32,
+
+    /// Upward acceleration from holding jump while submerged, cells/tick².
+    pub swim_up: f32,
+
+    /// Downward acceleration from holding sneak while submerged, cells/tick².
+    ///
+    /// Larger than [`swim_up`](Self::swim_up) because it is working against
+    /// buoyancy rather than with it, and diving has to feel deliberate.
+    pub swim_down: f32,
+
+    /// Top horizontal speed while fully submerged, cells/tick. 2.0 yd/s.
+    pub swim_speed: f32,
+
+    /// Horizontal acceleration while fully submerged, cells/tick².
+    ///
+    /// Derived from [`swim_speed`](Self::swim_speed) and
+    /// [`fluid_drag`](Self::fluid_drag) the same way the ground pair is derived
+    /// from each other, and checked by a unit test for the same reason: top
+    /// speed is what the two settle at, not what either one says.
+    pub swim_acceleration: f32,
+
+    /// The fastest a body sinks through fluid, cells/tick. 6 yd/s.
+    ///
+    /// Far below [`terminal_velocity`](Self::terminal_velocity), and that gap is
+    /// the whole mechanism behind milk breaking a fall.
+    pub fluid_terminal_velocity: f32,
 }
 
 impl Tuning {
@@ -126,6 +169,18 @@ impl Tuning {
         ground_acceleration: 0.43,
         air_acceleration: 0.06,
         step_height: 1.0,
+        buoyancy: 1.25,
+        fluid_drag: 0.8,
+        // A sustained rise of 2.5 yd/s once the drag has settled, which clears
+        // a block every three ticks — fast enough to escape a pond you fell
+        // into, slow enough that milk is not a lift.
+        swim_up: accel(4.5),
+        // And 2 yd/s down, against the buoyancy.
+        swim_down: accel(18.0),
+        swim_speed: speed(2.0),
+        // v × (1 − f) / f, as on the ground: 0.3 × 0.2 / 0.8.
+        swim_acceleration: 0.075,
+        fluid_terminal_velocity: speed(6.0),
     };
 }
 
@@ -207,6 +262,57 @@ mod tests {
         let tuning = Tuning::DEFAULT;
         assert!(Gait::Sprint.top_speed(&tuning) > Gait::Walk.top_speed(&tuning));
         assert!(Gait::Walk.top_speed(&tuning) > Gait::Sneak.top_speed(&tuning));
+    }
+
+    #[test]
+    fn swim_acceleration_and_fluid_drag_settle_at_the_swim_speed() {
+        // The same equilibrium the ground pair has, and the same hazard: a
+        // plausible-looking change to either silently changes how fast a player
+        // swims, because top speed is what the two settle at rather than what
+        // `swim_speed` says.
+        let tuning = Tuning::DEFAULT;
+        let settled = tuning.swim_acceleration * tuning.fluid_drag / (1.0 - tuning.fluid_drag);
+
+        assert!(
+            (settled - tuning.swim_speed).abs() < 0.02,
+            "acceleration {} and drag {} settle at {settled} cells/tick, but swim_speed is {}",
+            tuning.swim_acceleration,
+            tuning.fluid_drag,
+            tuning.swim_speed
+        );
+    }
+
+    #[test]
+    fn a_floating_body_keeps_its_eyes_out_of_the_milk() {
+        // **Where buoyancy above one actually shows.** A body rises until the
+        // fluid carries its weight, which is `1 / buoyancy` of it submerged —
+        // and whether that number leaves the eyes above the surface is the
+        // difference between floating and drowning while afloat.
+        let tuning = Tuning::DEFAULT;
+        assert!(
+            tuning.buoyancy > 1.0,
+            "buoyancy {} is not above one, so a body has no surface to find",
+            tuning.buoyancy
+        );
+
+        let submerged = super::super::PLAYER_HEIGHT / tuning.buoyancy;
+        assert!(
+            submerged < super::super::EYE_HEIGHT,
+            "a floating body sits {submerged} cells under with its eyes at {}",
+            super::super::EYE_HEIGHT
+        );
+    }
+
+    #[test]
+    fn milk_is_a_far_lower_terminal_velocity_than_air() {
+        // The gap IS the fall-breaking mechanism — see `phys::swim::vertical`.
+        let tuning = Tuning::DEFAULT;
+        assert!(
+            tuning.fluid_terminal_velocity * 4.0 < tuning.terminal_velocity,
+            "fluid terminal velocity {} is not decisively below the dry {}",
+            tuning.fluid_terminal_velocity,
+            tuning.terminal_velocity
+        );
     }
 
     #[test]

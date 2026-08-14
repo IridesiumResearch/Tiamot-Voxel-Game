@@ -39,15 +39,18 @@
 
 pub mod input;
 pub mod ray;
+pub mod swim;
 pub mod tuning;
 pub mod voxels;
 
 use crate::detgen::floor_to_i32;
+use crate::fluid::Fluid;
 
 pub use input::InputQueue;
 pub use ray::{Hit, REACH};
+pub use swim::{Submersion, submersion};
 pub use tuning::{Gait, Tuning};
-pub use voxels::{ChunkLookup, Voxels};
+pub use voxels::{ChunkLookup, Dry, FluidLookup, Voxels};
 
 /// Player box width, in cells. 0.6 yards.
 pub const PLAYER_WIDTH: f32 = 1.8;
@@ -181,6 +184,27 @@ pub trait Solid {
     /// fine".
     fn rebase(&self, _origin: crate::coords::ChunkPos) {}
 
+    /// What fluid fills the block at these **block** coordinates.
+    ///
+    /// # Mind the units
+    ///
+    /// Every other method here answers per sub-node cell. This one answers per
+    /// BLOCK — three cells to a side — because fluid is block-resolution by
+    /// design (Sub-Node Contract §4), and pretending otherwise by taking cell
+    /// coordinates would invite a caller to believe the three cells of a block
+    /// could hold different amounts. A frame cell `c` lies in frame block
+    /// `c.div_euclid(3)`.
+    ///
+    /// Defaults to empty, which is the right answer for every view that has no
+    /// fluid to report: a test grid, and the collision-only path a caller takes
+    /// when it holds no fluid layers. **Dryness is also what keeps this
+    /// backwards compatible with itself** — a body in air must take exactly the
+    /// arithmetic it took before fluid existed, and it does, because
+    /// [`step`] branches on the submerged fraction being zero.
+    fn fluid(&self, _x: i32, _y: i32, _z: i32) -> Fluid {
+        Fluid::EMPTY
+    }
+
     /// Whether any solid cell overlaps a box.
     fn overlaps(&self, aabb: &Aabb) -> bool {
         let (min_x, max_x) = aabb.cell_span(0);
@@ -280,9 +304,31 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
         return body;
     }
 
+    // **How wet the body is, decided once, before anything moves.**
+    //
+    // Every fluid effect below scales by this one number, so there is no
+    // threshold anywhere between walking and swimming — which is what stops
+    // waist-deep milk from flickering between the two as a player steps. It is
+    // measured from the box the tick STARTED in, for the same reason
+    // `was_on_ground` is last tick's answer: the resolutions that follow move
+    // the body, and a force computed halfway through them is a force applied to
+    // a body that was somewhere else.
+    //
+    // Zero for a dry world, and every branch below is guarded on that, so a
+    // body in air takes bit-identical arithmetic to what it took before fluid
+    // existed. Charter rule 4 is not negotiable retroactively: the determinism
+    // goldens in `crates/core/tests/determinism.rs` were hashed by the old code
+    // and must still match.
+    let wet = swim::submersion(solid, &body.aabb()).fraction;
+
     // --- vertical velocity -------------------------------------------------
     if intent.jump && body.on_ground {
+        // A push off the bottom is still a jump. Standing in a shallow pool and
+        // leaping out of it is the same action as leaping off dry ground, and
+        // routing it through the swim branch would turn it into a feeble drift.
         body.velocity[1] = tuning.jump_speed;
+    } else if wet > 0.0 {
+        swim::vertical(&mut body.velocity[1], wet, intent, tuning);
     } else {
         body.velocity[1] -= tuning.gravity;
         if body.velocity[1] < -tuning.terminal_velocity {
@@ -291,23 +337,35 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
     }
 
     // --- horizontal steering -----------------------------------------------
-    let acceleration = if body.on_ground {
+    let mut acceleration = if body.on_ground {
         tuning.ground_acceleration
     } else {
         tuning.air_acceleration
     };
-    let [wish_x, wish_z] = normalise(intent.walk);
-    body.velocity[0] += wish_x * acceleration;
-    body.velocity[2] += wish_z * acceleration;
-
-    let friction = if body.on_ground {
+    let mut friction = if body.on_ground {
         tuning.ground_friction
     } else {
         tuning.air_drag
     };
+    let mut top_speed = intent.gait.top_speed(tuning);
+    if wet > 0.0 {
+        // Blended from whatever the body's dry state was rather than replacing
+        // it, so a player wading a ford loses speed in proportion to how much of
+        // them is in the ford. The gait still matters underwater — a sprint is
+        // faster than a sneak there too — because the blend moves the ENDS of
+        // the range and not the choice between them.
+        acceleration += (tuning.swim_acceleration - acceleration) * wet;
+        friction += (tuning.fluid_drag - friction) * wet;
+        top_speed += (tuning.swim_speed - top_speed) * wet;
+    }
+
+    let [wish_x, wish_z] = normalise(intent.walk);
+    body.velocity[0] += wish_x * acceleration;
+    body.velocity[2] += wish_z * acceleration;
+
     body.velocity[0] *= friction;
     body.velocity[2] *= friction;
-    clamp_horizontal(&mut body.velocity, intent.gait.top_speed(tuning));
+    clamp_horizontal(&mut body.velocity, top_speed);
 
     // --- resolution --------------------------------------------------------
     let was_on_ground = body.on_ground;

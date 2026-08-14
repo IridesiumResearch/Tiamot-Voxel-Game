@@ -24,7 +24,8 @@
 //! places for good reasons.
 
 use crate::chunk::Chunk;
-use crate::coords::{ChunkPos, SubNodePos};
+use crate::coords::{ChunkPos, LocalBlock, SubNodePos};
+use crate::fluid::{Fluid, FluidLayer};
 use crate::material::MaterialId;
 
 use super::Solid;
@@ -44,9 +45,50 @@ pub trait ChunkLookup {
     fn chunk(&self, pos: ChunkPos) -> Option<&Chunk>;
 }
 
+/// Somewhere the fluid of already-loaded chunks can be looked up.
+///
+/// # Why this is not a method on [`ChunkLookup`]
+///
+/// Because the two are not in the same place on the server. Chunks live in
+/// `World` and fluid lives in `Fluidics` behind its own lock — deliberately, so
+/// that a fluid tick and a chunk load do not contend — and a trait demanding
+/// both would force one of them to hold a reference into the other. The client
+/// happens to keep both in its `ChunkStore` and implements both traits on it,
+/// which is exactly the freedom two traits buy.
+pub trait FluidLookup {
+    /// The fluid layer of a chunk, or `None` where there is none to report.
+    ///
+    /// `None` covers both "this chunk is dry" and "this chunk is not resident",
+    /// and they need no distinction: unlike solidity, absent fluid is not a
+    /// guess that can lose a player. The worst an unloaded chunk can do here is
+    /// fail to float a body that is standing in geometry it cannot see anyway.
+    fn fluid_layer(&self, pos: ChunkPos) -> Option<&FluidLayer>;
+}
+
+/// A world with no fluid in it at all.
+///
+/// The default for [`Voxels`], and what [`Voxels::new`] builds: a caller that
+/// only wants collision — the ray casts, the reach checks, every physics test
+/// scene — says nothing about fluid and gets a dry world, which costs one
+/// `Option` check per query and no lookups.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Dry;
+
+impl FluidLookup for Dry {
+    fn fluid_layer(&self, _pos: ChunkPos) -> Option<&FluidLayer> {
+        None
+    }
+}
+
 /// A [`Solid`] view of loaded chunks, in a frame anchored to `origin`.
-pub struct Voxels<'a, S: ChunkLookup> {
+pub struct Voxels<'a, S: ChunkLookup, F: FluidLookup = Dry> {
     source: &'a S,
+    /// Where to find fluid, if the caller has any.
+    ///
+    /// An `Option` rather than a `Dry` instance so that [`Voxels::new`] stays a
+    /// `const fn` with nothing to borrow — there is no `&'static Dry` to point
+    /// at from a const context.
+    fluid: Option<&'a F>,
     /// The chunk whose corner is cell `[0, 0, 0]` in this frame.
     ///
     /// A `Cell` because the frame MOVES: a body that crosses a chunk plane is
@@ -66,11 +108,33 @@ pub struct Voxels<'a, S: ChunkLookup> {
     absent: std::cell::Cell<bool>,
 }
 
-impl<'a, S: ChunkLookup> Voxels<'a, S> {
-    /// Views `source` with the frame anchored at `origin`'s corner.
+impl<'a, S: ChunkLookup> Voxels<'a, S, Dry> {
+    /// Views `source` with the frame anchored at `origin`'s corner, dry.
+    ///
+    /// For every caller that only asks about geometry: ray casts, reach checks,
+    /// the meshing probes. A body stepped against this view never floats,
+    /// because as far as it is concerned there is nothing to float in — see
+    /// [`Voxels::with_fluid`] for the view a player's tick uses.
     pub const fn new(source: &'a S, origin: ChunkPos) -> Self {
         Self {
             source,
+            fluid: None,
+            origin: std::cell::Cell::new(origin),
+            absent: std::cell::Cell::new(false),
+        }
+    }
+}
+
+impl<'a, S: ChunkLookup, F: FluidLookup> Voxels<'a, S, F> {
+    /// Views geometry and fluid together, in a frame anchored at `origin`.
+    ///
+    /// What steps a player. The two sources are separate because they are
+    /// separately owned on the server — see [`FluidLookup`] — and the frame
+    /// applies to both.
+    pub const fn with_fluid(source: &'a S, fluid: &'a F, origin: ChunkPos) -> Self {
+        Self {
+            source,
+            fluid: Some(fluid),
             origin: std::cell::Cell::new(origin),
             absent: std::cell::Cell::new(false),
         }
@@ -128,9 +192,42 @@ impl<'a, S: ChunkLookup> Voxels<'a, S> {
         };
         chunk.get_subnode(world)
     }
+
+    /// The fluid in a **block** of this frame — see [`Solid::fluid`] on the
+    /// units, which are blocks here and cells everywhere else.
+    fn fluid_in_block(&self, x: i32, y: i32, z: i32) -> Fluid {
+        let Some(fluid) = self.fluid else {
+            return Fluid::EMPTY;
+        };
+
+        // The frame's origin is a chunk corner, so frame block `b` is world
+        // block `origin × 16 + b`. Integer throughout: a frame this arithmetic
+        // rounded differently from the collision's would put the milk's surface
+        // in a different place from the geometry it sits in.
+        let span = crate::CHUNK_BLOCKS as i32;
+        let origin = self.origin.get();
+        let world = [
+            origin.x * span + x,
+            origin.y * span + y,
+            origin.z * span + z,
+        ];
+        let chunk = ChunkPos::new(
+            world[0].div_euclid(span),
+            world[1].div_euclid(span),
+            world[2].div_euclid(span),
+        );
+        let Some(layer) = fluid.fluid_layer(chunk) else {
+            return Fluid::EMPTY;
+        };
+        layer.get(LocalBlock::new(
+            world[0].rem_euclid(span) as u32,
+            world[1].rem_euclid(span) as u32,
+            world[2].rem_euclid(span) as u32,
+        ))
+    }
 }
 
-impl<S: ChunkLookup> Solid for Voxels<'_, S> {
+impl<S: ChunkLookup, F: FluidLookup> Solid for Voxels<'_, S, F> {
     /// Contract §2: solid iff the cell is occupied, whatever storage form the
     /// block uses — which is exactly what `get_subnode` answers, so `Uniform`,
     /// `Partial` and `Mixed` need no cases here.
@@ -168,6 +265,11 @@ impl<S: ChunkLookup> Solid for Voxels<'_, S> {
             world.z.div_euclid(span),
         );
         self.source.chunk(chunk).is_some()
+    }
+
+    /// Contract §4: what the block holds, at block resolution.
+    fn fluid(&self, x: i32, y: i32, z: i32) -> Fluid {
+        self.fluid_in_block(x, y, z)
     }
 }
 
