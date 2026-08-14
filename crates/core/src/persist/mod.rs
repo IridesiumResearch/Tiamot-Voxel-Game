@@ -413,6 +413,27 @@ impl WorldDb {
 
     /// Saves a chunk's fluid to a named domain, or removes it if it drained.
     ///
+    /// # KNOWN GAP: these bytes carry per-session fluid ids
+    ///
+    /// **Charter rule 8 says numeric runtime ids are per-session and never
+    /// stable across runs, and this path does not honour it yet.** A chunk's
+    /// blocks are translated to WORLD material ids on the way to disk — see
+    /// [`Self::encode`] and `idmap::MaterialMap` — but a [`crate::fluid::Fluid`]
+    /// byte carries a four-bit fluid id that goes to disk exactly as the running
+    /// session numbered it.
+    ///
+    /// [`crate::fluid::Fluids::register`] hands out ids positionally in
+    /// registration order, so the stored id is stable for as long as the mod set
+    /// and its load order are. Add a mod that registers a fluid ahead of an
+    /// existing one and every saved pond in the world decodes as the wrong
+    /// fluid — silently, because the byte is still perfectly valid.
+    ///
+    /// The fix is the one materials already have: a persistent name→id table in
+    /// the world database and a translation on the way in and out. It needs the
+    /// session's fluid registry to reach this layer, which it does not today —
+    /// fluids are registered during mod load, after the database is opened.
+    /// Until then, **a world's mod set must not gain or reorder fluids.**
+    ///
     /// # An empty layer DELETEs rather than writing one byte
     ///
     /// `fluid::codec::encode` turns an empty layer into a single byte, so
