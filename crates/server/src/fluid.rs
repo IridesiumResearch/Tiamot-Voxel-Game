@@ -302,6 +302,7 @@ impl Fluidics {
             .map_or(Tuning::DEFAULT, |(_, f)| Tuning {
                 flow_range: f.flow_range,
                 hole_search: Tuning::DEFAULT.hole_search,
+                waterlogs_at: f.waterlogs_at,
                 tick_rate: f.tick_rate,
             })
     }
@@ -329,17 +330,19 @@ struct Wet<'a> {
 }
 
 impl Neighbourhood for Wet<'_> {
-    /// Sub-Node Contract §4: a block accepts fluid iff its occupancy is empty.
+    /// Sub-Node Contract §4: how full the block is, in cells of 27.
+    ///
+    /// The world reports the fact and the fluid decides what it means — see
+    /// `Tuning::waterlogs_at`.
     ///
     /// `resident` rather than `chunk`, for the reason light documents at the
     /// same call: a flow must never generate terrain. Milk reaching the edge of
     /// what is loaded would otherwise pull chunks into memory at whatever rate
-    /// it spread, inside the tick.
-    fn accepts_fluid(&self, pos: BlockPos) -> bool {
-        let Some(chunk) = self.world.resident(pos.chunk()) else {
-            return false;
-        };
-        chunk.get_block_local(pos.local()).is_empty()
+    /// it spread, inside the tick. `None` is that case, and the solver treats it
+    /// as floor.
+    fn occupancy(&self, pos: BlockPos) -> Option<u32> {
+        let chunk = self.world.resident(pos.chunk())?;
+        Some(chunk.get_block_local(pos.local()).filled_cells())
     }
 
     fn fluid(&self, pos: BlockPos) -> Fluid {
@@ -394,6 +397,7 @@ pub fn fluids_from_rules(
         if let Err(err) = fluids.register(tiamot_core::fluid::Registered {
             name: rule.fluid.clone(),
             flow_range: rule.flow_range,
+            waterlogs_at: rule.waterlogs_at,
             tick_rate: rule.tick_rate,
             material,
         }) {

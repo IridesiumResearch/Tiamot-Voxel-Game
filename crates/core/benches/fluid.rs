@@ -92,12 +92,16 @@ impl Scene {
 }
 
 impl Neighbourhood for Scene {
-    fn accepts_fluid(&self, pos: BlockPos) -> bool {
+    fn occupancy(&self, pos: BlockPos) -> Option<u32> {
         // Bounded, or a benchmark measures milk falling into an infinite void.
         if pos.x.abs() > 40 || pos.z.abs() > 40 || pos.y < -4 || pos.y > 8 {
-            return false;
+            return None;
         }
-        !self.solid.contains(&(pos.x, pos.y, pos.z))
+        Some(if self.solid.contains(&(pos.x, pos.y, pos.z)) {
+            tiamot_core::UNITS_PER_BLOCK
+        } else {
+            0
+        })
     }
 
     fn fluid(&self, pos: BlockPos) -> Fluid {

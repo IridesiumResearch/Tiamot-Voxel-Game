@@ -335,6 +335,14 @@ pub struct FluidRules {
     /// travelled and there are only seven of them. A shorter range is a fluid
     /// that thins out faster.
     pub flow_range: u8,
+    /// How full a block must be before this fluid treats it as floor, in cells
+    /// of 27.
+    ///
+    /// Sub-Node Contract §4. Fourteen — over half — by default: under it a block
+    /// is more air than anything and the fluid runs through, at or above it the
+    /// block holds the fluid up. `1` is the old rule, where any chiselled cell
+    /// at all made a block waterproof.
+    pub waterlogs_at: u32,
     /// Simulation ticks between updates of this fluid.
     ///
     /// One means every fluid tick. Larger is slower and more viscous, and costs
@@ -349,6 +357,9 @@ impl FluidRules {
 
     /// How often a fluid updates if its mod said nothing.
     pub const DEFAULT_TICK_RATE: u8 = 1;
+
+    /// How full a block must be to be floor, if its mod said nothing.
+    pub const DEFAULT_WATERLOGS_AT: u32 = 14;
 }
 
 /// How a moment's finished picture is graded.

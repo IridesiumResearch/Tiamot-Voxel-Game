@@ -207,25 +207,48 @@ incremental paths, so the property test holding those two equal covers them.
 
 ## 4. Fluid — block resolution
 
-Fluid is block-resolution and does not otherwise interact with sub-nodes.
+Fluid is block-resolution. It reads sub-node occupancy for one purpose only:
+deciding whether a block is floor.
 
-- A block accepts fluid iff its occupancy is **empty** — that is, iff it is
-  `Uniform(AIR)`.
-- `Partial` and `Mixed` blocks are **fluid-solid**: they neither hold nor pass
-  fluid, however little of them is occupied.
+- A block accepts fluid iff its occupancy is **at or below the registering
+  fluid's threshold**, `register_fluid{ waterlogs_at }`, in cells of 27.
+- A block at or above that threshold is **fluid-solid**: it neither holds nor
+  passes fluid, and a mod may swap it for a different block through
+  `on_fluid_flow` if it wants waterlogging.
+- **There is still exactly one fluid level per block.** A block that is part
+  terrain and part fluid stores one level, and that level is NOT reduced by how
+  much terrain is in the way.
 
-This is deliberately cruder than collision. Modelling partial fluid volumes at
-sub-node resolution would multiply fluid state by 27 for a visual effect nobody
-asked for. Task 11 is block-resolution throughout and needs no sub-node
-awareness beyond "is this block empty".
+### Why the threshold, and what it replaces
+
+This section used to read "a block accepts fluid iff its occupancy is empty",
+which made any block with a single chiselled cell waterproof. That is defensible
+on blocky terrain and wrong on the terrain this engine is for.
+
+**Sub-node-smoothed terrain has no drops.** A smoothed hillside is a ramp
+*inside* blocks: every column's top block is `Partial`, so under the old rule
+every one of them was fluid-solid, nothing below any of them was a drop, and the
+solver saw a perfectly flat floor. Milk spread as a disc across a hillside,
+floating up to two-thirds of a block above ground that was smooth beneath it.
+Charter rule 19 keeps sub-node terrain and the worldgen plan smooths everything,
+so that is the COMMON case rather than a corner of one.
+
+### The volume lie, stated on purpose
+
+A block that is a third full of stone still holds a whole level of fluid. This
+is wrong and is deliberately not corrected: correcting it means fluid volume per
+sub-node, which is 27× the state and the thing the scope decision ruled out.
+
+The decision that makes it acceptable is that fluid quantities are **coarse by
+design** — a bucket holds a third, two thirds, or a full source — so a third of
+a block of unaccounted volume is inside the granularity anything can observe.
 
 ### Implemented by
 
-`crates/core/src/fluid/` — `Neighbourhood::accepts_fluid` is the whole of the
-rule above, and the solver consults nothing else about geometry. A block that
-stops accepting fluid loses whatever was in it on the next fluid tick, which is
-what "no partially flooded carved block" means when somebody chisels into a
-pond.
+`crates/core/src/fluid/` — `Neighbourhood::occupancy` reports how full a block
+is, and the solver compares that against the fluid's own threshold. The world
+reports a fact; the policy lives with the fluid, so two fluids in one world may
+disagree about what counts as floor.
 
 ### Depth, in sub-node units
 

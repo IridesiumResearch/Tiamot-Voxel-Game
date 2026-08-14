@@ -358,6 +358,36 @@ impl BlockView<'_> {
         }
     }
 
+    /// How many of the block's 27 cells are occupied.
+    ///
+    /// **Sub-Node Contract §4's input.** Fluid decides whether a block is floor
+    /// by how full it is rather than by whether it has been touched at all, so
+    /// this is the number it asks for. `is_empty` is the same question with the
+    /// threshold at one, and stays because collision and lighting ask it.
+    #[must_use]
+    pub fn filled_cells(&self) -> u32 {
+        match self {
+            Self::Uniform(material) => {
+                if material.is_air() {
+                    0
+                } else {
+                    SUBNODES_PER_BLOCK as u32
+                }
+            }
+            Self::Partial {
+                material,
+                occupancy,
+            } => {
+                if material.is_air() {
+                    0
+                } else {
+                    occupancy.count_ones()
+                }
+            }
+            Self::Mixed(cells) => cells.iter().filter(|material| !material.is_air()).count() as u32,
+        }
+    }
+
     /// The material at a sub-node index.
     ///
     /// # Panics
