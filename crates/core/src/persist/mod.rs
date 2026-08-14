@@ -31,6 +31,7 @@
 //! see [`crate::chunk::CorruptChunk`].
 
 pub mod codec;
+pub mod fluidmap;
 pub mod idmap;
 pub mod migrate;
 pub mod schema;
@@ -44,6 +45,7 @@ use crate::coords::ChunkPos;
 use crate::fluid::FluidLayer;
 use crate::material::Registry;
 use crate::persist::codec::{CodecError, Dictionary};
+use crate::persist::fluidmap::{FluidIdTable, FluidMap, FluidMapError};
 use crate::persist::idmap::{IdMapError, IdTable, MaterialMap};
 
 pub use crate::persist::schema::DEFAULT_DOMAIN;
@@ -102,6 +104,20 @@ pub enum WorldError {
     #[error("material id mapping failed")]
     Materials(#[from] IdMapError),
 
+    /// Fluid id mapping failed.
+    #[error("fluid id mapping failed")]
+    Fluids(#[from] FluidMapError),
+
+    /// A fluid id could not be translated between the session and the world.
+    #[error("fluid for chunk at ({}, {}, {})", pos.x, pos.y, pos.z)]
+    FluidId {
+        /// Which chunk.
+        pos: ChunkPos,
+        /// Why.
+        #[source]
+        source: crate::persist::fluidmap::UnmappedFluid,
+    },
+
     /// The world was written by an incompatible schema version.
     #[error(
         "world uses schema version {found}, but this build understands {expected} — \
@@ -115,6 +131,20 @@ pub enum WorldError {
     },
 }
 
+/// The same block, under a different fluid id.
+///
+/// Preserves the level and the source flag exactly — only the four id bits move
+/// between the session's numbering and the world's. A source that came back as a
+/// flow block would drain, and the pond would be gone a few ticks after the
+/// world loaded.
+fn retag(value: crate::fluid::Fluid, fluid: crate::fluid::FluidId) -> crate::fluid::Fluid {
+    if value.is_source() {
+        crate::fluid::Fluid::source(fluid)
+    } else {
+        crate::fluid::Fluid::flowing(fluid, value.level())
+    }
+}
+
 /// An open world database.
 ///
 /// Holds the connection, the reconciled material mapping for this session, and
@@ -124,6 +154,17 @@ pub struct WorldDb {
     path: PathBuf,
     ids: IdTable,
     materials: MaterialMap,
+    /// The world's fluid name ⇄ id table, loaded at open.
+    fluid_ids: FluidIdTable,
+    /// Session ⇄ world fluid translation.
+    ///
+    /// **The identity until [`WorldDb::reconcile_fluids`] is called**, because
+    /// fluids are registered during mod load and a world is opened before that
+    /// — there is nothing to reconcile against yet. A world that holds fluid and
+    /// was never reconciled is a caller bug, and the save path says so rather
+    /// than writing session ids to disk, which is the defect this whole
+    /// mechanism exists to remove.
+    fluids: Option<FluidMap>,
     dictionaries: Vec<Dictionary>,
 }
 
@@ -189,12 +230,15 @@ impl WorldDb {
 
         let mut ids = IdTable::load(&conn)?;
         let materials = ids.reconcile(&conn, registry)?;
+        let fluid_ids = FluidIdTable::load(&conn)?;
 
         Ok(Self {
             conn,
             path,
             ids,
             materials,
+            fluid_ids,
+            fluids: None,
             dictionaries: Vec::new(),
         })
     }
@@ -358,6 +402,76 @@ impl WorldDb {
 
     // -- fluid ------------------------------------------------------------
 
+    /// Gives this world's fluids stable ids, and adopts what it already knew.
+    ///
+    /// **Call this once, after the mods have registered their fluids and before
+    /// anything reads or writes a fluid layer.** It cannot happen inside
+    /// [`WorldDb::open`] the way the material reconcile does, because fluids are
+    /// registered during mod load and the world is opened before that.
+    ///
+    /// `fluids` is mutated exactly as `registry` is by the material reconcile:
+    /// a fluid the world knows but no mod registered this session is added as an
+    /// inert placeholder so its stored bytes round-trip (charter rule 8). See
+    /// [`crate::fluid::Fluids::register_placeholder`].
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure, or if the world has already used all
+    /// fifteen fluid ids and a newly registered fluid cannot be given one.
+    pub fn reconcile_fluids(
+        &mut self,
+        fluids: &mut crate::fluid::Fluids,
+    ) -> Result<(), WorldError> {
+        self.fluids = Some(self.fluid_ids.reconcile(&self.conn, fluids)?);
+        Ok(())
+    }
+
+    /// Whether [`WorldDb::reconcile_fluids`] has run.
+    #[must_use]
+    pub const fn fluids_reconciled(&self) -> bool {
+        self.fluids.is_some()
+    }
+
+    /// The translation, or the identity for a world with no fluid at all.
+    ///
+    /// A world whose mods registered nothing and which has never stored a fluid
+    /// has an empty table and an identity map, so the common case needs no
+    /// reconcile call at all — which is what keeps every existing test and every
+    /// fluid-free world working untouched.
+    fn fluid_map(&self) -> FluidMap {
+        self.fluids.clone().unwrap_or_default()
+    }
+
+    /// Rewrites a layer's fluid ids from one id space into the other.
+    ///
+    /// A fresh layer rather than an in-place edit: the caller's layer is the
+    /// live one the simulation is holding, and rewriting it into world ids would
+    /// leave the running world speaking the wrong numbers.
+    fn translate(
+        layer: &FluidLayer,
+        mut convert: impl FnMut(crate::fluid::Fluid) -> Result<crate::fluid::Fluid, WorldError>,
+    ) -> Result<FluidLayer, WorldError> {
+        let mut translated = Vec::with_capacity(crate::BLOCKS_PER_CHUNK);
+        for value in layer.blocks() {
+            translated.push(convert(value)?);
+        }
+        Ok(FluidLayer::from_blocks(translated))
+    }
+
+    /// A layer in this session's ids, as the ids this world stores.
+    fn to_world_ids(&self, pos: ChunkPos, layer: &FluidLayer) -> Result<FluidLayer, WorldError> {
+        let map = self.fluid_map();
+        Self::translate(layer, |value| {
+            if value.is_empty() {
+                return Ok(crate::fluid::Fluid::EMPTY);
+            }
+            let world = map
+                .to_world(value.fluid())
+                .map_err(|source| WorldError::FluidId { pos, source })?;
+            Ok(retag(value, crate::fluid::FluidId(world)))
+        })
+    }
+
     /// Loads a chunk's fluid from the default domain.
     ///
     /// `None` for a chunk with no row, which is the overwhelming majority of
@@ -393,13 +507,27 @@ impl WorldDb {
             return Ok(None);
         };
 
-        crate::fluid::codec::decode(&blob)
-            .map(Some)
-            .map_err(|source| WorldError::Fluid {
-                pos,
-                domain: domain.to_owned(),
-                source,
-            })
+        let stored = crate::fluid::codec::decode(&blob).map_err(|source| WorldError::Fluid {
+            pos,
+            domain: domain.to_owned(),
+            source,
+        })?;
+
+        // World ids to this session's. Every name the table lists has a session
+        // id after a reconcile — a placeholder if its mod is gone — so the only
+        // way this fails is a row naming an id the world's own table does not,
+        // which is a corrupt or hand-edited file.
+        let map = self.fluid_map();
+        Self::translate(&stored, |value| {
+            if value.is_empty() {
+                return Ok(crate::fluid::Fluid::EMPTY);
+            }
+            let session = map
+                .to_session(value.fluid().0)
+                .map_err(|source| WorldError::FluidId { pos, source })?;
+            Ok(retag(value, session))
+        })
+        .map(Some)
     }
 
     /// Saves a chunk's fluid to the default domain.
@@ -412,8 +540,6 @@ impl WorldDb {
     }
 
     /// Saves a chunk's fluid to a named domain, or removes it if it drained.
-    ///
-    /// # KNOWN GAP: these bytes carry per-session fluid ids
     ///
     /// **Charter rule 8 says numeric runtime ids are per-session and never
     /// stable across runs, and this path does not honour it yet.** A chunk's
@@ -461,6 +587,7 @@ impl WorldDb {
             return Ok(());
         }
 
+        let stored = self.to_world_ids(pos, layer)?;
         self.conn.execute(
             "INSERT INTO chunk_fluid (domain, x, y, z, data) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(domain, x, y, z) DO UPDATE SET data = excluded.data",
@@ -469,7 +596,7 @@ impl WorldDb {
                 pos.x,
                 pos.y,
                 pos.z,
-                crate::fluid::codec::encode(layer)
+                crate::fluid::codec::encode(&stored)
             ],
         )?;
         Ok(())
@@ -508,11 +635,11 @@ impl WorldDb {
                 let blob = if layer.is_empty() {
                     None
                 } else {
-                    Some(crate::fluid::codec::encode(layer))
+                    Some(crate::fluid::codec::encode(&self.to_world_ids(pos, layer)?))
                 };
-                (pos, blob)
+                Ok((pos, blob))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, WorldError>>()?;
 
         let transaction = self.conn.transaction()?;
         {

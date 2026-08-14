@@ -379,8 +379,15 @@ impl Fluidics {
     /// the first one's rate for all of them, which is wrong and is a smaller
     /// wrong than silently ignoring the field, which is what it did before.
     fn tuning(&self) -> Tuning {
+        // **`iter_registered`, and this is not tidiness.** A world that has ever
+        // held a fluid whose mod is now gone registers an inert placeholder for
+        // it (charter rule 8, see `persist::fluidmap`), and placeholders are
+        // numbered alongside real fluids — so one could land ahead of milk and
+        // hand the solver an inert fluid's rules for the whole world. Milk would
+        // stop spreading, and the cause would be a mod somebody removed months
+        // earlier.
         self.fluids
-            .iter()
+            .iter_registered()
             .next()
             .map_or(Tuning::DEFAULT, |(_, f)| Tuning {
                 flow_range: f.flow_range,

@@ -247,13 +247,22 @@ pub struct Registered {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Fluids {
     by_id: Vec<Registered>,
+    /// Ids that stand in for a fluid the world knows and no mod registered.
+    ///
+    /// See [`Fluids::register_placeholder`]. A `BTreeSet` rather than a flag on
+    /// [`Registered`] so the wire type stays exactly what a mod declared —
+    /// a placeholder is a fact about *this session*, not about the fluid.
+    placeholders: std::collections::BTreeSet<FluidId>,
 }
 
 impl Fluids {
     /// An empty registry — a world whose mods registered no fluid at all.
     #[must_use]
     pub const fn new() -> Self {
-        Self { by_id: Vec::new() }
+        Self {
+            by_id: Vec::new(),
+            placeholders: std::collections::BTreeSet::new(),
+        }
     }
 
     /// Registers a fluid and returns its id.
@@ -271,6 +280,60 @@ impl Fluids {
         self.by_id.push(fluid);
         // Ids start at one, because zero means "no fluid".
         Ok(FluidId(self.by_id.len() as u8))
+    }
+
+    /// Registers a stand-in for a fluid the world knows and no mod supplied.
+    ///
+    /// # Why an absent mod's fluid still gets an id
+    ///
+    /// Charter rule 8: unregistered ids map to a preserved placeholder and data
+    /// round-trips byte-for-byte. Materials do this by registering behaviourless
+    /// aliases (see [`crate::persist::idmap::IdTable::reconcile`]), and fluid
+    /// needs it more, not less — a stored fluid byte has only four bits of id,
+    /// so a world id with no session id could not even be held in memory, and
+    /// the only alternative to a stand-in is discarding somebody's lake because
+    /// they disabled a mod.
+    ///
+    /// The result is inert by construction: it spreads nowhere, is drawn as air,
+    /// and [`Fluids::is_placeholder`] lets the simulation leave it alone. It
+    /// exists to occupy an id so the bytes survive, and for no other reason —
+    /// put the mod back and the same blocks are milk again.
+    ///
+    /// # Errors
+    ///
+    /// [`RegisterError`] as [`Fluids::register`]. **Placeholders share the
+    /// fifteen ids with real fluids**, so a world that has accumulated fifteen
+    /// fluids across its history leaves none for a new mod. That is a real
+    /// limit and a loud error is the only honest response to it.
+    pub fn register_placeholder(&mut self, name: &str) -> Result<FluidId, RegisterError> {
+        let id = self.register(Registered {
+            name: name.to_owned(),
+            // Spreads nowhere and moves never: the fluid's own rules left with
+            // the mod that knew them, and guessing at them would rearrange a
+            // world the moment somebody disabled something.
+            flow_range: 0,
+            waterlogs_at: crate::UNITS_PER_BLOCK,
+            tick_rate: 1,
+            renews_from: 0,
+            // Air, so a client that is somehow told about it draws nothing.
+            material: MaterialId::AIR,
+        })?;
+        self.placeholders.insert(id);
+        Ok(id)
+    }
+
+    /// Whether this id is standing in for a fluid no mod registered.
+    #[must_use]
+    pub fn is_placeholder(&self, id: FluidId) -> bool {
+        self.placeholders.contains(&id)
+    }
+
+    /// Every fluid a mod actually registered this session, with its id.
+    ///
+    /// What the simulation and the wire table want. [`Fluids::iter`] yields
+    /// placeholders too, because the persistence layer has to see them.
+    pub fn iter_registered(&self) -> impl Iterator<Item = (FluidId, &Registered)> {
+        self.iter().filter(|(id, _)| !self.is_placeholder(*id))
     }
 
     /// What was registered under an id, if anything.

@@ -82,6 +82,21 @@ CREATE TABLE IF NOT EXISTS chunk_fluid (
     PRIMARY KEY (domain, x, y, z)
 );
 
+-- Stable world ids for fluids. Charter rule 8: a fluid byte carries a numeric
+-- id, `Fluids::register` numbers positionally in registration order, and
+-- without this table that per-session number went straight to disk — so adding
+-- a mod that registered a fluid ahead of an existing one silently turned every
+-- stored pond into a different fluid.
+--
+-- Its own table rather than a row in `id_map` because the two id spaces are not
+-- the same shape: a material id is a u16 and a fluid id is FOUR BITS, so id 500
+-- would not fit in the byte. Fifteen ids, and a world's history shares them
+-- with whatever is registered now — see `persist::fluidmap`.
+CREATE TABLE IF NOT EXISTS fluid_ids (
+    string_id  TEXT PRIMARY KEY,
+    numeric_id INTEGER UNIQUE NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS players (
     uuid    TEXT PRIMARY KEY,
     version INT NOT NULL,

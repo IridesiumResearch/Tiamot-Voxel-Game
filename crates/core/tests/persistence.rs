@@ -294,6 +294,173 @@ fn terrain_and_fluid_are_independent_rows() {
 }
 
 // ---------------------------------------------------------------------------
+// Charter rule 8 for fluids: string ids are canonical, numbers are per session,
+// and the world owns the mapping.
+// ---------------------------------------------------------------------------
+
+/// A fluid registration under a name, with milk-ish rules.
+fn fluid_named(name: &str) -> tiamot_core::fluid::Registered {
+    tiamot_core::fluid::Registered {
+        name: name.to_owned(),
+        flow_range: 7,
+        waterlogs_at: 14,
+        tick_rate: 1,
+        renews_from: 0,
+        material: MaterialId(4),
+    }
+}
+
+#[test]
+fn a_pond_is_still_milk_after_another_mod_loads_ahead_of_it() {
+    // **The defect this table exists to remove, end to end.**
+    //
+    // `Fluids::register` numbers positionally in registration order, and a fluid
+    // byte carries that number. Before the world owned the mapping, adding a mod
+    // that registered a fluid ahead of an existing one renumbered everything
+    // after it — and the renumbering went straight to disk, so every stored pond
+    // silently became a different fluid. The byte stays perfectly valid, which
+    // is what makes it the kind of bug nobody finds by looking.
+    use tiamot_core::fluid::{Fluid, FluidLayer, Fluids};
+
+    let path = scratch("fluid-ids-reordered");
+    let pos = ChunkPos::new(1, 0, 2);
+    let block = LocalBlock::new(3, 4, 5);
+
+    // Session one: milk alone, so it is fluid id 1.
+    {
+        let mut registry = registry_with(&[]);
+        let mut db = WorldDb::open(&path, &mut registry).expect("open");
+        let mut fluids = Fluids::new();
+        fluids.register(fluid_named("core_milk:milk")).expect("reg");
+        db.reconcile_fluids(&mut fluids).expect("reconcile");
+
+        let milk = fluids.id_of("core_milk:milk").expect("registered");
+        let mut layer = FluidLayer::empty();
+        layer.set(block, Fluid::source(milk));
+        db.save_chunk_fluid(pos, &layer).expect("save");
+    }
+
+    // Session two: a mod that registers a fluid alphabetically-first loads
+    // ahead of milk, so milk is now id 2 in this session.
+    let mut registry = registry_with(&[]);
+    let mut db = WorldDb::open(&path, &mut registry).expect("reopen");
+    let mut fluids = Fluids::new();
+    fluids.register(fluid_named("acid:acid")).expect("reg");
+    fluids.register(fluid_named("core_milk:milk")).expect("reg");
+    assert_eq!(
+        fluids.id_of("core_milk:milk"),
+        Some(tiamot_core::fluid::FluidId(2)),
+        "the staging is wrong: milk was supposed to be renumbered this session"
+    );
+    db.reconcile_fluids(&mut fluids).expect("reconcile");
+
+    let loaded = db
+        .load_chunk_fluid(pos)
+        .expect("read")
+        .expect("the pond is gone");
+    let value = loaded.get(block);
+
+    assert_eq!(
+        value.fluid(),
+        fluids.id_of("core_milk:milk").expect("registered"),
+        "the pond came back as fluid {:?}, which this session calls {:?} — a mod \
+         loading ahead of milk changed what somebody's lake is made of",
+        value.fluid(),
+        fluids
+            .get(value.fluid())
+            .map(|entry| entry.name.as_str())
+            .unwrap_or("nothing at all")
+    );
+    assert!(
+        value.is_source(),
+        "the pond came back as a flow block, so it would drain away"
+    );
+}
+
+#[test]
+fn a_pond_whose_mod_was_removed_survives_and_comes_back() {
+    // Charter rule 8's round trip. Disabling a mod must not delete the world's
+    // record of what it made — and re-enabling it must give the same blocks
+    // back, unchanged.
+    use tiamot_core::fluid::{Fluid, FluidLayer, Fluids};
+
+    let path = scratch("fluid-mod-removed");
+    let pos = ChunkPos::new(-4, 1, 0);
+    let block = LocalBlock::new(1, 1, 1);
+
+    // With the mod: pour some acid.
+    {
+        let mut registry = registry_with(&[]);
+        let mut db = WorldDb::open(&path, &mut registry).expect("open");
+        let mut fluids = Fluids::new();
+        fluids.register(fluid_named("acid:acid")).expect("reg");
+        db.reconcile_fluids(&mut fluids).expect("reconcile");
+
+        let acid = fluids.id_of("acid:acid").expect("registered");
+        let mut layer = FluidLayer::empty();
+        layer.set(block, Fluid::flowing(acid, 5));
+        db.save_chunk_fluid(pos, &layer).expect("save");
+    }
+
+    // Without it: the world still reads, and the block is held by a stand-in.
+    {
+        let mut registry = registry_with(&[]);
+        let mut db = WorldDb::open(&path, &mut registry).expect("reopen");
+        let mut fluids = Fluids::new();
+        fluids.register(fluid_named("core_milk:milk")).expect("reg");
+        db.reconcile_fluids(&mut fluids).expect("reconcile");
+
+        let loaded = db
+            .load_chunk_fluid(pos)
+            .expect("a world must be able to read its own chunks after a mod is removed")
+            .expect("the row is gone");
+        let value = loaded.get(block);
+        assert!(
+            fluids.is_placeholder(value.fluid()),
+            "acid came back as something other than a stand-in"
+        );
+        assert_eq!(value.level(), 5, "the stand-in lost the level");
+
+        // Saving it back must not lose it either — the common case is a chunk
+        // that gets rewritten for an unrelated reason.
+        db.save_chunk_fluid(pos, &loaded).expect("save");
+    }
+
+    // The mod comes back, and so does the acid — unchanged, after a round trip
+    // through a session that could not name it.
+    let mut registry = registry_with(&[]);
+    let mut db = WorldDb::open(&path, &mut registry).expect("reopen");
+    let mut fluids = Fluids::new();
+    fluids.register(fluid_named("core_milk:milk")).expect("reg");
+    fluids.register(fluid_named("acid:acid")).expect("reg");
+    db.reconcile_fluids(&mut fluids).expect("reconcile");
+
+    let loaded = db.load_chunk_fluid(pos).expect("read").expect("the row");
+    let value = loaded.get(block);
+    assert_eq!(
+        value.fluid(),
+        fluids.id_of("acid:acid").expect("registered"),
+        "the acid did not come back when its mod did"
+    );
+    assert_eq!(value.level(), 5);
+}
+
+#[test]
+fn a_world_with_no_fluid_needs_no_reconcile_at_all() {
+    // The overwhelmingly common case, and the reason the map defaults to the
+    // identity: a world whose mods registered no fluid, and which has never
+    // stored one, must work with no ceremony.
+    let mut registry = registry_with(&["core:stone"]);
+    let db = WorldDb::open_in_memory(&mut registry).expect("open");
+    assert!(!db.fluids_reconciled());
+
+    let pos = ChunkPos::new(0, 0, 0);
+    let stone = registry.id_of("core:stone").expect("registered");
+    db.save_chunk(pos, &Chunk::new(pos, stone)).expect("save");
+    assert!(db.load_chunk_fluid(pos).expect("read").is_none());
+}
+
+// ---------------------------------------------------------------------------
 // The domain column (schema readiness for Task 15a — no domain logic yet)
 // ---------------------------------------------------------------------------
 

@@ -424,7 +424,7 @@ impl ServerHandle {
         }
 
         let world_file = settings.world_path.join(WORLD_FILE);
-        let world =
+        let mut world =
             WorldDb::open(&world_file, &mut registry).map_err(|source| StartError::World {
                 path: world_file.clone(),
                 source: Box::new(source),
@@ -511,7 +511,7 @@ impl ServerHandle {
 
         // The fluids the mods registered, keyed by world material id for the
         // same reason emissions are.
-        let fluids = crate::fluid::fluids_from_rules(
+        let mut fluids = crate::fluid::fluids_from_rules(
             &host
                 .as_ref()
                 .map(|loaded| loaded.vm().registered_fluids())
@@ -529,12 +529,33 @@ impl ServerHandle {
             },
         );
 
+        // **Stable ids for the fluids, and adoption of any the world already
+        // knew.** Charter rule 8: a fluid byte on disk carries a number, and
+        // `Fluids::register` numbers positionally in registration order — so
+        // without this a mod loading ahead of another silently turns every
+        // stored pond into a different fluid.
+        //
+        // Here rather than inside `WorldDb::open` because fluids are registered
+        // during mod load, which has only just finished. `fluids` is mutated:
+        // anything the world knows and no mod supplied this session is added as
+        // an inert placeholder so its bytes round-trip.
+        world
+            .reconcile_fluids(&mut fluids)
+            .map_err(|source| StartError::World {
+                path: world_file.clone(),
+                source: Box::new(source),
+            })?;
+
         // The same registry, as the wire carries it. Built here rather than in
         // the tick because the join tables are assembled once, before the
         // simulation thread starts, and a client needs this before its first
         // chunk rather than after its first pond.
+        //
+        // `iter_registered`, so a placeholder for an absent mod's fluid is not
+        // offered to clients as something to draw. There is nothing to draw: it
+        // exists to hold an id so stored bytes survive.
         let fluid_table: Vec<tiamot_core::proto::FluidDef> = fluids
-            .iter()
+            .iter_registered()
             .map(|(id, registered)| {
                 let mut depths = [0u8; 8];
                 for (level, depth) in depths.iter_mut().enumerate() {
