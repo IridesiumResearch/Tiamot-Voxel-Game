@@ -91,6 +91,12 @@ pub struct Tuning {
     /// of spreading into a disc and reaching it by accident. Zero disables the
     /// preference, which makes a fluid spread evenly in all directions.
     pub hole_search: u8,
+    /// Fluid ticks between updates of this fluid.
+    ///
+    /// One is every fluid tick. Larger is slower and thicker — and it is the
+    /// only knob that changes how fast a spring is SEEN to run, which is the
+    /// first thing anybody watching a fluid has an opinion about.
+    pub tick_rate: u8,
 }
 
 impl Tuning {
@@ -98,6 +104,7 @@ impl Tuning {
     pub const DEFAULT: Self = Self {
         flow_range: MAX_LEVEL,
         hole_search: 4,
+        tick_rate: 1,
     };
 }
 
@@ -328,7 +335,7 @@ fn supplied(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos, was: Flui
     // neighbours that could feed this block. A neighbour at level n feeds
     // n-1 here; a source feeds MAX_LEVEL - 1.
     let mut best = Fluid::EMPTY;
-    for offset in LATERAL {
+    for (index, offset) in LATERAL.iter().enumerate() {
         let neighbour = BlockPos::new(pos.x + offset[0], pos.y + offset[1], pos.z + offset[2]);
         let there = world.fluid(neighbour);
         if there.is_empty() {
@@ -338,6 +345,22 @@ fn supplied(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos, was: Flui
         // on its way down and its level belongs to the column, not to the
         // floor beside it.
         if is_falling(world, neighbour) {
+            continue;
+        }
+        // **And it only feeds the way it is running.** Contract §4's flow
+        // direction: a block with a drop within `hole_search` feeds only the
+        // directions on a shortest path to it, so a spring beside a pit pours
+        // INTO the pit instead of spreading round it and arriving by accident.
+        //
+        // Asked from the neighbour's side and inverted, because this is a pull:
+        // what matters is the direction from the NEIGHBOUR to here, which is the
+        // opposite of the one we walked to reach it.
+        //
+        // This call is the whole of the hole-seeking behaviour, and its absence
+        // was the whole of the bug: `preferred` existed, was table-driven
+        // tested in four directions, passed, and was never once consulted by the
+        // solver. A tested function is not a tested behaviour.
+        if !feeds(world, tuning, neighbour, opposite_lateral(index)) {
             continue;
         }
         let reach = tuning.flow_range.min(MAX_LEVEL);
@@ -360,6 +383,38 @@ fn supplied(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos, was: Flui
     // fall rule move it on; the hole preference below is about which
     // neighbours a block feeds, not about what it holds.
     best
+}
+
+/// The index in [`LATERAL`] pointing the other way.
+///
+/// The array is ordered `-x, +x, -z, +z`, so flipping the low bit turns a
+/// direction into its opposite.
+const fn opposite_lateral(index: usize) -> usize {
+    index ^ 1
+}
+
+/// Whether the block at `pos` would feed the neighbour across `direction`.
+///
+/// # The early-out is the whole cost story
+///
+/// `preferred` walks outward from each of four directions looking for a drop,
+/// so asking it per contributing neighbour is up to sixteen bounded searches per
+/// block visited. On flat ground every one of them finds nothing and the answer
+/// is "feeds everywhere" — so ask that question ONCE, from the block itself,
+/// and return early.
+///
+/// Measured: wiring the preference in without this took the fluid unit tests
+/// from 0.11 s to 3.24 s. With it they are back under a fifth of a second, and
+/// the expensive path runs only where there is actually a hole to run into,
+/// which is where the behaviour is worth paying for.
+fn feeds(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos, direction: usize) -> bool {
+    if tuning.hole_search == 0 {
+        return true;
+    }
+    if drop_within(world, pos, tuning.hole_search).is_none() {
+        return true;
+    }
+    Solver::preferred(world, tuning, pos)[direction]
 }
 
 /// Whether the fluid at `pos` is falling rather than resting.
@@ -632,6 +687,52 @@ mod tests {
             let preferred = Solver::preferred(&scene, Tuning::DEFAULT, BlockPos::new(0, 1, 0));
             assert_eq!(preferred, want, "a hole to the {name} was not preferred");
         }
+    }
+
+    #[test]
+    fn a_spring_beside_a_pit_runs_into_it_rather_than_around_it() {
+        // **The test that was missing, and its absence was the bug.**
+        //
+        // `milk_prefers_the_direction_of_a_hole` calls `preferred` directly and
+        // passes. It passed while `preferred` was DEAD CODE — implemented,
+        // table-driven in four directions, and never once consulted by the
+        // solver. Reported from the window as "it does not seem to flow into
+        // holes very well; it spreads and flows into a hole".
+        //
+        // So this one pours actual milk and looks at where it went. A tested
+        // function is not a tested behaviour.
+        let mut scene = Scene::default().with_floor(16);
+        // A pit three blocks east of the spring, inside the four-block search,
+        // WITH A BOTTOM. The fixture's world is unbounded downwards, so a hole
+        // with nothing under it is a drain to infinity and nothing ever settles
+        // — which is what the first run of this test found.
+        scene.solid.remove(&(3, 0, 0));
+        scene.solid.insert((3, -1, 0));
+        let mut solver = Solver::new();
+        spring(&mut scene, &mut solver, 0, 1, 0);
+        scene.settle(&mut solver);
+
+        assert!(
+            scene.level(1, 1, 0) > 0 && scene.level(2, 1, 0) > 0,
+            "no milk ran towards the pit at all"
+        );
+        assert!(
+            scene.at(3, 0, 0).level() > 0,
+            "the milk never fell into the pit it was pointed at"
+        );
+        // And it did NOT spread the other way, which is the half that says the
+        // preference is being applied rather than the milk simply covering
+        // everything and reaching the pit by accident.
+        assert_eq!(
+            scene.level(-1, 1, 0),
+            0,
+            "milk spread away from the pit as well, so nothing is steering it"
+        );
+        assert_eq!(
+            scene.level(0, 1, 1),
+            0,
+            "milk spread sideways as well, so nothing is steering it"
+        );
     }
 
     #[test]

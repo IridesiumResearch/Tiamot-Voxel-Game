@@ -205,8 +205,22 @@ impl Fluidics {
     ///
     /// Returns every change, for broadcasting and re-meshing. Empty for a
     /// settled world, and it does not even take a lock to find that out.
-    pub fn tick(&mut self, world: &World) -> Vec<Flow> {
+    pub fn tick(&mut self, world: &World, fluid_tick: u64) -> Vec<Flow> {
         if self.solver.is_settled() {
+            return Vec::new();
+        }
+        // **A fluid's own rate, and until now it was registered and ignored.**
+        // `register_fluid{ tick_rate }` was accepted, stored, carried all the
+        // way here and consulted by nothing, so every fluid ran at the engine's
+        // rate whatever its mod asked for. Reported from the window as milk
+        // spreading about three times faster than wanted.
+        //
+        // One rate for the whole tick rather than per block: the solver's queue
+        // does not know which fluid a block holds until it looks, and a queue
+        // partitioned by fluid would be four data structures to make a puddle
+        // slower. Ships one fluid; the shape is here for when that changes.
+        let tuning = self.tuning();
+        if !fluid_tick.is_multiple_of(u64::from(tuning.tick_rate.max(1))) {
             return Vec::new();
         }
         // Taken apart so the solver can borrow the store mutably while the world
@@ -216,7 +230,7 @@ impl Fluidics {
             world,
             layers: &mut self.layers,
         };
-        let changes = solver.tick(&mut view, Tuning::DEFAULT, VISITS_PER_TICK);
+        let changes = solver.tick(&mut view, tuning, VISITS_PER_TICK);
         self.solver = solver;
         changes
     }
@@ -229,6 +243,23 @@ impl Fluidics {
     #[must_use]
     pub fn touched_chunks(changes: &[Flow]) -> BTreeSet<ChunkPos> {
         changes.iter().map(|change| change.pos.chunk()).collect()
+    }
+
+    /// What the solver runs with.
+    ///
+    /// The first registered fluid's settings, or the defaults where nothing is
+    /// registered. Honest about its own limit: with several fluids this takes
+    /// the first one's rate for all of them, which is wrong and is a smaller
+    /// wrong than silently ignoring the field, which is what it did before.
+    fn tuning(&self) -> Tuning {
+        self.fluids
+            .iter()
+            .next()
+            .map_or(Tuning::DEFAULT, |(_, f)| Tuning {
+                flow_range: f.flow_range,
+                hole_search: Tuning::DEFAULT.hole_search,
+                tick_rate: f.tick_rate,
+            })
     }
 
     fn write(&mut self, pos: BlockPos, value: Fluid) -> bool {

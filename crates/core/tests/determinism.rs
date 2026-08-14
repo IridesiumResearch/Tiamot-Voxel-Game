@@ -665,7 +665,13 @@ fn detgen_contains_no_terrain_policy() {
 /// platforms. The solver's active set is a `BTreeSet` for precisely this
 /// reason, and a `HashSet` swapped in would fail here on every platform and for
 /// a different value on each run.
-const FLUID_GOLDEN: u64 = 2_475_015_662_132_210_838;
+const FLUID_GOLDEN: u64 = 8_303_709_056_475_525_592;
+// Regenerated once, deliberately, when the hole preference was WIRED IN. It had
+// been written, table-driven tested and never consulted by the solver, so milk
+// spread evenly in all directions and reached a hole by covering the ground
+// between. Steering it changes where milk ends up in the slope scenario, which
+// is exactly what this hash is for — and is why the constant moved rather than
+// the test being relaxed.
 
 /// Runs the three scenarios the task names and hashes what settled.
 ///

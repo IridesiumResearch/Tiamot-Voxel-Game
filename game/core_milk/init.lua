@@ -36,9 +36,11 @@ game.register_fluid{
     -- comfortably below it — a flow_range of 3 would never catch an off-by-one
     -- at the limit.
     flow_range = 7,
-    -- Every fluid tick, so what a player sees is the engine's actual rate
-    -- rather than this mod's opinion of it.
-    tick_rate = 1,
+    -- Every third fluid tick, so a spring runs at about 3 Hz rather than 10.
+    -- Reported from the window as spreading "about 3x the speed I would hope
+    -- for", which is a mod's opinion to hold and this is where it belongs —
+    -- the engine's rate is 10 Hz and stays that way for anything that wants it.
+    tick_rate = 3,
 }
 
 game.log("registered core_milk:milk")

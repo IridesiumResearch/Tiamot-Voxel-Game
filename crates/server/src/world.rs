@@ -284,6 +284,22 @@ impl World {
     /// Collision treats absence as solid (see [`tiamot_core::phys::Voxels`]),
     /// so the honest failure here is a player standing still at the edge of
     /// what is loaded rather than falling through it.
+    /// Translates a WORLD material id back into the RUNTIME one.
+    ///
+    /// So the tick can hand a mod's hook the id that mod's own
+    /// `game.get_block_id` returned. Charter rule 8 makes those different
+    /// numbers — world ids are stable across sessions because the database
+    /// needs them to be, runtime ids come from registration order — and a hook
+    /// reporting the wrong one gives a mod a comparison that works whenever the
+    /// two coincide and silently fails when they do not.
+    ///
+    /// `None` for an id this world has never seen, which the caller should
+    /// treat as "leave it alone" rather than as an error.
+    #[must_use]
+    pub fn runtime_material(&self, world: u16) -> Option<MaterialId> {
+        self.db.materials().to_runtime(world).ok()
+    }
+
     #[must_use]
     pub fn resident(&self, pos: ChunkPos) -> Option<&Chunk> {
         self.cache.get(&pos)

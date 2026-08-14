@@ -1144,10 +1144,23 @@ impl ServerHandle {
                             // The mods' veto, after the engine's own rules and
                             // before the player is charged — a refusal must not
                             // cost them anything.
+                            // **In the id space a mod can compare against.**
+                            // `material` here is a WORLD id — stable across
+                            // sessions, which is what the database needs — and
+                            // `game.get_block_id` hands out RUNTIME ids, which
+                            // is what registration produces. Charter rule 8 says
+                            // those are different numbers, and handing a mod the
+                            // wrong one is a comparison that works whenever the
+                            // two happen to coincide and fails when they do not.
+                            //
+                            // Reported from the window as milk that "sometimes
+                            // just doesn't pour, it places like a block".
+                            let as_registered =
+                                world.runtime_material(material.0).unwrap_or(material);
                             let verdict = source.may_place(&tiamot_core::script::PlaceEvent {
                                 player: *request.actor.as_bytes(),
                                 block: plan.block,
-                                material,
+                                material: as_registered,
                                 occupancy: plan.occupancy,
                                 units: plan.units,
                             });
@@ -1373,7 +1386,7 @@ impl ServerHandle {
                         // checks an empty active set and allocates nothing.
                         if tick.is_multiple_of(crate::fluid::TICKS_PER_FLUID_TICK) {
                             let mut fluid = fluidics.write().expect("fluid lock");
-                            let changes = fluid.tick(&world);
+                            let changes = fluid.tick(&world, tick / crate::fluid::TICKS_PER_FLUID_TICK);
                             if !changes.is_empty() {
                                 // The whole layer, per touched chunk, rather
                                 // than a delta per block — see
