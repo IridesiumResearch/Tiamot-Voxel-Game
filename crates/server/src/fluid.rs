@@ -49,11 +49,17 @@ pub const TICKS_PER_FLUID_TICK: u64 = 2;
 
 /// The most blocks one fluid tick will visit.
 ///
-/// **Measured against the budget rather than guessed.** Charter rule 18 gives
-/// all of simulation 50 ms; the spring-field benchmark is what says whether this
-/// number is right, and it is reported as a share of that budget rather than in
-/// isolation. Blocks past it are carried, not dropped.
-pub const VISITS_PER_TICK: usize = 4_096;
+/// **Set from a measurement, and the first guess was four times too high.**
+/// Charter rule 18 gives all of simulation 50 ms shared by fifty players.
+/// `cargo bench -p tiamot-core --bench fluid` measured the hundred-spring field
+/// at **15.5 ms for one capped tick at 4,096 visits — 31% of a whole tick, for
+/// one system, while nobody is even looking at it**. At 512 the same tick
+/// measures **2.4 ms, 4.8%**, which is a share fluid can defend.
+///
+/// The spread simply takes more ticks, which is the right trade twice over: the
+/// carry means work is deferred and never dropped, and a fluid that takes a
+/// moment to find its level is what a fluid is supposed to look like.
+pub const VISITS_PER_TICK: usize = 512;
 
 /// A handle on the fluid store, for the mod API.
 ///
@@ -377,6 +383,24 @@ mod tests {
     use tiamot_core::fluid::FluidId;
 
     use super::*;
+
+    #[test]
+    fn the_bench_and_the_server_agree_on_the_cap() {
+        // `crates/core` cannot depend on the server (charter rule 3), so the
+        // benchmark that SET this number has to hold its own copy. This is what
+        // stops the two drifting and the published figure quietly becoming a
+        // measurement of something the server does not do.
+        let bench = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../core/benches/fluid.rs"
+        ))
+        .expect("the fluid benchmark");
+        let declared = format!("const VISITS: usize = {VISITS_PER_TICK};");
+        assert!(
+            bench.contains(&declared),
+            "the benchmark does not declare `{declared}`, so its numbers are not this server's"
+        );
+    }
 
     #[test]
     fn a_flat_index_becomes_the_block_it_names() {
