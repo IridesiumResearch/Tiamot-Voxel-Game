@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 
 use tiamot_core::block::{BlockView, Cells, EMPTY_CELLS};
+use tiamot_core::fluid::FluidLayer;
 use tiamot_core::inventory::{self, Stack};
 use tiamot_core::proto::Edit;
 use tiamot_core::script::ScriptVm as _;
@@ -530,6 +531,41 @@ impl World {
         Ok(written)
     }
 
+    /// Reads a chunk's stored fluid, if it has any.
+    ///
+    /// The load half of fluid persistence. Its counterpart is
+    /// [`crate::fluid::Fluidics::chunk_loaded`], which queues everything the
+    /// layer holds so milk saved mid-flow carries on flowing.
+    ///
+    /// **Not folded into [`World::chunk`]**, which would have been the obvious
+    /// place: the fluid lives in `Fluidics`, and a `World` that wrote into it
+    /// would need to hold its lock inside a chunk load. The tick joins them
+    /// instead, in the same place it hands new chunks to the lighting.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the read or the decode fails.
+    pub fn load_fluid(&self, pos: ChunkPos) -> Result<Option<FluidLayer>, WorldError> {
+        self.db.load_chunk_fluid(pos)
+    }
+
+    /// Writes fluid layers for chunks whose milk has changed.
+    ///
+    /// A layer that has drained to empty is passed in as empty and its row is
+    /// deleted, which is what stops a pond somebody emptied from coming back
+    /// the next time its chunk loads.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the write fails. The batch is one transaction, so a
+    /// failure changes nothing and the caller can retry.
+    pub fn save_fluid<'a>(
+        &mut self,
+        layers: impl IntoIterator<Item = (ChunkPos, &'a FluidLayer)>,
+    ) -> Result<usize, WorldError> {
+        self.db.save_chunk_fluid_batch(layers)
+    }
+
     /// Flushes and closes the database.
     ///
     /// # Errors
@@ -601,6 +637,116 @@ mod tests {
             .collect();
         let db = WorldDb::open(&path, &mut registry).expect("open");
         (World::open(db, 12345).expect("open world"), ids)
+    }
+
+    /// Reopens the same world file, as a restart would.
+    ///
+    /// Deliberately does NOT wipe, unlike [`world`]: the point is that the
+    /// second `World` finds what the first one left.
+    fn reopen(name: &str) -> World {
+        let path = std::env::temp_dir()
+            .join("tiamot-world-tests")
+            .join(format!("{name}.sqlite"));
+        let mut registry = tiamot_core::Registry::new();
+        for material in TEST_MATERIALS {
+            registry.register(material).expect("register");
+        }
+        let db = WorldDb::open(&path, &mut registry).expect("reopen");
+        World::open(db, 12345).expect("reopen world")
+    }
+
+    #[test]
+    fn a_pond_written_by_one_world_is_read_by_the_next() {
+        // **The round trip, across a real file and two `World`s.** Fluid is not
+        // derived state, so both halves of this are load-bearing, and each half
+        // passes its own unit tests while the pair is broken — a save that used
+        // one domain and a load that used another, say. Only running them
+        // against each other catches that.
+        use crate::fluid::Fluidics;
+        use tiamot_core::fluid::{Fluid, FluidId, Fluids};
+
+        let milk = FluidId(1);
+        let pond = BlockPos::new(20, 5, -9);
+        let chunk = pond.chunk();
+
+        {
+            let (mut world, _) = world("fluid-round-trip");
+            let mut fluidics = Fluidics::new(Fluids::new());
+            fluidics.set(pond, Fluid::source(milk));
+
+            let dirty = fluidics.take_dirty();
+            assert_eq!(dirty.len(), 1, "the pour did not mark its chunk");
+            assert_eq!(
+                world
+                    .save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                    .expect("save"),
+                1
+            );
+            world.close().expect("close");
+        }
+
+        // A second world on the same file, with a fresh store that has never
+        // heard of the pond.
+        let world = reopen("fluid-round-trip");
+        let layer = world
+            .load_fluid(chunk)
+            .expect("read")
+            .expect("the pond was not written");
+
+        let mut fluidics = Fluidics::new(Fluids::new());
+        assert!(!fluidics.knows(chunk));
+        fluidics.chunk_loaded(chunk, layer);
+
+        assert!(fluidics.knows(chunk));
+        assert!(
+            fluidics.at(pond).is_source(),
+            "the pond came back as {:?} rather than a source, so it would drain \
+             away a few ticks after the world loaded",
+            fluidics.at(pond)
+        );
+        assert!(
+            !fluidics.is_settled(),
+            "a reloaded pond must be queued, or milk saved mid-flow stops where it was"
+        );
+    }
+
+    #[test]
+    fn a_pond_that_drained_is_gone_after_a_restart() {
+        // The other direction, and the one that fails silently: a chunk whose
+        // layer emptied is dropped from memory, so a dirty list that followed
+        // the layer would never write the removal and the milk would come back.
+        use crate::fluid::Fluidics;
+        use tiamot_core::fluid::{Fluid, FluidId, Fluids};
+
+        let pond = BlockPos::new(3, 3, 3);
+        let chunk = pond.chunk();
+
+        {
+            let (mut world, _) = world("fluid-drain-round-trip");
+            let mut fluidics = Fluidics::new(Fluids::new());
+
+            fluidics.set(pond, Fluid::source(FluidId(1)));
+            let dirty = fluidics.take_dirty();
+            world
+                .save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                .expect("save the pond");
+
+            fluidics.set(pond, Fluid::EMPTY);
+            let dirty = fluidics.take_dirty();
+            assert_eq!(dirty.len(), 1, "the drain was not queued for writing");
+            world
+                .save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                .expect("save the drain");
+            world.close().expect("close");
+        }
+
+        assert!(
+            reopen("fluid-drain-round-trip")
+                .load_fluid(chunk)
+                .expect("read")
+                .is_none(),
+            "a pond that was emptied came back after a restart"
+        );
     }
 
     #[test]

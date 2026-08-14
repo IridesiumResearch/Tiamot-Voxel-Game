@@ -1389,6 +1389,40 @@ impl ServerHandle {
                         // adds is lit too, instead of being silently black.
                         let arrived = world.take_arrived();
                         if !arrived.is_empty() {
+                            // **The milk that was there before, before anything
+                            // else looks at the chunk.** Fluid is not derived
+                            // state — there is no function from terrain back to
+                            // "somebody poured here" — so a chunk arriving
+                            // without its saved pond is a pond that is gone.
+                            //
+                            // Ahead of the relight budget below on purpose: a
+                            // chunk whose relight is deferred still needs its
+                            // fluid, or the deferral would decide whether the
+                            // milk in it survived.
+                            let mut fluid = fluidics.write().expect("fluid lock");
+                            for pos in &arrived {
+                                // Already read: the lighting defers what it
+                                // cannot relight by putting the chunk back into
+                                // this same list, so chunks arrive twice.
+                                // Loading again would replace the live layer
+                                // with the last thing written to disk.
+                                if fluid.knows(*pos) {
+                                    continue;
+                                }
+                                match world.load_fluid(*pos) {
+                                    // Recorded as read either way — a chunk with
+                                    // no row is dry, which is an answer.
+                                    Ok(layer) => fluid.chunk_loaded(*pos, layer.unwrap_or_default()),
+                                    Err(err) => {
+                                        // Left unread so the next arrival
+                                        // retries. Treating a failed read as
+                                        // "dry" would quietly delete a pond.
+                                        error!(?pos, "could not load the fluid for a chunk: {err}");
+                                    }
+                                }
+                            }
+                            drop(fluid);
+
                             let mut light = lighting.write().expect("lighting lock");
                             let mut touched = std::collections::BTreeSet::new();
                             let mut done = 0;
@@ -1467,10 +1501,31 @@ impl ServerHandle {
                         // would turn a player chiselling one block into 20
                         // writes a second of the same chunk; waiting for
                         // shutdown would lose everything on a crash.
-                        if (tick % SAVE_INTERVAL_TICKS == 0 || control.take_save_request())
-                            && let Err(err) = world.save_dirty()
-                        {
-                            error!("could not save dirty chunks: {err}");
+                        if tick % SAVE_INTERVAL_TICKS == 0 || control.take_save_request() {
+                            if let Err(err) = world.save_dirty() {
+                                error!("could not save dirty chunks: {err}");
+                            }
+
+                            // **Fluid on the same debounce, and it needs one
+                            // just as much**: a spreading pond changes tens of
+                            // blocks a tick, and writing its chunk every time
+                            // would be a database write per tick for as long as
+                            // the milk was moving.
+                            let dirty = fluidics.write().expect("fluid lock").take_dirty();
+                            if !dirty.is_empty()
+                                && let Err(err) =
+                                    world.save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                            {
+                                // Put them back rather than dropping them. A
+                                // failed write that also forgot what it was
+                                // trying to write would lose the pond at the
+                                // next chunk unload, silently.
+                                error!("could not save fluid: {err}");
+                                let mut fluid = fluidics.write().expect("fluid lock");
+                                for (pos, _) in dirty {
+                                    fluid.mark_dirty(pos);
+                                }
+                            }
                         }
                     });
 
@@ -1479,6 +1534,21 @@ impl ServerHandle {
                     // live connection — and a final flush must not be skipped
                     // just because the last tick happened to find the lock
                     // taken.
+                    // The last of the milk. `World::close` flushes dirty chunks
+                    // and knows nothing about fluid, which lives in its own
+                    // store — so without this, everything poured since the last
+                    // debounced save would be lost on a clean shutdown, the one
+                    // case a player has every right to expect nothing is.
+                    {
+                        let dirty = fluidics.write().expect("fluid lock").take_dirty();
+                        if !dirty.is_empty()
+                            && let Err(err) =
+                                world.save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                        {
+                            error!("could not save fluid on shutdown: {err}");
+                        }
+                    }
+
                     {
                         let mut identities = shared.identities.blocking_lock();
                         if let Err(err) = store::flush(world.db(), &mut identities) {

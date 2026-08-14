@@ -147,6 +147,153 @@ fn a_batch_save_writes_every_chunk() {
 }
 
 // ---------------------------------------------------------------------------
+// Fluid. Not derived state — there is no function from terrain back to
+// "somebody poured milk here", so a pond that is not written down is a pond
+// that empties on restart.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pond_survives_a_round_trip_through_the_database() {
+    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer, MAX_LEVEL};
+
+    let mut registry = registry_with(&[]);
+    let db = WorldDb::open_in_memory(&mut registry).expect("open");
+    let pos = ChunkPos::new(4, -2, 9);
+    let milk = FluidId(1);
+
+    let mut layer = FluidLayer::empty();
+    layer.set(LocalBlock::new(3, 0, 3), Fluid::source(milk));
+    layer.set(LocalBlock::new(4, 0, 3), Fluid::flowing(milk, MAX_LEVEL));
+    layer.set(LocalBlock::new(5, 0, 3), Fluid::flowing(milk, 2));
+
+    db.save_chunk_fluid(pos, &layer).expect("save");
+    let loaded = db.load_chunk_fluid(pos).expect("load").expect("present");
+
+    assert_eq!(loaded, layer);
+    // Every distinction the byte carries, not just "there is milk": a source
+    // that came back as a full flow block would drain, and the pond would be
+    // gone a few ticks after the world loaded.
+    assert!(loaded.get(LocalBlock::new(3, 0, 3)).is_source());
+    assert!(!loaded.get(LocalBlock::new(4, 0, 3)).is_source());
+    assert_eq!(loaded.get(LocalBlock::new(5, 0, 3)).level(), 2);
+}
+
+#[test]
+fn a_dry_chunk_has_no_row_at_all() {
+    // The reason fluid is its own table. A world of dry chunks must cost
+    // nothing, and "nothing" means no row rather than a small row.
+    let mut registry = registry_with(&[]);
+    let db = WorldDb::open_in_memory(&mut registry).expect("open");
+    let pos = ChunkPos::new(0, 0, 0);
+
+    db.save_chunk_fluid(pos, &tiamot_core::fluid::FluidLayer::empty())
+        .expect("save");
+    assert!(db.load_chunk_fluid(pos).expect("load").is_none());
+}
+
+#[test]
+fn a_pond_that_drains_does_not_come_back() {
+    // **The bug this test exists for.** Save a pond, drain it, save again: if
+    // the second save upserted an empty layer instead of deleting the row, or
+    // skipped the write because there was nothing to write, the milk would
+    // reappear the next time the chunk loaded.
+    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer};
+
+    let mut registry = registry_with(&[]);
+    let db = WorldDb::open_in_memory(&mut registry).expect("open");
+    let pos = ChunkPos::new(1, 1, 1);
+
+    let mut layer = FluidLayer::empty();
+    layer.set(LocalBlock::new(0, 0, 0), Fluid::source(FluidId(1)));
+    db.save_chunk_fluid(pos, &layer).expect("save the pond");
+    assert!(db.load_chunk_fluid(pos).expect("load").is_some());
+
+    layer.set(LocalBlock::new(0, 0, 0), Fluid::EMPTY);
+    assert!(layer.is_empty(), "the layer did not actually drain");
+    db.save_chunk_fluid(pos, &layer).expect("save the drain");
+
+    assert!(
+        db.load_chunk_fluid(pos).expect("load").is_none(),
+        "a drained pond came back from the database"
+    );
+}
+
+#[test]
+fn a_fluid_batch_writes_the_ponds_and_removes_the_drains_together() {
+    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer};
+
+    let mut registry = registry_with(&[]);
+    let mut db = WorldDb::open_in_memory(&mut registry).expect("open");
+    let milk = FluidId(1);
+
+    // Sixteen chunks with milk, saved first so there is something to remove.
+    let mut wet = FluidLayer::empty();
+    wet.set(LocalBlock::new(2, 2, 2), Fluid::source(milk));
+    let positions: Vec<ChunkPos> = (0..16).map(|i| ChunkPos::new(i, 0, 0)).collect();
+    let written = db
+        .save_chunk_fluid_batch(positions.iter().map(|pos| (*pos, &wet)))
+        .expect("first batch");
+    assert_eq!(written, 16);
+
+    // Now half of them drain, in the same batch as the half that stay.
+    let dry = FluidLayer::empty();
+    db.save_chunk_fluid_batch(
+        positions
+            .iter()
+            .enumerate()
+            .map(|(index, pos)| (*pos, if index % 2 == 0 { &dry } else { &wet })),
+    )
+    .expect("second batch");
+
+    for (index, pos) in positions.iter().enumerate() {
+        let loaded = db.load_chunk_fluid(*pos).expect("load");
+        if index % 2 == 0 {
+            assert!(loaded.is_none(), "{pos:?} should have drained");
+        } else {
+            assert_eq!(
+                loaded.as_ref(),
+                Some(&wet),
+                "{pos:?} should still hold milk"
+            );
+        }
+    }
+}
+
+#[test]
+fn terrain_and_fluid_are_independent_rows() {
+    // A chunk can hold milk with no terrain edits and terrain edits with no
+    // milk, and neither save may disturb the other — which is the property that
+    // makes them separate tables rather than one blob.
+    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer};
+
+    let mut registry = registry_with(&["core:stone"]);
+    let db = WorldDb::open_in_memory(&mut registry).expect("open");
+    let stone = registry.id_of("core:stone").expect("registered");
+    let pos = ChunkPos::new(7, 7, 7);
+
+    let mut layer = FluidLayer::empty();
+    layer.set(LocalBlock::new(1, 1, 1), Fluid::source(FluidId(1)));
+    db.save_chunk_fluid(pos, &layer).expect("fluid");
+    db.save_chunk(pos, &Chunk::new(pos, stone))
+        .expect("terrain");
+
+    assert_eq!(
+        db.load_chunk(pos)
+            .expect("load")
+            .expect("present")
+            .is_uniform(),
+        Some(stone)
+    );
+    assert_eq!(db.load_chunk_fluid(pos).expect("load"), Some(layer));
+
+    // And a chunk with terrain but no milk answers `None` rather than erroring.
+    let dry = ChunkPos::new(8, 8, 8);
+    db.save_chunk(dry, &Chunk::new(dry, stone))
+        .expect("terrain");
+    assert!(db.load_chunk_fluid(dry).expect("load").is_none());
+}
+
+// ---------------------------------------------------------------------------
 // The domain column (schema readiness for Task 15a — no domain logic yet)
 // ---------------------------------------------------------------------------
 

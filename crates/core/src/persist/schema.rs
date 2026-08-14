@@ -8,6 +8,21 @@ use rusqlite::Connection;
 /// Schema version, stored in `meta`. Bumped when the *table layout* changes,
 /// which is separate from the per-blob format versions in
 /// [`crate::persist::codec`].
+///
+/// # Why adding `chunk_fluid` did not bump this
+///
+/// Because a bump is not a migration, it is a **refusal**: [`WorldDb::open`]
+/// rejects any world whose stored version is not this one, so bumping without a
+/// table-migration path would make every existing save unopenable. A purely
+/// additive table needs no migration — [`create`] runs on every open and
+/// `CREATE TABLE IF NOT EXISTS` gives an older world the new table, empty,
+/// which is the true answer that it has no fluid saved. Nothing existing reads
+/// or writes it, so an older build opening a newer world simply ignores it.
+///
+/// Bump this only for a change that would make old rows misread: a column
+/// added to an existing table, a type changed, a key redefined.
+///
+/// [`WorldDb::open`]: crate::persist::WorldDb::open
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// The domain every chunk and entity is written under until Task 15a.
@@ -44,6 +59,25 @@ CREATE TABLE IF NOT EXISTS chunks (
     y       INT NOT NULL,
     z       INT NOT NULL,
     version INT NOT NULL,
+    data    BLOB NOT NULL,
+    PRIMARY KEY (domain, x, y, z)
+);
+
+-- A pond is not derived state. Light is thrown away on shutdown and recomputed,
+-- because recomputing gives the same answer; there is no function from terrain
+-- back to 'somebody poured milk here', so fluid has to be written down.
+--
+-- Its own table rather than a column on `chunks`, and rather than a field in
+-- the chunk blob, because `FluidLayer`'s whole design is that a dry chunk costs
+-- nothing. A column would be one NULL per dry chunk and a blob field would put
+-- a fluid byte in every chunk in the world; a separate table gives a row only
+-- to the chunks that actually hold something. Rows are DELETEd when a layer
+-- drains, so the table stays proportional to the milk rather than to history.
+CREATE TABLE IF NOT EXISTS chunk_fluid (
+    domain  TEXT NOT NULL DEFAULT 'overworld',
+    x       INT NOT NULL,
+    y       INT NOT NULL,
+    z       INT NOT NULL,
     data    BLOB NOT NULL,
     PRIMARY KEY (domain, x, y, z)
 );

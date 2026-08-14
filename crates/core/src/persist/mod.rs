@@ -41,6 +41,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::chunk::Chunk;
 use crate::coords::ChunkPos;
+use crate::fluid::FluidLayer;
 use crate::material::Registry;
 use crate::persist::codec::{CodecError, Dictionary};
 use crate::persist::idmap::{IdMapError, IdTable, MaterialMap};
@@ -78,6 +79,23 @@ pub enum WorldError {
         /// Why.
         #[source]
         source: CodecError,
+    },
+
+    /// A stored fluid layer could not be decoded.
+    ///
+    /// Separate from [`WorldError::Chunk`] because the two blobs are separate
+    /// rows with separate formats: a world whose terrain reads perfectly can
+    /// still have one unreadable pond, and saying so is more useful than
+    /// reporting the chunk as broken.
+    #[error("fluid for chunk at ({}, {}, {}) in domain `{domain}`", pos.x, pos.y, pos.z)]
+    Fluid {
+        /// Which chunk.
+        pos: ChunkPos,
+        /// Which domain.
+        domain: String,
+        /// Why.
+        #[source]
+        source: crate::fluid::codec::FluidDecodeError,
     },
 
     /// Material id mapping failed.
@@ -332,6 +350,167 @@ impl WorldDb {
                     i64::from(codec::CHUNK_FORMAT_VERSION),
                     blob
                 ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(encoded.len())
+    }
+
+    // -- fluid ------------------------------------------------------------
+
+    /// Loads a chunk's fluid from the default domain.
+    ///
+    /// `None` for a chunk with no row, which is the overwhelming majority of
+    /// them and is why this is a separate table — see the schema.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an undecodable layer.
+    pub fn load_chunk_fluid(&self, pos: ChunkPos) -> Result<Option<FluidLayer>, WorldError> {
+        self.load_chunk_fluid_in(DEFAULT_DOMAIN, pos)
+    }
+
+    /// Loads a chunk's fluid from a named domain.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an undecodable layer.
+    pub fn load_chunk_fluid_in(
+        &self,
+        domain: &str,
+        pos: ChunkPos,
+    ) -> Result<Option<FluidLayer>, WorldError> {
+        let blob: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT data FROM chunk_fluid WHERE domain = ?1 AND x = ?2 AND y = ?3 AND z = ?4",
+                params![domain, pos.x, pos.y, pos.z],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(blob) = blob else {
+            return Ok(None);
+        };
+
+        crate::fluid::codec::decode(&blob)
+            .map(Some)
+            .map_err(|source| WorldError::Fluid {
+                pos,
+                domain: domain.to_owned(),
+                source,
+            })
+    }
+
+    /// Saves a chunk's fluid to the default domain.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure.
+    pub fn save_chunk_fluid(&self, pos: ChunkPos, layer: &FluidLayer) -> Result<(), WorldError> {
+        self.save_chunk_fluid_in(DEFAULT_DOMAIN, pos, layer)
+    }
+
+    /// Saves a chunk's fluid to a named domain, or removes it if it drained.
+    ///
+    /// # An empty layer DELETEs rather than writing one byte
+    ///
+    /// `fluid::codec::encode` turns an empty layer into a single byte, so
+    /// storing one would be nearly free — and would still be wrong. A pond that
+    /// is drained and then unloaded must not come back when the chunk next
+    /// loads, and a row that says "empty" is indistinguishable at the call site
+    /// from a row that says "a pond, still here" until it has been decoded.
+    /// Deleting keeps the table proportional to the milk in the world rather
+    /// than to every chunk milk has ever touched.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure.
+    pub fn save_chunk_fluid_in(
+        &self,
+        domain: &str,
+        pos: ChunkPos,
+        layer: &FluidLayer,
+    ) -> Result<(), WorldError> {
+        if layer.is_empty() {
+            self.conn.execute(
+                "DELETE FROM chunk_fluid WHERE domain = ?1 AND x = ?2 AND y = ?3 AND z = ?4",
+                params![domain, pos.x, pos.y, pos.z],
+            )?;
+            return Ok(());
+        }
+
+        self.conn.execute(
+            "INSERT INTO chunk_fluid (domain, x, y, z, data) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(domain, x, y, z) DO UPDATE SET data = excluded.data",
+            params![
+                domain,
+                pos.x,
+                pos.y,
+                pos.z,
+                crate::fluid::codec::encode(layer)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Saves many fluid layers in a single transaction.
+    ///
+    /// The same reasoning as [`Self::save_chunks_batch`]: one WAL commit for the
+    /// batch rather than one per chunk. Layers that drained are deleted in the
+    /// same transaction, so a save either lands whole or not at all — a batch
+    /// that wrote the new ponds but not the removals would resurrect milk.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure. The transaction rolls back.
+    pub fn save_chunk_fluid_batch<'a>(
+        &mut self,
+        layers: impl IntoIterator<Item = (ChunkPos, &'a FluidLayer)>,
+    ) -> Result<usize, WorldError> {
+        self.save_chunk_fluid_batch_in(DEFAULT_DOMAIN, layers)
+    }
+
+    /// Saves many fluid layers to a named domain in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::save_chunk_fluid_batch`].
+    pub fn save_chunk_fluid_batch_in<'a>(
+        &mut self,
+        domain: &str,
+        layers: impl IntoIterator<Item = (ChunkPos, &'a FluidLayer)>,
+    ) -> Result<usize, WorldError> {
+        let encoded = layers
+            .into_iter()
+            .map(|(pos, layer)| {
+                let blob = if layer.is_empty() {
+                    None
+                } else {
+                    Some(crate::fluid::codec::encode(layer))
+                };
+                (pos, blob)
+            })
+            .collect::<Vec<_>>();
+
+        let transaction = self.conn.transaction()?;
+        {
+            let mut write = transaction.prepare_cached(
+                "INSERT INTO chunk_fluid (domain, x, y, z, data) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(domain, x, y, z) DO UPDATE SET data = excluded.data",
+            )?;
+            let mut remove = transaction.prepare_cached(
+                "DELETE FROM chunk_fluid WHERE domain = ?1 AND x = ?2 AND y = ?3 AND z = ?4",
+            )?;
+            for (pos, blob) in &encoded {
+                match blob {
+                    Some(blob) => {
+                        write.execute(params![domain, pos.x, pos.y, pos.z, blob])?;
+                    }
+                    None => {
+                        remove.execute(params![domain, pos.x, pos.y, pos.z])?;
+                    }
+                }
             }
         }
         transaction.commit()?;
@@ -749,4 +928,51 @@ pub struct StoredPlayerKey {
     pub added_by: Option<Vec<u8>>,
     /// When revoked, if it has been.
     pub revoked_at: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_world_written_before_fluid_existed_still_opens() {
+        // **Adding `chunk_fluid` did not bump `SCHEMA_VERSION`, and this is the
+        // test that says why that is safe.** A bump is a refusal rather than a
+        // migration — [`WorldDb::open`] rejects any world whose stored version
+        // is not the current one — so bumping would have made every existing
+        // save unopenable. `CREATE TABLE IF NOT EXISTS` runs on every open
+        // instead, and a world from before the feature gets the table empty,
+        // which is the true answer that it has no fluid saved.
+        //
+        // A real file rather than `open_in_memory`, because the whole point is
+        // to close a world and open it again with different code.
+        let dir = std::env::temp_dir().join("tiamot-pre-fluid-world");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join(format!("{}.tiamot", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let pos = ChunkPos::new(2, 0, -1);
+        {
+            let mut registry = Registry::default();
+            let db = WorldDb::open(&path, &mut registry).expect("create");
+            db.save_chunk(pos, &Chunk::air(pos)).expect("save");
+            // Leaves the file shaped exactly like one an older build wrote.
+            db.conn
+                .execute("DROP TABLE chunk_fluid", [])
+                .expect("drop the table");
+        }
+
+        let mut registry = Registry::default();
+        let db = WorldDb::open(&path, &mut registry).expect("a pre-fluid world must still open");
+        assert!(
+            db.load_chunk(pos).expect("load").is_some(),
+            "the terrain did not survive the reopen"
+        );
+        assert!(
+            db.load_chunk_fluid(pos).expect("load").is_none(),
+            "a world with no fluid rows reported fluid"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

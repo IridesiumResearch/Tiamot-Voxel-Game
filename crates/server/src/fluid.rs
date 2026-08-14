@@ -11,12 +11,18 @@
 //! "there was milk here", so a fluid layer has to be written with its chunk or
 //! every pond in the world empties on restart.
 //!
-//! [`Fluidics::chunk_loaded`] and [`Fluidics::layer`] are the two ends of that
-//! and are used by the network path today. **The database side is not wired
-//! yet** — see the task's remaining work — so a pond currently survives a chunk
-//! leaving memory only for as long as the server runs. Written here rather than
-//! left to be discovered: an unwired half of a round trip is the kind of thing
-//! that reads as finished from either end alone.
+//! The round trip runs through a `chunk_fluid` table keyed by chunk position —
+//! its own table rather than a column on `chunks` or a field in the chunk blob,
+//! because [`FluidLayer`]'s whole design is that a dry chunk costs nothing, and
+//! only a separate table keeps that true on disk. A chunk arriving reads its
+//! row and hands it to [`Fluidics::chunk_loaded`], which queues everything in
+//! it so milk saved mid-flow carries on flowing; a chunk whose milk changed
+//! goes on the dirty list and is written on the same debounce as terrain.
+//!
+//! **A chunk that drained is written too, as empty, which deletes its row.**
+//! The layer is dropped from memory when it empties, so a dirty list that
+//! followed the layer would never hear about the drain — and the pond would
+//! come back the next time the chunk loaded.
 //!
 //! # Two clocks
 //!
@@ -146,6 +152,26 @@ impl tiamot_core::script::WorldEdit for Edits {
 #[derive(Debug, Default)]
 pub struct Fluidics {
     layers: HashMap<ChunkPos, FluidLayer>,
+    /// Chunks whose fluid has changed since the last save.
+    ///
+    /// A `BTreeSet` rather than a `HashSet` for the reason the active set is
+    /// one: `HashMap` iteration order is per-process random, and while the
+    /// order rows are written in is not a simulation result, the habit is what
+    /// stops the next person who reads this set inside the tick from
+    /// introducing one.
+    ///
+    /// **A drained chunk stays in here after its layer is dropped**, which is
+    /// the case that matters: the save turns "dirty with no layer" into an
+    /// empty layer, and an empty layer deletes the row. Without that a pond
+    /// somebody emptied would come straight back the next time its chunk
+    /// loaded.
+    dirty: std::collections::BTreeSet<ChunkPos>,
+    /// Chunks whose fluid has been read from the database this session.
+    ///
+    /// Separate from `layers` because a chunk that was read and found dry
+    /// belongs here and not there — see [`Fluidics::knows`] for what goes wrong
+    /// without the distinction.
+    loaded: std::collections::BTreeSet<ChunkPos>,
     fluids: Fluids,
     solver: Solver,
 }
@@ -156,9 +182,41 @@ impl Fluidics {
     pub fn new(fluids: Fluids) -> Self {
         Self {
             layers: HashMap::new(),
+            dirty: std::collections::BTreeSet::new(),
+            loaded: std::collections::BTreeSet::new(),
             fluids,
             solver: Solver::new(),
         }
+    }
+
+    /// Takes the chunks whose fluid needs writing, and what to write.
+    ///
+    /// Yields an empty layer for a chunk that drained, so the caller can hand
+    /// the whole sequence to [`crate::world::World::save_fluid`] and let the
+    /// removals and the writes land in one transaction.
+    pub fn take_dirty(&mut self) -> Vec<(ChunkPos, FluidLayer)> {
+        std::mem::take(&mut self.dirty)
+            .into_iter()
+            .map(|pos| {
+                let layer = self.layers.get(&pos).cloned().unwrap_or_default();
+                (pos, layer)
+            })
+            .collect()
+    }
+
+    /// How many chunks are waiting to be written.
+    #[must_use]
+    pub fn dirty(&self) -> usize {
+        self.dirty.len()
+    }
+
+    /// Puts a chunk back on the list of things to write.
+    ///
+    /// For a save that failed: the batch is one transaction, so nothing landed,
+    /// and forgetting what it was trying to write would lose the pond at the
+    /// next unload without anything going wrong visibly.
+    pub fn mark_dirty(&mut self, pos: ChunkPos) {
+        self.dirty.insert(pos);
     }
 
     /// What the mods registered.
@@ -202,13 +260,33 @@ impl Fluidics {
         self.solver.is_settled()
     }
 
+    /// Whether this chunk's fluid has already been read from the database.
+    ///
+    /// **The guard against loading a chunk twice**, and it is not hypothetical:
+    /// the tick's arrival list is shared with the lighting, which defers what it
+    /// cannot relight this tick by putting the chunk *back* into that list. A
+    /// deferred chunk therefore arrives again a tick later, and a second load
+    /// would replace the live layer with whatever was last written to disk —
+    /// discarding a pour the player made in between, or resurrecting a pond that
+    /// drained.
+    ///
+    /// Distinct from "holds a layer": a chunk that was read and found dry is
+    /// known and has no layer, and asking `layers.contains_key` would send it
+    /// back to the database on every arrival.
+    #[must_use]
+    pub fn knows(&self, pos: ChunkPos) -> bool {
+        self.loaded.contains(&pos)
+    }
+
     /// Takes a chunk's fluid as it came out of the database.
     ///
     /// An empty layer is not stored: the map is for chunks that hold something,
     /// so a world with one pond in it has one entry however far anybody walks.
+    /// The chunk is still recorded as read — see [`Fluidics::knows`].
     /// Everything in the chunk is queued, because milk saved mid-flow has to
     /// carry on flowing when it comes back.
     pub fn chunk_loaded(&mut self, pos: ChunkPos, layer: FluidLayer) {
+        self.loaded.insert(pos);
         if layer.is_empty() {
             return;
         }
@@ -223,8 +301,13 @@ impl Fluidics {
     /// Forgets a chunk's fluid.
     ///
     /// Called when a chunk leaves memory, after it has been written back.
+    ///
+    /// Forgets that it was read as well as what it held, so that a chunk which
+    /// comes back later is loaded from the database again rather than treated
+    /// as dry.
     pub fn forget(&mut self, pos: ChunkPos) {
         self.layers.remove(&pos);
+        self.loaded.remove(&pos);
     }
 
     /// Records what a block holds and wakes its neighbourhood.
@@ -318,6 +401,13 @@ impl Fluidics {
             // The chunk drained. Dropped rather than kept, so a world that was
             // flooded and then emptied costs what it did before.
             self.layers.remove(&chunk);
+        }
+        if changed {
+            // Marked here rather than at each caller because this is the single
+            // funnel every write goes through — the solver's, a mod's, a
+            // player's. A pond that changed and was not recorded is a pond that
+            // reverts to its last save the next time its chunk loads.
+            self.dirty.insert(chunk);
         }
         changed
     }
@@ -454,6 +544,94 @@ mod tests {
             bench.contains(&declared),
             "the benchmark does not declare `{declared}`, so its numbers are not this server's"
         );
+    }
+
+    #[test]
+    fn a_pour_marks_its_chunk_for_writing_and_a_load_does_not() {
+        let milk = FluidId(1);
+        let mut fluidics = Fluidics::new(Fluids::new());
+        let pos = ChunkPos::new(1, 0, 0);
+        let corner = block_at(pos, 0);
+
+        // Arriving from the database is not a change: the layer already agrees
+        // with what is on disk, and marking it dirty would rewrite every chunk
+        // a player walks past.
+        let mut saved = FluidLayer::empty();
+        saved.set(
+            tiamot_core::coords::LocalBlock::new(0, 0, 0),
+            Fluid::source(milk),
+        );
+        fluidics.chunk_loaded(pos, saved);
+        assert_eq!(fluidics.dirty(), 0, "a load dirtied the chunk it loaded");
+
+        // A pour is.
+        fluidics.set(
+            BlockPos::new(corner.x + 1, corner.y, corner.z),
+            Fluid::source(milk),
+        );
+        assert_eq!(fluidics.dirty(), 1);
+
+        let taken = fluidics.take_dirty();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].0, pos);
+        assert_eq!(taken[0].1.filled(), 2);
+        assert_eq!(fluidics.dirty(), 0, "taking the list did not clear it");
+    }
+
+    #[test]
+    fn a_chunk_that_drained_is_still_written_so_the_row_goes_away() {
+        // **The bug this guards.** When a layer empties it is dropped from the
+        // map to give the memory back — and if the dirty list followed it, the
+        // save would never hear about the drain and the pond would come back
+        // the next time the chunk loaded.
+        let milk = FluidId(1);
+        let mut fluidics = Fluidics::new(Fluids::new());
+        let pos = ChunkPos::new(-2, 3, 1);
+        let block = block_at(pos, 0);
+
+        fluidics.set(block, Fluid::source(milk));
+        fluidics.take_dirty();
+
+        fluidics.set(block, Fluid::EMPTY);
+        assert!(fluidics.layer(pos).is_none(), "the layer was not dropped");
+
+        let taken = fluidics.take_dirty();
+        assert_eq!(taken.len(), 1, "a drained chunk was not queued for writing");
+        assert_eq!(taken[0].0, pos);
+        assert!(
+            taken[0].1.is_empty(),
+            "a drained chunk must be written as empty, which is what deletes its row"
+        );
+    }
+
+    #[test]
+    fn a_chunk_that_arrives_twice_is_only_read_once() {
+        // **The bug this guards.** The tick's arrival list is shared with the
+        // lighting, which defers what it cannot relight by putting the chunk
+        // BACK into that list — so chunks genuinely arrive twice, a tick apart.
+        // A second load would replace the live layer with whatever was last
+        // written to disk, discarding a pour made in between.
+        let milk = FluidId(1);
+        let mut fluidics = Fluidics::new(Fluids::new());
+        let pos = ChunkPos::new(0, 0, 0);
+
+        assert!(!fluidics.knows(pos), "knew a chunk it has never seen");
+        fluidics.chunk_loaded(pos, FluidLayer::empty());
+        assert!(
+            fluidics.knows(pos),
+            "a chunk read and found dry must still count as read, or every \
+             arrival goes back to the database"
+        );
+
+        // A player pours into it, and then it arrives again.
+        let block = block_at(pos, 0);
+        fluidics.set(block, Fluid::source(milk));
+        assert!(fluidics.knows(pos), "the pour lost the chunk's read mark");
+
+        // Forgetting it — a real unload — puts it back to unread.
+        fluidics.forget(pos);
+        assert!(!fluidics.knows(pos));
+        assert!(fluidics.layer(pos).is_none());
     }
 
     #[test]
