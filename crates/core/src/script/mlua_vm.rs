@@ -826,6 +826,7 @@ impl ScriptVm for MluaVm {
                     material: entry.get("material").ok()?,
                     flow_range: entry.get("flow_range").ok()?,
                     waterlogs_at: entry.get("waterlogs_at").ok()?,
+                    renews_from: entry.get("renews_from").ok()?,
                     tick_rate: entry.get("tick_rate").ok()?,
                 })
             })
@@ -1834,6 +1835,20 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
         )));
     }
 
+    // How many neighbouring sources make a block a source of its own. Bounded
+    // by the four lateral directions: asking for five is asking for a rule that
+    // can never fire, which is a typo rather than an intention.
+    let renews_from: u8 = spec
+        .get("renews_from")
+        .unwrap_or(FluidRules::DEFAULT_RENEWS_FROM);
+    if renews_from > 4 {
+        return Err(mlua::Error::external(format!(
+            "register_fluid(\"{qualified}\"): renews_from must be 0..=4, got {renews_from}. It \
+             counts the four lateral neighbours, so anything above four is a rule that never \
+             fires."
+        )));
+    }
+
     let registry: Table = lua.named_registry_value("tiamot.fluids")?;
     if registry.contains_key(qualified.clone())? {
         return Err(mlua::Error::external(format!(
@@ -1846,6 +1861,7 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     entry.set("flow_range", flow_range)?;
     entry.set("waterlogs_at", waterlogs_at)?;
     entry.set("tick_rate", tick_rate)?;
+    entry.set("renews_from", renews_from)?;
     registry.set(qualified, entry)?;
     Ok(())
 }
@@ -2124,7 +2140,14 @@ const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "defa
 
 /// Fields `register_fluid` accepts. Anything else is a typo, and a typo that is
 /// silently ignored is a mod whose author cannot tell why nothing happened.
-const FLUID_FIELDS: [&str; 5] = ["id", "material", "flow_range", "waterlogs_at", "tick_rate"];
+const FLUID_FIELDS: [&str; 6] = [
+    "id",
+    "material",
+    "flow_range",
+    "waterlogs_at",
+    "tick_rate",
+    "renews_from",
+];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
 const BLOCK_FIELDS: [&str; 8] = [

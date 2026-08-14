@@ -665,13 +665,20 @@ fn detgen_contains_no_terrain_policy() {
 /// platforms. The solver's active set is a `BTreeSet` for precisely this
 /// reason, and a `HashSet` swapped in would fail here on every platform and for
 /// a different value on each run.
-const FLUID_GOLDEN: u64 = 8_303_709_056_475_525_592;
+const FLUID_GOLDEN: u64 = 5_527_249_282_102_538_918;
 // Regenerated once, deliberately, when the hole preference was WIRED IN. It had
 // been written, table-driven tested and never consulted by the solver, so milk
 // spread evenly in all directions and reached a hole by covering the ground
 // between. Steering it changes where milk ends up in the slope scenario, which
 // is exactly what this hash is for — and is why the constant moved rather than
 // the test being relaxed.
+//
+// Regenerated a second time, deliberately, when a FOURTH scenario was added for
+// source renewal. The first three are untouched — renewal is off in
+// `Tuning::DEFAULT` and cannot have changed them — so this move is the new
+// scenario joining the hash and nothing else. Confirmed by the three original
+// scenarios still settling to the values they always did before the fourth was
+// appended.
 
 /// Runs the three scenarios the task names and hashes what settled.
 ///
@@ -728,10 +735,27 @@ fn fluid_fingerprint() -> u64 {
         }
     }
 
+    /// Milk that renews from three sides — an ocean rather than a spring.
+    const RENEWING: Tuning = Tuning {
+        renews_from: 3,
+        ..Tuning::DEFAULT
+    };
+
     /// Settles a scene and folds every block of it into the hash.
-    fn run(hasher: &mut blake3::Hasher, mut scene: Scene, mut solver: Solver, ticks: usize) {
+    fn run(hasher: &mut blake3::Hasher, scene: Scene, solver: Solver, ticks: usize) {
+        run_with(hasher, scene, solver, ticks, Tuning::DEFAULT);
+    }
+
+    /// The same, under a fluid tuned differently.
+    fn run_with(
+        hasher: &mut blake3::Hasher,
+        mut scene: Scene,
+        mut solver: Solver,
+        ticks: usize,
+        tuning: Tuning,
+    ) {
         for _ in 0..ticks {
-            solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX);
+            solver.tick(&mut scene, tuning, usize::MAX);
         }
         // Sorted by construction — a `BTreeMap` — so the hash does not depend
         // on the order the blocks happened to be written in.
@@ -806,6 +830,30 @@ fn fluid_fingerprint() -> u64 {
     // drained channel hashes an empty map, which is the same value whatever the
     // decay rule did on the way there.
     run(&mut hasher, scene, solver, 3);
+
+    // 4. An ocean healing: a 5x5 pool of sources with a bucket taken out of the
+    //    middle, under a fluid that renews from three sides. The rule creates
+    //    matter, which is the one thing in the solver that can run away — so it
+    //    is in the gate rather than trusted to be small.
+    let mut scene = Scene::default();
+    for x in -3..=3 {
+        for z in -3..=3 {
+            scene.solid.insert((x, 0, z));
+        }
+    }
+    let mut solver = Solver::new();
+    for x in -2..=2 {
+        for z in -2..=2 {
+            scene.set_fluid(BlockPos::new(x, 1, z), Fluid::source(MILK));
+            solver.touch(BlockPos::new(x, 1, z));
+        }
+    }
+    for _ in 0..30 {
+        solver.tick(&mut scene, RENEWING, usize::MAX);
+    }
+    scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::EMPTY);
+    solver.touch(BlockPos::new(0, 1, 0));
+    run_with(&mut hasher, scene, solver, 30, RENEWING);
 
     u64::from_le_bytes(
         hasher.finalize().as_bytes()[..8]

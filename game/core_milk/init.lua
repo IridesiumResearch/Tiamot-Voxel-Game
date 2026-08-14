@@ -41,6 +41,20 @@ game.register_fluid{
     -- for", which is a mod's opinion to hold and this is where it belongs —
     -- the engine's rate is 10 Hz and stays that way for anything that wants it.
     tick_rate = 3,
+    -- **Sources on all but one side make a source.** Without this a source is a
+    -- thing that exists exactly once: scoop one out of the middle of a lake and
+    -- the hole fills with flow, which drains the moment its parent goes, and
+    -- the lake is permanently one block of source poorer. Do that along a
+    -- shoreline and the whole body of water is flow hanging off a shrinking
+    -- core — an ocean that collapses because somebody filled a bucket.
+    --
+    -- Three rather than the two Minecraft asks for, deliberately. At two, any
+    -- 2x2 pool is an infinite well and a bucket is a way to MAKE ocean; at
+    -- three the rule only heals water that was already there.
+    --
+    -- The engine defaults this to zero and does not have an opinion — creating
+    -- matter out of nothing is game design, and charter rule 1 puts that here.
+    renews_from = 3,
 }
 
 game.log("registered core_milk:milk")

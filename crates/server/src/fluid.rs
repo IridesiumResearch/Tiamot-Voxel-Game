@@ -387,6 +387,7 @@ impl Fluidics {
                 hole_search: Tuning::DEFAULT.hole_search,
                 waterlogs_at: f.waterlogs_at,
                 tick_rate: f.tick_rate,
+                renews_from: f.renews_from,
             })
     }
 
@@ -501,6 +502,7 @@ pub fn fluids_from_rules(
             flow_range: rule.flow_range,
             waterlogs_at: rule.waterlogs_at,
             tick_rate: rule.tick_rate,
+            renews_from: rule.renews_from,
             material,
         }) {
             tracing::warn!(fluid = %rule.fluid, "could not register a fluid: {err}");

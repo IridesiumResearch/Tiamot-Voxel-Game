@@ -39,7 +39,7 @@ use std::collections::BTreeSet;
 
 use crate::coords::BlockPos;
 
-use super::{Fluid, MAX_LEVEL};
+use super::{Fluid, FluidId, MAX_LEVEL};
 
 /// The six faces, as offsets, in the order the solver visits them.
 ///
@@ -112,6 +112,25 @@ pub struct Tuning {
     /// only knob that changes how fast a spring is SEEN to run, which is the
     /// first thing anybody watching a fluid has an opinion about.
     pub tick_rate: u8,
+    /// How many neighbouring sources make a block a source in its own right.
+    ///
+    /// **Zero disables renewal**, which is the engine default and keeps the
+    /// original model exactly as it was: sources are placed and only a player
+    /// or a mod removes one. A fluid that wants an ocean opts in.
+    ///
+    /// Counted over the four LATERAL neighbours only, and they must all be the
+    /// same fluid. Three means "sources on all but one side", which is stricter
+    /// than the two Minecraft asks for, and deliberately: at two, any 2×2 pool
+    /// is an infinite well, and the point of this rule is that **an ocean does
+    /// not collapse when somebody takes a bucket out of the middle of it** —
+    /// not that a bucket is a way to make more ocean.
+    ///
+    /// # Why this is a mod's decision and not the engine's
+    ///
+    /// It creates matter out of nothing, which is a game-design position rather
+    /// than a mechanism. Charter rule 1: the engine makes it expressible and
+    /// `game/core_milk` is where the opinion lives.
+    pub renews_from: u8,
 }
 
 impl Tuning {
@@ -124,6 +143,8 @@ impl Tuning {
         // than not and holds the fluid up.
         waterlogs_at: 14,
         tick_rate: 1,
+        // Off. Creating matter is a mod's call — see the field.
+        renews_from: 0,
     };
 }
 
@@ -330,12 +351,80 @@ fn settle_one(world: &mut impl Neighbourhood, tuning: Tuning, pos: BlockPos) -> 
         return None;
     }
 
+    // **Renewal, before the ordinary supply rule**, because a block that is
+    // about to become a source should not first be given a level by its
+    // neighbours and then have it overwritten — that would be two flows for one
+    // event, and every listener would see the block flicker.
+    if let Some(renewed) = renewed_source(world, tuning, pos) {
+        if renewed == was {
+            return None;
+        }
+        world.set_fluid(pos, renewed);
+        return Some(Flow {
+            pos,
+            was,
+            now: renewed,
+        });
+    }
+
     let now = supplied(world, tuning, pos, was);
     if now == was {
         return None;
     }
     world.set_fluid(pos, now);
     Some(Flow { pos, was, now })
+}
+
+/// Whether enough neighbouring sources make this block a source too.
+///
+/// # What this is for
+///
+/// **An ocean must not collapse when somebody takes a bucket out of the middle
+/// of it.** Without renewal, every source is a thing that exists exactly once:
+/// scoop one from the middle of a lake and the hole fills with *flow*, which
+/// has a level and a parent chain, and the lake is permanently one block of
+/// source poorer. Do it a few hundred times along a shoreline and the whole
+/// body of water is flow blocks hanging off a shrinking core.
+///
+/// [`Tuning::renews_from`] is how many of the four lateral neighbours have to be
+/// sources. Zero — the engine default — means this never fires and the model is
+/// exactly what it was.
+///
+/// # Same fluid, and laterally only
+///
+/// All the counted sources must be the same fluid, or two fluids meeting would
+/// breed a third state that is neither. Lateral rather than including the block
+/// above, because a source under a waterfall would otherwise renew from the
+/// column falling into it and a single spring would turn every block beneath it
+/// into a spring of its own.
+fn renewed_source(world: &impl Neighbourhood, tuning: Tuning, pos: BlockPos) -> Option<Fluid> {
+    if tuning.renews_from == 0 {
+        return None;
+    }
+
+    let mut fluid = FluidId::NONE;
+    let mut sources = 0u8;
+    for offset in &LATERAL {
+        let neighbour = BlockPos::new(pos.x + offset[0], pos.y + offset[1], pos.z + offset[2]);
+        let there = world.fluid(neighbour);
+        if !there.is_source() {
+            continue;
+        }
+        if fluid.is_none() {
+            fluid = there.fluid();
+        } else if fluid != there.fluid() {
+            // Two fluids, and neither of them gets to claim the block. Bailing
+            // rather than counting the first one seen: the answer must not
+            // depend on which direction the loop happened to start from.
+            return None;
+        }
+        sources += 1;
+    }
+
+    if fluid.is_none() || sources < tuning.renews_from {
+        return None;
+    }
+    Some(Fluid::source(fluid))
 }
 
 /// What this block should hold, given what is around it.
@@ -545,15 +634,26 @@ mod tests {
 
         /// Runs until nothing changes, or gives up. Returns the ticks taken.
         fn settle(&mut self, solver: &mut Solver) -> usize {
+            self.settle_with(solver, Tuning::DEFAULT)
+        }
+
+        /// The same, under a fluid that is tuned differently.
+        fn settle_with(&mut self, solver: &mut Solver, tuning: Tuning) -> usize {
             for tick in 0..200 {
                 if solver.is_settled() {
                     return tick;
                 }
-                solver.tick(self, Tuning::DEFAULT, usize::MAX);
+                solver.tick(self, tuning, usize::MAX);
             }
             panic!("never settled: {} blocks still active", solver.active());
         }
     }
+
+    /// Milk that renews from three sides — an ocean rather than a spring.
+    const RENEWING: Tuning = Tuning {
+        renews_from: 3,
+        ..Tuning::DEFAULT
+    };
 
     impl Neighbourhood for Scene {
         fn occupancy(&self, pos: BlockPos) -> Option<u32> {
@@ -587,6 +687,144 @@ mod tests {
     fn spring(scene: &mut Scene, solver: &mut Solver, x: i32, y: i32, z: i32) {
         scene.set_fluid(BlockPos::new(x, y, z), Fluid::source(MILK));
         solver.touch(BlockPos::new(x, y, z));
+    }
+
+    /// Fills a rectangle of source blocks at one height.
+    fn pool(
+        scene: &mut Scene,
+        solver: &mut Solver,
+        x: std::ops::Range<i32>,
+        z: std::ops::Range<i32>,
+        y: i32,
+    ) {
+        for zi in z {
+            for xi in x.clone() {
+                spring(scene, solver, xi, y, zi);
+            }
+        }
+    }
+
+    #[test]
+    fn a_bucket_taken_from_the_middle_of_an_ocean_fills_back_in() {
+        // **The whole point of renewal.** Without it a source is a thing that
+        // exists exactly once: scoop one out of a lake and the hole fills with
+        // FLOW, which has a level and a parent chain, and the lake is
+        // permanently one block of source poorer. Do that a few hundred times
+        // along a shoreline and the water is flow hanging off a shrinking core.
+        let mut scene = Scene::default().with_floor(16);
+        let mut solver = Solver::new();
+        pool(&mut scene, &mut solver, 0..5, 0..5, 1);
+        scene.settle_with(&mut solver, RENEWING);
+
+        // Take a bucket from the middle.
+        scene.set_fluid(BlockPos::new(2, 1, 2), Fluid::EMPTY);
+        solver.touch(BlockPos::new(2, 1, 2));
+        scene.settle_with(&mut solver, RENEWING);
+
+        assert!(
+            scene.at(2, 1, 2).is_source(),
+            "the hole came back as {:?} rather than a source",
+            scene.at(2, 1, 2)
+        );
+    }
+
+    #[test]
+    fn two_sources_are_not_enough_and_three_are() {
+        // The threshold, either side of it. Two would make every 2x2 pool an
+        // infinite well; three is "sources on all but one side", which is what
+        // was asked for and is stricter than Minecraft's rule on purpose.
+        //
+        // A cross with the centre missing: the centre has four lateral sources.
+        // Removing one arm leaves three, removing two leaves two.
+        let arms = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+        for present in [4usize, 3, 2] {
+            let mut scene = Scene::default().with_floor(16);
+            let mut solver = Solver::new();
+            for (dx, dz) in arms.iter().take(present) {
+                spring(&mut scene, &mut solver, *dx, 1, *dz);
+            }
+            solver.touch(BlockPos::new(0, 1, 0));
+            scene.settle_with(&mut solver, RENEWING);
+
+            let centre = scene.at(0, 1, 0);
+            if present >= 3 {
+                assert!(
+                    centre.is_source(),
+                    "{present} neighbouring sources should renew, got {centre:?}"
+                );
+            } else {
+                assert!(
+                    !centre.is_source(),
+                    "{present} neighbouring sources must NOT renew, got {centre:?} — at two, \
+                     every 2x2 pool is an infinite well"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fluid_that_does_not_renew_behaves_exactly_as_it_did() {
+        // The engine default is off, and off has to mean untouched — the
+        // determinism goldens were hashed by the rule as it was.
+        let mut scene = Scene::default().with_floor(16);
+        let mut solver = Solver::new();
+        pool(&mut scene, &mut solver, 0..5, 0..5, 1);
+        scene.settle(&mut solver);
+
+        scene.set_fluid(BlockPos::new(2, 1, 2), Fluid::EMPTY);
+        solver.touch(BlockPos::new(2, 1, 2));
+        scene.settle(&mut solver);
+
+        assert!(
+            !scene.at(2, 1, 2).is_source(),
+            "renewal fired for a fluid whose renews_from is zero"
+        );
+        assert!(
+            !scene.at(2, 1, 2).is_empty(),
+            "the staging is wrong: the hole should still have filled with FLOW"
+        );
+    }
+
+    #[test]
+    fn renewal_does_not_run_a_spring_down_a_waterfall() {
+        // Lateral only. Counting the block above would make every block under a
+        // falling column a source of its own, and one spring would become an
+        // infinite vertical one.
+        let mut scene = Scene::default().with_floor(16);
+        let mut solver = Solver::new();
+        // A source high up, with sources beside it at the same height only.
+        pool(&mut scene, &mut solver, -1..2, -1..2, 8);
+        scene.settle_with(&mut solver, RENEWING);
+
+        for y in 1..8 {
+            assert!(
+                !scene.at(0, y, 0).is_source(),
+                "the falling column made a source at y={y}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_fluids_meeting_do_not_breed_a_third() {
+        // Neither gets to claim the block, and — the part that matters for
+        // charter rule 4 — the answer must not depend on which direction the
+        // neighbour loop happened to start from.
+        const CREAM: FluidId = FluidId(2);
+        let mut scene = Scene::default().with_floor(16);
+        let mut solver = Solver::new();
+
+        scene.set_fluid(BlockPos::new(-1, 1, 0), Fluid::source(MILK));
+        scene.set_fluid(BlockPos::new(1, 1, 0), Fluid::source(MILK));
+        scene.set_fluid(BlockPos::new(0, 1, -1), Fluid::source(CREAM));
+        scene.set_fluid(BlockPos::new(0, 1, 1), Fluid::source(CREAM));
+        solver.touch(BlockPos::new(0, 1, 0));
+        scene.settle_with(&mut solver, RENEWING);
+
+        assert!(
+            !scene.at(0, 1, 0).is_source(),
+            "four sources of two different fluids renewed into {:?}",
+            scene.at(0, 1, 0)
+        );
     }
 
     #[test]

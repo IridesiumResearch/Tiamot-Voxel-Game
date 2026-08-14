@@ -225,6 +225,11 @@ pub struct Registered {
     /// One means every fluid tick. Larger is a slower, more viscous fluid, and
     /// it costs proportionally less to simulate.
     pub tick_rate: u8,
+    /// How many neighbouring sources make a block a source of its own.
+    ///
+    /// Zero never renews. See [`Tuning::renews_from`] — it is what stops an
+    /// ocean collapsing when somebody takes a bucket out of the middle of it.
+    pub renews_from: u8,
     /// The material a full block of it is drawn as.
     ///
     /// Fluid has no material of its own in the block store — a block holds
@@ -385,6 +390,7 @@ mod tests {
                 name: "core:milk".into(),
                 flow_range: 7,
                 waterlogs_at: 14,
+                renews_from: 0,
                 tick_rate: 1,
                 material: MaterialId(4),
             })
@@ -402,6 +408,7 @@ mod tests {
             name: "core:milk".into(),
             flow_range: 7,
             waterlogs_at: 14,
+            renews_from: 0,
             tick_rate: 1,
             material: MaterialId(4),
         };
@@ -421,6 +428,7 @@ mod tests {
                     name: format!("test:fluid{index}"),
                     flow_range: 7,
                     waterlogs_at: 14,
+                    renews_from: 0,
                     tick_rate: 1,
                     material: MaterialId(1),
                 })
@@ -431,6 +439,7 @@ mod tests {
                 name: "test:one-too-many".into(),
                 flow_range: 7,
                 waterlogs_at: 14,
+                renews_from: 0,
                 tick_rate: 1,
                 material: MaterialId(1),
             }),

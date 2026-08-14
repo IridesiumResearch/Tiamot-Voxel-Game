@@ -349,6 +349,13 @@ pub struct FluidRules {
     /// proportionally less to simulate — which is a real lever for a mod adding
     /// a fluid it expects to cover a lot of world.
     pub tick_rate: u8,
+    /// How many neighbouring sources make a block a source of its own.
+    ///
+    /// Zero — the default — never renews, and a source is a thing that exists
+    /// exactly once. Three is "sources on all but one side", which is what
+    /// stops an ocean collapsing when somebody takes a bucket out of the
+    /// middle of it. See `fluid::Tuning::renews_from`.
+    pub renews_from: u8,
 }
 
 impl FluidRules {
@@ -360,6 +367,9 @@ impl FluidRules {
 
     /// How full a block must be to be floor, if its mod said nothing.
     pub const DEFAULT_WATERLOGS_AT: u32 = 14;
+
+    /// Whether a fluid renews, if its mod said nothing. It does not.
+    pub const DEFAULT_RENEWS_FROM: u8 = 0;
 }
 
 /// How a moment's finished picture is graded.
