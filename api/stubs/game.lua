@@ -438,7 +438,10 @@ function game.set_block(position, block) end
 ---If your callback raises an error, your mod is disabled for the rest of the
 ---session **and the dig goes ahead**. A crash is not a veto — otherwise one
 ---broken mod could stop everybody on the server from digging.
----@param callback fun(event: Tiamot.DigEvent): boolean?
+---Return `false` to refuse with the engine's wording, a string to refuse with
+---your own, or `""` to cancel silently — the same ladder
+---`game.register_on_place` uses.
+---@param callback fun(event: Tiamot.DigEvent): boolean|string|nil
 function game.register_on_dig_complete(callback) end
 
 ---Registers a veto on placements.
@@ -447,13 +450,27 @@ function game.register_on_dig_complete(callback) end
 ---
 ---Called after the engine's own rules have passed — the player is carrying the
 ---material, the target block is empty, and nobody is standing in it — and
----before anything is written or charged. Return `false` to cancel it; the
----player keeps their material.
+---before anything is written or charged. Cancelling leaves the player holding
+---their material.
 ---
----The same rules as `game.register_on_dig_complete`: only an explicit `false`
----cancels, the first refusal stops the rest, and an error disables your mod
----while letting the placement through.
----@param callback fun(event: Tiamot.PlaceEvent): boolean?
+---**Cancelling has two meanings and what you return says which.** Refusing the
+---player is one; HANDLING the placement yourself and not wanting a block
+---written is the other — `core_milk` places milk by intercepting a placement,
+---pouring a fluid, and cancelling the write.
+---
+---| return | meaning |
+---| --- | --- |
+---| nothing, or anything truthy | the placement goes ahead |
+---| `false` | refused, and the player is told "you cannot build there" |
+---| `"reason"` | refused, and the player is told exactly that |
+---| `""` | cancelled, and the player is told nothing — you handled it |
+---
+---A returned reason is truncated to 512 bytes.
+---
+---The same rules as `game.register_on_dig_complete` otherwise: the first
+---cancellation stops the rest, and an error disables your mod while letting the
+---placement through.
+---@param callback fun(event: Tiamot.PlaceEvent): boolean|string|nil
 function game.register_on_place(callback) end
 
 ---One entity hitting another.

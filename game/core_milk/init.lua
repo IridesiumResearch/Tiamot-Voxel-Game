@@ -100,5 +100,10 @@ game.register_on_place(function(event)
     -- Cancel the terrain write. The block was only ever a way of naming what to
     -- pour — leaving it behind would seal the milk inside a solid block, which
     -- Sub-Node Contract §4 says cannot hold any.
-    return false
+    --
+    -- **The empty string, not `false`.** Both cancel the placement; `false`
+    -- means "the player may not build here" and the engine tells them so, which
+    -- is the wrong thing to say to somebody whose milk poured perfectly. This
+    -- pour SUCCEEDED — the mod handled it — so the player hears nothing.
+    return ""
 end)

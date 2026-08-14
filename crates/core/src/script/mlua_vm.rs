@@ -1584,6 +1584,26 @@ impl MluaVm {
                     // that is not going to happen.
                     return outcome;
                 }
+                // A string cancels too, and says what to tell the player — or
+                // says to tell them nothing, when it is empty. See
+                // `HookOutcome::reason`: a mod that HANDLED the action was
+                // being answered with a refusal every time it worked.
+                Ok(mlua::Value::String(reason)) => {
+                    let mut reason = reason.to_string_lossy();
+                    // A mod is not hostile but it can be buggy, and this goes on
+                    // the wire. Truncated on a character boundary, because
+                    // slicing a UTF-8 string anywhere else panics.
+                    if reason.len() > crate::script::MAX_REFUSAL_BYTES {
+                        let end = (0..=crate::script::MAX_REFUSAL_BYTES)
+                            .rev()
+                            .find(|at| reason.is_char_boundary(*at))
+                            .unwrap_or(0);
+                        reason.truncate(end);
+                    }
+                    outcome.allowed = false;
+                    outcome.reason = Some(reason);
+                    return outcome;
+                }
                 Ok(_) => {}
             }
         }
@@ -2466,18 +2486,17 @@ mod tests {
     }
 
     #[test]
-    fn only_an_explicit_false_cancels() {
-        // A hook that returns nothing is observing, not voting. If a bare
-        // `return` cancelled, every mod author who forgot one would silently
-        // make the world unbreakable — and the engine could not tell that apart
-        // from a deliberate veto.
+    fn a_hook_that_returns_nothing_is_observing_rather_than_voting() {
+        // If a bare `return` cancelled, every mod author who forgot one would
+        // silently make the world unbreakable — and the engine could not tell
+        // that apart from a deliberate veto.
         let mut vm = vm();
         load(
             &mut vm,
             "watcher",
             "seen = 0\n\
              game.register_on_dig_complete(function() seen = seen + 1 end)\n\
-             game.register_on_place(function() seen = seen + 1 return 'yes' end)",
+             game.register_on_place(function() seen = seen + 1 return true end)",
         )
         .expect("load");
         vm.freeze().expect("freeze");
@@ -2486,6 +2505,83 @@ mod tests {
         assert!(vm.place(&a_place()).allowed, "a truthy return cancelled");
         vm.eval_in("watcher", "assert(seen == 2, 'seen is ' .. seen)")
             .expect("both hooks should have run");
+    }
+
+    #[test]
+    fn what_a_hook_returns_says_whether_the_player_hears_about_it() {
+        // **Cancelling has two meanings and the engine could not tell them
+        // apart.** Refusing a player is one; HANDLING the action yourself is the
+        // other — `core_milk` pours milk by intercepting a placement and
+        // cancelling the block write, and was answered with "you cannot build
+        // there" every single time it worked.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "refuser",
+            "game.register_on_place(function(event)\n\
+               if event.x == 1 then return false end\n\
+               if event.x == 2 then return 'this land is claimed' end\n\
+               return ''\n\
+             end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let at = |x: i32| {
+            let mut event = a_place();
+            event.block = crate::coords::BlockPos::new(x, 0, 0);
+            event
+        };
+
+        // `false` — refused, and the caller's own wording is what is shown.
+        let outcome = vm.place(&at(1));
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.notice("you cannot build there"),
+            Some("you cannot build there")
+        );
+
+        // A string — refused, in the mod's words rather than the engine's.
+        let outcome = vm.place(&at(2));
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.notice("you cannot build there"),
+            Some("this land is claimed")
+        );
+
+        // Empty — cancelled, and the player hears nothing. The milk poured.
+        let outcome = vm.place(&at(3));
+        assert!(!outcome.allowed, "an empty string did not cancel");
+        assert_eq!(
+            outcome.notice("you cannot build there"),
+            None,
+            "a mod that handled the placement itself was reported to the player as a refusal"
+        );
+    }
+
+    #[test]
+    fn a_refusal_a_mod_wrote_is_bounded_before_it_reaches_a_player() {
+        // A mod is not hostile, but it can be buggy, and this ends up on the
+        // wire. Truncated on a character boundary, because slicing UTF-8
+        // anywhere else panics — and a mod is free to refuse in any language.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "shouty",
+            "game.register_on_place(function() return string.rep('никак', 4000) end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let outcome = vm.place(&a_place());
+        assert!(!outcome.allowed);
+        let reason = outcome.reason.expect("a reason");
+        assert!(
+            reason.len() <= crate::script::MAX_REFUSAL_BYTES,
+            "a mod put {} bytes in front of a player",
+            reason.len()
+        );
+        assert!(!reason.is_empty(), "the whole message was truncated away");
     }
 
     #[test]

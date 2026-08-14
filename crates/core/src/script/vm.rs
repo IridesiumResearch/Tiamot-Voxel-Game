@@ -593,9 +593,40 @@ pub struct PunchEvent {
 pub struct HookOutcome {
     /// Whether the action may proceed.
     pub allowed: bool,
+    /// What to tell the player, when the mod said.
+    ///
+    /// # Cancelling has two meanings and the engine could not tell them apart
+    ///
+    /// A hook returning `false` means "this does not happen", and that covers
+    /// two quite different intentions: *refusing* the player, and *handling*
+    /// the action itself. `core_milk` is the second — it pours milk and cancels
+    /// the block write, because the block was only ever a way of naming what to
+    /// pour — and it was being answered with "you cannot build there" every time
+    /// it worked. Reported from the window, with a log showing the pour
+    /// succeeding on the line above the complaint.
+    ///
+    /// So the return value now says which:
+    ///
+    /// | returned | meaning |
+    /// |---|---|
+    /// | nothing, or anything truthy | allowed |
+    /// | `false` | refused; the caller's own wording is shown |
+    /// | a non-empty string | refused; that wording is shown |
+    /// | `""` | cancelled, and the player is told nothing |
+    ///
+    /// `None` here is the `false` case. Use [`HookOutcome::notice`] rather than
+    /// reading it directly, so every caller spells the ladder the same way.
+    pub reason: Option<String>,
     /// Mods that faulted during this round, now disabled.
     pub faults: Vec<(String, ScriptError)>,
 }
+
+/// The longest refusal a mod may put in front of a player.
+///
+/// A mod is not hostile, but it can be buggy, and this ends up on the wire —
+/// [`crate::proto::MAX_CHAT_BYTES`] is the cap a chat message gets and there is
+/// no reason a refusal should get more.
+pub const MAX_REFUSAL_BYTES: usize = crate::proto::MAX_CHAT_BYTES;
 
 impl HookOutcome {
     /// An outcome nothing objected to.
@@ -603,7 +634,27 @@ impl HookOutcome {
     pub const fn allow() -> Self {
         Self {
             allowed: true,
+            reason: None,
             faults: Vec::new(),
+        }
+    }
+
+    /// What to say to the player, given the caller's own default wording.
+    ///
+    /// `None` for "say nothing": either the action was allowed, or a mod
+    /// cancelled it silently because it had handled the action itself.
+    #[must_use]
+    pub fn notice<'a>(&'a self, default: &'a str) -> Option<&'a str> {
+        if self.allowed {
+            return None;
+        }
+        match self.reason.as_deref() {
+            // A mod that cancelled without saying anything gets the caller's
+            // wording, because a refusal nobody explains reads as the game
+            // being broken.
+            None => Some(default),
+            Some("") => None,
+            Some(reason) => Some(reason),
         }
     }
 }

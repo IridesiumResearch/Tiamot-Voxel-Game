@@ -1071,6 +1071,15 @@ impl ServerHandle {
                                 // forever, and the player would watch a crack
                                 // that never finishes.
                                 shared.set_dig(&uuid, None);
+                                // Only when the mod supplied one. A silent
+                                // refusal was this path's behaviour before mods
+                                // could say anything, and inventing wording for
+                                // it now would put game copy in the engine.
+                                if let Some(notice) = verdict.reason.as_deref().filter(|reason| {
+                                    !reason.is_empty()
+                                }) {
+                                    shared.tell(&uuid, notice.to_owned());
+                                }
                                 continue;
                             }
 
@@ -1218,10 +1227,17 @@ impl ServerHandle {
                                 error!(mod_id = %mod_id, "mod disabled after an on_place failure: {err}");
                             }
                             if !verdict.allowed {
-                                shared.tell(
-                                    &request.actor,
-                                    "you cannot build there".to_owned(),
-                                );
+                                // **A cancelled placement is not always a
+                                // refused one.** `core_milk` pours milk and
+                                // cancels the block write, because the block was
+                                // only ever a way of naming what to pour — and
+                                // it was being answered with "you cannot build
+                                // there" every single time it worked. The mod
+                                // now says whether the player should hear
+                                // anything; see `HookOutcome::notice`.
+                                if let Some(notice) = verdict.notice("you cannot build there") {
+                                    shared.tell(&request.actor, notice.to_owned());
+                                }
                                 continue;
                             }
 
