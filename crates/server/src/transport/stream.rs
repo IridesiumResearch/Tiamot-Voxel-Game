@@ -88,6 +88,42 @@ impl Streamer {
         self.in_flight.is_empty() && self.next_needed(usize::MAX).is_empty()
     }
 
+    /// The radius this client is being streamed at.
+    #[must_use]
+    pub const fn view(&self) -> ViewDistance {
+        self.view
+    }
+
+    /// Changes the radius, returning chunks that left range.
+    ///
+    /// The same contract as [`Streamer::recentre`] and for the same reason —
+    /// the caller sends a `ChunkUnload` for each returned position, and a
+    /// client told to unload has thrown the chunk away, so shrinking and then
+    /// growing again streams it back.
+    ///
+    /// Growing returns nothing: no chunk leaves range when the range gets
+    /// bigger, and the new ones arrive through [`Streamer::next_needed`] on the
+    /// next pump like any other.
+    pub fn resize(&mut self, view: ViewDistance) -> Vec<ChunkPos> {
+        if view == self.view {
+            return Vec::new();
+        }
+        self.view = view;
+        self.in_flight
+            .retain(|pos| interest::contains(self.centre, view, *pos));
+
+        let departed: Vec<ChunkPos> = self
+            .sent
+            .iter()
+            .copied()
+            .filter(|pos| !interest::contains(self.centre, view, *pos))
+            .collect();
+        for pos in &departed {
+            self.sent.remove(pos);
+        }
+        departed
+    }
+
     /// Moves the interest centre, returning chunks that left range.
     ///
     /// The caller sends a `ChunkUnload` for each. They are forgotten here, so
@@ -178,6 +214,80 @@ mod tests {
 
     fn streamer() -> Streamer {
         Streamer::new(ORIGIN, ViewDistance::MINIMUM)
+    }
+
+    #[test]
+    fn shrinking_the_radius_unloads_what_left_range() {
+        // The client asking to see less has to actually cost less, and the
+        // chunks it can no longer see have to be taken off it — otherwise
+        // "reduce your view distance" would free nothing on either side, which
+        // is the entire reason somebody reaches for the setting.
+        let mut streamer = Streamer::new(ORIGIN, ViewDistance::DEFAULT);
+        for pos in streamer.next_needed(usize::MAX) {
+            streamer.requested(pos);
+            streamer.completed(pos);
+            streamer.delivered(pos);
+        }
+        let before = streamer.sent_count();
+        assert!(streamer.is_complete());
+
+        let departed = streamer.resize(ViewDistance::MINIMUM);
+        assert!(
+            !departed.is_empty(),
+            "shrinking to the minimum unloaded nothing"
+        );
+        assert_eq!(
+            streamer.sent_count(),
+            before - departed.len(),
+            "the unload list and what is still held must agree"
+        );
+        assert_eq!(
+            streamer.sent_count(),
+            interest::chunks_around(ORIGIN, ViewDistance::MINIMUM).len(),
+            "what is left should be exactly the smaller interest set"
+        );
+        assert!(
+            streamer.is_complete(),
+            "shrinking left work outstanding, so the client would be sent chunks it \
+             cannot see"
+        );
+    }
+
+    #[test]
+    fn growing_the_radius_unloads_nothing_and_asks_for_the_rest() {
+        // No chunk leaves range when the range gets bigger, and the new ones
+        // arrive through the ordinary pump rather than through a special path.
+        let mut streamer = Streamer::new(ORIGIN, ViewDistance::MINIMUM);
+        for pos in streamer.next_needed(usize::MAX) {
+            streamer.requested(pos);
+            streamer.completed(pos);
+            streamer.delivered(pos);
+        }
+        let held = streamer.sent_count();
+
+        assert!(
+            streamer.resize(ViewDistance::DEFAULT).is_empty(),
+            "growing the radius unloaded something"
+        );
+        assert_eq!(streamer.sent_count(), held, "growing dropped a held chunk");
+        assert!(
+            !streamer.is_complete(),
+            "growing the radius asked for nothing new"
+        );
+    }
+
+    #[test]
+    fn resizing_to_the_same_radius_is_a_no_op() {
+        // A client re-sending its preference — on a reconnect, or every time a
+        // settings screen closes — must not churn its whole interest set.
+        let mut streamer = Streamer::new(ORIGIN, ViewDistance::DEFAULT);
+        for pos in streamer.next_needed(usize::MAX) {
+            streamer.requested(pos);
+            streamer.completed(pos);
+            streamer.delivered(pos);
+        }
+        assert!(streamer.resize(ViewDistance::DEFAULT).is_empty());
+        assert!(streamer.is_complete());
     }
 
     #[test]

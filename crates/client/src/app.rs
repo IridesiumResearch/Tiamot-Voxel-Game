@@ -642,6 +642,18 @@ pub struct App {
     spawn: Option<Position>,
     /// Whether the world has been joined.
     joined: bool,
+    /// The radius the server is actually streaming, in chunks.
+    ///
+    /// **Separate from `config.view_distance`, which stays the player's
+    /// PREFERENCE.** The server clamps to its own limit, so the two differ
+    /// whenever a server is stingier than this client asked to be — and
+    /// overwriting the preference with the grant would make a reconnect ask for
+    /// what it was last given rather than what the player configured, ratcheting
+    /// the world smaller every time they joined a strict server.
+    ///
+    /// The fog is drawn from this one, so the world ends in haze rather than in
+    /// clear air.
+    granted_view: tiamot_core::interest::ViewDistance,
     /// The most recent warnings, newest last.
     warnings: Vec<String>,
     /// A smoothed frame rate, for the HUD.
@@ -797,6 +809,10 @@ impl App {
             f32::from(config.view_distance) * tiamot_core::CHUNK_BLOCKS as f32,
         );
         Self {
+            // Until the server says otherwise, assume it grants what was
+            // asked. A client that drew no world until the grant arrived would
+            // flash empty for a round trip on every join.
+            granted_view: config.view(),
             config,
             connection,
             renderer,
@@ -1804,6 +1820,27 @@ impl App {
         self.connection.shutdown();
     }
 
+    /// Records the radius the server says it is actually streaming at.
+    ///
+    /// **The granted value replaces what the fog is drawn from, and never the
+    /// configured preference.** Overwriting the preference would make a
+    /// reconnect ask for what it was last given rather than what the player
+    /// chose, ratcheting the world smaller every time they joined a strict
+    /// server.
+    fn accept_view_distance(&mut self, horizontal: u8, vertical: u8) {
+        self.granted_view = tiamot_core::interest::ViewDistance::clamped(horizontal, vertical);
+        if horizontal != self.config.view_distance {
+            // Worth saying out loud: a player who set 16 and is being sent 8
+            // should be able to find out why the world is smaller than they
+            // asked for.
+            tracing::info!(
+                asked = self.config.view_distance,
+                granted = horizontal,
+                "the server capped the view distance"
+            );
+        }
+    }
+
     /// Drains everything the network has produced since the last frame.
     ///
     /// Returns `false` once the connection has ended, which is the signal to
@@ -1852,6 +1889,18 @@ impl App {
                     self.tick = tick;
                     self.joined = true;
 
+                    // **Ask for the radius this client was configured with.**
+                    // Sent on join rather than on connect because the server
+                    // only has a streamer for a player who has reached the
+                    // world. The answer comes back as `Event::ViewDistance`
+                    // carrying what was actually granted, which is what the fog
+                    // is then drawn from — asking is not getting, and the
+                    // server's own limit is the ceiling.
+                    self.connection.send(crate::net::Command::ViewDistance {
+                        horizontal: self.config.view_distance,
+                        vertical: self.config.vertical_view_distance,
+                    });
+
                     // The body starts where the server said, in the same
                     // (chunk, local cells) pair the server simulates in — no
                     // conversion, so nothing to disagree about.
@@ -1876,6 +1925,17 @@ impl App {
                 Event::ChunkFluid(pos, layer) => self.store.set_fluid(pos, *layer),
 
                 Event::Fluids { fluids } => self.store.set_fluid_table(&fluids),
+
+                // **The GRANTED radius, which is what the fog is drawn from.**
+                // Using the configured one instead would end the world in clear
+                // air whenever the server gave less than was asked for — and
+                // the server's limit is the one that decides, so that is not a
+                // rare case but the normal one on any server with a lower cap
+                // than this client's config.
+                Event::ViewDistance {
+                    horizontal,
+                    vertical,
+                } => self.accept_view_distance(horizontal, vertical),
 
                 Event::Sky(sky) => self.sky = sky,
 
@@ -2051,7 +2111,7 @@ impl App {
             .set_sun(moment.intensity, moment.sun, moment.sun_direction);
         self.renderer.set_sky(
             moment.sky,
-            f32::from(self.config.view_distance) * tiamot_core::CHUNK_BLOCKS as f32,
+            f32::from(self.granted_view.horizontal) * tiamot_core::CHUNK_BLOCKS as f32,
         );
         self.renderer.set_grade(moment.grade);
 

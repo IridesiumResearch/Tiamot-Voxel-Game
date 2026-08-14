@@ -747,6 +747,7 @@ impl Session {
             ClientMessage::CancelDig => "CancelDig",
             ClientMessage::SelectTool { .. } => "SelectTool",
             ClientMessage::Place { .. } => "Place",
+            ClientMessage::ViewDistance { .. } => "ViewDistance",
         };
         self.close_with(DisconnectReason::ProtocolError {
             detail: format!("{what} is not valid in phase {:?}", self.phase),

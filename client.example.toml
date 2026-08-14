@@ -41,10 +41,22 @@ world_path = "singleplayer"
 #
 # Work grows with the SQUARE of this. Values outside the engine's supported
 # range are clamped rather than obeyed.
+#
+# This is a REQUEST, not a setting the client can impose. On join the client
+# asks the server for this radius and the server answers with what it is
+# willing to send, capped by its own `view_distance` — so a server configured
+# lower than this wins, and the fog is drawn at what was actually granted
+# rather than at what was asked for. Asking for LESS is always granted, which
+# is the direction that matters: this is how you make the world smaller on a
+# machine that wants it smaller, on somebody else's server.
+#
+# In singleplayer the embedded server is started with this value, so here the
+# request and the limit are the same number and you always get what you ask.
 view_distance = 8
 
 # How far to render vertically, in chunks. Smaller than the horizontal radius
-# on purpose: players move horizontally far more than vertically.
+# on purpose: players move horizontally far more than vertically. Requested and
+# capped exactly as the horizontal radius is.
 vertical_view_distance = 4
 
 # How the world is drawn. A debugging aid, not a lighting setting — see

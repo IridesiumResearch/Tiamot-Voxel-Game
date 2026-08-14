@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -66,6 +66,14 @@ pub const PROTOCOL_VERSION: u32 = 11;
 // because it is state. Two messages rather than one for exactly that reason —
 // re-sending a mod's whole keyframe list twenty times a second to carry one
 // float would be absurd.
+// v11 (Task 11): appended `ServerMessage::{ChunkFluid, FluidTable}`.
+// v12 (Task 11): appended `ClientMessage::ViewDistance` and
+// `ServerMessage::ViewDistance`. How far a player sees is a bargain between two
+// machines — the client knows what its GPU can take, the server knows what it
+// can afford to send fifty of — so the client asks and the server answers with
+// what it is willing to send. Two messages rather than one because the granted
+// value is not the requested one, and a client drawing its fog for a radius the
+// server refused would end the world in clear air.
 // v10 (Task 10): `SkyFrame` grew a `grade`. **A field on an existing struct, not
 // an appended variant** — the one shape of change this format does not make
 // safe, because postcard is not self-describing and an old client would read the
@@ -477,6 +485,33 @@ pub enum ClientMessage {
         /// Which material to place, as a world material id.
         material: u16,
     },
+
+    /// Ask for how far the server should stream chunks to this player.
+    ///
+    /// **Appended at the end** (protocol v12).
+    ///
+    /// # A request, and the server's own limit is the ceiling
+    ///
+    /// How far a player can see is a bargain between two machines: the client
+    /// knows what its GPU and its patience can take, and the server knows what
+    /// it can afford to send fifty of. Neither can decide alone. So the client
+    /// asks and the server answers with [`ServerMessage::ViewDistance`],
+    /// clamped to its configured maximum — a client asking for the horizon does
+    /// not get to make the server pay for it.
+    ///
+    /// **Asking for LESS is always granted**, and that direction matters more:
+    /// a player on a modest machine, or on a bad link, needs a way to make the
+    /// world smaller, and before this there was none — the server's setting was
+    /// everyone's setting.
+    ///
+    /// May be sent at any time, not only on join. A player changing it should
+    /// not have to reconnect.
+    ViewDistance {
+        /// Chunks of horizontal radius.
+        horizontal: u8,
+        /// Chunks of vertical radius.
+        vertical: u8,
+    },
 }
 
 /// Messages a server sends.
@@ -753,6 +788,22 @@ pub enum ServerMessage {
         /// Every fluid, in ascending id order.
         fluids: Vec<FluidDef>,
     },
+
+    /// How far the server is actually streaming to this player.
+    ///
+    /// **Appended at the end** (protocol v12).
+    ///
+    /// The answer to [`ClientMessage::ViewDistance`], and sent unprompted on
+    /// join so a client knows the server's default before it has asked for
+    /// anything. **The granted value, not the requested one**, which is the
+    /// point: a client that drew its fog for a radius the server refused would
+    /// show the world ending in clear air well before the haze reached it.
+    ViewDistance {
+        /// Chunks of horizontal radius the server will send.
+        horizontal: u8,
+        /// Chunks of vertical radius the server will send.
+        vertical: u8,
+    },
 }
 
 /// One registered fluid, as the wire carries it.
@@ -996,6 +1047,9 @@ pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolEr
         | ClientMessage::CancelDig
         | ClientMessage::SelectTool { tool: None }
         | ClientMessage::Place { .. }
+        // Two bytes, and `ViewDistance::clamped` bounds them on the way in —
+        // there is no value a peer can put here that costs anything to hold.
+        | ClientMessage::ViewDistance { .. }
         | ClientMessage::Disconnect => {}
     }
     Ok(())
@@ -1090,6 +1144,7 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::ChunkFluid { .. }
         | ServerMessage::FluidTable { .. }
         | ServerMessage::SkyTable { .. }
+        | ServerMessage::ViewDistance { .. }
         | ServerMessage::TimeOfDay { .. } => {}
     }
     Ok(())
@@ -1357,7 +1412,7 @@ mod tests {
         // test fails after an edit, something was inserted or reordered rather
         // than appended, and PROTOCOL_VERSION must be bumped.
         let signature = WireSignature([0u8; 64]);
-        let client: [(ClientMessage, u8); 14] = [
+        let client: [(ClientMessage, u8); 15] = [
             (
                 ClientMessage::Hello {
                     protocol_version: 0,
@@ -1429,6 +1484,14 @@ mod tests {
                     material: 0,
                 },
                 13,
+            ),
+            // Protocol v12.
+            (
+                ClientMessage::ViewDistance {
+                    horizontal: 0,
+                    vertical: 0,
+                },
+                14,
             ),
         ];
 
@@ -1696,6 +1759,14 @@ mod tests {
 
         let table = encode(&ServerMessage::FluidTable { fluids: Vec::new() }).expect("encode");
         assert_eq!(table[0], 20);
+
+        // Protocol v12.
+        let view = encode(&ServerMessage::ViewDistance {
+            horizontal: 0,
+            vertical: 0,
+        })
+        .expect("encode");
+        assert_eq!(view[0], 21);
     }
 
     #[test]

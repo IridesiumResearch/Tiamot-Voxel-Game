@@ -164,6 +164,8 @@ struct Seen {
     sky: Option<client::sky::Sky>,
     /// The most recent time of day the server sent.
     time_of_day: Option<f32>,
+    /// The radius the server said it is streaming at.
+    view_distance: Option<(u8, u8)>,
 }
 
 impl Seen {
@@ -183,6 +185,10 @@ impl Seen {
             Event::ChunkFluid(pos, layer) => self.store.set_fluid(pos, *layer),
             Event::Fluids { fluids } => self.store.set_fluid_table(&fluids),
             Event::Sky(sky) => self.sky = Some(sky),
+            Event::ViewDistance {
+                horizontal,
+                vertical,
+            } => self.view_distance = Some((horizontal, vertical)),
             Event::TimeOfDay(time) => self.time_of_day = Some(time),
             Event::ChunkUnload(pos) => {
                 self.store.remove(pos);

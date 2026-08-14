@@ -188,6 +188,19 @@ pub enum Event {
         fluids: Vec<tiamot_core::proto::FluidDef>,
     },
 
+    /// How far the server is actually streaming.
+    ///
+    /// The GRANTED radius, not the one this client asked for — the server
+    /// clamps to its own limit. The fog is drawn from this, so a client that
+    /// asked for more than it was given still ends the world in haze rather
+    /// than in clear air.
+    ViewDistance {
+        /// Chunks of horizontal radius.
+        horizontal: u8,
+        /// Chunks of vertical radius.
+        vertical: u8,
+    },
+
     /// The sky a mod registered, sent once on join.
     Sky(crate::sky::Sky),
 
@@ -256,6 +269,17 @@ pub enum Command {
     Dig {
         /// The cell under the crosshair, or `None` to cancel.
         target: Option<tiamot_core::SubNodePos>,
+    },
+    /// Ask the server for a streaming radius.
+    ///
+    /// A request. The server clamps it to its own configured maximum and
+    /// answers with [`Event::ViewDistance`] carrying what was actually granted.
+    /// May be sent at any time, so changing it does not need a reconnect.
+    ViewDistance {
+        /// Chunks of horizontal radius.
+        horizontal: u8,
+        /// Chunks of vertical radius.
+        vertical: u8,
     },
     /// Choose the held tool.
     SelectTool {
@@ -934,6 +958,16 @@ async fn session(
                 let _ = events.send(Event::Fluids { fluids });
             }
 
+            ServerMessage::ViewDistance {
+                horizontal,
+                vertical,
+            } => {
+                let _ = events.send(Event::ViewDistance {
+                    horizontal,
+                    vertical,
+                });
+            }
+
             ServerMessage::HelloAck { .. }
             | ServerMessage::ModManifest { .. }
             | ServerMessage::EntityStateDelta { .. } => {}
@@ -1051,6 +1085,13 @@ fn to_wire(command: Command) -> ClientMessage {
         } => ClientMessage::StartDig { target },
         Command::Dig { target: None } => ClientMessage::CancelDig,
         Command::SelectTool { tool } => ClientMessage::SelectTool { tool },
+        Command::ViewDistance {
+            horizontal,
+            vertical,
+        } => ClientMessage::ViewDistance {
+            horizontal,
+            vertical,
+        },
         Command::Place { target, material } => ClientMessage::Place { target, material },
         Command::Disconnect => ClientMessage::Disconnect,
         // Unreachable: the session loop applies it and never gets here. A

@@ -1035,6 +1035,10 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
     let mut broadcasts = shared.outbound.subscribe();
     let mut kicks = shared.kicks.subscribe();
     let mut streamer: Option<Streamer> = None;
+    // Whether the player reached the world on this message, so the opening
+    // view-distance answer can be sent after the join flow rather than inside
+    // it.
+    let mut just_joined = false;
 
     // The streaming beat is an `interval`, NOT a `sleep` inside the select.
     //
@@ -1226,6 +1230,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
             // `recentre` as the player moves; see `stream.rs` on why the
             // client is not asked where it is.
             streamer = Some(Streamer::new(shared.spawn.chunk(), shared.view_distance));
+            just_joined = true;
             info!(
                 player = session.display_name().unwrap_or("<unnamed>"),
                 uuid = session.uuid().map(|id| id.short()).unwrap_or_default(),
@@ -1235,6 +1240,61 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
 
         for outbound in &response.send {
             frame::write(&mut send, outbound).await?;
+        }
+
+        // **After the join flow, not inside it.** `JoinWorld` is the message
+        // that completes the handshake, and clients and tests alike key off its
+        // position in the sequence — slipping this in ahead of it displaced the
+        // whole flow, which `a_bot_completes_the_whole_join_flow` caught.
+        //
+        // Unprompted, so a client that never asks still knows the radius it is
+        // being sent and draws its fog there rather than at a number of its own.
+        if std::mem::take(&mut just_joined) {
+            frame::write(
+                &mut send,
+                &ServerMessage::ViewDistance {
+                    horizontal: shared.view_distance.horizontal,
+                    vertical: shared.view_distance.vertical,
+                },
+            )
+            .await?;
+        }
+
+        // **The client's say in how far it sees, clamped by the server's.**
+        //
+        // Handled here rather than in the session for the reason content
+        // requests are: the session is a state machine over the handshake and
+        // owns no streamer. Charter rule 2 keeps the decision on the server —
+        // this is a request, and the answer is what the server is willing to
+        // send rather than what the client asked for.
+        if let ClientMessage::ViewDistance {
+            horizontal,
+            vertical,
+        } = &message
+            && let Some(streamer) = streamer.as_mut()
+        {
+            // Capped by the server's configured radius on both axes, then by
+            // the engine's own bounds. Asking for LESS is always granted, which
+            // is the direction that matters: a player on a modest machine needs
+            // a way to make the world smaller, and before this there was none.
+            let granted = tiamot_core::interest::ViewDistance::clamped(
+                (*horizontal).min(shared.view_distance.horizontal),
+                (*vertical).min(shared.view_distance.vertical),
+            );
+            for pos in streamer.resize(granted) {
+                frame::write(&mut send, &ServerMessage::ChunkUnload { pos }).await?;
+            }
+            // Echoed even when it changed nothing, so a client that asked for
+            // more than it may have still learns what it actually got and draws
+            // its fog there.
+            frame::write(
+                &mut send,
+                &ServerMessage::ViewDistance {
+                    horizontal: granted.horizontal,
+                    vertical: granted.vertical,
+                },
+            )
+            .await?;
         }
 
         // Content requests are served here rather than in the session, which

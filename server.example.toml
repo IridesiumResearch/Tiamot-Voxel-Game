@@ -27,13 +27,19 @@ max_players = 16
 
 # How far players can see, in chunks. One chunk is 16 blocks.
 #
+# **This is the CEILING, not the setting.** Clients ask for a radius and the
+# server grants the smaller of what was asked and this — so a player may choose
+# to see less, and nobody may make this server send more. A client asking for
+# 255 gets this number and is told so.
+#
 # Interest volume grows with the SQUARE of the horizontal radius, so 16 is four
 # times the streaming work of 8. Values outside 1..=32 are clamped rather than
 # obeyed — a server that accepted 200 would appear to start and then fail to
 # keep up in a way that looked like an engine bug.
 view_distance = 8
 
-# How far players can see vertically, in chunks. Clamped to 1..=16.
+# How far players can see vertically, in chunks. Clamped to 1..=16, and a
+# ceiling on what clients may ask for exactly as the horizontal radius is.
 #
 # Smaller than the horizontal radius on purpose: players move horizontally far
 # more than vertically, and the interesting content is a thin shell around the
