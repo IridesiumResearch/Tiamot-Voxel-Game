@@ -563,6 +563,7 @@ impl ServerHandle {
                         tiamot_core::fluid::Fluid::flowing(id, level as u8).depth_units() as u8;
                 }
                 tiamot_core::proto::FluidDef {
+                    color: registered.color,
                     id: id.0,
                     name: registered.name.clone(),
                     material: registered.material.get(),

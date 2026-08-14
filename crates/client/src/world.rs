@@ -86,6 +86,12 @@ pub struct ChunkStore {
     /// surface is would show as milk at one height on screen and another under
     /// your feet.
     fluid_depths: [[u8; 8]; tiamot_core::fluid::MAX_FLUIDS + 1],
+    /// What each fluid looks like from inside, as `0..=1` per channel.
+    ///
+    /// **The same space the sky's colours are in**, because this is fed to the
+    /// same `set_sky` they are — a fluid tinted in a different space would be a
+    /// different colour on screen from the one the mod chose.
+    fluid_colours: [[f32; 3]; tiamot_core::fluid::MAX_FLUIDS + 1],
 }
 
 impl ChunkStore {
@@ -158,6 +164,7 @@ impl ChunkStore {
     pub fn set_fluid_table(&mut self, fluids: &[tiamot_core::proto::FluidDef]) {
         self.fluid_materials = [0; tiamot_core::fluid::MAX_FLUIDS + 1];
         self.fluid_depths = [[0; 8]; tiamot_core::fluid::MAX_FLUIDS + 1];
+        self.fluid_colours = [[1.0; 3]; tiamot_core::fluid::MAX_FLUIDS + 1];
         for def in fluids {
             let Some(slot) = usize::from(def.id).checked_sub(0) else {
                 continue;
@@ -167,6 +174,7 @@ impl ChunkStore {
             }
             self.fluid_materials[slot] = def.material;
             self.fluid_depths[slot] = def.depths;
+            self.fluid_colours[slot] = def.color.map(|channel| f32::from(channel) / 255.0);
         }
         if !self.fluid.is_empty() {
             self.mark_all_dirty();
@@ -198,6 +206,18 @@ impl ChunkStore {
             }
         }
         out
+    }
+
+    /// What being inside a fluid looks like, `0..=1` per channel.
+    ///
+    /// White for a fluid this client was never told about, which is the same
+    /// answer as no tint at all rather than a black screen.
+    #[must_use]
+    pub fn fluid_colour(&self, fluid: tiamot_core::fluid::FluidId) -> [f32; 3] {
+        self.fluid_colours
+            .get(usize::from(fluid.0))
+            .copied()
+            .unwrap_or([1.0; 3])
     }
 
     /// The fluid in one chunk, as the mesher wants it.

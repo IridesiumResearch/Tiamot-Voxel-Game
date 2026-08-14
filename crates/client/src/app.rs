@@ -42,6 +42,15 @@ use crate::world::{ABSENT_POLICY, ChunkStore};
 /// invisible HUD, and 170 KiB is not worth a failure mode.
 const HUD_FONT: &[u8] = include_bytes!("../assets/third-party/go-font/Go-Mono.ttf");
 
+/// How far you can see inside a fluid, in blocks.
+///
+/// Sixteen — one chunk. Far enough to make out the shape of a pool you are
+/// swimming in, close enough that being under is unmistakable and that the
+/// world beyond dissolves rather than merely tinting. Not a mod's choice yet: a
+/// fluid declares its colour, and how far light carries through it is a second
+/// knob that can be added when something wants one.
+const UNDERWATER_VISIBILITY: f32 = 16.0;
+
 /// Installs [`HUD_FONT`] as the only font egui has.
 ///
 /// **Required, not cosmetic.** The client builds egui without `default_fonts`
@@ -1820,6 +1829,22 @@ impl App {
         self.connection.shutdown();
     }
 
+    /// Which fluid the camera is inside, if any.
+    ///
+    /// The EYE rather than the body: a swimmer floating with their head out is
+    /// not looking through milk, and tinting the frame from the body's
+    /// submerged fraction would put them underwater while they can plainly see
+    /// the sky. `phys::swim::fluid_at` is the same surface height the physics
+    /// floats them at and the mesher draws — a tint arriving a fraction of a
+    /// cell early or late is the kind of mismatch nobody can debug from a
+    /// screenshot.
+    fn submerged_in(&self) -> Option<tiamot_core::fluid::FluidId> {
+        let predictor = self.predictor.as_ref()?;
+        let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin());
+        let fluid = phys::swim::fluid_at(&voxels, predictor.body().eye());
+        (!fluid.is_none()).then_some(fluid)
+    }
+
     /// Records the radius the server says it is actually streaming at.
     ///
     /// **The granted value replaces what the fog is drawn from, and never the
@@ -2109,10 +2134,23 @@ impl App {
         let moment = self.sky.moment();
         self.renderer
             .set_sun(moment.intensity, moment.sun, moment.sun_direction);
-        self.renderer.set_sky(
-            moment.sky,
-            f32::from(self.granted_view.horizontal) * tiamot_core::CHUNK_BLOCKS as f32,
-        );
+        // **Under the milk, the milk IS the sky.**
+        //
+        // Being submerged is fog: dense, close, and the colour of what you are
+        // in. Saying it that way rather than adding a tint pass means it works
+        // in all three lighting modes without touching any of them — modes 1
+        // and 2 fog in the world shader, mode 3 fogs from depth in the post
+        // chain, and both take the same colour and distance. It also gets the
+        // background right, which a tint over the frame would not: the sky
+        // through the surface is milk, not sky.
+        let (sky, far) = match self.submerged_in() {
+            Some(fluid) => (self.store.fluid_colour(fluid), UNDERWATER_VISIBILITY),
+            None => (
+                moment.sky,
+                f32::from(self.granted_view.horizontal) * tiamot_core::CHUNK_BLOCKS as f32,
+            ),
+        };
+        self.renderer.set_sky(sky, far);
         self.renderer.set_grade(moment.grade);
 
         let sensitivity = self.config.mouse_sensitivity;

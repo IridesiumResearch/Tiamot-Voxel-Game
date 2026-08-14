@@ -230,6 +230,11 @@ pub struct Registered {
     /// Zero never renews. See [`Tuning::renews_from`] — it is what stops an
     /// ocean collapsing when somebody takes a bucket out of the middle of it.
     pub renews_from: u8,
+    /// What being inside it looks like, sRGB `0..=255`.
+    ///
+    /// Separate from the material, because a texture is what the surface looks
+    /// like from outside and this is what the world looks like from within.
+    pub color: [u8; 3],
     /// The material a full block of it is drawn as.
     ///
     /// Fluid has no material of its own in the block store — a block holds
@@ -315,6 +320,9 @@ impl Fluids {
             waterlogs_at: crate::UNITS_PER_BLOCK,
             tick_rate: 1,
             renews_from: 0,
+            // Never drawn and never submerged in, so the colour is arbitrary;
+            // white is the one that cannot be mistaken for a deliberate choice.
+            color: [255, 255, 255],
             // Air, so a client that is somehow told about it draws nothing.
             material: MaterialId::AIR,
         })?;
@@ -454,6 +462,7 @@ mod tests {
                 flow_range: 7,
                 waterlogs_at: 14,
                 renews_from: 0,
+                color: [255, 255, 255],
                 tick_rate: 1,
                 material: MaterialId(4),
             })
@@ -472,6 +481,7 @@ mod tests {
             flow_range: 7,
             waterlogs_at: 14,
             renews_from: 0,
+            color: [255, 255, 255],
             tick_rate: 1,
             material: MaterialId(4),
         };
@@ -492,6 +502,7 @@ mod tests {
                     flow_range: 7,
                     waterlogs_at: 14,
                     renews_from: 0,
+                    color: [255, 255, 255],
                     tick_rate: 1,
                     material: MaterialId(1),
                 })
@@ -503,6 +514,7 @@ mod tests {
                 flow_range: 7,
                 waterlogs_at: 14,
                 renews_from: 0,
+                color: [255, 255, 255],
                 tick_rate: 1,
                 material: MaterialId(1),
             }),

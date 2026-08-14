@@ -356,6 +356,8 @@ pub struct FluidRules {
     /// stops an ocean collapsing when somebody takes a bucket out of the
     /// middle of it. See `fluid::Tuning::renews_from`.
     pub renews_from: u8,
+    /// What being inside it looks like, sRGB `0..=255`.
+    pub color: [u8; 3],
 }
 
 impl FluidRules {
@@ -370,6 +372,13 @@ impl FluidRules {
 
     /// Whether a fluid renews, if its mod said nothing. It does not.
     pub const DEFAULT_RENEWS_FROM: u8 = 0;
+
+    /// What a fluid looks like from inside, if its mod said nothing.
+    ///
+    /// White, which is milk's own answer and a visible one for anything else —
+    /// a mod that forgot the field gets a tint it will notice rather than a
+    /// transparent one it will not.
+    pub const DEFAULT_COLOR: [u8; 3] = [255, 255, 255];
 }
 
 /// How a moment's finished picture is graded.

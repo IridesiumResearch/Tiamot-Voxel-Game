@@ -827,6 +827,11 @@ impl ScriptVm for MluaVm {
                     flow_range: entry.get("flow_range").ok()?,
                     waterlogs_at: entry.get("waterlogs_at").ok()?,
                     renews_from: entry.get("renews_from").ok()?,
+                    color: [
+                        entry.get("color_r").ok()?,
+                        entry.get("color_g").ok()?,
+                        entry.get("color_b").ok()?,
+                    ],
                     tick_rate: entry.get("tick_rate").ok()?,
                 })
             })
@@ -1780,6 +1785,29 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
 /// else a fluid might do — hurt you, make a sound, be drinkable — is the
 /// registering mod's business and needs no engine support beyond the hooks that
 /// already exist.
+/// What a fluid looks like from inside, as three `0..=255` channels.
+///
+/// Split out of [`register_fluid`] only because that function had outgrown the
+/// line limit; it is one field's parsing and belongs beside the rest.
+fn fluid_colour(spec: &Table, qualified: &str) -> mlua::Result<[u8; 3]> {
+    let Some(table) = spec.get::<Option<Table>>("color")? else {
+        return Ok(FluidRules::DEFAULT_COLOR);
+    };
+    let mut channels = FluidRules::DEFAULT_COLOR;
+    for (index, key) in ["r", "g", "b"].into_iter().enumerate() {
+        // A channel a mod left out is full, so `{ r = 0 }` is cyan rather than
+        // black — the same reading `light_emit` gives an omitted channel.
+        let value: i64 = table.get::<Option<i64>>(key)?.unwrap_or(255);
+        if !(0..=255).contains(&value) {
+            return Err(mlua::Error::external(format!(
+                "register_fluid(\"{qualified}\"): color.{key} must be 0..=255, got {value}"
+            )));
+        }
+        channels[index] = value as u8;
+    }
+    Ok(channels)
+}
+
 fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
     if frozen {
@@ -1869,6 +1897,8 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
         )));
     }
 
+    let color = fluid_colour(spec, &qualified)?;
+
     let registry: Table = lua.named_registry_value("tiamot.fluids")?;
     if registry.contains_key(qualified.clone())? {
         return Err(mlua::Error::external(format!(
@@ -1882,6 +1912,9 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     entry.set("waterlogs_at", waterlogs_at)?;
     entry.set("tick_rate", tick_rate)?;
     entry.set("renews_from", renews_from)?;
+    entry.set("color_r", color[0])?;
+    entry.set("color_g", color[1])?;
+    entry.set("color_b", color[2])?;
     registry.set(qualified, entry)?;
     Ok(())
 }
@@ -2160,13 +2193,14 @@ const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "defa
 
 /// Fields `register_fluid` accepts. Anything else is a typo, and a typo that is
 /// silently ignored is a mod whose author cannot tell why nothing happened.
-const FLUID_FIELDS: [&str; 6] = [
+const FLUID_FIELDS: [&str; 7] = [
     "id",
     "material",
     "flow_range",
     "waterlogs_at",
     "tick_rate",
     "renews_from",
+    "color",
 ];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
@@ -2483,6 +2517,59 @@ mod tests {
 
         assert!(!vm.dig_complete(&a_dig()).allowed, "the veto was ignored");
         assert!(!vm.place(&a_place()).allowed, "the veto was ignored");
+    }
+
+    #[test]
+    fn a_fluid_declares_what_it_looks_like_from_inside() {
+        // The tint over a submerged camera, and a mod's decision rather than the
+        // engine's: a texture is what the SURFACE looks like from outside, and
+        // clear water has a vivid surface with a faint tint.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "dairy",
+            "game.register_block{ id = 'milk' }\n\
+             game.register_block{ id = 'oil' }\n\
+             game.register_fluid{ id = 'milk', material = 'milk', \
+               color = { r = 245, g = 243, b = 232 } }\n\
+             game.register_fluid{ id = 'oil', material = 'oil' }",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let fluids = vm.registered_fluids();
+        let milk = fluids
+            .iter()
+            .find(|rule| rule.fluid == "dairy:milk")
+            .expect("milk");
+        assert_eq!(milk.color, [245, 243, 232]);
+
+        // And white when a mod says nothing, which is a tint it will notice
+        // rather than a transparent one it will not.
+        let oil = fluids
+            .iter()
+            .find(|rule| rule.fluid == "dairy:oil")
+            .expect("oil");
+        assert_eq!(oil.color, [255, 255, 255]);
+    }
+
+    #[test]
+    fn a_colour_channel_outside_a_byte_is_refused_by_name() {
+        let mut vm = vm();
+        let err = load(
+            &mut vm,
+            "dairy",
+            "game.register_block{ id = 'milk' }\n\
+             game.register_fluid{ id = 'milk', material = 'milk', color = { g = 300 } }",
+        )
+        .expect_err("300 is not a channel");
+        // `Display` names the mod and the file, which is what an operator reads
+        // first; the detail the mod author needs is in the `Debug` form.
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("color.g") && text.contains("300"),
+            "the error should name the field and the value: {text}"
+        );
     }
 
     #[test]

@@ -55,6 +55,13 @@ game.register_fluid{
     -- The engine defaults this to zero and does not have an opinion — creating
     -- matter out of nothing is game design, and charter rule 1 puts that here.
     renews_from = 3,
+    -- What the world looks like from inside it. Milk, so a warm white rather
+    -- than a pure one — pure white reads as fog or as a broken frame, and the
+    -- point of being under milk is that you can tell.
+    --
+    -- The engine has no opinion about this (charter rule 1); it is the mod that
+    -- knows the fluid is milk.
+    color = { r = 245, g = 243, b = 232 },
 }
 
 game.log("registered core_milk:milk")

@@ -510,6 +510,7 @@ pub fn fluids_from_rules(
             waterlogs_at: rule.waterlogs_at,
             tick_rate: rule.tick_rate,
             renews_from: rule.renews_from,
+            color: rule.color,
             material,
         }) {
             tracing::warn!(fluid = %rule.fluid, "could not register a fluid: {err}");

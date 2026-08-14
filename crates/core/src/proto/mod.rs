@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -74,6 +74,11 @@ pub const PROTOCOL_VERSION: u32 = 12;
 // what it is willing to send. Two messages rather than one because the granted
 // value is not the requested one, and a client drawing its fog for a radius the
 // server refused would end the world in clear air.
+// v13 (Task 11): `FluidDef` grew a `color`, for the tint over a submerged
+// camera. **A field on an existing struct, not an appended variant** — the one
+// shape of change this format does not make safe, exactly as v10 was, so the
+// version check is what keeps a v12 client from reading the next fluid's bytes
+// as this one's colour.
 // v10 (Task 10): `SkyFrame` grew a `grade`. **A field on an existing struct, not
 // an appended variant** — the one shape of change this format does not make
 // safe, because postcard is not self-describing and an old client would read the
@@ -826,6 +831,15 @@ pub struct FluidDef {
     /// about where a surface sits — which would show as milk at one height on
     /// screen and a different one under your feet.
     pub depths: [u8; 8],
+    /// What being inside it looks like, as sRGB `0..=255`.
+    ///
+    /// **Not the texture, and not derived from it.** A texture is what a surface
+    /// of the fluid looks like from outside; this is what the whole world looks
+    /// like when you are under it, and the two are genuinely different choices —
+    /// clear water has a vivid surface and a faint tint. The engine has no
+    /// opinion about either (charter rule 1): the mod that registered the fluid
+    /// says.
+    pub color: [u8; 3],
 }
 
 /// One moment in a mod's day, on the wire.
