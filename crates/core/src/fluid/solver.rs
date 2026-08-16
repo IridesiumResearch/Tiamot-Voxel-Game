@@ -164,6 +164,36 @@ pub struct Flow {
     pub now: Fluid,
 }
 
+/// A flow that did not happen, and where it was stopped.
+///
+/// # What this is for
+///
+/// The interesting thing about a fluid is not only where it went but where it
+/// *tried* to go. A mod that wants waterlogging — a block that changes when milk
+/// reaches it — has no way to find out that milk is pressing against something
+/// unless the engine says so: the fluid layer records where milk IS, and a block
+/// milk cannot enter is by definition somewhere it is not.
+///
+/// Reported per lateral direction rather than per block, because "which side is
+/// wet" is the question a mod is actually asking.
+///
+/// The blocking block's material is deliberately NOT here. This module knows
+/// occupancy and nothing about materials — [`Neighbourhood`] is the whole of its
+/// view of the world — and a `MaterialId` is only meaningful next to the
+/// registry that issued it (charter rule 8). The server looks it up when it
+/// hands the event to a mod, where the right registry is in scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blocked {
+    /// The block holding the fluid.
+    pub from: BlockPos,
+    /// The block it could not get into.
+    pub into: BlockPos,
+    /// Which fluid was pressing.
+    pub fluid: FluidId,
+    /// What level it was pressing at, `1..=7`.
+    pub level: u8,
+}
+
 /// The active set, and the rule that drains it.
 ///
 /// Holds no world of its own — [`Neighbourhood`] is the world — so a server and
@@ -177,7 +207,33 @@ pub struct Solver {
     /// Carried rather than dropped: a spring field that overruns its budget
     /// finishes next tick instead of leaving milk half-spread forever.
     carried: BTreeSet<BlockPos>,
+    /// Flows that could not happen, for the `on_fluid_flow` hook.
+    ///
+    /// Drained by the caller with [`Solver::take_blocked`] rather than returned
+    /// from `tick`: it is an observation channel and not part of what the solver
+    /// did, and a caller with no mods listening should be able to ignore it
+    /// without the signature saying otherwise.
+    ///
+    /// **Capped at [`BLOCKED_PER_TICK`] and dropped rather than carried**, which
+    /// is the opposite of what `carried` does and is deliberate. An unfinished
+    /// flow must be finished or the world is wrong; an unreported block is a
+    /// notification nobody got, and the shoreline it describes will still be
+    /// there next time the pond is examined. Carrying them would let a mod that
+    /// is slow to handle them grow an unbounded queue inside the tick.
+    blocked: Vec<Blocked>,
 }
+
+/// How many blocked flows one tick will report.
+///
+/// A cap on the HOOK's cost, not on the solver's — the visit budget already
+/// bounds that. Task 11 asks for `on_fluid_flow` to be budgeted, and this is
+/// where: a mod's callback runs once per entry, so an ocean meeting a continent
+/// must not be able to hand the script VM ten thousand events in one tick.
+///
+/// Sixty-four is roughly the perimeter of an eight-block pond, so an ordinary
+/// pool reports its whole shoreline in a tick and only something enormous is
+/// sampled rather than enumerated.
+const BLOCKED_PER_TICK: usize = 64;
 
 impl Solver {
     /// An empty solver.
@@ -219,6 +275,16 @@ impl Solver {
         self.active.is_empty() && self.carried.is_empty()
     }
 
+    /// Takes the flows that could not happen since this was last called.
+    ///
+    /// Drained rather than returned from [`Solver::tick`] because it is an
+    /// observation channel and not part of what the solver did: a caller with no
+    /// mods listening never calls this, and the events cost nothing but the
+    /// bounded `Vec` they were written into.
+    pub fn take_blocked(&mut self) -> Vec<Blocked> {
+        std::mem::take(&mut self.blocked)
+    }
+
     /// Runs one fluid tick, visiting at most `budget` blocks.
     ///
     /// Returns every change made, in the order it was made, for broadcasting and
@@ -252,6 +318,13 @@ impl Solver {
                 continue;
             }
             visited += 1;
+            // Where this block's milk is pressing against something that will
+            // not take it. Recorded whether or not the block itself changed: a
+            // settled pond against a wall changes nothing every tick and is
+            // exactly the case a waterlogging mod cares about.
+            if self.blocked.len() < BLOCKED_PER_TICK {
+                record_blocked(world, tuning, pos, &mut self.blocked);
+            }
             if let Some(change) = settle_one(world, tuning, pos) {
                 // Whatever changed wakes its neighbours, including the block
                 // above: milk drained from under a column is what lets the
@@ -327,6 +400,62 @@ impl Solver {
 }
 
 /// Decides what one block should hold, and writes it if that differs.
+/// Records the lateral directions this block's fluid is pressing into and
+/// cannot enter.
+///
+/// **Only where the fluid would actually have gone.** A block at level 1 has
+/// nothing left to give — the next block along would be level 0 — so it presses
+/// against nothing and reports nothing, and a dry block obviously does not
+/// either. Without that, every solid block adjacent to any milk anywhere would
+/// generate an event every time the pond was examined.
+///
+/// The block BELOW is not considered. Fluid stopped by a floor is not blocked,
+/// it is resting; that is the ordinary case and a mod hearing about it would
+/// hear about every pond in the world having a bottom.
+fn record_blocked(
+    world: &impl Neighbourhood,
+    tuning: Tuning,
+    pos: BlockPos,
+    out: &mut Vec<Blocked>,
+) {
+    let here = world.fluid(pos);
+    if here.is_empty() {
+        return;
+    }
+    // A source pushes at full level; a flow pushes at what it has.
+    let level = if here.is_source() {
+        MAX_LEVEL
+    } else {
+        here.level()
+    };
+    if level <= 1 {
+        return;
+    }
+
+    for offset in &LATERAL {
+        let into = BlockPos::new(pos.x + offset[0], pos.y + offset[1], pos.z + offset[2]);
+        // Unloaded is not blocked. A flow reaching the edge of the loaded world
+        // is a flow nobody can answer for yet, and reporting it would tell a mod
+        // that a chunk which has not arrived is a wall.
+        if world.occupancy(into).is_none() {
+            continue;
+        }
+        if !is_floor(world, tuning, into) {
+            continue;
+        }
+        // Already holding this fluid means it is not blocked, it is met.
+        if !world.fluid(into).is_empty() {
+            continue;
+        }
+        out.push(Blocked {
+            from: pos,
+            into,
+            fluid: here.fluid(),
+            level,
+        });
+    }
+}
+
 fn settle_one(world: &mut impl Neighbourhood, tuning: Tuning, pos: BlockPos) -> Option<Flow> {
     let was = world.fluid(pos);
 
@@ -647,6 +776,97 @@ mod tests {
             }
             panic!("never settled: {} blocks still active", solver.active());
         }
+    }
+
+    #[test]
+    fn milk_pressing_against_a_wall_is_reported_and_a_pond_bottom_is_not() {
+        // What `on_fluid_flow` is built on. A mod cannot see a flow that did
+        // not happen any other way — a block milk cannot enter is a block with
+        // no milk in it, indistinguishable from one milk never reached.
+        let mut scene = Scene::default().with_floor(4).wall(2, 1, 0);
+        scene.fluid.insert((0, 1, 0), Fluid::source(MILK));
+        let mut solver = Solver::default();
+        solver.touch(BlockPos::new(0, 1, 0));
+        scene.settle(&mut solver);
+
+        let blocked = solver.take_blocked();
+        assert!(
+            blocked
+                .iter()
+                .any(|event| event.into == BlockPos::new(2, 1, 0)),
+            "milk spread up to the wall at x=2 and never reported being stopped \
+             by it: {blocked:?}"
+        );
+
+        // **Lateral only, so a pond never reports having a bottom.** Fluid
+        // stopped by the ground it is sitting on is not blocked, it is resting,
+        // and a mod hearing about that would hear about every pond in the world.
+        //
+        // Stated as "every report is sideways" rather than "nothing at y=0",
+        // because milk that spills off the edge of this fixture's floor lands at
+        // y=0 and presses into the floor blocks from the side — which is a real
+        // blocked flow and correctly reported.
+        assert!(
+            blocked.iter().all(|event| event.into.y == event.from.y),
+            "a vertical block was reported: {blocked:?}"
+        );
+
+        // Every report names the fluid doing the pressing, or a mod with two
+        // fluids in its world cannot tell which one reached the wall.
+        assert!(blocked.iter().all(|event| event.fluid == MILK));
+    }
+
+    #[test]
+    fn a_trickle_with_nothing_left_to_give_reports_nothing() {
+        // Level 1 has nowhere to go: the next block along would be level 0. A
+        // block pressing against nothing must not report pressing against
+        // something, or every solid block next to the far edge of every puddle
+        // generates an event forever.
+        let mut scene = Scene::default().with_floor(4).wall(1, 1, 0);
+        scene.fluid.insert((0, 1, 0), Fluid::flowing(MILK, 1));
+        let mut solver = Solver::default();
+        solver.touch(BlockPos::new(0, 1, 0));
+        solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX);
+
+        assert!(
+            solver.take_blocked().is_empty(),
+            "a level-1 trickle reported a blocked flow it never had to make"
+        );
+    }
+
+    #[test]
+    fn the_blocked_report_is_capped_rather_than_growing_without_bound() {
+        // Task 11 asks for the hook to be budgeted. The solver's visit budget
+        // bounds its own work; this bounds what it hands the script VM, which
+        // is a separate cost — a mod's callback runs once per entry.
+        //
+        // A long wall with a source against every block of it.
+        let mut scene = Scene::default().with_floor(64);
+        for z in -60..=60 {
+            scene.solid.insert((1, 1, z));
+            scene.fluid.insert((0, 1, z), Fluid::source(MILK));
+        }
+        let mut solver = Solver::default();
+        for z in -60..=60 {
+            solver.touch(BlockPos::new(0, 1, z));
+        }
+        solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX);
+
+        let blocked = solver.take_blocked();
+        assert!(
+            blocked.len() <= BLOCKED_PER_TICK,
+            "{} blocked flows reported in one tick, over the cap of {}",
+            blocked.len(),
+            BLOCKED_PER_TICK
+        );
+        assert!(
+            !blocked.is_empty(),
+            "a hundred and twenty sources against a wall reported nothing at all"
+        );
+
+        // And taking them empties the list, so the next tick starts fresh
+        // rather than re-reporting the same shoreline.
+        assert!(solver.take_blocked().is_empty());
     }
 
     /// Milk that renews from three sides — an ocean rather than a spring.

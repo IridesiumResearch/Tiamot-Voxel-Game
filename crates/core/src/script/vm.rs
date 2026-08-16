@@ -606,6 +606,47 @@ pub struct PunchEvent {
     pub target: [u8; 32],
 }
 
+/// Fluid pressing against something it cannot get into.
+///
+/// # Why the hook is about the flow that DIDN'T happen
+///
+/// Where a fluid went is already in the world — a mod can read it back with
+/// `game.get_fluid`. Where it *tried* to go is not recorded anywhere by
+/// definition: a block milk cannot enter is a block with no milk in it, and it
+/// looks exactly like a block milk never reached.
+///
+/// That is the fact a waterlogging mod needs, and it is why this event carries
+/// what is in the way as well as where. See `game/core_milk` for the reference
+/// implementation, and the Sub-Node Contract §4 for what "cannot get into"
+/// means at sub-node resolution.
+///
+/// **Budgeted at the solver**, so a shoreline a thousand blocks long reports a
+/// bounded sample per tick rather than handing the script VM the whole coast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FluidFlowEvent {
+    /// The block the fluid is in.
+    pub from: BlockPos,
+    /// The block it could not enter.
+    pub into: BlockPos,
+    /// Which fluid, by its registered string id.
+    pub fluid: String,
+    /// What level it is pressing at, `1..=7`.
+    pub level: u8,
+    /// The material of the block in the way.
+    ///
+    /// A **runtime** id, resolved to its string before it reaches Lua — charter
+    /// rule 8 again: a numeric id handed to a mod is a number that means
+    /// something different on the next run.
+    pub blocked_by: MaterialId,
+    /// Which of the blocking block's 27 cells are filled.
+    ///
+    /// The whole mask rather than a count, because "how much" and "which shape"
+    /// are different questions and only one of them can be recovered from a
+    /// count. A mod deciding whether to swap in a waterlogged block wants the
+    /// count; a mod carving a channel wants the shape.
+    pub occupancy: u32,
+}
+
 /// What a round of cancellable hooks decided.
 ///
 /// # A faulted mod does not get a veto
@@ -806,6 +847,17 @@ pub trait ScriptVm: Sized {
     /// are Task 12, so there is nothing to punch. This is here, and tested, so
     /// that task adds a caller rather than an API.
     fn punch(&mut self, event: &PunchEvent) -> HookOutcome;
+
+    /// Tells every registered `on_fluid_flow` that a flow was blocked.
+    ///
+    /// **An observation, not a veto.** The flow has already failed to happen and
+    /// nothing a mod says can change that, so the returned outcome carries only
+    /// the faults — a mod that throws in here is disabled like any other
+    /// (charter rule 10) and the `allowed` field means nothing.
+    ///
+    /// What a mod does with it is act on the world, which is what
+    /// `game.set_block` and `game.set_fluid` are for.
+    fn fluid_flow(&mut self, event: &FluidFlowEvent) -> HookOutcome;
 
     /// Blocks registered during the loading window, **ordered by numeric id**.
     ///

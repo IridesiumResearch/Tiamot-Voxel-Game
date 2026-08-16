@@ -38,7 +38,7 @@ mod solver;
 pub mod codec;
 
 pub use layer::FluidLayer;
-pub use solver::{Flow, Neighbourhood, Solver, Tuning};
+pub use solver::{Blocked, Flow, Neighbourhood, Solver, Tuning};
 
 /// The fullest a fluid block can be.
 ///

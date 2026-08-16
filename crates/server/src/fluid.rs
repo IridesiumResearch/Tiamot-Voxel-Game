@@ -362,6 +362,28 @@ impl Fluidics {
         changes
     }
 
+    /// The flows that could not happen, for the `on_fluid_flow` hook.
+    ///
+    /// Drained rather than returned from [`Fluidics::tick`] for the reason
+    /// `Solver::take_blocked` gives: it is an observation channel, and a server
+    /// with no mods listening never asks.
+    pub fn take_blocked(&mut self) -> Vec<tiamot_core::fluid::Blocked> {
+        self.solver.take_blocked()
+    }
+
+    /// A registered fluid's string id, for handing to a mod.
+    ///
+    /// `None` for a placeholder — a fluid whose mod is gone has no name any mod
+    /// could act on, and inventing one would put a stand-in's id into a
+    /// comparison that will never match (charter rule 8).
+    #[must_use]
+    pub fn name_of(&self, id: tiamot_core::fluid::FluidId) -> Option<&str> {
+        self.fluids
+            .iter_registered()
+            .find(|(registered, _)| *registered == id)
+            .map(|(_, entry)| entry.name.as_str())
+    }
+
     /// Every chunk a set of changes touched.
     ///
     /// What the caller re-meshes and re-sends. A `BTreeSet` so the order is the

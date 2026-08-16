@@ -83,6 +83,62 @@ game.log("registered core_milk:milk")
 -- engine's, which is the point of it living here.
 local MILK = game.get_block_id("core_milk:milk")
 
+-- Waterlogging: a block that changes when milk presses on it.
+--
+-- **The design decision this implements, and it is not the obvious one.** The
+-- tempting model is to let one block hold terrain AND fluid at once. That is
+-- refused: Sub-Node Contract §4 says a block above the threshold holds no
+-- fluid, full stop, and a block holding both would need every system that
+-- reads occupancy — collision, meshing, lighting, the solver — to learn a
+-- second rule.
+--
+-- Instead a MOD swaps the block for a different one. `core_milk:sponge` is dry and
+-- `core_milk:waterlogged` is what it becomes; both are ordinary solid blocks, so
+-- nothing in the engine needs to know that one is wetter than the other. A
+-- crafting recipe wringing a bucket back out of it is a later mod's business.
+--
+-- This exists to prove `on_fluid_flow` reaches far enough to express the
+-- feature, which is the only thing a reference mod is for.
+game.register_block{
+    id = "sponge",
+    name = "Sponge",
+    description = "Dry. Milk pressing against it will not stay that way.",
+    textures = { all = "textures/milk.png" },
+    hardness = 0.3,
+}
+
+game.register_block{
+    id = "waterlogged",
+    name = "Waterlogged sponge",
+    description = "What a sponge becomes when milk reaches it.",
+    textures = { all = "textures/milk.png" },
+    hardness = 0.3,
+    -- Heavier to shift than the dry one, and pulling whatever it is mixed with
+    -- along with it — which is `dominance` doing the job it exists for.
+    dominance = 2.0,
+}
+
+game.register_on_fluid_flow(function(event)
+    -- Only a sponge, and only where the milk actually is milk. A mod that
+    -- reacted to every blocked flow would be a mod that reacted to every wall
+    -- on every shoreline in the world.
+    if event.block ~= "core_milk:sponge" or event.fluid ~= "core_milk:milk" then
+        return
+    end
+
+    -- A trickle does not soak a sponge. `level` is what the milk is pressing
+    -- at, 1 to 7, so this is the mod's own threshold and not the engine's.
+    if event.level < 3 then
+        return
+    end
+
+    game.set_block(event.into, "core_milk:waterlogged")
+    game.log(
+        "a sponge soaked at "
+            .. event.into.x .. "," .. event.into.y .. "," .. event.into.z
+    )
+end)
+
 game.register_on_place(function(event)
     if event.material ~= MILK then
         -- Somebody placing an ordinary block. Nothing to do with us; returning

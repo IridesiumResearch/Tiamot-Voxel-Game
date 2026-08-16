@@ -53,6 +53,12 @@ const HOOK_DIG: &str = "on_dig_complete";
 /// Hook name used in registry keys and in fault messages.
 const HOOK_PLACE: &str = "on_place";
 
+/// Registry key holding the mods that registered `on_fluid_flow`.
+const FLOWERS: &str = "tiamot.flowers";
+
+/// Hook name used in registry keys and in fault messages.
+const HOOK_FLOW: &str = "on_fluid_flow";
+
 /// A player UUID as lowercase hex, for handing to Lua.
 ///
 /// Hex rather than the raw 32 bytes because a mod keying per-player state needs
@@ -696,6 +702,44 @@ impl ScriptVm for MluaVm {
         self.run_hook(HOOK_PUNCH, PUNCHERS, &table)
     }
 
+    fn fluid_flow(&mut self, event: &crate::script::FluidFlowEvent) -> HookOutcome {
+        let Ok(table) = self.lua.create_table().and_then(|table| {
+            // Block coordinates on both, and named so that nobody has to guess
+            // which end is which. `get_light` takes blocks and a dig event's
+            // x/y/z are CELLS, which has caught somebody once already — so
+            // these are never bare x/y/z.
+            let at = self.lua.create_table()?;
+            at.set("x", event.from.x)?;
+            at.set("y", event.from.y)?;
+            at.set("z", event.from.z)?;
+            table.set("from", at)?;
+
+            let into = self.lua.create_table()?;
+            into.set("x", event.into.x)?;
+            into.set("y", event.into.y)?;
+            into.set("z", event.into.z)?;
+            table.set("into", into)?;
+
+            table.set("fluid", event.fluid.as_str())?;
+            table.set("level", event.level)?;
+            table.set("occupancy", event.occupancy)?;
+            table.set("units", event.occupancy.count_ones())?;
+            // The blocking block by NAME. A runtime id would be a number that
+            // means something different next run (charter rule 8), and this is
+            // the one field a mod is certain to compare against.
+            let name = self
+                .registered_blocks()
+                .into_iter()
+                .find(|(_, id)| *id == event.blocked_by)
+                .map(|(name, _)| name);
+            table.set("block", name)?;
+            Ok(table)
+        }) else {
+            return HookOutcome::allow();
+        };
+        self.run_hook(HOOK_FLOW, FLOWERS, &table)
+    }
+
     fn registered_blocks(&self) -> Vec<(String, MaterialId)> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.blocks") else {
             return Vec::new();
@@ -1022,6 +1066,15 @@ impl MluaVm {
         game.set(
             "register_on_punch",
             self.hook_registrar(mod_id, HOOK_PUNCH, PUNCHERS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
+        // Registered through the same machinery even though it cannot veto:
+        // what a hook DOES with its return value is the dispatcher's business,
+        // and giving observation hooks a second registrar would be two paths
+        // that have to keep agreeing about freezing and load order.
+        game.set(
+            "register_on_fluid_flow",
+            self.hook_registrar(mod_id, HOOK_FLOW, FLOWERS)?,
         )
         .map_err(|err| self.vm_error(&err))?;
         Ok(())
@@ -1488,7 +1541,7 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.tickers", tickers)
             .map_err(|err| self.vm_error(&err))?;
-        for list in [DIGGERS, PLACERS, PUNCHERS] {
+        for list in [DIGGERS, PLACERS, PUNCHERS, FLOWERS] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
             self.lua
                 .set_named_registry_value(list, table)
@@ -2723,6 +2776,79 @@ mod tests {
              assert(placed.occupancy == 7, 'occupancy')",
         )
         .expect("the hooks should have received the event fields");
+    }
+
+    #[test]
+    fn a_blocked_flow_reaches_a_mod_with_what_is_in_the_way() {
+        // What `on_fluid_flow` exists for: a mod cannot see a flow that did not
+        // happen any other way, because a block milk cannot enter is a block
+        // with no milk in it and looks exactly like one milk never reached.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "sponge",
+            "seen = nil\n\
+             game.register_block{ id = \"rock\" }\n\
+             game.register_on_fluid_flow(function(e) seen = e end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let rock = vm
+            .registered_blocks()
+            .into_iter()
+            .find(|(name, _)| name == "sponge:rock")
+            .map(|(_, id)| id)
+            .expect("rock should be registered");
+
+        let outcome = vm.fluid_flow(&crate::script::FluidFlowEvent {
+            from: crate::coords::BlockPos::new(1, 2, 3),
+            into: crate::coords::BlockPos::new(2, 2, 3),
+            fluid: "core_milk:milk".to_owned(),
+            level: 5,
+            blocked_by: rock,
+            // Three cells filled, which is what `units` must come to.
+            occupancy: 0b111,
+        });
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+
+        vm.eval_in(
+            "sponge",
+            "assert(seen.from.x == 1 and seen.from.y == 2 and seen.from.z == 3, 'from')\n\
+             assert(seen.into.x == 2 and seen.into.y == 2 and seen.into.z == 3, 'into')\n\
+             assert(seen.fluid == 'core_milk:milk', 'fluid is ' .. tostring(seen.fluid))\n\
+             assert(seen.level == 5, 'level')\n\
+             assert(seen.occupancy == 7, 'occupancy')\n\
+             assert(seen.units == 3, 'units is ' .. tostring(seen.units))\n\
+             assert(seen.block == 'sponge:rock', 'block is ' .. tostring(seen.block))",
+        )
+        .expect("the hook should have received the event fields");
+    }
+
+    #[test]
+    fn a_mod_that_throws_in_on_fluid_flow_is_disabled_rather_than_killing_the_tick() {
+        // Charter rule 10. Nothing is being vetoed here — the flow already
+        // failed — so the only thing an error can do is take the mod down with
+        // it, which is exactly what it must do and no more.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "broken",
+            "game.register_on_fluid_flow(function() error('boom') end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let outcome = vm.fluid_flow(&crate::script::FluidFlowEvent {
+            from: crate::coords::BlockPos::new(0, 0, 0),
+            into: crate::coords::BlockPos::new(1, 0, 0),
+            fluid: "core_milk:milk".to_owned(),
+            level: 7,
+            blocked_by: MaterialId::UNKNOWN,
+            occupancy: crate::block::OCCUPANCY_FULL,
+        });
+        assert_eq!(outcome.faults.len(), 1, "the mod should have been faulted");
+        assert_eq!(outcome.faults[0].0, "broken");
     }
 
     #[test]

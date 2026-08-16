@@ -1541,6 +1541,67 @@ impl ServerHandle {
                                     });
                                 }
                             }
+
+                            // **Where the milk tried to go and could not.**
+                            //
+                            // The fluid layer records where milk IS, so a block
+                            // it cannot enter is indistinguishable from one it
+                            // never reached — which is exactly the fact a
+                            // waterlogging mod needs. `on_fluid_flow` is the
+                            // only way a mod can learn it.
+                            //
+                            // The lock is dropped before the callbacks run.
+                            // A mod's `game.set_fluid` takes the same lock, and
+                            // holding it across a callback is the one
+                            // arrangement that deadlocks.
+                            let blocked = fluid.take_blocked();
+                            drop(fluid);
+                            for event in blocked {
+                                let Some(name) = fluidics
+                                    .read()
+                                    .expect("fluid lock")
+                                    .name_of(event.fluid)
+                                    .map(str::to_owned)
+                                else {
+                                    // A placeholder: its mod is gone, so no mod
+                                    // can be listening for it by name.
+                                    continue;
+                                };
+                                let cells = world
+                                    .block_cells(event.into, &mut source)
+                                    .unwrap_or(tiamot_core::block::EMPTY_CELLS);
+                                // The first non-air cell names the block: a
+                                // mixed block has no single material, and the
+                                // occupancy below is what says so.
+                                let world_id = cells
+                                    .iter()
+                                    .find(|cell| !cell.is_air())
+                                    .copied()
+                                    .unwrap_or(tiamot_core::MaterialId::AIR);
+                                // World id to RUNTIME id: what a mod holds is
+                                // never what a chunk holds (charter rule 8).
+                                let material = world
+                                    .runtime_material(world_id.0)
+                                    .unwrap_or(tiamot_core::MaterialId::UNKNOWN);
+                                let mut occupancy = 0u32;
+                                for (index, cell) in cells.iter().enumerate() {
+                                    if !cell.is_air() {
+                                        occupancy |= 1 << index;
+                                    }
+                                }
+                                let verdict =
+                                    source.fluid_blocked(&tiamot_core::script::FluidFlowEvent {
+                                        from: event.from,
+                                        into: event.into,
+                                        fluid: name,
+                                        level: event.level,
+                                        blocked_by: material,
+                                        occupancy,
+                                    });
+                                for (mod_id, err) in &verdict.faults {
+                                    error!(mod_id = %mod_id, "mod disabled after an on_fluid_flow failure: {err}");
+                                }
+                            }
                         }
 
                         // The day advances once per tick, and is broadcast at

@@ -38,8 +38,8 @@ mod vm;
 
 pub use host::{HostError, ModHost, Phase, read_manifest};
 pub use vm::{
-    Backend, BlockRules, BlockTexture, Brush, DigEvent, FluidRules, HookOutcome, MAX_REFUSAL_BYTES,
-    PlaceEvent, PunchEvent, ScriptError, ScriptVm, Tool, VmLimits, WorldEdit,
+    Backend, BlockRules, BlockTexture, Brush, DigEvent, FluidFlowEvent, FluidRules, HookOutcome,
+    MAX_REFUSAL_BYTES, PlaceEvent, PunchEvent, ScriptError, ScriptVm, Tool, VmLimits, WorldEdit,
 };
 
 #[cfg(feature = "script")]

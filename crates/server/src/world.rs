@@ -192,6 +192,20 @@ impl Generator {
             Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
         }
     }
+
+    /// Tells the mods a flow was blocked.
+    ///
+    /// Nothing is being asked — the flow already failed — so the outcome
+    /// carries only the faults. See `ScriptVm::fluid_flow`.
+    pub fn fluid_blocked(
+        &mut self,
+        event: &tiamot_core::script::FluidFlowEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().fluid_flow(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
 }
 
 impl ChunkSource for Generator {

@@ -521,6 +521,53 @@ function game.register_on_place(callback) end
 ---@param callback fun(event: Tiamot.PunchEvent): boolean?
 function game.register_on_punch(callback) end
 
+---Fluid pressing against something it cannot get into.
+---
+---Coordinates are BLOCKS on both ends, and they are named rather than being bare
+---`x`/`y`/`z` — a dig event's `x`/`y`/`z` are CELLS, and the two have been
+---confused before.
+---@class Tiamot.FluidFlowEvent
+---@field from { x: integer, y: integer, z: integer } The block the fluid is in.
+---@field into { x: integer, y: integer, z: integer } The block it could not enter.
+---@field fluid string The fluid's registered id, e.g. `"core:milk"`.
+---@field level integer What level it is pressing at, 1 to 7.
+---@field block string? The blocking block's id, or nil if nothing registered it.
+---@field occupancy integer 27-bit mask of which of the blocking block's sub-nodes are filled.
+---@field units integer How many of the 27 are filled — `occupancy`'s popcount.
+
+---Registers a listener for flows that could not happen.
+---
+---**Registration window only.**
+---
+---# Why the hook is about the flow that DIDN'T happen
+---
+---Where a fluid went is already in the world and `game.get_fluid` will tell you.
+---Where it *tried* to go is recorded nowhere: a block milk cannot enter is a
+---block with no milk in it, and that looks exactly like a block milk never
+---reached. This is the only way to learn the difference.
+---
+---That is the fact waterlogging needs — see `game/core_milk` for the reference
+---implementation, which swaps a block for a wet one when milk presses on it.
+---
+---# It cannot veto
+---
+---The flow has already failed; there is nothing left to allow or refuse, so a
+---return value is ignored. Act on the world instead, with `game.set_block` or
+---`game.set_fluid`. An error still disables your mod, as everywhere else.
+---
+---# It is budgeted, and it is not exhaustive
+---
+---At most 64 blocked flows are reported per fluid tick, and the surplus is
+---DROPPED rather than queued — so a shoreline a thousand blocks long is sampled
+---across several ticks rather than delivered at once. Write the callback so that
+---missing one is harmless: the same shoreline is still there next tick.
+---
+---Nothing fires for a settled world at all. The solver only examines blocks an
+---edit woke or a flow is moving through, so a pond nobody has touched costs
+---nothing here either.
+---@param callback fun(event: Tiamot.FluidFlowEvent)
+function game.register_on_fluid_flow(callback) end
+
 ---Registers a named input action.
 ---
 ---Mods register actions; the engine owns key bindings and mods never read keys.
