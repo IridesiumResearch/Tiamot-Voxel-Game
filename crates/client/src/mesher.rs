@@ -762,12 +762,18 @@ fn fluid_buffers(quads: &[Quad], grid: &SubNodeGrid) -> (Vec<FluidVertex>, Vec<u
                     0
                 };
 
-                let flow = flow_at(
-                    grid,
-                    (x as usize / per_axis) as i32,
-                    by,
-                    (z as usize / per_axis) as i32,
-                );
+                // **Clamped, because a vertex coordinate runs to 48 and a block
+                // index stops at 15.** A vertex on the chunk's far face divides
+                // to block 16, which `block_height` reports as absent — and
+                // `flow_at` reads an absent neighbour as the floor, on purpose,
+                // because milk at the edge of a shelf really is running off it.
+                // The two together invented a steep outward flow along the
+                // positive faces of every chunk, which would have read as a
+                // current running off the edge of the world.
+                let block = |cell: u32| -> i32 {
+                    (cell as usize / per_axis).min(tiamot_core::CHUNK_BLOCKS as usize - 1) as i32
+                };
+                let flow = flow_at(grid, block(x), by, block(z));
                 vertices.push(FluidVertex::new(
                     x,
                     y,
