@@ -1193,6 +1193,22 @@ fn a_pond_can_be_seen_through() {
          the floor beneath the milk does not change what is on screen, so the milk is opaque"
     );
 
+    // **And mode 3 draws it too**, which is a different pipeline: the post
+    // chain compiles its own copy of the fluid pass for the float target, and a
+    // chain that failed to would drop every pond in the world silently.
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let beautiful_dark = through(&mut renderer, DARK);
+    let beautiful_pale = through(&mut renderer, PALE);
+    let beautiful = (0..3)
+        .map(|channel| (beautiful_pale[channel] - beautiful_dark[channel]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        beautiful > 0.05,
+        "in mode 3 a pond over a dark floor came out {beautiful_dark:?} and over a pale one \
+         {beautiful_pale:?} — the post chain's fluid pipeline is not drawing"
+    );
+    renderer.set_lighting_mode(LightingMode::Classic);
+
     // And it is milk rather than a window: the pond has to be doing SOMETHING
     // to the colour, or "transparent" has been implemented as "not drawn".
     let bare = {
