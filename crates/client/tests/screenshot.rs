@@ -1116,6 +1116,109 @@ fn mode_one_is_dark_where_the_sun_never_reaches_and_dims_as_the_day_ends() {
 }
 
 #[test]
+fn a_pond_can_be_seen_through() {
+    // **Reported from the window: "water should be semi transparent when inside
+    // and out. right now I just see out to the rest of the world and from the
+    // outside it is opaque."**
+    //
+    // Both halves were one cause: milk was laid into the same quad list as
+    // terrain and drawn in the same opaque pass, so it could only ever be a
+    // wall — and from inside, its own near surface was a back face and was
+    // culled away to nothing.
+    //
+    // The test that cannot be argued with is whether what is UNDER the milk can
+    // change the picture. Two floors of different colours, the same pond over
+    // each: if the milk is opaque the two frames are identical, and if it is
+    // transparent they are not. No absolute colour is asserted anywhere, so no
+    // driver's filtering can decide it.
+    let Some(gpu) = gpu() else { return };
+
+    const DARK: MaterialId = MaterialId(2);
+    const PALE: MaterialId = MaterialId(3);
+
+    /// A pond filling one block layer over the floor.
+    struct Pond;
+    impl client::mesher::FluidFill for Pond {
+        fn fill(&self, local: tiamot_core::coords::LocalBlock) -> Option<(u16, u8)> {
+            (local.y == 9).then_some((PALE.get(), 24))
+        }
+    }
+
+    let floor = |material: MaterialId| {
+        let mut chunk = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+        for x in 0..16 {
+            for z in 0..16 {
+                chunk
+                    .set_block(BlockPos::new(x, 8, z), BlockValue::Uniform(material))
+                    .expect("in chunk");
+            }
+        }
+        chunk
+    };
+
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+    // Slot indices are material ids: a dark floor at 2, a pale one at 3.
+    let atlas = Atlas::build(&[
+        None,
+        None,
+        Some(Image::solid(16, 16, [40, 40, 40, 255])),
+        Some(Image::solid(16, 16, [230, 230, 230, 255])),
+    ]);
+    renderer.set_atlas(&atlas);
+
+    let mut camera = Camera {
+        position: Position::from_world(8.0, 16.0, 8.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -1.2);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    let through = |renderer: &mut Renderer, material: MaterialId| {
+        let chunk = floor(material);
+        let mesh = mesher::mesh_chunk(&chunk, &Neighbours::none(), Absent::Solid, &DAY, &Pond);
+        renderer.set_chunk(ChunkPos::new(0, 0, 0), &mesh);
+        let frame = target.capture(renderer, &camera).expect("capture");
+        average(&frame, WIDTH / 4, HEIGHT / 4, WIDTH * 3 / 4, HEIGHT * 3 / 4)
+    };
+
+    let over_dark = through(&mut renderer, DARK);
+    let over_pale = through(&mut renderer, PALE);
+
+    let difference = (0..3)
+        .map(|channel| (over_pale[channel] - over_dark[channel]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        difference > 0.05,
+        "a pond over a dark floor came out {over_dark:?} and over a pale one {over_pale:?} — \
+         the floor beneath the milk does not change what is on screen, so the milk is opaque"
+    );
+
+    // And it is milk rather than a window: the pond has to be doing SOMETHING
+    // to the colour, or "transparent" has been implemented as "not drawn".
+    let bare = {
+        let chunk = floor(PALE);
+        let mesh = mesher::mesh_chunk(
+            &chunk,
+            &Neighbours::none(),
+            Absent::Solid,
+            &DAY,
+            &mesher::NoFluid,
+        );
+        renderer.set_chunk(ChunkPos::new(0, 0, 0), &mesh);
+        let frame = target.capture(&mut renderer, &camera).expect("capture");
+        average(&frame, WIDTH / 4, HEIGHT / 4, WIDTH * 3 / 4, HEIGHT * 3 / 4)
+    };
+    let tint = (0..3)
+        .map(|channel| (bare[channel] - over_pale[channel]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        tint > 0.01,
+        "a pale floor is {bare:?} bare and {over_pale:?} under a pond — the milk is not there \
+         at all rather than being transparent"
+    );
+}
+
+#[test]
 fn a_lamps_colour_survives_mode_threes_tonemap() {
     // **Reported from the window: "Lights in light mode 3 should be more
     // saturated. right now they look almost white."** They were, and the cause

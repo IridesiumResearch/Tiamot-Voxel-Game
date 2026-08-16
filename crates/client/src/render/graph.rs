@@ -323,6 +323,31 @@ struct Step<'a> {
     target: &'a wgpu::TextureView,
 }
 
+/// The world pipeline for the float target, with or without cascades to bind.
+///
+/// `fragment_main` does not mention the shadow bind group and `fragment_shadowed`
+/// does, so the two pipelines have different layouts — which is what lets
+/// "shadows off" allocate no cascades at all rather than binding empty ones.
+fn world_pipeline_for(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+    shadows: Option<&super::shadow::Shadows>,
+    mode: crate::config::RenderMode,
+) -> wgpu::RenderPipeline {
+    match shadows {
+        Some(shadows) => super::build_shadowed_pipeline(
+            gpu,
+            shader,
+            layout,
+            shadows.sample_layout(),
+            mode,
+            HDR_FORMAT,
+        ),
+        None => super::build_pipeline(gpu, shader, layout, mode, HDR_FORMAT),
+    }
+}
+
 /// The mode 3 chain: an HDR scene target, two bloom buffers, and the pipelines
 /// that walk between them.
 pub struct Post {
@@ -364,6 +389,7 @@ pub struct Post {
     /// beside them so that everything mode 3 allocates is dropped together —
     /// two `Option`s that had to be kept in step would eventually not be.
     world: wgpu::RenderPipeline,
+    fluid: wgpu::RenderPipeline,
     selection: wgpu::RenderPipeline,
 }
 
@@ -448,20 +474,13 @@ impl Post {
                 uniform("post-blur-v-uniforms"),
                 uniform("post-composite-uniforms"),
             ],
-            world: match shadows.as_ref() {
-                Some(shadows) => super::build_shadowed_pipeline(
-                    gpu,
-                    world_shader,
-                    world_layout,
-                    shadows.sample_layout(),
-                    mode,
-                    HDR_FORMAT,
-                ),
-                // No cascades to bind, so the pipeline that does not mention
-                // them: `fragment_main` leaves every surface unshadowed, which
-                // is what "shadows off" means.
-                None => super::build_pipeline(gpu, world_shader, world_layout, mode, HDR_FORMAT),
-            },
+            world: world_pipeline_for(gpu, world_shader, world_layout, shadows.as_ref(), mode),
+            fluid: super::build_fluid_pipeline(
+                gpu,
+                world_shader,
+                &[Some(world_layout)],
+                HDR_FORMAT,
+            ),
             selection: super::build_selection_pipeline(
                 gpu,
                 selection_shader,
@@ -516,6 +535,12 @@ impl Post {
     #[must_use]
     pub const fn world_pipeline(&self) -> &wgpu::RenderPipeline {
         &self.world
+    }
+
+    /// The blended fluid pipeline, compiled for the float target.
+    #[must_use]
+    pub const fn fluid_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.fluid
     }
 
     /// The selection-outline pipeline, compiled for the float target.

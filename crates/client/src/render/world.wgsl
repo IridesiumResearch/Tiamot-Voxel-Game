@@ -53,6 +53,8 @@ struct Globals {
     // normal-offset bias is measured in these: a bias smaller than a texel
     // cannot fix a texel-sized quantisation error. w unused.
     shadow_texel: vec4<f32>,
+    // Seconds of animation in x, three spare. Read by the fluid stages only.
+    fluid: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -134,8 +136,13 @@ fn face_shade(axis: u32, positive: bool) -> f32 {
     return 0.75;                        // x sides
 }
 
-@vertex
-fn vertex_main(input: VertexIn) -> VertexOut {
+// The shared vertex stage, as a plain function.
+//
+// **A plain function and not the entry point**, because WGSL forbids calling an
+// entry point: `fluid_vertex` needs everything this does and then one more
+// thing, and the alternative to factoring it out is two copies of the unpacking
+// that must never disagree.
+fn unpack_vertex(input: VertexIn) -> VertexOut {
     let x = f32(input.packed & 0x3Fu);
     let y = f32((input.packed >> 6u) & 0x3Fu);
     let z = f32((input.packed >> 12u) & 0x3Fu);
@@ -208,6 +215,11 @@ fn vertex_main(input: VertexIn) -> VertexOut {
     out.sun = levels.x;
     out.block_light = levels.yzw;
     return out;
+}
+
+@vertex
+fn vertex_main(input: VertexIn) -> VertexOut {
+    return unpack_vertex(input);
 }
 
 // How much of the sky has taken over at this distance, 0 to 1.
@@ -630,6 +642,163 @@ fn surface(input: VertexOut, shadow: f32) -> vec4<f32> {
 fn generic_shadow(input: VertexOut) -> f32 {
     let sunward = -globals.sun_direction.xyz;
     return smoothstep(0.0, SOFT_TERMINATOR, dot(input.normal, sunward));
+}
+
+// ---------------------------------------------------------------------------
+// Fluid
+// ---------------------------------------------------------------------------
+//
+// Milk is drawn in its own blended pass, after every chunk's opaque geometry,
+// from a twelve-byte vertex that carries two things terrain has no use for:
+// where the surface really sits, and which way it is running.
+
+// Fine units per cell in a fluid vertex's drop. Must match `mesher::FINE`.
+const FLUID_FINE: f32 = 16.0;
+
+// Cells per block. Must match `tiamot_core::SUBNODES_PER_AXIS`.
+const CELLS_PER_BLOCK: f32 = 3.0;
+
+// How much of what is behind it a fluid surface lets through.
+//
+// **Reported from the window: "water should be semi transparent when inside and
+// out. right now I just see out to the rest of the world and from the outside
+// it is opaque."** Both halves of that were one bug — milk was in the opaque
+// pass, so it could only ever be a wall, and from inside its own near surface
+// was back-face culled and simply was not there at all.
+//
+// A shade under three quarters: enough to see the shape of the bottom through a
+// pond and to know that a river has stones in it, not so much that a deep pool
+// stops reading as deep. Engine-wide rather than per fluid, which is the honest
+// limit here: `register_fluid` has a `color` and no alpha, and adding one is a
+// protocol change rather than a shader constant.
+const FLUID_ALPHA: f32 = 0.72;
+
+// Blocks per second a flowing surface's texture travels at full flow.
+//
+// Slower than the milk itself would move, deliberately. A scroll matched to a
+// real flow speed reads as a conveyor belt; what sells moving water is a drift
+// slow enough that the eye reads it as the surface being disturbed.
+const FLOW_SPEED: f32 = 0.35;
+
+// How far still milk wanders, in blocks, and how fast.
+//
+// Not a wave — there is no displacement here, only the texture sliding in a
+// small circle. It is what stops a settled pond from looking like a painted
+// floor, and it is deliberately at the edge of noticeable.
+const RIPPLE_SIZE: f32 = 0.02;
+const RIPPLE_SPEED: f32 = 0.6;
+
+struct FluidIn {
+    @location(0) packed: u32,
+    @location(1) material: u32,
+    @location(2) chunk_offset: vec4<f32>,
+    // drop:16 | flow_x:8 | flow_z:8 — see `mesher::FluidVertex`.
+    @location(3) surface: u32,
+};
+
+struct FluidOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) tile_uv: vec2<f32>,
+    @location(1) @interpolate(flat) slot: u32,
+    @location(2) shade: f32,
+    @location(3) sun: f32,
+    @location(4) block_light: vec3<f32>,
+    @location(5) distance: f32,
+    @location(6) occlusion: f32,
+    @location(7) world: vec3<f32>,
+    @location(8) @interpolate(flat) normal: vec3<f32>,
+    // Which way this surface runs, in blocks per second, flat across the quad.
+    @location(9) @interpolate(flat) flow: vec2<f32>,
+};
+
+// A signed byte out of a word. WGSL has no i8, so the sign is put back by hand.
+fn signed_byte(word: u32, shift: u32) -> f32 {
+    let raw = (word >> shift) & 0xFFu;
+    let value = select(f32(raw), f32(raw) - 256.0, raw > 127u);
+    return value / 127.0;
+}
+
+@vertex
+fn fluid_vertex(input: FluidIn) -> FluidOut {
+    // The same unpacking as `vertex_main`, and then the one thing that differs.
+    var base: VertexIn;
+    base.packed = input.packed;
+    base.material = input.material;
+    base.chunk_offset = input.chunk_offset;
+    let lit = unpack_vertex(base);
+
+    var out: FluidOut;
+    out.tile_uv = lit.tile_uv;
+    out.slot = lit.slot;
+    out.shade = lit.shade;
+    out.sun = lit.sun;
+    out.block_light = lit.block_light;
+    out.occlusion = lit.occlusion;
+    out.normal = lit.normal;
+
+    // **The drop is what makes the surface smooth.**
+    //
+    // The occupancy this vertex came from is on the sub-node lattice and can
+    // only be a whole number of cells deep. The real surface of a half-full
+    // block is not, so the mesher records where it actually is and this lowers
+    // the vertex to it — bilinearly across the quad, which is exactly the field
+    // `SubNodeGrid::surface_at` describes. Zero for every vertex that is not on
+    // the surface, so the sides and the bottom of a pool are untouched.
+    //
+    // `fill_fluid` rounds the occupancy UP, so this is never negative and a
+    // vertex can never escape the geometry its own face culling assumed.
+    let drop = f32(input.surface & 0xFFFFu) / FLUID_FINE / CELLS_PER_BLOCK;
+    let lowered = lit.world - vec3<f32>(0.0, drop, 0.0);
+    out.clip = globals.view_projection * vec4<f32>(lowered, 1.0);
+    out.distance = length(lowered);
+    out.world = lowered;
+
+    out.flow = vec2<f32>(signed_byte(input.surface, 16u), signed_byte(input.surface, 24u));
+    return out;
+}
+
+@fragment
+fn fluid_fragment(input: FluidOut) -> @location(0) vec4<f32> {
+    // Rebuilt rather than shared, because the fluid stage carries one attribute
+    // more than the world stage and WGSL has no subtyping to say so.
+    var lit: VertexOut;
+    lit.clip = input.clip;
+    lit.tile_uv = input.tile_uv;
+    lit.slot = input.slot;
+    lit.shade = input.shade;
+    lit.sun = input.sun;
+    lit.block_light = input.block_light;
+    lit.distance = input.distance;
+    lit.occlusion = input.occlusion;
+    lit.world = input.world;
+    lit.normal = input.normal;
+
+    // **Flowing milk scrolls; still milk ripples.**
+    //
+    // The direction comes from the surface's own gradient, worked out where the
+    // heights were (see `mesher::flow_at`), so a spring on a slope runs downhill
+    // and a settled pond has nothing to run. Which means the choice between the
+    // two is not a branch on some flag — it falls out of `flow` being zero.
+    let time = globals.fluid.x;
+    let speed = length(input.flow);
+    let drift = input.flow * time * FLOW_SPEED;
+    // The ripple fades in exactly as the flow fades out, so a pool feeding a
+    // stream has no line across it where one becomes the other.
+    let still = clamp(1.0 - speed * 4.0, 0.0, 1.0);
+    let wobble = vec2<f32>(
+        sin(time * RIPPLE_SPEED),
+        cos(time * RIPPLE_SPEED * 0.7)
+    ) * RIPPLE_SIZE * still;
+    lit.tile_uv = input.tile_uv + drift + wobble;
+
+    // Mode 2's generic shadow applies to milk as much as to anything else; mode
+    // 3's cascades do not, because the fluid pass has no shadow bind group.
+    var shadow = 1.0;
+    if (globals.lighting_mode == 1u) {
+        shadow = generic_shadow(lit);
+    }
+    let colour = surface(lit, shadow);
+    return vec4<f32>(colour.rgb, colour.a * FLUID_ALPHA);
 }
 
 // Modes 1 and 2. Neither has a shadow map; mode 2 has an opinion anyway.

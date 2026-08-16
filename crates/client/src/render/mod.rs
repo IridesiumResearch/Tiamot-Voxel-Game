@@ -171,6 +171,16 @@ struct Globals {
     /// in the shader because the cascade radius lives on this side and the
     /// alternative is recovering it from the length of a matrix row.
     shadow_texel: [f32; 4],
+    /// Fluid's own word: seconds since the client started in `x`, three spare.
+    ///
+    /// **Appended**, for the reason `light_view_projection` documents: every
+    /// field after an insertion moves, and the shader finds out by reading the
+    /// wrong sixteen bytes.
+    ///
+    /// The clock is what makes milk move. It is presentation and nothing else
+    /// reads it — charter rule 4 does not reach the scroll rate of a texture,
+    /// and this value is deliberately not the simulation's tick.
+    fluid: [f32; 4],
 }
 
 /// How much light the darkest place still gets.
@@ -224,6 +234,8 @@ fn upload_mesh(gpu: &Gpu, mesh: &Mesh) -> ChunkMesh {
         vertices: vertex_buffer,
         indices: index_buffer,
         index_count: u32::try_from(indices.len()).unwrap_or(0),
+        // The debug body is a box, and a box holds no milk.
+        fluid: None,
         used_bytes: (vertex_bytes.len() + index_bytes.len()) as u64,
     }
 }
@@ -298,7 +310,11 @@ fn body_mesh() -> Mesh {
             shade: lit,
         });
     }
-    Mesh { quads }
+    Mesh {
+        quads,
+        fluid_vertices: Vec::new(),
+        fluid_indices: Vec::new(),
+    }
 }
 
 /// One chunk's camera-relative offset, as an instance attribute.
@@ -313,8 +329,19 @@ struct ChunkMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+    /// The fluid half, drawn in a second blended pass after every chunk's
+    /// opaque geometry. `None` for the overwhelming majority of chunks, which
+    /// have no milk in them and pay nothing for this.
+    fluid: Option<FluidMesh>,
     /// Bytes actually written, as opposed to the pooled buffers' capacity.
     used_bytes: u64,
+}
+
+/// One chunk's transparent fluid geometry.
+struct FluidMesh {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
 }
 
 /// Line-segment vertices the selection buffer holds without growing.
@@ -473,6 +500,10 @@ impl BufferPool {
     fn give_mesh(&mut self, mesh: ChunkMesh) {
         self.give(BufferKind::Vertex, mesh.vertices);
         self.give(BufferKind::Index, mesh.indices);
+        if let Some(fluid) = mesh.fluid {
+            self.give(BufferKind::Vertex, fluid.vertices);
+            self.give(BufferKind::Index, fluid.indices);
+        }
     }
 }
 
@@ -563,10 +594,21 @@ impl Gpu {
     }
 }
 
+/// Where the fluid clock wraps, in seconds.
+///
+/// A large whole number of seconds, so a texture offset taken modulo one lands
+/// in the same place either side of the wrap and nothing jumps.
+const FLUID_CLOCK_WRAP: f32 = 3600.0;
+
 /// Draws the world.
 pub struct Renderer {
     gpu: Gpu,
     pipeline: wgpu::RenderPipeline,
+    /// The blended pass that draws milk, over the direct target. Mode 3 uses
+    /// the post chain's own copy, compiled for the float target instead.
+    fluid_pipeline: wgpu::RenderPipeline,
+    /// Seconds of animation, for the fluid scroll. See `advance_clock`.
+    elapsed: f32,
     globals: wgpu::Buffer,
     bind_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
@@ -671,6 +713,8 @@ impl Renderer {
         let bind_layout = build_bind_layout(&gpu);
 
         let pipeline = build_pipeline(&gpu, &shader, &bind_layout, mode, COLOUR_FORMAT);
+        let fluid_pipeline =
+            build_fluid_pipeline(&gpu, &shader, &[Some(&bind_layout)], COLOUR_FORMAT);
 
         let selection_shader = gpu
             .device
@@ -733,6 +777,8 @@ impl Renderer {
         Ok(Self {
             gpu,
             pipeline,
+            fluid_pipeline,
+            elapsed: 0.0,
             globals,
             bind_layout,
             bind_group,
@@ -941,13 +987,39 @@ impl Renderer {
         self.gpu.queue.write_buffer(&vertex_buffer, 0, vertex_bytes);
         self.gpu.queue.write_buffer(&index_buffer, 0, index_bytes);
 
+        // The fluid half, when there is one. Its own buffers from the same
+        // pool: a chunk with no milk in it allocates nothing here and the
+        // `Option` is what says so, rather than a zero-length buffer that the
+        // draw loop would then have to skip every frame.
+        let mut fluid = None;
+        let mut fluid_bytes = 0;
+        if !mesh.has_no_fluid() {
+            let vertex_bytes: &[u8] = bytemuck::cast_slice(&mesh.fluid_vertices);
+            let index_bytes: &[u8] = bytemuck::cast_slice(&mesh.fluid_indices);
+            let vertices = self
+                .pool
+                .take(&self.gpu, BufferKind::Vertex, vertex_bytes.len() as u64);
+            let indices = self
+                .pool
+                .take(&self.gpu, BufferKind::Index, index_bytes.len() as u64);
+            self.gpu.queue.write_buffer(&vertices, 0, vertex_bytes);
+            self.gpu.queue.write_buffer(&indices, 0, index_bytes);
+            fluid_bytes = (vertex_bytes.len() + index_bytes.len()) as u64;
+            fluid = Some(FluidMesh {
+                vertices,
+                indices,
+                index_count: u32::try_from(mesh.fluid_indices.len()).unwrap_or(0),
+            });
+        }
+
         self.chunks.insert(
             pos,
             ChunkMesh {
                 vertices: vertex_buffer,
                 indices: index_buffer,
                 index_count: u32::try_from(indices.len()).unwrap_or(0),
-                used_bytes: (vertex_bytes.len() + index_bytes.len()) as u64,
+                fluid,
+                used_bytes: (vertex_bytes.len() + index_bytes.len()) as u64 + fluid_bytes,
             },
         );
     }
@@ -1197,6 +1269,21 @@ impl Renderer {
                     .map_or([1.0; shadow::CASCADES], |s| *s.texel_world());
                 [world[0], world[1], world[2], 0.0]
             },
+            fluid: [self.elapsed, 0.0, 0.0, 0.0],
+        }
+    }
+
+    /// Advances the clock that milk scrolls by, in seconds.
+    ///
+    /// **Wrapped, and that is not tidiness.** An `f32` holding hours of seconds
+    /// has coarser steps than a frame is long, so a texture offset computed from
+    /// it stops advancing smoothly and a river starts to judder — hours into a
+    /// session, on the machine of whoever was still playing. Wrapping at a whole
+    /// number of scroll cycles keeps the value small and the seam invisible,
+    /// because the UV is taken modulo one anyway.
+    pub fn advance_clock(&mut self, dt: f32) {
+        if dt.is_finite() {
+            self.elapsed = (self.elapsed + dt) % FLUID_CLOCK_WRAP;
         }
     }
 
@@ -1332,6 +1419,7 @@ impl Renderer {
         &'a wgpu::TextureView,
         &'a wgpu::RenderPipeline,
         &'a wgpu::RenderPipeline,
+        &'a wgpu::RenderPipeline,
     ) {
         match self.post.as_ref() {
             Some(post) => {
@@ -1340,6 +1428,7 @@ impl Renderer {
                     scene,
                     depth,
                     post.world_pipeline(),
+                    post.fluid_pipeline(),
                     post.selection_pipeline(),
                 )
             }
@@ -1347,8 +1436,45 @@ impl Renderer {
                 target,
                 &self.depth,
                 &self.pipeline,
+                &self.fluid_pipeline,
                 &self.selection_pipeline,
             ),
+        }
+    }
+
+    /// Draws every visible chunk's milk, after all of the opaque geometry.
+    ///
+    /// **After, and in one sweep, rather than per chunk as it is met.**
+    /// Transparency composites against what is already in the target, so the
+    /// whole opaque world has to be there first — interleaving would blend a
+    /// pond against whichever chunks happened to be drawn before it, and the
+    /// answer would change as the camera turned.
+    ///
+    /// The fluid pipeline does not write depth, so milk behind milk is not
+    /// occluded by milk in front of it. What that costs is that two fluid
+    /// surfaces seen through one another are not sorted against each other,
+    /// which for one fluid of one colour is invisible and for two would not be.
+    fn draw_fluid(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pipeline: &wgpu::RenderPipeline,
+        visible: &[ChunkPos],
+    ) {
+        let mut wet = false;
+        for (index, pos) in visible.iter().enumerate() {
+            let Some(fluid) = self.chunks.get(pos).and_then(|mesh| mesh.fluid.as_ref()) else {
+                continue;
+            };
+            if !wet {
+                // Set once, and only when there is milk in view at all: a dry
+                // world must not pay a pipeline switch every frame for nothing.
+                pass.set_pipeline(pipeline);
+                wet = true;
+            }
+            pass.set_vertex_buffer(0, fluid.vertices.slice(..));
+            pass.set_index_buffer(fluid.indices.slice(..), wgpu::IndexFormat::Uint32);
+            let instance = index as u32;
+            pass.draw_indexed(0..fluid.index_count, 0, instance..instance + 1);
         }
     }
 
@@ -1434,7 +1560,8 @@ impl Renderer {
 
         self.fill_cascades(&mut encoder, &visible);
 
-        let (colour, depth, world_pipeline, selection_pipeline) = self.world_pass_target(target);
+        let (colour, depth, world_pipeline, fluid_pipeline, selection_pipeline) =
+            self.world_pass_target(target);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1487,6 +1614,8 @@ impl Renderer {
                 pass.set_index_buffer(self.body.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
             }
+
+            self.draw_fluid(&mut pass, fluid_pipeline, &visible);
 
             // Last, so it draws over the world it outlines. Its pipeline does
             // not write depth, so the order within the pass is what decides
@@ -1706,6 +1835,45 @@ fn vertex_layout() -> [wgpu::VertexBufferLayout<'static>; 2] {
     ]
 }
 
+/// The same, for the twelve-byte fluid vertex: one more word at location 3.
+fn fluid_vertex_layout() -> [wgpu::VertexBufferLayout<'static>; 2] {
+    const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] = [
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 4,
+            shader_location: 1,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: 8,
+            shader_location: 3,
+        },
+    ];
+    const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x4,
+        offset: 0,
+        shader_location: 2,
+    }];
+
+    [
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<crate::mesher::FluidVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &VERTEX_ATTRIBUTES,
+        },
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Instance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &INSTANCE_ATTRIBUTES,
+        },
+    ]
+}
+
 /// The world pipeline with the shadow cascades bound as a second group.
 ///
 /// A separate function and a separate entry point rather than a flag, because
@@ -1753,6 +1921,85 @@ fn build_pipeline(
         mode,
         format,
     )
+}
+
+/// The fluid pipeline: the same world shader, blended, over its own vertex.
+///
+/// # Why fluid is a separate pipeline rather than a flag
+///
+/// Three things differ, and none of them can be a uniform.
+///
+/// **Blending is pipeline state.** A transparent surface has to be composited
+/// against what is already in the target, and that is `ColorTargetState::blend`,
+/// which is fixed when the pipeline is built.
+///
+/// **Depth writes are off.** Milk still TESTS against the depth buffer — a pond
+/// behind a hill is hidden by the hill — but it must not write, or the nearer
+/// face of a pond would occlude its own far face and a swimmer would see a hole
+/// where the bottom should be. This is why the fluid pass runs after all the
+/// opaque geometry rather than interleaved with it.
+///
+/// **The vertex is wider.** A fluid vertex carries where the surface really sits
+/// and which way it is running (see `mesher::FluidVertex`), which terrain has no
+/// use for and should not pay four bytes a vertex to carry.
+///
+/// Back faces are NOT culled. From inside a pond the near surface is a back face
+/// and it is exactly what a swimmer is looking through; culling it is what made
+/// being underwater look like being in air.
+fn build_fluid_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    bind_layouts: &[Option<&wgpu::BindGroupLayout>],
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let layout = gpu
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fluid-pipeline-layout"),
+            bind_group_layouts: bind_layouts,
+            immediate_size: 0,
+        });
+
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fluid"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("fluid_vertex"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &fluid_vertex_layout(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fluid_fragment"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
 }
 
 /// The world pipeline, whichever bind groups and fragment stage it wants.

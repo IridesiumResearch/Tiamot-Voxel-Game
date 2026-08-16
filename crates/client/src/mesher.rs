@@ -140,7 +140,30 @@ pub struct SubNodeGrid {
     /// of them: it skips both the allocation and the second mask per column,
     /// so a world with no milk in it meshes exactly as it did.
     fluid: Option<[Vec<u64>; 3]>,
+    /// Each block's fluid surface height, in sixteenths of a cell, `0` for dry.
+    ///
+    /// **This is what makes the surface smooth rather than a staircase.** The
+    /// occupancy above is on the lattice and can only ever be 1, 2 or 3 cells
+    /// deep; the real surface of a level-3 pool is 1.0 cells and of a level-5 is
+    /// 1.67, and those are not lattice positions. So the lattice carries the
+    /// occupancy — which is all face culling needs — and this carries where the
+    /// top of the milk actually is, to a sixteenth of a cell.
+    ///
+    /// A block is three cells, so the range is 0..=48 and it fits a byte.
+    /// Indexed by [`LocalBlock::index`], one byte per block, allocated only for
+    /// a chunk that has fluid in it.
+    heights: Option<Vec<u8>>,
 }
+
+/// Fine units per cell in [`SubNodeGrid::heights`] and a fluid vertex's drop.
+///
+/// Sixteen: a sixteenth of a cell is a 48th of a block, finer than the seven
+/// levels a fluid can actually take, so the quantisation here is never the
+/// thing a player sees.
+const FINE: u32 = 16;
+
+/// The tallest a block's fluid surface can be, in [`FINE`] units. Three cells.
+const FULL_BLOCK: u32 = FINE * SUBNODES_PER_AXIS;
 
 impl SubNodeGrid {
     /// Expands a chunk, seeding the padding bits from its neighbours.
@@ -182,6 +205,7 @@ impl SubNodeGrid {
         let mut materials = vec![0u16; CELLS];
         let mut columns = [vec![0u64; N * N], vec![0u64; N * N], vec![0u64; N * N]];
         let mut wet: Option<[Vec<u64>; 3]> = None;
+        let mut heights: Option<Vec<u8>> = None;
 
         for index in 0..BLOCKS_PER_CHUNK {
             let local = LocalBlock::from_index(index);
@@ -197,6 +221,7 @@ impl SubNodeGrid {
                         &mut materials,
                         &mut columns,
                         &mut wet,
+                        &mut heights,
                         local,
                         material,
                         depth,
@@ -240,6 +265,7 @@ impl SubNodeGrid {
                     &mut materials,
                     &mut columns,
                     &mut wet,
+                    &mut heights,
                     local,
                     material,
                     depth,
@@ -251,6 +277,7 @@ impl SubNodeGrid {
             materials,
             columns,
             fluid: wet,
+            heights,
         };
         grid.seed_padding(neighbours, absent);
         grid
@@ -288,6 +315,89 @@ impl SubNodeGrid {
     #[must_use]
     fn material(&self, x: usize, y: usize, z: usize) -> u16 {
         self.materials[x + N * y + N * N * z]
+    }
+
+    /// Whether a cell holds fluid. Out-of-range cells are dry.
+    #[must_use]
+    fn is_fluid(&self, x: i32, y: i32, z: i32) -> bool {
+        let Some(fluid) = self.fluid.as_ref() else {
+            return false;
+        };
+        let inside = |value: i32| usize::try_from(value).ok().filter(|value| *value < N);
+        let (Some(x), Some(y), Some(z)) = (inside(x), inside(y), inside(z)) else {
+            return false;
+        };
+        fluid[1][x * N + z] >> (y as u32 + FIRST) & 1 == 1
+    }
+
+    /// A block's fluid surface height in [`FINE`] units, or `None` if it is dry.
+    ///
+    /// Block coordinates, and **out-of-range blocks are dry** rather than
+    /// wrapping. A pond at a chunk's edge therefore slopes down to nothing at
+    /// the seam until the neighbouring chunk arrives, which is the same
+    /// compromise the corner-light sampler makes and for the same reason: the
+    /// grid's padding is one CELL wide and cannot answer a question about the
+    /// block beyond it.
+    #[must_use]
+    fn block_height(&self, bx: i32, by: i32, bz: i32) -> Option<u32> {
+        let heights = self.heights.as_ref()?;
+        let blocks = tiamot_core::CHUNK_BLOCKS as i32;
+        if !(0..blocks).contains(&bx) || !(0..blocks).contains(&by) || !(0..blocks).contains(&bz) {
+            return None;
+        }
+        let local = LocalBlock::new(bx as u32, by as u32, bz as u32);
+        match heights[local.index()] {
+            0 => None,
+            height => Some(u32::from(height)),
+        }
+    }
+
+    /// The fluid surface height at a vertex, in [`FINE`] units above the floor
+    /// of block row `by`.
+    ///
+    /// **A pure function of the vertex's own position**, which is the property
+    /// that matters and the reason it is written this way rather than per quad.
+    /// Two quads that share an edge ask this the same question at the same
+    /// coordinates and get the same answer, so a smoothed surface has no cracks
+    /// in it — not because anything checks for them, but because there is
+    /// nowhere for one to come from.
+    ///
+    /// The height is averaged over the up-to-four blocks touching this corner
+    /// that actually hold fluid. Dry neighbours are left out rather than counted
+    /// as zero: counting them would drag every shoreline down to nothing and
+    /// leave a pond looking like a shallow dish.
+    ///
+    /// `cx` and `cz` are CELL coordinates and may sit inside a block rather than
+    /// on its corner, which happens when greedy merging splits a face mid-block.
+    /// They are rounded to the nearest block corner. That is an approximation
+    /// and it is a consistent one — same input, same answer — so it still cannot
+    /// crack.
+    #[must_use]
+    fn surface_at(&self, cx: usize, cz: usize, by: i32) -> u32 {
+        let per_axis = SUBNODES_PER_AXIS as usize;
+        // Nearest block corner: cell 0..1 belongs to corner 0, 2..4 to corner 1.
+        let corner_x = (cx + per_axis / 2) / per_axis;
+        let corner_z = (cz + per_axis / 2) / per_axis;
+
+        let mut total = 0;
+        let mut count = 0;
+        // The four blocks meeting at this corner, in a fixed order.
+        for (dx, dz) in [(-1, -1), (0, -1), (-1, 0), (0, 0)] {
+            let bx = corner_x as i32 + dx;
+            let bz = corner_z as i32 + dz;
+            if let Some(height) = self.block_height(bx, by, bz) {
+                total += height;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            // No fluid touches this corner at all. The vertex belongs to a face
+            // that exists, so something here is wet — a block whose height row
+            // is out of range, at a chunk seam. Full is the least wrong answer:
+            // it leaves the surface flat rather than collapsing it.
+            return FULL_BLOCK;
+        }
+        total / count
     }
 
     /// Whether a cell is occupied. Occupancy is "not air" (charter rule 5).
@@ -376,6 +486,12 @@ impl FluidFill for NoFluid {
     }
 }
 
+impl<T: FluidFill + ?Sized> FluidFill for &T {
+    fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
+        (**self).fill(local)
+    }
+}
+
 /// Lays a fluid slab into the bottom `depth` cells of a block.
 ///
 /// The cells are ordinary occupancy, so everything downstream treats milk as
@@ -386,6 +502,7 @@ fn fill_fluid(
     materials: &mut [u16],
     columns: &mut [Vec<u64>; 3],
     wet: &mut Option<[Vec<u64>; 3]>,
+    heights: &mut Option<Vec<u8>>,
     local: LocalBlock,
     material: u16,
     depth: u8,
@@ -394,23 +511,35 @@ fn fill_fluid(
     let base_y = local.y as usize * SUBNODES_PER_AXIS as usize;
     let base_z = local.z as usize * SUBNODES_PER_AXIS as usize;
 
-    // **Seven levels onto three layers, and this is the coarse step.**
+    // **The lattice rounds UP, and the vertices come back down.**
     //
     // `depth` is the fraction of the block's HEIGHT that is full, in
     // twenty-sevenths — level 7 is 24/27, about 0.9 of a block, which is what
-    // gives a brim-full block a visible surface. A block is only three
-    // sub-nodes tall, so laying that into the lattice quantises seven levels
-    // into three heights: `depth / 9`.
+    // gives a brim-full block a visible surface. A block is three cells tall, so
+    // the real surface sits at `depth / 9` cells, which is almost never a
+    // lattice position.
     //
-    // Clamped to at least one layer, because a level of 1 is 3/27 and would
-    // floor to nothing — a puddle that exists to the physics and to `get_fluid`
-    // and cannot be seen is worse than one drawn a little too deep.
+    // This used to take the floor of that and stop there, which quantised seven
+    // levels onto three heights and was the whole reason a pond looked like a
+    // staircase. Now the occupancy is filled to the CEILING of the surface — so
+    // the lattice always covers the milk rather than falling short of it — and
+    // `SubNodeGrid::heights` records where the surface really is, in sixteenths
+    // of a cell. The mesher pulls the top vertices down to it.
     //
-    // This is the honest limit of drawing fluid as lattice geometry, and it is
-    // the step before per-vertex surface heights rather than a substitute for
-    // them: smooth surfaces need heights BETWEEN cells, which is a vertex
-    // attribute rather than an occupancy bit.
-    let layers = (usize::from(depth) / 9).clamp(1, SUBNODES_PER_AXIS as usize);
+    // Rounding up rather than down is what makes the drop a vertex carries
+    // unsigned and, more importantly, non-negative: a vertex is only ever
+    // lowered from the lattice, never raised above it, so no fluid vertex can
+    // escape the occupancy its own face culling was computed from.
+    //
+    // At least one layer, because a level of 1 is 3/27 and its ceiling in cells
+    // is still 1 — but the clamp is kept explicit, since a puddle that exists to
+    // the physics and to `get_fluid` and cannot be seen is the worst outcome
+    // available here.
+    let height = (u32::from(depth) * FULL_BLOCK / tiamot_core::UNITS_PER_BLOCK).min(FULL_BLOCK);
+    let heights = heights.get_or_insert_with(|| vec![0u8; BLOCKS_PER_CHUNK]);
+    heights[local.index()] = u8::try_from(height).unwrap_or(u8::MAX);
+
+    let layers = (height.div_ceil(FINE) as usize).clamp(1, SUBNODES_PER_AXIS as usize);
     for cy in 0..layers {
         for cz in 0..SUBNODES_PER_AXIS as usize {
             for cx in 0..SUBNODES_PER_AXIS as usize {
@@ -442,23 +571,52 @@ fn fill_fluid(
 }
 
 /// A meshed chunk.
+///
+/// # Two quad lists, because fluid is drawn separately
+///
+/// Milk was laid into the same list as terrain and drawn in the same opaque
+/// pass, which is why it could only ever be opaque. It is its own list now, and
+/// the renderer draws it after the terrain with blending on and depth writes
+/// off — the ordinary way to draw transparent geometry, and the only way a
+/// player can see the ground through a pond.
+///
+/// The split is free in the mesher: the two face sets are already disjoint (a
+/// cell holds terrain or fluid, never both) and already separately culled, so
+/// this is the same work sorted into two buckets rather than any extra.
 #[derive(Debug, Default, Clone)]
 pub struct Mesh {
-    /// The merged quads.
+    /// The merged opaque quads.
     pub quads: Vec<Quad>,
+    /// The fluid half, **already expanded to vertices**.
+    ///
+    /// Terrain stays as quads because a quad is self-describing: its four
+    /// corners follow from its own position and extent. A fluid quad is not —
+    /// where each corner sits depends on the surface height field, and which way
+    /// it scrolls on that field's gradient — so it is resolved here, while the
+    /// grid it was meshed from is still in hand, rather than being carried in a
+    /// form that cannot be expanded later.
+    pub fluid_vertices: Vec<FluidVertex>,
+    /// Indices into [`Mesh::fluid_vertices`].
+    pub fluid_indices: Vec<u32>,
 }
 
 impl Mesh {
-    /// Four corners per quad.
+    /// Four corners per quad, opaque geometry only.
     #[must_use]
     pub fn vertex_count(&self) -> usize {
         self.quads.len() * 4
     }
 
-    /// Two triangles per quad.
+    /// Two triangles per quad, opaque geometry only.
     #[must_use]
     pub fn index_count(&self) -> usize {
         self.quads.len() * 6
+    }
+
+    /// How many fluid quads there are. Four vertices each.
+    #[must_use]
+    pub fn fluid_quad_count(&self) -> usize {
+        self.fluid_vertices.len() / 4
     }
 
     /// Bytes a GPU vertex buffer would need.
@@ -473,16 +631,31 @@ impl Mesh {
         self.index_count() * size_of::<u32>()
     }
 
-    /// Total VRAM for this mesh.
+    /// Total VRAM for this mesh, fluid included.
     #[must_use]
     pub fn gpu_bytes(&self) -> usize {
-        self.vertex_bytes() + self.index_bytes()
+        self.vertex_bytes()
+            + self.index_bytes()
+            + self.fluid_vertices.len() * size_of::<FluidVertex>()
+            + self.fluid_indices.len() * size_of::<u32>()
     }
 
-    /// Whether the mesh has nothing to draw.
+    /// Whether the mesh has nothing to draw **at all**, fluid included.
     #[must_use]
     pub fn is_empty(&self) -> bool {
+        self.quads.is_empty() && self.fluid_vertices.is_empty()
+    }
+
+    /// Whether there is no opaque geometry. A pond hanging in the air has none.
+    #[must_use]
+    pub fn has_no_terrain(&self) -> bool {
         self.quads.is_empty()
+    }
+
+    /// Whether there is no fluid geometry, which is nearly every chunk.
+    #[must_use]
+    pub fn has_no_fluid(&self) -> bool {
+        self.fluid_vertices.is_empty()
     }
 
     /// Expands to the vertex and index buffers a renderer uploads.
@@ -518,15 +691,7 @@ impl Mesh {
 
         for quad in &self.quads {
             let base = u32::try_from(vertices.len()).unwrap_or(0);
-            for (corner, (du, dv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
-                let u = u32::from(quad.u) + du * u32::from(quad.du);
-                let v = u32::from(quad.v) + dv * u32::from(quad.dv);
-                let w = u32::from(quad.w) + u32::from(quad.positive);
-                let (x, y, z) = match quad.axis {
-                    0 => (w, u, v),
-                    1 => (u, w, v),
-                    _ => (u, v, w),
-                };
+            for (corner, (x, y, z)) in quad_corners(quad).into_iter().enumerate() {
                 // Corner `n` of the shade is vertex `n` here: both walk
                 // `[(0,0), (1,0), (1,1), (0,1)]`, and `crate::shade::Shade`
                 // says so where it is defined.
@@ -540,20 +705,256 @@ impl Mesh {
                     quad.shade.corner(corner),
                 ));
             }
-            // The y axis's (u, v, w) mapping is an odd permutation, so its
-            // corners circulate the other way. See the method docs.
-            let outward = quad.positive != (quad.axis == 1);
-            if outward {
-                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-            } else {
-                // Reversed, so a quad winds the same way when seen from its own
-                // outside whichever direction it faces.
-                indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
-            }
+            push_quad_indices(&mut indices, base, quad);
         }
 
         (vertices, indices)
     }
+}
+
+/// Expands fluid quads into vertices, against the grid they were meshed from.
+///
+/// **The grid is required and that is the point.** A fluid vertex carries where
+/// the surface really is and which way it is running, and neither is a property
+/// of the quad — both are read from the height field at the vertex's own
+/// coordinates, which is what makes two quads sharing an edge agree about it and
+/// so what keeps a smoothed surface free of cracks. See
+/// [`SubNodeGrid::surface_at`].
+#[must_use]
+fn fluid_buffers(quads: &[Quad], grid: &SubNodeGrid) -> (Vec<FluidVertex>, Vec<u32>) {
+    {
+        let mut vertices = Vec::with_capacity(quads.len() * 4);
+        let mut indices = Vec::with_capacity(quads.len() * 6);
+        let per_axis = SUBNODES_PER_AXIS as usize;
+
+        for quad in quads {
+            let base = u32::try_from(vertices.len()).unwrap_or(0);
+            for (corner, (x, y, z)) in quad_corners(quad).into_iter().enumerate() {
+                // Which block row this vertex's surface belongs to. A vertex
+                // sits ON a plane between two cells, so a vertex at the very
+                // bottom of a block row is the top of the row beneath — take the
+                // cell below it, which is the one the fluid is actually in.
+                let below = y.saturating_sub(1) as usize;
+                let by = (below / per_axis) as i32;
+
+                // Only a vertex ON the surface moves. Everything else — the
+                // bottom of a waterfall, the side of a column with more milk
+                // above it — stays exactly on the lattice, so the drop is zero
+                // and the geometry is what it always was.
+                //
+                // **A vertex is a corner, not a cell.** It is shared by up to
+                // four cells horizontally, and the quad it belongs to may sit
+                // on either side of it — a block's top face has corners at the
+                // block's far edges, where the cell AT the corner coordinate is
+                // already the next block along and is usually dry. Asking about
+                // the single cell at `(x, z)` therefore answered "not fluid" for
+                // every corner on a pond's positive edge, and the surface came
+                // out flat because half its vertices never moved.
+                //
+                // So: any of the four below is milk, none of the four above is.
+                let wet_below = fluid_touches(grid, x, below as u32, z);
+                let wet_above = fluid_touches(grid, x, y, z);
+                let drop = if wet_below && !wet_above {
+                    let lattice = ((below % per_axis) as u32 + 1) * FINE;
+                    let surface = grid.surface_at(x as usize, z as usize, by);
+                    u16::try_from(lattice.saturating_sub(surface)).unwrap_or(u16::MAX)
+                } else {
+                    0
+                };
+
+                let flow = flow_at(
+                    grid,
+                    (x as usize / per_axis) as i32,
+                    by,
+                    (z as usize / per_axis) as i32,
+                );
+                vertices.push(FluidVertex::new(
+                    x,
+                    y,
+                    z,
+                    quad.axis,
+                    quad.positive,
+                    quad.material,
+                    quad.shade.corner(corner),
+                    drop,
+                    flow,
+                ));
+            }
+            push_quad_indices(&mut indices, base, quad);
+        }
+
+        (vertices, indices)
+    }
+}
+
+/// A quad's four corners in cell coordinates, in `to_buffers` order.
+fn quad_corners(quad: &Quad) -> [(u32, u32, u32); 4] {
+    let mut corners = [(0, 0, 0); 4];
+    for (corner, (du, dv)) in [(0, 0), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
+        let u = u32::from(quad.u) + du * u32::from(quad.du);
+        let v = u32::from(quad.v) + dv * u32::from(quad.dv);
+        let w = u32::from(quad.w) + u32::from(quad.positive);
+        corners[corner] = match quad.axis {
+            0 => (w, u, v),
+            1 => (u, w, v),
+            _ => (u, v, w),
+        };
+    }
+    corners
+}
+
+/// Two triangles, wound so the quad faces outward whichever way it points.
+///
+/// The y axis's `(u, v, w)` mapping is an odd permutation, so its corners
+/// circulate the other way — see [`Mesh::to_buffers`].
+fn push_quad_indices(indices: &mut Vec<u32>, base: u32, quad: &Quad) {
+    if quad.positive == (quad.axis != 1) {
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    } else {
+        indices.extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+    }
+}
+
+/// A fluid vertex: 12 bytes.
+///
+/// [`PackedVertex`]'s two words, plus one that says where the milk's surface
+/// actually is and which way it is running. Fluid has its own draw call for
+/// transparency, so it can have its own format without costing terrain — which
+/// is the overwhelming majority of a world's geometry — a single byte.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FluidVertex {
+    /// x:6 | y:6 | z:6 | axis:2 | positive:1 | occlusion:2 | fine light:8.
+    /// Identical to [`PackedVertex::packed`], so one shader can unpack either.
+    pub packed: u32,
+    /// material:16 | light:16, as [`PackedVertex::material`].
+    pub material: u32,
+    /// `drop:16` | `flow_x:8` | `flow_z:8`.
+    ///
+    /// `drop` is how far BELOW the lattice position the vertex really sits, in
+    /// [`FINE`] units — always zero for a vertex that is not on the surface, and
+    /// never negative, because `fill_fluid` rounds the occupancy up.
+    ///
+    /// `flow_x` and `flow_z` are a signed direction, `i8`, `±127` for a full
+    /// unit. Zero in both is still milk, which ripples rather than scrolls.
+    pub surface: u32,
+}
+
+impl FluidVertex {
+    /// Where this vertex sits on the lattice, in cells, before its drop.
+    #[must_use]
+    pub const fn position(&self) -> (u32, u32, u32) {
+        (
+            self.packed & 0x3F,
+            (self.packed >> 6) & 0x3F,
+            (self.packed >> 12) & 0x3F,
+        )
+    }
+
+    /// The face's axis and direction.
+    #[must_use]
+    pub const fn face(&self) -> (u8, bool) {
+        (
+            ((self.packed >> 18) & 0x3) as u8,
+            (self.packed >> 20) & 1 == 1,
+        )
+    }
+
+    /// The material this vertex draws.
+    #[must_use]
+    pub const fn material(&self) -> u16 {
+        (self.material & 0xFFFF) as u16
+    }
+
+    /// How far below the lattice the surface really is, in [`FINE`] units.
+    #[must_use]
+    pub const fn drop(&self) -> u16 {
+        (self.surface & 0xFFFF) as u16
+    }
+
+    /// Which way the milk here is running, as the packed signed pair.
+    #[must_use]
+    pub const fn flow(&self) -> (i8, i8) {
+        (
+            ((self.surface >> 16) & 0xFF) as u8 as i8,
+            ((self.surface >> 24) & 0xFF) as u8 as i8,
+        )
+    }
+
+    /// Packs one corner.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a vertex has this many fields; grouping them into a struct \
+                  whose only purpose is to be unpacked here would move the \
+                  argument list rather than shorten it"
+    )]
+    pub const fn new(
+        x: u32,
+        y: u32,
+        z: u32,
+        axis: u8,
+        positive: bool,
+        material: u16,
+        corner: crate::shade::Corner,
+        drop: u16,
+        flow: (i8, i8),
+    ) -> Self {
+        let base = PackedVertex::lit(x, y, z, axis, positive, material, corner);
+        Self {
+            packed: base.packed,
+            material: base.material,
+            surface: (drop as u32) | ((flow.0 as u8 as u32) << 16) | ((flow.1 as u8 as u32) << 24),
+        }
+    }
+}
+
+/// Whether any of the four cells meeting at a vertical edge holds fluid.
+///
+/// `x` and `z` are a VERTEX's coordinates, so the cells that touch it are the
+/// four at `x-1..=x` by `z-1..=z`. `y` is a cell row.
+fn fluid_touches(grid: &SubNodeGrid, x: u32, y: u32, z: u32) -> bool {
+    for dx in [-1, 0] {
+        for dz in [-1, 0] {
+            if grid.is_fluid(x as i32 + dx, y as i32, z as i32 + dz) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Which way the milk at a block is running, as a unit-ish `i8` pair.
+///
+/// **Downhill, from the surface itself.** The solver knows which neighbours it
+/// pushed into, but none of that is on the wire and none of it needs to be: a
+/// fluid's surface already slopes the way it flows, so the direction is the
+/// negative gradient of the height field the smoothing pass built. A spring on a
+/// slope has a surface falling away from it and scrolls outward; a settled pond
+/// is flat, its gradient is zero, and it does not scroll at all — which is the
+/// distinction the effect exists to draw, arrived at without a protocol change.
+fn flow_at(grid: &SubNodeGrid, bx: i32, by: i32, bz: i32) -> (i8, i8) {
+    let sample = |x: i32, z: i32| -> i32 {
+        // A dry neighbour reads as the floor rather than as "no data": milk at
+        // the edge of a shelf is running OFF it, and treating the empty side as
+        // equal height would say it was still.
+        grid.block_height(x, by, z).unwrap_or(0) as i32
+    };
+    let here = sample(bx, bz);
+    let _ = here;
+    let gradient_x = sample(bx + 1, bz) - sample(bx - 1, bz);
+    let gradient_z = sample(bx, bz + 1) - sample(bx, bz - 1);
+    // Downhill is the negative gradient. These are CENTRAL differences, taken
+    // over two blocks, so a surface falling a full cell per block comes to two
+    // cells across the difference — which is the divisor, and which makes such a
+    // slope saturate exactly. Anything gentler is proportional; anything steeper
+    // was already running as fast as this can say.
+    let scale = |value: i32| -> i8 {
+        let full = 2 * i32::try_from(FINE).unwrap_or(16);
+        let scaled = -value * 127 / full;
+        scaled.clamp(-127, 127) as i8
+    };
+    (scale(gradient_x), scale(gradient_z))
 }
 
 /// Directional face shading for lighting mode 1.
@@ -694,9 +1095,18 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
     let mut mesh = Mesh::default();
     // A plane of faces for one slice: N rows of an N-bit mask.
     let mut plane = vec![0u64; N * N];
+    // The same for the fluid faces, which merge into their own quad list and
+    // are drawn in their own pass. Allocated only for a chunk that has fluid.
+    let mut wet_plane = if grid.fluid.is_some() {
+        vec![0u64; N * N]
+    } else {
+        Vec::new()
+    };
     // One slice's worth of corner light, reused across every slice and
     // direction. Entries for cells with no face are never read.
     let mut shades = vec![Shade::default(); N * N];
+    // Merged into a local list and expanded at the end, once, against the grid.
+    let mut fluid: Vec<Quad> = Vec::new();
 
     for (axis, positive) in FACES {
         // Face culling, a whole column at a time. This is the entire reason for
@@ -706,6 +1116,7 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
         let columns = &grid.columns[axis];
         let wet = grid.fluid.as_ref().map(|fluid| &fluid[axis]);
         plane.fill(0);
+        wet_plane.fill(0);
 
         for u in 0..N {
             for v in 0..N {
@@ -739,17 +1150,26 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
                 } else {
                     solid & !(solid << 1)
                 };
-                let faces = match wet {
+                // **The fluid's own faces go to their own plane**, rather than
+                // being OR-ed into the terrain's as they were. They are drawn in
+                // a separate, blended pass so that a pond can be seen through,
+                // and a transparent surface cannot share a draw call with the
+                // opaque world behind it.
+                //
+                // The two sets are disjoint by construction — a cell holds
+                // terrain or fluid, never both, because terrain wins the cell in
+                // `fill_fluid` — so this is the same faces sorted into two
+                // buckets and not any extra work.
+                let wet_faces = match wet {
                     Some(wet) => {
                         let wet = wet[u * N + v];
-                        faces
-                            | if positive {
-                                wet & !(column >> 1)
-                            } else {
-                                wet & !(column << 1)
-                            }
+                        if positive {
+                            wet & !(column >> 1)
+                        } else {
+                            wet & !(column << 1)
+                        }
                     }
-                    None => faces,
+                    None => 0,
                 };
                 // Scatter the column's faces into per-slice planes.
                 let mut remaining = faces >> FIRST;
@@ -758,6 +1178,14 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
                     remaining &= remaining - 1;
                     if w < N {
                         plane[w * N + u] |= 1 << v;
+                    }
+                }
+                let mut remaining = wet_faces >> FIRST;
+                while remaining != 0 {
+                    let w = remaining.trailing_zeros() as usize;
+                    remaining &= remaining - 1;
+                    if w < N {
+                        wet_plane[w * N + u] |= 1 << v;
                     }
                 }
             }
@@ -781,10 +1209,38 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
                 }
             }
 
-            greedy_merge(grid, &shades, slice, axis, positive, w, &mut mesh);
+            greedy_merge(
+                grid,
+                &shades,
+                slice,
+                axis,
+                positive,
+                w,
+                false,
+                &mut mesh.quads,
+            );
+
+            if wet_plane.is_empty() {
+                continue;
+            }
+            let slice = &mut wet_plane[w * N..(w + 1) * N];
+            for (u, row) in slice.iter().enumerate() {
+                let mut bits = *row;
+                while bits != 0 {
+                    let v = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let (cx, cy, cz) = SubNodeGrid::cell(axis, u, v, w);
+                    shades[u * N + v] = shade_at(light, grid, axis, positive, cx, cy, cz);
+                }
+            }
+            greedy_merge(grid, &shades, slice, axis, positive, w, true, &mut fluid);
         }
     }
 
+    // Resolved here rather than carried as quads: see `Mesh::fluid_vertices`.
+    let (vertices, indices) = fluid_buffers(&fluid, grid);
+    mesh.fluid_vertices = vertices;
+    mesh.fluid_indices = indices;
     mesh
 }
 
@@ -843,6 +1299,12 @@ fn shade_at(
 }
 
 /// Merges one slice's face bitmap into as few quads as possible.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the merge needs the grid, the shading, the plane it consumes, and \
+              which face of which slice it is merging; every one of them is a \
+              distinct input and none groups naturally with another"
+)]
 fn greedy_merge(
     grid: &SubNodeGrid,
     shades: &[Shade],
@@ -850,8 +1312,34 @@ fn greedy_merge(
     axis: usize,
     positive: bool,
     w: usize,
-    mesh: &mut Mesh,
+    fluid: bool,
+    out: &mut Vec<Quad>,
 ) {
+    // **A fluid face carries its block's surface height as a merge key.**
+    //
+    // A vertex on the surface is pulled down to where the milk really is, and
+    // the hardware interpolates linearly between a quad's four corners. Across
+    // one block that is exactly the bilinear field `surface_at` describes; across
+    // two blocks at different heights it is a straight line through a corner the
+    // quad has no vertex for, which would flatten the step between a deep pool
+    // and the shallow lip beside it into a ramp.
+    //
+    // Where a pond IS flat every block agrees, this key is constant, and the
+    // whole surface merges into one quad exactly as it did before — which is the
+    // case that decides a fluid mesh's vertex count.
+    let height_key = |cx: usize, cy: usize, cz: usize| -> u32 {
+        if !fluid {
+            return 0;
+        }
+        let per_axis = SUBNODES_PER_AXIS as usize;
+        grid.block_height(
+            (cx / per_axis) as i32,
+            (cy / per_axis) as i32,
+            (cz / per_axis) as i32,
+        )
+        .unwrap_or(0)
+    };
+
     for u in 0..N {
         let mut row = plane[u];
         while row != 0 {
@@ -859,6 +1347,7 @@ fn greedy_merge(
             let (cx, cy, cz) = SubNodeGrid::cell(axis, u, v, w);
             let material = grid.material(cx, cy, cz);
             let shade = shades[u * N + v];
+            let height = height_key(cx, cy, cz);
 
             // Extend along v while the faces are present and the material
             // matches. Merging across a material boundary would produce a quad
@@ -880,7 +1369,10 @@ fn greedy_merge(
                 // straight through a shadow edge. Uniformly lit surfaces —
                 // most of a world — have identical shades and merge exactly as
                 // before. See `crate::shade`.
-                if grid.material(nx, ny, nz) != material || shades[u * N + v + span_v] != shade {
+                if grid.material(nx, ny, nz) != material
+                    || shades[u * N + v + span_v] != shade
+                    || height_key(nx, ny, nz) != height
+                {
                     break;
                 }
                 span_v += 1;
@@ -902,6 +1394,7 @@ fn greedy_merge(
                     let (nx, ny, nz) = SubNodeGrid::cell(axis, u + span_u, v + offset, w);
                     grid.material(nx, ny, nz) == material
                         && shades[(u + span_u) * N + v + offset] == shade
+                        && height_key(nx, ny, nz) == height
                 });
                 if !matches {
                     break;
@@ -910,7 +1403,7 @@ fn greedy_merge(
                 span_u += 1;
             }
 
-            mesh.quads.push(Quad {
+            out.push(Quad {
                 axis: u8::try_from(axis).unwrap_or(0),
                 positive,
                 w: u8::try_from(w).unwrap_or(0),
@@ -1083,7 +1576,6 @@ mod tests {
         // exist as geometry. Opaque milk hides that from above; from inside the
         // milk it is a hole straight through the world, reported from the
         // window as "under water I just see through the world".
-        const MILK: u16 = 9;
 
         let mut chunk = empty();
         chunk
@@ -1110,21 +1602,169 @@ mod tests {
              straight through it"
         );
 
-        // And the milk's underside against that stone is the face that goes
-        // instead — it is the one nobody can ever be on the far side of.
+        // **And no milk at all is in the opaque list.** It is drawn in its own
+        // blended pass now, which is both what makes a pond see-through and
+        // what keeps the two occupancy sets from arguing over a shared face.
         assert!(
-            !faces.iter().any(|(axis, positive, _, _, w, material)| {
-                *axis == 1 && !*positive && *w == 3 && *material == MILK
-            }),
-            "the milk drew a face against the stone it is resting on"
+            !faces
+                .iter()
+                .any(|(_, _, _, _, _, material)| *material == MILK),
+            "milk is still in the opaque quad list, so it cannot be transparent"
         );
 
-        // The milk's own surface is still there, or there is no pond to see.
+        // The milk's own surface is there, in the fluid list, or there is no
+        // pond to see. A brim-full block is 24 of 27, which is 2.625 cells, so
+        // the occupancy rounds up to three layers and the surface vertices are
+        // dropped back down to where the milk really is.
+        let surface: Vec<_> = mesh
+            .fluid_vertices
+            .iter()
+            .filter(|vertex| vertex.face() == (1, true) && vertex.material() == MILK)
+            .collect();
+        assert!(!surface.is_empty(), "the pond has no surface");
+        for vertex in &surface {
+            let (_, y, _) = vertex.position();
+            assert_eq!(y, 6, "the milk's top face is not on the lattice top");
+            // Three cells of lattice, 2.625 cells of milk: 0.375 of a cell, and
+            // FINE is sixteenths, so six.
+            assert_eq!(
+                vertex.drop(),
+                6,
+                "a brim-full block's surface was not pulled down to where the \
+                 milk actually is"
+            );
+        }
+    }
+
+    /// A material id for milk in the fluid fixtures below. Any non-zero value:
+    /// the mesher never resolves it, it only carries it.
+    const MILK: u16 = 9;
+
+    #[test]
+    fn a_flat_pond_is_flat_and_a_sloping_one_is_not() {
+        // The two halves of the smoothing, in one fixture. A settled pond must
+        // come out perfectly level — every vertex dropped by the same amount —
+        // or a still surface shimmers as the eye moves along it. And a pond
+        // whose blocks hold different amounts must NOT, or the smoothing is
+        // doing nothing and this is the old staircase with extra arithmetic.
+        struct Sloped;
+        impl FluidFill for Sloped {
+            fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
+                if local.y != 4 {
+                    return None;
+                }
+                // Deep at one end, shallow at the other.
+                match local.x {
+                    4 => Some((MILK, 24)),
+                    5 => Some((MILK, 18)),
+                    6 => Some((MILK, 9)),
+                    _ => None,
+                }
+            }
+        }
+        struct Level;
+        impl FluidFill for Level {
+            fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
+                if local.y == 4 && (4..=6).contains(&local.x) {
+                    Some((MILK, 18))
+                } else {
+                    None
+                }
+            }
+        }
+
+        fn drops(chunk: &Chunk, fill: &impl FluidFill) -> Vec<u16> {
+            let mesh = mesh_chunk(chunk, &Neighbours::open(), Absent::Air, &DAY, fill);
+            let mut drops: Vec<u16> = mesh
+                .fluid_vertices
+                .iter()
+                .filter(|vertex| vertex.face() == (1, true))
+                .map(super::FluidVertex::drop)
+                .collect();
+            drops.sort_unstable();
+            drops.dedup();
+            drops
+        }
+
+        let chunk = empty();
+        let flat = drops(&chunk, &Level);
+        assert_eq!(
+            flat.len(),
+            1,
+            "a level pond's surface came out at {flat:?} different heights"
+        );
+
+        let sloped = drops(&chunk, &Sloped);
         assert!(
-            faces.iter().any(|(axis, positive, _, _, w, material)| {
-                *axis == 1 && *positive && *w == 4 && *material == MILK
-            }),
-            "the pond has no surface"
+            sloped.len() > 1,
+            "a pond three blocks deep at one end and one at the other came out \
+             perfectly flat ({sloped:?}), so nothing is being smoothed"
+        );
+    }
+
+    #[test]
+    fn still_milk_does_not_scroll_and_falling_milk_does() {
+        // The flow direction is the negative gradient of the surface, so this
+        // is the same fixture asking a different question: a level pond has no
+        // gradient and must not scroll, and a surface that falls away must.
+        struct Level;
+        impl FluidFill for Level {
+            fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
+                if local.y == 4 && (4..=8).contains(&local.x) && (4..=8).contains(&local.z) {
+                    Some((MILK, 24))
+                } else {
+                    None
+                }
+            }
+        }
+        struct Slope;
+        impl FluidFill for Slope {
+            fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
+                if local.y != 4 || !(4..=8).contains(&local.z) {
+                    return None;
+                }
+                match local.x {
+                    4 => Some((MILK, 27)),
+                    5 => Some((MILK, 18)),
+                    6 => Some((MILK, 9)),
+                    _ => None,
+                }
+            }
+        }
+
+        fn flows(chunk: &Chunk, fill: &impl FluidFill) -> Vec<(i8, i8)> {
+            let mesh = mesh_chunk(chunk, &Neighbours::open(), Absent::Air, &DAY, fill);
+            mesh.fluid_vertices
+                .iter()
+                .map(super::FluidVertex::flow)
+                .collect()
+        }
+
+        let chunk = empty();
+
+        // The middle of a level pond: every neighbour agrees, so the gradient
+        // is zero everywhere it is measured against milk on both sides.
+        assert!(
+            flows(&chunk, &Level).contains(&(0, 0)),
+            "a level pond has nowhere with zero flow, so still milk will scroll"
+        );
+
+        // And the slope runs downhill, in +x: deeper at x=4, so the surface
+        // falls toward +x and the milk runs that way.
+        let sloped = flows(&chunk, &Slope);
+        assert!(
+            sloped.iter().any(|(x, z)| *x > 0 && *z == 0),
+            "milk on a surface falling toward +x, level in z, is not running \
+             that way anywhere: {sloped:?}"
+        );
+        // The pond's own z edges DO have a gradient — a shore is a slope — so
+        // this cannot ask that no vertex runs in z. What it can ask is that the
+        // dominant direction is the one the surface actually falls in.
+        let downhill = sloped.iter().filter(|(x, _)| *x > 0).count();
+        let sideways = sloped.iter().filter(|(x, _)| *x < 0).count();
+        assert!(
+            downhill > sideways,
+            "more milk is running uphill ({sideways}) than downhill ({downhill})"
         );
     }
 

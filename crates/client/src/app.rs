@@ -2137,6 +2137,11 @@ impl App {
         // rather than twenty steps; `set_time` snapping to the server's answer
         // is what stops it drifting.
         self.sky.advance(dt);
+        // Milk's own clock, which is not the sky's and not the tick's: it is
+        // how far a fluid texture has scrolled, and nothing but the fluid pass
+        // reads it. Presentation, so it runs on frame time rather than being
+        // pinned to the simulation.
+        self.renderer.advance_clock(dt);
         let moment = self.sky.moment();
         self.renderer
             .set_sun(moment.intensity, moment.sun, moment.sun_direction);
