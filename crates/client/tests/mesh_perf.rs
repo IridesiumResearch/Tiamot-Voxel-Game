@@ -392,3 +392,72 @@ fn border_aware_meshing_does_not_cost_more_than_the_spike_measured() {
          Neighbour culling is not allowed to spend the margin the verdict was granted on."
     );
 }
+
+/// What mode 1's move to propagated light costs in geometry.
+///
+/// **Not a gate, a measurement.** Mode 1 used to mesh against a flat daylight
+/// constant so that every corner agreed and the greedy merge rate matched Task
+/// 08's exactly. It cannot any more — knowing you are underground IS knowing the
+/// stored sunlight — so this reports what that is worth on a realistic chunk,
+/// under light that varies and under light that does not.
+///
+/// **Two numbers, and the honest reading needs both.** Measured on the realistic
+/// chunk: 1,194 quads under even light and 4,301 under the ramp below — 260%
+/// more. That ramp is a deliberate worst case and not a lamp: it falls one level
+/// per block along all three axes at once, so almost no two neighbouring corners
+/// agree anywhere in the chunk. A single lamp on a floor was measured at 22%
+/// when smooth lighting landed (see `crate::shade`), which is the figure a real
+/// scene sits near.
+///
+/// The number that matters most is the FIRST one. Open ground under an even sky
+/// is most of a world; there every corner still agrees, the merge is exactly
+/// what it always was, and mode 1's geometry is unchanged. What it now pays for
+/// is lit interiors — which is precisely where it previously could not tell a
+/// cave from a field.
+#[test]
+fn what_mode_ones_move_to_real_light_costs_in_quads() {
+    use client::shade::BlockLight;
+
+    /// Light falling one level per block along every axis at once. Harsher than
+    /// any real light source — a lamp on a floor varies in two axes, not three —
+    /// and chosen for that: it is the ceiling on what this change can cost.
+    struct Gradient;
+    impl BlockLight for Gradient {
+        fn at(&self, x: i32, y: i32, z: i32) -> tiamot_core::light::Light {
+            let distance = (x.abs() + y.abs() + z.abs()).clamp(0, 15) as u8;
+            tiamot_core::light::Light::new(15 - distance, 0, 0, 0)
+        }
+    }
+
+    let chunk = realistic();
+    let flat = client::mesher::mesh_chunk(
+        &chunk,
+        &Neighbours::open(),
+        Absent::Air,
+        &client::shade::Uniform(tiamot_core::light::Light::DAYLIGHT),
+        &client::mesher::NoFluid,
+    );
+    let varying = client::mesher::mesh_chunk(
+        &chunk,
+        &Neighbours::open(),
+        Absent::Air,
+        &Gradient,
+        &client::mesher::NoFluid,
+    );
+
+    let even = flat.quads.len();
+    let ramp = varying.quads.len();
+    println!(
+        "mode 1 meshing: {even} quads under even light, {ramp} under a one-level-per-block ramp \
+         ({:.0}% more)",
+        (ramp as f64 / even as f64 - 1.0) * 100.0
+    );
+
+    // Under light that does not vary, every corner still agrees and the merge is
+    // exactly what it always was — which is the claim worth pinning, because it
+    // is the case that decides a world's vertex count.
+    assert!(
+        ramp >= even,
+        "a varying light cannot merge BETTER than a constant one: {ramp} against {even}"
+    );
+}
