@@ -126,26 +126,41 @@ enterable; the shape you see is the shape you collide with.
   at all, which is why they behaved.
 - Movement resolves one axis at a time (X, then Y, then Z), which is what makes
   a body slide along a wall rather than stick to it.
-- **A body must never be left inside geometry.** This is the invariant that
-  outranks every performance concern in Task 09.
-- **A body that BEGINS a tick inside geometry is eased out of it.** The rule
-  above is about what movement may leave behind; this is about what the world
-  may do to a body that was standing still — a block placed where it stands, a
-  chunk arriving around it, a mod rewriting the ground under it.
+- **Movement must never put a body inside geometry.** This is the invariant that
+  outranks every performance concern in Task 09. It is a rule about what the
+  *sweeps* may leave behind, and it is unchanged.
+- **A body that BEGINS a tick inside geometry stays there.** *(Amended
+  2026-08-16, superseding "is eased out of it".)* The rule above is about what
+  movement may leave behind; this is about what the world may do to a body that
+  was standing still — a block placed where it stands, a chunk arriving around
+  it, a mod rewriting the ground under it.
 
-  Every sweep assumes the body started outside, so an overlapping body was
-  neither in nor out: it could not walk (each axis reads as blocked at zero
-  distance) and it could pass *upward* through solid cells, because the face
-  leading the move was already above them. Measured before this rule: a buried
-  body's horizontal velocity was zeroed on the second tick and it stayed at one
-  x for as long as it was held there, then jumped straight up through the slab.
+  The engine used to ease such a body out along the shortest axis, one sub-node
+  per tick. That is withdrawn, for two reasons that are about the rule rather
+  than its implementation.
 
-  The escape is along the **shortest** axis out, capped at one sub-node per tick
-  so it reads as being pushed rather than teleported, and **upward when two axes
-  are equally short**. Upward is not arbitrary: a body half inside the floor
-  must end up standing on it, and pushing it down instead would post it through
-  the world. While it is still overlapping it keeps its footing for the same
-  reason.
+  **It could not be made to answer.** Every case where an escape would have
+  helped is a case where the cells cannot say which way out is real. A body at a
+  chunk boundary reaches into the chunk across it and an absent chunk reads as
+  solid, so a boundary whose neighbour has not arrived is indistinguishable from
+  a wall — and pushing on that guess cost players their position, reported from
+  the window as chunk boundaries having their own collision. A body inside an
+  unloaded chunk reads as buried in every direction. A body genuinely entombed
+  has no shortest way out that the cells it touches can supply. The pass ended up
+  refusing all three, which is most of what a player actually meets.
+
+  **And being stuck is supposed to be bad.** A body squeezed into geometry should
+  suffer for it and eventually die, which is what every game with this problem
+  does, rather than being quietly relocated by the engine. The damage rule is not
+  written yet — health is an entity property and entities are Task 12 — so what
+  §2 guarantees for now is the *mechanism* it will read: a body whose volume
+  overlaps solid cells is left overlapping them, visibly, every tick.
+
+  **A stuck body can still walk out.** The sweep tests only the cells a leading
+  face would ENTER, never the ones a body already occupies, so a step toward open
+  air is unobstructed and a step deeper is refused. That is what makes this
+  survivable rather than a soft-lock, and it is a property of the sweep rather
+  than a special case: no code anywhere asks whether the body started inside.
 
 Task 09 implements this. Task 02b's prototype measured 0.0136 ms/tick for 100
 bodies.

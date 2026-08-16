@@ -5,8 +5,12 @@
 //!
 //! Implements **Sub-Node Contract §2**, quoted where each rule is enforced:
 //! collision is solid at sub-node resolution, a cell is solid iff occupied,
-//! step-up is one sub-node, movement resolves one axis at a time, and *a body
-//! must never be left inside geometry*.
+//! step-up is one sub-node, and movement resolves one axis at a time.
+//!
+//! **A body that begins a tick inside geometry is left there**, which is a
+//! change from the contract's original §2 and is recorded in it. The engine used
+//! to ease such a body out; see [`step`] for why it no longer does and what a
+//! damage rule is meant to read instead.
 //!
 //! # This is simulation code
 //!
@@ -292,17 +296,35 @@ impl Body {
 pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> Body {
     let mut body = body;
 
-    // Before anything else, because every sweep below assumes the body starts
-    // outside geometry. Contract §2: "A body that BEGINS a tick inside geometry
-    // is eased out of it."
-    if depenetrate(solid, &mut body) {
-        // Standing, for as long as it takes to get out. A body being pushed out
-        // of the floor that also read as falling would spend the escape
-        // accelerating downward into what it is escaping.
-        body.on_ground = true;
-        body.velocity[1] = 0.0;
-        return body;
-    }
+    // **A body inside geometry stays inside it.**
+    //
+    // There used to be a depenetration pass here that eased a body out along the
+    // shortest axis, and it is gone on purpose rather than because it was
+    // broken. Two things were wrong with the idea, not the implementation.
+    //
+    // The first is that it could not be made to work. Every case where the
+    // escape would have been *useful* — a body at a chunk boundary, a body
+    // inside an unloaded chunk, a body genuinely entombed — is a case where the
+    // cells cannot say which way out is real, so the pass had to refuse; and
+    // what it refused on was most of what a player actually hits. The comments
+    // it left behind are a record of that retreat.
+    //
+    // The second is that being stuck in a block is supposed to be bad. A player
+    // squeezed into geometry should suffer for it and eventually die, the way
+    // suffocation works in every game that has this problem — not be quietly
+    // teleported to safety by the engine. So the engine no longer has an
+    // opinion: the body stays where it is, and the tick runs normally around it.
+    //
+    // **A body inside geometry can still walk out**, which is what makes this
+    // survivable rather than a soft-lock: [`sweep`] only tests the cells a
+    // leading face would ENTER, never the ones a body already occupies, so a
+    // step toward open air is unobstructed and a step deeper is refused.
+    //
+    // The damage is not here and cannot be yet. It needs health, which is an
+    // entity property, and entities are Task 12 — implementing them now would be
+    // building a future prompt's feature early. What this leaves is the
+    // mechanism a damage rule will read: a body whose own volume overlaps solid
+    // geometry, every tick, with nothing hiding it.
 
     // **How wet the body is, decided once, before anything moves.**
     //
@@ -547,119 +569,6 @@ fn resolve_horizontal(
     if stops_dead {
         body.velocity[axis] = 0.0;
     }
-}
-
-/// The most a body is pushed out of geometry in one tick, in cells.
-///
-/// One sub-node. Enough that a body buried a block deep surfaces in three ticks
-/// — a seventh of a second — and little enough that being caught by a placed
-/// block reads as being shoved rather than as a teleport.
-const DEPENETRATION_PER_TICK: f32 = 1.0;
-
-/// Eases a body out of any geometry it is overlapping, and says whether it was.
-///
-/// Contract §2: the escape is along the shortest axis, capped at
-/// [`DEPENETRATION_PER_TICK`], and **upward when two are equally short**.
-///
-/// # Why upward wins ties
-///
-/// A body half inside the floor has an equally short way up and down, and the
-/// two are not equally good: up leaves it standing on the surface, down posts it
-/// through into the dark. The same reasoning as an unloaded chunk reading as
-/// solid — when the choice is arbitrary, take the one whose failure mode is
-/// recoverable.
-fn depenetrate(solid: &impl Solid, body: &mut Body) -> bool {
-    let aabb = body.aabb();
-    if !solid.overlaps(&aabb) {
-        return false;
-    }
-
-    // The block of cells the body is inside. Every solid cell it overlaps, as
-    // one span per axis — which is all the escape needs, because leaving that
-    // span along any axis leaves all of them.
-    let (min_x, max_x) = aabb.cell_span(0);
-    let (min_y, max_y) = aabb.cell_span(1);
-    let (min_z, max_z) = aabb.cell_span(2);
-    let mut low = [i32::MAX; 3];
-    let mut high = [i32::MIN; 3];
-    let mut anywhere_free = false;
-    for y in min_y..=max_y {
-        for z in min_z..=max_z {
-            for x in min_x..=max_x {
-                if !solid.solid(x, y, z) {
-                    anywhere_free = true;
-                    continue;
-                }
-                // **Never shove a body out of geometry that might not exist.**
-                //
-                // A body standing at a chunk boundary reaches into the chunk
-                // across it, and an absent chunk reads as solid — so a boundary
-                // whose neighbour has not arrived looks exactly like being half
-                // inside a wall, and this pushed the body a sub-node a tick to
-                // "escape" it. Reported from the window as "it almost feels like
-                // chunk boundaries have their own collision", with a log full of
-                // pushes at local coordinates of 0.x and 47.x: the two edges of
-                // a chunk, over and over.
-                //
-                // Stopping a body against geometry that may not be there is a
-                // guess that costs a moment standing still. MOVING it on the same
-                // guess is a guess that costs a player their position.
-                if !solid.loaded(x, y, z) {
-                    return false;
-                }
-                for (axis, cell) in [x, y, z].into_iter().enumerate() {
-                    low[axis] = low[axis].min(cell);
-                    high[axis] = high[axis].max(cell);
-                }
-            }
-        }
-    }
-    if low[0] == i32::MAX {
-        // `overlaps` said yes and the scan found nothing, which cannot happen
-        // while the two read the same grid. Leaving rather than pushing by a
-        // distance computed from `i32::MAX`.
-        return false;
-    }
-
-    // **A body with nothing free anywhere inside it is not half inside a block,
-    // and must not be shoved.**
-    //
-    // The case this exists for is a world that has not arrived: an unloaded
-    // chunk reads as solid so a player must not fall out of it, which means a
-    // player standing in one reads as buried in every direction. Pushing then
-    // walks them a sub-node a tick through geometry nobody has seen — measured
-    // as a spawned bot drifting east out of its own spawn block, which is how
-    // this was found.
-    //
-    // Being genuinely entombed — a mod filling the world in around a player —
-    // lands here too, and standing still is the right answer there as well: the
-    // shortest way out of solid rock is not a fact the cells a body touches can
-    // supply.
-    if !anywhere_free {
-        return false;
-    }
-
-    // Six ways out, as signed distances. Positive moves the body up the axis.
-    let mut best_axis = 1;
-    let mut best_push = f32::MAX;
-    let mut best_distance = f32::MAX;
-    for axis in [1, 0, 2] {
-        let out_positive = (high[axis] + 1) as f32 + SKIN - aabb.min[axis];
-        let out_negative = low[axis] as f32 - SKIN - aabb.max[axis];
-        for push in [out_positive, out_negative] {
-            // Strictly less, and the axes are visited with Y first, so a tie
-            // keeps the upward answer rather than the last one tried.
-            if push.abs() < best_distance {
-                best_distance = push.abs();
-                best_push = push;
-                best_axis = axis;
-            }
-        }
-    }
-
-    let capped = best_push.clamp(-DEPENETRATION_PER_TICK, DEPENETRATION_PER_TICK);
-    body.position[best_axis] += capped;
-    true
 }
 
 /// Puts a body back on the ground when it has walked off something small.
