@@ -484,7 +484,7 @@ impl ServerHandle {
                     .find(|(_, name)| *name == rules.block)
                     .map(|(id, _)| id)?;
                 let world_id = world.materials().to_world(runtime).ok()?;
-                Some((tiamot_core::MaterialId(world_id), rules.hardness))
+                Some((tiamot_core::MaterialId(world_id), rules.resistance()))
             })
             .collect::<std::collections::BTreeMap<_, _>>();
         // Emissive blocks, keyed by world id for the same reason hardness is.
@@ -1044,7 +1044,27 @@ impl ServerHandle {
                                 continue;
                             }
 
-                            let hardness = shared.hardness_of(material);
+                            // **What the brush removes is what has to be paid
+                            // for.** A sub-node costs a thirteen-and-a-half-th
+                            // of its own material; a whole block costs a blend
+                            // over everything in it, so an ore seam runs at a
+                            // speed between the ore and the rock around it
+                            // rather than at whichever of the two the crosshair
+                            // happened to land on. See
+                            // `tiamot_core::dig::hardness`.
+                            let hardness = match brush {
+                                tiamot_core::dig::Brush::SubNode => {
+                                    shared.subnode_hardness_of(material)
+                                }
+                                tiamot_core::dig::Brush::Block => {
+                                    let cells = world
+                                        .block_cells(target.block(), &mut source)
+                                        .unwrap_or(tiamot_core::block::EMPTY_CELLS);
+                                    shared.block_hardness_of(&tiamot_core::block::BlockView::Mixed(
+                                        &cells,
+                                    ))
+                                }
+                            };
                             let Some(done) = shared.advance_dig(&uuid, hardness) else {
                                 continue;
                             };

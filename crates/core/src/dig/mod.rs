@@ -18,6 +18,17 @@
 //! for a given hardness and tool is therefore identical everywhere — which is
 //! what lets a client predict the crack overlay's timing without the two ever
 //! disagreeing about when the block actually went.
+//!
+//! # Where the hardness comes from
+//!
+//! This module counts ticks against a hardness; [`hardness`] works out what that
+//! hardness is for a block made of several materials, and what one sub-node of
+//! it costs. The two are separate because the counting has no opinion about
+//! composition and the blend has none about time.
+
+pub mod hardness;
+
+pub use hardness::{Resistance, SUBNODE_SHARE, block_hardness, subnode_hardness};
 
 use crate::coords::SubNodePos;
 

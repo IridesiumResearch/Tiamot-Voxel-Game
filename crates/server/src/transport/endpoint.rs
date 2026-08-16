@@ -235,12 +235,13 @@ pub struct Shared {
     /// dig at all, which is deliberate. See [`Shared::resolve_tool`].
     pub default_tool: Option<String>,
 
-    /// Seconds to break each material with a bare hand.
+    /// How each material resists a tool: its bare-handed seconds, and how
+    /// strongly it imposes that on a block it is only part of.
     ///
     /// Keyed by WORLD material id, because that is what a chunk holds. A
     /// material with no entry gets the engine default rather than being
     /// unbreakable — see `BlockRules::DEFAULT_HARDNESS`.
-    pub hardness: std::collections::BTreeMap<tiamot_core::MaterialId, f32>,
+    pub hardness: std::collections::BTreeMap<tiamot_core::MaterialId, tiamot_core::dig::Resistance>,
 
     /// Named `bodies` rather than `players` because `players` is already the
     /// connected *count* on this struct, and two fields whose names differ only
@@ -652,13 +653,37 @@ impl Shared {
             .or_else(|| self.tools.get(self.default_tool.as_deref()?))
     }
 
+    /// How a material resists a tool, defaulted for anything unregistered.
+    #[must_use]
+    pub fn resistance_of(&self, material: tiamot_core::MaterialId) -> tiamot_core::dig::Resistance {
+        self.hardness.get(&material).copied().unwrap_or_else(|| {
+            tiamot_core::dig::Resistance::new(tiamot_core::script::BlockRules::DEFAULT_HARDNESS)
+        })
+    }
+
     /// How long a material takes to break with a bare hand, in seconds.
     #[must_use]
     pub fn hardness_of(&self, material: tiamot_core::MaterialId) -> f32 {
-        self.hardness
-            .get(&material)
-            .copied()
-            .unwrap_or(tiamot_core::script::BlockRules::DEFAULT_HARDNESS)
+        self.resistance_of(material).hardness
+    }
+
+    /// How long one sub-node cell of a material takes to break, in seconds.
+    ///
+    /// A thirteen-and-a-half-th of the whole-block figure, so chiselling a block
+    /// out cell by cell costs twice what smashing it does. See
+    /// `tiamot_core::dig::hardness`.
+    #[must_use]
+    pub fn subnode_hardness_of(&self, material: tiamot_core::MaterialId) -> f32 {
+        tiamot_core::dig::subnode_hardness(material, |id| self.resistance_of(id))
+    }
+
+    /// How long a whole block takes to break, blended over what it is made of.
+    ///
+    /// The blend lives in core (`dig::hardness`) and the material table lives
+    /// here, so this is the seam between them and the only place the two meet.
+    #[must_use]
+    pub fn block_hardness_of(&self, view: &tiamot_core::block::BlockView<'_>) -> f32 {
+        tiamot_core::dig::block_hardness(view, |id| self.resistance_of(id))
     }
 
     /// Every dig currently running, as `(player, target, brush)`.

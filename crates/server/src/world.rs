@@ -481,6 +481,30 @@ impl World {
             .map_or(MaterialId::AIR, |view| view.subnode(0)))
     }
 
+    /// Reads a block's 27 sub-node cells.
+    ///
+    /// For callers that need the block's *composition* rather than one cell of
+    /// it — how hard it is to break, chiefly, which is a question about the
+    /// mixture (see `tiamot_core::dig::hardness`). Cells rather than a
+    /// [`BlockView`] because the view borrows the chunk, and the chunk is
+    /// behind a cache this method has to let go of.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the chunk cannot be reached.
+    pub fn block_cells(
+        &mut self,
+        pos: BlockPos,
+        source: &mut dyn ChunkSource,
+    ) -> Result<Cells, WorldError> {
+        Ok(self
+            .chunk(pos.chunk(), source)?
+            .get_block(pos)
+            .map_or(EMPTY_CELLS, |view| {
+                std::array::from_fn(|index| view.subnode(index))
+            }))
+    }
+
     /// Reads one sub-node's material.
     ///
     /// # Errors

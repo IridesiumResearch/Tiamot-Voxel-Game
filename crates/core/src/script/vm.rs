@@ -245,6 +245,15 @@ pub struct BlockRules {
     /// unbreakable block, because "I forgot to set hardness" should not produce
     /// bedrock.
     pub hardness: f32,
+    /// How strongly this material imposes its hardness on a block it is only
+    /// part of.
+    ///
+    /// `1.0` is neutral and what a mod that says nothing gets. Above it the
+    /// material carries a mixture toward its own speed — which works in both
+    /// directions, because the blend averages mining *rates*: a high dominance
+    /// on something soft makes the whole block soft, and on something stubborn
+    /// makes the whole block stubborn. See [`crate::dig::hardness`].
+    pub dominance: f32,
     /// What breaking it yields, if the mod overrode the default.
     ///
     /// `None` means the ordinary rule from the Sub-Node Contract §9: the block
@@ -266,6 +275,15 @@ pub struct BlockRules {
 impl BlockRules {
     /// Seconds to break a block whose mod said nothing about hardness.
     pub const DEFAULT_HARDNESS: f32 = 0.75;
+
+    /// How this block resists a tool, as the mixture blend wants it.
+    #[must_use]
+    pub const fn resistance(&self) -> crate::dig::Resistance {
+        crate::dig::Resistance {
+            hardness: self.hardness,
+            dominance: self.dominance,
+        }
+    }
 
     /// What this block contributes to block light.
     ///

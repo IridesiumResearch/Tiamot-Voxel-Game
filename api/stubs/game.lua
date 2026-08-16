@@ -120,11 +120,37 @@ function Stream:next_bool() end
 ---@field id string Required. Namespaced with your mod id automatically.
 ---@field name string? Display name.
 ---@field description string? One-line description.
----@field hardness number? Seconds to break with a bare hand. Default 0.75. Must not be negative.
+---@field hardness number? Seconds to break with a bare hand. Default 0.75. Must not be negative. One SUB-NODE of it costs a thirteen-and-a-half-th of this, so chiselling a block out cell by cell takes twice as long as smashing it whole.
+---@field dominance number? How strongly this material imposes its hardness on a block it is only part of. Default 1.0. Must be positive. See below.
 ---@field drops table<string, integer>? Overrides what breaking it yields: block id to UNITS (27 to a block). Omit for the ordinary rule — the block drops itself, 27 units whole or one per occupied sub-node. Bare ids are namespaced with your mod id.
 ---@field tags string[]? Arbitrary tags for other mods to match on.
 ---@field textures Tiamot.BlockTextures? Which images clients draw this block with.
 ---@field light_emit Tiamot.LightEmit? Light this block gives off. Omit for anything that is not a lamp.
+
+---How `dominance` decides a mixed block's hardness.
+---
+---A block is 27 sub-node cells and each may be a different material, so the
+---engine has to blend. It averages mining RATES, weighted by `dominance`:
+---
+---    rate = sum(dominance / hardness) / sum(dominance)     time = 1 / rate
+---
+---Averaging rates rather than times means the SOFT part of a block carries the
+---rest away for free — dirt mixed into stone breaks at nearly dirt's speed with
+---every dominance left at 1. What that alone cannot express is a material that
+---is *sticky*: hard to cut in a way that makes everything packed around it hard
+---to cut. `dominance` is that knob, and because the average is over rates it
+---works in both directions at once:
+---
+---    dirt:   hardness = 0.5,  dominance = 3   -- weakens anything it is in
+---    rubber: hardness = 10.0, dominance = 6   -- toughens anything it is in
+---
+---With those, half a block of dirt and stone breaks in 0.59 s (stone alone is
+---1.5 s) and half a block of rubber and stone takes 5.68 s. A block with no
+---`dominance` set anywhere still blends sensibly; the field is for materials
+---that should punch above their share.
+---
+---The blend never leaves the range its materials define: a block of stone and
+---dirt can never be harder than stone.
 
 ---Light a block gives off, per colour channel, 0 to 15.
 ---

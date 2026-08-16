@@ -43,3 +43,36 @@ game.register_block{
 }
 
 game.log("registered core:lamp")
+
+-- Two blocks whose only purpose is to prove `dominance` works through the
+-- public API, for the same reason the lamp above proves `light_emit` does.
+--
+-- A block is 27 sub-node cells, so a chiselled block can hold more than one
+-- material and the engine has to decide what the mixture costs to break. It
+-- averages mining RATES, which means the soft part of a block carries the rest
+-- away on its own; `dominance` is how a material says it should count for more
+-- than its share of the cells. See `api/stubs/game.lua`.
+--
+-- Chisel a few cells of `core:crumb` into a wall of `core:white` and the wall
+-- comes apart noticeably faster. Do the same with `core:pitch` and it takes
+-- markedly longer. Neither is a game design decision — they are the two
+-- directions of one mechanism, made visible.
+game.register_block{
+    id = "crumb",
+    name = "Crumb",
+    description = "Soft, and it takes whatever it is mixed into with it.",
+    textures = { all = "textures/white.png" },
+    hardness = 0.2,
+    dominance = 3.0,
+}
+
+game.register_block{
+    id = "pitch",
+    name = "Pitch",
+    description = "Stubborn, and it makes whatever it is mixed into stubborn.",
+    textures = { all = "textures/white.png" },
+    hardness = 6.0,
+    dominance = 6.0,
+}
+
+game.log("registered core:crumb and core:pitch")

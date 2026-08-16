@@ -768,6 +768,10 @@ impl ScriptVm for MluaVm {
                     .as_ref()
                     .and_then(|entry| entry.get::<Option<f32>>("hardness").ok().flatten())
                     .unwrap_or(BlockRules::DEFAULT_HARDNESS);
+                let dominance = entry
+                    .as_ref()
+                    .and_then(|entry| entry.get::<Option<f32>>("dominance").ok().flatten())
+                    .unwrap_or(crate::dig::Resistance::DEFAULT_DOMINANCE);
                 let drops = entry
                     .as_ref()
                     .and_then(|entry| entry.get::<Option<Table>>("drops").ok().flatten())
@@ -801,6 +805,7 @@ impl ScriptVm for MluaVm {
                     BlockRules {
                         block: block.clone(),
                         hardness,
+                        dominance,
                         drops,
                         light_emit,
                     },
@@ -1714,10 +1719,27 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
                  got {hardness}"
             )));
         }
+        // Zero is refused as well as negative, unlike `hardness`. A hardness of
+        // zero is meaningful — a block that comes apart on contact — but a
+        // dominance of zero means "this material has no say in a mixture at
+        // all", and a block made entirely of such materials would have nothing
+        // left to average. Refusing it here is cheaper than the alternative,
+        // which is a division nobody can predict the result of.
+        let dominance: Option<f32> = spec.get("dominance")?;
+        if let Some(dominance) = dominance
+            && (!dominance.is_finite() || dominance <= 0.0)
+        {
+            return Err(mlua::Error::external(format!(
+                "register_block(\"{id}\"): dominance must be a positive number, got {dominance}"
+            )));
+        }
         let drops: Option<Table> = spec.get("drops")?;
         let entry = lua.create_table()?;
         if let Some(hardness) = hardness {
             entry.set("hardness", hardness)?;
+        }
+        if let Some(dominance) = dominance {
+            entry.set("dominance", dominance)?;
         }
 
         // `light_emit = { r = 0..15, g = ..., b = ... }`. Validated here rather
@@ -2204,11 +2226,12 @@ const FLUID_FIELDS: [&str; 7] = [
 ];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
-const BLOCK_FIELDS: [&str; 8] = [
+const BLOCK_FIELDS: [&str; 9] = [
     "id",
     "name",
     "drops",
     "hardness",
+    "dominance",
     "description",
     "tags",
     "textures",
@@ -3281,6 +3304,64 @@ mod dig_rules_tests {
             rules[1].drops.as_deref(),
             Some(&[("core:gem".to_owned(), 3)][..]),
             "a bare drop id is qualified with the registering mod's namespace"
+        );
+    }
+
+    #[test]
+    fn dominance_reaches_the_engine_and_defaults_to_neutral() {
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core",
+            r#"
+            game.register_block{ id = "plain", hardness = 1.5 }
+            game.register_block{ id = "dirt", hardness = 0.5, dominance = 3.0 }
+            "#,
+        )
+        .expect("load");
+
+        let rules = vm.registered_block_rules();
+        assert!(
+            (rules[0].dominance - crate::dig::Resistance::DEFAULT_DOMINANCE).abs() < 1e-6,
+            "a block that says nothing should pull its own weight and no more, got {}",
+            rules[0].dominance
+        );
+        assert!((rules[1].dominance - 3.0).abs() < 1e-6);
+
+        // And the two travel together into the blend, which is the whole point
+        // of the field existing on `BlockRules` rather than beside it.
+        assert!((rules[1].resistance().hardness - 0.5).abs() < 1e-6);
+        assert!((rules[1].resistance().dominance - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_dominance_of_zero_is_refused_rather_than_clamped() {
+        // Unlike hardness, where zero is meaningful. A material with no say at
+        // all in a mixture leaves a block made entirely of such materials with
+        // nothing to average — so this is refused at registration, where the
+        // error can name the mod and the block.
+        let mut zero = vm();
+        let err = load(
+            &mut zero,
+            "core",
+            r#"game.register_block{ id = "ghost", dominance = 0 }"#,
+        )
+        .expect_err("a dominance of zero should be refused");
+        assert!(
+            detail_of(&err).contains("dominance"),
+            "the error should name the field: {}",
+            detail_of(&err)
+        );
+
+        let mut negative = vm();
+        assert!(
+            load(
+                &mut negative,
+                "core",
+                r#"game.register_block{ id = "odd", dominance = -2 }"#,
+            )
+            .is_err(),
+            "a negative dominance should be refused too"
         );
     }
 
