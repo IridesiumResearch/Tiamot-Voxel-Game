@@ -286,13 +286,60 @@ fn luma(colour: vec3<f32>) -> f32 {
     return dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
+// How wide mode 2's terminator is, in `dot(normal, sunward)`.
+//
+// Wider than mode 3's, and deliberately. Mode 3 has a depth map to say where a
+// shadow actually falls, so its terminator only has to cover the few minutes
+// either side of a face turning away from the sun. Mode 2 has nothing but the
+// facing test, so this band IS its entire soft edge — and a narrow one makes
+// every wall of one orientation flip from lit to unlit on a single frame.
+const SOFT_TERMINATOR: f32 = 0.35;
+
+// What mode 2 keeps of the ambient floor a mod asked for.
+//
+// **Underground, and only underground.** Reported from the window: "the ambient
+// light in caves should be cut to a third of what it is. It is too bright
+// underground." A third, exactly as asked.
+//
+// It is applied here rather than by lowering `sky.ambient` because that value
+// belongs to a mod (charter rule 1) and the other modes are reading it too. What
+// varies between modes is how much of the floor each one needs to stay legible,
+// which is presentation, which is this shader's business.
+const CLASSIC_AMBIENT: f32 = 1.0 / 3.0;
+
+// The least light mode 1 leaves on a surface the sun and every lamp have both
+// abandoned. Not zero: a pitch-black cave in the mode whose whole selling point
+// is that it is cheap and legible is a cave nobody can find their way out of.
+//
+// A twelfth. Dark enough that walking underground is obviously a different
+// place from walking on the surface, light enough that geometry still reads.
+const SIMPLE_FLOOR: f32 = 1.0 / 12.0;
+
 fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
-    // Mode 1: face shading and occlusion only, which is Task 08's world. The
-    // vertices still carry light — the mesher was handed a flat daylight value
-    // to bake, so they carry the same one everywhere and the branch is what
-    // makes that visible rather than merely uniform.
+    // **Mode 1: one brightness, no hue, no sky.**
+    //
+    // It used to be `shade * occlusion` and nothing else — the mesher was handed
+    // a flat daylight value, so every vertex carried the same light and a cave
+    // was exactly as bright as a field at noon. Reported from the window as mode
+    // 1 needing to make "beneath the ground dark" and to have "a day night cycle
+    // even if it is just an across the board darkening", which is precisely what
+    // this is.
+    //
+    // Mode 1 now meshes with the real propagated light like the others (see
+    // `LightingMode::uses_propagated_light`), and spends it on ONE number. The
+    // sun channel scaled by the time of day gives the day/night cycle and the
+    // dark cave in the same term, because stored sunlight is already zero
+    // underground; block light comes in as a monochrome peak so a lamp is still
+    // worth carrying down there.
+    //
+    // What mode 1 deliberately does not do is everything below this branch: no
+    // sky hue, no separate sun and skylight, no per-channel falloff, no
+    // occlusion neutral. That is what keeps it the cheap mode.
     if (globals.lighting_mode == 0u) {
-        return vec3<f32>(input.shade * input.occlusion);
+        let day = input.sun * globals.sun_intensity;
+        let lamp = max(input.block_light.r, max(input.block_light.g, input.block_light.b));
+        let level = max(max(day, lamp), SIMPLE_FLOOR);
+        return vec3<f32>(input.shade * input.occlusion * level);
     }
     // The sky's own colour at unit brightness. Used for the skylight below and
     // for the two floors further down, all of which want the hue of the sky
@@ -372,7 +419,11 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     //
     // Anything that SHOULD brighten with the day is daylight above, gated by
     // the stored sunlight channel, and a sealed cave has none of that.
-    let ambient = sky_hue * globals.ambient;
+    var floor_level = globals.ambient;
+    if (globals.lighting_mode == 1u) {
+        floor_level = floor_level * CLASSIC_AMBIENT;
+    }
+    let ambient = sky_hue * floor_level;
     let shaded = max(lit, ambient) * input.shade;
 
     // **Occlusion darkens toward grey, not by scaling.**
@@ -558,10 +609,39 @@ fn surface(input: VertexOut, shadow: f32) -> vec4<f32> {
     return vec4<f32>(mix(lit, globals.sky_colour.rgb, haze), texel.a);
 }
 
-// Modes 1 and 2: no shadow map exists, so nothing is in shadow.
+// Mode 2's shadows, which are not shadows.
+//
+// **A generic shadow: what a face's orientation says, with nothing asked about
+// what is in front of it.** Mode 3 spends three cascades and a PCF kernel
+// answering "is anything between this fragment and the sun". Mode 2 answers the
+// far cheaper half of the same question — "is this fragment even pointing at the
+// sun" — and gets most of the shape for none of the memory.
+//
+// It is exactly `shadow_factor`'s first two lines with the depth map removed,
+// which is the property worth having: the two modes cannot disagree about which
+// faces the sun is behind, because there is one rule and mode 3 adds to it
+// rather than replacing it. A north wall is dark in both; only mode 3 knows the
+// tower next to it is throwing a shadow across the ground.
+//
+// The result multiplies the SUN term alone, so a face turned away from the sun
+// falls to skylight (`SKY_FLOOR`) rather than to black, and a cave stays exactly
+// as dark as the stored sunlight says. Charter rule 19's gate again: this may
+// darken what the sun reaches and may never brighten what the sky does not.
+fn generic_shadow(input: VertexOut) -> f32 {
+    let sunward = -globals.sun_direction.xyz;
+    return smoothstep(0.0, SOFT_TERMINATOR, dot(input.normal, sunward));
+}
+
+// Modes 1 and 2. Neither has a shadow map; mode 2 has an opinion anyway.
 @fragment
 fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
-    return surface(input, 1.0);
+    // Mode 1 is flat by construction — it has no sun direction in its lighting
+    // at all, only the axis constants in `face_shade` — so handing it a facing
+    // term would be shading it twice by two different rules.
+    if (globals.lighting_mode == 0u) {
+        return surface(input, 1.0);
+    }
+    return surface(input, generic_shadow(input));
 }
 
 // Mode 3: the same surface, with the cascades consulted.

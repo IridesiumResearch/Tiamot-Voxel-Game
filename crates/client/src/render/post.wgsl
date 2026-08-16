@@ -146,8 +146,41 @@ fn shoulder(x: f32) -> f32 {
     return KNEE + headroom * (1.0 - exp(-(x - KNEE) / headroom));
 }
 
+// How much of the per-channel roll-off survives.
+//
+// **This is why lamps were white.** Applying `shoulder` to r, g and b
+// separately compresses the bright channels harder than the dim ones, which is
+// the same thing as draining the colour out of anything bright — and the
+// brightest things in this renderer are precisely the ones whose colour is the
+// point. Measured on `core:lamp`, whose light is (15, 11, 6) out of 15: the
+// surface beside it arrives at (1.62, 1.19, 0.65), a clear orange, and left
+// per-channel it tonemapped to (1.00, 0.97, 0.65) — red and green within three
+// percent of each other, which is a pale yellow-white. Reported from the window
+// as mode 3's lights looking "almost white".
+//
+// Rolling off the PEAK and scaling the whole colour by what that costs preserves
+// the ratio between channels exactly, so the same lamp lands on (1.00, 0.73,
+// 0.40) — the orange it started as, at a brightness the display can show.
+//
+// Not zero, though. A real highlight does go white eventually; a light bright
+// enough to hurt has no colour left in it, and holding saturation perfectly all
+// the way up reads as a flat sticker of colour rather than as something glowing.
+// A sixth of the per-channel answer is enough to bend the very brightest
+// highlights toward white and not enough to touch a lamp.
+const HIGHLIGHT_DESATURATION: f32 = 1.0 / 6.0;
+
 fn tonemap(colour: vec3<f32>) -> vec3<f32> {
-    return vec3<f32>(shoulder(colour.r), shoulder(colour.g), shoulder(colour.b));
+    let per_channel = vec3<f32>(shoulder(colour.r), shoulder(colour.g), shoulder(colour.b));
+    let peak = max(colour.r, max(colour.g, colour.b));
+    // Nothing above the knee: the shoulder is the identity there, so both
+    // branches agree and the cheap one is also the exact one. This is most of
+    // the frame — the sky, every surface in daylight — and it must come through
+    // untouched, which is the whole argument for the knee in the first place.
+    if (peak <= KNEE) {
+        return per_channel;
+    }
+    let hue_preserving = colour * (shoulder(peak) / peak);
+    return mix(hue_preserving, per_channel, HIGHLIGHT_DESATURATION);
 }
 
 // How far the surface under this pixel is, in blocks.

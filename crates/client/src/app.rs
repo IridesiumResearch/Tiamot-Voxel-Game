@@ -2068,15 +2068,21 @@ impl App {
             let neighbours = self.store.neighbours(*pos);
 
             let mesh_started = std::time::Instant::now();
-            // Mode 1 meshes against a flat daylight value rather than the real
-            // one. Not a shortcut in the shader's sense — the mesher may only
-            // merge two faces whose corner light agrees, so real light splits
-            // quads along every shadow edge. Handing it a constant puts the
-            // merge rate, and therefore the vertex count and the meshing cost,
-            // back exactly where Task 08 left them.
+            // **Every mode meshes against the real light now, mode 1 included.**
+            //
+            // It used to take a flat daylight constant. That was not a shortcut
+            // in the shader's sense — the mesher may only merge two faces whose
+            // corner light agrees, so real light splits quads along every shadow
+            // edge, and a constant put the merge rate and the vertex count back
+            // exactly where Task 08 left them.
+            //
+            // What it also did was leave mode 1 unable to tell a cave from a
+            // field, because "am I underground" is a question only the stored
+            // sunlight answers. There is no cheaper way to ask it. See
+            // `LightingMode::Simple`.
             let fluid = self.store.fluid_for(*pos);
+            let light = self.store.light_for(*pos);
             let mesh = if self.config.lighting_mode.uses_propagated_light() {
-                let light = self.store.light_for(*pos);
                 mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &light, &fluid)
             } else {
                 mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &FLAT_DAYLIGHT, &fluid)

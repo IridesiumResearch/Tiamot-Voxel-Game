@@ -713,6 +713,14 @@ fn every_face_of_a_block_is_drawn_at_its_own_brightness() {
     let chunks = vec![chunk];
 
     let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    // **Mode 1 explicitly, because mode 1's constants are what is being
+    // asserted.** This ran on the default mode until mode 2 gained a generic
+    // shadow, at which point a face the sun stands behind stopped being white
+    // and started being dim skylight — which is blue, and the "any pixel where
+    // red has caught up with blue is the block" test below duly reported the
+    // block as invisible. The ordering under test has never been mode 2's; it is
+    // `face_shade`'s, and only mode 1 shows it unmixed with anything else.
+    renderer.set_lighting_mode(LightingMode::Simple);
     let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
 
     // The block spans one unit at (8, 8, 8), so its centre is (8.5, 8.5, 8.5).
@@ -1047,6 +1055,178 @@ fn canopy_scene() -> Vec<Chunk> {
 }
 
 #[test]
+fn mode_one_is_dark_where_the_sun_never_reaches_and_dims_as_the_day_ends() {
+    // **Reported from the window: "light mode 1 should still make beneath the
+    // ground dark and have a day night cycle even if it is just an across the
+    // board darkening."**
+    //
+    // Before this, mode 1 meshed against a flat daylight constant, so a cave was
+    // exactly as bright as a field at noon and the time of day did nothing at
+    // all. Both halves of that sentence are asserted here, because the fix is
+    // one term — `max(sun * intensity, lamp, floor)` — and either half alone
+    // would pass with the other still broken.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    renderer.set_lighting_mode(LightingMode::Simple);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    let luminance = |frame: &Image| {
+        let colour = average(frame, 0, HEIGHT / 2, WIDTH, HEIGHT);
+        (colour[0] + colour[1] + colour[2]) / 3.0
+    };
+    let under = |renderer: &mut Renderer, light: tiamot_core::light::Light| {
+        upload_lit(renderer, &chunks, &client::shade::Uniform(light));
+        luminance(&target.capture(renderer, &viewpoint()).expect("capture"))
+    };
+
+    // Noon on the surface, against the same geometry with no sunlight stored on
+    // it at all — which is exactly what the server propagates into a cave.
+    renderer.set_sun(1.0, [1.0, 1.0, 1.0], [0.05, -0.99, 0.1]);
+    let daylight = under(&mut renderer, tiamot_core::light::Light::DAYLIGHT);
+    let cave = under(&mut renderer, tiamot_core::light::Light::new(0, 0, 0, 0));
+    assert!(
+        cave < daylight * 0.5,
+        "underground came out at {cave} against {daylight} in the open — mode 1 is not reading \
+         stored sunlight, so a cave is as bright as a field"
+    );
+    assert!(
+        cave > 0.0,
+        "a cave in mode 1 is pitch black, which is a mode nobody can find their way out of"
+    );
+
+    // And the cycle: the same lit surface at dusk, with nothing changed but the
+    // sun's strength.
+    let noon = under(&mut renderer, tiamot_core::light::Light::DAYLIGHT);
+    renderer.set_sun(0.15, [1.0, 1.0, 1.0], [0.05, -0.99, 0.1]);
+    let dusk = under(&mut renderer, tiamot_core::light::Light::DAYLIGHT);
+    assert!(
+        dusk < noon * 0.5,
+        "dusk came out at {dusk} against {noon} at noon — mode 1 has no day/night cycle"
+    );
+
+    // A lamp still works down there, which is what stops the floor above from
+    // being the only thing between a player and the dark.
+    let lamplit = under(&mut renderer, tiamot_core::light::Light::new(0, 12, 12, 12));
+    assert!(
+        lamplit > cave * 1.5,
+        "a lamp underground came out at {lamplit} against {cave} with no lamp — mode 1 drops \
+         block light, so nothing a player carries can light a cave"
+    );
+}
+
+#[test]
+fn a_lamps_colour_survives_mode_threes_tonemap() {
+    // **Reported from the window: "Lights in light mode 3 should be more
+    // saturated. right now they look almost white."** They were, and the cause
+    // was the tonemap rolling r, g and b off separately — which compresses the
+    // bright channels harder than the dim ones, and so drains the colour out of
+    // exactly the things whose colour is the point.
+    //
+    // Mode 2 is the reference: it does not tonemap at all, so whatever
+    // saturation the lamp has there is the saturation the light actually has.
+    // Mode 3 may legitimately have a little less — a highlight bright enough
+    // does go white, which `HIGHLIGHT_DESATURATION` allows on purpose — but it
+    // must not be a different colour from mode 2's.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // `core:lamp`'s own colour at full strength, and full strength is the point:
+    // the tonemap's shoulder only bites above its knee, so a mid-level lamp
+    // never reaches the code under test. This is also the case that goes wrong
+    // in game — a wall right beside a lamp.
+    let lamp = tiamot_core::light::Light::new(0, 15, 11, 6);
+
+    // How far from grey a colour is, as a share of its own brightness. Relative
+    // rather than absolute, so this measures hue rather than exposure — the two
+    // modes do not agree about brightness and are not being asked to.
+    let saturation = |frame: &Image| {
+        let colour = average(frame, 0, HEIGHT / 2, WIDTH, HEIGHT);
+        let peak = colour[0].max(colour[1]).max(colour[2]);
+        let floor = colour[0].min(colour[1]).min(colour[2]);
+        (peak - floor) / peak.max(1.0 / 255.0)
+    };
+    let render = |renderer: &mut Renderer, mode| {
+        renderer.set_lighting_mode(mode);
+        upload_lit(renderer, &chunks, &client::shade::Uniform(lamp));
+        target.capture(renderer, &viewpoint()).expect("capture")
+    };
+
+    let classic = render(&mut renderer, LightingMode::Classic);
+    let beautiful = render(&mut renderer, LightingMode::Beautiful);
+    let (untonemapped, tonemapped) = (saturation(&classic), saturation(&beautiful));
+
+    assert!(
+        untonemapped > 0.15,
+        "mode 2's lamplit frame is only {untonemapped} from grey, so the fixture is not \
+         coloured enough for the comparison below to mean anything"
+    );
+
+    // Measured on lavapipe: mode 2 lands at 0.26 and mode 3 at 0.30 — mode 3
+    // comes out MORE saturated than the mode with no tonemap at all, because
+    // mode 2 has no headroom and simply clips its two bright channels to 1.0
+    // while mode 3 rolls them down together and keeps the ratio.
+    //
+    // With the roll-off applied per channel instead, mode 3 measured 0.17 —
+    // barely two thirds of mode 2's. That is the reported bug, and it is what
+    // this bound fails on.
+    assert!(
+        tonemapped > untonemapped * 0.95,
+        "mode 3 kept {tonemapped} of the lamp's colour against mode 2's {untonemapped} — the \
+         tonemap is draining the highlights toward white"
+    );
+
+    // And the hue itself, not merely how much of it there is: this lamp is warm,
+    // so red leads green leads blue, and a tonemap that compressed the channels
+    // unevenly would flatten that ordering before it flattened the magnitude.
+    let warm = average(&beautiful, 0, HEIGHT / 2, WIDTH, HEIGHT);
+    assert!(
+        warm[0] > warm[1] && warm[1] > warm[2],
+        "a warm lamp came out as {warm:?} in mode 3, which is not warm"
+    );
+}
+
+#[test]
+fn mode_twos_caves_are_darker_than_mode_threes() {
+    // **Reported from the window: "the ambient light in caves should be cut to a
+    // third of what it is. It is too bright underground."**
+    //
+    // The ambient floor is a mod's number (`sky.ambient`) and the other modes
+    // are reading it too, so the third is taken in the shader, for mode 2 alone
+    // — which makes mode 3 the control. Same scene, same stored light, same
+    // everything else.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Nothing stored: no sunlight, no lamp. Whatever is left on screen IS the
+    // ambient floor, which is the quantity under test.
+    let dark = tiamot_core::light::Light::new(0, 0, 0, 0);
+    let luminance = |renderer: &mut Renderer, mode| {
+        renderer.set_lighting_mode(mode);
+        upload_lit(renderer, &chunks, &client::shade::Uniform(dark));
+        let frame = target.capture(renderer, &viewpoint()).expect("capture");
+        let colour = average(&frame, 0, HEIGHT / 2, WIDTH, HEIGHT);
+        (colour[0] + colour[1] + colour[2]) / 3.0
+    };
+
+    let classic = luminance(&mut renderer, LightingMode::Classic);
+    let beautiful = luminance(&mut renderer, LightingMode::Beautiful);
+    assert!(
+        classic < beautiful,
+        "an unlit cave is {classic} in mode 2 and {beautiful} in mode 3 — mode 2's third of the \
+         ambient floor is not being applied"
+    );
+    assert!(
+        classic > 0.0,
+        "mode 2's cave is pitch black rather than a third as bright"
+    );
+}
+
+#[test]
 fn the_underside_of_an_overhang_is_not_lit_as_though_the_sun_were_under_it() {
     // **Reported from the window: "the underside of blocks, when lit at all,
     // are completely lit, which is odd."** It was, and the reason was that the
@@ -1089,20 +1269,38 @@ fn the_underside_of_an_overhang_is_not_lit_as_though_the_sun_were_under_it() {
         under / top
     };
 
-    // Mode 2 has no shadow map, so its underside keeps `face_shade`'s half and
-    // nothing else. This is the counter-example that makes the assertion below
-    // non-vacuous: without it, a test that mode 3's underside is dark would
-    // also pass if every mode had always drawn it dark.
+    // **Mode 1 is the counter-example, and it used to be mode 2.**
+    //
+    // The comparison needs a mode that does NOT test which way a face points, or
+    // "mode 3 draws the underside dark" would also pass if every mode had always
+    // drawn it dark. Mode 2 was that mode until it gained a generic shadow — the
+    // facing half of mode 3's test, without the cascades — and started darkening
+    // undersides too, which is the change working rather than a regression.
+    //
+    // Mode 1 cannot be dragged into it: its lighting has no sun direction at
+    // all, only `face_shade`'s per-axis constants, so an underside there keeps a
+    // fixed share of a top whatever the sun is doing.
+    renderer.set_lighting_mode(LightingMode::Simple);
+    let simple = ratio(&mut renderer);
     renderer.set_lighting_mode(LightingMode::Classic);
     let classic = ratio(&mut renderer);
-
     renderer.set_lighting_mode(LightingMode::Beautiful);
     let beautiful = ratio(&mut renderer);
 
+    // Measured on lavapipe: 0.73 in mode 1 against 0.41 and 0.42 — both modes
+    // that ask about direction take roughly 44% off, and the bound is set well
+    // inside that so a different driver's texture filtering cannot decide it.
+    for (mode, lit) in [("2", classic), ("3", beautiful)] {
+        assert!(
+            lit < simple * 0.75,
+            "an overhang's underside is {lit} of the floor's brightness in mode {mode} against \
+             {simple} in mode 1 — the sun is still reaching a face that points away from it"
+        );
+    }
     assert!(
-        beautiful < classic * 0.75,
-        "an overhang's underside is {beautiful} of the floor's brightness in mode 3 and \
-         {classic} in mode 2 — the sun is still reaching a face that points away from it"
+        simple > 0.5,
+        "mode 1's underside came out at {simple} of its floor, so the measurement cannot tell a \
+         lit underside from an unlit one and the bounds above prove nothing"
     );
 }
 
@@ -1764,6 +1962,29 @@ struct Rendered {
 /// with is uniformity: a frame that drew nothing is the clear colour everywhere,
 /// whatever the post chain then does to it, so a frame that VARIES has geometry
 /// in it.
+///
+/// # The threshold, and why it moved
+///
+/// [`FLAT_FRAME`] was 0.05 and had almost no margin: the dimmest combination in
+/// the matrix measured 0.057. Mode 1 then stopped meshing against flat daylight
+/// and started spending the real stored sunlight, so the lamplit scene — which
+/// has no sun in it at all — went from full daylight to two thirds of a lamp,
+/// and its variation fell by the same two thirds to 0.038. The geometry was
+/// exactly as visible as before.
+///
+/// A relative measure was tried and is worse: dividing by the frame's own mean
+/// rescues the dim scenes and punishes the bright ones, and open terrain under a
+/// wide sky came out lower still.
+///
+/// So the threshold moved instead, to a number chosen against what a genuinely
+/// blank frame gives rather than against how bright a scene happens to be. A
+/// frame that drew nothing is the clear colour in every region, so its spread is
+/// zero to within a quantisation step — 1/255, or 0.004. The measured matrix
+/// spans 0.038 to 0.57.
+///
+/// Ten times a quantisation step, and a third of the dimmest real frame.
+const FLAT_FRAME: f32 = 0.02;
+
 fn spread(image: &Image) -> f32 {
     let mut lowest = [f32::MAX; 3];
     let mut highest = [f32::MIN; 3];
@@ -1846,7 +2067,7 @@ fn every_scene_draws_a_world_in_every_lighting_mode() {
 
             let variation = spread(&frame);
             assert!(
-                variation > 0.05,
+                variation > FLAT_FRAME,
                 "{}/{mode:?}: the frame varies by only {variation}, so it is one flat colour and \
                  nothing was drawn",
                 scene.label
@@ -1930,10 +2151,14 @@ fn every_scene_draws_a_world_in_every_lighting_mode() {
     }
 
     // The terrain and lamplit scenes are the SAME geometry under different
-    // stored light, so mode 1 — which meshes against flat daylight and ignores
-    // what the server sent — has to draw them identically. Anything else means
-    // light is reaching a mode whose whole definition is that it does not use
-    // it, and the vertex count that Task 08's cost profile depends on with it.
+    // stored light, so **every** mode has to tell them apart — mode 1 included,
+    // which is a reversal of what this asserted before.
+    //
+    // Mode 1 used to mesh against flat daylight and ignore what the server sent,
+    // and this checked that the two scenes came out byte-identical there. That
+    // was the property that made mode 1 unable to tell a cave from a field, so
+    // it is gone: mode 1 now spends the stored light on a single brightness. See
+    // `LightingMode::Simple`.
     let hash_of = |scene: &str, mode: LightingMode| -> &str {
         matrix
             .iter()
@@ -1941,20 +2166,14 @@ fn every_scene_draws_a_world_in_every_lighting_mode() {
             .map(|rendered| rendered.hash.as_str())
             .expect("every scene rendered in every mode")
     };
-    assert_eq!(
-        hash_of("terrain", LightingMode::Simple),
-        hash_of("lamplit", LightingMode::Simple),
-        "mode 1 drew two different pictures for one scene under two different lights, so it is \
-         reading stored light after all"
-    );
-
-    // And the modes that DO use light must tell those two apart, or the
-    // comparison above is true for the boring reason.
-    assert_ne!(
-        hash_of("terrain", LightingMode::Classic),
-        hash_of("lamplit", LightingMode::Classic),
-        "mode 2 drew the same picture for daylight and for a warm lamp"
-    );
+    for mode in MODES {
+        assert_ne!(
+            hash_of("terrain", mode),
+            hash_of("lamplit", mode),
+            "{mode:?} drew the same picture for full daylight and for a warm lamp with no sun, \
+             so stored light is not reaching it"
+        );
+    }
 }
 
 /// Writes the whole three-by-three matrix out as PNGs, for the human gate.

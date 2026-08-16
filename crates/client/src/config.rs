@@ -140,15 +140,27 @@ pub enum RenderMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LightingMode {
-    /// Mode 1. Directional face shading and ambient occlusion, no propagated
-    /// light — Task 08's look, and the baseline the other modes are measured
-    /// against.
+    /// Mode 1. Directional face shading, ambient occlusion, and propagated
+    /// light spent on a single brightness — no hue, no sky, no per-channel
+    /// falloff.
     ///
-    /// The mesher samples flat daylight in this mode rather than the real
-    /// value, which is not a detail: two faces may only merge when their corner
-    /// light agrees, so real light splits quads along every shadow edge.
-    /// Feeding it a constant restores Task 08's merge rate exactly, which is
-    /// what "mode 1's cost profile is unchanged" has to mean.
+    /// # It used to mesh with flat daylight, and no longer can
+    ///
+    /// Feeding the mesher a constant restored Task 08's merge rate exactly —
+    /// two faces may only merge when their corner light agrees, so real light
+    /// splits quads along every shadow edge — and that was what "mode 1's cost
+    /// profile is unchanged" meant.
+    ///
+    /// The price was that mode 1 could not tell a cave from a field: every
+    /// vertex carried the same daylight, so underground was as bright as noon
+    /// and the time of day did nothing. Reported from the window, and there is
+    /// no cheaper fix available — knowing you are underground *is* knowing the
+    /// stored sunlight, and that is the value the mesher bakes.
+    ///
+    /// So mode 1 pays mode 2's meshing cost and keeps its own shading cost,
+    /// which is the half of the difference that runs per fragment rather than
+    /// per edit. What it buys is a mode that is still legible on integrated
+    /// graphics and still has a night.
     Simple,
     /// Mode 2. Smooth propagated light, coloured, with sky-tinted distance fog.
     #[default]
@@ -190,12 +202,18 @@ impl LightingMode {
 
     /// Whether this mode uses the propagated light the server sends.
     ///
-    /// Mode 1 does not, and the mesher is handed a flat value instead — see the
-    /// variant's own documentation for why that is a meshing decision rather
-    /// than a shading one.
+    /// **Every mode does.** Mode 1 was the exception until it needed to know
+    /// which of its surfaces were underground, which is a question only the
+    /// stored sunlight can answer — see [`LightingMode::Simple`].
+    ///
+    /// Kept as a method rather than deleted along with its one `false`: it names
+    /// the decision at the call site, and a future mode that genuinely wants
+    /// flat light should not have to rediscover where that decision is made.
     #[must_use]
     pub const fn uses_propagated_light(self) -> bool {
-        !matches!(self, Self::Simple)
+        match self {
+            Self::Simple | Self::Classic | Self::Beautiful => true,
+        }
     }
 
     /// Whether this mode draws through the post chain.
