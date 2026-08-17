@@ -62,7 +62,13 @@ pub const NONCE_BYTES: usize = 32;
 /// rotated, keys revoked. That stability is what lets every other system key on
 /// it: inventory, ownership, bans, mod storage, and later the mimic imprint all
 /// use the UUID and never the display name.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Serialised as its 32 raw bytes, which is what makes it usable as a key in
+/// anything that persists — an entity's owner, a nametag bound to a player, a
+/// mod's storage. Not as hex: that is a display form, and a round trip through
+/// one is a place for a world file to disagree with itself.
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PlayerUuid([u8; UUID_BYTES]);
 
 impl PlayerUuid {

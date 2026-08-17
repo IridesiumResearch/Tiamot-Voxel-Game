@@ -94,10 +94,23 @@ impl Aabb {
     /// is what every other system means by "where the player is".
     #[must_use]
     pub fn player_at(feet: [f32; 3]) -> Self {
-        let half = PLAYER_WIDTH / 2.0;
+        Self::sized_at(feet, PLAYER_WIDTH, PLAYER_HEIGHT)
+    }
+
+    /// A box of arbitrary size standing with its feet at `feet`.
+    ///
+    /// The same convention as [`Self::player_at`], which is now written in
+    /// terms of this — an entity and a player are the same shape of thing to
+    /// the collision code, and charter rule 2 means there had better be exactly
+    /// one implementation of what that shape is. A mob with its own dimensions
+    /// therefore collides, steps up, and swims through the code the player
+    /// already proved.
+    #[must_use]
+    pub fn sized_at(feet: [f32; 3], width: f32, height: f32) -> Self {
+        let half = width / 2.0;
         Self {
             min: [feet[0] - half, feet[1], feet[2] - half],
-            max: [feet[0] + half, feet[1] + PLAYER_HEIGHT, feet[2] + half],
+            max: [feet[0] + half, feet[1] + height, feet[2] + half],
         }
     }
 
