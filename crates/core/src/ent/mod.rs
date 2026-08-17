@@ -40,6 +40,7 @@
 
 pub mod access;
 pub mod component;
+pub mod replicate;
 
 use std::collections::BTreeMap;
 
@@ -47,6 +48,7 @@ pub use access::{Access, Patch};
 pub use component::{
     AnimTag, Collider, HUMANOID_MODEL, Health, Nametag, Owner, Transform, Velocity,
 };
+pub use replicate::{Delta, Spawn, Tracker, Update};
 
 use crate::coords::ChunkPos;
 
