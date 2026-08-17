@@ -150,9 +150,30 @@ pub struct SubNodeGrid {
     /// top of the milk actually is, to a sixteenth of a cell.
     ///
     /// A block is three cells, so the range is 0..=48 and it fits a byte.
-    /// Indexed by [`LocalBlock::index`], one byte per block, allocated only for
-    /// a chunk that has fluid in it.
+    /// One byte per block over the PADDED region — the chunk plus one block of
+    /// each neighbour, see [`PADDED_BLOCKS`] — and allocated only for a chunk
+    /// that has fluid in it.
     heights: Option<Vec<u8>>,
+}
+
+/// Blocks per axis in [`SubNodeGrid::heights`]: the chunk and a one-block shell.
+///
+/// The shell is what makes a pond agree with itself across a chunk seam. Corner
+/// heights average the four blocks meeting at a vertex, so a chunk that cannot
+/// see past its own edge averages two blocks where its neighbour averages the
+/// other two, and the two surfaces meet at different heights — a step down the
+/// line of every seam. One block of overlap and both sides average the same
+/// four.
+const PADDED_BLOCKS: usize = tiamot_core::CHUNK_BLOCKS as usize + 2;
+
+/// Index into [`SubNodeGrid::heights`], for block coordinates in `-1..=16`.
+const fn height_index(bx: i32, by: i32, bz: i32) -> Option<usize> {
+    let last = tiamot_core::CHUNK_BLOCKS as i32;
+    if bx < -1 || by < -1 || bz < -1 || bx > last || by > last || bz > last {
+        return None;
+    }
+    let span = PADDED_BLOCKS as i32;
+    Some(((bx + 1) + span * (by + 1) + span * span * (bz + 1)) as usize)
 }
 
 /// Fine units per cell in [`SubNodeGrid::heights`] and a fluid vertex's drop.
@@ -216,7 +237,9 @@ impl SubNodeGrid {
             // scene is fast.
             if view.is_air() {
                 // Empty of terrain, so it may hold fluid.
-                if let Some((material, depth)) = fluid.fill(local) {
+                if let Some((material, depth)) =
+                    fluid.fill(local.x as i32, local.y as i32, local.z as i32)
+                {
                     fill_fluid(
                         &mut materials,
                         &mut columns,
@@ -235,7 +258,7 @@ impl SubNodeGrid {
             // milk on a sub-node-smoothed slope sits INSIDE the thinning ground
             // rather than floating on top of it. The fluid is laid down after
             // the terrain below, into whatever cells the terrain left.
-            let flooded = fluid.fill(local);
+            let flooded = fluid.fill(local.x as i32, local.y as i32, local.z as i32);
 
             let base_x = local.x as usize * SUBNODES_PER_AXIS as usize;
             let base_y = local.y as usize * SUBNODES_PER_AXIS as usize;
@@ -273,6 +296,37 @@ impl SubNodeGrid {
             }
         }
 
+        // **The shell of neighbouring blocks, for their heights alone.**
+        //
+        // Only when this chunk has milk of its own: the shell exists to make
+        // corner averaging and face culling agree with the chunk next door, and
+        // a chunk that draws no fluid has nothing to agree about. That keeps the
+        // extra `fill` calls off every dry chunk in the world, which is nearly
+        // all of them.
+        if heights.is_some() {
+            let last = tiamot_core::CHUNK_BLOCKS as i32;
+            for bz in -1..=last {
+                for by in -1..=last {
+                    for bx in -1..=last {
+                        let inside = |value: i32| (0..last).contains(&value);
+                        if inside(bx) && inside(by) && inside(bz) {
+                            continue;
+                        }
+                        let Some((_, depth)) = fluid.fill(bx, by, bz) else {
+                            continue;
+                        };
+                        let height = (u32::from(depth) * FULL_BLOCK / tiamot_core::UNITS_PER_BLOCK)
+                            .min(FULL_BLOCK);
+                        if let (Some(heights), Some(index)) =
+                            (heights.as_mut(), height_index(bx, by, bz))
+                        {
+                            heights[index] = u8::try_from(height).unwrap_or(u8::MAX).max(1);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut grid = Self {
             materials,
             columns,
@@ -286,6 +340,8 @@ impl SubNodeGrid {
     /// Fills bit 0 and bit 49 of every column from the adjacent chunk.
     fn seed_padding(&mut self, neighbours: &Neighbours<'_>, absent: Absent) {
         let solid_when_absent = absent == Absent::Solid;
+        let per_axis = SUBNODES_PER_AXIS as usize;
+        let last = tiamot_core::CHUNK_BLOCKS as i32;
 
         for (axis, positive) in FACES {
             let neighbour = neighbours.side(axis, positive);
@@ -294,6 +350,8 @@ impl SubNodeGrid {
             // The plane of the NEIGHBOUR that touches us: its last cell if it
             // is on our negative side, its first if positive.
             let neighbour_w = if positive { 0 } else { N - 1 };
+            // And the neighbouring BLOCK, which is where its milk is recorded.
+            let neighbour_block = if positive { last } else { -1 };
 
             for u in 0..N {
                 for v in 0..N {
@@ -306,7 +364,35 @@ impl SubNodeGrid {
                     };
                     if occupied {
                         self.columns[axis][u * N + v] |= 1 << bit;
+                        continue;
                     }
+
+                    // **And the fluid's half of the same padding.**
+                    //
+                    // A wet block fills every cell terrain left it, so a
+                    // neighbouring block that holds milk holds it in the cell
+                    // against this face — and the face between the two is
+                    // interior to one body of milk, exactly as it would be
+                    // inside a chunk. Seeded into BOTH sets: `columns` is what
+                    // the fluid culls against, and `wet` is what terrain
+                    // subtracts, so the stone the milk covers keeps its face.
+                    //
+                    // Only where the neighbour's terrain did not already claim
+                    // the cell, since terrain wins it in `fill_fluid`.
+                    let (bx, by, bz) = block_cell(
+                        axis,
+                        (u / per_axis) as i32,
+                        (v / per_axis) as i32,
+                        neighbour_block,
+                    );
+                    if self.block_height(bx, by, bz).is_none() {
+                        continue;
+                    }
+                    let Some(fluid) = self.fluid.as_mut() else {
+                        continue;
+                    };
+                    fluid[axis][u * N + v] |= 1 << bit;
+                    self.columns[axis][u * N + v] |= 1 << bit;
                 }
             }
         }
@@ -332,24 +418,38 @@ impl SubNodeGrid {
 
     /// A block's fluid surface height in [`FINE`] units, or `None` if it is dry.
     ///
-    /// Block coordinates, and **out-of-range blocks are dry** rather than
-    /// wrapping. A pond at a chunk's edge therefore slopes down to nothing at
-    /// the seam until the neighbouring chunk arrives, which is the same
-    /// compromise the corner-light sampler makes and for the same reason: the
-    /// grid's padding is one CELL wide and cannot answer a question about the
-    /// block beyond it.
+    /// Block coordinates, valid one block PAST the chunk on every axis — see
+    /// [`PADDED_BLOCKS`]. Anything further out is dry, which is right: the shell
+    /// is one block wide because a corner is shared by four blocks and no
+    /// question here reaches further than that.
     #[must_use]
     fn block_height(&self, bx: i32, by: i32, bz: i32) -> Option<u32> {
         let heights = self.heights.as_ref()?;
-        let blocks = tiamot_core::CHUNK_BLOCKS as i32;
-        if !(0..blocks).contains(&bx) || !(0..blocks).contains(&by) || !(0..blocks).contains(&bz) {
-            return None;
-        }
-        let local = LocalBlock::new(bx as u32, by as u32, bz as u32);
-        match heights[local.index()] {
+        match heights[height_index(bx, by, bz)?] {
             0 => None,
             height => Some(u32::from(height)),
         }
+    }
+
+    /// The four corner heights of the block a cell belongs to, packed.
+    ///
+    /// **The merge key for a fluid face**, six bits a corner. Two faces may only
+    /// become one quad when the hardware's interpolation between the merged
+    /// quad's four corners is the surface both of them describe — which across a
+    /// single block it is exactly, and across two blocks whose corners differ it
+    /// is not. A flat pond has one key everywhere and merges whole, so the case
+    /// that decides a fluid mesh's size is untouched.
+    #[must_use]
+    fn surface_key(&self, cx: usize, cy: usize, cz: usize) -> u32 {
+        let per_axis = SUBNODES_PER_AXIS as usize;
+        let by = (cy / per_axis) as i32;
+        let (bx, bz) = (cx / per_axis, cz / per_axis);
+        let mut key = 0;
+        for (corner, (dx, dz)) in [(0, 0), (1, 0), (0, 1), (1, 1)].into_iter().enumerate() {
+            let height = self.surface_at((bx + dx) * per_axis, (bz + dz) * per_axis, by);
+            key |= (height & 0x3F) << (corner * 6);
+        }
+        key
     }
 
     /// The fluid surface height at a vertex, in [`FINE`] units above the floor
@@ -420,6 +520,18 @@ impl SubNodeGrid {
     }
 }
 
+/// [`SubNodeGrid::cell`]'s mapping, in signed block coordinates.
+///
+/// The padding sits one block OUTSIDE the chunk, so the same permutation has to
+/// be expressible at −1.
+const fn block_cell(axis: usize, u: i32, v: i32, w: i32) -> (i32, i32, i32) {
+    match axis {
+        0 => (w, u, v),
+        1 => (u, w, v),
+        _ => (u, v, w),
+    }
+}
+
 /// The material of one sub-node cell of a chunk, by cell coordinates.
 fn cell_material(chunk: &Chunk, x: usize, y: usize, z: usize) -> tiamot_core::MaterialId {
     let per_axis = SUBNODES_PER_AXIS as usize;
@@ -474,21 +586,31 @@ pub trait FluidFill {
     /// `None` for a dry block, and for a fluid the caller cannot draw — a
     /// server naming a fluid it never registered is drawn as nothing rather
     /// than guessed at.
-    fn fill(&self, local: LocalBlock) -> Option<(u16, u8)>;
+    ///
+    /// # The coordinates run one block PAST the chunk
+    ///
+    /// Chunk-local block coordinates, `-1..=CHUNK_BLOCKS` on every axis, which
+    /// is the fluid's half of what [`SubNodeGrid::seed_padding`] does for
+    /// terrain. Without that one block of overlap a chunk cannot tell milk in
+    /// its neighbour from air: it drew a full wall of faces down every seam
+    /// through a pond, twice over, and each side worked out a different surface
+    /// height there. A caller that genuinely has no neighbour — a test, an
+    /// unloaded chunk — answers `None` and gets what it always did.
+    fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)>;
 }
 
 /// A world with no fluid in it, which is most of them.
 pub struct NoFluid;
 
 impl FluidFill for NoFluid {
-    fn fill(&self, _local: LocalBlock) -> Option<(u16, u8)> {
+    fn fill(&self, _x: i32, _y: i32, _z: i32) -> Option<(u16, u8)> {
         None
     }
 }
 
 impl<T: FluidFill + ?Sized> FluidFill for &T {
-    fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
-        (**self).fill(local)
+    fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)> {
+        (**self).fill(x, y, z)
     }
 }
 
@@ -511,36 +633,44 @@ fn fill_fluid(
     let base_y = local.y as usize * SUBNODES_PER_AXIS as usize;
     let base_z = local.z as usize * SUBNODES_PER_AXIS as usize;
 
-    // **The lattice rounds UP, and the vertices come back down.**
+    // **A wet block is FULL on the lattice, and the surface is the drop alone.**
     //
     // `depth` is the fraction of the block's HEIGHT that is full, in
     // twenty-sevenths — level 7 is 24/27, about 0.9 of a block, which is what
-    // gives a brim-full block a visible surface. A block is three cells tall, so
-    // the real surface sits at `depth / 9` cells, which is almost never a
-    // lattice position.
+    // gives a brim-full block a visible surface. That is almost never a lattice
+    // position, so the lattice cannot carry it and never could.
     //
-    // This used to take the floor of that and stop there, which quantised seven
-    // levels onto three heights and was the whole reason a pond looked like a
-    // staircase. Now the occupancy is filled to the CEILING of the surface — so
-    // the lattice always covers the milk rather than falling short of it — and
-    // `SubNodeGrid::heights` records where the surface really is, in sixteenths
-    // of a cell. The mesher pulls the top vertices down to it.
+    // What it used to try was to fill the ceiling of the surface in cells and
+    // pull the top vertices back down. Two blocks of milk side by side then
+    // disagreed about how many cells they occupied — a level 6 fills three, a
+    // level 5 fills two — and face culling drew a WALL between them, one cell
+    // tall, in the middle of a body of milk. A pond came out as a ziggurat of
+    // terraces, each with a step face whose back side showed through the
+    // transparent surface in front of it: the "internal faces" reported from
+    // the window, and the harsh edge where a fall meets the pool it is filling.
     //
-    // Rounding up rather than down is what makes the drop a vertex carries
-    // unsigned and, more importantly, non-negative: a vertex is only ever
-    // lowered from the lattice, never raised above it, so no fluid vertex can
-    // escape the occupancy its own face culling was computed from.
+    // Filling every free cell removes the disagreement at the source. Two
+    // adjacent wet blocks are now occupied identically whatever their levels, so
+    // the face between them is interior and culled, and the ONLY thing that
+    // shapes a body of milk is where its surface vertices are pulled down to.
+    // That field is continuous by construction (`SubNodeGrid::surface_at` is a
+    // pure function of a vertex's own position), so what used to be a staircase
+    // is a sheet.
     //
-    // At least one layer, because a level of 1 is 3/27 and its ceiling in cells
-    // is still 1 — but the clamp is kept explicit, since a puddle that exists to
-    // the physics and to `get_fluid` and cannot be seen is the worst outcome
-    // available here.
+    // It also makes the drop unconditionally non-negative — the lattice top is
+    // now the highest a surface can be asked to sit — where the old rounding
+    // only nearly did, and clamped a corner that wanted to rise above its own
+    // block into a crack.
     let height = (u32::from(depth) * FULL_BLOCK / tiamot_core::UNITS_PER_BLOCK).min(FULL_BLOCK);
-    let heights = heights.get_or_insert_with(|| vec![0u8; BLOCKS_PER_CHUNK]);
-    heights[local.index()] = u8::try_from(height).unwrap_or(u8::MAX);
+    let heights = heights.get_or_insert_with(|| vec![0u8; PADDED_BLOCKS.pow(3)]);
+    // At least one unit: zero is how `block_height` says "dry", and a puddle
+    // that exists to the physics and to `get_fluid` but not to the mesher is the
+    // worst outcome available here.
+    if let Some(index) = height_index(local.x as i32, local.y as i32, local.z as i32) {
+        heights[index] = u8::try_from(height).unwrap_or(u8::MAX).max(1);
+    }
 
-    let layers = (height.div_ceil(FINE) as usize).clamp(1, SUBNODES_PER_AXIS as usize);
-    for cy in 0..layers {
+    for cy in 0..SUBNODES_PER_AXIS as usize {
         for cz in 0..SUBNODES_PER_AXIS as usize {
             for cx in 0..SUBNODES_PER_AXIS as usize {
                 let x = base_x + cx;
@@ -762,17 +892,15 @@ fn fluid_buffers(quads: &[Quad], grid: &SubNodeGrid) -> (Vec<FluidVertex>, Vec<u
                     0
                 };
 
-                // **Clamped, because a vertex coordinate runs to 48 and a block
-                // index stops at 15.** A vertex on the chunk's far face divides
-                // to block 16, which `block_height` reports as absent — and
-                // `flow_at` reads an absent neighbour as the floor, on purpose,
-                // because milk at the edge of a shelf really is running off it.
-                // The two together invented a steep outward flow along the
-                // positive faces of every chunk, which would have read as a
-                // current running off the edge of the world.
-                let block = |cell: u32| -> i32 {
-                    (cell as usize / per_axis).min(tiamot_core::CHUNK_BLOCKS as usize - 1) as i32
-                };
+                // A vertex coordinate runs to 48, so a vertex on the chunk's far
+                // face divides to block 16 — which the height shell now answers
+                // for. It used to be clamped to block 15 instead, because
+                // `flow_at` reads an absent neighbour as the floor on purpose
+                // (milk at the edge of a shelf really is running off it) and
+                // that invented a current pouring off every seam in the world.
+                // With the neighbour's real height in hand the honest answer is
+                // available and the clamp would now be the thing that lies.
+                let block = |cell: u32| -> i32 { (cell as usize / per_axis) as i32 };
                 let flow = flow_at(grid, block(x), by, block(z));
                 vertices.push(FluidVertex::new(
                     x,
@@ -1111,6 +1239,13 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
     // One slice's worth of corner light, reused across every slice and
     // direction. Entries for cells with no face are never read.
     let mut shades = vec![Shade::default(); N * N];
+    // And the same for the fluid surface's merge keys, which only the fluid
+    // pass fills and only a chunk with fluid in it allocates.
+    let mut keys = if grid.fluid.is_some() {
+        vec![0u32; N * N]
+    } else {
+        Vec::new()
+    };
     // Merged into a local list and expanded at the end, once, against the grid.
     let mut fluid: Vec<Quad> = Vec::new();
 
@@ -1198,48 +1333,28 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
         }
 
         for w in 0..N {
-            // **Each cell's shade is computed exactly once**, for the cells
-            // that actually have a face, before merging looks at any of them.
-            // Computing inside the merge instead means recomputing a candidate
-            // cell for every span it is tested against — measured at 2.3× the
-            // mesh time on realistic content, which is most of the way to the
-            // Task 02b gate for no reason.
-            let slice = &mut plane[w * N..(w + 1) * N];
-            for (u, row) in slice.iter().enumerate() {
-                let mut bits = *row;
-                while bits != 0 {
-                    let v = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let (cx, cy, cz) = SubNodeGrid::cell(axis, u, v, w);
-                    shades[u * N + v] = shade_at(light, grid, axis, positive, cx, cy, cz);
-                }
-            }
-
-            greedy_merge(
+            shade_and_merge(
                 grid,
-                &shades,
-                slice,
-                axis,
-                positive,
-                w,
-                false,
+                light,
+                &mut plane[w * N..(w + 1) * N],
+                &mut shades,
+                None,
+                (axis, positive, w),
                 &mut mesh.quads,
             );
 
             if wet_plane.is_empty() {
                 continue;
             }
-            let slice = &mut wet_plane[w * N..(w + 1) * N];
-            for (u, row) in slice.iter().enumerate() {
-                let mut bits = *row;
-                while bits != 0 {
-                    let v = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let (cx, cy, cz) = SubNodeGrid::cell(axis, u, v, w);
-                    shades[u * N + v] = shade_at(light, grid, axis, positive, cx, cy, cz);
-                }
-            }
-            greedy_merge(grid, &shades, slice, axis, positive, w, true, &mut fluid);
+            shade_and_merge(
+                grid,
+                light,
+                &mut wet_plane[w * N..(w + 1) * N],
+                &mut shades,
+                Some(&mut keys),
+                (axis, positive, w),
+                &mut fluid,
+            );
         }
     }
 
@@ -1248,6 +1363,45 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
     mesh.fluid_vertices = vertices;
     mesh.fluid_indices = indices;
     mesh
+}
+
+/// Shades one slice's faces, then merges them.
+///
+/// **Each cell's shade is computed exactly once**, for the cells that actually
+/// have a face, before merging looks at any of them. Computing inside the merge
+/// instead means recomputing a candidate cell for every span it is tested
+/// against — measured at 2.3× the mesh time on realistic content, which is most
+/// of the way to the Task 02b gate for no reason. The fluid's merge keys ride
+/// the same pass for the same reason, and only the fluid pass asks for them.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the slice, its two scratch buffers, and which face of which slice \
+              it is; grouping them would move the argument list rather than \
+              shorten it"
+)]
+fn shade_and_merge(
+    grid: &SubNodeGrid,
+    light: &impl BlockLight,
+    slice: &mut [u64],
+    shades: &mut [Shade],
+    keys: Option<&mut [u32]>,
+    (axis, positive, w): (usize, bool, usize),
+    out: &mut Vec<Quad>,
+) {
+    let mut keys = keys;
+    for (u, row) in slice.iter().enumerate() {
+        let mut bits = *row;
+        while bits != 0 {
+            let v = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let (cx, cy, cz) = SubNodeGrid::cell(axis, u, v, w);
+            shades[u * N + v] = shade_at(light, grid, axis, positive, cx, cy, cz);
+            if let Some(keys) = keys.as_deref_mut() {
+                keys[u * N + v] = grid.surface_key(cx, cy, cz);
+            }
+        }
+    }
+    greedy_merge(grid, shades, slice, axis, positive, w, keys.as_deref(), out);
 }
 
 /// Meshes a chunk in one call.
@@ -1267,6 +1421,17 @@ pub fn mesh_chunk(
 
 impl crate::shade::CellOccupancy for SubNodeGrid {
     fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+        // **Milk does not occlude.** Ambient occlusion is a statement about
+        // light that geometry blocked, and a fluid you can see the world through
+        // did not block it.
+        //
+        // It also decouples the shading from how deep the fluid lattice happens
+        // to be filled: `fill_fluid` occupies every free cell of a wet block, so
+        // reading fluid as solid here would darken the corners of the stone
+        // around a puddle a ninth of a block deep as if it were a wall.
+        if self.is_fluid(x, y, z) {
+            return false;
+        }
         let inside = |value: i32| usize::try_from(value).ok().filter(|value| *value < N);
         let (Some(x), Some(y), Some(z)) = (inside(x), inside(y), inside(z)) else {
             // Outside the chunk. See `shade::corner_occlusion` — the grid's
@@ -1318,32 +1483,25 @@ fn greedy_merge(
     axis: usize,
     positive: bool,
     w: usize,
-    fluid: bool,
+    keys: Option<&[u32]>,
     out: &mut Vec<Quad>,
 ) {
-    // **A fluid face carries its block's surface height as a merge key.**
+    // **A fluid face carries its block's four CORNER heights as a merge key.**
     //
-    // A vertex on the surface is pulled down to where the milk really is, and
-    // the hardware interpolates linearly between a quad's four corners. Across
-    // one block that is exactly the bilinear field `surface_at` describes; across
-    // two blocks at different heights it is a straight line through a corner the
-    // quad has no vertex for, which would flatten the step between a deep pool
-    // and the shallow lip beside it into a ramp.
+    // Precomputed per cell by the caller for the same reason the shades are:
+    // working it out inside the merge re-derives a candidate cell once for every
+    // span it is tested against.
     //
-    // Where a pond IS flat every block agrees, this key is constant, and the
-    // whole surface merges into one quad exactly as it did before — which is the
-    // case that decides a fluid mesh's vertex count.
-    let height_key = |cx: usize, cy: usize, cz: usize| -> u32 {
-        if !fluid {
-            return 0;
+    // The block's own height is not enough and was the earlier version of this.
+    // A corner is the average of the four blocks meeting at it, so two blocks at
+    // the same level whose neighbours differ have different corners — and
+    // merging them draws a straight line between the two ends of the run,
+    // through corners the quad has no vertex for.
+    let height_key = |u: usize, v: usize| -> u32 {
+        match keys {
+            Some(keys) => keys[u * N + v],
+            None => 0,
         }
-        let per_axis = SUBNODES_PER_AXIS as usize;
-        grid.block_height(
-            (cx / per_axis) as i32,
-            (cy / per_axis) as i32,
-            (cz / per_axis) as i32,
-        )
-        .unwrap_or(0)
     };
 
     for u in 0..N {
@@ -1353,7 +1511,7 @@ fn greedy_merge(
             let (cx, cy, cz) = SubNodeGrid::cell(axis, u, v, w);
             let material = grid.material(cx, cy, cz);
             let shade = shades[u * N + v];
-            let height = height_key(cx, cy, cz);
+            let height = height_key(u, v);
 
             // Extend along v while the faces are present and the material
             // matches. Merging across a material boundary would produce a quad
@@ -1377,7 +1535,7 @@ fn greedy_merge(
                 // before. See `crate::shade`.
                 if grid.material(nx, ny, nz) != material
                     || shades[u * N + v + span_v] != shade
-                    || height_key(nx, ny, nz) != height
+                    || height_key(u, v + span_v) != height
                 {
                     break;
                 }
@@ -1400,7 +1558,7 @@ fn greedy_merge(
                     let (nx, ny, nz) = SubNodeGrid::cell(axis, u + span_u, v + offset, w);
                     grid.material(nx, ny, nz) == material
                         && shades[(u + span_u) * N + v + offset] == shade
-                        && height_key(nx, ny, nz) == height
+                        && height_key(u + span_u, v + offset) == height
                 });
                 if !matches {
                     break;
@@ -1566,8 +1724,8 @@ mod tests {
     }
 
     impl FluidFill for Pond {
-        fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
-            (local.x == self.block.x && local.y == self.block.y && local.z == self.block.z)
+        fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)> {
+            (x == self.block.x as i32 && y == self.block.y as i32 && z == self.block.z as i32)
                 .then_some((self.material, self.depth))
         }
     }
@@ -1655,12 +1813,12 @@ mod tests {
         // doing nothing and this is the old staircase with extra arithmetic.
         struct Sloped;
         impl FluidFill for Sloped {
-            fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
-                if local.y != 4 {
+            fn fill(&self, x: i32, y: i32, _z: i32) -> Option<(u16, u8)> {
+                if y != 4 {
                     return None;
                 }
                 // Deep at one end, shallow at the other.
-                match local.x {
+                match x {
                     4 => Some((MILK, 24)),
                     5 => Some((MILK, 18)),
                     6 => Some((MILK, 9)),
@@ -1670,8 +1828,8 @@ mod tests {
         }
         struct Level;
         impl FluidFill for Level {
-            fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
-                if local.y == 4 && (4..=6).contains(&local.x) {
+            fn fill(&self, x: i32, y: i32, _z: i32) -> Option<(u16, u8)> {
+                if y == 4 && (4..=6).contains(&x) {
                     Some((MILK, 18))
                 } else {
                     None
@@ -1715,8 +1873,8 @@ mod tests {
         // gradient and must not scroll, and a surface that falls away must.
         struct Level;
         impl FluidFill for Level {
-            fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
-                if local.y == 4 && (4..=8).contains(&local.x) && (4..=8).contains(&local.z) {
+            fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)> {
+                if y == 4 && (4..=8).contains(&x) && (4..=8).contains(&z) {
                     Some((MILK, 24))
                 } else {
                     None
@@ -1725,11 +1883,11 @@ mod tests {
         }
         struct Slope;
         impl FluidFill for Slope {
-            fn fill(&self, local: LocalBlock) -> Option<(u16, u8)> {
-                if local.y != 4 || !(4..=8).contains(&local.z) {
+            fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)> {
+                if y != 4 || !(4..=8).contains(&z) {
                     return None;
                 }
-                match local.x {
+                match x {
                     4 => Some((MILK, 27)),
                     5 => Some((MILK, 18)),
                     6 => Some((MILK, 9)),

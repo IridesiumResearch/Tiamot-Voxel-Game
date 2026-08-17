@@ -617,12 +617,12 @@ pub struct ChunkFluid<'a> {
 }
 
 impl crate::mesher::FluidFill for ChunkFluid<'_> {
-    fn fill(&self, local: tiamot_core::coords::LocalBlock) -> Option<(u16, u8)> {
+    fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)> {
         let span = tiamot_core::CHUNK_BLOCKS as i32;
         let at = tiamot_core::BlockPos::new(
-            self.pos.x * span + local.x as i32,
-            self.pos.y * span + local.y as i32,
-            self.pos.z * span + local.z as i32,
+            self.pos.x * span + x,
+            self.pos.y * span + y,
+            self.pos.z * span + z,
         );
         let (material, depth) = self.store.fluid_fill(self.store.fluid_at(at))?;
 
@@ -656,6 +656,47 @@ mod tests {
 
     fn solid_at(x: i32, y: i32, z: i32) -> Chunk {
         Chunk::new(ChunkPos::new(x, y, z), STONE)
+    }
+
+    #[test]
+    fn a_chunk_can_see_one_block_of_its_neighbours_milk() {
+        // **The wiring behind `FluidFill`'s one block of overlap.**
+        //
+        // The mesher culls a fluid face at a chunk's edge against the block
+        // beyond it, and that block belongs to the chunk next door. Nothing in
+        // the mesher can fetch it — the store can, because a fluid lookup is by
+        // world position and always could have been. This is the half that says
+        // `ChunkFluid` actually answers for coordinates outside its own chunk,
+        // which is what the mesher's seam test assumes and cannot check.
+        use tiamot_core::coords::LocalBlock;
+        use tiamot_core::fluid::{Fluid, FluidId, FluidLayer};
+
+        let mut store = ChunkStore::new();
+        store.set_fluid_table(&[tiamot_core::proto::FluidDef {
+            id: 1,
+            name: "test:milk".into(),
+            material: STONE.get(),
+            depths: [0, 3, 6, 10, 13, 17, 20, 24],
+            color: [255, 255, 255],
+        }]);
+
+        // Milk in the neighbour only, in the block against the shared face.
+        let mut layer = FluidLayer::empty();
+        let id = FluidId(1);
+        layer.set(LocalBlock::new(0, 4, 4), Fluid::source(id));
+        store.set_fluid(ChunkPos::new(1, 0, 0), layer);
+
+        let fluid = store.fluid_for(ChunkPos::new(0, 0, 0));
+        let span = tiamot_core::CHUNK_BLOCKS as i32;
+        assert!(
+            crate::mesher::FluidFill::fill(&fluid, span, 4, 4).is_some(),
+            "chunk 0 cannot see the milk one block past its own edge, so it \
+             will draw a wall of faces down the seam against it"
+        );
+        assert!(
+            crate::mesher::FluidFill::fill(&fluid, span - 1, 4, 4).is_none(),
+            "chunk 0 reports milk in its own last block, which is dry"
+        );
     }
 
     #[test]

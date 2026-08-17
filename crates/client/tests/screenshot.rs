@@ -1135,12 +1135,22 @@ fn a_pond_can_be_seen_through() {
 
     const DARK: MaterialId = MaterialId(2);
     const PALE: MaterialId = MaterialId(3);
+    /// **The milk's own material, and it has to differ from both floors.**
+    ///
+    /// It was PALE, which made the last assertion here measure the wrong thing:
+    /// pale milk over a pale floor is the same colour whatever the milk does, so
+    /// the only difference left was the occlusion the fluid cast on itself. Milk
+    /// no longer occludes anything — it is transparent, see
+    /// `SubNodeGrid::solid` — and the assertion failed for the renderer being
+    /// right. Give the milk a colour of its own and it measures the tint it
+    /// claims to.
+    const MILK: MaterialId = MaterialId(4);
 
     /// A pond filling one block layer over the floor.
     struct Pond;
     impl client::mesher::FluidFill for Pond {
-        fn fill(&self, local: tiamot_core::coords::LocalBlock) -> Option<(u16, u8)> {
-            (local.y == 9).then_some((PALE.get(), 24))
+        fn fill(&self, _x: i32, y: i32, _z: i32) -> Option<(u16, u8)> {
+            (y == 9).then_some((MILK.get(), 24))
         }
     }
 
@@ -1157,12 +1167,14 @@ fn a_pond_can_be_seen_through() {
     };
 
     let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
-    // Slot indices are material ids: a dark floor at 2, a pale one at 3.
+    // Slot indices are material ids: a dark floor at 2, a pale one at 3, and
+    // the milk at 4, a blue neither floor could be mistaken for.
     let atlas = Atlas::build(&[
         None,
         None,
         Some(Image::solid(16, 16, [40, 40, 40, 255])),
         Some(Image::solid(16, 16, [230, 230, 230, 255])),
+        Some(Image::solid(16, 16, [90, 140, 220, 255])),
     ]);
     renderer.set_atlas(&atlas);
 
