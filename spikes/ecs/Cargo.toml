@@ -1,0 +1,24 @@
+[package]
+name = "ecs-spike"
+description = "Task 12 decision spike: which entity store the engine uses, measured."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# THROWAWAY CODE. This crate exists to produce the numbers behind
+# docs/ecs-verdict.md, not to be maintained. It is excluded from the
+# workspace's default-members so a normal build never produces it, and the two
+# candidate libraries it measures enter the lockfile HERE and nowhere else —
+# whichever one wins, only the winner ever reaches `crates/core`.
+#
+# The dependency firewall (charter rule 3) does not apply: this is neither
+# `core` nor `server`.
+
+[dependencies]
+tiamot-core.workspace = true
+bevy_ecs = "0.19"
+hecs = "0.11"

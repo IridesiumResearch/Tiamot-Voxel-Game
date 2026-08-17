@@ -6,6 +6,7 @@ members = [
     "crates/client",
     "crates/bot",
     "spikes/subnode",
+    "spikes/ecs",
 ]
 
 # Spikes are throwaway measurement code, not shippable engine. They stay
