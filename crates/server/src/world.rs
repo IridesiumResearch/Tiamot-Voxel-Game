@@ -168,6 +168,39 @@ impl Generator {
         }
     }
 
+    /// Runs every mod's per-entity step callback over the entities it owns.
+    ///
+    /// `owned` groups live entity ids by the mod that spawned them, which the
+    /// engine works out because it is the only side that knows — a mod asking
+    /// which entities are its own would have to be trusted with the answer.
+    ///
+    /// Returns the mods that faulted, exactly as [`Self::tick`] does.
+    pub fn entity_step(
+        &mut self,
+        owned: &std::collections::BTreeMap<String, Vec<u64>>,
+        dt_ticks: u32,
+    ) -> Vec<(String, tiamot_core::script::ScriptError)> {
+        let Self::Mods(generator) = self else {
+            return Vec::new();
+        };
+        let vm = generator.host_mut().vm_mut();
+        let mut faults = Vec::new();
+        // In the VM's own registration order rather than the map's, so two
+        // servers running the same mod set call callbacks in the same order —
+        // which is load order, which the resolver already made deterministic.
+        for mod_id in vm.entity_steppers() {
+            let Some(ids) = owned.get(&mod_id) else {
+                continue;
+            };
+            match vm.entity_step(&mod_id, ids, dt_ticks) {
+                Ok(Some(fault)) => faults.push(fault),
+                Ok(None) => {}
+                Err(err) => warn!("script VM failed during an entity step: {err}"),
+            }
+        }
+        faults
+    }
+
     /// Asks the mods whether a dig may proceed.
     ///
     /// A server with no mods allows everything: charter rule 1 puts the rules

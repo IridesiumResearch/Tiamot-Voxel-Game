@@ -829,6 +829,32 @@ pub trait ScriptVm: Sized {
     /// The `Result` is for a VM-level failure that affects everything.
     fn tick(&mut self, dt_ticks: u32) -> Result<Vec<(String, ScriptError)>, ScriptError>;
 
+    /// Runs one mod's per-entity step callback over the entities it owns.
+    ///
+    /// Called once per tick per mod, with the ids of every live entity whose
+    /// `source` is that mod. The engine does the grouping because it is the
+    /// only side that knows which entity belongs to whom — a mod asking would
+    /// have to be trusted with the answer.
+    ///
+    /// Each entity costs its own instruction budget, not a share of one. A mod
+    /// with two hundred mobs must not get a two-hundredth of a budget each,
+    /// and one runaway mob must not starve the other hundred and ninety-nine.
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError`] if the VM itself failed. A callback that raised is
+    /// reported in the returned list and its mod is disabled (charter rule 10),
+    /// exactly as [`Self::tick`] does.
+    fn entity_step(
+        &mut self,
+        mod_id: &str,
+        entities: &[u64],
+        dt_ticks: u32,
+    ) -> Result<Option<(String, ScriptError)>, ScriptError>;
+
+    /// Which mods registered a per-entity step callback, in load order.
+    fn entity_steppers(&self) -> Vec<String>;
+
     /// Asks every registered `on_dig_complete` whether a dig may proceed.
     ///
     /// Called **before** the geometry is removed. A mod returning `false`

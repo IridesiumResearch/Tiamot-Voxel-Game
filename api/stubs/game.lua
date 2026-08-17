@@ -729,4 +729,29 @@ function game.entities_in_radius(position, radius, source) end
 ---```
 ---@field storage { get: fun(key: string): string|number|boolean|nil, set: fun(key: string, value: string|number|boolean|nil), keys: fun(): string[] }
 
+---Runs once per tick for every entity your mod spawned.
+---
+---**This is where a mob's behaviour lives.** The engine moves bodies and this
+---decides where they are trying to go — set `drive` and the physics that runs
+---immediately afterwards acts on it, in the same tick.
+---
+---Called with the entity's id, so use `game.entity(id)` to read it and
+---`game.set_entity(id, ...)` to change it. You only ever see your own
+---entities; the engine does the grouping.
+---
+---**Each entity gets its own instruction budget**, not a share of one. Two
+---hundred mobs are two hundred budgets, and one runaway mob cannot starve the
+---rest. An error disables your whole mod, as every hook does — and it stops at
+---the first failure rather than reporting the same error two hundred times.
+---
+---```lua
+---game.register_on_entity_step(function(id, dt)
+---    local me = game.entity(id)
+---    if not me then return end
+---    game.set_entity(id, { drive = { walk = { x = 1, z = 0 }, gait = "walk" } })
+---end)
+---```
+---@param callback fun(id: integer, dt: integer)
+function game.register_on_entity_step(callback) end
+
 return game

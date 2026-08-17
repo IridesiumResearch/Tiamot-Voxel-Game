@@ -29,7 +29,7 @@
 //! things nobody can see being skipped by every loop for the rest of the
 //! session.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tiamot_core::coords::ChunkPos;
 use tiamot_core::ent::{Entities, Entity, EntityId};
@@ -181,6 +181,20 @@ impl Population {
                 (pos, entities)
             })
             .collect()
+    }
+
+    /// Live entity ids grouped by the mod that spawned them.
+    ///
+    /// For the per-entity step callbacks: the engine does the grouping because
+    /// it is the only side that knows whose entity is whose. A `BTreeMap` and
+    /// slot order within each mod, so the call order is a property of the data.
+    #[must_use]
+    pub fn owned_by_mod(&self) -> BTreeMap<String, Vec<u64>> {
+        let mut grouped: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for (id, entity) in self.entities.iter() {
+            grouped.entry(entity.source.clone()).or_default().push(id.0);
+        }
+        grouped
     }
 
     /// Steps every entity by one tick.

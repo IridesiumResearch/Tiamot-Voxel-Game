@@ -667,6 +667,64 @@ impl ScriptVm for MluaVm {
         Ok(faults)
     }
 
+    fn entity_step(
+        &mut self,
+        mod_id: &str,
+        entities: &[u64],
+        dt_ticks: u32,
+    ) -> Result<Option<(String, ScriptError)>, ScriptError> {
+        if entities.is_empty() || self.faulted.contains(mod_id) {
+            return Ok(None);
+        }
+        let callback: mlua::Function = match self
+            .lua
+            .named_registry_value(&Self::hook_key("on_entity_step", mod_id))
+        {
+            Ok(callback) => callback,
+            // The mod registered nothing, which is the normal case for most
+            // mods and not worth an error.
+            Err(_) => return Ok(None),
+        };
+
+        for id in entities {
+            // **Armed per entity, not per tick.** A mod with two hundred mobs
+            // must not get a two-hundredth of a budget each, and one runaway
+            // mob must not starve the other hundred and ninety-nine.
+            self.arm_budget(self.limits.instructions_per_call)?;
+            let result = callback.call::<()>((*id as i64, dt_ticks));
+            self.disarm_budget();
+
+            if let Err(err) = result {
+                // Charter rule 10: the mod is disabled and the tick continues.
+                // Stopping at the first failure rather than running the rest is
+                // deliberate — a mod whose callback throws will throw for every
+                // entity, and reporting two hundred identical faults would bury
+                // the one that matters.
+                let error = Self::classify(&err, mod_id, "on_entity_step");
+                self.faulted.insert(mod_id.to_owned());
+                tracing::error!(
+                    mod_id = %mod_id,
+                    error = %error,
+                    "disabling mod after an entity step failure"
+                );
+                return Ok(Some((mod_id.to_owned(), error)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn entity_steppers(&self) -> Vec<String> {
+        self.lua
+            .named_registry_value::<Table>("tiamot.entity_steppers")
+            .map(|table| {
+                table
+                    .sequence_values::<String>()
+                    .filter_map(Result::ok)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn dig_complete(&mut self, event: &crate::script::DigEvent) -> HookOutcome {
         let Ok(table) = self.hook_event(event.player).and_then(|table| {
             table.set("x", event.target.x)?;
@@ -1211,6 +1269,8 @@ impl MluaVm {
         game.set("register_on_tick", register_on_tick)
             .map_err(|err| self.vm_error(&err))?;
 
+        self.install_entity_step_hook(mod_id, game)?;
+
         // The two cancellable hooks. Registered exactly like `on_tick` — one
         // callback per mod, ordered by load order — so a mod author has one
         // shape to learn rather than three.
@@ -1712,6 +1772,43 @@ impl MluaVm {
         Ok(())
     }
 
+    /// Puts `game.register_on_entity_step` on the `game` table.
+    ///
+    /// Its own method only because `install_registration` had outgrown the line
+    /// limit; the shape is exactly `register_on_tick`'s, which is the point —
+    /// a mod author has one shape to learn rather than several.
+    fn install_entity_step_hook(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let owner = mod_id.to_owned();
+        let key = Self::hook_key("on_entity_step", mod_id);
+        let register_on_entity_step = self
+            .lua
+            .create_function(move |lua, callback: mlua::Function| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                lua.set_named_registry_value(&key, callback)?;
+                // The same registration-order list `on_tick` keeps, for the
+                // same reason: load order is the call order, and the resolver
+                // already made load order deterministic.
+                let steppers: Table = lua.named_registry_value("tiamot.entity_steppers")?;
+                let already = steppers
+                    .sequence_values::<String>()
+                    .filter_map(Result::ok)
+                    .any(|existing| existing == owner);
+                if !already {
+                    steppers.set(steppers.raw_len() + 1, owner.clone())?;
+                }
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_on_entity_step", register_on_entity_step)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// Everything callable after freeze: lookups, bulk noise, streams, constants.
     fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- frozen-phase API ---------------------------------------------
@@ -1863,6 +1960,10 @@ impl MluaVm {
         let tickers = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.tickers", tickers)
+            .map_err(|err| self.vm_error(&err))?;
+        let steppers = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.entity_steppers", steppers)
             .map_err(|err| self.vm_error(&err))?;
         for list in [DIGGERS, PLACERS, PUNCHERS, FLOWERS] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
@@ -4627,5 +4728,98 @@ mod entity_tests {
              assert(#game.storage.keys() == 0)",
         )
         .expect("no world");
+    }
+    #[test]
+    fn a_mods_entity_callback_runs_once_per_entity_it_owns() {
+        let (mut vm, store) = vm_with_entities();
+        load(
+            &mut vm,
+            "herder",
+            "seen = {}\n\
+             game.register_on_entity_step(function(id, dt)\n\
+               seen[#seen + 1] = id\n\
+               game.set_entity(id, { drive = { walk = { x = 1, z = 0 } } })\n\
+             end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "herder",
+            "a = game.spawn_entity{ pos = {x=0,y=0,z=0} }\n\
+             b = game.spawn_entity{ pos = {x=1,y=0,z=0} }",
+        )
+        .expect("spawn");
+        let ids: Vec<u64> = store
+            .entities
+            .lock()
+            .expect("lock")
+            .ids()
+            .into_iter()
+            .map(|id| id.0)
+            .collect();
+
+        assert!(vm.entity_step("herder", &ids, 1).expect("step").is_none());
+        vm.eval_in(
+            "herder",
+            "assert(#seen == 2, 'callback ran ' .. #seen .. ' times for two entities')\n\
+             assert(seen[1] == a and seen[2] == b, 'the callback saw them out of order')",
+        )
+        .expect("what the mod saw");
+
+        // And the drive it set reached the entity the physics will read.
+        let entities = store.entities.lock().expect("lock");
+        for (_, entity) in entities.iter() {
+            assert!(
+                (entity.drive.walk[0] - 1.0).abs() < f32::EPSILON,
+                "the callback's drive did not reach the entity"
+            );
+        }
+    }
+
+    #[test]
+    fn a_callback_that_throws_disables_its_mod_and_stops_reporting() {
+        // Charter rule 10: the mod is disabled and the tick continues. Stopping
+        // at the first failure is deliberate — a callback that throws will
+        // throw for every entity, and two hundred identical faults would bury
+        // the one that matters.
+        let (mut vm, _store) = vm_with_entities();
+        load(
+            &mut vm,
+            "broken",
+            "runs = 0\n\
+             game.register_on_entity_step(function(id)\n\
+               runs = runs + 1\n\
+               error('no')\n\
+             end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        let fault = vm
+            .entity_step("broken", &[1, 2, 3, 4], 1)
+            .expect("vm ok")
+            .expect("should fault");
+        assert_eq!(fault.0, "broken");
+        assert!(
+            vm.faulted_mods().contains(&"broken".to_owned()),
+            "the mod was not disabled"
+        );
+
+        // A disabled mod is not called again.
+        assert!(
+            vm.entity_step("broken", &[1], 1).expect("vm ok").is_none(),
+            "a faulted mod was called again"
+        );
+    }
+
+    #[test]
+    fn a_mod_that_registered_no_entity_callback_is_not_a_stepper() {
+        let (mut vm, _store) = vm_with_entities();
+        load(&mut vm, "quiet", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        assert!(vm.entity_steppers().is_empty());
+        assert!(vm.entity_step("quiet", &[1], 1).expect("vm ok").is_none());
     }
 }

@@ -1648,6 +1648,22 @@ impl ServerHandle {
                         }
                         control.note_lit_chunks(lighting.read().expect("lighting lock").len());
 
+                        // **The mods' own entity logic, before the physics.**
+                        //
+                        // A mod sets `drive` and the step that follows acts on
+                        // it, so a mob reacts within the tick it decided rather
+                        // than the one after — which at 20 Hz is the difference
+                        // between a mob that turns when you do and one that
+                        // always lags you by 50 ms.
+                        {
+                            let owned = population.read().expect("entity lock").owned_by_mod();
+                            if !owned.is_empty() {
+                                for (mod_id, err) in source.entity_step(&owned, 1) {
+                                    error!(mod_id = %mod_id, "entity step failed: {err}");
+                                }
+                            }
+                        }
+
                         // **Entities, every tick.** Unlike fluid there is no
                         // halving to be had: a mob stepping at 10 Hz is a mob
                         // that visibly stutters, because unlike a pond it is
