@@ -2422,3 +2422,102 @@ fn the_chunk_border_overlay_draws_only_when_it_is_asked_for() {
         "turning the borders off left some of them on screen"
     );
 }
+
+#[test]
+fn an_entity_is_drawn_where_the_server_put_it() {
+    // **The first test that an entity reaches the screen at all.** Everything
+    // before it — the store, the interest set, the wire format, the
+    // interpolation buffer — is testable without a GPU and was tested without
+    // one. This is the step that says the last hop happened.
+    //
+    // Asserted by DIFFERENCE rather than by colour: a frame with an entity in
+    // it and the same frame without must not be identical. Reading a hue would
+    // make the test a hostage to the atlas, the lighting mode and the driver's
+    // filtering, and `tiamot-session-flake` is the memory of what that costs.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    let camera = viewpoint();
+
+    let bare = target.capture(&mut renderer, &camera).expect("capture");
+    let before = average(&bare, WIDTH / 4, HEIGHT / 4, WIDTH * 3 / 4, HEIGHT * 3 / 4);
+
+    // Right in front of the camera, a couple of blocks out, at its own height.
+    let ahead = camera.forward();
+    renderer.set_entities(vec![[ahead.x * 2.0, ahead.y * 2.0 - 1.0, ahead.z * 2.0]]);
+    let peopled = target.capture(&mut renderer, &camera).expect("capture");
+    let after = average(
+        &peopled,
+        WIDTH / 4,
+        HEIGHT / 4,
+        WIDTH * 3 / 4,
+        HEIGHT * 3 / 4,
+    );
+
+    let difference = (0..3)
+        .map(|channel| (after[channel] - before[channel]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        difference > 0.01,
+        "the frame is {before:?} with no entities and {after:?} with one two \
+         blocks in front of the camera — nothing was drawn"
+    );
+
+    // And taking it away puts the frame back, so the difference above was the
+    // entity and not something that changed once and stayed changed.
+    renderer.set_entities(Vec::new());
+    let empty_again = target.capture(&mut renderer, &camera).expect("capture");
+    let restored = average(
+        &empty_again,
+        WIDTH / 4,
+        HEIGHT / 4,
+        WIDTH * 3 / 4,
+        HEIGHT * 3 / 4,
+    );
+    let residue = (0..3)
+        .map(|channel| (restored[channel] - before[channel]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        residue < 0.001,
+        "removing the entity left the frame at {restored:?} rather than back at \
+         {before:?}"
+    );
+}
+
+#[test]
+fn a_hundred_entities_all_reach_the_instance_buffer() {
+    // The instance array is grown in powers of two and shared with the chunks
+    // and the player's own body. A crowd is where an off-by-one in that
+    // arithmetic shows up, and it shows up as the LAST entity silently missing
+    // — which no single-entity test can see.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    let camera = viewpoint();
+    let ahead = camera.forward();
+
+    let crowd: Vec<[f32; 3]> = (0..100)
+        .map(|index| {
+            let along = 2.0 + index as f32 * 0.05;
+            [ahead.x * along, ahead.y * along - 1.0, ahead.z * along]
+        })
+        .collect();
+    renderer.set_entities(crowd);
+    let frame = target.capture(&mut renderer, &camera).expect("capture");
+
+    renderer.set_entities(Vec::new());
+    let empty = target.capture(&mut renderer, &camera).expect("capture");
+
+    let with = average(&frame, WIDTH / 4, HEIGHT / 4, WIDTH * 3 / 4, HEIGHT * 3 / 4);
+    let without = average(&empty, WIDTH / 4, HEIGHT / 4, WIDTH * 3 / 4, HEIGHT * 3 / 4);
+    let difference = (0..3)
+        .map(|channel| (with[channel] - without[channel]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        difference > 0.01,
+        "a hundred entities in front of the camera changed the frame from \
+         {without:?} to {with:?}"
+    );
+}

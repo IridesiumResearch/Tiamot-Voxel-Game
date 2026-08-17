@@ -673,6 +673,14 @@ pub struct Renderer {
     /// head, and all you see is its inside faces.
     body: ChunkMesh,
     body_at: Option<[f32; 3]>,
+    /// Where every entity in view is this frame, camera-relative, in cells.
+    ///
+    /// Rebuilt each frame from the interpolation buffer, because that is what
+    /// it means for an entity to move: nothing here is cached between frames
+    /// and nothing needs to be. They ride the same instance array as the
+    /// chunks, after the body, so drawing them is an instance index rather than
+    /// a second buffer and a second binding.
+    entities_at: Vec<[f32; 3]>,
     /// The outline pipeline, and the line segments it draws this frame.
     selection_pipeline: wgpu::RenderPipeline,
     /// The chunk-border overlay: the same line pipeline, its own buffer.
@@ -823,6 +831,7 @@ impl Renderer {
             fog_end: f32::MAX,
             drawn: 0,
             body: body_buffers,
+            entities_at: Vec::new(),
             body_at: None,
         })
     }
@@ -880,6 +889,24 @@ impl Renderer {
     /// position would be the one thing in the frame that did not.
     pub const fn set_body(&mut self, at: Option<[f32; 3]>) {
         self.body_at = at;
+    }
+
+    /// Where every entity in view is this frame, camera-relative, in cells.
+    ///
+    /// # The box is a stand-in, and a deliberate one
+    ///
+    /// Entities are drawn with the same box mesh the player's own body uses —
+    /// which is the collision AABB, not a figure. The packed vertex format
+    /// positions to a **sub-node cell**, six bits an axis, and a humanoid is
+    /// 5.4 cells tall and 1.8 wide: there is no sub-cell resolution in that
+    /// format to put a head, a torso and two arms in. A figure needs float
+    /// positions and its own pipeline, which is what the skinned rig brings.
+    ///
+    /// So this is honest rather than finished: it puts entities on screen, at
+    /// the right size, in the right place, moving the way they really move —
+    /// which is everything except what they look like.
+    pub fn set_entities(&mut self, at: Vec<[f32; 3]>) {
+        self.entities_at = at;
     }
 
     /// Switches the lighting mode.
@@ -1322,6 +1349,13 @@ impl Renderer {
             });
         }
 
+        // And every entity, after it. Same array, same reason.
+        for at in &self.entities_at {
+            instances.push(Instance {
+                offset: [at[0], at[1], at[2], 0.0],
+            });
+        }
+
         if instances.len() > self.instance_capacity {
             // Grown in powers of two rather than to the exact size, so a world
             // filling in does not reallocate on almost every frame.
@@ -1478,6 +1512,36 @@ impl Renderer {
         }
     }
 
+    /// Draws the player's own body and every entity in view.
+    ///
+    /// **One implementation, called from both passes.** The direct path and the
+    /// post chain each build their own render pass, and the first version of
+    /// this put the entity draw in only one of them — so entities were invisible
+    /// in two of the three lighting modes and present in the third, which reads
+    /// as a lighting bug rather than a missing draw call.
+    ///
+    /// Everything here rides the chunks' instance array: the body's offset is
+    /// the one after the last chunk's, and the entities follow it. They differ
+    /// from each other only in where they are, which is exactly what an instance
+    /// offset says — so a hundred mobs are a hundred draws of one buffer rather
+    /// than a hundred buffers.
+    fn draw_bodies(&self, pass: &mut wgpu::RenderPass<'_>, chunks: usize) {
+        if self.body_at.is_none() && self.entities_at.is_empty() {
+            return;
+        }
+        let mut instance = chunks as u32;
+        pass.set_vertex_buffer(0, self.body.vertices.slice(..));
+        pass.set_index_buffer(self.body.indices.slice(..), wgpu::IndexFormat::Uint32);
+        if self.body_at.is_some() {
+            pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
+            instance += 1;
+        }
+        for _ in 0..self.entities_at.len() {
+            pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
+            instance += 1;
+        }
+    }
+
     /// Draws the visible chunks into every shadow cascade.
     ///
     /// The same meshes and the same instance buffer as the world pass, drawn
@@ -1499,15 +1563,10 @@ impl Renderer {
                 let instance = index as u32;
                 pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
             }
-            // And the body, which is the only thing in the world that moves and
-            // therefore the only way to see whether a moving shadow looks
-            // right. Its instance is the one after the last chunk's.
-            if self.body_at.is_some() {
-                let instance = visible.len() as u32;
-                pass.set_vertex_buffer(0, self.body.vertices.slice(..));
-                pass.set_index_buffer(self.body.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
-            }
+            // And the body and every entity — which are the only things in the
+            // world that MOVE, and therefore the only way to see whether a
+            // moving shadow looks right at all.
+            self.draw_bodies(pass, visible.len());
         });
     }
 
@@ -1608,12 +1667,7 @@ impl Renderer {
                 pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
             }
 
-            if self.body_at.is_some() {
-                let instance = visible.len() as u32;
-                pass.set_vertex_buffer(0, self.body.vertices.slice(..));
-                pass.set_index_buffer(self.body.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
-            }
+            self.draw_bodies(&mut pass, visible.len());
 
             self.draw_fluid(&mut pass, fluid_pipeline, &visible);
 

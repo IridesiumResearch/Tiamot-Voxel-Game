@@ -2399,6 +2399,42 @@ impl App {
             self.camera.position = Position::from_world(eye[0], eye[1], eye[2]);
             self.renderer.set_body(None);
         }
+        // After the camera has settled, because every offset is relative to it.
+        self.place_entities();
+    }
+
+    /// Places every entity in view for this frame.
+    ///
+    /// **Recomputed every frame, from the interpolation buffer.** That is what
+    /// it means for an entity to move: the buffer holds a handful of samples
+    /// and the pose between them depends on when this frame is, so caching it
+    /// would cache the one thing that is supposed to change.
+    ///
+    /// The camera-relative offset is taken through `Position::offset_to`, which
+    /// is the only correct way to subtract two positions in a floating origin
+    /// (charter rule 7) — the entity and the camera may be in different chunks,
+    /// and subtracting their local parts would compare nothing.
+    fn place_entities(&mut self) {
+        let now = self.since_start.elapsed();
+        let cells = f64::from(tiamot_core::SUBNODES_PER_AXIS);
+        // The box stands centred on the feet rather than beside them, exactly
+        // as the player's own body does.
+        let half = f64::from(crate::render::BODY_WIDTH_CELLS) / (2.0 * cells);
+
+        let mut placed = Vec::with_capacity(self.entities.len());
+        for (_, entity) in self.entities.iter() {
+            let Some(pose) = entity.pose(now) else {
+                continue;
+            };
+            let corner = tiamot_core::BlockPos::from_chunk_corner(pose.chunk);
+            let feet = [
+                f64::from(corner.x) + f64::from(pose.local[0]) / cells - half,
+                f64::from(corner.y) + f64::from(pose.local[1]) / cells,
+                f64::from(corner.z) + f64::from(pose.local[2]) / cells - half,
+            ];
+            placed.push(self.camera.position.offset_to(feet));
+        }
+        self.renderer.set_entities(placed);
     }
 
     /// Jumps to the edge of the world, for the floating-origin check.
