@@ -136,6 +136,24 @@ CREATE TABLE IF NOT EXISTS entities (
     data    BLOB NOT NULL
 );
 
+-- A mod's own facts about the world: which world this is, whether something has
+-- already happened, who a thing belongs to. Without it a mod has to smuggle
+-- such a fact into a block somewhere, where a player can dig it up.
+--
+-- Keyed by mod id AND key, so one mod cannot read another's — the isolation is
+-- a property of the primary key and of the API that never takes a mod id as a
+-- parameter, rather than of everyone's good behaviour.
+--
+-- Additive, like `chunk_fluid`: `CREATE TABLE IF NOT EXISTS` gives an older
+-- world the new table empty on the next open, so this does not bump
+-- SCHEMA_VERSION. A bump is a refusal, not a migration.
+CREATE TABLE IF NOT EXISTS mod_storage (
+    mod_id TEXT NOT NULL,
+    key    TEXT NOT NULL,
+    value  BLOB NOT NULL,
+    PRIMARY KEY (mod_id, key)
+);
+
 CREATE INDEX IF NOT EXISTS entities_by_chunk
     ON entities (domain, chunk_x, chunk_y, chunk_z);
 

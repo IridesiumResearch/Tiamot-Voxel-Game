@@ -700,4 +700,33 @@ function game.set_entity(id, spec) end
 ---@return integer[]
 function game.entities_in_radius(position, radius, source) end
 
+--- MOD STORAGE -------------------------------------------------------------
+
+---Your mod's own persistent key/value store, saved with the world.
+---
+---Somewhere to keep a fact that is not attached to a block, a chunk or an
+---entity — which world this is, whether something has happened yet, who a
+---thing belongs to. Without it, such a fact has to be smuggled into a block
+---somewhere, where a player can dig it up.
+---
+---**It is yours alone.** There is nowhere in this API to name another mod's
+---storage, so two mods may both use the key `"seen"` and mean different things.
+---
+---Values may be a string, a number or a boolean. Not a table: that would need
+---a serialisation format baked into the mod API for ever, along with the
+---engine's opinion on cycles and functions. Encode your own structure into a
+---string and you can change it whenever you like.
+---
+---**If you are storing "which player", store the UUID and never the name.**
+---Names are a per-server claim and can be rebound to someone else; the UUID is
+---the identity, and every engine system keys on it.
+---
+---```lua
+---game.storage.set("imprint", uuid)     -- a UUID string, not a display name
+---game.storage.set("greeted", true)
+---local who = game.storage.get("imprint")
+---for _, key in ipairs(game.storage.keys()) do ... end
+---```
+---@field storage { get: fun(key: string): string|number|boolean|nil, set: fun(key: string, value: string|number|boolean|nil), keys: fun(): string[] }
+
 return game

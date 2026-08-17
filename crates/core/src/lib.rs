@@ -82,6 +82,7 @@ pub mod proto;
 pub mod script;
 pub mod session;
 pub mod sky;
+pub mod storage;
 pub mod tick;
 
 pub use block::{BlockContent, BlockValue, BlockView, Cells, SlotIndex};

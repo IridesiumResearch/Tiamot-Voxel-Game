@@ -996,3 +996,94 @@ fn an_entity_written_by_a_newer_format_is_refused_rather_than_guessed_at() {
         "the error does not say which chunk: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Mod storage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_mods_facts_survive_a_restart_and_stay_its_own() {
+    // The Mimic's imprint is exactly this: a fact about the world that is not
+    // attached to a block, a chunk or an entity, and that has to be the same
+    // fact after the server comes back up.
+    use tiamot_core::storage::{Bag, Value};
+
+    let path = scratch("mod-storage");
+    let mut registry = registry_with(&["core:stone"]);
+    let uuid = tiamot_core::PlayerUuid::from_bytes([0x5A; 32]);
+
+    {
+        let db = WorldDb::open(&path, &mut registry).expect("open");
+        let mut mine = Bag::new();
+        mine.insert("imprint".into(), Value::uuid(uuid));
+        mine.insert("greeted".into(), Value::Flag(true));
+        mine.insert("count".into(), Value::Number(3.5));
+        db.save_mod_storage("core_mimic", &mine).expect("save mine");
+
+        let mut theirs = Bag::new();
+        theirs.insert("imprint".into(), Value::Text("not a uuid".into()));
+        db.save_mod_storage("someone_else", &theirs)
+            .expect("save theirs");
+    }
+
+    let db = WorldDb::open(&path, &mut registry).expect("reopen");
+    let mine = db.load_mod_storage("core_mimic").expect("load mine");
+    assert_eq!(
+        mine.get("imprint").and_then(Value::as_uuid),
+        Some(uuid),
+        "the imprint did not survive the restart as the same player"
+    );
+    assert_eq!(mine.get("greeted"), Some(&Value::Flag(true)));
+    assert_eq!(mine.get("count").and_then(Value::as_number), Some(3.5));
+    assert_eq!(
+        mine.keys().cloned().collect::<Vec<_>>(),
+        vec![
+            "count".to_owned(),
+            "greeted".to_owned(),
+            "imprint".to_owned()
+        ],
+        "keys must come back in order, or a mod iterating them sees a different \
+         world on two runs"
+    );
+
+    // One mod's key of the same name is a different fact.
+    assert_eq!(
+        db.load_mod_storage("someone_else")
+            .expect("load theirs")
+            .get("imprint")
+            .and_then(Value::as_uuid),
+        None
+    );
+    assert_eq!(
+        db.mods_with_storage().expect("index"),
+        vec!["core_mimic".to_owned(), "someone_else".to_owned()]
+    );
+}
+
+#[test]
+fn saving_a_mods_storage_replaces_it_rather_than_merging() {
+    // The caller holds the whole bag in memory, so a merge would leave a
+    // deleted key on disk for ever — and the next load would bring it back.
+    use tiamot_core::storage::{Bag, Value};
+
+    let path = scratch("mod-storage-replace");
+    let mut registry = registry_with(&["core:stone"]);
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+
+    let mut first = Bag::new();
+    first.insert("gone".into(), Value::Flag(true));
+    first.insert("kept".into(), Value::Number(1.0));
+    db.save_mod_storage("keeper", &first).expect("first save");
+
+    let mut second = Bag::new();
+    second.insert("kept".into(), Value::Number(2.0));
+    db.save_mod_storage("keeper", &second).expect("second save");
+
+    let loaded = db.load_mod_storage("keeper").expect("load");
+    assert_eq!(
+        loaded.keys().cloned().collect::<Vec<_>>(),
+        vec!["kept".to_owned()],
+        "a deleted key came back"
+    );
+    assert_eq!(loaded.get("kept").and_then(Value::as_number), Some(2.0));
+}

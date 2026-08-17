@@ -229,6 +229,8 @@ pub struct MluaVm {
     edits: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::script::WorldEdit>>>>,
     /// Where the `game.*_entity` calls reach, once there is a world.
     entities: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::ent::Access>>>>,
+    /// Where `game.storage` reaches, once there is a world.
+    storage: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::storage::Access>>>>,
 }
 
 /// Where a world's clock starts when the sky mod does not say.
@@ -487,6 +489,7 @@ impl ScriptVm for MluaVm {
             light: std::sync::Arc::new(std::sync::Mutex::new(None)),
             fluid: std::sync::Arc::new(std::sync::Mutex::new(None)),
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
             edits: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         // Installed here rather than in a second constructor the caller has to
@@ -541,6 +544,12 @@ impl ScriptVm for MluaVm {
 
     fn set_entity_access(&mut self, access: std::sync::Arc<dyn crate::ent::Access>) {
         if let Ok(mut slot) = self.entities.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_storage_access(&mut self, access: std::sync::Arc<dyn crate::storage::Access>) {
+        if let Ok(mut slot) = self.storage.lock() {
             *slot = Some(access);
         }
     }
@@ -1603,6 +1612,106 @@ impl MluaVm {
         Ok(())
     }
 
+    /// Puts `game.storage` on the `game` table.
+    ///
+    /// A table with three functions rather than three `game.*` entries, because
+    /// this is one concept and a mod reads `game.storage.get` more easily than
+    /// `game.storage_get`. `check-stubs.sh` sees it as one registration, which
+    /// is why the stubs document it as an `@field`.
+    ///
+    /// **The mod id is captured, never passed.** A mod cannot name another's
+    /// storage because there is nowhere in the API to put the name — the
+    /// isolation is a property of the surface rather than of good behaviour.
+    fn install_storage_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let storage = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+
+        macro_rules! store {
+            ($slot:expr, $absent:expr) => {{
+                let guard = $slot.lock().map_err(|_| {
+                    mlua::Error::external("the mod storage is poisoned; the simulation panicked")
+                })?;
+                match guard.as_ref() {
+                    Some(store) => std::sync::Arc::clone(store),
+                    None => return Ok($absent),
+                }
+            }};
+        }
+
+        let slot = std::sync::Arc::clone(&self.storage);
+        let owner = mod_id.to_owned();
+        let get = self
+            .lua
+            .create_function(move |lua, key: String| {
+                let store = store!(slot, mlua::Value::Nil);
+                Ok(match store.get(&owner, &key) {
+                    None => mlua::Value::Nil,
+                    Some(crate::storage::Value::Text(text)) => {
+                        mlua::Value::String(lua.create_string(&text)?)
+                    }
+                    Some(crate::storage::Value::Number(number)) => mlua::Value::Number(number),
+                    Some(crate::storage::Value::Flag(flag)) => mlua::Value::Boolean(flag),
+                })
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        storage.set("get", get).map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.storage);
+        let owner = mod_id.to_owned();
+        let set = self
+            .lua
+            .create_function(move |_, (key, value): (String, mlua::Value)| {
+                let store = store!(slot, ());
+                let value = match value {
+                    mlua::Value::Nil => None,
+                    mlua::Value::String(text) => {
+                        Some(crate::storage::Value::Text(text.to_str()?.to_owned()))
+                    }
+                    mlua::Value::Integer(number) => {
+                        Some(crate::storage::Value::Number(number as f64))
+                    }
+                    mlua::Value::Number(number) => Some(crate::storage::Value::Number(number)),
+                    mlua::Value::Boolean(flag) => Some(crate::storage::Value::Flag(flag)),
+                    // A table would need a serialisation format that becomes
+                    // part of the mod API for ever, and with it the engine's
+                    // opinion on cycles, functions and userdata. Refused
+                    // loudly, so a mod encodes its own structure into a string
+                    // — which it can change without an engine release.
+                    other => {
+                        return Err(mlua::Error::external(format!(
+                            "storage.set: a {} cannot be stored; use a string, a number or a \
+                             boolean",
+                            other.type_name()
+                        )));
+                    }
+                };
+                store.set(&owner, &key, value);
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        storage.set("set", set).map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.storage);
+        let owner = mod_id.to_owned();
+        let keys = self
+            .lua
+            .create_function(move |lua, ()| {
+                let store = store!(slot, lua.create_table()?);
+                let out = lua.create_table()?;
+                for (index, key) in store.keys(&owner).into_iter().enumerate() {
+                    out.set(index + 1, key)?;
+                }
+                Ok(out)
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        storage
+            .set("keys", keys)
+            .map_err(|err| self.vm_error(&err))?;
+
+        game.set("storage", storage)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// Everything callable after freeze: lookups, bulk noise, streams, constants.
     fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- frozen-phase API ---------------------------------------------
@@ -1623,6 +1732,7 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
 
         self.install_entity_api(mod_id, game)?;
+        self.install_storage_api(mod_id, game)?;
 
         let (get_fluid, set_fluid) = self.fluid_functions()?;
         game.set("get_fluid", get_fluid)
@@ -4378,6 +4488,143 @@ mod entity_tests {
              assert(game.entity(1) == nil)\n\
              assert(game.set_entity(1, { yaw = 1 }) == false)\n\
              assert(#game.entities_in_radius({x=0,y=0,z=0}, 10) == 0)",
+        )
+        .expect("no world");
+    }
+    /// A storage store a test can watch: the server's semantics, in memory.
+    #[derive(Default)]
+    struct Shelf {
+        held: std::sync::Mutex<std::collections::BTreeMap<(String, String), crate::storage::Value>>,
+    }
+
+    impl crate::storage::Access for Shelf {
+        fn get(&self, mod_id: &str, key: &str) -> Option<crate::storage::Value> {
+            self.held
+                .lock()
+                .ok()?
+                .get(&(mod_id.to_owned(), key.to_owned()))
+                .cloned()
+        }
+
+        fn set(&self, mod_id: &str, key: &str, value: Option<crate::storage::Value>) {
+            if let Ok(mut held) = self.held.lock() {
+                let at = (mod_id.to_owned(), key.to_owned());
+                match value {
+                    Some(value) => held.insert(at, value),
+                    None => held.remove(&at),
+                };
+            }
+        }
+
+        fn keys(&self, mod_id: &str) -> Vec<String> {
+            self.held.lock().map_or_else(
+                |_| Vec::new(),
+                |held| {
+                    held.keys()
+                        .filter(|(owner, _)| owner == mod_id)
+                        .map(|(_, key)| key.clone())
+                        .collect()
+                },
+            )
+        }
+    }
+
+    fn vm_with_storage() -> (MluaVm, std::sync::Arc<Shelf>) {
+        let mut vm = vm();
+        let shelf = std::sync::Arc::new(Shelf::default());
+        vm.set_storage_access(
+            std::sync::Arc::clone(&shelf) as std::sync::Arc<dyn crate::storage::Access>
+        );
+        (vm, shelf)
+    }
+
+    #[test]
+    fn a_mod_stores_and_reads_back_its_own_facts() {
+        let (mut vm, shelf) = vm_with_storage();
+        load(&mut vm, "keeper", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "keeper",
+            "game.storage.set('imprint', 'abc123')\n\
+             game.storage.set('count', 7)\n\
+             game.storage.set('greeted', true)\n\
+             assert(game.storage.get('imprint') == 'abc123')\n\
+             assert(game.storage.get('count') == 7)\n\
+             assert(game.storage.get('greeted') == true)\n\
+             assert(game.storage.get('nothing') == nil)\n\
+             local keys = game.storage.keys()\n\
+             assert(#keys == 3, 'expected 3 keys, got ' .. #keys)\n\
+             assert(keys[1] == 'count', 'keys are not in order: ' .. keys[1])\n\
+             game.storage.set('count', nil)\n\
+             assert(game.storage.get('count') == nil)",
+        )
+        .expect("storage round trip");
+
+        assert_eq!(
+            crate::storage::Access::keys(&*shelf, "keeper"),
+            vec!["greeted".to_owned(), "imprint".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_mods_storage_is_keyed_to_that_mod() {
+        // The isolation is a property of the API surface: the mod id is
+        // captured when the function is built and there is nowhere to pass a
+        // different one. This is the test that the capture is per environment
+        // rather than shared.
+        let (mut vm, shelf) = vm_with_storage();
+        load(&mut vm, "first", "game.register_on_tick(function() end)").expect("load first");
+        load(&mut vm, "second", "game.register_on_tick(function() end)").expect("load second");
+        let _ = vm.freeze();
+
+        vm.eval_in("first", "game.storage.set('who', 'first')")
+            .expect("first");
+        vm.eval_in("second", "game.storage.set('who', 'second')")
+            .expect("second");
+        vm.eval_in(
+            "first",
+            "assert(game.storage.get('who') == 'first', 'a mod read the other one\\'s value')",
+        )
+        .expect("isolation");
+
+        assert_eq!(
+            crate::storage::Access::get(&*shelf, "first", "who"),
+            Some(crate::storage::Value::Text("first".into()))
+        );
+        assert_eq!(
+            crate::storage::Access::get(&*shelf, "second", "who"),
+            Some(crate::storage::Value::Text("second".into()))
+        );
+    }
+
+    #[test]
+    fn storing_a_table_is_refused_by_name_rather_than_silently_dropped() {
+        let (mut vm, _shelf) = vm_with_storage();
+        load(&mut vm, "keeper", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        let err = vm
+            .eval_in("keeper", "game.storage.set('bad', { 1, 2, 3 })")
+            .expect_err("a table cannot be stored");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("table") && text.contains("string"),
+            "the error should say what was passed and what is allowed: {text}"
+        );
+    }
+
+    #[test]
+    fn storage_does_nothing_rather_than_failing_when_there_is_no_world() {
+        let mut vm = vm();
+        load(&mut vm, "early", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "early",
+            "game.storage.set('anything', 1)\n\
+             assert(game.storage.get('anything') == nil)\n\
+             assert(#game.storage.keys() == 0)",
         )
         .expect("no world");
     }

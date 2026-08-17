@@ -636,6 +636,28 @@ impl World {
         Ok(written)
     }
 
+    /// Everything one mod has stored.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an undecodable value.
+    pub fn load_mod_storage(&self, mod_id: &str) -> Result<tiamot_core::storage::Bag, WorldError> {
+        self.db.load_mod_storage(mod_id)
+    }
+
+    /// Replaces everything one mod has stored.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an unencodable value.
+    pub fn save_mod_storage(
+        &self,
+        mod_id: &str,
+        bag: &tiamot_core::storage::Bag,
+    ) -> Result<(), WorldError> {
+        self.db.save_mod_storage(mod_id, bag)
+    }
+
     /// Flushes and closes the database.
     ///
     /// # Errors

@@ -120,6 +120,26 @@ fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
 /// the transport and the simulation thread does not hold them. A client filters
 /// what it is not holding, and the payload for the uniform chunks that make up
 /// most of a world is three bytes.
+/// Writes back every mod whose storage changed since the last save.
+///
+/// Its own function because the tick has two save sites — the debounced one and
+/// the shutdown flush — and a mod's facts have to survive both. A failure is
+/// logged rather than fatal: losing a mod's bookkeeping is bad, and taking the
+/// server down over it is worse.
+fn flush_mod_storage(
+    world: &crate::world::World,
+    storage: &std::sync::RwLock<crate::storage::ModStorage>,
+) {
+    let Ok(mut held) = storage.write() else {
+        return;
+    };
+    for (mod_id, bag) in held.take_dirty() {
+        if let Err(err) = world.save_mod_storage(&mod_id, &bag) {
+            error!("could not save storage for mod `{mod_id}`: {err}");
+        }
+    }
+}
+
 fn broadcast_light(
     shared: &Shared,
     lighting: &crate::light::Lighting,
@@ -814,6 +834,9 @@ impl ServerHandle {
                     let population = std::sync::Arc::new(std::sync::RwLock::new(
                         crate::ent::Population::new(),
                     ));
+                    let mod_storage = std::sync::Arc::new(std::sync::RwLock::new(
+                        crate::storage::ModStorage::new(),
+                    ));
 
                     // Either the mods generate terrain, or there are no mods
                     // and the world is air. Both are legitimate.
@@ -838,6 +861,24 @@ impl ServerHandle {
                             // `ent::Access` also takes `&self`.
                             host.vm_mut().set_entity_access(std::sync::Arc::new(
                                 crate::ent::Shared::new(std::sync::Arc::clone(&population)),
+                            ));
+                            // A mod's own facts, read from the world before it
+                            // can ask for them. Loaded per loaded mod rather
+                            // than by scanning the table, so a mod that is no
+                            // longer installed keeps its rows untouched instead
+                            // of being resurrected into memory and written back.
+                            if let Ok(mut storage) = mod_storage.write() {
+                                for mod_id in host.resolved().ids() {
+                                    match world.load_mod_storage(mod_id) {
+                                        Ok(bag) => storage.load(mod_id, bag),
+                                        Err(err) => error!(
+                                            "could not load storage for mod `{mod_id}`: {err}"
+                                        ),
+                                    }
+                                }
+                            }
+                            host.vm_mut().set_storage_access(std::sync::Arc::new(
+                                crate::storage::Shared::new(std::sync::Arc::clone(&mod_storage)),
                             ));
                             crate::world::Generator::Mods(Box::new(
                                 crate::world::ModGenerator::new(host),
@@ -1675,14 +1716,18 @@ impl ServerHandle {
                             // blocks a tick, and writing its chunk every time
                             // would be a database write per tick for as long as
                             // the milk was moving.
-                            let mobs = population.write().expect("entity lock").take_dirty();
+                            flush_mod_storage(&world, &mod_storage);
+                            flush_mod_storage(&world, &mod_storage);
+                        let mobs = population.write().expect("entity lock").take_dirty();
                             if !mobs.is_empty()
                                 && let Err(err) = world
                                     .save_entities(mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
                             {
                                 error!("could not save entities: {err}");
                             }
-                            let mobs = population.write().expect("entity lock").take_dirty();
+                            flush_mod_storage(&world, &mod_storage);
+                            flush_mod_storage(&world, &mod_storage);
+                        let mobs = population.write().expect("entity lock").take_dirty();
                         if !mobs.is_empty()
                             && let Err(err) = world
                                 .save_entities(mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
@@ -1718,6 +1763,7 @@ impl ServerHandle {
                     // debounced save would be lost on a clean shutdown, the one
                     // case a player has every right to expect nothing is.
                     {
+                        flush_mod_storage(&world, &mod_storage);
                         let mobs = population.write().expect("entity lock").take_dirty();
                         if !mobs.is_empty()
                             && let Err(err) = world

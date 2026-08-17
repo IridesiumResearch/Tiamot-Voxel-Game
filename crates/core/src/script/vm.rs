@@ -794,6 +794,9 @@ pub trait ScriptVm: Sized {
     /// frozen API is installed before there is a world to have entities in.
     fn set_entity_access(&mut self, access: std::sync::Arc<dyn crate::ent::Access>);
 
+    /// Points `game.storage` at the server's store.
+    fn set_storage_access(&mut self, access: std::sync::Arc<dyn crate::storage::Access>);
+
     /// Runs every registered `on_generate` callback for one chunk.
     ///
     /// # Errors

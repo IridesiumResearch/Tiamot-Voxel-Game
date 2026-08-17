@@ -129,6 +129,17 @@ pub enum WorldError {
         reason: String,
     },
 
+    /// A stored mod value could not be encoded or decoded.
+    #[error("mod `{mod_id}` storage key `{key}`: {reason}")]
+    ModStorage {
+        /// Which mod.
+        mod_id: String,
+        /// Which key.
+        key: String,
+        /// Why.
+        reason: String,
+    },
+
     /// Material id mapping failed.
     #[error("material id mapping failed")]
     Materials(#[from] IdMapError),
@@ -872,6 +883,80 @@ impl WorldDb {
             Ok(ChunkPos::new(row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    // -- mod storage ------------------------------------------------------
+
+    /// Everything one mod has stored, in key order.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an undecodable value.
+    pub fn load_mod_storage(&self, mod_id: &str) -> Result<crate::storage::Bag, WorldError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT key, value FROM mod_storage WHERE mod_id = ?1 ORDER BY key")?;
+        let rows = statement.query_map(params![mod_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        let mut bag = crate::storage::Bag::new();
+        for row in rows {
+            let (key, blob) = row?;
+            let value = postcard::from_bytes(&blob).map_err(|source| WorldError::ModStorage {
+                mod_id: mod_id.to_owned(),
+                key: key.clone(),
+                reason: source.to_string(),
+            })?;
+            bag.insert(key, value);
+        }
+        Ok(bag)
+    }
+
+    /// Every mod that has anything stored, in order.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure.
+    pub fn mods_with_storage(&self) -> Result<Vec<String>, WorldError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT DISTINCT mod_id FROM mod_storage ORDER BY mod_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Replaces everything one mod has stored.
+    ///
+    /// Replace rather than merge, for the reason a chunk's entities are
+    /// replaced: the caller holds the whole bag in memory and a merge would
+    /// leave a deleted key behind for ever.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an unencodable value.
+    pub fn save_mod_storage(
+        &self,
+        mod_id: &str,
+        bag: &crate::storage::Bag,
+    ) -> Result<(), WorldError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("DELETE FROM mod_storage WHERE mod_id = ?1", params![mod_id])?;
+        {
+            let mut insert = transaction
+                .prepare("INSERT INTO mod_storage (mod_id, key, value) VALUES (?1, ?2, ?3)")?;
+            for (key, value) in bag {
+                let blob =
+                    postcard::to_allocvec(value).map_err(|source| WorldError::ModStorage {
+                        mod_id: mod_id.to_owned(),
+                        key: key.clone(),
+                        reason: source.to_string(),
+                    })?;
+                insert.execute(params![mod_id, key, blob])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     // -- players ----------------------------------------------------------
