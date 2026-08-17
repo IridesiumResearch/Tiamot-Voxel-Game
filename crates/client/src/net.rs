@@ -179,6 +179,33 @@ pub enum Event {
     /// missed the last one is repaired by this one.
     ChunkFluid(ChunkPos, Box<tiamot_core::fluid::FluidLayer>),
 
+    /// Entities that have come into view.
+    ///
+    /// Reliable: a client that missed one holds an id it can never draw. A
+    /// spawn for an entity already known REPLACES it, which is the recovery
+    /// path when a server's queue to this client overflowed and it re-sent
+    /// everything from scratch.
+    EntitySpawn(Vec<tiamot_core::proto::EntityDef>),
+
+    /// Entities that have left view or stopped existing.
+    ///
+    /// One event for both, because a client cannot do anything different about
+    /// them — see `ServerMessage::EntityDespawn`.
+    EntityDespawn(Vec<u64>),
+
+    /// Where the entities in view are now.
+    ///
+    /// Superseded by the next one 50 ms later, which is what makes it safe to
+    /// lose. `tick` orders them; it is not a clock — see
+    /// `crate::entities` for why the interpolation buffer stamps arrival time
+    /// instead.
+    EntityState {
+        /// Server tick, for ordering.
+        tick: u64,
+        /// One entry per entity that moved.
+        entities: Vec<tiamot_core::proto::EntityDelta>,
+    },
+
     /// Every fluid the server's mods registered, sent once on join.
     ///
     /// Without it a chunk's fluid names a number the client cannot draw — see
@@ -883,6 +910,18 @@ async fn session(
 
             ServerMessage::TimeOfDay { time } => {
                 let _ = events.send(Event::TimeOfDay(time));
+            }
+
+            ServerMessage::EntitySpawn { entities } => {
+                let _ = events.send(Event::EntitySpawn(entities));
+            }
+
+            ServerMessage::EntityDespawn { entities } => {
+                let _ = events.send(Event::EntityDespawn(entities));
+            }
+
+            ServerMessage::EntityState { tick, entities } => {
+                let _ = events.send(Event::EntityState { tick, entities });
             }
 
             ServerMessage::ChunkFluid { pos, fluid } => {

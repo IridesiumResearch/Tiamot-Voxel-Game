@@ -28,7 +28,7 @@ use tiamot_core::script::{HostError, MluaVm, ModHost, ScriptVm as _, VmLimits};
 use tiamot_core::session::store;
 use tiamot_core::{Registry, WorldDb};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::cert::{CertError, ServerCert};
 use crate::sim::{self, Control};
@@ -120,6 +120,67 @@ fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
 /// the transport and the simulation thread does not hold them. A client filters
 /// what it is not holding, and the payload for the uniform chunks that make up
 /// most of a world is three bytes.
+/// Turns one viewer's update into the messages that carry it.
+///
+/// Split out because it is the whole of the wire format's opinion about
+/// entities, and because a nametag has to be resolved here — the current
+/// display name bound to a UUID is a fact only the server has (charter rule
+/// 13), and a client holding the UUID instead would show a stale name until it
+/// reconnected.
+fn entity_messages(
+    update: tiamot_core::ent::Update,
+    tick: u64,
+    shared: &Shared,
+) -> Vec<ServerMessage> {
+    let mut messages = Vec::new();
+
+    if !update.spawned.is_empty() {
+        let entities = update
+            .spawned
+            .into_iter()
+            .map(|spawn| tiamot_core::proto::EntityDef {
+                id: spawn.id.0,
+                chunk: spawn.transform.chunk,
+                local: spawn.transform.local,
+                velocity: spawn.velocity.0,
+                yaw: tiamot_core::ent::replicate::quantise_yaw(spawn.transform.yaw),
+                pitch: tiamot_core::ent::replicate::quantise_pitch(spawn.transform.pitch),
+                anim: spawn.anim.0,
+                model: spawn.model,
+                collider: spawn.collider.map(|box_| [box_.width, box_.height]),
+                nametag: spawn.nametag,
+            })
+            .collect();
+        messages.push(ServerMessage::EntitySpawn { entities });
+    }
+
+    if !update.despawned.is_empty() {
+        messages.push(ServerMessage::EntityDespawn {
+            entities: update.despawned.into_iter().map(|id| id.0).collect(),
+        });
+    }
+
+    if !update.moved.is_empty() {
+        let entities = update
+            .moved
+            .into_iter()
+            .map(|delta| tiamot_core::proto::EntityDelta {
+                id: delta.id.0,
+                chunk: delta.chunk,
+                local: delta.local,
+                velocity: delta.velocity,
+                yaw: delta.yaw,
+                pitch: delta.pitch,
+                anim: delta.anim.0,
+            })
+            .collect();
+        messages.push(ServerMessage::EntityState { tick, entities });
+    }
+
+    let _ = shared;
+    messages
+}
+
 /// Writes back every mod whose storage changed since the last save.
 ///
 /// Its own function because the tick has two save sites — the debounced one and
@@ -691,6 +752,7 @@ impl ServerHandle {
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            entity_messages: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             // Capacity is per-receiver backlog, not a total. 1024 messages at
             // 20 Hz is roughly fifty seconds behind before a client starts
             // losing them, which is far longer than a connection worth keeping.
@@ -886,6 +948,13 @@ impl ServerHandle {
                         }
                         None => crate::world::Generator::Air(crate::world::Air),
                     };
+
+                    // One per connected player, kept across ticks: a tracker
+                    // IS the record of what that client has been told.
+                    let mut trackers: std::collections::BTreeMap<
+                        tiamot_core::PlayerUuid,
+                        tiamot_core::ent::Tracker,
+                    > = std::collections::BTreeMap::new();
 
                     let mut clock = sim::MonotonicClock::new();
                     sim::run(&mut clock, &control, |tick| {
@@ -1589,6 +1658,51 @@ impl ServerHandle {
                                 .write()
                                 .expect("entity lock")
                                 .tick(&world, &fluid);
+                        }
+
+                        // **What each player is told about the entities.**
+                        //
+                        // One tracker per player, per `ent::replicate`. The
+                        // decision of what to send is pure and lives in `core`;
+                        // this is only the plumbing that asks and queues.
+                        //
+                        // Inside its own scope, and holding no mod-facing lock:
+                        // nothing here enters a callback, which is what would
+                        // deadlock the tick thread against itself.
+                        {
+                            let mobs = population.read().expect("entity lock");
+                            let bodies = shared.bodies.lock();
+                            if let Ok(bodies) = bodies {
+                                for (uuid, player) in bodies.iter() {
+                                    let tracker = trackers.entry(*uuid).or_default();
+                                    let update = tracker.update(
+                                        mobs.entities(),
+                                        player.origin,
+                                        shared.view_distance,
+                                        None,
+                                    );
+                                    if update.is_empty() {
+                                        continue;
+                                    }
+                                    let overflowed = shared.push_entity_messages(
+                                        uuid,
+                                        entity_messages(update, tick, &shared),
+                                    );
+                                    if overflowed {
+                                        // The queue was cleared, so what this
+                                        // player has been told is now unknown.
+                                        // Forgetting is the only recoverable
+                                        // answer: the next pass re-spawns
+                                        // everything in view from scratch.
+                                        warn!(?uuid, "entity queue overflowed; resending in full");
+                                        tracker.clear();
+                                    }
+                                }
+                                // Players who left take their tracker with
+                                // them, or a long-running server accumulates
+                                // one per person who has ever connected.
+                                trackers.retain(|uuid, _| bodies.contains_key(uuid));
+                            }
                         }
 
                         // **Fluid, at half the simulation's rate.** Nobody can

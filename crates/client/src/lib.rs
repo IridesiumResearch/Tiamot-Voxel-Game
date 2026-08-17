@@ -39,6 +39,7 @@ pub mod app;
 pub mod cache;
 pub mod camera;
 pub mod config;
+pub mod entities;
 pub mod mesher;
 pub mod net;
 pub mod predict;

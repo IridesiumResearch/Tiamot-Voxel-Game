@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -74,6 +74,14 @@ pub const PROTOCOL_VERSION: u32 = 13;
 // what it is willing to send. Two messages rather than one because the granted
 // value is not the requested one, and a client drawing its fog for a radius the
 // server refused would end the world in clear air.
+// v14 (Task 12): appended `ServerMessage::{EntitySpawn, EntityDespawn,
+// EntityState}`. Three messages rather than one because they have three
+// lifetimes: a spawn and a despawn must arrive or the client holds an id it
+// cannot draw or a mob that never leaves, while a state update is superseded
+// 50 ms later and is better dropped than retransmitted behind a stalled
+// stream. They are also PER PLAYER rather than broadcast — which entities
+// somebody can see is their own interest set, and sending everyone every mob
+// would make a populated world cost the square of the people watching it.
 // v13 (Task 11): `FluidDef` grew a `color`, for the tint over a submerged
 // camera. **A field on an existing struct, not an appended variant** — the one
 // shape of change this format does not make safe, exactly as v10 was, so the
@@ -101,6 +109,22 @@ pub const MAX_NAME_BYTES: usize = 32;
 
 /// Longest chat message.
 pub const MAX_CHAT_BYTES: usize = 512;
+
+/// Longest canonical string id a message may carry.
+///
+/// A mod id and a name, plus punctuation. Ids come from manifests, so this is
+/// generous rather than tight — the point is that a hostile server cannot make
+/// a client allocate an unbounded string, not that any real id approaches it.
+pub const MAX_ID_BYTES: usize = 128;
+
+/// Most entities one message may describe.
+///
+/// A player's interest cylinder at the largest view distance holds about 1,800
+/// chunks, and a world with an entity in every one of them is already past
+/// anything the tick budget allows. The cap is what stops a hostile server
+/// making a client allocate for a herd that does not exist — charter rule 14 —
+/// and the server splits legitimately larger sets across messages.
+pub const MAX_ENTITIES_PER_MESSAGE: usize = 4096;
 
 /// A `BLAKE3` content hash.
 pub type ContentHash = [u8; 32];
@@ -809,6 +833,107 @@ pub enum ServerMessage {
         /// Chunks of vertical radius the server will send.
         vertical: u8,
     },
+
+    /// Entities that have come into this player's view.
+    ///
+    /// **Appended at the end** (protocol v14).
+    ///
+    /// Everything needed to start drawing one, sent once. A client that missed
+    /// this would hold an id it could never draw, which is why this half of
+    /// entity replication is reliable and [`Self::EntityState`] is not.
+    ///
+    /// Per player rather than broadcast: which entities a player can see is
+    /// their own interest set, and sending everybody every mob in the world
+    /// would make the cost of a populated world quadratic in the players
+    /// watching it.
+    EntitySpawn {
+        /// The entities, in the server's own slot order.
+        entities: Vec<EntityDef>,
+    },
+
+    /// Entities that have left this player's view, or stopped existing.
+    ///
+    /// **Appended at the end** (protocol v14).
+    ///
+    /// The two are one message deliberately: a client cannot do anything
+    /// different about them, and telling them apart would mean the server
+    /// tracking which entities died as opposed to merely walking away.
+    EntityDespawn {
+        /// Opaque entity ids.
+        entities: Vec<u64>,
+    },
+
+    /// Where the entities a player can see are now.
+    ///
+    /// **Appended at the end** (protocol v14).
+    ///
+    /// The unreliable half. A lost one is corrected by the next, 50 ms later,
+    /// so it carries no information that is not re-sent — which is what lets it
+    /// be dropped rather than retransmitted behind a stalled stream.
+    ///
+    /// An entity that has not moved is not in here at all. A field of settled
+    /// mobs therefore costs nothing, which is the case that decides what a
+    /// populated world costs to run.
+    EntityState {
+        /// The server tick this describes, so a client can order what arrives
+        /// out of order and interpolate between two of them.
+        tick: u64,
+        /// One entry per entity that moved.
+        entities: Vec<EntityDelta>,
+    },
+}
+
+/// An entity as a client is first told about it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EntityDef {
+    /// Opaque id. Stable for as long as the entity exists.
+    pub id: u64,
+    /// Chunk half of the position (charter rule 7).
+    pub chunk: ChunkPos,
+    /// Cell offset within that chunk, `0..48` on each axis.
+    pub local: [f32; 3],
+    /// Cells per tick.
+    pub velocity: [f32; 3],
+    /// Facing, quantised: 256 steps around the circle.
+    pub yaw: u8,
+    /// Pitch, quantised over the quarter turn each way.
+    pub pitch: i8,
+    /// Which clip to play.
+    pub anim: u8,
+    /// The model's canonical string id, or `None` for something invisible.
+    ///
+    /// **A name, not a number.** Models are content-addressed assets a mod
+    /// ships, and a client resolves the name against what it has been pushed.
+    /// A per-session number would be one more table to keep in step for no
+    /// saving worth having — an entity is spawned once.
+    pub model: Option<String>,
+    /// Footprint and height, in cells, or `None` for something with no box.
+    pub collider: Option<[f32; 2]>,
+    /// The label above it, already resolved to the current display name.
+    ///
+    /// Resolved by the server because the name bound to a UUID is a fact only
+    /// it has (charter rule 13), and a client holding the UUID instead would
+    /// show a stale name until it reconnected.
+    pub nametag: Option<String>,
+}
+
+/// Where one entity is now.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EntityDelta {
+    /// Opaque id.
+    pub id: u64,
+    /// Chunk half of the position.
+    pub chunk: ChunkPos,
+    /// Cell offset within that chunk.
+    pub local: [f32; 3],
+    /// Cells per tick.
+    pub velocity: [f32; 3],
+    /// Facing, quantised.
+    pub yaw: u8,
+    /// Pitch, quantised.
+    pub pitch: i8,
+    /// Which clip to play.
+    pub anim: u8,
 }
 
 /// One registered fluid, as the wire carries it.
@@ -1131,6 +1256,54 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
                     len: 0,
                     limit: 0,
                 });
+            }
+        }
+        // **Entity positions reach the client's own frame arithmetic**, and a
+        // non-finite one propagates into every interpolation it takes part in
+        // — the same hazard `PlayerState` has, from a different message.
+        // Charter rule 14: a server is not trusted merely for being the server.
+        ServerMessage::EntitySpawn { entities } => {
+            check_len("entity_spawn", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
+            for entity in entities {
+                let finite = entity
+                    .local
+                    .iter()
+                    .chain(entity.velocity.iter())
+                    .chain(entity.collider.iter().flatten())
+                    .all(|value| value.is_finite());
+                if !finite {
+                    return Err(ProtocolError::FieldTooLarge {
+                        field: "entity_spawn",
+                        len: 0,
+                        limit: 0,
+                    });
+                }
+                if let Some(model) = &entity.model {
+                    check_len("entity_model", model.len(), MAX_ID_BYTES)?;
+                }
+                if let Some(nametag) = &entity.nametag {
+                    check_len("entity_nametag", nametag.len(), MAX_NAME_BYTES)?;
+                }
+            }
+        }
+        ServerMessage::EntityDespawn { entities } => {
+            check_len("entity_despawn", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
+        }
+        ServerMessage::EntityState { entities, .. } => {
+            check_len("entity_state", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
+            for entity in entities {
+                let finite = entity
+                    .local
+                    .iter()
+                    .chain(entity.velocity.iter())
+                    .all(|value| value.is_finite());
+                if !finite {
+                    return Err(ProtocolError::FieldTooLarge {
+                        field: "entity_state",
+                        len: 0,
+                        limit: 0,
+                    });
+                }
             }
         }
         ServerMessage::Chat { text, .. } => check_len("chat", text.len(), MAX_CHAT_BYTES)?,
@@ -1781,6 +1954,82 @@ mod tests {
         })
         .expect("encode");
         assert_eq!(view[0], 21);
+
+        // Protocol v14, appended after ViewDistance and currently the newest.
+        let spawn = encode(&ServerMessage::EntitySpawn {
+            entities: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(spawn[0], 22);
+
+        let despawn = encode(&ServerMessage::EntityDespawn {
+            entities: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(despawn[0], 23);
+
+        let state = encode(&ServerMessage::EntityState {
+            tick: 0,
+            entities: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(state[0], 24);
+    }
+
+    #[test]
+    fn an_entity_message_with_a_non_finite_position_is_refused() {
+        // Charter rule 14: a server is not trusted merely for being the server.
+        // These positions reach the client's own frame arithmetic, so a NaN
+        // propagates into every interpolation it takes part in — the same
+        // hazard `PlayerState` has, arriving through a different message.
+        let poison = ServerMessage::EntityState {
+            tick: 1,
+            entities: vec![EntityDelta {
+                id: 1,
+                chunk: ChunkPos::new(0, 0, 0),
+                local: [f32::NAN, 0.0, 0.0],
+                velocity: [0.0; 3],
+                yaw: 0,
+                pitch: 0,
+                anim: 0,
+            }],
+        };
+        assert!(validate_server_message(&poison).is_err());
+
+        let infinite = ServerMessage::EntitySpawn {
+            entities: vec![EntityDef {
+                id: 1,
+                chunk: ChunkPos::new(0, 0, 0),
+                local: [0.0; 3],
+                velocity: [f32::INFINITY, 0.0, 0.0],
+                yaw: 0,
+                pitch: 0,
+                anim: 0,
+                model: None,
+                collider: None,
+                nametag: None,
+            }],
+        };
+        assert!(validate_server_message(&infinite).is_err());
+
+        // And a collider, which is the field it would be easiest to forget:
+        // a non-finite box would reach the client's culling rather than its
+        // physics, and would make a mob either always or never drawn.
+        let bad_box = ServerMessage::EntitySpawn {
+            entities: vec![EntityDef {
+                id: 1,
+                chunk: ChunkPos::new(0, 0, 0),
+                local: [0.0; 3],
+                velocity: [0.0; 3],
+                yaw: 0,
+                pitch: 0,
+                anim: 0,
+                model: None,
+                collider: Some([f32::NAN, 1.0]),
+                nametag: None,
+            }],
+        };
+        assert!(validate_server_message(&bad_box).is_err());
     }
 
     #[test]

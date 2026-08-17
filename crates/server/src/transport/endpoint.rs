@@ -209,6 +209,21 @@ pub struct Shared {
     /// noise at best.
     pub notices: std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, Vec<String>>>,
 
+    /// Entity messages waiting for one player.
+    ///
+    /// **Per player, not broadcast**, because which entities somebody can see
+    /// is their own interest set — sending everybody every mob in the world
+    /// would make a populated world cost the square of the people watching it.
+    ///
+    /// Drained on that player's own connection task, like `notices`. Bounded,
+    /// for the reason notices are: a client that reads slower than the
+    /// simulation produces would otherwise grow this without limit. When the
+    /// bound is hit the queue is CLEARED and the tracker reset, so the player
+    /// is re-told everything from scratch — dropping the oldest would drop a
+    /// spawn and leave an id the client can never draw.
+    pub entity_messages:
+        std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, Vec<ServerMessage>>>,
+
     /// Every distributable file the loaded mods supply, by hash.
     ///
     /// Built once at startup and immutable thereafter. Rebuilding it while the
@@ -367,6 +382,13 @@ pub const MAX_QUEUED_CHUNK_REQUESTS: usize = 512;
 /// a healthy server ever holds, and small enough that a client flooding edits
 /// cannot grow it into a memory problem.
 pub const MAX_QUEUED_EDITS: usize = 4096;
+
+/// How many unread entity messages one player may accumulate.
+///
+/// Three seconds of a busy tick at twenty a second, which is far more slack
+/// than a healthy connection needs and far less than an unbounded queue. Past
+/// it the queue is cleared and the player re-told from scratch.
+const MAX_QUEUED_ENTITY_MESSAGES: usize = 60;
 
 /// How many unread notices one player may accumulate.
 ///
@@ -854,6 +876,38 @@ impl Shared {
         }
     }
 
+    /// Queues entity messages for one player.
+    ///
+    /// Returns whether the queue overflowed, in which case it was cleared and
+    /// the caller must reset that player's tracker: a queue that dropped a
+    /// spawn leaves the client holding an id it can never draw, so starting
+    /// over is the only recoverable answer.
+    pub fn push_entity_messages(
+        &self,
+        uuid: &PlayerUuid,
+        messages: impl IntoIterator<Item = ServerMessage>,
+    ) -> bool {
+        let Ok(mut queues) = self.entity_messages.lock() else {
+            return false;
+        };
+        let queue = queues.entry(*uuid).or_default();
+        queue.extend(messages);
+        if queue.len() > MAX_QUEUED_ENTITY_MESSAGES {
+            queue.clear();
+            return true;
+        }
+        false
+    }
+
+    /// Takes every entity message queued for one player.
+    #[must_use]
+    pub fn take_entity_messages(&self, uuid: &PlayerUuid) -> Vec<ServerMessage> {
+        self.entity_messages
+            .lock()
+            .map(|mut queues| queues.remove(uuid).unwrap_or_default())
+            .unwrap_or_default()
+    }
+
     /// Takes everything queued for one player.
     #[must_use]
     pub fn take_notices(&self, uuid: &PlayerUuid) -> Vec<String> {
@@ -1147,6 +1201,15 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     // nobody else draws their crack.
                     if let Some(progress) = shared.dig_progress(&uuid) {
                         frame::write(&mut send, &progress).await?;
+                    }
+                    // Everything about the entities this player can see —
+                    // spawns and despawns because they must arrive, states
+                    // because they are superseded. All on the reliable stream
+                    // for now; the unreliable channel is a later optimisation
+                    // and the split that matters (what is re-sent and what is
+                    // not) is already in the message shapes.
+                    for message in shared.take_entity_messages(&uuid) {
+                        frame::write(&mut send, &message).await?;
                     }
                     // Why the last thing they asked for did not happen. Sent
                     // as chat from nobody: a refusal the player never sees is
@@ -1572,6 +1635,7 @@ mod tests {
             inventories: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             inventory_dirty: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            entity_messages: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             kicks: tokio::sync::broadcast::channel(4).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),

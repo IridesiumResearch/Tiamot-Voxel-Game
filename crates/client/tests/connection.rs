@@ -166,6 +166,7 @@ struct Seen {
     time_of_day: Option<f32>,
     /// The radius the server said it is streaming at.
     view_distance: Option<(u8, u8)>,
+    entities: client::entities::Entities,
 }
 
 impl Seen {
@@ -183,6 +184,14 @@ impl Seen {
             Event::Chunk(chunk) => self.store.insert(*chunk),
             Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
             Event::ChunkFluid(pos, layer) => self.store.set_fluid(pos, *layer),
+            Event::EntitySpawn(entities) => {
+                self.entities.spawned(&entities, std::time::Duration::ZERO);
+            }
+            Event::EntityDespawn(ids) => self.entities.despawned(&ids),
+            Event::EntityState { tick, entities } => {
+                self.entities
+                    .moved(tick, &entities, std::time::Duration::ZERO);
+            }
             Event::Fluids { fluids } => self.store.set_fluid_table(&fluids),
             Event::Sky(sky) => self.sky = Some(sky),
             Event::ViewDistance {

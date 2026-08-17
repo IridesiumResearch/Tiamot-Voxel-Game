@@ -644,6 +644,16 @@ pub struct App {
     connection: Connection,
     renderer: Renderer,
     store: ChunkStore,
+    /// Entities the server has told this client about.
+    entities: crate::entities::Entities,
+    /// This machine's clock, for stamping when an update arrived.
+    ///
+    /// **A local monotonic base, never the server's tick.** See
+    /// `crate::entities`: relating two machines' clocks is a thing that can be
+    /// wrong, and when it is wrong it shows entities in a future nobody has
+    /// been told about. Arrival time cannot drift because it measures nothing
+    /// about the other machine.
+    since_start: std::time::Instant,
     camera: Camera,
     /// Material name by id, for the HUD and for diagnostics.
     materials: BTreeMap<u16, String>,
@@ -826,6 +836,8 @@ impl App {
             connection,
             renderer,
             store: ChunkStore::new(),
+            entities: crate::entities::Entities::new(),
+            since_start: std::time::Instant::now(),
             camera,
             materials: BTreeMap::new(),
             spawn: None,
@@ -1866,6 +1878,23 @@ impl App {
         }
     }
 
+    /// Records one entity event, stamped with when it arrived here.
+    ///
+    /// Its own method so `pump_network` stays inside the line limit, and
+    /// because the stamping is the part worth naming: the arrival time is this
+    /// machine's clock and never the server's tick. See `crate::entities`.
+    fn entity_event(&mut self, event: Event) {
+        let at = self.since_start.elapsed();
+        match event {
+            Event::EntitySpawn(entities) => self.entities.spawned(&entities, at),
+            Event::EntityDespawn(ids) => self.entities.despawned(&ids),
+            Event::EntityState { tick, entities } => self.entities.moved(tick, &entities, at),
+            // Every other event is handled where it arrives; this method exists
+            // for the three that share a clock.
+            _ => {}
+        }
+    }
+
     /// Drains everything the network has produced since the last frame.
     ///
     /// Returns `false` once the connection has ended, which is the signal to
@@ -1946,6 +1975,10 @@ impl App {
                 Event::Chunk(chunk) => self.store.insert(*chunk),
 
                 Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
+
+                event @ (Event::EntitySpawn(_)
+                | Event::EntityDespawn(_)
+                | Event::EntityState { .. }) => self.entity_event(event),
 
                 Event::ChunkFluid(pos, layer) => self.store.set_fluid(pos, *layer),
 
