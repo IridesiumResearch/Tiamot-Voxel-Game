@@ -145,6 +145,34 @@ impl Aabb {
     }
 }
 
+/// How big a body is, in cells.
+///
+/// **One type for "the size of the thing being simulated", used by the player
+/// and by every entity.** Charter rule 2 allows one simulation, and a mob that
+/// fell through its own version of the collision code would be a second one.
+/// The only thing an entity brings of its own is this.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Shape {
+    /// Footprint, in cells. The box is centred on it.
+    pub width: f32,
+    /// Height, in cells. The box stands on its feet.
+    pub height: f32,
+}
+
+impl Shape {
+    /// The engine's humanoid, which is also the player.
+    pub const HUMANOID: Self = Self {
+        width: PLAYER_WIDTH,
+        height: PLAYER_HEIGHT,
+    };
+
+    /// The box this shape makes with its feet at `feet`.
+    #[must_use]
+    pub fn aabb(&self, feet: [f32; 3]) -> Aabb {
+        Aabb::sized_at(feet, self.width, self.height)
+    }
+}
+
 /// Solidity of the voxel grid, in the body's frame.
 ///
 /// Contract §2: "A sub-node cell is solid iff occupied (not air). `Uniform`,
@@ -297,6 +325,30 @@ impl Body {
     }
 }
 
+/// What one tick's axis resolutions need to know beyond the body itself.
+///
+/// A struct rather than six more parameters, and grouped exactly here because
+/// every field is **decided once before anything moves and read by both
+/// horizontal axes**. That is not tidiness: `stops_dead` used to be re-derived
+/// per axis from `velocity[1]`, and `resolve_vertical` runs BETWEEN the two
+/// horizontal resolves and zeroes that velocity on a head bump — so X asked
+/// before the bump and kept its speed while Z asked after it and lost all of
+/// it, from identical input in a symmetric scene. Holding the decisions in one
+/// value computed once makes that mistake hard to make again.
+#[derive(Debug, Clone, Copy)]
+struct Context<'a> {
+    /// The engine's movement constants.
+    tuning: &'a Tuning,
+    /// How big the body is.
+    shape: Shape,
+    /// Whether the body entered the tick on the ground.
+    was_on_ground: bool,
+    /// Whether being blocked costs the body its horizontal speed.
+    stops_dead: bool,
+    /// Whether the body is guarding against walking off an edge.
+    sneaking: bool,
+}
+
 /// Advances a body by one tick.
 ///
 /// The order is gravity, then jump, then steering, then the three axis
@@ -307,6 +359,24 @@ impl Body {
 /// and the horizontal axes resolve before the vertical one has recomputed it.
 #[must_use]
 pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> Body {
+    step_shaped(solid, body, intent, tuning, Shape::HUMANOID)
+}
+
+/// Advances a body of an arbitrary size by one tick.
+///
+/// [`step`] is this with [`Shape::HUMANOID`], which is what a player is. An
+/// entity brings its own box and nothing else: it falls, collides at sub-node
+/// resolution, steps up a lip and floats in milk through this exact code,
+/// because charter rule 2 allows one simulation and a mob with its own physics
+/// would be a second one.
+#[must_use]
+pub fn step_shaped(
+    solid: &impl Solid,
+    body: Body,
+    intent: Intent,
+    tuning: &Tuning,
+    shape: Shape,
+) -> Body {
     let mut body = body;
 
     // **A body inside geometry stays inside it.**
@@ -354,7 +424,7 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
     // existed. Charter rule 4 is not negotiable retroactively: the determinism
     // goldens in `crates/core/tests/determinism.rs` were hashed by the old code
     // and must still match.
-    let wet = swim::submersion(solid, &body.aabb()).fraction;
+    let wet = swim::submersion(solid, &shape.aabb(body.position)).fraction;
 
     // --- vertical velocity -------------------------------------------------
     if intent.jump && body.on_ground {
@@ -365,7 +435,7 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
     } else if wet > 0.0 {
         // Asked only when there is fluid to be in, so a dry tick pays nothing
         // for a question about milk.
-        let head_clear = swim::head_is_clear(solid, &body.aabb());
+        let head_clear = swim::head_is_clear(solid, &shape.aabb(body.position));
         swim::vertical(&mut body.velocity[1], wet, head_clear, intent, tuning);
     } else {
         body.velocity[1] -= tuning.gravity;
@@ -433,36 +503,21 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
     // the height it started from rather than a tick of gravity below it.
     let entry_height = body.position[1];
 
-    resolve_horizontal(
-        solid,
-        &mut body,
-        0,
+    let context = Context {
+        tuning,
+        shape,
         was_on_ground,
         stops_dead,
         sneaking,
-        tuning,
-    );
-    resolve_vertical(solid, &mut body);
-    resolve_horizontal(
-        solid,
-        &mut body,
-        2,
-        was_on_ground,
-        stops_dead,
-        sneaking,
-        tuning,
-    );
+    };
+
+    resolve_horizontal(solid, &mut body, 0, &context);
+    resolve_vertical(solid, &mut body, shape);
+    resolve_horizontal(solid, &mut body, 2, &context);
 
     // After BOTH horizontal axes, because a body leaves a lip sideways and how
     // far it has to fall is only known once it has finished moving.
-    step_down(
-        solid,
-        &mut body,
-        was_on_ground,
-        was_rising,
-        entry_height,
-        tuning,
-    );
+    step_down(solid, &mut body, was_rising, entry_height, &context);
 
     debug_assert!(
         body.position.iter().all(|v| v.is_finite()) && body.velocity.iter().all(|v| v.is_finite()),
@@ -483,21 +538,20 @@ pub fn step(solid: &impl Solid, body: Body, intent: Intent, tuning: &Tuning) -> 
 /// the body walked off the edge anyway — and the restored horizontal position
 /// was only known to be clear at the *old* height, so the body could be put
 /// back inside geometry, which contract §2 forbids outright.
-fn resolve_horizontal(
-    solid: &impl Solid,
-    body: &mut Body,
-    axis: usize,
-    was_on_ground: bool,
-    stops_dead: bool,
-    sneaking: bool,
-    tuning: &Tuning,
-) {
+fn resolve_horizontal(solid: &impl Solid, body: &mut Body, axis: usize, context: &Context<'_>) {
+    let &Context {
+        tuning,
+        shape,
+        was_on_ground,
+        stops_dead,
+        sneaking,
+    } = context;
     let delta = body.velocity[axis];
     if delta == 0.0 {
         return;
     }
 
-    let swept = sweep(solid, &body.aabb(), axis, delta);
+    let swept = sweep(solid, &shape.aabb(body.position), axis, delta);
     if sneaking {
         let supported = longest_supported_move(solid, body.position, axis, swept.distance);
         if supported.blocked {
@@ -538,8 +592,10 @@ fn resolve_horizontal(
     // Blocked. Contract §2: "A body blocked horizontally retries the move one
     // sub-node higher; if that is clear and it was on the ground, it steps."
     if was_on_ground {
-        let lifted = body.aabb().translated([0.0, tuning.step_height, 0.0]);
-        let head_room = sweep(solid, &body.aabb(), 1, tuning.step_height);
+        let lifted = shape
+            .aabb(body.position)
+            .translated([0.0, tuning.step_height, 0.0]);
+        let head_room = sweep(solid, &shape.aabb(body.position), 1, tuning.step_height);
         if !head_room.blocked && !sweep(solid, &lifted, axis, delta).blocked {
             body.position[1] += tuning.step_height;
             body.position[axis] += delta;
@@ -617,11 +673,16 @@ fn resolve_horizontal(
 fn step_down(
     solid: &impl Solid,
     body: &mut Body,
-    was_on_ground: bool,
     was_rising: bool,
     entry_height: f32,
-    tuning: &Tuning,
+    context: &Context<'_>,
 ) {
+    let &Context {
+        tuning,
+        shape,
+        was_on_ground,
+        ..
+    } = context;
     if !was_on_ground || was_rising || body.on_ground {
         return;
     }
@@ -630,7 +691,7 @@ fn step_down(
     // how far to place the body. The sweep is what keeps this from ever putting
     // a body inside geometry — contract §2's overriding invariant — because it
     // stops a skin short of the surface exactly as landing does.
-    let reach = sweep(solid, &body.aabb(), 1, -tuning.step_height);
+    let reach = sweep(solid, &shape.aabb(body.position), 1, -tuning.step_height);
     if !reach.blocked {
         // Nothing within a sub-node: this is a hole, not a rut. Fall.
         return;
@@ -651,7 +712,7 @@ fn step_down(
     // reach and strode straight over the top, reported from the window as "if I
     // dig a hole straight down two I can currently walk right across it without
     // falling in". A rut has its floor within a sub-node; a hole does not.
-    if strides_over_a_gap(solid, body) {
+    if strides_over_a_gap(solid, body, shape) {
         // Back to the height the tick began at. The vertical resolve has already
         // applied a tick of gravity by now, and leaving that in place turned a
         // 30 cm spike into an 8 cm one rather than removing it — the body still
@@ -660,7 +721,7 @@ fn step_down(
         // and where it stood.
         let recover = entry_height - body.position[1];
         if recover > 0.0 {
-            body.position[1] += sweep(solid, &body.aabb(), 1, recover).distance;
+            body.position[1] += sweep(solid, &shape.aabb(body.position), 1, recover).distance;
         }
         body.on_ground = true;
         body.velocity[1] = 0.0;
@@ -680,7 +741,7 @@ fn step_down(
 /// Contract §2's stride rule. A body with no horizontal motion has no "ahead"
 /// and strides nowhere — standing still at the edge of a crack, it drops into
 /// it, which is what standing still over a hole should do.
-fn strides_over_a_gap(solid: &impl Solid, body: &Body) -> bool {
+fn strides_over_a_gap(solid: &impl Solid, body: &Body, shape: Shape) -> bool {
     let [x, _, z] = body.velocity;
     let speed = (x * x + z * z).sqrt();
     if speed <= 0.0 {
@@ -690,26 +751,26 @@ fn strides_over_a_gap(solid: &impl Solid, body: &Body) -> bool {
     // One footprint, because that is the span a body's own feet cover: the
     // question this asks is whether the far side of the gap is within the
     // stance, not whether the body could reach it eventually.
-    let reach = PLAYER_WIDTH / speed;
+    let reach = shape.width / speed;
     let ahead = [
         body.position[0] + x * reach,
         body.position[1],
         body.position[2] + z * reach,
     ];
-    standing_on_ground(solid, ahead)
+    standing_on_ground_shaped(solid, ahead, shape)
 }
 
 /// Moves the body vertically and recomputes ground contact.
-fn resolve_vertical(solid: &impl Solid, body: &mut Body) {
+fn resolve_vertical(solid: &impl Solid, body: &mut Body, shape: Shape) {
     let delta = body.velocity[1];
     if delta == 0.0 {
         // Still needs a ground answer: a body that neither rose nor fell this
         // tick is standing on something if something is under it.
-        body.on_ground = standing_on_ground(solid, body.position);
+        body.on_ground = standing_on_ground_shaped(solid, body.position, shape);
         return;
     }
 
-    let swept = sweep(solid, &body.aabb(), 1, delta);
+    let swept = sweep(solid, &shape.aabb(body.position), 1, delta);
     body.position[1] += swept.distance;
 
     if swept.blocked {
@@ -765,7 +826,13 @@ fn longest_supported_move(
 /// what a diagnostic must not do.
 #[must_use]
 pub fn standing_on_ground(solid: &impl Solid, position: [f32; 3]) -> bool {
-    let probe = Aabb::player_at(position).translated([0.0, -SKIN * 2.0, 0.0]);
+    standing_on_ground_shaped(solid, position, Shape::HUMANOID)
+}
+
+/// Whether a body of this size is resting on something.
+#[must_use]
+pub fn standing_on_ground_shaped(solid: &impl Solid, position: [f32; 3], shape: Shape) -> bool {
+    let probe = shape.aabb(position).translated([0.0, -SKIN * 2.0, 0.0]);
     let (min_x, max_x) = probe.cell_span(0);
     let (min_z, max_z) = probe.cell_span(2);
     let y = floor_to_i32(probe.min[1]);

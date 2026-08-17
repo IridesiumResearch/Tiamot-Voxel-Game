@@ -22,6 +22,7 @@ pub mod cert;
 pub mod checkmods;
 pub mod config;
 pub mod content;
+pub mod ent;
 pub mod fluid;
 pub mod handle;
 pub mod light;

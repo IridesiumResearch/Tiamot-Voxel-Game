@@ -99,6 +99,26 @@ pub struct Entity {
     pub transform: Transform,
     /// How fast it is moving. Zero is a meaningful answer, so not optional.
     pub velocity: Velocity,
+    /// Whether it ended last tick standing on something.
+    ///
+    /// Between-tick state that [`crate::phys::step_shaped`] needs and that a
+    /// world file does not: an entity thawing starts in the air for one tick,
+    /// which costs it a single tick of gravity and nothing else. Persisting it
+    /// would be storing the answer to a question the next tick asks anyway.
+    #[serde(skip)]
+    pub on_ground: bool,
+    /// What a mod is asking it to do this tick.
+    ///
+    /// **The engine moves bodies; something else says where they are trying to
+    /// go** (charter rule 1). This is the same [`Intent`](crate::phys::Intent)
+    /// a player's input queue produces, deliberately — a mob steers through the
+    /// machinery the player already proved, and the engine has no opinion about
+    /// what a mob wants.
+    ///
+    /// Not persisted: a walk direction is a frame of intent, and a mob thawing
+    /// a week later should be asked again rather than resume a stride.
+    #[serde(skip)]
+    pub drive: crate::phys::Intent,
     /// The box it occupies, or `None` for something that does not collide.
     pub collider: Option<Collider>,
     /// What to draw, as a canonical string id, or `None` for invisible.
@@ -144,6 +164,8 @@ impl Entity {
         Self {
             transform,
             velocity: Velocity::default(),
+            on_ground: false,
+            drive: crate::phys::Intent::default(),
             collider: None,
             model: None,
             anim: AnimTag::default(),

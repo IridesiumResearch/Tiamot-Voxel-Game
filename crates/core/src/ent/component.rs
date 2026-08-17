@@ -116,33 +116,13 @@ impl Transform {
 #[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Velocity(pub [f32; 3]);
 
-/// The box an entity occupies, in cells.
+/// The box an entity occupies.
 ///
-/// Width and height rather than a min/max pair, because an entity's box is
-/// always centred on its footprint and standing on its feet — the same
-/// convention [`crate::phys::Aabb::player_at`] uses, and keeping it means an
-/// entity and a player collide by exactly one code path (charter rule 2).
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Collider {
-    /// Footprint, in cells.
-    pub width: f32,
-    /// Height, in cells.
-    pub height: f32,
-}
-
-impl Collider {
-    /// The dimensions of the built-in humanoid, which players also use.
-    pub const HUMANOID: Self = Self {
-        width: crate::phys::PLAYER_WIDTH,
-        height: crate::phys::PLAYER_HEIGHT,
-    };
-
-    /// The box this collider makes with its feet at `feet`.
-    #[must_use]
-    pub fn aabb(&self, feet: [f32; 3]) -> crate::phys::Aabb {
-        crate::phys::Aabb::sized_at(feet, self.width, self.height)
-    }
-}
+/// [`crate::phys::Shape`] itself, not a copy of it. The player has been
+/// colliding through that type since Task 09, and charter rule 2 means there
+/// had better be exactly one answer to "how big is the thing being simulated" —
+/// a mob with its own box type would be the beginning of a second physics.
+pub type Collider = crate::phys::Shape;
 
 /// The model the engine ships, and the one thing that is not mod content.
 ///
