@@ -64,6 +64,19 @@ pub mod meta_keys {
     pub const WORLD_NAME: &str = "world_name";
 }
 
+/// The format an entity blob is written in.
+///
+/// The `version` column of the `entities` table, and its own number rather than
+/// [`codec::CHUNK_FORMAT_VERSION`] because the two blobs change for entirely
+/// different reasons — adding a field to a block does not move an entity's
+/// bytes, and a shared number would force a migration on every world for a
+/// change that touched nothing it holds.
+///
+/// **`postcard` variants are position-encoded** (see [`codec`]), so appending an
+/// enum variant or a struct field is safe and inserting or reordering one is
+/// not. Anything that is not an append bumps this and adds a migration.
+pub const ENTITY_FORMAT_VERSION: u8 = 1;
+
 /// Anything that can go wrong talking to a world database.
 #[derive(Debug, thiserror::Error)]
 pub enum WorldError {
@@ -98,6 +111,22 @@ pub enum WorldError {
         /// Why.
         #[source]
         source: crate::fluid::codec::FluidDecodeError,
+    },
+
+    /// A stored entity could not be encoded or decoded.
+    ///
+    /// Its own variant rather than folding into [`WorldError::Chunk`] for the
+    /// same reason fluid has one: a chunk whose terrain reads perfectly can
+    /// still have one unreadable mob in it, and saying which is more useful
+    /// than condemning the chunk.
+    #[error("entity in chunk ({}, {}, {}) in domain `{domain}`: {reason}", pos.x, pos.y, pos.z)]
+    Entity {
+        /// Which chunk it was anchored to.
+        pos: ChunkPos,
+        /// Which domain.
+        domain: String,
+        /// Why.
+        reason: String,
     },
 
     /// Material id mapping failed.
@@ -688,6 +717,161 @@ impl WorldDb {
                 source,
             }
         })
+    }
+
+    // -- entities ---------------------------------------------------------
+
+    /// Loads the entities anchored to a chunk, in the order they were saved.
+    ///
+    /// # Order is part of the contract
+    ///
+    /// `ORDER BY id` is not decoration. Entities come back into
+    /// [`crate::ent::Entities`] in the order this returns them, and that order
+    /// becomes the iteration order every later tick sees — which charter rule 4
+    /// requires be a property of the data rather than of the database's mood.
+    /// `SQLite` is free to return rows in any order without an `ORDER BY`, and
+    /// usually returns them in rowid order, which is exactly the kind of "works
+    /// until it doesn't" this rule exists to forbid.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an undecodable entity.
+    pub fn load_chunk_entities(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<Vec<crate::ent::Entity>, WorldError> {
+        self.load_chunk_entities_in(DEFAULT_DOMAIN, pos)
+    }
+
+    /// Loads a chunk's entities from a named domain.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an undecodable entity.
+    pub fn load_chunk_entities_in(
+        &self,
+        domain: &str,
+        pos: ChunkPos,
+    ) -> Result<Vec<crate::ent::Entity>, WorldError> {
+        let mut statement = self.conn.prepare(
+            "SELECT version, data FROM entities
+             WHERE domain = ?1 AND chunk_x = ?2 AND chunk_y = ?3 AND chunk_z = ?4
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![domain, pos.x, pos.y, pos.z], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+
+        let mut entities = Vec::new();
+        for row in rows {
+            let (version, blob) = row?;
+            if version != i64::from(ENTITY_FORMAT_VERSION) {
+                return Err(WorldError::Entity {
+                    pos,
+                    domain: domain.to_owned(),
+                    reason: format!(
+                        "stored in format version {version}, this build writes \
+                         {ENTITY_FORMAT_VERSION}"
+                    ),
+                });
+            }
+            entities.push(
+                postcard::from_bytes(&blob).map_err(|source| WorldError::Entity {
+                    pos,
+                    domain: domain.to_owned(),
+                    reason: source.to_string(),
+                })?,
+            );
+        }
+        Ok(entities)
+    }
+
+    /// Replaces the entities anchored to a chunk.
+    ///
+    /// # Replace, not merge
+    ///
+    /// A chunk's entities are saved as a set, because that is how they are
+    /// frozen: [`crate::ent::Entities::take_chunk`] removes all of them at once
+    /// and this writes all of them at once. Merging would leave a mob behind
+    /// every time one wandered into the next chunk — it would be written there
+    /// and never removed here, and the world would slowly fill with copies.
+    ///
+    /// Passing an empty slice deletes the chunk's rows, so a chunk nothing
+    /// lives in costs nothing, exactly as a dry chunk costs no fluid row.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an unencodable entity.
+    pub fn save_chunk_entities(
+        &self,
+        pos: ChunkPos,
+        entities: &[crate::ent::Entity],
+    ) -> Result<(), WorldError> {
+        self.save_chunk_entities_in(DEFAULT_DOMAIN, pos, entities)
+    }
+
+    /// Replaces a chunk's entities in a named domain.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an unencodable entity.
+    pub fn save_chunk_entities_in(
+        &self,
+        domain: &str,
+        pos: ChunkPos,
+        entities: &[crate::ent::Entity],
+    ) -> Result<(), WorldError> {
+        // One transaction, because a half-written chunk is worse than an
+        // unwritten one: the delete has already happened and the world has lost
+        // entities it still believes it saved.
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM entities
+             WHERE domain = ?1 AND chunk_x = ?2 AND chunk_y = ?3 AND chunk_z = ?4",
+            params![domain, pos.x, pos.y, pos.z],
+        )?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO entities (domain, chunk_x, chunk_y, chunk_z, version, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for entity in entities {
+                let blob = postcard::to_allocvec(entity).map_err(|source| WorldError::Entity {
+                    pos,
+                    domain: domain.to_owned(),
+                    reason: source.to_string(),
+                })?;
+                insert.execute(params![
+                    domain,
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    i64::from(ENTITY_FORMAT_VERSION),
+                    blob
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every chunk that has entities stored in it, in a stable order.
+    ///
+    /// For the shutdown flush and for tests. Ordered so two runs over one file
+    /// see the same world.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure.
+    pub fn chunks_with_entities(&self) -> Result<Vec<ChunkPos>, WorldError> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT chunk_x, chunk_y, chunk_z FROM entities
+             WHERE domain = ?1 ORDER BY chunk_x, chunk_y, chunk_z",
+        )?;
+        let rows = statement.query_map(params![DEFAULT_DOMAIN], |row| {
+            Ok(ChunkPos::new(row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     // -- players ----------------------------------------------------------

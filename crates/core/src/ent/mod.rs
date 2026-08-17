@@ -42,7 +42,9 @@ pub mod component;
 
 use std::collections::BTreeMap;
 
-pub use component::{AnimTag, Collider, Health, ModelId, Nametag, Owner, Transform, Velocity};
+pub use component::{
+    AnimTag, Collider, HUMANOID_MODEL, Health, Nametag, Owner, Transform, Velocity,
+};
 
 use crate::coords::ChunkPos;
 
@@ -99,9 +101,20 @@ pub struct Entity {
     pub velocity: Velocity,
     /// The box it occupies, or `None` for something that does not collide.
     pub collider: Option<Collider>,
-    /// What to draw, or `None` for something invisible.
-    pub model: Option<ModelId>,
+    /// What to draw, as a canonical string id, or `None` for invisible.
+    ///
+    /// **A string and not a number, because this goes to disk.** Charter rule 8
+    /// makes numeric runtime ids per-session and never stable across runs, and
+    /// the fluid-id defect (`7dc37d8`) is what a session number reaching a world
+    /// file actually costs: every saved pond decoded as the wrong fluid the day
+    /// a mod's load order changed, silently, because the byte was still valid.
+    /// The wire gets a compact id from a table sent at join, exactly as
+    /// materials do; the world file gets the name.
+    pub model: Option<String>,
     /// What it is doing, for the client to pick a clip from.
+    ///
+    /// Deliberately NOT persisted — see [`AnimTag`].
+    #[serde(skip)]
     pub anim: AnimTag,
     /// Hit points, or `None` for something that cannot be hurt.
     pub health: Option<Health>,
@@ -546,26 +559,54 @@ mod tests {
         // is serialised whole here rather than per chunk, which is the strongest
         // form of the claim.
         let mut world = Entities::new();
-        let id = world.spawn(Entity {
+        let furnished = world.spawn(Entity {
             health: Some(Health::full(20)),
             nametag: Some(Nametag::Text("a name".into())),
-            model: Some(ModelId::HUMANOID),
+            model: Some(HUMANOID_MODEL.into()),
             collider: Some(Collider::HUMANOID),
             anim: AnimTag::WALK,
             script: Some(vec![1, 2, 3]),
             ..mob(1.0)
         });
-        world.spawn(mob(2.0));
-        world.despawn(id);
+        let doomed = world.spawn(mob(2.0));
+        world.spawn(mob(3.0));
+        world.despawn(doomed);
 
         let bytes = postcard::to_allocvec(&world).expect("encode");
         let back: Entities = postcard::from_bytes(&bytes).expect("decode");
-        assert_eq!(back, world);
         assert_eq!(
             postcard::to_allocvec(&back).expect("re-encode"),
             bytes,
             "re-encoding produced different bytes"
         );
+
+        // **The one thing that deliberately does not survive.** An entity
+        // thawing a week later has no business resuming a swing, and not
+        // writing the tag is also what keeps a per-session number out of a
+        // world file — see `AnimTag`.
+        assert_eq!(
+            back.get(furnished).map(|entity| entity.anim),
+            Some(AnimTag::IDLE),
+            "an animation tag came back from disk"
+        );
+        assert_eq!(
+            world.get(furnished).map(|entity| entity.anim),
+            Some(AnimTag::WALK),
+            "and the live world still has the one it was given"
+        );
+
+        // Everything else is equal, which is the claim the rule actually makes.
+        assert_eq!(back.len(), world.len());
+        for ((left, live), (right, stored)) in world.iter().zip(back.iter()) {
+            assert_eq!(left, right, "the ids moved");
+            assert_eq!(
+                Entity {
+                    anim: AnimTag::IDLE,
+                    ..live.clone()
+                },
+                *stored
+            );
+        }
     }
 
     #[test]

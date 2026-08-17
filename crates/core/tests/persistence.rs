@@ -835,3 +835,164 @@ fn a_world_file_is_created_on_a_path_that_does_not_exist_yet() {
     db.close().expect("close");
     assert!(Path::new(&path).exists(), "the world file should exist");
 }
+
+// ---------------------------------------------------------------------------
+// Entities, frozen with their chunk
+// ---------------------------------------------------------------------------
+
+/// A mob with everything filled in, so a round trip has something to lose.
+fn furnished_mob(chunk: ChunkPos, label: &str) -> tiamot_core::ent::Entity {
+    use tiamot_core::ent::{AnimTag, Collider, Entity, HUMANOID_MODEL, Health, Nametag, Transform};
+    Entity {
+        health: Some(Health::full(20)),
+        nametag: Some(Nametag::Player(tiamot_core::PlayerUuid::from_bytes(
+            [9; 32],
+        ))),
+        model: Some(HUMANOID_MODEL.to_owned()),
+        collider: Some(Collider::HUMANOID),
+        anim: AnimTag::SWIM,
+        script: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        ..Entity::at(Transform::at(chunk, [1.5, 2.5, 3.5]), label)
+    }
+}
+
+#[test]
+fn a_chunks_entities_survive_a_freeze_and_a_thaw() {
+    let path = scratch("entity-freeze-thaw");
+    let mut registry = registry_with(&["core:stone"]);
+    let home = ChunkPos::new(4, 1, -2);
+
+    // Freeze: the live store hands the chunk's entities over and the world
+    // writes them. This is what a chunk unloading does.
+    let frozen = {
+        let mut world = tiamot_core::ent::Entities::new();
+        world.spawn(furnished_mob(home, "test:first"));
+        world.spawn(furnished_mob(ChunkPos::new(9, 9, 9), "test:elsewhere"));
+        world.spawn(furnished_mob(home, "test:second"));
+
+        let db = WorldDb::open(&path, &mut registry).expect("open");
+        let taken = world.take_chunk(home);
+        db.save_chunk_entities(home, &taken).expect("save");
+        taken
+    };
+    assert_eq!(frozen.len(), 2);
+
+    // Thaw, through a second `WorldDb` over the same file — the strong form,
+    // since a single connection could be answering from its own cache.
+    let db = WorldDb::open(&path, &mut registry).expect("reopen");
+    let thawed = db.load_chunk_entities(home).expect("load");
+
+    assert_eq!(
+        thawed.iter().map(|e| e.source.as_str()).collect::<Vec<_>>(),
+        vec!["test:first", "test:second"],
+        "entities came back in a different order than they were frozen in, so \
+         the iteration order every later tick sees depends on the database"
+    );
+    for (before, after) in frozen.iter().zip(&thawed) {
+        assert_eq!(after.transform.chunk, before.transform.chunk);
+        assert_eq!(after.nametag, before.nametag);
+        assert_eq!(after.health, before.health);
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.script, before.script);
+        assert_eq!(after.owner, before.owner);
+    }
+
+    // **The one deliberate loss.** A mob thawing has no business resuming the
+    // swim it was in the middle of, and not writing the tag is what keeps a
+    // per-session number out of the world file.
+    assert!(
+        thawed
+            .iter()
+            .all(|e| e.anim == tiamot_core::ent::AnimTag::IDLE),
+        "an animation tag survived to disk"
+    );
+}
+
+#[test]
+fn saving_a_chunks_entities_replaces_them_rather_than_adding_to_them() {
+    // **The bug this is here to prevent**: a mob wanders from chunk A into
+    // chunk B, both are saved, and the copy in A is never removed — so the
+    // world slowly fills with duplicates of everything that ever moved.
+    let path = scratch("entity-replace");
+    let mut registry = registry_with(&["core:stone"]);
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+    let home = ChunkPos::new(0, 0, 0);
+
+    db.save_chunk_entities(home, &[furnished_mob(home, "test:a")])
+        .expect("first save");
+    db.save_chunk_entities(home, &[furnished_mob(home, "test:b")])
+        .expect("second save");
+
+    let loaded = db.load_chunk_entities(home).expect("load");
+    assert_eq!(
+        loaded.iter().map(|e| e.source.as_str()).collect::<Vec<_>>(),
+        vec!["test:b"],
+        "the first save's entity was still there beside the second's"
+    );
+
+    // And an empty save is a delete, so a chunk nothing lives in costs nothing.
+    db.save_chunk_entities(home, &[]).expect("empty save");
+    assert!(db.load_chunk_entities(home).expect("load").is_empty());
+    assert!(
+        db.chunks_with_entities().expect("index").is_empty(),
+        "a chunk with no entities still has rows"
+    );
+}
+
+#[test]
+fn one_chunks_entities_do_not_disturb_another_chunks() {
+    let path = scratch("entity-chunk-isolation");
+    let mut registry = registry_with(&["core:stone"]);
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+    let here = ChunkPos::new(1, 0, 0);
+    let there = ChunkPos::new(2, 0, 0);
+
+    db.save_chunk_entities(here, &[furnished_mob(here, "test:here")])
+        .expect("save here");
+    db.save_chunk_entities(there, &[furnished_mob(there, "test:there")])
+        .expect("save there");
+    // Rewriting one must not touch the other, which is what a per-chunk DELETE
+    // scoped too widely would do.
+    db.save_chunk_entities(here, &[]).expect("clear here");
+
+    assert!(db.load_chunk_entities(here).expect("load").is_empty());
+    assert_eq!(
+        db.load_chunk_entities(there).expect("load").len(),
+        1,
+        "clearing one chunk removed another chunk's entities"
+    );
+    assert_eq!(db.chunks_with_entities().expect("index"), vec![there]);
+}
+
+#[test]
+fn an_entity_written_by_a_newer_format_is_refused_rather_than_guessed_at() {
+    // Everything on disk is untrusted (see the `persist` module docs). A blob
+    // stamped with a version this build does not write is a world from a newer
+    // engine, and decoding it as though it were current is how a save file
+    // becomes quietly wrong instead of loudly unreadable.
+    let path = scratch("entity-future-version");
+    let mut registry = registry_with(&["core:stone"]);
+    let home = ChunkPos::new(0, 0, 0);
+
+    {
+        let db = WorldDb::open(&path, &mut registry).expect("open");
+        db.save_chunk_entities(home, &[furnished_mob(home, "test:a")])
+            .expect("save");
+    }
+    // Reach past the API deliberately: there is no supported way to write a
+    // future version, which is the point.
+    let conn = rusqlite::Connection::open(&path).expect("raw open");
+    conn.execute(
+        "UPDATE entities SET version = ?1",
+        [i64::from(tiamot_core::persist::ENTITY_FORMAT_VERSION) + 1],
+    )
+    .expect("bump");
+    drop(conn);
+
+    let db = WorldDb::open(&path, &mut registry).expect("reopen");
+    let err = db.load_chunk_entities(home).expect_err("should refuse");
+    assert!(
+        err.to_string().contains("entity in chunk"),
+        "the error does not say which chunk: {err}"
+    );
+}

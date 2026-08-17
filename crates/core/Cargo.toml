@@ -45,6 +45,11 @@ vm-luau = ["script", "mlua/luau"]
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
+# The persistence tests reach past `WorldDb` on purpose, to write rows no
+# supported API can write — a blob stamped with a future format version, which
+# is the case that proves an untrusted world file is refused rather than
+# guessed at.
+rusqlite.workspace = true
 
 [[bench]]
 name = "voxel"

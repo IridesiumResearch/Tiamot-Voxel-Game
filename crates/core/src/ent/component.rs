@@ -144,23 +144,12 @@ impl Collider {
     }
 }
 
-/// Which model a client should draw.
+/// The model the engine ships, and the one thing that is not mod content.
 ///
-/// A per-session numeric id exactly like [`crate::MaterialId`], for charter
-/// rule 8's reason: the string id (`"engine:humanoid"`) is canonical, the number
-/// is not stable across runs, and the world database owns the mapping.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub struct ModelId(pub u16);
-
-impl ModelId {
-    /// The rig the engine ships, `"engine:humanoid"`.
-    ///
-    /// The one model that is not mod content, because players have to be drawn
-    /// as something before any mod has loaded.
-    pub const HUMANOID: Self = Self(1);
-}
+/// Players have to be drawn as something before any mod has loaded, so the
+/// humanoid rig is the engine's. Mods may use it too — see the task's
+/// `engine:humanoid`.
+pub const HUMANOID_MODEL: &str = "engine:humanoid";
 
 /// What an entity is doing, as a tag.
 ///
@@ -173,6 +162,19 @@ impl ModelId {
 /// A `u8` rather than an enum so a mod can register its own tags for its own
 /// models without an engine change. The built-ins below are the clips the
 /// engine's humanoid ships with.
+///
+/// # Not persisted
+///
+/// What a mob was doing when its chunk unloaded is not world state — it is a
+/// frame of presentation, and an entity thawing a week later has no business
+/// resuming a swing. [`super::Entity`] skips this field on the way to disk and
+/// it comes back [`Self::IDLE`].
+///
+/// That is also what keeps charter rule 8 out of this type. Numeric ids are
+/// per-session; a mod-registered tag would be numbered positionally at load
+/// time, so writing one to disk would mean a world's saved mobs silently
+/// changing what they were doing when a mod's load order changed — the fluid-id
+/// defect, in a smaller place. Not writing it at all is the whole fix.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
