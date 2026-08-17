@@ -38,10 +38,12 @@
 //! a mob that died gets `None`, which is the only answer that cannot corrupt
 //! anything. The generation saturates rather than wrapping — see [`Slot`].
 
+pub mod access;
 pub mod component;
 
 use std::collections::BTreeMap;
 
+pub use access::{Access, Patch};
 pub use component::{
     AnimTag, Collider, HUMANOID_MODEL, Health, Nametag, Owner, Transform, Velocity,
 };

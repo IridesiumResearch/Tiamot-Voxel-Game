@@ -808,6 +808,12 @@ impl ServerHandle {
                     let fluidics = std::sync::Arc::new(std::sync::RwLock::new(
                         crate::fluid::Fluidics::new(fluids),
                     ));
+                    // And the entities, behind the same kind of lock for the
+                    // same reason: `game.spawn_entity` runs on this thread
+                    // inside a tick.
+                    let population = std::sync::Arc::new(std::sync::RwLock::new(
+                        crate::ent::Population::new(),
+                    ));
 
                     // Either the mods generate terrain, or there are no mods
                     // and the world is air. Both are legitimate.
@@ -826,6 +832,12 @@ impl ServerHandle {
                             // store sits behind the lock above.
                             host.vm_mut().set_fluid_access(std::sync::Arc::new(
                                 crate::fluid::Shared::new(std::sync::Arc::clone(&fluidics)),
+                            ));
+                            // And the entities, which is the second writable
+                            // handle in the frozen API and the reason
+                            // `ent::Access` also takes `&self`.
+                            host.vm_mut().set_entity_access(std::sync::Arc::new(
+                                crate::ent::Shared::new(std::sync::Arc::clone(&population)),
                             ));
                             crate::world::Generator::Mods(Box::new(
                                 crate::world::ModGenerator::new(host),
@@ -1481,6 +1493,27 @@ impl ServerHandle {
                             }
                             drop(fluid);
 
+                            // **And the entities that live there**, for the
+                            // same reason and with the same guard: a chunk
+                            // arriving without its mobs is a mob that is gone,
+                            // and chunks arrive twice.
+                            let mut mobs = population.write().expect("entity lock");
+                            for pos in &arrived {
+                                if mobs.knows(*pos) {
+                                    continue;
+                                }
+                                match world.load_entities(*pos) {
+                                    Ok(entities) => mobs.chunk_loaded(*pos, entities),
+                                    Err(err) => {
+                                        // Left unread so the next arrival
+                                        // retries. Treating a failed read as
+                                        // "empty" would quietly delete a mob.
+                                        error!(?pos, "could not load the entities for a chunk: {err}");
+                                    }
+                                }
+                            }
+                            drop(mobs);
+
                             let mut light = lighting.write().expect("lighting lock");
                             let mut touched = std::collections::BTreeSet::new();
                             let mut done = 0;
@@ -1504,6 +1537,18 @@ impl ServerHandle {
                             broadcast_light(&shared, &light, &touched);
                         }
                         control.note_lit_chunks(lighting.read().expect("lighting lock").len());
+
+                        // **Entities, every tick.** Unlike fluid there is no
+                        // halving to be had: a mob stepping at 10 Hz is a mob
+                        // that visibly stutters, because unlike a pond it is
+                        // something a player is looking straight at.
+                        {
+                            let fluid = fluidics.read().expect("fluid lock");
+                            population
+                                .write()
+                                .expect("entity lock")
+                                .tick(&world, &fluid);
+                        }
 
                         // **Fluid, at half the simulation's rate.** Nobody can
                         // see the difference between milk moving ten times a
@@ -1630,7 +1675,21 @@ impl ServerHandle {
                             // blocks a tick, and writing its chunk every time
                             // would be a database write per tick for as long as
                             // the milk was moving.
-                            let dirty = fluidics.write().expect("fluid lock").take_dirty();
+                            let mobs = population.write().expect("entity lock").take_dirty();
+                            if !mobs.is_empty()
+                                && let Err(err) = world
+                                    .save_entities(mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
+                            {
+                                error!("could not save entities: {err}");
+                            }
+                            let mobs = population.write().expect("entity lock").take_dirty();
+                        if !mobs.is_empty()
+                            && let Err(err) = world
+                                .save_entities(mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
+                        {
+                            error!("could not save entities: {err}");
+                        }
+                        let dirty = fluidics.write().expect("fluid lock").take_dirty();
                             if !dirty.is_empty()
                                 && let Err(err) =
                                     world.save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
@@ -1659,6 +1718,13 @@ impl ServerHandle {
                     // debounced save would be lost on a clean shutdown, the one
                     // case a player has every right to expect nothing is.
                     {
+                        let mobs = population.write().expect("entity lock").take_dirty();
+                        if !mobs.is_empty()
+                            && let Err(err) = world
+                                .save_entities(mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
+                        {
+                            error!("could not save entities: {err}");
+                        }
                         let dirty = fluidics.write().expect("fluid lock").take_dirty();
                         if !dirty.is_empty()
                             && let Err(err) =

@@ -227,6 +227,8 @@ pub struct MluaVm {
     fluid: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::fluid::Access>>>>,
     /// Where `game.set_block` sends its edits, once there is a world.
     edits: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::script::WorldEdit>>>>,
+    /// Where the `game.*_entity` calls reach, once there is a world.
+    entities: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::ent::Access>>>>,
 }
 
 /// Where a world's clock starts when the sky mod does not say.
@@ -484,6 +486,7 @@ impl ScriptVm for MluaVm {
             next_material: 2,
             light: std::sync::Arc::new(std::sync::Mutex::new(None)),
             fluid: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
             edits: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         // Installed here rather than in a second constructor the caller has to
@@ -532,6 +535,12 @@ impl ScriptVm for MluaVm {
 
     fn set_fluid_access(&mut self, access: std::sync::Arc<dyn crate::fluid::Access>) {
         if let Ok(mut slot) = self.fluid.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_entity_access(&mut self, access: std::sync::Arc<dyn crate::ent::Access>) {
+        if let Ok(mut slot) = self.entities.lock() {
             *slot = Some(access);
         }
     }
@@ -1392,6 +1401,208 @@ impl MluaVm {
         Ok((get, set))
     }
 
+    /// The `game.*_entity` family, built once per mod environment.
+    ///
+    /// Its own method for the reason `fluid_functions` is: these are the part of
+    /// the frozen API that depends on something outside the VM.
+    ///
+    /// # What a mod says, and what it does not
+    ///
+    /// Positions are **world blocks as plain numbers** — one block is one yard
+    /// (charter rule 5) — and never a chunk frame. Charter rule 7's
+    /// `(chunk, local)` pairing exists so the engine never accumulates a
+    /// world-space `f32`; a mod that had to know about it would be a mod that
+    /// gets it wrong 60,000 blocks out, and every mod would have to get it right
+    /// separately. See `ent::Transform::from_world`.
+    ///
+    /// Ids are opaque integers. Lua 5.4 has a real 64-bit integer subtype, so a
+    /// mod holds one exactly rather than through an `f64` that starts rounding
+    /// at 2^53 — one of the concrete reasons `docs/scripting-vm.md` picked it.
+    fn entity_functions(&self, owner: &str) -> Result<EntityApi, ScriptError> {
+        let (spawn, despawn) = self.entity_lifecycle(owner)?;
+        let (get, set, within) = self.entity_queries()?;
+        Ok(EntityApi {
+            spawn,
+            despawn,
+            get,
+            set,
+            within,
+        })
+    }
+
+    /// `game.spawn_entity` and `game.despawn_entity`.
+    fn entity_lifecycle(
+        &self,
+        owner: &str,
+    ) -> Result<(mlua::Function, mlua::Function), ScriptError> {
+        /// A missing world is not an error a mod should have to write code
+        /// around — it happens during worldgen and in a test with no server —
+        /// so every call here answers "nothing happened" instead.
+        macro_rules! store {
+            ($slot:expr, $absent:expr) => {{
+                let guard = $slot.lock().map_err(|_| {
+                    mlua::Error::external(
+                        "the entity store is poisoned; the simulation thread panicked",
+                    )
+                })?;
+                match guard.as_ref() {
+                    Some(store) => std::sync::Arc::clone(store),
+                    None => return Ok($absent),
+                }
+            }};
+        }
+
+        let store = std::sync::Arc::clone(&self.entities);
+        let source = owner.to_owned();
+        let spawn = self
+            .lua
+            .create_function(move |_, spec: Table| {
+                let store = store!(store, None::<i64>);
+                let position: Table = spec.get("pos")?;
+                let transform = crate::ent::Transform::from_world(
+                    position.get("x")?,
+                    position.get("y")?,
+                    position.get("z")?,
+                );
+                let mut entity = crate::ent::Entity::at(transform, source.clone());
+                entity.model = spec.get::<Option<String>>("model")?;
+                if let Some(points) = spec.get::<Option<u32>>("health")? {
+                    entity.health = Some(crate::ent::Health::full(points));
+                }
+                if let Some(name) = spec.get::<Option<String>>("nametag")? {
+                    entity.nametag = Some(crate::ent::Nametag::Text(name));
+                }
+                // A box only if the mod asked for one: an entity with no
+                // collider is a marker, and markers are useful.
+                if let Some(box_spec) = spec.get::<Option<Table>>("collider")? {
+                    entity.collider = Some(crate::ent::Collider {
+                        width: box_spec.get("width")?,
+                        height: box_spec.get("height")?,
+                    });
+                }
+                Ok(store.spawn(entity).map(|id| id.0 as i64))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        let store = std::sync::Arc::clone(&self.entities);
+        let despawn = self
+            .lua
+            .create_function(move |_, id: i64| {
+                let store = store!(store, false);
+                Ok(store.despawn(crate::ent::EntityId(id as u64)))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        Ok((spawn, despawn))
+    }
+
+    /// `game.entity`, `game.set_entity` and `game.entities_in_radius`.
+    fn entity_queries(
+        &self,
+    ) -> Result<(mlua::Function, mlua::Function, mlua::Function), ScriptError> {
+        /// As in `entity_lifecycle`: no world is not an error a mod writes code
+        /// around.
+        macro_rules! store {
+            ($slot:expr, $absent:expr) => {{
+                let guard = $slot.lock().map_err(|_| {
+                    mlua::Error::external(
+                        "the entity store is poisoned; the simulation thread panicked",
+                    )
+                })?;
+                match guard.as_ref() {
+                    Some(store) => std::sync::Arc::clone(store),
+                    None => return Ok($absent),
+                }
+            }};
+        }
+
+        let store = std::sync::Arc::clone(&self.entities);
+        let get = self
+            .lua
+            .create_function(move |lua, id: i64| {
+                let store = store!(store, None::<Table>);
+                let Some(entity) = store.get(crate::ent::EntityId(id as u64)) else {
+                    return Ok(None);
+                };
+                let out = lua.create_table()?;
+                let [x, y, z] = entity.transform.to_world();
+                let position = lua.create_table()?;
+                position.set("x", x)?;
+                position.set("y", y)?;
+                position.set("z", z)?;
+                out.set("pos", position)?;
+                out.set("yaw", entity.transform.yaw)?;
+                out.set("pitch", entity.transform.pitch)?;
+                let velocity = lua.create_table()?;
+                velocity.set("x", entity.velocity.0[0])?;
+                velocity.set("y", entity.velocity.0[1])?;
+                velocity.set("z", entity.velocity.0[2])?;
+                out.set("velocity", velocity)?;
+                out.set("on_ground", entity.on_ground)?;
+                out.set("source", entity.source)?;
+                out.set("model", entity.model)?;
+                out.set("anim", entity.anim.0)?;
+                if let Some(health) = entity.health {
+                    out.set("health", health.current)?;
+                    out.set("max_health", health.max)?;
+                }
+                Ok(Some(out))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        let store = std::sync::Arc::clone(&self.entities);
+        let set = self
+            .lua
+            .create_function(move |_, (id, spec): (i64, Table)| {
+                let store = store!(store, false);
+                let patch = read_patch(&spec)?;
+                Ok(store.patch(crate::ent::EntityId(id as u64), &patch))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        let store = std::sync::Arc::clone(&self.entities);
+        let within = self
+            .lua
+            .create_function(
+                move |lua, (position, radius, filter): (Table, f64, Option<String>)| {
+                    let store = store!(store, lua.create_table()?);
+                    let centre = [position.get("x")?, position.get("y")?, position.get("z")?];
+                    let found = store.within(centre, radius, filter.as_deref());
+                    // A sequence, so `ipairs` works and the nearest is index 1.
+                    let out = lua.create_table()?;
+                    for (index, id) in found.into_iter().enumerate() {
+                        out.set(index + 1, id.0 as i64)?;
+                    }
+                    Ok(out)
+                },
+            )
+            .map_err(|err| self.vm_error(&err))?;
+
+        Ok((get, set, within))
+    }
+
+    /// Puts the five entity functions on the `game` table.
+    ///
+    /// **Set one by one with literal names, rather than from a list.**
+    /// `scripts/check-stubs.sh` finds the engine's API surface by grepping for
+    /// `game.set("name"`, so a loop over a table of names would register five
+    /// functions the stub checker cannot see — and that checker exists
+    /// precisely to catch the API and its documentation drifting apart.
+    fn install_entity_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let entities = self.entity_functions(mod_id)?;
+        game.set("spawn_entity", entities.spawn)
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("despawn_entity", entities.despawn)
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("entity", entities.get)
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("set_entity", entities.set)
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("entities_in_radius", entities.within)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// Everything callable after freeze: lookups, bulk noise, streams, constants.
     fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- frozen-phase API ---------------------------------------------
@@ -1410,6 +1621,8 @@ impl MluaVm {
         let set_block = self.block_writer()?;
         game.set("set_block", set_block)
             .map_err(|err| self.vm_error(&err))?;
+
+        self.install_entity_api(mod_id, game)?;
 
         let (get_fluid, set_fluid) = self.fluid_functions()?;
         game.set("get_fluid", get_fluid)
@@ -1854,6 +2067,61 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
 /// coded rule. Sub-node resolution is only a real feature if a mod can reach
 /// it, and `brush = "subnode"` is how — `core:chisel` in the reference mods is
 /// nothing more than a mod using this.
+/// The five entity functions, built together and installed by name.
+struct EntityApi {
+    spawn: mlua::Function,
+    despawn: mlua::Function,
+    get: mlua::Function,
+    set: mlua::Function,
+    within: mlua::Function,
+}
+
+/// Reads a `game.set_entity` table into a [`crate::ent::Patch`].
+///
+/// Absent means "leave it alone" throughout — see the type. Nothing here can
+/// create or destroy an entity or change its size, so a mod cannot grow a mob a
+/// collider halfway through a tick.
+fn read_patch(spec: &Table) -> mlua::Result<crate::ent::Patch> {
+    let mut patch = crate::ent::Patch::default();
+    if let Some(position) = spec.get::<Option<Table>>("pos")? {
+        patch.position = Some([position.get("x")?, position.get("y")?, position.get("z")?]);
+    }
+    if let Some(velocity) = spec.get::<Option<Table>>("velocity")? {
+        patch.velocity = Some([velocity.get("x")?, velocity.get("y")?, velocity.get("z")?]);
+    }
+    patch.yaw = spec.get("yaw")?;
+    patch.pitch = spec.get("pitch")?;
+    patch.health = spec.get("health")?;
+    if let Some(tag) = spec.get::<Option<u8>>("anim")? {
+        patch.anim = Some(crate::ent::AnimTag(tag));
+    }
+    if let Some(drive) = spec.get::<Option<Table>>("drive")? {
+        let walk: Option<Table> = drive.get("walk")?;
+        let (x, z) = match walk {
+            Some(walk) => (walk.get("x")?, walk.get("z")?),
+            None => (0.0, 0.0),
+        };
+        // The gait names, and an unknown one is an error rather than a silent
+        // walk: a mod that typed `"sprint"` should hear about it.
+        let gait = match drive.get::<Option<String>>("gait")?.as_deref() {
+            None | Some("walk") => crate::phys::Gait::Walk,
+            Some("sprint") => crate::phys::Gait::Sprint,
+            Some("sneak") => crate::phys::Gait::Sneak,
+            Some(other) => {
+                return Err(mlua::Error::external(format!(
+                    "set_entity: unknown gait `{other}`; expected walk, sprint or sneak"
+                )));
+            }
+        };
+        patch.drive = Some(crate::phys::Intent {
+            walk: [x, z],
+            jump: drive.get::<Option<bool>>("jump")?.unwrap_or(false),
+            gait,
+        });
+    }
+    Ok(patch)
+}
+
 /// `game.register_fluid{ id, material, flow_range, tick_rate }`.
 ///
 /// The whole of what the engine needs to simulate and draw a fluid. Everything
@@ -3866,5 +4134,251 @@ mod dig_rules_tests {
         )
         .expect_err("should refuse");
         assert!(detail_of(&err).contains("brsh"), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod entity_tests {
+    use super::*;
+    use crate::script::vm::{ScriptVm, VmLimits};
+    use std::path::Path;
+
+    fn vm() -> MluaVm {
+        MluaVm::new(VmLimits::default()).expect("create vm")
+    }
+
+    fn load(vm: &mut MluaVm, id: &str, source: &str) -> Result<(), ScriptError> {
+        vm.load_mod(id, source, Path::new("."))
+    }
+
+    /// A live entity store a test can watch.
+    ///
+    /// The real `Entities` behind a lock, not a stand-in — the point of these
+    /// tests is that the Lua surface drives the actual store, and a fake would
+    /// let the two agree about something neither does.
+    #[derive(Default)]
+    struct Menagerie {
+        entities: std::sync::Mutex<crate::ent::Entities>,
+    }
+
+    impl crate::ent::Access for Menagerie {
+        fn spawn(&self, entity: crate::ent::Entity) -> Option<crate::ent::EntityId> {
+            self.entities.lock().ok().map(|mut e| e.spawn(entity))
+        }
+
+        fn despawn(&self, id: crate::ent::EntityId) -> bool {
+            self.entities
+                .lock()
+                .is_ok_and(|mut e| e.despawn(id).is_some())
+        }
+
+        fn get(&self, id: crate::ent::EntityId) -> Option<crate::ent::Entity> {
+            self.entities.lock().ok().and_then(|e| e.get(id).cloned())
+        }
+
+        fn patch(&self, id: crate::ent::EntityId, patch: &crate::ent::Patch) -> bool {
+            self.entities
+                .lock()
+                .ok()
+                .and_then(|mut e| e.get_mut(id).map(|entity| patch.apply(entity)))
+                .unwrap_or(false)
+        }
+
+        fn within(
+            &self,
+            centre: [f64; 3],
+            radius: f64,
+            source: Option<&str>,
+        ) -> Vec<crate::ent::EntityId> {
+            let Ok(entities) = self.entities.lock() else {
+                return Vec::new();
+            };
+            let centre = crate::ent::Transform::from_world(centre[0], centre[1], centre[2]);
+            let cells = radius * f64::from(crate::SUBNODES_PER_AXIS);
+            entities
+                .within(&centre, cells as f32)
+                .into_iter()
+                .filter(|(id, _)| {
+                    source
+                        .is_none_or(|wanted| entities.get(*id).is_some_and(|e| e.source == wanted))
+                })
+                .map(|(id, _)| id)
+                .collect()
+        }
+    }
+
+    /// A VM with an entity store behind it, and the store to inspect.
+    fn vm_with_entities() -> (MluaVm, std::sync::Arc<Menagerie>) {
+        let mut vm = vm();
+        let store = std::sync::Arc::new(Menagerie::default());
+        vm.set_entity_access(
+            std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::ent::Access>
+        );
+        (vm, store)
+    }
+
+    #[test]
+    fn a_mod_spawns_reads_and_despawns_an_entity() {
+        let (mut vm, store) = vm_with_entities();
+        load(
+            &mut vm,
+            "keeper",
+            "turn = 0\n\
+             id = nil\n\
+             seen = nil\n\
+             game.register_on_tick(function()\n\
+               turn = turn + 1\n\
+               if turn == 1 then\n\
+                 id = game.spawn_entity{ pos = {x=10.5,y=64,z=-3}, model='engine:humanoid', health=20 }\n\
+               elseif turn == 2 then\n\
+                 seen = game.entity(id)\n\
+               else\n\
+                 game.despawn_entity(id)\n\
+               end\n\
+             end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        assert!(vm.tick(1).expect("tick").is_empty());
+        assert_eq!(store.entities.lock().expect("lock").len(), 1);
+
+        assert!(vm.tick(1).expect("tick").is_empty());
+        // The mod read it back; check what it saw rather than trusting the call
+        // returned something.
+        vm.eval_in(
+            "keeper",
+            "assert(seen ~= nil, 'game.entity returned nil')\n\
+             assert(math.abs(seen.pos.x - 10.5) < 0.05, 'x came back as ' .. seen.pos.x)\n\
+             assert(math.abs(seen.pos.z + 3) < 0.05, 'z came back as ' .. seen.pos.z)\n\
+             assert(seen.health == 20, 'health came back as ' .. tostring(seen.health))\n\
+             assert(seen.source == 'keeper', 'source came back as ' .. seen.source)",
+        )
+        .expect("what the mod saw");
+
+        assert!(vm.tick(1).expect("tick").is_empty());
+        assert_eq!(store.entities.lock().expect("lock").len(), 0);
+    }
+
+    #[test]
+    fn a_stale_id_reads_as_nothing_rather_than_as_its_successor() {
+        // The generation check, from Lua. A mod holding the id of a mob that
+        // died must get nil — not whatever moved into its slot, which is the
+        // same slot, because the free list hands the lowest one back.
+        let (mut vm, _store) = vm_with_entities();
+        load(&mut vm, "keeper", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "keeper",
+            "local first = game.spawn_entity{ pos = {x=0,y=0,z=0} }\n\
+             game.despawn_entity(first)\n\
+             local second = game.spawn_entity{ pos = {x=0,y=0,z=0} }\n\
+             assert(game.entity(first) == nil, 'a stale id resolved')\n\
+             assert(game.entity(second) ~= nil, 'the new entity did not resolve')\n\
+             assert(game.despawn_entity(first) == false, 'a stale id despawned its successor')\n\
+             assert(game.entity(second) ~= nil, 'and took it out of the world')",
+        )
+        .expect("stale id");
+    }
+
+    #[test]
+    fn a_mod_steers_an_entity_rather_than_teleporting_it() {
+        // `drive` is the mod-facing half of charter rule 1: the engine moves
+        // bodies and something else says where they are trying to go. Setting
+        // it must reach the entity the physics will read next tick.
+        let (mut vm, store) = vm_with_entities();
+        load(&mut vm, "herder", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "herder",
+            "id = game.spawn_entity{ pos = {x=0,y=64,z=0} }\n\
+             assert(game.set_entity(id, {\n\
+               drive = { walk = { x = 1, z = 0 }, gait = 'sprint', jump = true },\n\
+               yaw = 1.5, anim = 2,\n\
+             }), 'set_entity changed nothing')",
+        )
+        .expect("steer");
+
+        let entities = store.entities.lock().expect("lock");
+        let (_, entity) = entities.iter().next().expect("one entity");
+        assert_eq!(entity.drive.gait, crate::phys::Gait::Sprint);
+        assert!(entity.drive.jump);
+        assert!((entity.drive.walk[0] - 1.0).abs() < f32::EPSILON);
+        assert!((entity.transform.yaw - 1.5).abs() < f32::EPSILON);
+        assert_eq!(entity.anim, crate::ent::AnimTag::RUN);
+    }
+
+    #[test]
+    fn a_mistyped_gait_is_an_error_rather_than_a_silent_walk() {
+        // A mod that typed `run` when the engine says `sprint` should hear
+        // about it. Silently walking would be a mob that is subtly wrong and a
+        // bug nobody can see.
+        let (mut vm, _store) = vm_with_entities();
+        load(&mut vm, "herder", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        let err = vm
+            .eval_in(
+                "herder",
+                "local id = game.spawn_entity{ pos = {x=0,y=0,z=0} }\n\
+                 game.set_entity(id, { drive = { gait = 'run' } })",
+            )
+            .expect_err("should refuse");
+        // `Display` names the mod, which is what an operator reads first; the
+        // detail a mod author needs is in the `Debug` form.
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("unknown gait") && text.contains("run"),
+            "the error should name the field and the value: {text}"
+        );
+    }
+
+    #[test]
+    fn a_radius_query_answers_in_blocks_nearest_first_and_filters_by_mod() {
+        let (mut vm, _store) = vm_with_entities();
+        load(&mut vm, "watcher", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        // Radius is in BLOCKS, and the store works in cells — three to a block
+        // (charter rule 5). A query that forgot the conversion would reach a
+        // third as far, which is the sort of thing that looks like a tuning
+        // problem for a week.
+        vm.eval_in(
+            "watcher",
+            "local near = game.spawn_entity{ pos = {x=2,y=0,z=0} }\n\
+             local far = game.spawn_entity{ pos = {x=20,y=0,z=0} }\n\
+             local mid = game.spawn_entity{ pos = {x=5,y=0,z=0} }\n\
+             local found = game.entities_in_radius({x=0,y=0,z=0}, 10)\n\
+             assert(#found == 2, 'expected 2 within 10 blocks, got ' .. #found)\n\
+             assert(found[1] == near, 'the nearest is not first')\n\
+             assert(found[2] == mid, 'the order is wrong')\n\
+             assert(#game.entities_in_radius({x=0,y=0,z=0}, 10, 'watcher') == 2)\n\
+             assert(#game.entities_in_radius({x=0,y=0,z=0}, 10, 'someone_else') == 0)\n\
+             assert(#game.entities_in_radius({x=0,y=0,z=0}, 100) == 3, 'the far one is reachable')\n\
+             local _ = far",
+        )
+        .expect("radius query");
+    }
+
+    #[test]
+    fn the_entity_api_does_nothing_rather_than_failing_when_there_is_no_world() {
+        // Called during worldgen, or in a test with no server behind the VM.
+        // An error here would be one every mod has to write code around, and
+        // the fluid API already answers this way.
+        let mut vm = vm();
+        load(&mut vm, "early", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "early",
+            "assert(game.spawn_entity{ pos = {x=0,y=0,z=0} } == nil)\n\
+             assert(game.despawn_entity(1) == false)\n\
+             assert(game.entity(1) == nil)\n\
+             assert(game.set_entity(1, { yaw = 1 }) == false)\n\
+             assert(#game.entities_in_radius({x=0,y=0,z=0}, 10) == 0)",
+        )
+        .expect("no world");
     }
 }

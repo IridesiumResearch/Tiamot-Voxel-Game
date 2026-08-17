@@ -788,6 +788,12 @@ pub trait ScriptVm: Sized {
     /// there is no fluid anywhere, which is true — see [`crate::fluid::Access`].
     fn set_fluid_access(&mut self, access: std::sync::Arc<dyn crate::fluid::Access>);
 
+    /// Points the entity API at the server's store.
+    ///
+    /// The same seam as [`Self::set_fluid_access`], for the same reason: the
+    /// frozen API is installed before there is a world to have entities in.
+    fn set_entity_access(&mut self, access: std::sync::Arc<dyn crate::ent::Access>);
+
     /// Runs every registered `on_generate` callback for one chunk.
     ///
     /// # Errors

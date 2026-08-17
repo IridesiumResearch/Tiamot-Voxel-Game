@@ -94,6 +94,47 @@ impl Transform {
         offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]
     }
 
+    /// From world block coordinates, which is how a mod says where something is.
+    ///
+    /// # Mods do not have chunk frames, and must not
+    ///
+    /// Charter rule 7's `(chunk, local)` pairing is an engine concern: it exists
+    /// so world-space `f32` is never accumulated. A mod that had to know about
+    /// it would be a mod that gets it wrong at 60,000 blocks out, and every mod
+    /// would have to get it right separately. So the API speaks plain world
+    /// blocks — one block is one yard (charter rule 5) — and the conversion
+    /// lives here, once.
+    ///
+    /// `f64` in, because that is what a Lua number is. The arithmetic is
+    /// `floor`, subtract and multiply, all inside the deterministic subset.
+    #[must_use]
+    pub fn from_world(x: f64, y: f64, z: f64) -> Self {
+        let span = f64::from(crate::CHUNK_BLOCKS);
+        let cells = f64::from(crate::SUBNODES_PER_AXIS);
+        let axis = |value: f64| {
+            let chunk = crate::detgen::floor_to_i32((value / span) as f32);
+            let local = (value - f64::from(chunk) * span) * cells;
+            (chunk, local as f32)
+        };
+        let (cx, lx) = axis(x);
+        let (cy, ly) = axis(y);
+        let (cz, lz) = axis(z);
+        Self::at(ChunkPos::new(cx, cy, cz), [lx, ly, lz])
+    }
+
+    /// Back to world block coordinates.
+    #[must_use]
+    pub fn to_world(&self) -> [f64; 3] {
+        let span = f64::from(crate::CHUNK_BLOCKS);
+        let cells = f64::from(crate::SUBNODES_PER_AXIS);
+        let axis = |chunk: i32, local: f32| f64::from(chunk) * span + f64::from(local) / cells;
+        [
+            axis(self.chunk.x, self.local[0]),
+            axis(self.chunk.y, self.local[1]),
+            axis(self.chunk.z, self.local[2]),
+        ]
+    }
+
     /// The block this entity's feet are in.
     ///
     /// `floor_to_i32` rather than `f32::floor`: the latter lowers to libm
@@ -297,6 +338,36 @@ mod tests {
             transform.block(),
             crate::BlockPos::new(corner.x + 15, corner.y, corner.z + 1)
         );
+    }
+
+    #[test]
+    fn world_coordinates_round_trip_through_the_chunk_frame() {
+        // The conversion a mod's every position goes through. It must survive
+        // the round trip, and it must work at a NEGATIVE coordinate — where a
+        // truncating divide would put a position in the wrong chunk and a
+        // `rem` would give it a negative local offset.
+        for (x, y, z) in [
+            (0.0, 0.0, 0.0),
+            (10.5, 64.0, -3.25),
+            (-0.5, -1.0, -16.0),
+            (-1000.75, 200.5, 999.25),
+        ] {
+            let transform = Transform::from_world(x, y, z);
+            let [bx, by, bz] = transform.to_world();
+            let close = |a: f64, b: f64| (a - b).abs() < 1.0 / 48.0;
+            assert!(
+                close(bx, x) && close(by, y) && close(bz, z),
+                "({x}, {y}, {z}) came back as ({bx}, {by}, {bz})"
+            );
+            let span = crate::CHUNK_BLOCKS as f32 * crate::SUBNODES_PER_AXIS as f32;
+            for axis in 0..3 {
+                assert!(
+                    transform.local[axis] >= 0.0 && transform.local[axis] < span,
+                    "({x}, {y}, {z}) produced a local offset outside its own chunk: {:?}",
+                    transform.local
+                );
+            }
+        }
     }
 
     #[test]

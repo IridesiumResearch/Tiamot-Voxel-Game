@@ -610,4 +610,94 @@ function game.flat_heightmap(height) end
 ---@return Tiamot.Stream
 function game.rng_stream(pos, name) end
 
+--- ENTITIES ----------------------------------------------------------------
+---
+--- Positions here are WORLD BLOCKS, as plain numbers, and may be fractional —
+--- one block is one yard. There is no chunk frame in this API and there is not
+--- meant to be: the engine anchors positions to a chunk internally so it never
+--- accumulates a world-space float, and a mod that had to do that itself would
+--- be a mod that gets it wrong sixty thousand blocks out.
+---
+--- Ids are opaque integers. Hold one as long as you like: an id whose entity
+--- has gone stops resolving, it does not start pointing at whatever took its
+--- place.
+
+---Puts an entity in the world.
+---
+---Returns its id, or nil if there is no world yet — during worldgen, say.
+---
+---`collider` is optional, and leaving it out is meaningful: an entity with no
+---box is a marker. It has a position and nothing else, it does not fall, and
+---nothing collides with it.
+---
+---The mod that calls this is recorded as the entity's source, which is what
+---`entities_in_radius` filters on and what tells the engine whose entity a
+---leftover is when a mod is removed from a world.
+---
+---```lua
+---local id = game.spawn_entity{
+---    pos = { x = 10.5, y = 64, z = -3 },
+---    model = "engine:humanoid",
+---    health = 20,
+---    nametag = "Something",
+---    collider = { width = 1.8, height = 5.4 },  -- cells
+---}
+---```
+---@param spec { pos: { x: number, y: number, z: number }, model?: string, health?: integer, nametag?: string, collider?: { width: number, height: number } }
+---@return integer|nil id
+function game.spawn_entity(spec) end
+
+---Removes an entity. Returns whether it was there to remove.
+---@param id integer
+---@return boolean removed
+function game.despawn_entity(id) end
+
+---Everything the engine knows about an entity, or nil if the id is stale.
+---
+---A copy, not a live view. Read it, decide, and write back with `set_entity`.
+---@param id integer
+---@return { pos: { x: number, y: number, z: number }, yaw: number, pitch: number, velocity: { x: number, y: number, z: number }, on_ground: boolean, source: string, model: string|nil, anim: integer, health: integer|nil, max_health: integer|nil }|nil
+function game.entity(id) end
+
+---Changes an entity. Returns whether anything changed.
+---
+---Every field is optional and anything you leave out is left alone. You cannot
+---create or destroy an entity here, change its size, or change its source:
+---those are decided when it spawns.
+---
+---**`drive` is how you move something, and `pos` is not.** `drive` is what the
+---entity is TRYING to do, and the engine's physics does the rest — it walks,
+---collides, steps up a lip and swims exactly as a player does. Setting `pos`
+---teleports, without sweeping, so it will happily put a mob inside a wall and
+---the engine will leave it there.
+---
+---```lua
+---game.set_entity(id, {
+---    drive = { walk = { x = 1, z = 0 }, gait = "walk" },
+---    yaw = 1.57,
+---    anim = 1,  -- WALK
+---})
+---```
+---@param id integer
+---@param spec { pos?: { x: number, y: number, z: number }, velocity?: { x: number, y: number, z: number }, yaw?: number, pitch?: number, health?: integer, anim?: integer, drive?: { walk?: { x: number, z: number }, jump?: boolean, gait?: "walk"|"sprint"|"sneak" } }
+---@return boolean changed
+function game.set_entity(id, spec) end
+
+---Every entity within `radius` blocks of a position, nearest first.
+---
+---`source` filters by which mod spawned them. That is the only label the
+---engine has an opinion about — it has no idea what a "hostile" is — so a
+---finer filter belongs in your own state.
+---
+---```lua
+---for _, id in ipairs(game.entities_in_radius({ x = 0, y = 64, z = 0 }, 32)) do
+---    ...
+---end
+---```
+---@param position { x: number, y: number, z: number }
+---@param radius number Blocks.
+---@param source? string
+---@return integer[]
+function game.entities_in_radius(position, radius, source) end
+
 return game

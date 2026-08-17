@@ -260,6 +260,81 @@ impl Population {
     }
 }
 
+/// A handle on the entity store, for the mod API.
+///
+/// The same arrangement `fluid::Shared` uses, behind a lock for the same
+/// reason: `game.spawn_entity` runs inside a tick, on the simulation thread,
+/// and cannot borrow what the tick is holding. Uncontended in practice — both
+/// sides are that one thread — and never held across a mod callback, which is
+/// the arrangement that would deadlock.
+pub struct Shared {
+    population: std::sync::Arc<std::sync::RwLock<Population>>,
+}
+
+impl Shared {
+    /// Wraps a store the simulation thread owns.
+    #[must_use]
+    pub const fn new(population: std::sync::Arc<std::sync::RwLock<Population>>) -> Self {
+        Self { population }
+    }
+}
+
+impl tiamot_core::ent::Access for Shared {
+    fn spawn(&self, entity: Entity) -> Option<EntityId> {
+        // A poisoned lock means the simulation thread panicked, in which case
+        // there is no world to spawn into. `None` is the honest answer, and
+        // panicking inside a mod callback would blame the mod for it.
+        self.population
+            .write()
+            .ok()
+            .map(|mut population| population.spawn(entity))
+    }
+
+    fn despawn(&self, id: EntityId) -> bool {
+        self.population
+            .write()
+            .is_ok_and(|mut population| population.despawn(id).is_some())
+    }
+
+    fn get(&self, id: EntityId) -> Option<Entity> {
+        self.population
+            .read()
+            .ok()
+            .and_then(|population| population.get(id).cloned())
+    }
+
+    fn patch(&self, id: EntityId, patch: &tiamot_core::ent::Patch) -> bool {
+        let Ok(mut population) = self.population.write() else {
+            return false;
+        };
+        population
+            .get_mut(id)
+            .is_some_and(|entity| patch.apply(entity))
+    }
+
+    fn within(&self, centre: [f64; 3], radius: f64, source: Option<&str>) -> Vec<EntityId> {
+        let Ok(population) = self.population.read() else {
+            return Vec::new();
+        };
+        let centre = tiamot_core::ent::Transform::from_world(centre[0], centre[1], centre[2]);
+        // Blocks in, cells inside: a mod says "within 32 yards" and the engine
+        // knows that is 96 cells (charter rule 5).
+        let cells = radius * f64::from(tiamot_core::SUBNODES_PER_AXIS);
+        population
+            .entities()
+            .within(&centre, cells as f32)
+            .into_iter()
+            .filter(|(id, _)| match source {
+                None => true,
+                Some(wanted) => population
+                    .get(*id)
+                    .is_some_and(|entity| entity.source == wanted),
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

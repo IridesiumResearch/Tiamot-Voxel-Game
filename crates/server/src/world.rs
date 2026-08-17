@@ -604,6 +604,38 @@ impl World {
         self.db.save_chunk_fluid_batch(layers)
     }
 
+    /// Reads the entities anchored to a chunk.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an undecodable entity.
+    pub fn load_entities(
+        &self,
+        pos: ChunkPos,
+    ) -> Result<Vec<tiamot_core::ent::Entity>, WorldError> {
+        self.db.load_chunk_entities(pos)
+    }
+
+    /// Replaces the entities anchored to each chunk given.
+    ///
+    /// A chunk with an empty slice has its rows deleted, which is how the last
+    /// mob to leave stops coming back.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an unencodable entity.
+    pub fn save_entities<'a>(
+        &mut self,
+        chunks: impl IntoIterator<Item = (ChunkPos, &'a [tiamot_core::ent::Entity])>,
+    ) -> Result<usize, WorldError> {
+        let mut written = 0;
+        for (pos, entities) in chunks {
+            self.db.save_chunk_entities(pos, entities)?;
+            written += entities.len();
+        }
+        Ok(written)
+    }
+
     /// Flushes and closes the database.
     ///
     /// # Errors
