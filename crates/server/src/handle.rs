@@ -1841,30 +1841,27 @@ impl ServerHandle {
                                 error!("could not save dirty chunks: {err}");
                             }
 
+                            // A mod's own facts on the same debounce, for the
+                            // same reason: a state machine that writes a key
+                            // every tick would otherwise be a database write
+                            // every tick.
+                            flush_mod_storage(&world, &mod_storage);
+
+                            let mobs = population.write().expect("entity lock").take_dirty();
+                            if !mobs.is_empty()
+                                && let Err(err) = world.save_entities(
+                                    mobs.iter().map(|(pos, held)| (*pos, held.as_slice())),
+                                )
+                            {
+                                error!("could not save entities: {err}");
+                            }
+
                             // **Fluid on the same debounce, and it needs one
                             // just as much**: a spreading pond changes tens of
                             // blocks a tick, and writing its chunk every time
                             // would be a database write per tick for as long as
                             // the milk was moving.
-                            flush_mod_storage(&world, &mod_storage);
-                            flush_mod_storage(&world, &mod_storage);
-                        let mobs = population.write().expect("entity lock").take_dirty();
-                            if !mobs.is_empty()
-                                && let Err(err) = world
-                                    .save_entities(mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
-                            {
-                                error!("could not save entities: {err}");
-                            }
-                            flush_mod_storage(&world, &mod_storage);
-                            flush_mod_storage(&world, &mod_storage);
-                        let mobs = population.write().expect("entity lock").take_dirty();
-                        if !mobs.is_empty()
-                            && let Err(err) = world
-                                .save_entities(mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
-                        {
-                            error!("could not save entities: {err}");
-                        }
-                        let dirty = fluidics.write().expect("fluid lock").take_dirty();
+                            let dirty = fluidics.write().expect("fluid lock").take_dirty();
                             if !dirty.is_empty()
                                 && let Err(err) =
                                     world.save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
@@ -1887,6 +1884,7 @@ impl ServerHandle {
                     // live connection — and a final flush must not be skipped
                     // just because the last tick happened to find the lock
                     // taken.
+                    //
                     // The last of the milk. `World::close` flushes dirty chunks
                     // and knows nothing about fluid, which lives in its own
                     // store — so without this, everything poured since the last
