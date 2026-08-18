@@ -2445,7 +2445,12 @@ fn an_entity_is_drawn_where_the_server_put_it() {
 
     // Right in front of the camera, a couple of blocks out, at its own height.
     let ahead = camera.forward();
-    renderer.set_entities(vec![[ahead.x * 2.0, ahead.y * 2.0 - 1.0, ahead.z * 2.0]]);
+    renderer.set_entities(vec![client::render::skinned::Figure {
+        offset: [ahead.x * 2.0, ahead.y * 2.0 - 1.0, ahead.z * 2.0],
+        yaw: 0.0,
+        anim: 0,
+        phase: 0.0,
+    }]);
     let peopled = target.capture(&mut renderer, &camera).expect("capture");
     let after = average(
         &peopled,
@@ -2487,10 +2492,11 @@ fn an_entity_is_drawn_where_the_server_put_it() {
 
 #[test]
 fn a_hundred_entities_all_reach_the_instance_buffer() {
-    // The instance array is grown in powers of two and shared with the chunks
-    // and the player's own body. A crowd is where an off-by-one in that
-    // arithmetic shows up, and it shows up as the LAST entity silently missing
-    // — which no single-entity test can see.
+    // The figure instance array and the joint palette are both grown in powers
+    // of two. A crowd is where an off-by-one in that arithmetic shows up, and
+    // it shows up as the LAST entity silently missing — which no single-entity
+    // test can see. A hundred is also past the initial palette allocation, so
+    // this exercises the reallocation rather than only the first fit.
     let Some(gpu) = gpu() else { return };
     let chunks = scene();
     let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
@@ -2498,10 +2504,16 @@ fn a_hundred_entities_all_reach_the_instance_buffer() {
     let camera = viewpoint();
     let ahead = camera.forward();
 
-    let crowd: Vec<[f32; 3]> = (0..100)
+    let crowd: Vec<client::render::skinned::Figure> = (0..100)
         .map(|index| {
             let along = 2.0 + index as f32 * 0.05;
-            [ahead.x * along, ahead.y * along - 1.0, ahead.z * along]
+            client::render::skinned::Figure {
+                offset: [ahead.x * along, ahead.y * along - 1.0, ahead.z * along],
+                yaw: index as f32 * 0.1,
+                // Every clip the rig ships, so a crowd exercises all of them.
+                anim: (index % 6) as u8,
+                phase: index as f32 * 0.05,
+            }
         })
         .collect();
     renderer.set_entities(crowd);
@@ -2519,5 +2531,52 @@ fn a_hundred_entities_all_reach_the_instance_buffer() {
         difference > 0.01,
         "a hundred entities in front of the camera changed the frame from \
          {without:?} to {with:?}"
+    );
+}
+
+#[test]
+fn a_figure_is_posed_by_its_clip_rather_than_drawn_at_rest() {
+    // **The test the "did anything draw" one cannot be.** A skinning pipeline
+    // that never bound its palette, or bound one full of identities, draws the
+    // rig perfectly — in its rest pose, for ever, whatever the server said it
+    // was doing. The frame would change when an entity appeared and would go on
+    // looking right, and the only symptom is a world of statues.
+    //
+    // So: the same figure in the same place, once standing and once mid-stride.
+    // Different pixels means the palette reached the vertex stage.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    let camera = viewpoint();
+    let ahead = camera.forward();
+    let offset = [ahead.x * 2.5, ahead.y * 2.5 - 1.0, ahead.z * 2.5];
+
+    let mut capture = |anim: u8, phase: f32| {
+        renderer.set_entities(vec![client::render::skinned::Figure {
+            offset,
+            yaw: 0.0,
+            anim,
+            phase,
+        }]);
+        target.capture(&mut renderer, &camera).expect("capture")
+    };
+
+    // Idle at its first keyframe, which is the rest pose.
+    let standing = capture(0, 0.0);
+    // Walking, a tenth of the way in — deliberately not a quarter, where the
+    // cycle's own keyframes put the legs back at neutral.
+    let striding = capture(1, 0.1);
+
+    let differing = standing
+        .rgba
+        .iter()
+        .zip(&striding.rgba)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        differing > 64,
+        "only {differing} bytes differ between a figure standing and the same \
+         figure mid-stride, so the joint palette is not reaching the shader"
     );
 }

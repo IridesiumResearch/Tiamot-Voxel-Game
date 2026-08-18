@@ -102,6 +102,9 @@ pub struct Shadows {
     binds: [wgpu::BindGroup; CASCADES],
     /// What the world shader binds to sample all this.
     sample_layout: wgpu::BindGroupLayout,
+    /// The per-cascade uniform's layout, for a pipeline that draws into this
+    /// pass with a vertex format of its own — see [`Shadows::cascade_bind`].
+    draw_layout: wgpu::BindGroupLayout,
     sample_bind: wgpu::BindGroup,
     /// The matrices the last [`Shadows::update`] computed, for the world pass.
     matrices: [Mat4; CASCADES],
@@ -200,6 +203,7 @@ impl Shadows {
             }),
             layers: std::array::from_fn(|index| layer(index as u32)),
             uniforms,
+            draw_layout,
             binds,
             sample_layout,
             matrices: [Mat4::IDENTITY; CASCADES],
@@ -276,6 +280,24 @@ impl Shadows {
     ///
     /// `draw` is handed a pass and the cascade's index; the caller knows what
     /// its meshes are and this module deliberately does not.
+    /// The layout of the per-cascade uniform.
+    #[must_use]
+    pub const fn layout(&self) -> &wgpu::BindGroupLayout {
+        &self.draw_layout
+    }
+
+    /// The per-cascade uniform bind group, for a pipeline that draws into this
+    /// pass with a layout of its own.
+    ///
+    /// The skinned pipeline is the caller: it shares this uniform but has a
+    /// different vertex format, so it cannot share the pipeline — and a bind
+    /// group made for one layout binds anywhere the layouts match.
+    #[must_use]
+    pub fn cascade_bind(&self, index: usize) -> Option<&wgpu::BindGroup> {
+        self.binds.get(index)
+    }
+
+    /// Draws into every cascade, calling `draw` once per layer.
     pub fn render(
         &self,
         encoder: &mut wgpu::CommandEncoder,

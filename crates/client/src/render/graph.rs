@@ -285,7 +285,7 @@ fn post_pipeline(
 ///
 /// The same modules the other modes draw with — a second copy compiled from the
 /// same file would be a second thing to keep in step.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Shaders<'a> {
     /// The world shader.
     pub world: &'a wgpu::ShaderModule,
@@ -293,6 +293,8 @@ pub struct Shaders<'a> {
     pub selection: &'a wgpu::ShaderModule,
     /// The bind group layout both of them use.
     pub layout: &'a wgpu::BindGroupLayout,
+    /// The skinned figures, which own their own shader and palette layout.
+    pub skinned: &'a super::skinned::Skinned,
 }
 
 /// What the chain is being built for.
@@ -391,6 +393,9 @@ pub struct Post {
     world: wgpu::RenderPipeline,
     fluid: wgpu::RenderPipeline,
     selection: wgpu::RenderPipeline,
+    /// Figures, for the float target. Compiled here for the reason the others
+    /// are: a pipeline is compiled against one output format.
+    skinned: wgpu::RenderPipeline,
 }
 
 impl Post {
@@ -400,11 +405,16 @@ impl Post {
     /// they are the SAME shaders the other modes draw with, and a second copy
     /// compiled from the same file would be a second thing to keep in step.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear build of everything mode 3 allocates; splitting it hides the order"
+    )]
     pub fn new(gpu: &Gpu, shaders: &Shaders<'_>, frame: Setup) -> Self {
         let Shaders {
             world: world_shader,
             selection: selection_shader,
             layout: world_layout,
+            skinned: skinned_model,
         } = *shaders;
         let Setup {
             mode,
@@ -481,6 +491,13 @@ impl Post {
                 &[Some(world_layout)],
                 HDR_FORMAT,
             ),
+            skinned: super::skinned::colour_pipeline(
+                gpu,
+                skinned_model,
+                world_layout,
+                mode,
+                HDR_FORMAT,
+            ),
             selection: super::build_selection_pipeline(
                 gpu,
                 selection_shader,
@@ -547,6 +564,12 @@ impl Post {
     #[must_use]
     pub const fn selection_pipeline(&self) -> &wgpu::RenderPipeline {
         &self.selection
+    }
+
+    /// The skinned-figure pipeline, compiled for the float target.
+    #[must_use]
+    pub const fn skinned_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.skinned
     }
 
     /// Whether this chain is built for a frame of this size.

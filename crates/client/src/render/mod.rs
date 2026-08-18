@@ -32,6 +32,7 @@ pub mod grade;
 pub mod graph;
 pub mod offscreen;
 pub mod shadow;
+pub mod skinned;
 
 use std::collections::BTreeMap;
 
@@ -672,6 +673,21 @@ pub struct Renderer {
     /// third — a box drawn around the camera is a box drawn inside the player's
     /// head, and all you see is its inside faces.
     body: ChunkMesh,
+    /// Skinned figures — every entity and every other player.
+    ///
+    /// Beside the box rather than replacing it: the box is still what the
+    /// client's own debug body draws as, and a figure whose model failed to
+    /// load has to fall back to something.
+    skinned: skinned::Skinned,
+    /// The figure pipeline for the swapchain format. Mode 3 keeps its own,
+    /// compiled against the float target, in `post`.
+    skinned_pipeline: wgpu::RenderPipeline,
+    /// The figure pipeline for the shadow cascades.
+    ///
+    /// `None` until there are cascades to draw into: the cascade uniform's
+    /// layout comes from `Shadows`, which mode 3 owns and the other modes do
+    /// not allocate at all.
+    skinned_shadow: Option<wgpu::RenderPipeline>,
     body_at: Option<[f32; 3]>,
     /// Where every entity in view is this frame, camera-relative, in cells.
     ///
@@ -680,7 +696,7 @@ pub struct Renderer {
     /// and nothing needs to be. They ride the same instance array as the
     /// chunks, after the body, so drawing them is an instance index rather than
     /// a second buffer and a second binding.
-    entities_at: Vec<[f32; 3]>,
+    entities_at: Vec<skinned::Figure>,
     /// The outline pipeline, and the line segments it draws this frame.
     selection_pipeline: wgpu::RenderPipeline,
     /// The chunk-border overlay: the same line pipeline, its own buffer.
@@ -782,8 +798,17 @@ impl Renderer {
 
         let depth = make_depth(&gpu, width, height);
 
+        // The engine's own rig, built in Rust and uploaded once. A mod-supplied
+        // model goes through the same constructor — see `core::model`.
+        let skinned = skinned::Skinned::new(&gpu, tiamot_core::model::humanoid());
+        let skinned_pipeline =
+            skinned::colour_pipeline(&gpu, &skinned, &bind_layout, mode, COLOUR_FORMAT);
+
         Ok(Self {
             gpu,
+            skinned,
+            skinned_pipeline,
+            skinned_shadow: None,
             pipeline,
             fluid_pipeline,
             elapsed: 0.0,
@@ -905,8 +930,8 @@ impl Renderer {
     /// So this is honest rather than finished: it puts entities on screen, at
     /// the right size, in the right place, moving the way they really move —
     /// which is everything except what they look like.
-    pub fn set_entities(&mut self, at: Vec<[f32; 3]>) {
-        self.entities_at = at;
+    pub fn set_entities(&mut self, figures: Vec<skinned::Figure>) {
+        self.entities_at = figures;
     }
 
     /// Switches the lighting mode.
@@ -1349,13 +1374,6 @@ impl Renderer {
             });
         }
 
-        // And every entity, after it. Same array, same reason.
-        for at in &self.entities_at {
-            instances.push(Instance {
-                offset: [at[0], at[1], at[2], 0.0],
-            });
-        }
-
         if instances.len() > self.instance_capacity {
             // Grown in powers of two rather than to the exact size, so a world
             // filling in does not reallocate on almost every frame.
@@ -1402,6 +1420,7 @@ impl Renderer {
                 world: &self.world_shader,
                 selection: &self.selection_shader,
                 layout: &self.bind_layout,
+                skinned: &self.skinned,
             },
             graph::Setup {
                 mode: self.mode,
@@ -1410,6 +1429,14 @@ impl Renderer {
                 shadow_texels: self.shadow_quality.texels(),
             },
         ));
+        // The figure pipeline for the cascades, which can only be built once
+        // there are cascades: its layout comes from `Shadows`, and the modes
+        // that allocate none have nothing to compile against.
+        self.skinned_shadow = self
+            .post
+            .as_ref()
+            .and_then(graph::Post::shadows)
+            .map(|shadows| skinned::shadow_pipeline(&self.gpu, &self.skinned, shadows.layout()));
     }
 
     /// Runs the post chain, if this mode has one.
@@ -1454,6 +1481,7 @@ impl Renderer {
         &'a wgpu::RenderPipeline,
         &'a wgpu::RenderPipeline,
         &'a wgpu::RenderPipeline,
+        &'a wgpu::RenderPipeline,
     ) {
         match self.post.as_ref() {
             Some(post) => {
@@ -1464,6 +1492,7 @@ impl Renderer {
                     post.world_pipeline(),
                     post.fluid_pipeline(),
                     post.selection_pipeline(),
+                    post.skinned_pipeline(),
                 )
             }
             None => (
@@ -1472,6 +1501,7 @@ impl Renderer {
                 &self.pipeline,
                 &self.fluid_pipeline,
                 &self.selection_pipeline,
+                &self.skinned_pipeline,
             ),
         }
     }
@@ -1520,26 +1550,21 @@ impl Renderer {
     /// in two of the three lighting modes and present in the third, which reads
     /// as a lighting bug rather than a missing draw call.
     ///
-    /// Everything here rides the chunks' instance array: the body's offset is
-    /// the one after the last chunk's, and the entities follow it. They differ
-    /// from each other only in where they are, which is exactly what an instance
-    /// offset says — so a hundred mobs are a hundred draws of one buffer rather
-    /// than a hundred buffers.
+    /// It rides the chunks' instance array: the body's offset is the one after
+    /// the last chunk's, which is what an instance offset is for.
+    ///
+    /// **Entities are no longer drawn here.** They are skinned figures with
+    /// float positions and a skeleton, which the packed voxel vertex cannot
+    /// express — see `render::skinned`. This is the client's own debug body and
+    /// nothing else.
     fn draw_bodies(&self, pass: &mut wgpu::RenderPass<'_>, chunks: usize) {
-        if self.body_at.is_none() && self.entities_at.is_empty() {
+        if self.body_at.is_none() {
             return;
         }
-        let mut instance = chunks as u32;
+        let instance = chunks as u32;
         pass.set_vertex_buffer(0, self.body.vertices.slice(..));
         pass.set_index_buffer(self.body.indices.slice(..), wgpu::IndexFormat::Uint32);
-        if self.body_at.is_some() {
-            pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
-            instance += 1;
-        }
-        for _ in 0..self.entities_at.len() {
-            pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
-            instance += 1;
-        }
+        pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
     }
 
     /// Draws the visible chunks into every shadow cascade.
@@ -1563,11 +1588,25 @@ impl Renderer {
                 let instance = index as u32;
                 pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
             }
-            // And the body and every entity — which are the only things in the
-            // world that MOVE, and therefore the only way to see whether a
-            // moving shadow looks right at all.
+            // And the client's own debug body.
             self.draw_bodies(pass, visible.len());
         });
+
+        // Figures cast too, in their own pipeline and therefore in their own
+        // sweep of the cascades. **A mob with no shadow floats**, which is the
+        // one thing about a drawn body that everybody notices immediately.
+        if self.skinned.drawn() > 0
+            && let Some(skinned_shadow) = self.skinned_shadow.as_ref()
+        {
+            shadows.render(encoder, |pass, cascade| {
+                let Some(bind) = shadows.cascade_bind(cascade) else {
+                    return;
+                };
+                pass.set_pipeline(skinned_shadow);
+                pass.set_bind_group(1, bind, &[]);
+                self.skinned.draw(pass);
+            });
+        }
     }
 
     /// Renders one frame into `target`.
@@ -1610,6 +1649,14 @@ impl Renderer {
         let visible = self.cull_and_upload(camera, view_projection);
         self.upload_chunk_borders(camera, &visible);
 
+        // **Once per frame, before any pass.** All three read the same
+        // instances and the same palette, which is what makes a figure appear
+        // in the same place in the world and in its own shadow — posing per
+        // pass would let the two disagree by a frame.
+        let figures = std::mem::take(&mut self.entities_at);
+        self.skinned.prepare(&self.gpu, &figures);
+        self.entities_at = figures;
+
         let mut encoder = self
             .gpu
             .device
@@ -1619,7 +1666,7 @@ impl Renderer {
 
         self.fill_cascades(&mut encoder, &visible);
 
-        let (colour, depth, world_pipeline, fluid_pipeline, selection_pipeline) =
+        let (colour, depth, world_pipeline, fluid_pipeline, selection_pipeline, skinned_pipeline) =
             self.world_pass_target(target);
 
         {
@@ -1668,6 +1715,15 @@ impl Renderer {
             }
 
             self.draw_bodies(&mut pass, visible.len());
+
+            // Figures, in their own pipeline. After the terrain because they
+            // are opaque and depth-tested either way, and before the fluid
+            // because the fluid is blended and has to come last.
+            if self.skinned.drawn() > 0 {
+                pass.set_pipeline(skinned_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                self.skinned.draw(&mut pass);
+            }
 
             self.draw_fluid(&mut pass, fluid_pipeline, &visible);
 

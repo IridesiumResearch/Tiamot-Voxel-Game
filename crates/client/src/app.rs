@@ -2417,22 +2417,31 @@ impl App {
     fn place_entities(&mut self) {
         let now = self.since_start.elapsed();
         let cells = f64::from(tiamot_core::SUBNODES_PER_AXIS);
-        // The box stands centred on the feet rather than beside them, exactly
-        // as the player's own body does.
-        let half = f64::from(crate::render::BODY_WIDTH_CELLS) / (2.0 * cells);
 
         let mut placed = Vec::with_capacity(self.entities.len());
-        for (_, entity) in self.entities.iter() {
+        for (id, entity) in self.entities.iter() {
             let Some(pose) = entity.pose(now) else {
                 continue;
             };
             let corner = tiamot_core::BlockPos::from_chunk_corner(pose.chunk);
+            // The figure stands ON its feet, not centred in a box: the rig's
+            // origin is between them, which is where the server's position is.
             let feet = [
-                f64::from(corner.x) + f64::from(pose.local[0]) / cells - half,
+                f64::from(corner.x) + f64::from(pose.local[0]) / cells,
                 f64::from(corner.y) + f64::from(pose.local[1]) / cells,
-                f64::from(corner.z) + f64::from(pose.local[2]) / cells - half,
+                f64::from(corner.z) + f64::from(pose.local[2]) / cells,
             ];
-            placed.push(self.camera.position.offset_to(feet));
+            placed.push(crate::render::skinned::Figure {
+                offset: self.camera.position.offset_to(feet),
+                yaw: pose.yaw,
+                anim: pose.anim,
+                // **Each figure keeps its own clock**, offset by its id. Two
+                // hundred mobs sharing one march in step, which reads as a
+                // chorus line rather than as a crowd — and the offset has to be
+                // stable across frames or the phase jitters, which is why it
+                // comes from the id rather than from anything about the frame.
+                phase: now.as_secs_f32() + (id % 977) as f32 * 0.037,
+            });
         }
         self.renderer.set_entities(placed);
     }
