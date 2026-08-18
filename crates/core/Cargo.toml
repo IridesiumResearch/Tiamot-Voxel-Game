@@ -70,3 +70,7 @@ harness = false
 [[bench]]
 name = "light"
 harness = false
+
+[[bench]]
+name = "perception"
+harness = false

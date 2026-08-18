@@ -8,8 +8,8 @@
 //! The engine answers sight questions out of the world, and the world is the one
 //! mod-facing thing that does not live behind a lock for the whole run: the tick
 //! thread owns it and lends it to the mods for the part of each tick that runs
-//! their callbacks (`server::sight`). Every piece of that is unit-tested on its
-//! own — the traversal in `core::sight`, the lease in `server::sight`, the trip
+//! their callbacks (`server::lease`). Every piece of that is unit-tested on its
+//! own — the traversal in `core::sight`, the lease in `server::lease`, the trip
 //! through Lua in the VM's own tests — and all three can pass while the window
 //! is wired into the wrong part of the tick, in which case a mod sees `nil`
 //! for ever and every one of those tests still goes green.
@@ -42,6 +42,13 @@ const PATIENCE: Duration = Duration::from_secs(10);
 const SAW_THROUGH_AIR: BlockPos = BlockPos::new(1, 8, 1);
 const STOPPED_BY_GROUND: BlockPos = BlockPos::new(3, 8, 1);
 const HAD_NO_WORLD: BlockPos = BlockPos::new(5, 8, 1);
+
+/// Where the mod reports its route. The floor of the generated world is the
+/// top of the chunk below, so feet stand at y=0 and a walk from block x=1 to
+/// x=6 is six blocks long — a number the mod encodes by which marker it writes.
+const WALKED_SIX_BLOCKS: BlockPos = BlockPos::new(1, 12, 3);
+const WALKED_SOMETHING_ELSE: BlockPos = BlockPos::new(3, 12, 3);
+const FOUND_NO_ROUTE: BlockPos = BlockPos::new(5, 12, 3);
 
 /// The middle cell of a block, which is what a whole-block edit fills and the
 /// only resolution the bot exposes for asking what it was told.
@@ -102,6 +109,15 @@ fn write_seer(name: &str) -> PathBuf {
          \x20       if not down then\n\
          \x20           game.set_block({ x = 3, y = 8, z = 1 }, \"seer:marker\")\n\
          \x20       end\n\
+         \x20   end\n\
+         \x20   local route, why = game.find_path(\n\
+         \x20       { x = 1.5, y = 0, z = 1.5 }, { x = 6.5, y = 0, z = 1.5 })\n\
+         \x20   if route == nil then\n\
+         \x20       game.set_block({ x = 5, y = 12, z = 3 }, \"seer:marker\")\n\
+         \x20   elseif #route == 6 then\n\
+         \x20       game.set_block({ x = 1, y = 12, z = 3 }, \"seer:marker\")\n\
+         \x20   else\n\
+         \x20       game.set_block({ x = 3, y = 12, z = 3 }, \"seer:marker\")\n\
          \x20   end\n\
          end)\n",
     )
@@ -195,6 +211,32 @@ fn a_mod_asking_during_a_tick_is_never_told_there_is_no_world() {
             !bot.saw_subnode(centre_of(HAD_NO_WORLD), marker),
             "the mod was told there was no world to look through, \
              which means the world is not lent where the callbacks run"
+        );
+    });
+}
+
+#[test]
+fn a_mod_can_walk_a_route_across_the_generated_world() {
+    // Six blocks, x=1 through x=6 inclusive, over flat ground. The length is
+    // asserted rather than "a route came back", because a search that returned
+    // the two ends and nothing between them would satisfy the weaker check and
+    // walk a mob straight through anything in the way.
+    let server = start("route", write_seer("route"));
+    block_on(async {
+        let mut bot = join(&server).await;
+        let marker = marker_id(&bot);
+
+        bot.expect_block(WALKED_SIX_BLOCKS, marker, PATIENCE)
+            .await
+            .expect("the mod should find the six-block walk across flat ground");
+
+        assert!(
+            !bot.saw_subnode(centre_of(FOUND_NO_ROUTE), marker),
+            "the search found no route across open ground"
+        );
+        assert!(
+            !bot.saw_subnode(centre_of(WALKED_SOMETHING_ELSE), marker),
+            "the route was the wrong length"
         );
     });
 }

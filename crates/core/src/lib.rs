@@ -74,6 +74,7 @@ pub mod inventory;
 pub mod light;
 pub mod material;
 pub mod modload;
+pub mod path;
 pub mod persist;
 pub mod phys;
 pub mod place;

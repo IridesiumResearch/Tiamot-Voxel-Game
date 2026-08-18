@@ -807,6 +807,15 @@ pub trait ScriptVm: Sized {
     /// outside that window is told so — see [`crate::sight::Access`].
     fn set_sight_access(&mut self, access: std::sync::Arc<dyn crate::sight::Access>);
 
+    /// Points `game.find_path` at the world.
+    ///
+    /// The same lending window as [`Self::set_sight_access`], because it is the
+    /// same world and the same moment — see [`crate::path::Access`]. Two
+    /// setters rather than one because sight and navigation are two questions,
+    /// and a mod that only ever asks one of them should not have to know the
+    /// other exists.
+    fn set_path_access(&mut self, access: std::sync::Arc<dyn crate::path::Access>);
+
     /// Runs every registered `on_generate` callback for one chunk.
     ///
     /// # Errors

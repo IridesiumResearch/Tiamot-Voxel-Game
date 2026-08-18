@@ -3,6 +3,10 @@
 
 //! Lending the world to the mods, for exactly as long as they are running.
 //!
+//! Everything a mod may learn about terrain comes through here — sight today,
+//! pathfinding with it — because they all need the same thing at the same
+//! moment: the world, during the part of the tick that runs mod callbacks.
+//!
 //! # The problem this solves
 //!
 //! Every other mod-facing store — lighting, fluid, entities, storage — sits
@@ -40,7 +44,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use tiamot_core::sight::{Access, Sighting};
+use tiamot_core::path;
+use tiamot_core::sight::{self, Sighting};
 
 use crate::world::World;
 
@@ -50,6 +55,13 @@ use crate::world::World;
 /// one out. Hand [`Self::handle`] to the VM.
 pub struct Lease {
     slot: Arc<Mutex<Option<World>>>,
+    /// Pathfinding expansions left in this tick, shared by every mod.
+    ///
+    /// See [`path::TICK_BUDGET`]. A per-call ceiling bounds one mob and does
+    /// nothing about two hundred of them, so the engine holds the pool and the
+    /// tick refills it — which makes the cost of navigation a property of the
+    /// engine rather than of how carefully every installed mod was written.
+    allowance: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Default for Lease {
@@ -64,7 +76,19 @@ impl Lease {
     pub fn new() -> Self {
         Self {
             slot: Arc::new(Mutex::new(None)),
+            allowance: Arc::new(std::sync::atomic::AtomicU32::new(path::TICK_BUDGET)),
         }
+    }
+
+    /// Refills the tick's pathfinding pool.
+    ///
+    /// Called once per tick by the simulation loop. Explicit rather than folded
+    /// into [`Self::lending`], which happens more than once a tick: a pool that
+    /// refilled per lend would be two pools, and neither would be the one the
+    /// budget was reasoned about.
+    pub fn open_tick(&self) {
+        self.allowance
+            .store(path::TICK_BUDGET, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The mod-facing handle. Answers [`Sighting::Unavailable`] whenever the
@@ -73,6 +97,7 @@ impl Lease {
     pub fn handle(&self) -> Shared {
         Shared {
             slot: Arc::clone(&self.slot),
+            allowance: Arc::clone(&self.allowance),
         }
     }
 
@@ -114,9 +139,10 @@ impl Lease {
 /// what changes is whether there is a world in the slot behind it.
 pub struct Shared {
     slot: Arc<Mutex<Option<World>>>,
+    allowance: Arc<std::sync::atomic::AtomicU32>,
 }
 
-impl Access for Shared {
+impl sight::Access for Shared {
     fn line_of_sight(&self, from: [f64; 3], to: [f64; 3]) -> Sighting {
         // A poisoned lease means the simulation thread panicked while the world
         // was lent, which is not something a mod should be told about with an
@@ -128,7 +154,7 @@ impl Access for Shared {
             return Sighting::Unavailable;
         };
 
-        if tiamot_core::sight::between(world, from, to) {
+        if sight::between(world, from, to) {
             Sighting::Clear
         } else {
             Sighting::Blocked
@@ -136,11 +162,73 @@ impl Access for Shared {
     }
 }
 
+impl path::Access for Shared {
+    fn find_path(&self, from: [f64; 3], to: [f64; 3], options: path::Options) -> path::Route {
+        let Ok(slot) = self.slot.lock() else {
+            return path::Route::Unavailable;
+        };
+        let Some(world) = slot.as_ref() else {
+            return path::Route::Unavailable;
+        };
+
+        // A search names blocks, and a mod names a point in one. Truncating
+        // would put a mob west of the origin in the block next door, which is
+        // the bug that only ever shows up on one side of the map — so the
+        // conversion is the entity API's own, `floor` and not a cast.
+        let Some(from) = block_of(from) else {
+            return path::Route::Unreachable;
+        };
+        let Some(to) = block_of(to) else {
+            return path::Route::Unreachable;
+        };
+
+        // Whatever this call asked for, capped by what the tick has left. A
+        // pool that is empty answers `Exhausted` without searching, which is
+        // something a mob already has to handle — and is the difference between
+        // a busy tick and a tick that runs eight times over budget.
+        let remaining = self.allowance.load(std::sync::atomic::Ordering::Relaxed);
+        if remaining == 0 {
+            return path::Route::Exhausted;
+        }
+        let options = path::Options {
+            budget: options.allowance().min(remaining),
+            ..options
+        };
+
+        let (route, spent) = path::search_counted(world, from, to, &options);
+        self.allowance
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |left| Some(left.saturating_sub(spent)),
+            )
+            .ok();
+        route
+    }
+}
+
+/// The block a world point is in, or `None` if it is not a number.
+///
+/// Charter rule 4: `0/0` in Lua is a quiet NaN and it reaches here the same way
+/// it reaches an entity patch. Refused rather than floored, because
+/// `NaN as i32` is zero and a search starting at the world origin because a mod
+/// divided by zero is the kind of answer that looks like a pathfinding bug.
+fn block_of(point: [f64; 3]) -> Option<tiamot_core::BlockPos> {
+    if !point.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let transform = tiamot_core::ent::Transform::from_world(point[0], point[1], point[2]);
+    Some(transform.block())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tiamot_core::MaterialId;
     use tiamot_core::chunk::Chunk;
     use tiamot_core::coords::ChunkPos;
+    use tiamot_core::path::{self, Access as _};
+    use tiamot_core::sight::Access as _;
 
     fn world() -> World {
         let mut registry = tiamot_core::Registry::new();
@@ -191,6 +279,98 @@ mod tests {
         assert_eq!(
             handle.line_of_sight([0.0; 3], [1.0, 0.0, 0.0]),
             Sighting::Unavailable
+        );
+    }
+
+    /// A room with a floor and a pillar in it.
+    ///
+    /// The pillar's top is somewhere a body could stand and nowhere it can get
+    /// to, which is what makes a search spend its whole allowance: an
+    /// unreachable goal that is merely *outside* the loaded world is rejected
+    /// before the first expansion, and would prove nothing about a budget.
+    fn room() -> World {
+        let mut world = world();
+        let stone = MaterialId(1);
+        world
+            .chunk(ChunkPos::new(0, 0, 0), &mut Empty)
+            .expect("the chunk loads");
+        for x in 0..16 {
+            for z in 0..16 {
+                place(&mut world, tiamot_core::BlockPos::new(x, 0, z), stone);
+            }
+        }
+        for y in 1..=3 {
+            place(&mut world, tiamot_core::BlockPos::new(8, y, 8), stone);
+        }
+        world
+    }
+
+    fn place(world: &mut World, pos: tiamot_core::BlockPos, material: MaterialId) {
+        world
+            .apply(
+                &tiamot_core::proto::Edit::Block {
+                    pos,
+                    material: material.get(),
+                },
+                &mut Empty,
+            )
+            .expect("place");
+    }
+
+    /// Start on the floor; goal on top of the pillar, three blocks up.
+    const FLOOR: [f64; 3] = [1.5, 1.0, 1.5];
+    const PILLAR_TOP: [f64; 3] = [8.5, 4.0, 8.5];
+
+    #[test]
+    fn the_ticks_pathfinding_pool_is_shared_and_refilled() {
+        // The protection this exists for: two hundred mobs each making one
+        // affordable search is not affordable. Once the pool is empty every
+        // later search says so without looking, and the next tick refills it.
+        let lease = Lease::new();
+        let handle = lease.handle();
+        lease.open_tick();
+
+        let mut world = room();
+
+        // One search over the whole room, to prove the fixture is a search and
+        // not an early refusal.
+        let (returned, first) = lease.lending(world, || {
+            handle.find_path(FLOOR, PILLAR_TOP, path::Options::default())
+        });
+        world = returned;
+        assert_eq!(
+            first,
+            path::Route::Unreachable,
+            "the pillar top should be standable and unreachable"
+        );
+
+        // Drain the rest of the pool.
+        let (returned, ()) = lease.lending(world, || {
+            for _ in 0..path::TICK_BUDGET.div_ceil(64) {
+                let _ = handle.find_path(FLOOR, PILLAR_TOP, path::Options::default());
+            }
+        });
+        world = returned;
+
+        let (returned, drained) = lease.lending(world, || {
+            handle.find_path(FLOOR, PILLAR_TOP, path::Options::default())
+        });
+        world = returned;
+        assert_eq!(
+            drained,
+            path::Route::Exhausted,
+            "the pool did not run out, so it is not a pool"
+        );
+
+        // And a new tick gets a fresh one.
+        lease.open_tick();
+        let (_world, refilled) = lease.lending(world, || {
+            handle.find_path(FLOOR, PILLAR_TOP, path::Options::default())
+        });
+        assert_eq!(
+            refilled,
+            path::Route::Unreachable,
+            "the pool was not refilled, so one busy tick would starve every later one"
         );
     }
 

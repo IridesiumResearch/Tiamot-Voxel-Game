@@ -234,10 +234,12 @@ pub struct MluaVm {
     /// Where `game.line_of_sight` looks, while the tick has lent the world out.
     ///
     /// Unlike every other slot here, what is behind this one comes and goes
-    /// *within* a tick — see `server::sight`. The handle is installed once and
+    /// *within* a tick — see `server::lease`. The handle is installed once and
     /// answers `Unavailable` whenever the engine is mid-edit, which is why the
     /// Lua function has a third return value and the others do not.
     sight: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::sight::Access>>>>,
+    /// Where `game.find_path` searches, through the same lending window.
+    paths: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::path::Access>>>>,
 }
 
 /// Where a world's clock starts when the sky mod does not say.
@@ -498,6 +500,7 @@ impl ScriptVm for MluaVm {
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
             storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sight: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            paths: std::sync::Arc::new(std::sync::Mutex::new(None)),
             edits: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         // Installed here rather than in a second constructor the caller has to
@@ -564,6 +567,12 @@ impl ScriptVm for MluaVm {
 
     fn set_sight_access(&mut self, access: std::sync::Arc<dyn crate::sight::Access>) {
         if let Ok(mut slot) = self.sight.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_path_access(&mut self, access: std::sync::Arc<dyn crate::path::Access>) {
+        if let Ok(mut slot) = self.paths.lock() {
             *slot = Some(access);
         }
     }
@@ -1409,6 +1418,90 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))
     }
 
+    /// The `game.find_path` function, built once per mod environment.
+    ///
+    /// # Two returns, because "no" has three meanings
+    ///
+    /// A route, or `nil` and a reason: `"unreachable"`, `"budget"`, or
+    /// `"no world"`. A mob that treats a spent budget as "there is no way
+    /// there" gives up on somewhere it could have reached with a nearer target,
+    /// and one that treats it as "not yet" retries a search that will never
+    /// succeed. The engine knows which happened; collapsing them would throw
+    /// that away at the one boundary where it cannot be recovered.
+    ///
+    /// The route is world blocks, horizontally CENTRED. A mob steers at a
+    /// point, and the corner of a block is not where anything walks.
+    fn path_finder(&self, mod_id: &str) -> Result<mlua::Function, ScriptError> {
+        let paths = std::sync::Arc::clone(&self.paths);
+        let owner = mod_id.to_owned();
+        self.lua
+            .create_function(
+                move |lua, (from, to, options): (Table, Table, Option<Table>)| {
+                    let point = |table: &Table| -> mlua::Result<[f64; 3]> {
+                        Ok([table.get("x")?, table.get("y")?, table.get("z")?])
+                    };
+                    let from = point(&from)?;
+                    let to = point(&to)?;
+
+                    // Every field optional, and a mod that passes nothing gets
+                    // something humanoid — the shape almost every mob is.
+                    let default = crate::path::Options::default();
+                    let options = match options {
+                        None => default,
+                        Some(table) => crate::path::Options {
+                            budget: table.get("budget").unwrap_or(default.budget),
+                            height: table.get("height").unwrap_or(default.height),
+                            step_up: table.get("step_up").unwrap_or(default.step_up),
+                            max_drop: table.get("max_drop").unwrap_or(default.max_drop),
+                        },
+                    };
+
+                    let guard = paths.lock().map_err(|_| {
+                        mlua::Error::external(
+                            "the world lease is poisoned; the simulation thread panicked",
+                        )
+                    })?;
+                    let route = guard
+                        .as_ref()
+                        .map_or(crate::path::Route::Unavailable, |access| {
+                            access.find_path(from, to, options)
+                        });
+
+                    let refusal = |reason: &'static str| -> mlua::Result<mlua::MultiValue> {
+                        Ok(mlua::MultiValue::from_iter([
+                            mlua::Value::Nil,
+                            mlua::Value::String(lua.create_string(reason)?),
+                        ]))
+                    };
+
+                    match route {
+                        crate::path::Route::Found(blocks) => {
+                            let out = lua.create_table()?;
+                            let half = 1.0 / 2.0;
+                            for block in blocks {
+                                let step = lua.create_table()?;
+                                step.set("x", f64::from(block.x) + half)?;
+                                step.set("y", f64::from(block.y))?;
+                                step.set("z", f64::from(block.z) + half)?;
+                                out.push(step)?;
+                            }
+                            Ok(mlua::MultiValue::from_iter([mlua::Value::Table(out)]))
+                        }
+                        crate::path::Route::Unreachable => refusal("unreachable"),
+                        crate::path::Route::Exhausted => refusal("budget"),
+                        crate::path::Route::Unavailable => {
+                            tracing::debug!(
+                                mod_id = %owner,
+                                "game.find_path was asked while there was no world to search"
+                            );
+                            refusal("no world")
+                        }
+                    }
+                },
+            )
+            .map_err(|err| self.vm_error(&err))
+    }
+
     /// The `game.set_block` function, built once per mod environment.
     ///
     /// Its own method for the reason `light_reader` is: it is part of the frozen
@@ -1911,6 +2004,10 @@ impl MluaVm {
 
         let line_of_sight = self.sight_reader(mod_id)?;
         game.set("line_of_sight", line_of_sight)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let find_path = self.path_finder(mod_id)?;
+        game.set("find_path", find_path)
             .map_err(|err| self.vm_error(&err))?;
 
         // The bulk noise entry point. Takes a whole region and returns a native
@@ -2986,6 +3083,31 @@ mod tests {
         }
     }
 
+    /// A pathfinder that answers whatever a test told it to.
+    #[derive(Default)]
+    struct Map {
+        reply: std::sync::Mutex<Option<crate::path::Route>>,
+        asked: std::sync::Mutex<Vec<crate::path::Options>>,
+    }
+
+    impl crate::path::Access for Map {
+        fn find_path(
+            &self,
+            _from: [f64; 3],
+            _to: [f64; 3],
+            options: crate::path::Options,
+        ) -> crate::path::Route {
+            if let Ok(mut asked) = self.asked.lock() {
+                asked.push(options);
+            }
+            self.reply
+                .lock()
+                .ok()
+                .and_then(|reply| reply.clone())
+                .unwrap_or(crate::path::Route::Unavailable)
+        }
+    }
+
     /// An edit queue a test can look inside.
     #[derive(Default)]
     struct Slate {
@@ -4012,6 +4134,98 @@ mod tests {
             asked.as_slice(),
             &[([1.5, 2.5, 3.5], [4.5, 5.5, 6.5])],
             "the points the mod named are not the points the engine was asked about"
+        );
+    }
+
+    /// A mod that turns whatever `game.find_path` returned into a block edit:
+    /// the first step of the route, or the reason there was not one.
+    const PATH_MOD: &str = "game.register_on_tick(function()\n\
+           local route, why = game.find_path(\n\
+             {x=0,y=0,z=0}, {x=5,y=0,z=0}, {max_drop = 1})\n\
+           if route then\n\
+             game.set_block({x=#route,y=0,z=0}, 'test:route')\n\
+           else\n\
+             game.set_block({x=0,y=0,z=0}, 'test:' .. why)\n\
+           end\n\
+         end)";
+
+    #[test]
+    fn find_path_reports_its_three_refusals_apart() {
+        // A mob that treats a spent budget as "there is no way there" gives up
+        // on somewhere it could reach; one that treats it as "not yet" retries
+        // for ever. The engine knows which happened, and this is the boundary
+        // where that knowledge is either passed on or lost.
+        let mut vm = vm();
+        let slate = std::sync::Arc::new(Slate::default());
+        vm.set_world_edit(
+            std::sync::Arc::clone(&slate) as std::sync::Arc<dyn crate::script::WorldEdit>
+        );
+        let map = std::sync::Arc::new(Map::default());
+
+        load(&mut vm, "walker", PATH_MOD).expect("load");
+        let _ = vm.freeze();
+
+        // Nothing installed at all.
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        vm.set_path_access(std::sync::Arc::clone(&map) as std::sync::Arc<dyn crate::path::Access>);
+
+        *map.reply.lock().expect("reply") = Some(crate::path::Route::Unreachable);
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        *map.reply.lock().expect("reply") = Some(crate::path::Route::Exhausted);
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        *map.reply.lock().expect("reply") = Some(crate::path::Route::Found(vec![
+            crate::BlockPos::new(0, 0, 0),
+            crate::BlockPos::new(1, 0, 0),
+            crate::BlockPos::new(2, 0, 0),
+        ]));
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        let written = slate.written.lock().expect("slate");
+        let names: Vec<&str> = written.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "test:no world",
+                "test:unreachable",
+                "test:budget",
+                "test:route"
+            ],
+            "a refusal reached Lua as the wrong reason"
+        );
+        // And the route arrived as a Lua array of the right length, which the
+        // mod encoded into the position it wrote.
+        assert_eq!(
+            written.last().map(|(pos, _)| pos.x),
+            Some(3),
+            "the route did not reach Lua as a three-element array"
+        );
+    }
+
+    #[test]
+    fn find_path_options_reach_the_engine_and_the_rest_default() {
+        // A mod that names one option must not silently lose the others: a mob
+        // that asked for `max_drop = 1` and got the default 3 walks off a
+        // ledge, and the mod looks wrong.
+        let mut vm = vm();
+        let map = std::sync::Arc::new(Map::default());
+        *map.reply.lock().expect("reply") = Some(crate::path::Route::Unreachable);
+        vm.set_path_access(std::sync::Arc::clone(&map) as std::sync::Arc<dyn crate::path::Access>);
+        vm.set_world_edit(std::sync::Arc::new(Slate::default()));
+
+        load(&mut vm, "walker", PATH_MOD).expect("load");
+        let _ = vm.freeze();
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        let asked = map.asked.lock().expect("asked");
+        assert_eq!(
+            asked.as_slice(),
+            &[crate::path::Options {
+                max_drop: 1,
+                ..crate::path::Options::default()
+            }]
         );
     }
 }

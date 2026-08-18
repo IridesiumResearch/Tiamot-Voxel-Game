@@ -911,12 +911,13 @@ impl ServerHandle {
                     ));
 
                     // The world itself, lent to the mods for the part of each
-                    // tick that runs their callbacks. Not a lock like the four
-                    // above, and `crates/server/src/sight.rs` says why: the tick
+                    // tick that runs their callbacks — everything they may learn
+                    // about terrain comes through here. Not a lock like the four
+                    // above, and `crates/server/src/lease.rs` says why: the tick
                     // holds the world mutably through generation and every edit,
                     // so the only safe handle is one that is empty except while
                     // it is deliberately lent.
-                    let sight = crate::sight::Lease::new();
+                    let sight = crate::lease::Lease::new();
 
                     // Either the mods generate terrain, or there are no mods
                     // and the world is air. Both are legitimate.
@@ -978,6 +979,10 @@ impl ServerHandle {
                             // the world into it.
                             host.vm_mut()
                                 .set_sight_access(std::sync::Arc::new(sight.handle()));
+                            // And where it can walk, through the same lease and
+                            // the same window.
+                            host.vm_mut()
+                                .set_path_access(std::sync::Arc::new(sight.handle()));
                             crate::world::Generator::Mods(Box::new(
                                 crate::world::ModGenerator::new(host),
                             ))
@@ -1005,6 +1010,11 @@ impl ServerHandle {
                         let mut world = held
                             .take()
                             .expect("the world is put back at the end of every tick");
+                        // Refill what the mods may spend on pathfinding this
+                        // tick. One pool for every mod and every mob, because a
+                        // per-call ceiling bounds one search and says nothing
+                        // about two hundred of them.
+                        sight.open_tick();
                         // Every block edited this tick, relit once at the end
                         // rather than four times in the middle. Batching is
                         // what makes the cost of a swarm of players placing

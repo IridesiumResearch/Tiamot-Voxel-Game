@@ -374,6 +374,58 @@ function game.get_light(position) end
 ---@return boolean|nil visible `true` clear, `false` blocked, `nil` no world to look through
 function game.line_of_sight(from, to) end
 
+---Options for `game.find_path`. Every field is optional; the defaults describe
+---something humanoid.
+---@class Tiamot.PathOptions
+---@field budget? integer Blocks the search may expand before giving up. Default 2000, capped at 10000, and 0 means the default. A search is unbounded work wearing the shape of a function call, and this is what bounds it. **There is also a pool of 8000 expansions shared by every search in one tick**, so what you ask for is capped by what the tick has left — measured, 2000 expansions is about 0.5 ms, or 1% of a tick, and the whole pool is about 4%. A mob that cannot find a way in two thousand blocks should do something else, not stall the server.
+---@field height? integer Blocks of clear space the body needs above its feet. Default 2. Not read off the entity's collider on purpose: you may want a mob to route only where it would also fit crouching, or to reserve headroom it does not strictly need.
+---@field step_up? integer How far it climbs in one move, in blocks. Default 1. Zero for something that cannot climb at all.
+---@field max_drop? integer How far it will fall in one move, in blocks. Default 3. Nothing here knows about fall damage — that is your rule, not the engine's — so this is only how far the search is willing to route.
+
+---A walkable route between two points, or why there is not one.
+---
+---Navigation is **block resolution** and deliberately simple (Sub-Node Contract
+---§6): a block is walked through only if its bottom sub-node layer — the nine
+---cells at the floor — is empty. So a mob may fail to path through a gap you
+---could squeeze into. That is an accepted limitation, not a bug: sub-node
+---navigation would multiply the search by twenty-seven for very little.
+---
+---Returns an array of `{ x, y, z }` in world blocks, start first and goal last,
+---**horizontally centred** — a mob steers at a point, and the corner of a block
+---is not where anything walks. `y` is the block's floor, which is where feet go.
+---
+---On failure returns `nil` and a reason, and the reason matters:
+---
+---* `"unreachable"` — everything reachable was searched and the goal was not in
+---  it; or the goal is not somewhere this body could stand; or the ends are more
+---  than 192 blocks apart. Asking again will not help.
+---* `"budget"` — the search ran out first, either its own or the tick's shared
+---  pool. **Not the same thing as unreachable.** A nearer target, a bigger
+---  budget, or simply the next tick might succeed. A mob that treats this as
+---  "there is no way" gives up on somewhere it could have reached. Searching
+---  every tick is how you exhaust the pool and make it everyone's problem:
+---  repath when the target has moved, not because a tick went by.
+---* `"no world"` — asked when the engine had no world to search, which is
+---  `register_on_generate` and a test with no server. See `game.line_of_sight`.
+---
+---The goal must be somewhere the body could stand: floor underneath, headroom
+---above. A route into a wall or into mid-air is not a route.
+---
+---```lua
+---local route, why = game.find_path(here, there, { max_drop = 1 })
+---if route then
+---    steer_towards(route[2])          -- [1] is where you already are
+---elseif why == "budget" then
+---    aim_somewhere_closer()
+---end
+---```
+---@param from { x: number, y: number, z: number }
+---@param to { x: number, y: number, z: number }
+---@param options? Tiamot.PathOptions
+---@return { x: number, y: number, z: number }[]|nil route
+---@return string|nil reason `"unreachable"`, `"budget"` or `"no world"` when there is no route
+function game.find_path(from, to, options) end
+
 ---Fields accepted by `game.register_fluid`.
 ---@class Tiamot.FluidSpec
 ---@field id string Unqualified id. `"milk"` from mod `core_milk` becomes `"core_milk:milk"`.
