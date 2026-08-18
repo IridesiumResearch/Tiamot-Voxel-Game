@@ -546,6 +546,16 @@ impl ServerHandle {
             "material table built"
         );
 
+        // The same table, the way `game.set_block` needs it: a mod names a
+        // block and the engine resolves the number. Built from `materials`
+        // rather than from the registry so that both sides of the API agree by
+        // construction — a mod placing what a client is told about cannot be
+        // one number out (charter rule 8).
+        let block_names: std::collections::BTreeMap<String, u16> = materials
+            .iter()
+            .map(|material| (material.name.clone(), material.id))
+            .collect();
+
         // Breaking rules, keyed by WORLD id because that is what a chunk holds.
         // Built here, after the world's id map exists, for the same reason the
         // material table is: a table of this session's runtime ids would name
@@ -941,6 +951,18 @@ impl ServerHandle {
                             }
                             host.vm_mut().set_storage_access(std::sync::Arc::new(
                                 crate::storage::Shared::new(std::sync::Arc::clone(&mod_storage)),
+                            ));
+                            // And `game.set_block`, which until now was
+                            // installed by the VM's own tests and by nothing
+                            // else — so a mod that placed a block did nothing at
+                            // all on a running server, silently, because an
+                            // uninstalled edit queue is exactly what worldgen
+                            // sees and is not an error there.
+                            host.vm_mut().set_world_edit(std::sync::Arc::new(
+                                crate::fluid::Edits::new(
+                                    std::sync::Arc::clone(&shared),
+                                    block_names,
+                                ),
                             ));
                             crate::world::Generator::Mods(Box::new(
                                 crate::world::ModGenerator::new(host),
