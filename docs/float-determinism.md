@@ -215,6 +215,29 @@ It is explicitly **not** required for rendering, audio, UI layout, camera
 smoothing, or client-side interpolation. Do not tax presentation code with these
 rules; it has different constraints and no cross-machine agreement to maintain.
 
+### Presentation code that lives in `crates/core` (Task 12)
+
+The lint is scoped to the crate and the exemption is scoped to the *purpose*, so
+the two disagree wherever presentation code sits in `core`. There is one such
+place, and it is deliberate: `core::model` — the glTF reader, the built-in
+humanoid rig and the animation sampler.
+
+It is in `core` because it must be testable and **fuzzable without a GPU**
+(charter rule 14 asks for a fuzz target in the same task as the parser), and
+because the server has no business linking a renderer to validate a file. None
+of it feeds the simulation: the server never calls it, no chunk hash depends on
+it, and two clients disagreeing about an elbow by a float's last bit cannot make
+two worlds disagree about anything.
+
+So `core::model::humanoid` and `core::model::animate` carry a narrow
+`#[allow(clippy::disallowed_methods)]` at the use site, naming this section.
+`sin` and `cos` build quaternions there; a lookup table would cost precision in
+the one place nobody can measure it and buy an agreement nobody needs.
+
+**This is the only exemption inside `core`, and it stays that way.** A future
+module that wants one is a module that should ask whether it belongs in `core`
+at all.
+
 ---
 
 ## Enforcement

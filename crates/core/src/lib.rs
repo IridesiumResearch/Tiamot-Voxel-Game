@@ -73,6 +73,7 @@ pub mod interest;
 pub mod inventory;
 pub mod light;
 pub mod material;
+pub mod model;
 pub mod modload;
 pub mod path;
 pub mod persist;

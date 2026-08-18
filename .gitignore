@@ -14,6 +14,15 @@
 # noise. Build output and crash artefacts are not.
 /fuzz/target/
 /fuzz/artifacts/
+
+# The glTF corpus is SEEDS AND REGRESSIONS ONLY, which departs from the rule
+# above deliberately. A protocol seed is tens of bytes; a `.glb` is tens of
+# kilobytes, and ten minutes of fuzzing left a 12 MB corpus. The named `.glb`
+# files are the seed set (`cargo run -p tiamot-core --example gltf_seeds`) plus
+# every input that has ever crashed the reader; everything a fuzzer derives from
+# those is reproducible in minutes and is not worth carrying in the history.
+/fuzz/corpus/gltf_ingest/*
+!/fuzz/corpus/gltf_ingest/*.glb
 /fuzz/coverage/
 /fuzz/Cargo.lock
 

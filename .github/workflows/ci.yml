@@ -212,6 +212,17 @@ jobs:
             --target x86_64-unknown-linux-gnu \
             -- -max_total_time=60 -rss_limit_mb=2048
 
+      # Task 12's glTF reader, and the largest hostile-input surface in the
+      # project: a container holding a JSON document, a binary blob, and indices
+      # from one into the other. The target asserts more than "it did not
+      # panic" — every index in a model that LOADED has to be inside what it
+      # indexes, because the next thing that touches it is a GPU.
+      - name: Fuzz the glTF reader (smoke)
+        run: |
+          cargo +nightly fuzz run gltf_ingest \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=60 -rss_limit_mb=2048
+
       # From Task 07 onward this is how every task's `game/` mods are validated.
       # It boots no world and binds no socket: a mod API that cannot be checked
       # without a running server is an API with a usability bug.

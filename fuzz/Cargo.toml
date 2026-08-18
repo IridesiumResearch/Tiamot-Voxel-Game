@@ -50,4 +50,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "gltf_ingest"
+path = "fuzz_targets/gltf_ingest.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
