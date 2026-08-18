@@ -127,6 +127,21 @@ fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
 /// display name bound to a UUID is a fact only the server has (charter rule
 /// 13), and a client holding the UUID instead would show a stale name until it
 /// reconnected.
+/// A label as text, or `None` for a player the server does not have a name for.
+///
+/// `None` rather than a placeholder: a client that is sent no label draws none,
+/// and inventing `"<unnamed>"` would put engine copy on somebody's head.
+fn resolve_nametag(label: &tiamot_core::ent::Nametag, shared: &Shared) -> Option<String> {
+    match label {
+        tiamot_core::ent::Nametag::Text(text) => Some(text.clone()),
+        tiamot_core::ent::Nametag::Player(uuid) => shared
+            .online
+            .lock()
+            .ok()
+            .and_then(|online| online.get(uuid).cloned()),
+    }
+}
+
 fn entity_messages(
     update: tiamot_core::ent::Update,
     tick: u64,
@@ -148,7 +163,15 @@ fn entity_messages(
                 anim: spawn.anim.0,
                 model: spawn.model,
                 collider: spawn.collider.map(|box_| [box_.width, box_.height]),
-                nametag: spawn.nametag,
+                // Resolved here, where the roster is. Charter rule 13: a
+                // display name is a per-server claim bound to a UUID, so the
+                // engine stores the UUID and looks the name up at send time —
+                // which is what makes a player renaming themselves change the
+                // label over their own head and over anything a mod tagged
+                // with them.
+                nametag: spawn
+                    .nametag
+                    .and_then(|label| resolve_nametag(&label, shared)),
             })
             .collect();
         messages.push(ServerMessage::EntitySpawn { entities });
@@ -1143,6 +1166,13 @@ impl ServerHandle {
                                     intent,
                                     &tiamot_core::phys::Tuning::DEFAULT,
                                 );
+                                // What a client draws this body doing, decided
+                                // where both halves are known: what was asked
+                                // for, and what came of it.
+                                player.anim = crate::transport::anim_from_motion(
+                                    intent,
+                                    &player.body,
+                                );
                                 // **The server's half of the picture.** A client
                                 // log established that the two simulations part
                                 // company by cells while the PLAYER IS STANDING
@@ -1183,6 +1213,49 @@ impl ServerHandle {
                                     player.body.velocity = [0.0; 3];
                                 }
                             }
+                        }
+
+                        // **Every player is also an entity** (charter rule 2).
+                        // The body that moves is the `PlayerSim` stepped above;
+                        // this mirrors it into the entity store so that
+                        // everything that asks "what is near me" — a mod, the
+                        // replication tracker, another client's renderer — gets
+                        // one answer with one shape, rather than each growing
+                        // its own idea of where the people are.
+                        //
+                        // The mirrors are transient: never saved, never stepped,
+                        // never dirtying a chunk. `ent::Population::transient`
+                        // says what each of those would otherwise cost.
+                        {
+                            let mut mobs = population.write().expect("entity lock");
+                            let mut present = std::collections::BTreeSet::new();
+                            if let Ok(bodies) = shared.bodies.lock() {
+                                for (uuid, player) in bodies.iter() {
+                                    present.insert(*uuid);
+                                    let turn = std::f32::consts::TAU;
+                                    mobs.sync_player(
+                                        *uuid,
+                                        tiamot_core::ent::Transform {
+                                            chunk: player.origin,
+                                            local: player.body.position,
+                                            // Turns on the wire so transmitting
+                                            // a heading needs no trigonometry;
+                                            // radians here because that is what
+                                            // a transform holds. One multiply.
+                                            yaw: player.look[0] * turn,
+                                            pitch: player.look[1] * turn,
+                                        },
+                                        tiamot_core::ent::Velocity(player.body.velocity),
+                                        player.body.on_ground,
+                                        player.anim,
+                                    );
+                                }
+                            }
+                            // Whoever is not in the roster has gone. Driven by
+                            // who IS here rather than by a disconnect event: a
+                            // disconnection the tick never saw would otherwise
+                            // leave a body standing in the world for ever.
+                            mobs.retain_players(&present);
                         }
 
                         // Digging, after movement so a dig is judged against
@@ -1769,7 +1842,12 @@ impl ServerHandle {
                                         mobs.entities(),
                                         player.origin,
                                         shared.view_distance,
-                                        None,
+                                        // Their own body. Nobody needs to be
+                                        // told where they are by the machine
+                                        // they are telling, and a client drawing
+                                        // itself sees the inside of its own
+                                        // head.
+                                        mobs.player_entity(uuid),
                                     );
                                     if update.is_empty() {
                                         continue;

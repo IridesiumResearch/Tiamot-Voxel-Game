@@ -750,8 +750,22 @@ function game.despawn_entity(id) end
 ---Everything the engine knows about an entity, or nil if the id is stale.
 ---
 ---A copy, not a live view. Read it, decide, and write back with `set_entity`.
+---
+---**Players are entities too.** Every connected player is mirrored into the
+---entity store each tick with `source = "engine:player"`, so `entities_in_radius`
+---finds them like anything else and `owner` is their UUID. Their bodies are moved
+---by their own inputs, so writing to one with `set_entity` is overwritten on the
+---next tick — read them, do not drive them.
+---
+---`owner` is a UUID in hex and **never a name** (charter rule 13): names are a
+---per-server claim that can be rebound, UUIDs are identity. Store the UUID if you
+---mean "this player"; `game.storage` takes strings for exactly that.
+---
+---`nametag` is a literal label somebody set. `nametag_player` is a UUID whose
+---CURRENT display name the engine resolves when it draws the tag — a player's
+---own body has the second, never the first.
 ---@param id integer
----@return { pos: { x: number, y: number, z: number }, yaw: number, pitch: number, velocity: { x: number, y: number, z: number }, on_ground: boolean, source: string, model: string|nil, anim: integer, health: integer|nil, max_health: integer|nil }|nil
+---@return { pos: { x: number, y: number, z: number }, yaw: number, pitch: number, velocity: { x: number, y: number, z: number }, on_ground: boolean, source: string, model: string|nil, anim: integer, health: integer|nil, max_health: integer|nil, owner: string|nil, nametag: string|nil, nametag_player: string|nil }|nil
 function game.entity(id) end
 
 ---Changes an entity. Returns whether anything changed.

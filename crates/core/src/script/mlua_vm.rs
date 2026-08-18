@@ -1772,6 +1772,26 @@ impl MluaVm {
                 out.set("source", entity.source)?;
                 out.set("model", entity.model)?;
                 out.set("anim", entity.anim.0)?;
+                // Charter rule 13: the UUID, as hex, and never the name. A mod
+                // that stores "whose is this" must store something a rename
+                // cannot invalidate, and giving it only the name would leave it
+                // no way to do that — the reason `game.storage` has
+                // `Value::uuid` for the same job.
+                if let Some(owner) = entity.owner {
+                    out.set("owner", owner.0.to_hex())?;
+                }
+                // And the label, resolved as far as `core` can: text is text,
+                // and a player's tag is their UUID, because the current name is
+                // a fact only the server's roster has. A mod wanting to print it
+                // is asking a presentation question the engine answers at send
+                // time — see `ent::replicate::Spawn::nametag`.
+                match entity.nametag {
+                    Some(crate::ent::Nametag::Text(text)) => out.set("nametag", text)?,
+                    Some(crate::ent::Nametag::Player(uuid)) => {
+                        out.set("nametag_player", uuid.to_hex())?;
+                    }
+                    None => {}
+                }
                 if let Some(health) = entity.health {
                     out.set("health", health.current)?;
                     out.set("max_health", health.max)?;

@@ -32,7 +32,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{AnimTag, Collider, Entities, Entity, EntityId, Transform, Velocity};
+use super::{AnimTag, Collider, Entities, Entity, EntityId, Nametag, Transform, Velocity};
 use crate::coords::ChunkPos;
 use crate::interest::{ViewDistance, contains};
 
@@ -69,14 +69,19 @@ pub struct Spawn {
     pub collider: Option<Collider>,
     /// What it is doing.
     pub anim: AnimTag,
-    /// The label above it, already resolved to text.
+    /// The label above it, unresolved.
     ///
-    /// **Resolved here, not on the client.** A [`super::Nametag::Player`] holds
-    /// a UUID and the *current* display name bound to it is a fact only the
-    /// server has (charter rule 13). Sending the UUID would make every client
-    /// keep a roster it has no other use for, and would make a rebound name
-    /// stale on every screen until someone reconnected.
-    pub nametag: Option<String>,
+    /// A [`Nametag::Player`] carries a UUID, and the *current* display name
+    /// bound to it is a fact only the server's roster has (charter rule 13).
+    /// **The caller resolves it to text before sending**, and this module does
+    /// not, because `core` has no roster and inventing one so that a pure
+    /// function could look a name up would be the wrong shape entirely.
+    ///
+    /// Resolved on the server rather than the client for the same rule: sending
+    /// the UUID would make every client keep a roster it has no other use for,
+    /// and a rebound name would stay stale on every screen until someone
+    /// reconnected.
+    pub nametag: Option<Nametag>,
 }
 
 /// A change to an entity a viewer already knows about.
@@ -284,9 +289,7 @@ fn spawn_of(id: EntityId, entity: &Entity) -> Spawn {
         model: entity.model.clone(),
         collider: entity.collider,
         anim: entity.anim,
-        // Left unresolved here: only the caller knows the roster. See the
-        // field's docs — the server fills it in before sending.
-        nametag: None,
+        nametag: entity.nametag.clone(),
     }
 }
 

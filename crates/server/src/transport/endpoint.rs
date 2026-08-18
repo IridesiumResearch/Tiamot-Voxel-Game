@@ -277,6 +277,27 @@ pub struct PlayerSim {
     pub dig: Option<tiamot_core::dig::Dig>,
     /// The tool they say they are holding, or `None` for a bare hand.
     pub tool: Option<String>,
+    /// Where they are looking, in turns, as the wire carries it.
+    ///
+    /// **Presentation, and the simulation never reads it.** Movement arrives
+    /// already rotated into world space precisely so the tick needs no
+    /// trigonometry (charter rule 4), so this exists only to point the drawn
+    /// body: without it every other player faces north for ever.
+    pub look: [f32; 2],
+    /// What a client should draw this body doing.
+    ///
+    /// Set by the tick from the input that moved it. **Server-side animation is
+    /// state tags only** — the server says "walking" and the client picks a clip
+    /// and advances its own time, which is what keeps skeletal animation out of
+    /// the deterministic simulation entirely (charter rule 4 does not reach
+    /// presentation, and interpolating a joint is transcendental work).
+    pub anim: tiamot_core::ent::AnimTag,
+    /// The tick the current `look` came with.
+    ///
+    /// Inputs are sent three times over for redundancy, so they arrive out of
+    /// order routinely. Without this an older duplicate overwrites a newer
+    /// look and heads twitch backwards.
+    pub look_tick: u64,
 }
 
 impl PlayerSim {
@@ -299,7 +320,50 @@ impl PlayerSim {
             inputs: tiamot_core::phys::InputQueue::new(tick),
             dig: None,
             tool: None,
+            anim: tiamot_core::ent::AnimTag::IDLE,
+            look: [0.0; 2],
+            look_tick: 0,
         }
+    }
+}
+
+/// The tag a client should draw a body with, from what it was asked to do and
+/// what it ended up doing.
+///
+/// Intent first, then speed: a player holding sneak is sneaking whether or not
+/// they are moving, because a crouch is a posture rather than a gait. Below the
+/// idle threshold everything else is standing still — a body drifting to a stop
+/// under friction should not keep walking on the spot for the three ticks it
+/// takes.
+#[must_use]
+pub fn anim_from_motion(
+    intent: tiamot_core::phys::Intent,
+    body: &tiamot_core::phys::Body,
+) -> tiamot_core::ent::AnimTag {
+    use tiamot_core::ent::AnimTag;
+    use tiamot_core::phys::Gait;
+
+    if matches!(intent.gait, Gait::Sneak) {
+        return AnimTag::SNEAK;
+    }
+
+    // Squared, so the comparison needs no root.
+    let [vx, _, vz] = body.velocity;
+    let speed = vx * vx + vz * vz;
+    // A tenth of a walk, which is slower than anything a player can hold and
+    // faster than the tail of the friction curve.
+    let idle = tiamot_core::phys::Tuning::DEFAULT.walk_speed * 0.1;
+    if speed < idle * idle {
+        return AnimTag::IDLE;
+    }
+    // Faster than a walk can go means they are sprinting. Reading the gait
+    // instead would show a run the moment the key went down, before the body
+    // had accelerated into one.
+    let walk = tiamot_core::phys::Tuning::DEFAULT.walk_speed;
+    if speed > walk * walk {
+        AnimTag::RUN
+    } else {
+        AnimTag::WALK
     }
 }
 
@@ -550,13 +614,24 @@ impl Shared {
         uuid: &PlayerUuid,
         tick: u64,
         intent: tiamot_core::phys::Intent,
+        look: [f32; 2],
     ) -> bool {
         let Ok(mut bodies) = self.bodies.lock() else {
             return false;
         };
-        bodies
-            .get_mut(uuid)
-            .is_some_and(|player| player.inputs.offer(tick, intent))
+        let Some(player) = bodies.get_mut(uuid) else {
+            return false;
+        };
+        // Recorded even when the intent is refused as a duplicate: the two
+        // answer different questions. A repeat of an already-simulated tick
+        // must not move anybody again, and it still carries where they were
+        // looking — which is presentation, and where they are looking NOW is
+        // closer to the truth than where they were looking when they joined.
+        if tick >= player.look_tick {
+            player.look = look;
+            player.look_tick = tick;
+        }
+        player.inputs.offer(tick, intent)
     }
 
     /// Starts, re-aims, or stops a player's dig.
@@ -1433,14 +1508,14 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
             Action::Input {
                 tick,
                 movement,
+                look,
                 actions,
-                ..
             } => {
                 if let Some(uuid) = session.uuid() {
                     // A refusal is ordinary traffic: a duplicate from the
                     // three-input redundancy, or an input whose tick has
                     // already been simulated.
-                    shared.queue_input(&uuid, *tick, intent_from_wire(*movement, *actions));
+                    shared.queue_input(&uuid, *tick, intent_from_wire(*movement, *actions), *look);
                 }
             }
             Action::Dig { target } => {

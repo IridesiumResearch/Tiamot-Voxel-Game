@@ -1046,6 +1046,84 @@ impl Bot {
             .map(|layer| layer.get(pos.local()))
     }
 
+    /// Every entity the server has told this bot about, by id.
+    ///
+    /// Rebuilt from the message history rather than kept as state, exactly as
+    /// [`Bot::light_at`] is: what a bot knows is defined as what it was sent, so
+    /// a scenario asserting about entities is asserting about the wire.
+    ///
+    /// Spawns insert, despawns remove, deltas move. A delta for an entity the
+    /// bot never saw spawn is **ignored**, which is the honest reading: deltas
+    /// go on the unreliable channel and spawns do not, so an unmatched delta is
+    /// a stale packet about something already despawned, not a discovery.
+    #[must_use]
+    pub fn entities(&self) -> std::collections::BTreeMap<u64, tiamot_core::proto::EntityDef> {
+        let mut live: std::collections::BTreeMap<u64, tiamot_core::proto::EntityDef> =
+            std::collections::BTreeMap::new();
+        for message in self.received().iter() {
+            match message {
+                ServerMessage::EntitySpawn { entities } => {
+                    for entity in entities {
+                        live.insert(entity.id, entity.clone());
+                    }
+                }
+                ServerMessage::EntityDespawn { entities } => {
+                    for id in entities {
+                        live.remove(id);
+                    }
+                }
+                ServerMessage::EntityState { entities, .. } => {
+                    for delta in entities {
+                        if let Some(known) = live.get_mut(&delta.id) {
+                            known.chunk = delta.chunk;
+                            known.local = delta.local;
+                            known.velocity = delta.velocity;
+                            known.yaw = delta.yaw;
+                            known.pitch = delta.pitch;
+                            known.anim = delta.anim;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        live
+    }
+
+    /// Waits until the bot knows about an entity the filter accepts.
+    ///
+    /// The filter is a closure rather than a struct of optional fields because
+    /// every scenario wants a different question — "the one called Alice", "any
+    /// humanoid", "the mimic" — and a filter type would grow a field per test.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Unexpected`] if the timeout expires with nothing matching.
+    pub async fn expect_entity(
+        &mut self,
+        matches: impl Fn(&tiamot_core::proto::EntityDef) -> bool,
+        timeout: std::time::Duration,
+    ) -> Result<tiamot_core::proto::EntityDef, BotError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(found) = self.entities().into_values().find(|entity| matches(entity)) {
+                return Ok(found);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(BotError::Unexpected {
+                    expected: "an entity matching the filter",
+                    got: format!("{} entities, none of them it", self.entities().len()),
+                });
+            }
+            match tokio::time::timeout(remaining, self.recv()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {}
+            }
+        }
+    }
+
     /// The fluid layer the server has most recently reported for a chunk.
     ///
     /// `None` until a `ChunkFluid` arrives for it. **The last one wins**, and

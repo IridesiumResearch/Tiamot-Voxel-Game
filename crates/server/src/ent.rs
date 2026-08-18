@@ -32,10 +32,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tiamot_core::coords::ChunkPos;
-use tiamot_core::ent::{Entities, Entity, EntityId};
+use tiamot_core::ent::{Entities, Entity, EntityId, Transform, Velocity};
 use tiamot_core::phys::{self, Body};
 
 use crate::world::World;
+
+/// The `source` every player mirror carries.
+///
+/// The engine's own namespace, not a mod's — the same one charter rule 8 keeps
+/// `engine:unknown` in. A mod cannot register under it, so `owned_by_mod` never
+/// hands a player's body to anybody's step callback, and a mod filtering
+/// `entities_in_radius` by source can ask for exactly the players.
+pub const PLAYER_SOURCE: &str = "engine:player";
 
 /// Every live entity, and the bookkeeping the tick needs around them.
 #[derive(Debug, Default)]
@@ -53,6 +61,24 @@ pub struct Population {
     /// found empty belongs here and not there — without the distinction an
     /// empty chunk is re-read from the database every time it arrives.
     loaded: BTreeSet<ChunkPos>,
+    /// Entities that mirror something the engine already owns.
+    ///
+    /// A player's body lives in `transport::Shared::bodies` and is moved by
+    /// their inputs. It is *also* an entity, because everything that asks
+    /// "what is near me" — a mod, a client's renderer, the replication
+    /// tracker — should get one answer with one shape (charter rule 2). This
+    /// set is what keeps the mirror from being mistaken for a real one:
+    ///
+    /// - **Never persisted.** A world file that saved players would grow a
+    ///   corpse for everyone who ever visited, standing where they logged out.
+    /// - **Never dirties a chunk.** A mirror is written every tick, and a
+    ///   player walking would otherwise mark every chunk they cross for saving,
+    ///   twenty times a second.
+    /// - **Never stepped.** Its physics has already happened; stepping it again
+    ///   would apply gravity to a body that has already fallen this tick.
+    transient: BTreeSet<EntityId>,
+    /// Which entity mirrors which player.
+    players: BTreeMap<tiamot_core::PlayerUuid, EntityId>,
 }
 
 impl Population {
@@ -78,6 +104,81 @@ impl Population {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.entities.is_empty()
+    }
+
+    /// The entity mirroring a player, if they have one.
+    ///
+    /// The replication tracker's `exclude`: nobody needs to be told where they
+    /// are by the machine they are telling, and a client drawing its own body
+    /// through its own eyes sees the inside of its own head.
+    #[must_use]
+    pub fn player_entity(&self, uuid: &tiamot_core::PlayerUuid) -> Option<EntityId> {
+        self.players.get(uuid).copied()
+    }
+
+    /// Creates or updates the entity mirroring one player.
+    ///
+    /// Called every tick for every connected player, after their physics has
+    /// run — which is why none of this marks anything dirty. See
+    /// [`Population::transient`].
+    pub fn sync_player(
+        &mut self,
+        uuid: tiamot_core::PlayerUuid,
+        transform: Transform,
+        velocity: Velocity,
+        on_ground: bool,
+        anim: tiamot_core::ent::AnimTag,
+    ) -> EntityId {
+        if let Some(&id) = self.players.get(&uuid)
+            && let Some(entity) = self.entities.get_mut(id)
+        {
+            entity.transform = transform;
+            entity.velocity = velocity;
+            entity.on_ground = on_ground;
+            entity.anim = anim;
+            return id;
+        }
+
+        // `self.entities.spawn`, not `self.spawn`: the latter marks the chunk
+        // for saving, which is the one thing a mirror must never do.
+        let mut entity = Entity::at(transform, PLAYER_SOURCE);
+        entity.velocity = velocity;
+        entity.on_ground = on_ground;
+        entity.anim = anim;
+        entity.model = Some(tiamot_core::ent::HUMANOID_MODEL.to_owned());
+        // The player's own box, so a client culls the drawn body against the
+        // same shape the server collided it with (charter rule 2).
+        entity.collider = Some(phys::Shape::HUMANOID);
+        entity.owner = Some(tiamot_core::ent::Owner(uuid));
+        // The UUID and not the name (charter rule 13): the current display name
+        // is resolved when the spawn is sent, so a rebinding follows.
+        entity.nametag = Some(tiamot_core::ent::Nametag::Player(uuid));
+        let id = self.entities.spawn(entity);
+        self.transient.insert(id);
+        self.players.insert(uuid, id);
+        id
+    }
+
+    /// Removes the mirrors of players who are no longer connected.
+    ///
+    /// Takes the set that IS here rather than the one that left, because a
+    /// disconnect the tick never saw would otherwise leave a body standing in
+    /// the world for ever — and the roster is the thing the server is sure of.
+    pub fn retain_players(&mut self, present: &BTreeSet<tiamot_core::PlayerUuid>) {
+        let gone: Vec<tiamot_core::PlayerUuid> = self
+            .players
+            .keys()
+            .filter(|uuid| !present.contains(*uuid))
+            .copied()
+            .collect();
+        for uuid in gone {
+            if let Some(id) = self.players.remove(&uuid) {
+                self.transient.remove(&id);
+                // The arena directly, again: a mirror leaving must not mark a
+                // chunk for saving either.
+                self.entities.despawn(id);
+            }
+        }
     }
 
     /// Whether this chunk's entities have been read this session.
@@ -136,6 +237,18 @@ impl Population {
     /// back. Returns them in slot order, which is the order they must be
     /// written in — see [`tiamot_core::persist::WorldDb::load_chunk_entities`].
     pub fn freeze(&mut self, pos: ChunkPos) -> Vec<Entity> {
+        // A chunk somebody is standing in is not a chunk to unload, and the
+        // mirror in it is not something to write to disk. Refusing is the whole
+        // guard: `take_chunk` removes everything anchored to the chunk, so
+        // without this a player's body would be frozen out from under them and
+        // saved into the world file as a corpse.
+        if self.players.values().any(|id| {
+            self.entities
+                .get(*id)
+                .is_some_and(|held| held.chunk() == pos)
+        }) {
+            return Vec::new();
+        }
         self.loaded.remove(&pos);
         let frozen = self.entities.take_chunk(pos);
         if !frozen.is_empty() {
@@ -176,6 +289,7 @@ impl Population {
                 let ids = grouped.remove(&pos).unwrap_or_default();
                 let entities = ids
                     .into_iter()
+                    .filter(|id| !self.transient.contains(id))
                     .filter_map(|id| self.entities.get(id).cloned())
                     .collect();
                 (pos, entities)
@@ -213,6 +327,13 @@ impl Population {
     /// mod writing its transform; it simply does not fall.
     pub fn tick(&mut self, world: &World, fluid: &crate::fluid::Fluidics) {
         for id in self.entities.ids() {
+            // A player's mirror has already moved this tick, under its own
+            // inputs. Stepping it again would apply a second tick of gravity to
+            // a body that has had one — and the correction would arrive as the
+            // other players on your screen sinking into the floor.
+            if self.transient.contains(&id) {
+                continue;
+            }
             let Some(entity) = self.entities.get(id) else {
                 continue;
             };
@@ -402,6 +523,190 @@ mod tests {
                     .expect("place");
             }
         }
+    }
+
+    fn player() -> tiamot_core::PlayerUuid {
+        tiamot_core::identity::Identity::generate()
+            .expect("identity")
+            .uuid_as_root()
+    }
+
+    fn somewhere(chunk: ChunkPos) -> Transform {
+        Transform::at(chunk, [24.0, 4.0, 24.0])
+    }
+
+    #[test]
+    fn a_players_mirror_is_never_written_to_the_world() {
+        // The failure this exists for: a world file that saved players grows a
+        // corpse for everyone who ever visited, standing where they logged out,
+        // and every one of them comes back as a real entity on the next load.
+        let mut population = Population::new();
+        let home = ChunkPos::new(1, 0, 1);
+        let uuid = player();
+
+        population.sync_player(
+            uuid,
+            somewhere(home),
+            Velocity::default(),
+            true,
+            tiamot_core::ent::AnimTag::IDLE,
+        );
+        // A real mob in the same chunk, so the chunk genuinely needs saving and
+        // the test is about what goes IN the row rather than whether one exists.
+        population.spawn(Entity::at(somewhere(home), "test:mob"));
+
+        let saved = population.take_dirty();
+        let entities: Vec<&Entity> = saved
+            .iter()
+            .filter(|(pos, _)| *pos == home)
+            .flat_map(|(_, held)| held.iter())
+            .collect();
+        assert_eq!(entities.len(), 1, "the mirror was written to the world");
+        assert_eq!(entities[0].source, "test:mob");
+    }
+
+    #[test]
+    fn a_walking_player_does_not_dirty_every_chunk_they_cross() {
+        // A mirror is written every tick. If that marked its chunk for saving,
+        // one player walking would be a database write per chunk per tick, for
+        // as long as they kept moving.
+        let mut population = Population::new();
+        let uuid = player();
+        population.sync_player(
+            uuid,
+            somewhere(ChunkPos::new(0, 0, 0)),
+            Velocity::default(),
+            true,
+            tiamot_core::ent::AnimTag::IDLE,
+        );
+        assert!(
+            population.take_dirty().is_empty(),
+            "spawning a mirror dirtied a chunk"
+        );
+
+        for step in 1..8 {
+            population.sync_player(
+                uuid,
+                somewhere(ChunkPos::new(step, 0, 0)),
+                Velocity::default(),
+                true,
+                tiamot_core::ent::AnimTag::WALK,
+            );
+        }
+        assert!(
+            population.take_dirty().is_empty(),
+            "walking across chunks marked them for saving"
+        );
+    }
+
+    #[test]
+    fn a_mirror_is_updated_in_place_rather_than_respawned() {
+        // The id has to be stable: a client is told about entities by id, and a
+        // mirror that despawned and respawned every tick would be a spawn and a
+        // despawn message per player per tick, and a body that flickered.
+        let mut population = Population::new();
+        let uuid = player();
+        let first = population.sync_player(
+            uuid,
+            somewhere(ChunkPos::new(0, 0, 0)),
+            Velocity::default(),
+            true,
+            tiamot_core::ent::AnimTag::IDLE,
+        );
+        let again = population.sync_player(
+            uuid,
+            somewhere(ChunkPos::new(3, 0, 0)),
+            Velocity([1.0, 0.0, 0.0]),
+            false,
+            tiamot_core::ent::AnimTag::WALK,
+        );
+        assert_eq!(first, again);
+        assert_eq!(population.len(), 1);
+
+        let entity = population.get(first).expect("the mirror is there");
+        assert_eq!(entity.transform.chunk, ChunkPos::new(3, 0, 0));
+        assert_eq!(entity.anim, tiamot_core::ent::AnimTag::WALK);
+        assert!(!entity.on_ground);
+        assert_eq!(entity.owner.map(|owner| owner.0), Some(uuid));
+        assert_eq!(entity.source, PLAYER_SOURCE);
+    }
+
+    #[test]
+    fn a_player_who_leaves_takes_their_body_with_them() {
+        let mut population = Population::new();
+        let stays = player();
+        let goes = player();
+        for uuid in [stays, goes] {
+            population.sync_player(
+                uuid,
+                somewhere(ChunkPos::new(0, 0, 0)),
+                Velocity::default(),
+                true,
+                tiamot_core::ent::AnimTag::IDLE,
+            );
+        }
+        assert_eq!(population.len(), 2);
+
+        population.retain_players(&BTreeSet::from([stays]));
+        assert_eq!(population.len(), 1);
+        assert!(population.player_entity(&goes).is_none());
+        assert!(population.player_entity(&stays).is_some());
+        assert!(
+            population.take_dirty().is_empty(),
+            "a player logging out marked a chunk for saving"
+        );
+    }
+
+    #[test]
+    fn a_mirror_is_not_stepped_by_the_entity_physics() {
+        // Its physics already ran, from the player's own inputs. A second step
+        // would be a second tick of gravity, and the correction arrives as the
+        // other players on your screen sinking into the floor.
+        let mut world = world();
+        let home = ChunkPos::new(0, 0, 0);
+        world.chunk(home, &mut Empty).expect("chunk");
+
+        let mut population = Population::new();
+        let uuid = player();
+        let id = population.sync_player(
+            uuid,
+            somewhere(home),
+            Velocity::default(),
+            true,
+            tiamot_core::ent::AnimTag::IDLE,
+        );
+        let before = population.get(id).expect("mirror").transform;
+
+        let fluid = crate::fluid::Fluidics::default();
+        for _ in 0..10 {
+            population.tick(&world, &fluid);
+        }
+
+        let after = population.get(id).expect("mirror").transform;
+        assert_eq!(
+            before.local, after.local,
+            "the mirror fell; the player's own physics is the only thing that may move it"
+        );
+    }
+
+    #[test]
+    fn a_chunk_somebody_is_standing_in_is_not_frozen() {
+        let mut population = Population::new();
+        let home = ChunkPos::new(2, 0, 2);
+        population.sync_player(
+            player(),
+            somewhere(home),
+            Velocity::default(),
+            true,
+            tiamot_core::ent::AnimTag::IDLE,
+        );
+        population.spawn(Entity::at(somewhere(home), "test:mob"));
+
+        assert!(
+            population.freeze(home).is_empty(),
+            "a chunk with a player in it was unloaded, taking their body with it"
+        );
+        assert_eq!(population.len(), 2, "freezing removed entities anyway");
     }
 
     #[test]
