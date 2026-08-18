@@ -331,6 +331,49 @@ function game.register_on_tick(callback) end
 ---@return { sun: integer, r: integer, g: integer, b: integer }
 function game.get_light(position) end
 
+---Whether one point in the world can see another.
+---
+---**Positions are POINTS, not bodies.** This is a single line between two
+---coordinates. If you mean "can this mob see that one", raise both ends to eye
+---height yourself — a line drawn between two sets of feet clips the floor they
+---are both standing on, and the engine has no idea where your mob keeps its
+---eyes.
+---
+---Coordinates are world BLOCKS, as plain floats, the same as
+---`game.spawn_entity` and `game.entity` speak. Fractions are kept: the test
+---runs at sub-node resolution, so half a block matters and is not rounded away.
+---
+---Three answers, and the third is not a kind of `false`:
+---
+---* `true` — nothing solid stands between them.
+---* `false` — something does; or they are more than 64 blocks apart; or the
+---  line crosses terrain the server has not loaded. All three are "no" to what
+---  you were really asking, and unloaded terrain reads as solid everywhere else
+---  in the engine too.
+---* `nil` — the engine had no world to look through at that moment. This
+---  happens in `register_on_generate` (you are *making* the chunk you would be
+---  asking about) and in a test with no server. **It is not "I could not see
+---  it"** — a mob that stops following because it got `nil` looks exactly like
+---  a mob that lost sight of you, and the two have completely different fixes.
+---  Lua treats `nil` as false in a condition, so ignoring the difference is
+---  safe; the distinction is there for when you are debugging.
+---
+---Available from `register_on_tick` and from an entity's step callback, which
+---is where perception belongs. The cost is cells walked, so it is cheap over
+---short distances and capped at 64 blocks.
+---
+---```lua
+---local me = game.entity(id)
+---local eye = { x = me.pos.x, y = me.pos.y + 1.5, z = me.pos.z }
+---if game.line_of_sight(eye, { x = target.x, y = target.y + 1.5, z = target.z }) then
+---    -- it is in view
+---end
+---```
+---@param from { x: number, y: number, z: number }
+---@param to { x: number, y: number, z: number }
+---@return boolean|nil visible `true` clear, `false` blocked, `nil` no world to look through
+function game.line_of_sight(from, to) end
+
 ---Fields accepted by `game.register_fluid`.
 ---@class Tiamot.FluidSpec
 ---@field id string Unqualified id. `"milk"` from mod `core_milk` becomes `"core_milk:milk"`.

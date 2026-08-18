@@ -797,6 +797,16 @@ pub trait ScriptVm: Sized {
     /// Points `game.storage` at the server's store.
     fn set_storage_access(&mut self, access: std::sync::Arc<dyn crate::storage::Access>);
 
+    /// Points `game.line_of_sight` at the world.
+    ///
+    /// **Unlike every other setter here, what is behind this handle appears and
+    /// disappears within a tick.** The world is not a store the server can hand
+    /// over once: the tick thread owns it and holds it mutably through chunk
+    /// generation and every edit, so it is lent out for the part of the tick
+    /// that runs mod callbacks and taken back afterwards. A mod that reads it
+    /// outside that window is told so — see [`crate::sight::Access`].
+    fn set_sight_access(&mut self, access: std::sync::Arc<dyn crate::sight::Access>);
+
     /// Runs every registered `on_generate` callback for one chunk.
     ///
     /// # Errors

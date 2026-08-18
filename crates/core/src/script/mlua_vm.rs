@@ -231,6 +231,13 @@ pub struct MluaVm {
     entities: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::ent::Access>>>>,
     /// Where `game.storage` reaches, once there is a world.
     storage: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::storage::Access>>>>,
+    /// Where `game.line_of_sight` looks, while the tick has lent the world out.
+    ///
+    /// Unlike every other slot here, what is behind this one comes and goes
+    /// *within* a tick — see `server::sight`. The handle is installed once and
+    /// answers `Unavailable` whenever the engine is mid-edit, which is why the
+    /// Lua function has a third return value and the others do not.
+    sight: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::sight::Access>>>>,
 }
 
 /// Where a world's clock starts when the sky mod does not say.
@@ -490,6 +497,7 @@ impl ScriptVm for MluaVm {
             fluid: std::sync::Arc::new(std::sync::Mutex::new(None)),
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
             storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            sight: std::sync::Arc::new(std::sync::Mutex::new(None)),
             edits: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         // Installed here rather than in a second constructor the caller has to
@@ -550,6 +558,12 @@ impl ScriptVm for MluaVm {
 
     fn set_storage_access(&mut self, access: std::sync::Arc<dyn crate::storage::Access>) {
         if let Ok(mut slot) = self.storage.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_sight_access(&mut self, access: std::sync::Arc<dyn crate::sight::Access>) {
+        if let Ok(mut slot) = self.sight.lock() {
             *slot = Some(access);
         }
     }
@@ -1341,6 +1355,60 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))
     }
 
+    /// The `game.line_of_sight` function, built once per mod environment.
+    ///
+    /// # Three answers, not two
+    ///
+    /// `true` and `false` are about the world; `nil` means the engine could not
+    /// look — the world was mid-edit, or there is no server behind the VM at
+    /// all. Collapsing that into `false` would have been kinder to write and
+    /// worse to debug: a mimic that stopped following would look like a mimic
+    /// that lost sight of you, and no amount of staring at the mod would say
+    /// otherwise. Lua treats `nil` as false in a condition, so a mod that does
+    /// not care gets the safe behaviour for free, and one that does can tell.
+    ///
+    /// The mod id is captured so the warning names the mod that asked. A mod
+    /// reading the world from `on_generate` is making a mistake worth seeing in
+    /// the log, and the log is the only place it can be seen.
+    fn sight_reader(&self, mod_id: &str) -> Result<mlua::Function, ScriptError> {
+        let sight = std::sync::Arc::clone(&self.sight);
+        let owner = mod_id.to_owned();
+        self.lua
+            .create_function(move |_, (from, to): (Table, Table)| {
+                let point = |table: &Table| -> mlua::Result<[f64; 3]> {
+                    Ok([table.get("x")?, table.get("y")?, table.get("z")?])
+                };
+                let from = point(&from)?;
+                let to = point(&to)?;
+
+                let guard = sight.lock().map_err(|_| {
+                    mlua::Error::external(
+                        "the world lease is poisoned; the simulation thread panicked",
+                    )
+                })?;
+                let answer = guard
+                    .as_ref()
+                    .map_or(crate::sight::Sighting::Unavailable, |access| {
+                        access.line_of_sight(from, to)
+                    });
+
+                Ok(match answer {
+                    crate::sight::Sighting::Clear => mlua::Value::Boolean(true),
+                    crate::sight::Sighting::Blocked => mlua::Value::Boolean(false),
+                    crate::sight::Sighting::Unavailable => {
+                        tracing::debug!(
+                            mod_id = %owner,
+                            "game.line_of_sight was asked while there was no world to look \
+                             through; it is available from on_tick and an entity's on_step, \
+                             and not from on_generate"
+                        );
+                        mlua::Value::Nil
+                    }
+                })
+            })
+            .map_err(|err| self.vm_error(&err))
+    }
+
     /// The `game.set_block` function, built once per mod environment.
     ///
     /// Its own method for the reason `light_reader` is: it is part of the frozen
@@ -1839,6 +1907,10 @@ impl MluaVm {
 
         let get_light = self.light_reader()?;
         game.set("get_light", get_light)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let line_of_sight = self.sight_reader(mod_id)?;
+        game.set("line_of_sight", line_of_sight)
             .map_err(|err| self.vm_error(&err))?;
 
         // The bulk noise entry point. Takes a whole region and returns a native
@@ -2892,6 +2964,28 @@ mod tests {
         }
     }
 
+    /// A world that answers whatever a test told it to, and remembers what it
+    /// was asked. The engine's own answer is tested in `crate::sight`; what is
+    /// under test here is the trip through Lua.
+    #[derive(Default)]
+    struct Eye {
+        reply: std::sync::Mutex<Option<crate::sight::Sighting>>,
+        asked: std::sync::Mutex<Vec<([f64; 3], [f64; 3])>>,
+    }
+
+    impl crate::sight::Access for Eye {
+        fn line_of_sight(&self, from: [f64; 3], to: [f64; 3]) -> crate::sight::Sighting {
+            if let Ok(mut asked) = self.asked.lock() {
+                asked.push((from, to));
+            }
+            self.reply
+                .lock()
+                .ok()
+                .and_then(|reply| *reply)
+                .unwrap_or(crate::sight::Sighting::Unavailable)
+        }
+    }
+
     /// An edit queue a test can look inside.
     #[derive(Default)]
     struct Slate {
@@ -3838,6 +3932,87 @@ mod tests {
         let blocks = vm.block_ids();
         assert!(blocks.contains_key("mymod:white"), "{blocks:?}");
         assert!(blocks["mymod:white"].get() >= 2, "reserved ids are 0 and 1");
+    }
+
+    /// A mod that turns whatever `game.line_of_sight` returned into a block
+    /// edit, so a test can see the exact Lua value rather than a proxy for it.
+    const SIGHT_MOD: &str = "game.register_on_tick(function()\n\
+           local seen = game.line_of_sight({x=1.5,y=2.5,z=3.5}, {x=4.5,y=5.5,z=6.5})\n\
+           if seen == true then\n\
+             game.set_block({x=1,y=0,z=0}, 'test:clear')\n\
+           elseif seen == false then\n\
+             game.set_block({x=2,y=0,z=0}, 'test:blocked')\n\
+           else\n\
+             game.set_block({x=3,y=0,z=0}, 'test:unknown')\n\
+           end\n\
+         end)";
+
+    #[test]
+    fn line_of_sight_reports_clear_blocked_and_unknown_separately() {
+        // The three answers are the whole design: `nil` is not a third flavour
+        // of "no". A mod that cannot tell "I lost sight of you" from "I was
+        // asked while the engine had no world" has no way to debug a mob that
+        // stopped following, which is the failure this API was shaped around.
+        let mut vm = vm();
+        let slate = std::sync::Arc::new(Slate::default());
+        vm.set_world_edit(
+            std::sync::Arc::clone(&slate) as std::sync::Arc<dyn crate::script::WorldEdit>
+        );
+        let eye = std::sync::Arc::new(Eye::default());
+
+        load(&mut vm, "watcher", SIGHT_MOD).expect("load");
+        let _ = vm.freeze();
+
+        // No world installed at all — a test with no server behind the VM, and
+        // the same answer worldgen gets.
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        vm.set_sight_access(std::sync::Arc::clone(&eye) as std::sync::Arc<dyn crate::sight::Access>);
+
+        *eye.reply.lock().expect("reply") = Some(crate::sight::Sighting::Clear);
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        *eye.reply.lock().expect("reply") = Some(crate::sight::Sighting::Blocked);
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        // Installed, but the world is not lent right now.
+        *eye.reply.lock().expect("reply") = Some(crate::sight::Sighting::Unavailable);
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        let written = slate.written.lock().expect("slate");
+        let names: Vec<&str> = written.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["test:unknown", "test:clear", "test:blocked", "test:unknown"],
+            "a sighting reached Lua as the wrong value"
+        );
+    }
+
+    #[test]
+    fn line_of_sight_passes_world_blocks_through_unrounded() {
+        // Charter rule 7 and the entity API's own rule: mods speak world blocks
+        // as plain floats, and a sight test that rounded its ends to whole
+        // blocks would answer about a line nobody asked about — which at
+        // sub-node resolution is a different line by up to three cells.
+        let mut vm = vm();
+        let slate = std::sync::Arc::new(Slate::default());
+        vm.set_world_edit(
+            std::sync::Arc::clone(&slate) as std::sync::Arc<dyn crate::script::WorldEdit>
+        );
+        let eye = std::sync::Arc::new(Eye::default());
+        *eye.reply.lock().expect("reply") = Some(crate::sight::Sighting::Clear);
+        vm.set_sight_access(std::sync::Arc::clone(&eye) as std::sync::Arc<dyn crate::sight::Access>);
+
+        load(&mut vm, "watcher", SIGHT_MOD).expect("load");
+        let _ = vm.freeze();
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        let asked = eye.asked.lock().expect("asked");
+        assert_eq!(
+            asked.as_slice(),
+            &[([1.5, 2.5, 3.5], [4.5, 5.5, 6.5])],
+            "the points the mod named are not the points the engine was asked about"
+        );
     }
 }
 

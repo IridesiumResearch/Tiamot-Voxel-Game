@@ -28,6 +28,7 @@ pub mod handle;
 pub mod light;
 pub mod rcon;
 pub mod shutdown;
+pub mod sight;
 pub mod sim;
 pub mod storage;
 pub mod trace;

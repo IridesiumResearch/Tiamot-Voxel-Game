@@ -864,7 +864,7 @@ impl ServerHandle {
                     // The seed is only used if the world has none yet — an
                     // existing world keeps the seed it was created with, or
                     // terrain beyond the explored edge would change shape.
-                    let mut world = match crate::world::World::open(world, new_seed) {
+                    let world = match crate::world::World::open(world, new_seed) {
                         Ok(world) => world,
                         Err(err) => {
                             error!("could not read the world seed: {err}");
@@ -909,6 +909,14 @@ impl ServerHandle {
                     let mod_storage = std::sync::Arc::new(std::sync::RwLock::new(
                         crate::storage::ModStorage::new(),
                     ));
+
+                    // The world itself, lent to the mods for the part of each
+                    // tick that runs their callbacks. Not a lock like the four
+                    // above, and `crates/server/src/sight.rs` says why: the tick
+                    // holds the world mutably through generation and every edit,
+                    // so the only safe handle is one that is empty except while
+                    // it is deliberately lent.
+                    let sight = crate::sight::Lease::new();
 
                     // Either the mods generate terrain, or there are no mods
                     // and the world is air. Both are legitimate.
@@ -964,6 +972,12 @@ impl ServerHandle {
                                     block_names,
                                 ),
                             ));
+                            // And the world, which is how a mod finds out
+                            // whether it can see something. There is nothing to
+                            // clone here: the handle is empty until a tick lends
+                            // the world into it.
+                            host.vm_mut()
+                                .set_sight_access(std::sync::Arc::new(sight.handle()));
                             crate::world::Generator::Mods(Box::new(
                                 crate::world::ModGenerator::new(host),
                             ))
@@ -978,8 +992,19 @@ impl ServerHandle {
                         tiamot_core::ent::Tracker,
                     > = std::collections::BTreeMap::new();
 
+                    // The world lives in an `Option` for the tick's duration so
+                    // that the tick body can MOVE it into the sight lease and
+                    // take it back. Moving rather than borrowing is what makes
+                    // the lending window compiler-enforced: between the two the
+                    // tick has no world, so there is nothing for a mod's read to
+                    // race with. The cost is one `Option` move per tick.
+                    let mut held = Some(world);
+
                     let mut clock = sim::MonotonicClock::new();
                     sim::run(&mut clock, &control, |tick| {
+                        let mut world = held
+                            .take()
+                            .expect("the world is put back at the end of every tick");
                         // Every block edited this tick, relit once at the end
                         // rather than four times in the middle. Batching is
                         // what makes the cost of a swarm of players placing
@@ -1502,9 +1527,19 @@ impl ServerHandle {
                         // `dt_ticks` is 1 here because the loop calls `step`
                         // once per tick even when catching up — the catch-up
                         // is several calls, not one call with a bigger number.
-                        for (mod_id, err) in source.tick(1) {
-                            error!(mod_id = %mod_id, "mod disabled after a tick failure: {err}");
-                        }
+                        //
+                        // **The world is lent to the mods here** and taken back
+                        // on the next line — see `crate::sight`. The tick cannot
+                        // touch `world` inside the closure because it no longer
+                        // has one, which is the point: a mod reading terrain is
+                        // reading a world nothing else is halfway through
+                        // changing.
+                        let (returned, ()) = sight.lending(world, || {
+                            for (mod_id, err) in source.tick(1) {
+                                error!(mod_id = %mod_id, "mod disabled after a tick failure: {err}");
+                            }
+                        });
+                        world = returned;
 
                         // Serve chunk requests. Bounded per tick by
                         // CHUNKS_PER_TICK: encoding is real work on this
@@ -1677,12 +1712,19 @@ impl ServerHandle {
                         // than the one after — which at 20 Hz is the difference
                         // between a mob that turns when you do and one that
                         // always lags you by 50 ms.
+                        //
+                        // Lent the world, like the tick hooks above: this is
+                        // where a mob decides what to do, so it is exactly where
+                        // `game.line_of_sight` has to work.
                         {
                             let owned = population.read().expect("entity lock").owned_by_mod();
                             if !owned.is_empty() {
-                                for (mod_id, err) in source.entity_step(&owned, 1) {
-                                    error!(mod_id = %mod_id, "entity step failed: {err}");
-                                }
+                                let (returned, ()) = sight.lending(world, || {
+                                    for (mod_id, err) in source.entity_step(&owned, 1) {
+                                        error!(mod_id = %mod_id, "entity step failed: {err}");
+                                    }
+                                });
+                                world = returned;
                             }
                         }
 
@@ -1899,7 +1941,11 @@ impl ServerHandle {
                                 }
                             }
                         }
+
+                        held = Some(world);
                     });
+
+                    let mut world = held.expect("the last tick put the world back");
 
                     // The network thread is already stopped by the time this
                     // returns, so a blocking lock here cannot contend with a

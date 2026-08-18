@@ -81,6 +81,7 @@ pub mod proto;
 #[cfg(feature = "script")]
 pub mod script;
 pub mod session;
+pub mod sight;
 pub mod sky;
 pub mod storage;
 pub mod tick;
