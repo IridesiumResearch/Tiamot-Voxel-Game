@@ -74,6 +74,20 @@ jobs:
       - name: Twenty bots placing and removing lamps
         run: cargo test -p bot --test lamp_load --release -- --ignored --nocapture
 
+  entity-load:
+    name: entity swarm (200 mobs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Task 12's stated load test. Two hundred scripted mobs in one area, each
+      # running a Lua callback with its own instruction budget every tick, all
+      # of them inside a viewer's cylinder so replication is measured too.
+      - name: Two hundred scripted mobs for thirty seconds
+        run: cargo test -p bot --test entity_load --release -- --ignored --nocapture
+
   micro-bench:
     name: criterion micro-benchmarks
     runs-on: ubuntu-latest

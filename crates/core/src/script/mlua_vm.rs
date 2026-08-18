@@ -5316,6 +5316,73 @@ mod entity_tests {
     }
 
     #[test]
+    fn a_runaway_entity_step_is_cut_off_rather_than_hanging_the_tick() {
+        // Charter rule 10: a mod error disables that mod, never kills the tick.
+        // An infinite loop inside a per-entity callback is the shape of that
+        // error most likely to reach a real server, because a mob's behaviour
+        // is a state machine and a state machine is where a `while` goes.
+        let (mut vm, _store) = vm_with_entities();
+        load(
+            &mut vm,
+            "runaway",
+            "game.register_on_entity_step(function() while true do end end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        let fault = vm
+            .entity_step("runaway", &[1], 1)
+            .expect("the VM itself should survive")
+            .expect("the runaway should have been stopped");
+        assert_eq!(fault.0, "runaway");
+        assert!(
+            vm.faulted_mods().contains(&"runaway".to_owned()),
+            "the mod was not disabled"
+        );
+    }
+
+    #[test]
+    fn every_entity_gets_its_own_instruction_budget() {
+        // **The property the load test cannot show and this one can.** A budget
+        // shared across the tick would let the first few mobs spend it and
+        // starve the rest, and the symptom on a server would be "my mod works
+        // with ten mobs and breaks at a hundred" — with nothing in the log to
+        // say why.
+        //
+        // Each callback burns a large, BOUNDED number of instructions: enough
+        // that a shared budget would be gone within a handful of entities, and
+        // comfortably inside one call's allowance. Two hundred of them, which
+        // is the task's own number.
+        let (mut vm, _store) = vm_with_entities();
+        load(
+            &mut vm,
+            "busy",
+            "seen = 0\n\
+             game.register_on_entity_step(function()\n\
+               local total = 0\n\
+               for i = 1, 20000 do total = total + i end\n\
+               seen = seen + 1\n\
+             end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        let ids: Vec<u64> = (1..=200).collect();
+        let fault = vm
+            .entity_step("busy", &ids, 1)
+            .expect("the VM should survive");
+        assert!(
+            fault.is_none(),
+            "an entity ran out of budget, so the budget is shared: {fault:?}"
+        );
+        vm.eval_in(
+            "busy",
+            "assert(seen == 200, 'only ' .. seen .. ' of 200 entities ran')",
+        )
+        .expect("every entity should have been stepped");
+    }
+
+    #[test]
     fn a_mod_that_registered_no_entity_callback_is_not_a_stepper() {
         let (mut vm, _store) = vm_with_entities();
         load(&mut vm, "quiet", "game.register_on_tick(function() end)").expect("load");
