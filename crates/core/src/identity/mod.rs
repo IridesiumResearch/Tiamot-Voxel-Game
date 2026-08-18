@@ -60,7 +60,7 @@ pub const NONCE_BYTES: usize = 32;
 ///
 /// **Never changes**, whatever happens to the key set — devices added, keys
 /// rotated, keys revoked. That stability is what lets every other system key on
-/// it: inventory, ownership, bans, mod storage, and later the mimic imprint all
+/// it: inventory, ownership, bans, and mod storage all
 /// use the UUID and never the display name.
 /// Serialised as its 32 raw bytes, which is what makes it usable as a key in
 /// anything that persists — an entity's owner, a nametag bound to a player, a

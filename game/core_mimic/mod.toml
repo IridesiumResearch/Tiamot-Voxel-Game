@@ -1,0 +1,12 @@
+# The one default mob, and the mod API's acceptance test.
+#
+# Everything the Mimic does happens through the public API. If any of it had
+# needed engine support a third-party mod could not reach, that would be a bug
+# in the API rather than something to work around here — charter rule 1. The
+# test that says so is a grep: the string "mimic" appears nowhere outside
+# `game/`.
+id = "core_mimic"
+name = "Core Mimic"
+version = "0.1.0"
+description = "The blank-white mimic of the first player to join. A test fixture, not a game."
+license = "GPL-3.0-only"

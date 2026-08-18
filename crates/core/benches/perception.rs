@@ -103,7 +103,7 @@ fn perception(c: &mut Criterion) {
     let open = Field::flat();
     let sealed = Field::flat().walled();
 
-    // The mimic's own check: thirty-two yards, which is the radius the task
+    // A follower's own check: thirty-two yards, which is the radius the task
     // gives it. Once per mob per tick.
     c.bench_function("sight/32 blocks, clear", |b| {
         b.iter(|| {

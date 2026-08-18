@@ -1109,7 +1109,8 @@ impl Bot {
     ///
     /// The filter is a closure rather than a struct of optional fields because
     /// every scenario wants a different question — "the one called Alice", "any
-    /// humanoid", "the mimic" — and a filter type would grow a field per test.
+    /// humanoid", "the one that follows people" — and a filter type would grow a
+    /// field per test.
     ///
     /// # Errors
     ///

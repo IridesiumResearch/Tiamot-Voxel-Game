@@ -347,9 +347,18 @@ impl PlayerSim {
 pub fn anim_from_motion(
     intent: tiamot_core::phys::Intent,
     body: &tiamot_core::phys::Body,
+    digging: bool,
 ) -> tiamot_core::ent::AnimTag {
     use tiamot_core::ent::AnimTag;
     use tiamot_core::phys::Gait;
+
+    // Swinging beats everything, including standing still: the arm is the part
+    // anyone is looking at. This is the only reason the server knows about a
+    // dig here at all — it already tracks one to decide when the block breaks,
+    // and a body that mines without moving its arms reads as broken.
+    if digging {
+        return AnimTag::SWING;
+    }
 
     if matches!(intent.gait, Gait::Sneak) {
         return AnimTag::SNEAK;

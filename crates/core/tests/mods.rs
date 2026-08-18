@@ -61,6 +61,7 @@ fn the_reference_mods_load_in_dependency_order() {
         vec![
             "core",
             "core_milk",
+            "core_mimic",
             "core_sky",
             "core_tools",
             "core_worldgen"

@@ -836,7 +836,7 @@ mod tests {
     fn every_step_of_a_route_is_somewhere_the_body_could_be() {
         // The property that matters to a mob walking it: no step teleports, and
         // every one is standable. A route that satisfied the goal test and
-        // nothing else would still be a route the mimic falls off.
+        // nothing else would still be a route a mob falls off.
         let world = field().solid(BlockPos::new(4, 1, 4));
         let route = found(search(
             &world,

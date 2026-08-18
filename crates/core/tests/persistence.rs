@@ -1003,9 +1003,9 @@ fn an_entity_written_by_a_newer_format_is_refused_rather_than_guessed_at() {
 
 #[test]
 fn a_mods_facts_survive_a_restart_and_stay_its_own() {
-    // The Mimic's imprint is exactly this: a fact about the world that is not
-    // attached to a block, a chunk or an entity, and that has to be the same
-    // fact after the server comes back up.
+    // A mob imprinting on a player is exactly this: a fact about the world that
+    // is not attached to a block, a chunk or an entity, and that has to be the
+    // same fact after the server comes back up.
     use tiamot_core::storage::{Bag, Value};
 
     let path = scratch("mod-storage");
@@ -1018,7 +1018,7 @@ fn a_mods_facts_survive_a_restart_and_stay_its_own() {
         mine.insert("imprint".into(), Value::uuid(uuid));
         mine.insert("greeted".into(), Value::Flag(true));
         mine.insert("count".into(), Value::Number(3.5));
-        db.save_mod_storage("core_mimic", &mine).expect("save mine");
+        db.save_mod_storage("a_mod", &mine).expect("save mine");
 
         let mut theirs = Bag::new();
         theirs.insert("imprint".into(), Value::Text("not a uuid".into()));
@@ -1027,7 +1027,7 @@ fn a_mods_facts_survive_a_restart_and_stay_its_own() {
     }
 
     let db = WorldDb::open(&path, &mut registry).expect("reopen");
-    let mine = db.load_mod_storage("core_mimic").expect("load mine");
+    let mine = db.load_mod_storage("a_mod").expect("load mine");
     assert_eq!(
         mine.get("imprint").and_then(Value::as_uuid),
         Some(uuid),
@@ -1056,7 +1056,7 @@ fn a_mods_facts_survive_a_restart_and_stay_its_own() {
     );
     assert_eq!(
         db.mods_with_storage().expect("index"),
-        vec!["core_mimic".to_owned(), "someone_else".to_owned()]
+        vec!["a_mod".to_owned(), "someone_else".to_owned()]
     );
 }
 

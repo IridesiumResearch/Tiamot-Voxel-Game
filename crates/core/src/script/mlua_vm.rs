@@ -1400,9 +1400,9 @@ impl MluaVm {
     /// `true` and `false` are about the world; `nil` means the engine could not
     /// look — the world was mid-edit, or there is no server behind the VM at
     /// all. Collapsing that into `false` would have been kinder to write and
-    /// worse to debug: a mimic that stopped following would look like a mimic
-    /// that lost sight of you, and no amount of staring at the mod would say
-    /// otherwise. Lua treats `nil` as false in a condition, so a mod that does
+    /// worse to debug: a mob that stopped following would look exactly like a
+    /// mob that lost sight of you, and no amount of staring at the mod would
+    /// say otherwise. Lua treats `nil` as false in a condition, so a mod that does
     /// not care gets the safe behaviour for free, and one that does can tell.
     ///
     /// The mod id is captured so the warning names the mod that asked. A mod

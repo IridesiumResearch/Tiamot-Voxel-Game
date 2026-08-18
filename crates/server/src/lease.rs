@@ -378,8 +378,8 @@ mod tests {
     fn terrain_the_world_has_not_loaded_blocks() {
         // The difference this test exists for: `Blocked` is an answer about the
         // world and `Unavailable` is an answer about the engine, and a mod that
-        // cannot tell them apart cannot tell "the mimic lost sight of you"
-        // from "the mimic was asked at the wrong moment".
+        // cannot tell them apart cannot tell "the mob lost sight of you"
+        // from "the mob was asked at the wrong moment".
         let lease = Lease::new();
         let handle = lease.handle();
 

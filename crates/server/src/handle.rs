@@ -134,11 +134,28 @@ fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
 fn resolve_nametag(label: &tiamot_core::ent::Nametag, shared: &Shared) -> Option<String> {
     match label {
         tiamot_core::ent::Nametag::Text(text) => Some(text.clone()),
+        // **The identity registry, not the list of who is connected.** Charter
+        // rule 13 makes a display name a per-server claim bound to a UUID, and
+        // the binding outlives the session — so a label naming somebody who
+        // logged out an hour ago still has a name to render. Reading the online
+        // roster instead made every such label blank, which looks like a bug in
+        // whatever put the label there.
+        //
+        // `try_lock`: a tick must never wait on a registry that is mid-join.
+        // The online roster is the fallback for exactly that moment, and it has
+        // the answer for anyone connected, which is when it matters most.
         tiamot_core::ent::Nametag::Player(uuid) => shared
-            .online
-            .lock()
+            .identities
+            .try_lock()
             .ok()
-            .and_then(|online| online.get(uuid).cloned()),
+            .and_then(|identities| identities.name_of(uuid).map(str::to_owned))
+            .or_else(|| {
+                shared
+                    .online
+                    .lock()
+                    .ok()
+                    .and_then(|online| online.get(uuid).cloned())
+            }),
     }
 }
 
@@ -1179,6 +1196,7 @@ impl ServerHandle {
                                 player.anim = crate::transport::anim_from_motion(
                                     intent,
                                     &player.body,
+                                    player.dig.is_some(),
                                 );
                                 // **The server's half of the picture.** A client
                                 // log established that the two simulations part

@@ -620,7 +620,7 @@ pub struct PunchEvent {
 /// # Why the engine does not say whether this is their first time
 ///
 /// It knows, and telling you would be content. "First-ever join" is a rule a
-/// mod invents — a mimic imprints on one, a tutorial greets one, a shop gives
+/// mod invents — a mob imprints on one, a tutorial greets one, a shop gives
 /// one a starting stack — and every one of them wants a different definition of
 /// first. `game.storage` is how a mod remembers what it has seen, so the fact
 /// belongs there rather than in an engine field that would be right for exactly

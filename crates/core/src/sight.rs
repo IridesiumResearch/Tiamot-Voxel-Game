@@ -23,7 +23,7 @@
 //! # A ray, at sub-node resolution
 //!
 //! [`crate::phys::ray::cast`] already walks the grid a cell at a time, and it is
-//! the same traversal the player's crosshair uses. Reusing it means a mimic and
+//! the same traversal the player's crosshair uses. Reusing it means a mob and
 //! a pickaxe agree about what a chiselled block blocks, which is Sub-Node
 //! Contract §2 applied to sight — a slab you can see over is a slab you can
 //! stand on, and there is one implementation deciding both.
@@ -244,7 +244,7 @@ mod tests {
     fn an_unloaded_chunk_blocks() {
         // Charter-wide rule: absence reads as solid. A mob does not get to see
         // through terrain the server has not loaded — and this is the case that
-        // makes the mimic stop at the edge of what is streamed rather than
+        // makes a follower stop at the edge of what is streamed rather than
         // chase through it.
         let world = Loaded::default().air(ChunkPos::new(0, 0, 0));
         assert!(!between(&world, [1.5, 1.5, 1.5], [20.0, 1.5, 1.5]));
