@@ -11,7 +11,9 @@ pub mod frame;
 pub mod impair;
 pub mod stream;
 
-pub use endpoint::{Shared, TransportError, accept_loop, anim_from_motion, bind, server_config};
+pub use endpoint::{
+    SWING_TICKS, Shared, TransportError, accept_loop, anim_from_motion, bind, server_config,
+};
 pub use frame::FrameError;
 pub use impair::{Impairment, Link};
 pub use stream::Streamer;

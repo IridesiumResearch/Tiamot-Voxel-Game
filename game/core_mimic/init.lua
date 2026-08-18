@@ -29,6 +29,13 @@ local FLEE_TICKS = 60 -- three seconds of running away after a punch
 local WANDER_TICKS = 50 -- how often it picks a new idle direction
 local WANDER_BLOCKS = 6 -- how far from home it will drift
 local TRAIL_SLACK = 20 -- breadcrumbs kept past the delay, for jitter
+local KNOCKBACK = 1.6 -- cells per tick a punch shoves it, about three blocks a second
+
+-- Animation tags, as the engine numbers them. Named because `anim = 1` in the
+-- middle of a state machine says nothing about what it means.
+local ANIM_IDLE = 0
+local ANIM_WALK = 1
+local ANIM_RUN = 2
 
 -- The four ways it paces while idle, in order.
 local WANDER_FACES = { { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } }
@@ -89,21 +96,30 @@ end
 --- lip and swims exactly as a player does. Setting `pos` would teleport it,
 --- and a mob that slides through walls is not eerie, it is broken.
 local function steer(id, self_pos, target, gait, anim)
+    local dx, dz = target.x - self_pos.x, target.z - self_pos.z
     if distance(self_pos, target) < 0.35 then
-        game.set_entity(id, { drive = { walk = { x = 0, z = 0 } }, anim = anim or 0 })
+        -- **Standing still is ANIM_IDLE**, and it has to be said explicitly:
+        -- `anim or ANIM_IDLE` looks like it does this and does not. Lua's `or`
+        -- falls through on `false` and `nil` only, and every animation tag —
+        -- including zero — is truthy, so that expression is just `anim`. A
+        -- mimic that stopped went on walking on the spot.
+        game.set_entity(id, { drive = { walk = { x = 0, z = 0 } }, anim = ANIM_IDLE })
         return
     end
     -- Magnitude is ignored — the gait decides how fast anything moves — so this
     -- is a direction and nothing more.
     game.set_entity(id, {
-        drive = {
-            walk = { x = target.x - self_pos.x, z = target.z - self_pos.z },
-            gait = gait or "walk",
-        },
-        -- Facing follows travel. The engine has no opinion about where a mob
-        -- looks; it is presentation, and this is the mod's decision to make.
-        yaw = 0,
-        anim = anim or 1,
+        drive = { walk = { x = dx, z = dz }, gait = gait or "walk" },
+        -- **Facing follows travel.** The engine has no opinion about where a
+        -- mob looks — `Transform.yaw` is presentation and nothing in the
+        -- physics reads it — so pointing the body is this mod's job, and a
+        -- mimic that never turned faced north for ever.
+        --
+        -- `atan` is a transcendental, which charter rule 4 bans from the
+        -- SIMULATION. This is not simulation: a heading changes nothing about
+        -- where anything is, and the engine sends it quantised to a byte.
+        yaw = math.atan(dx, dz),
+        anim = anim or ANIM_WALK,
     })
 end
 
@@ -121,9 +137,43 @@ end)
 
 -- **Being hit.** The engine has no damage model and this mob deals none; a
 -- punch is only a reason to be somewhere else for a moment.
+--
+-- The shove is this mod's decision too, and it has to be: the engine reports
+-- who hit what and stops (charter rule 1), so a mob that took a punch without
+-- moving is a mob whose mod never told it to. Velocity rather than position —
+-- `pos` teleports without sweeping and would put it through a wall.
 game.register_on_punch(function(event)
-    if mimic ~= nil and event.target == mimic then
-        flee_until = now + FLEE_TICKS
+    if mimic == nil or event.target ~= mimic then
+        return
+    end
+    flee_until = now + FLEE_TICKS
+
+    local self = game.entity(mimic)
+    if self == nil then
+        return
+    end
+    -- Away from whoever swung. Found by matching the attacker's UUID against
+    -- the owner of a nearby player's body, because the event says who hit and
+    -- the entity store says where they are.
+    for _, id in ipairs(game.entities_in_radius(self.pos, 8, "engine:player")) do
+        local attacker = game.entity(id)
+        if attacker ~= nil and attacker.owner == event.attacker then
+            local dx, dz = self.pos.x - attacker.pos.x, self.pos.z - attacker.pos.z
+            local length = math.sqrt(dx * dx + dz * dz)
+            if length > 0.001 then
+                -- Cells per tick, which is what velocity is in. Sideways and a
+                -- little up, so the shove reads as a hit rather than as a slide.
+                game.set_entity(mimic, {
+                    velocity = {
+                        x = dx / length * KNOCKBACK,
+                        y = KNOCKBACK * 0.6,
+                        z = dz / length * KNOCKBACK,
+                    },
+                    anim = ANIM_RUN,
+                })
+            end
+            return
+        end
     end
 end)
 
@@ -204,7 +254,7 @@ game.register_on_entity_step(function(id)
             x = self.pos.x + (self.pos.x - from.x),
             y = self.pos.y,
             z = self.pos.z + (self.pos.z - from.z),
-        }, "sprint", 2)
+        }, "sprint", ANIM_RUN)
         return
     end
 
@@ -246,5 +296,5 @@ game.register_on_entity_step(function(id)
         y = anchor.y,
         z = anchor.z + face[2] * WANDER_BLOCKS,
     }
-    steer(id, self.pos, wander_to, "walk", 1)
+    steer(id, self.pos, wander_to, "walk", ANIM_WALK)
 end)

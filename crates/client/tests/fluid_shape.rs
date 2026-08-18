@@ -309,16 +309,49 @@ fn the_surface_reaches_the_depth_the_milk_actually_has() {
     let lowest = surface.iter().copied().fold(f32::MAX, f32::min);
     let highest = surface.iter().copied().fold(f32::MIN, f32::max);
 
-    // One fine unit either way: the height field is quantised to 48ths of a
-    // block and nothing here should be off by more than the quantisation.
-    // `fill_fluid`'s arithmetic: 3 of 27 units over a block 48 fine units tall.
-    let shallowest = 3 * 48 / tiamot_core::UNITS_PER_BLOCK;
-    let rim = POOL as f32 + shallowest as f32 / 48.0;
+    // **The claim is that the LATTICE is not deciding**, which is what the
+    // original of this test measured by naming the rim block's own height. It
+    // cannot name that any more, and for a good reason: a corner averages the
+    // four blocks meeting at it, and since the shoreline rule landed a corner
+    // with open air beside it comes down to the floor
+    // (`a_shoreline_comes_down_to_the_floor_and_a_wall_does_not`). So the rim
+    // block's corners are mixtures now, and no vertex sits at exactly the
+    // height one level asks for.
+    //
+    // What still holds, and is the thing worth guarding: the surface takes
+    // values BETWEEN the lattice's steps. A block is three cells, so a height
+    // clamped to the lattice is a whole number of thirds; a height field is
+    // free of it only if something lands off one.
+    let off_lattice = surface
+        .iter()
+        .filter(|height| {
+            // `floor_to_i32` rather than `round`: rounding is on charter rule
+            // 4's banned list and a test takes no exemption from it, which is
+            // the gate working. The fractional part is what matters here and
+            // either gives it.
+            let cells = (*height - POOL as f32) * 3.0;
+            let fraction = cells - tiamot_core::detgen::floor_to_i32(cells) as f32;
+            fraction > 1.0 / 48.0 && fraction < 1.0 - 1.0 / 48.0
+        })
+        .count();
     assert!(
-        (lowest - rim).abs() <= 1.0 / 48.0,
-        "the shallowest milk in the pool is drawn at {lowest} when the level it \
-         holds puts its surface at {rim} — the lattice is still deciding where \
-         the surface can go"
+        off_lattice > 0,
+        "every one of the pool's {} surface heights is a whole number of cells, \
+         so the lattice is still deciding where the surface can go",
+        surface.len()
+    );
+
+    // And it reaches the floor at its outer rim rather than ending in a cliff,
+    // which is the shoreline rule seen from here.
+    assert!(
+        lowest < POOL as f32 + 3.0 / 48.0,
+        "the pool's outermost surface is at {lowest}, a floor of {POOL} away — \
+         a shoreline that does not come down is the vertical edge a puddle was \
+         reported as having"
+    );
+    assert!(
+        lowest >= POOL as f32 - f32::EPSILON,
+        "the surface came out at {lowest}, below the floor the pool sits on"
     );
 
     // And the deepest point is the block top, because the fall standing in it

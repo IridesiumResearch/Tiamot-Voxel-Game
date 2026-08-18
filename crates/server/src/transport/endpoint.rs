@@ -300,6 +300,12 @@ pub struct PlayerSim {
     /// the deterministic simulation entirely (charter rule 4 does not reach
     /// presentation, and interpolating a joint is transcendental work).
     pub anim: tiamot_core::ent::AnimTag,
+    /// The tick a swing was thrown on, or zero.
+    ///
+    /// A punch has no duration of its own — it is one message — so the body has
+    /// to be told to keep swinging for a moment or the tag is gone before the
+    /// next update is sent and nobody ever sees it. See `SWING_TICKS`.
+    pub swung_on: u64,
     /// The tick the current `look` came with.
     ///
     /// Inputs are sent three times over for redundancy, so they arrive out of
@@ -329,6 +335,7 @@ impl PlayerSim {
             dig: None,
             tool: None,
             anim: tiamot_core::ent::AnimTag::IDLE,
+            swung_on: 0,
             look: [0.0; 2],
             look_tick: 0,
         }
@@ -343,6 +350,14 @@ impl PlayerSim {
 /// idle threshold everything else is standing still — a body drifting to a stop
 /// under friction should not keep walking on the spot for the three ticks it
 /// takes.
+/// How long a punch keeps the arm moving, in ticks.
+///
+/// Four, which is the length of the rig's swing clip at twenty ticks a second.
+/// A punch is one message and has no duration of its own, so without this the
+/// tag would be gone before the next entity update went out and nobody would
+/// ever see an arm move.
+pub const SWING_TICKS: u64 = 8;
+
 #[must_use]
 pub fn anim_from_motion(
     intent: tiamot_core::phys::Intent,

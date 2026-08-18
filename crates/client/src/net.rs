@@ -297,6 +297,11 @@ pub enum Command {
         /// The cell under the crosshair, or `None` to cancel.
         target: Option<tiamot_core::SubNodePos>,
     },
+    /// Hit an entity the crosshair is on.
+    Punch {
+        /// The entity, as the server named it when it spawned.
+        entity: u64,
+    },
     /// Ask the server for a streaming radius.
     ///
     /// A request. The server clamps it to its own configured maximum and
@@ -1123,6 +1128,7 @@ fn to_wire(command: Command) -> ClientMessage {
             target: Some(target),
         } => ClientMessage::StartDig { target },
         Command::Dig { target: None } => ClientMessage::CancelDig,
+        Command::Punch { entity } => ClientMessage::Punch { entity },
         Command::SelectTool { tool } => ClientMessage::SelectTool { tool },
         Command::ViewDistance {
             horizontal,

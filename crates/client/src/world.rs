@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tiamot_core::fluid::FluidLayer;
 use tiamot_core::light::{Light, LightLayer};
+use tiamot_core::phys::ChunkLookup as _;
 use tiamot_core::proto::Edit;
 use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId, SubNodePos};
 
@@ -617,6 +618,28 @@ pub struct ChunkFluid<'a> {
 }
 
 impl crate::mesher::FluidFill for ChunkFluid<'_> {
+    /// Whether a dry block is terrain the milk is held in by.
+    ///
+    /// The store rather than the mesher's own occupancy, because the mesher
+    /// only has the chunk it is meshing and this has to answer the same way for
+    /// the same block from either side of a seam — see `FluidFill::solid`.
+    ///
+    /// A block the client has not been sent counts as a wall: a shoreline that
+    /// tapered into terrain that simply has not arrived would rise back up the
+    /// moment it did, which is a visible flicker along the edge of the streamed
+    /// world.
+    fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+        let span = tiamot_core::CHUNK_BLOCKS as i32;
+        let at = tiamot_core::BlockPos::new(
+            self.pos.x * span + x,
+            self.pos.y * span + y,
+            self.pos.z * span + z,
+        );
+        self.store
+            .chunk(at.chunk())
+            .is_none_or(|chunk| chunk.get_block(at).is_some_and(|block| !block.is_empty()))
+    }
+
     fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)> {
         let span = tiamot_core::CHUNK_BLOCKS as i32;
         let at = tiamot_core::BlockPos::new(

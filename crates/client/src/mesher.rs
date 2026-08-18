@@ -154,6 +154,15 @@ pub struct SubNodeGrid {
     /// each neighbour, see [`PADDED_BLOCKS`] — and allocated only for a chunk
     /// that has fluid in it.
     heights: Option<Vec<u8>>,
+    /// Which blocks of that region are dry terrain the milk is held in by.
+    ///
+    /// See [`FluidFill::solid`]. A dry neighbour that is a wall is left out of
+    /// a corner's average so the surface meets it at its own level; a dry
+    /// neighbour that is open air counts as zero so the surface comes down to
+    /// the floor. Without the distinction a shoreline is a vertical cliff of
+    /// whatever the rim block's level happened to be — reported from a running
+    /// game as "a puddle with very high edges".
+    walls: Option<Vec<bool>>,
 }
 
 /// Blocks per axis in [`SubNodeGrid::heights`]: the chunk and a one-block shell.
@@ -227,6 +236,7 @@ impl SubNodeGrid {
         let mut columns = [vec![0u64; N * N], vec![0u64; N * N], vec![0u64; N * N]];
         let mut wet: Option<[Vec<u64>; 3]> = None;
         let mut heights: Option<Vec<u8>> = None;
+        let mut walls: Option<Vec<bool>> = None;
 
         for index in 0..BLOCKS_PER_CHUNK {
             let local = LocalBlock::from_index(index);
@@ -305,26 +315,38 @@ impl SubNodeGrid {
         // all of them.
         if heights.is_some() {
             let last = tiamot_core::CHUNK_BLOCKS as i32;
+            let mut blocked = vec![false; PADDED_BLOCKS * PADDED_BLOCKS * PADDED_BLOCKS];
             for bz in -1..=last {
                 for by in -1..=last {
                     for bx in -1..=last {
-                        let inside = |value: i32| (0..last).contains(&value);
-                        if inside(bx) && inside(by) && inside(bz) {
-                            continue;
-                        }
-                        let Some((_, depth)) = fluid.fill(bx, by, bz) else {
+                        let Some(index) = height_index(bx, by, bz) else {
                             continue;
                         };
-                        let height = (u32::from(depth) * FULL_BLOCK / tiamot_core::UNITS_PER_BLOCK)
-                            .min(FULL_BLOCK);
-                        if let (Some(heights), Some(index)) =
-                            (heights.as_mut(), height_index(bx, by, bz))
-                        {
-                            heights[index] = u8::try_from(height).unwrap_or(u8::MAX).max(1);
+                        let inside = |value: i32| (0..last).contains(&value);
+                        let shell = !(inside(bx) && inside(by) && inside(bz));
+
+                        match fluid.fill(bx, by, bz) {
+                            Some((_, depth)) if shell => {
+                                let height = (u32::from(depth) * FULL_BLOCK
+                                    / tiamot_core::UNITS_PER_BLOCK)
+                                    .min(FULL_BLOCK);
+                                if let Some(heights) = heights.as_mut() {
+                                    heights[index] = u8::try_from(height).unwrap_or(u8::MAX).max(1);
+                                }
+                            }
+                            // Already recorded by the pass over the chunk's own
+                            // blocks above.
+                            Some(_) => {}
+                            // Dry. Whether the surface meets it or comes down to
+                            // the floor at it depends on what it is, and the
+                            // fluid source is the one authority both sides of a
+                            // seam ask — see `FluidFill::solid`.
+                            None => blocked[index] = fluid.solid(bx, by, bz),
                         }
                     }
                 }
             }
+            walls = Some(blocked);
         }
 
         let mut grid = Self {
@@ -332,6 +354,7 @@ impl SubNodeGrid {
             columns,
             fluid: wet,
             heights,
+            walls,
         };
         grid.seed_padding(neighbours, absent);
         grid
@@ -416,6 +439,17 @@ impl SubNodeGrid {
         fluid[1][x * N + z] >> (y as u32 + FIRST) & 1 == 1
     }
 
+    /// Whether a dry block is terrain the milk is held in by.
+    ///
+    /// Out of range answers `true`, which leaves the surface where it was: a
+    /// corner the grid cannot see past is not a shoreline it can taper into.
+    fn walled(&self, bx: i32, by: i32, bz: i32) -> bool {
+        let Some(walls) = self.walls.as_ref() else {
+            return true;
+        };
+        height_index(bx, by, bz).is_none_or(|index| walls[index])
+    }
+
     /// A block's fluid surface height in [`FINE`] units, or `None` if it is dry.
     ///
     /// Block coordinates, valid one block PAST the chunk on every axis — see
@@ -462,10 +496,18 @@ impl SubNodeGrid {
     /// in it — not because anything checks for them, but because there is
     /// nowhere for one to come from.
     ///
-    /// The height is averaged over the up-to-four blocks touching this corner
-    /// that actually hold fluid. Dry neighbours are left out rather than counted
-    /// as zero: counting them would drag every shoreline down to nothing and
-    /// leave a pond looking like a shallow dish.
+    /// The height is averaged over the up-to-four blocks touching this corner.
+    /// A dry one counts as **zero if it is open air** — so the surface comes
+    /// down to the floor at a shoreline instead of ending in a cliff of
+    /// whatever the rim block's level happened to be — and is **left out if it
+    /// is a wall**, so milk poured against stone meets it at its own level
+    /// rather than pulling away from it.
+    ///
+    /// Both answers come from [`FluidFill::solid`], which is one authority for
+    /// every block on both sides of a chunk seam. Using the mesher's own
+    /// occupancy inside the chunk and guessing for the shell would make the two
+    /// chunks either side of a seam disagree about the same block, which is a
+    /// step down the length of every seam.
     ///
     /// `cx` and `cz` are CELL coordinates and may sit inside a block rather than
     /// on its corner, which happens when greedy merging splits a face mid-block.
@@ -487,6 +529,9 @@ impl SubNodeGrid {
             let bz = corner_z as i32 + dz;
             if let Some(height) = self.block_height(bx, by, bz) {
                 total += height;
+                count += 1;
+            } else if !self.walled(bx, by, bz) {
+                // Open air: the surface comes down to the floor here.
                 count += 1;
             }
         }
@@ -597,6 +642,29 @@ pub trait FluidFill {
     /// height there. A caller that genuinely has no neighbour — a test, an
     /// unloaded chunk — answers `None` and gets what it always did.
     fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)>;
+
+    /// Whether a DRY block is something the fluid is held in by.
+    ///
+    /// # Why the fluid source answers a question about terrain
+    ///
+    /// Because a surface corner averages the four blocks meeting at it, and a
+    /// dry one has to be treated differently depending on what it is: open air
+    /// means the milk's surface should come down to the floor there, and a wall
+    /// means it should stay at its own level and meet the stone.
+    ///
+    /// **One authority answers for every block, on both sides of a chunk
+    /// seam.** A mesher that used its own occupancy for blocks inside the chunk
+    /// and guessed for the shell would have the two chunks either side of a
+    /// seam disagree about the same block — which is a step down the length of
+    /// every seam, and the exact failure the shell exists to prevent.
+    ///
+    /// Coordinates run one block past the chunk, as [`FluidFill::fill`]'s do.
+    /// Defaults to `false`: a caller with no terrain to consult — a test, an
+    /// unloaded chunk — gets shorelines that taper, which is the commoner case
+    /// and the safer guess.
+    fn solid(&self, _x: i32, _y: i32, _z: i32) -> bool {
+        false
+    }
 }
 
 /// A world with no fluid in it, which is most of them.
@@ -1730,6 +1798,59 @@ mod tests {
         }
     }
 
+    /// A three-by-three pond with open air on one side and a wall on the other.
+    ///
+    /// Milk over `x, z` in `3..=5` at `y = 4`; stone in the column at `x = 6`.
+    /// Three blocks wide because a one-block pond has no interior corner —
+    /// every one of its four is a shoreline, so it cannot tell "came down at
+    /// the edge" from "came down everywhere".
+    struct Shore;
+
+    impl FluidFill for Shore {
+        fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)> {
+            (y == 4 && (3..=5).contains(&x) && (3..=5).contains(&z)).then_some((7, 24))
+        }
+        fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+            x == 6 && y == 4 && (3..=5).contains(&z)
+        }
+    }
+
+    #[test]
+    fn a_shoreline_comes_down_to_the_floor_and_a_wall_does_not() {
+        // **Reported from a running game**: "water needs to go to zero toward
+        // its flow edges — right now it seems to go to about 50% and stop, so a
+        // puddle looks awkward with very high edges."
+        //
+        // A corner's height averages the blocks meeting at it, and a dry one
+        // used to be left out entirely. So the outermost vertex of a pond sat
+        // at the rim block's own full height and the surface ended in a
+        // vertical cliff of whatever level that block happened to hold.
+        //
+        // Now a dry neighbour counts as zero when it is open air, and is still
+        // left out when it is a wall — because milk poured against stone should
+        // meet the stone rather than pull away from it. Both cases here, in one
+        // pond, so a fix that just made everything taper fails the second half.
+        let grid =
+            SubNodeGrid::from_chunk_with_fluid(&empty(), &Neighbours::none(), Absent::Air, &Shore);
+
+        let per_axis = SUBNODES_PER_AXIS as usize;
+        // The corner at (4, 4): all four blocks around it are milk.
+        let inside = grid.surface_at(4 * per_axis, 4 * per_axis, 4);
+        // The corner at (3, 3): one block of milk and three of open air.
+        let open = grid.surface_at(3 * per_axis, 3 * per_axis, 4);
+        // The corner at (6, 4): two blocks of milk and two of wall.
+        let walled = grid.surface_at(6 * per_axis, 4 * per_axis, 4);
+
+        assert!(
+            open < inside,
+            "the surface does not come down at a shoreline: {open} against {inside} inside"
+        );
+        assert_eq!(
+            walled, inside,
+            "the surface pulled away from a wall it was poured against"
+        );
+    }
+
     #[test]
     fn the_ground_under_a_pond_still_has_a_surface() {
         // **The face that was not there, and the hole it left.**
@@ -1789,13 +1910,20 @@ mod tests {
         for vertex in &surface {
             let (_, y, _) = vertex.position();
             assert_eq!(y, 6, "the milk's top face is not on the lattice top");
-            // Three cells of lattice, 2.625 cells of milk: 0.375 of a cell, and
-            // FINE is sixteenths, so six.
-            assert_eq!(
-                vertex.drop(),
-                6,
+            // **Pulled down, and by more than the brim-full block alone would
+            // ask for.** Three cells of lattice against 2.625 cells of milk is
+            // six sixteenths; every corner of a lone block is also a shoreline,
+            // and a shoreline comes down to the floor
+            // (`a_shoreline_comes_down_to_the_floor_and_a_wall_does_not`), so
+            // one block of milk on open ground draws as a spill rather than as
+            // a slab with vertical sides. What this test is about is that the
+            // surface is pulled down AT ALL: it used to sit on the lattice top,
+            // which is a block of milk pretending to be a block of stone.
+            assert!(
+                vertex.drop() >= 6,
                 "a brim-full block's surface was not pulled down to where the \
-                 milk actually is"
+                 milk actually is: {}",
+                vertex.drop()
             );
         }
     }
@@ -1837,12 +1965,31 @@ mod tests {
             }
         }
 
+        /// The distinct surface heights over the pond's INTERIOR.
+        ///
+        /// Interior, because a shoreline is not level and is not meant to be:
+        /// a dry neighbour over open air brings the surface down to the floor
+        /// (`a_shoreline_comes_down_to_the_floor_and_a_wall_does_not`), so the
+        /// outermost vertices of any pond differ from its middle whatever its
+        /// levels are. What "flat" means is that the part of the pond with milk
+        /// on every side of it is one height.
+        ///
+        /// The fixtures below run the full width of the chunk in `z`, so the
+        /// interior is the middle column in `x` and nothing else.
         fn drops(chunk: &Chunk, fill: &impl FluidFill) -> Vec<u16> {
             let mesh = mesh_chunk(chunk, &Neighbours::open(), Absent::Air, &DAY, fill);
+            // Both fixtures fill blocks 4..=6 in `x` and the whole chunk in
+            // `z`, so their shorelines are the corners at `x = 4` and `x = 7`
+            // and their interior is the two corners between.
+            let interior = [5 * SUBNODES_PER_AXIS, 6 * SUBNODES_PER_AXIS];
             let mut drops: Vec<u16> = mesh
                 .fluid_vertices
                 .iter()
                 .filter(|vertex| vertex.face() == (1, true))
+                .filter(|vertex| {
+                    let (x, _, _) = vertex.position();
+                    interior.contains(&x)
+                })
                 .map(super::FluidVertex::drop)
                 .collect();
             drops.sort_unstable();

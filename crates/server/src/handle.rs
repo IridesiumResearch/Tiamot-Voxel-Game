@@ -1196,7 +1196,9 @@ impl ServerHandle {
                                 player.anim = crate::transport::anim_from_motion(
                                     intent,
                                     &player.body,
-                                    player.dig.is_some(),
+                                    player.dig.is_some()
+                                        || tick.saturating_sub(player.swung_on)
+                                            < crate::transport::SWING_TICKS,
                                 );
                                 // **The server's half of the picture.** A client
                                 // log established that the two simulations part
@@ -1899,6 +1901,20 @@ impl ServerHandle {
                                     "a punch was thrown from further away than an arm reaches"
                                 );
                                 continue;
+                            }
+
+                            // **The swing everybody else sees.** A punch is
+                            // one message with no duration, so the attacker's
+                            // body is told to keep swinging for a few ticks —
+                            // otherwise the tag is gone before the next entity
+                            // update goes out and a hit looks like nothing
+                            // happening. Set before the hooks run, because it
+                            // is about the swing rather than about whether it
+                            // landed: you swung either way.
+                            if let Ok(mut bodies) = shared.bodies.lock()
+                                && let Some(player) = bodies.get_mut(&uuid)
+                            {
+                                player.swung_on = tick;
                             }
 
                             let verdict = source.may_punch(&tiamot_core::script::PunchEvent {

@@ -631,6 +631,33 @@ impl Pacing {
     }
 }
 
+/// How often a held attack button throws another punch.
+///
+/// The length of the rig's own swing clip. A dig re-aimed is the same dig and
+/// costs nothing to repeat; a punch re-sent is another punch, and a held button
+/// at a hundred frames a second would be a hundred of them.
+const PUNCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Where a ray enters a box, in the ray's own units, or `None` if it misses.
+///
+/// The slab test. Division by a zero direction component gives an infinity
+/// rather than a `NaN`, and the `min`/`max` ordering below is what makes the
+/// infinities cancel — which is the whole reason this is written with a
+/// reciprocal rather than with a branch per axis.
+fn ray_box(origin: [f32; 3], direction: [f32; 3], min: [f32; 3], max: [f32; 3]) -> Option<f32> {
+    let mut near = f32::NEG_INFINITY;
+    let mut far = f32::INFINITY;
+    for axis in 0..3 {
+        let inverse = 1.0 / direction[axis];
+        let first = (min[axis] - origin[axis]) * inverse;
+        let second = (max[axis] - origin[axis]) * inverse;
+        near = near.max(first.min(second));
+        far = far.min(first.max(second));
+    }
+    // Behind the eye, or no overlap at all.
+    (far >= near.max(0.0)).then(|| near.max(0.0))
+}
+
 /// The client, between frames.
 ///
 /// Several independent debug toggles, which clippy counts as too many bools.
@@ -654,6 +681,9 @@ pub struct App {
     /// been told about. Arrival time cannot drift because it measures nothing
     /// about the other machine.
     since_start: std::time::Instant,
+    /// When the last punch was thrown, so a held button is a swing rather than
+    /// a hundred of them a second. See [`App::dig`].
+    last_punch: std::time::Duration,
     camera: Camera,
     /// Material name by id, for the HUD and for diagnostics.
     materials: BTreeMap<u16, String>,
@@ -838,6 +868,7 @@ impl App {
             store: ChunkStore::new(),
             entities: crate::entities::Entities::new(),
             since_start: std::time::Instant::now(),
+            last_punch: std::time::Duration::ZERO,
             camera,
             materials: BTreeMap::new(),
             spawn: None,
@@ -1485,12 +1516,95 @@ impl App {
             .collect()
     }
 
-    /// Starts or re-aims a dig at whatever the crosshair is on.
+    /// The entity under the crosshair, if one is nearer than the block behind
+    /// it.
+    ///
+    /// **Picked on the client and judged on the server.** The client says which
+    /// entity it believes it hit; the server checks the attacker could reach it
+    /// and the mods decide what a hit means (charter rule 2 — a viewer that
+    /// could assert a hit could assert every hit). So this being approximate is
+    /// fine, and it being generous is not exploitable.
+    ///
+    /// The box is the entity's own collider, which is the same box the server
+    /// collided it with — aiming at something and missing because the client
+    /// drew it somewhere else is the one failure this must not have.
+    #[must_use]
+    pub fn punch_target(&self) -> Option<u64> {
+        let predictor = self.predictor.as_ref()?;
+        let origin = predictor.origin();
+        let eye = predictor.body().eye();
+        let forward = self.camera.forward();
+        let direction = [forward.x, forward.y, forward.z];
+        let now = self.since_start.elapsed();
+        let span = tiamot_core::CHUNK_SUBNODES as f32;
+
+        // How far the terrain is, so a mob behind a wall cannot be hit through
+        // it. The cell's own corner rather than its centre: a half-cell either
+        // way is far below what anybody can aim.
+        let blocked_at = self.looking_at().map_or(phys::REACH, |hit| {
+            let to = [
+                hit.cell[0] as f32 - eye[0],
+                hit.cell[1] as f32 - eye[1],
+                hit.cell[2] as f32 - eye[2],
+            ];
+            (to[0] * to[0] + to[1] * to[1] + to[2] * to[2]).sqrt()
+        });
+
+        let mut nearest: Option<(f32, u64)> = None;
+        for (id, entity) in self.entities.iter() {
+            let Some([width, height]) = entity.collider else {
+                continue;
+            };
+            let Some(pose) = entity.pose(now) else {
+                continue;
+            };
+            // Into the predicted body's frame, in cells — the frame the ray is
+            // already in (charter rule 7).
+            let feet = [
+                (pose.chunk.x - origin.x) as f32 * span + pose.local[0],
+                (pose.chunk.y - origin.y) as f32 * span + pose.local[1],
+                (pose.chunk.z - origin.z) as f32 * span + pose.local[2],
+            ];
+            let half = width / 2.0;
+            let min = [feet[0] - half, feet[1], feet[2] - half];
+            let max = [feet[0] + half, feet[1] + height, feet[2] + half];
+            let Some(distance) = ray_box(eye, direction, min, max) else {
+                continue;
+            };
+            if distance > phys::REACH || distance > blocked_at {
+                continue;
+            }
+            if nearest.is_none_or(|(best, _)| distance < best) {
+                nearest = Some((distance, id));
+            }
+        }
+        nearest.map(|(_, id)| id)
+    }
+
+    /// Starts or re-aims a dig at whatever the crosshair is on — or throws a
+    /// punch, if what the crosshair is on is somebody.
     ///
     /// Re-sent every frame the button is held, which is what `StartDig`'s
     /// protocol docs ask for: re-aiming at the same cell keeps its progress, so
     /// repeating is free and it means a dig follows the crosshair.
+    ///
+    /// **A punch is not free to repeat**, which is why it has a cooldown of its
+    /// own. A dig re-aimed is the same dig; a punch re-sent is another punch,
+    /// and a held button at a hundred frames a second would be a hundred of
+    /// them a second. One per swing is what a swing is.
     pub fn dig(&mut self) {
+        if let Some(entity) = self.punch_target() {
+            let now = self.since_start.elapsed();
+            if now.saturating_sub(self.last_punch) >= PUNCH_INTERVAL {
+                self.last_punch = now;
+                self.connection.send(Command::Punch { entity });
+            }
+            // Nothing is being dug: the crosshair is on a person. Cancelling
+            // any dig in progress, or a swing at somebody standing in front of
+            // a wall keeps chipping at the wall behind them.
+            self.stop_digging();
+            return;
+        }
         let Some(target) = self.dig_target() else {
             return;
         };
