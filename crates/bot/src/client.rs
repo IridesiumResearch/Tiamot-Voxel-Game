@@ -832,6 +832,21 @@ impl Bot {
         .await
     }
 
+    /// Hits an entity.
+    ///
+    /// Reach and existence are the server's to judge, so this always sends and
+    /// never reports whether the hit landed — asking would mean inventing a
+    /// reply message for something the engine deliberately has no opinion
+    /// about. A scenario checks the CONSEQUENCE, which is whatever the mod that
+    /// handled it did.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError`] if the message cannot be sent.
+    pub async fn punch(&mut self, entity: u64) -> Result<(), BotError> {
+        self.send(&ClientMessage::Punch { entity }).await
+    }
+
     /// Aims at a cell until `done`, re-sending the dig each round.
     async fn dig_until_gone(
         &mut self,

@@ -136,6 +136,14 @@ pub struct Shared {
     /// faster than 20 Hz can apply them and grow this until the server died.
     pub edits: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, Edit)>>,
 
+    /// Hits waiting for the tick to judge.
+    ///
+    /// Queued rather than acted on here for the reason every other action is:
+    /// deciding whether a punch lands needs the world and every body in it, and
+    /// both belong to the tick thread. Two connections punching at once would
+    /// otherwise resolve in whichever order the OS woke them.
+    pub punches: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, u64)>>,
+
     /// World edits queued by the operator rather than by a player.
     ///
     /// **Not reachable from the network.** These come from
@@ -860,6 +868,29 @@ impl Shared {
             .unwrap_or_default()
     }
 
+    /// Records a punch for the next tick to judge.
+    ///
+    /// Bounded like the edit queue: a client that spams this cannot make the
+    /// server hold an unbounded list of them.
+    pub fn queue_punch(&self, actor: PlayerUuid, entity: u64) -> bool {
+        let Ok(mut queue) = self.punches.lock() else {
+            return false;
+        };
+        if queue.len() >= MAX_QUEUED_EDITS {
+            return false;
+        }
+        queue.push_back((actor, entity));
+        true
+    }
+
+    /// Takes the punches waiting to be judged.
+    pub fn drain_punches(&self) -> Vec<(PlayerUuid, u64)> {
+        self.punches
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
     /// Asks the simulation to encode a chunk.
     ///
     /// Returns `None` if the queue is full, in which case the caller retries
@@ -1523,6 +1554,11 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     shared.set_dig(&uuid, *target);
                 }
             }
+            Action::Punch { entity } => {
+                if let Some(uuid) = session.uuid() {
+                    shared.queue_punch(uuid, *entity);
+                }
+            }
             Action::SelectTool { tool } => {
                 if let Some(uuid) = session.uuid() {
                     shared.select_tool(&uuid, tool.clone());
@@ -1701,6 +1737,7 @@ mod tests {
             players: AtomicU32::new(0),
             control: Control::new(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             outbound: tokio::sync::broadcast::channel(16).0,

@@ -77,6 +77,12 @@ fn hex_uuid(uuid: [u8; 32]) -> String {
 /// Registry key holding the mods that registered `on_punch`.
 const PUNCHERS: &str = "tiamot.punchers";
 
+/// Registry key holding the mods that registered `on_player_join`.
+const JOINERS: &str = "tiamot.joiners";
+
+/// Hook name used in registry keys and in fault messages.
+const HOOK_JOIN: &str = "on_player_join";
+
 /// Hook name used in registry keys and in fault messages.
 const HOOK_PUNCH: &str = "on_punch";
 
@@ -793,12 +799,30 @@ impl ScriptVm for MluaVm {
             // read the other one. `player` stays for consistency with the other
             // two events, which have only one.
             table.set("attacker", table.get::<String>("player")?)?;
-            table.set("target", hex_uuid(event.target))?;
+            // The entity, not a UUID: everything in the world is an entity now,
+            // including the other players. A mod that wants to know whether it
+            // hit a person reads `owner`, which is the same field
+            // `game.entity` reports and the same UUID `game.storage` should
+            // key on (charter rule 13).
+            table.set("target", event.target.0 as i64)?;
+            if let Some(owner) = event.owner {
+                table.set("owner", hex_uuid(owner))?;
+            }
             Ok(table)
         }) else {
             return HookOutcome::allow();
         };
         self.run_hook(HOOK_PUNCH, PUNCHERS, &table)
+    }
+
+    fn player_join(&mut self, event: &crate::script::JoinEvent) -> HookOutcome {
+        let Ok(table) = self.hook_event(event.player).and_then(|table| {
+            table.set("name", event.name.as_str())?;
+            Ok(table)
+        }) else {
+            return HookOutcome::allow();
+        };
+        self.run_hook(HOOK_JOIN, JOINERS, &table)
     }
 
     fn fluid_flow(&mut self, event: &crate::script::FluidFlowEvent) -> HookOutcome {
@@ -1174,6 +1198,11 @@ impl MluaVm {
         game.set(
             "register_on_fluid_flow",
             self.hook_registrar(mod_id, HOOK_FLOW, FLOWERS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
+        game.set(
+            "register_on_player_join",
+            self.hook_registrar(mod_id, HOOK_JOIN, JOINERS)?,
         )
         .map_err(|err| self.vm_error(&err))?;
         Ok(())
@@ -1702,6 +1731,18 @@ impl MluaVm {
                 if let Some(name) = spec.get::<Option<String>>("nametag")? {
                     entity.nametag = Some(crate::ent::Nametag::Text(name));
                 }
+                // A label that follows a player's CURRENT name rather than a
+                // copy of what they were called when the entity was made.
+                // Charter rule 13 in the one place a mod would otherwise get it
+                // wrong: a stored name goes stale on a rebinding, and the stale
+                // copy is then the thing a later lookup keys on.
+                if let Some(uuid) = spec.get::<Option<String>>("nametag_player")? {
+                    let uuid = crate::identity::PlayerUuid::from_hex(&uuid)
+                        .map_err(|_| mlua::Error::external(
+                            "nametag_player takes a player UUID in hex, as `game.entity` reports one",
+                        ))?;
+                    entity.nametag = Some(crate::ent::Nametag::Player(uuid));
+                }
                 // A box only if the mod asked for one: an entity with no
                 // collider is a marker, and markers are useful.
                 if let Some(box_spec) = spec.get::<Option<Table>>("collider")? {
@@ -2154,7 +2195,7 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.entity_steppers", steppers)
             .map_err(|err| self.vm_error(&err))?;
-        for list in [DIGGERS, PLACERS, PUNCHERS, FLOWERS] {
+        for list in [DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
             self.lua
                 .set_named_registry_value(list, table)
@@ -3648,11 +3689,12 @@ mod tests {
     }
 
     #[test]
-    fn the_punch_hook_works_even_though_nothing_calls_it_yet() {
-        // Entities are Task 12, so there is nothing to punch and no caller.
-        // Registration and dispatch exist and are tested now so that task adds
-        // a CALLER rather than an API — and so this does not arrive untested
-        // and half-remembered when it is finally needed.
+    fn a_punch_reaches_the_hook_naming_the_entity_and_its_owner() {
+        // The target is an entity id and not a UUID, which is the widening the
+        // Task 09 version of `PunchEvent` said entities would need. `owner` is
+        // carried beside it because the commonest question about a punch is
+        // "did somebody hit a person", and the engine has the answer in its
+        // hand — making every mod look it up would be work with no upside.
         let mut vm = vm();
         load(
             &mut vm,
@@ -3664,16 +3706,67 @@ mod tests {
 
         let event = crate::script::PunchEvent {
             attacker: [0x11; 32],
-            target: [0x22; 32],
+            target: crate::ent::EntityId::new(7, 1),
+            owner: Some([0x22; 32]),
         };
         assert!(!vm.punch(&event).allowed, "the veto was ignored");
         vm.eval_in(
             "referee",
             "assert(seen.attacker == string.rep('11', 32), 'attacker')\n\
-             assert(seen.target == string.rep('22', 32), 'target')\n\
-             assert(seen.attacker ~= seen.target, 'the two parties must be distinguishable')",
+             assert(seen.target ~= nil and seen.target ~= 0, 'target')\n\
+             assert(seen.owner == string.rep('22', 32), 'owner')\n\
+             assert(seen.attacker ~= seen.owner, 'the two parties must be distinguishable')",
         )
         .expect("the hook should see both parties");
+    }
+
+    #[test]
+    fn a_join_reaches_the_hook_with_the_uuid_and_the_current_name() {
+        // Charter rule 13 lives or dies at this boundary: a mod handed only a
+        // name has no way to remember "this player" across a rename, and a mod
+        // handed only a UUID has nothing to print.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "greeter",
+            "seen = nil\ngame.register_on_player_join(function(e) seen = e end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let outcome = vm.player_join(&crate::script::JoinEvent {
+            player: [0x33; 32],
+            name: "Ada".to_owned(),
+        });
+        assert!(outcome.faults.is_empty(), "the hook raised: {outcome:?}");
+        vm.eval_in(
+            "greeter",
+            "assert(seen.player == string.rep('33', 32), 'uuid')\n\
+             assert(seen.name == 'Ada', 'name')",
+        )
+        .expect("the hook should see both");
+    }
+
+    #[test]
+    fn a_join_hook_cannot_refuse_entry() {
+        // There is nothing to refuse: the player is already in the world by the
+        // time this runs, and who may connect at all is charter rule 13's
+        // business, decided long before a body exists. A hook returning `false`
+        // must not silently look like it did something.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "bouncer",
+            "game.register_on_player_join(function() return false end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let outcome = vm.player_join(&crate::script::JoinEvent {
+            player: [0x44; 32],
+            name: "Nobody".to_owned(),
+        });
+        assert!(outcome.faults.is_empty());
     }
 
     #[test]

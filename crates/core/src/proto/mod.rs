@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -540,6 +540,30 @@ pub enum ClientMessage {
         horizontal: u8,
         /// Chunks of vertical radius.
         vertical: u8,
+    },
+
+    /// Hit an entity.
+    ///
+    /// **Appended at the end** (protocol v15).
+    ///
+    /// # Why the engine has no idea what this does
+    ///
+    /// Nothing in core reacts to a punch. It reaches the mods as
+    /// `on_punch` and stops there, because what a hit *means* — damage,
+    /// knockback, aggro, nothing at all — is a game decision and charter rule 1
+    /// puts those in mods. The engine's job is to say who hit what, in a way
+    /// nobody can lie about.
+    ///
+    /// # Reach is checked server-side, like everything else
+    ///
+    /// The id is the entity as the server named it in
+    /// [`ServerMessage::EntitySpawn`], so a client cannot invent one — a stale
+    /// id resolves to nothing and a punch at somebody across the map fails the
+    /// reach test. Charter rule 2: the client is a viewer, and a viewer that
+    /// could assert a hit could assert every hit.
+    Punch {
+        /// The entity being hit, as the server named it.
+        entity: u64,
     },
 }
 
@@ -1189,6 +1213,11 @@ pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolEr
         // Two bytes, and `ViewDistance::clamped` bounds them on the way in —
         // there is no value a peer can put here that costs anything to hold.
         | ClientMessage::ViewDistance { .. }
+        // Eight bytes naming an entity. Every value is decodable and almost
+        // all of them resolve to nothing, which the server treats as a punch
+        // at thin air — there is nothing to bound here that the entity store
+        // does not bound already.
+        | ClientMessage::Punch { .. }
         | ClientMessage::Disconnect => {}
     }
     Ok(())
@@ -1599,7 +1628,7 @@ mod tests {
         // test fails after an edit, something was inserted or reordered rather
         // than appended, and PROTOCOL_VERSION must be bumped.
         let signature = WireSignature([0u8; 64]);
-        let client: [(ClientMessage, u8); 15] = [
+        let client: [(ClientMessage, u8); 16] = [
             (
                 ClientMessage::Hello {
                     protocol_version: 0,
@@ -1680,6 +1709,8 @@ mod tests {
                 },
                 14,
             ),
+            // Protocol v15.
+            (ClientMessage::Punch { entity: 0 }, 15),
         ];
 
         for (message, expected) in client {

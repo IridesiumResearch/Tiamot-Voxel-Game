@@ -382,6 +382,31 @@ function game.line_of_sight(from, to) end
 ---@field step_up? integer How far it climbs in one move, in blocks. Default 1. Zero for something that cannot climb at all.
 ---@field max_drop? integer How far it will fall in one move, in blocks. Default 3. Nothing here knows about fall damage — that is your rule, not the engine's — so this is only how far the search is willing to route.
 
+---Called when a player arrives in the world.
+---
+---**The engine does not tell you whether this is their first time**, and that
+---is deliberate. "First-ever join" is a rule you invent — a mob that imprints on
+---one, a tutorial that greets one, a shop that gives one a starting stack — and
+---every one of them wants a different definition of first. Remember it yourself
+---with `game.storage`, keyed on the UUID.
+---
+---`player` is the UUID and is the identity. `name` is what they are currently
+---called on this server, which is a claim bound to that UUID and can be rebound
+---(charter rule 13) — store the UUID, print the name.
+---
+---Runs on the simulation thread inside the tick, before that player's first
+---tick, so `game.spawn_entity`, `game.line_of_sight` and the rest all work here.
+---
+---```lua
+---game.register_on_player_join(function(event)
+---    if not game.storage.get("imprint") then
+---        game.storage.set("imprint", event.player)
+---    end
+---end)
+---```
+---@param callback fun(event: { player: string, name: string })
+function game.register_on_player_join(callback) end
+
 ---A walkable route between two points, or why there is not one.
 ---
 ---Navigation is **block resolution** and deliberately simple (Sub-Node Contract
@@ -595,24 +620,32 @@ function game.register_on_dig_complete(callback) end
 ---@param callback fun(event: Tiamot.PlaceEvent): boolean|string|nil
 function game.register_on_place(callback) end
 
----One entity hitting another.
+---Somebody hitting something.
 ---@class Tiamot.PunchEvent
 ---@field attacker string Who threw the punch, as 64 hex characters.
----@field target string Who received it.
+---@field target integer The entity that took it, as `game.entity` names one. Everything in the world is an entity, including the other players.
+---@field owner string|nil The player that entity belongs to, if it belongs to one — so "did somebody hit a person" is one field rather than a lookup.
 ---@field player string The same value as `attacker`. Present so every hook event has a `player` field; prefer `attacker` here, because a punch has two parties and `player` does not say which.
 
 ---Registers a veto on punches.
 ---
 ---**Registration window only.**
 ---
----**Nothing calls this yet.** Entities are Task 12, and the only things in the
----world today are players and voxels, so there is nothing to left-click on. The
----registration and dispatch exist and are tested, so that task adds a caller
----rather than an API — the same arrangement `game.register_action` has.
+---The engine has no damage model and no opinion about what a hit does — that is
+---your rule, not its (charter rule 1). It tells you who hit what, having already
+---checked that the attacker could reach it, and stops there.
 ---
----When it does fire, the rules are the same as the other two hooks: return
----`false` to cancel, anything else allows, the first refusal stops the rest,
----and an error disables your mod while letting the punch land.
+---The rules are the other hooks': return `false` to cancel, anything else
+---allows, the first refusal stops the rest, and an error disables your mod while
+---letting the punch land.
+---
+---```lua
+---game.register_on_punch(function(event)
+---    if event.owner == game.storage.get("imprint") then
+---        return false  -- this one is protected
+---    end
+---end)
+---```
 ---@param callback fun(event: Tiamot.PunchEvent): boolean?
 function game.register_on_punch(callback) end
 

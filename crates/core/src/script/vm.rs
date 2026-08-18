@@ -586,24 +586,55 @@ pub struct PlaceEvent {
     pub units: u32,
 }
 
-/// One entity hitting another.
+/// Somebody hitting something.
 ///
-/// **Nothing dispatches this yet, and that is not an oversight.** Entities are
-/// Task 12; the only things in the world today are players and voxels, and
-/// "left-click on an entity" has nothing to land on. What exists now is the
-/// registration and the dispatch path, tested, so that Task 12 adds a caller
-/// rather than an API — the same arrangement `register_action` has, which is
-/// stored now and inert until Task 13.
+/// The attacker is a canonical player UUID (charter rule 13); the target is an
+/// **entity**, because that is what everything in the world is now — including
+/// the other players, who are mirrored into the entity store every tick.
 ///
-/// Both parties are canonical UUIDs (charter rule 13). When entities arrive
-/// they will need a wider target type than a player UUID, and that is a
-/// deliberate future edit rather than something to guess at now.
+/// This is the "wider target type" the Task 09 version of this struct said
+/// entities would need. It arrived: a punch names an entity id, and a mod that
+/// wants to know whether it hit a person reads that entity's `owner`.
+///
+/// # The engine has no opinion about what a hit does
+///
+/// Nothing in core reacts. Damage, knockback, aggro, or nothing at all are game
+/// decisions and charter rule 1 puts them in mods — the engine's job is to say
+/// who hit what, in a way a client cannot lie about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PunchEvent {
     /// Who threw the punch.
     pub attacker: [u8; 32],
-    /// Who received it.
-    pub target: [u8; 32],
+    /// The entity that took it.
+    pub target: crate::ent::EntityId,
+    /// The player that entity belongs to, if it belongs to one.
+    ///
+    /// Carried rather than left for the mod to look up, because the commonest
+    /// question about a punch is "did somebody hit a person" and the answer is
+    /// one field the engine already has in its hand.
+    pub owner: Option<[u8; 32]>,
+}
+
+/// A player arriving in the world.
+///
+/// # Why the engine does not say whether this is their first time
+///
+/// It knows, and telling you would be content. "First-ever join" is a rule a
+/// mod invents — a mimic imprints on one, a tutorial greets one, a shop gives
+/// one a starting stack — and every one of them wants a different definition of
+/// first. `game.storage` is how a mod remembers what it has seen, so the fact
+/// belongs there rather than in an engine field that would be right for exactly
+/// one mod (charter rule 1).
+///
+/// The UUID is the identity and the name is a per-server claim bound to it
+/// (charter rule 13). Both are here because a mod needs the first to remember
+/// anything and the second to say anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinEvent {
+    /// Who arrived, canonically.
+    pub player: [u8; 32],
+    /// What they are currently called on this server.
+    pub name: String,
 }
 
 /// Fluid pressing against something it cannot get into.
@@ -895,11 +926,19 @@ pub trait ScriptVm: Sized {
     /// own checks pass but before anything is written or charged.
     fn place(&mut self, event: &PlaceEvent) -> HookOutcome;
 
+    /// Tells every registered `on_player_join` that somebody arrived.
+    ///
+    /// Nothing is being asked — they are already in the world — so the outcome
+    /// carries only the faults, exactly as `fluid_flow` does. Refusing entry is
+    /// not a mod's decision to make here: an allowlist is charter rule 13's
+    /// business and happens long before a body exists.
+    fn player_join(&mut self, event: &JoinEvent) -> HookOutcome;
+
     /// Asks every registered `on_punch` whether a hit lands.
     ///
-    /// The same rules again. **No caller yet** — see [`PunchEvent`]: entities
-    /// are Task 12, so there is nothing to punch. This is here, and tested, so
-    /// that task adds a caller rather than an API.
+    /// The same rules again. A mod returning `false` means the hit did not
+    /// land, and no later hook is asked — the same first-refusal-wins rule
+    /// [`Self::dig_complete`] documents, and for the same reason.
     fn punch(&mut self, event: &PunchEvent) -> HookOutcome;
 
     /// Tells every registered `on_fluid_flow` that a flow was blocked.

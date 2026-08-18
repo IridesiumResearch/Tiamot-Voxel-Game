@@ -226,6 +226,32 @@ impl Generator {
         }
     }
 
+    /// Tells the mods somebody arrived.
+    pub fn player_joined(
+        &mut self,
+        event: &tiamot_core::script::JoinEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().player_join(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
+    /// Tells the mods somebody hit something.
+    ///
+    /// A mod may refuse it, which is what "the hit did not land" means — and
+    /// what the hit DOES if it lands is entirely a mod's business, because the
+    /// engine has no damage model (charter rule 1).
+    pub fn may_punch(
+        &mut self,
+        event: &tiamot_core::script::PunchEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().punch(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
     /// Tells the mods a flow was blocked.
     ///
     /// Nothing is being asked — the flow already failed — so the outcome

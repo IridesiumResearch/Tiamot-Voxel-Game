@@ -782,6 +782,7 @@ impl ServerHandle {
             players: AtomicU32::new(0),
             control: control.clone(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -1026,6 +1027,12 @@ impl ServerHandle {
                     // the lending window compiler-enforced: between the two the
                     // tick has no world, so there is nothing for a mod's read to
                     // race with. The cost is one `Option` move per tick.
+                    // Who the tick has already told the mods about. Arrivals
+                    // are a diff against this rather than an event from the
+                    // network, so a join the tick never saw cannot be missed.
+                    let mut known_players: std::collections::BTreeSet<tiamot_core::PlayerUuid> =
+                        std::collections::BTreeSet::new();
+
                     let mut held = Some(world);
 
                     let mut clock = sim::MonotonicClock::new();
@@ -1226,6 +1233,7 @@ impl ServerHandle {
                         // The mirrors are transient: never saved, never stepped,
                         // never dirtying a chunk. `ent::Population::transient`
                         // says what each of those would otherwise cost.
+                        let mut joined: Vec<tiamot_core::script::JoinEvent> = Vec::new();
                         {
                             let mut mobs = population.write().expect("entity lock");
                             let mut present = std::collections::BTreeSet::new();
@@ -1256,6 +1264,27 @@ impl ServerHandle {
                             // disconnection the tick never saw would otherwise
                             // leave a body standing in the world for ever.
                             mobs.retain_players(&present);
+
+                            // Arrivals are the same diff read the other way.
+                            // Derived rather than delivered as an event from
+                            // the connection task, because a hook must run on
+                            // this thread inside the tick — a mod called from a
+                            // connection could spawn an entity while the tick
+                            // was iterating them.
+                            for uuid in &present {
+                                if known_players.insert(*uuid) {
+                                    joined.push(tiamot_core::script::JoinEvent {
+                                        player: *uuid.as_bytes(),
+                                        name: shared
+                                            .online
+                                            .lock()
+                                            .ok()
+                                            .and_then(|online| online.get(uuid).cloned())
+                                            .unwrap_or_default(),
+                                    });
+                                }
+                            }
+                            known_players.retain(|uuid| present.contains(uuid));
                         }
 
                         // Digging, after movement so a dig is judged against
@@ -1618,6 +1647,18 @@ impl ServerHandle {
                         // reading a world nothing else is halfway through
                         // changing.
                         let (returned, ()) = sight.lending(world, || {
+                            // Arrivals first: a mod that spawns something for a
+                            // new player should have done it before that
+                            // player's first tick runs, not after.
+                            for event in &joined {
+                                let outcome = source.player_joined(event);
+                                for (mod_id, err) in &outcome.faults {
+                                    error!(
+                                        mod_id = %mod_id,
+                                        "mod disabled after an on_player_join failure: {err}"
+                                    );
+                                }
+                            }
                             for (mod_id, err) in source.tick(1) {
                                 error!(mod_id = %mod_id, "mod disabled after a tick failure: {err}");
                             }
@@ -1787,6 +1828,70 @@ impl ServerHandle {
                             broadcast_light(&shared, &light, &touched);
                         }
                         control.note_lit_chunks(lighting.read().expect("lighting lock").len());
+
+                        // **Punches, judged here and nowhere else.** A client
+                        // says which entity it hit; the server decides whether
+                        // it could have. Charter rule 2: a viewer that could
+                        // assert a hit could assert every hit.
+                        //
+                        // What a hit MEANS is not decided here at all. The
+                        // engine has no damage model — it reports who hit what
+                        // and the mods do the rest (charter rule 1).
+                        for (uuid, target) in shared.drain_punches() {
+                            let id = tiamot_core::ent::EntityId(target);
+                            let Some((centre, owner)) = ({
+                                let mobs = population.read().expect("entity lock");
+                                mobs.get(id).map(|entity| {
+                                    (entity.transform, entity.owner.map(|owner| owner.0))
+                                })
+                            }) else {
+                                // A stale id, or one a client invented. Silence
+                                // rather than an error: an entity that
+                                // despawned between the click and the tick is
+                                // ordinary, and telling the mods about a punch
+                                // at nothing would be inventing an event.
+                                continue;
+                            };
+
+                            let Some(attacker) = ({
+                                let bodies = shared.bodies.lock().ok();
+                                bodies.and_then(|bodies| {
+                                    bodies.get(&uuid).map(|player| {
+                                        tiamot_core::ent::Transform::at(
+                                            player.origin,
+                                            player.body.position,
+                                        )
+                                    })
+                                })
+                            }) else {
+                                continue;
+                            };
+
+                            // The same reach the crosshair has, measured
+                            // between the two bodies' feet. Squared, so no
+                            // root: charter rule 4 allows `sqrt`, but there is
+                            // no reason to spend one on a comparison.
+                            let offset = centre.offset_to(&attacker);
+                            let distance =
+                                offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2];
+                            let reach = tiamot_core::phys::ray::REACH;
+                            if distance > reach * reach {
+                                debug!(
+                                    actor = %uuid.short(),
+                                    "a punch was thrown from further away than an arm reaches"
+                                );
+                                continue;
+                            }
+
+                            let verdict = source.may_punch(&tiamot_core::script::PunchEvent {
+                                attacker: *uuid.as_bytes(),
+                                target: id,
+                                owner: owner.map(|owner| *owner.as_bytes()),
+                            });
+                            for (mod_id, err) in &verdict.faults {
+                                error!(mod_id = %mod_id, "mod disabled after an on_punch failure: {err}");
+                            }
+                        }
 
                         // **The mods' own entity logic, before the physics.**
                         //

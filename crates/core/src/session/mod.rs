@@ -107,6 +107,18 @@ pub enum Action {
         material: u16,
     },
 
+    /// Hit an entity.
+    ///
+    /// A request, like [`Action::Place`]: the session has established only that
+    /// this player is in the world and may ask. Whether the entity exists,
+    /// whether it is within reach, and what a hit means are all decided by the
+    /// simulation, which is the only thing that can see the world and every
+    /// body in it at once.
+    Punch {
+        /// The entity, as the server named it when it spawned.
+        entity: u64,
+    },
+
     /// Record a movement/look input for the next tick.
     Input {
         /// The tick the client believes it is on.
@@ -355,6 +367,9 @@ impl Session {
             }),
             (Phase::InWorld, ClientMessage::CancelDig) => {
                 Response::act(Action::Dig { target: None })
+            }
+            (Phase::InWorld, ClientMessage::Punch { entity }) => {
+                Response::act(Action::Punch { entity: *entity })
             }
             (Phase::InWorld, ClientMessage::SelectTool { tool }) => {
                 Response::act(Action::SelectTool { tool: tool.clone() })
@@ -759,6 +774,7 @@ impl Session {
             ClientMessage::SelectTool { .. } => "SelectTool",
             ClientMessage::Place { .. } => "Place",
             ClientMessage::ViewDistance { .. } => "ViewDistance",
+            ClientMessage::Punch { .. } => "Punch",
         };
         self.close_with(DisconnectReason::ProtocolError {
             detail: format!("{what} is not valid in phase {:?}", self.phase),
