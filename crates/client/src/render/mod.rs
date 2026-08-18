@@ -1723,6 +1723,15 @@ impl Renderer {
                 pass.set_pipeline(skinned_pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 self.skinned.draw(&mut pass);
+
+                // **Put the chunks' instance array back.** A figure's instances
+                // live in slot 1 too, and `draw_fluid` below sets only slot 0
+                // and the indices — it inherits slot 1 from the chunk loop
+                // above, which is the whole reason one buffer serves every
+                // chunk. Leaving the figures' buffer bound there fed each pond
+                // a figure's position as its chunk offset, and reported as
+                // "fluid rendered in the sky".
+                pass.set_vertex_buffer(1, self.instances.slice(..));
             }
 
             self.draw_fluid(&mut pass, fluid_pipeline, &visible);

@@ -2580,3 +2580,83 @@ fn a_figure_is_posed_by_its_clip_rather_than_drawn_at_rest() {
          figure mid-stride, so the joint palette is not reaching the shader"
     );
 }
+
+#[test]
+fn a_figure_in_the_frame_does_not_move_the_milk() {
+    // **The bug this exists for, reported from a running game as "fluid
+    // rendered in the sky".**
+    //
+    // Chunks and the debug body use per-instance vertex data in slot 1, and the
+    // fluid pass sets only slot 0 and its indices — it inherits slot 1 from the
+    // chunk loop, which is the whole reason one instance buffer serves every
+    // chunk. Drawing figures between the two left the FIGURES' instance buffer
+    // bound there, so every pond took a figure's position as its chunk offset
+    // and drew wherever that was.
+    //
+    // The figure here is BEHIND the camera and contributes no pixels of its
+    // own. So if anything in the frame changes, it changed because the figure's
+    // draw disturbed something that was not the figure.
+    let Some(gpu) = gpu() else { return };
+
+    const STONE: MaterialId = MaterialId(2);
+    const MILK: MaterialId = MaterialId(4);
+
+    struct Pond;
+    impl client::mesher::FluidFill for Pond {
+        fn fill(&self, _x: i32, y: i32, _z: i32) -> Option<(u16, u8)> {
+            (y == 9).then_some((MILK.get(), 24))
+        }
+    }
+
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+    let atlas = Atlas::build(&[
+        None,
+        None,
+        Some(Image::solid(16, 16, [230, 230, 230, 255])),
+        None,
+        Some(Image::solid(16, 16, [90, 140, 220, 255])),
+    ]);
+    renderer.set_atlas(&atlas);
+
+    let mut chunk = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+    for x in 0..16 {
+        for z in 0..16 {
+            chunk
+                .set_block(BlockPos::new(x, 8, z), BlockValue::Uniform(STONE))
+                .expect("in chunk");
+        }
+    }
+    let mesh = mesher::mesh_chunk(&chunk, &Neighbours::none(), Absent::Solid, &DAY, &Pond);
+    renderer.set_chunk(ChunkPos::new(0, 0, 0), &mesh);
+
+    let mut camera = Camera {
+        position: Position::from_world(8.0, 16.0, 8.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -1.2);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    let alone = target.capture(&mut renderer, &camera).expect("capture");
+
+    // Behind the camera, which is looking down and forward.
+    let forward = camera.forward();
+    renderer.set_entities(vec![client::render::skinned::Figure {
+        offset: [-forward.x * 12.0, -forward.y * 12.0, -forward.z * 12.0],
+        yaw: 0.0,
+        anim: 1,
+        phase: 0.25,
+    }]);
+    let peopled = target.capture(&mut renderer, &camera).expect("capture");
+
+    let differing = alone
+        .rgba
+        .iter()
+        .zip(&peopled.rgba)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} bytes of the frame changed when a figure was added BEHIND the \
+         camera — a figure's draw is disturbing state a later pass depends on"
+    );
+}
