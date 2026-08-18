@@ -2420,6 +2420,15 @@ impl App {
 
         let mut placed = Vec::with_capacity(self.entities.len());
         for (id, entity) in self.entities.iter() {
+            // **The engine's rig, or nothing.** A model is a canonical string
+            // id and the only one the client has is its own; a server naming
+            // another is naming something it has not pushed yet, and drawing a
+            // humanoid for it would put a person where a mod meant a crate.
+            // An entity with no model at all is a marker and is meant to be
+            // invisible.
+            if entity.model.as_deref() != Some(tiamot_core::ent::HUMANOID_MODEL) {
+                continue;
+            }
             let Some(pose) = entity.pose(now) else {
                 continue;
             };
