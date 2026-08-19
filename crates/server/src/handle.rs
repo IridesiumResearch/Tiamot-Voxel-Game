@@ -597,6 +597,35 @@ impl ServerHandle {
             .collect();
         info!(actions = action_table.len(), "action table built");
 
+        // Charter rule 1 once more: the engine has no sounds, so this is
+        // whatever the mods registered. The file travels by hash through the
+        // same content pipeline a texture does.
+        let sound_table: Vec<tiamot_core::proto::SoundDef> = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_sounds())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|sound| {
+                let file = content_index.hash_of(&sound.mod_id, &sound.file);
+                if file.is_none() {
+                    error!(
+                        mod_id = %sound.mod_id,
+                        path = %sound.file,
+                        sound = %sound.id,
+                        "sound declares a file that is not in the mod directory; clients will \
+                         play nothing"
+                    );
+                }
+                tiamot_core::proto::SoundDef {
+                    id: sound.id,
+                    file,
+                    gain: sound.gain,
+                    pitch_variance: sound.pitch_variance,
+                }
+            })
+            .collect();
+        info!(sounds = sound_table.len(), "sound table built");
+
         info!(
             materials = materials.len(),
             textured = materials.iter().filter(|m| m.texture.is_some()).count(),
@@ -800,6 +829,7 @@ impl ServerHandle {
             materials,
             tool_table,
             action_table,
+            sound_table,
             fluid_table,
             sky_day_length: sky.0,
             sky_keyframes: sky.1,
@@ -1052,6 +1082,11 @@ impl ServerHandle {
                             // tests alone, and this is the same shape.
                             host.vm_mut()
                                 .set_tools_access(std::sync::Arc::new(HeldTools {
+                                    shared: std::sync::Arc::clone(&shared),
+                                }));
+                            // And who is close enough to hear a mod's sounds.
+                            host.vm_mut()
+                                .set_sound_access(std::sync::Arc::new(Earshot {
                                     shared: std::sync::Arc::clone(&shared),
                                 }));
                             crate::world::Generator::Mods(Box::new(
@@ -2460,5 +2495,64 @@ impl tiamot_core::dig::Tools for HeldTools {
         }
         self.shared.select_tool(&uuid, tool.map(ToOwned::to_owned));
         true
+    }
+}
+
+/// `game.play_sound`, delivered to whoever is close enough to hear it.
+///
+/// The seam from [`tiamot_core::sound::Access`]. Deciding who is in earshot
+/// needs every connected player, which lives here rather than in `core`
+/// (charter rule 3) — and the engine has no idea what a sound IS, only who to
+/// tell about one (rule 1).
+struct Earshot {
+    shared: std::sync::Arc<crate::transport::endpoint::Shared>,
+}
+
+impl tiamot_core::sound::Access for Earshot {
+    fn play(&self, request: &tiamot_core::sound::PlayRequest) -> u32 {
+        let message = tiamot_core::proto::ServerMessage::PlaySound {
+            sound: request.sound.clone(),
+            pos: request.pos,
+            radius: request.radius,
+            gain: request.gain,
+            entity: request.entity,
+        };
+
+        // **Who is close enough, decided here and not by the client.** A client
+        // told about every sound in the world could hear through walls and
+        // across a continent, and would pay for the messages either way.
+        //
+        // A sound that follows an ENTITY is sent to everyone in radius of where
+        // the mod says it starts. Following it after that is the client's job:
+        // it has the entity's interpolated position every frame, and the server
+        // does not.
+        let Ok(bodies) = self.shared.bodies.lock() else {
+            return 0;
+        };
+        let radius = f64::from(request.radius);
+        let mut told = 0;
+        for (uuid, player) in bodies.iter() {
+            let at =
+                tiamot_core::ent::Transform::at(player.origin, player.body.position).to_world();
+            // Squared, so there is no root: charter rule 4 does not reach audio,
+            // but a square root nobody needs is still a square root nobody
+            // needs.
+            let offset = [
+                at[0] - request.pos[0],
+                at[1] - request.pos[1],
+                at[2] - request.pos[2],
+            ];
+            let distance = offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2];
+            if distance > radius * radius {
+                continue;
+            }
+            // Queued per player rather than broadcast, which is the whole point:
+            // the queue is drained on that player's own connection task.
+            let _ = self
+                .shared
+                .push_entity_messages(uuid, std::iter::once(message.clone()));
+            told += 1;
+        }
+        told
     }
 }

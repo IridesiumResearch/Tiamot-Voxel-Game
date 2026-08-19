@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -133,6 +133,13 @@ pub const MAX_ENTITIES_PER_MESSAGE: usize = 4096;
 /// generous for any real mod set and finite against one that is not. A hundred
 /// mods with ten controls each fits.
 pub const MAX_ACTIONS: usize = 1024;
+
+/// Most sounds a server may declare in one [`ServerMessage::SoundTable`].
+///
+/// Each entry costs the client a decode job and a buffer it holds for the
+/// session, so this is generous for any real mod set and finite against one
+/// that is not.
+pub const MAX_SOUNDS: usize = 1024;
 
 /// A `BLAKE3` content hash.
 pub type ContentHash = [u8; 32];
@@ -354,6 +361,25 @@ pub struct ActionDef {
     /// Empty means the mod shipped it unbound, which is legitimate: the player
     /// binds it or it does nothing.
     pub default_key: String,
+}
+
+/// A sound a mod registered, as the client needs to see it.
+///
+/// The file travels through the content pipeline like a texture — by hash, on
+/// request — so this carries the hash rather than the bytes. **It is hostile
+/// input** (charter rule 14): a client decodes audio from servers it does not
+/// trust, and the decoder bounds everything before it allocates.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SoundDef {
+    /// The qualified id, e.g. `"core_tools:break"`.
+    pub id: String,
+    /// The content hash of the audio file, or `None` if the mod named one that
+    /// is not in its directory — the client plays nothing rather than guessing.
+    pub file: Option<ContentHash>,
+    /// How loud, as a multiplier on the file's own level.
+    pub gain: f32,
+    /// How much to vary the pitch per play, as a fraction.
+    pub pitch_variance: f32,
 }
 
 /// One material in the world's id table, as the client needs to see it.
@@ -973,6 +999,36 @@ pub enum ServerMessage {
         /// Every mod-registered action, in load order.
         actions: Vec<ActionDef>,
     },
+    /// The sounds a server's mods registered, sent once on join.
+    ///
+    /// **Appended at the end** (protocol v17).
+    ///
+    /// Empty is the ordinary case for a server whose mods make no noise.
+    SoundTable {
+        /// Every registered sound, in load order.
+        sounds: Vec<SoundDef>,
+    },
+
+    /// Play a sound, because something happened near this player.
+    ///
+    /// **Appended at the end** (protocol v17).
+    ///
+    /// Only sent to players inside the request's radius — a sound nobody can
+    /// hear costs the check and nothing else. What it sounds like from where
+    /// they are standing is the client's business: the server says what
+    /// happened and where, never how loud it arrived.
+    PlaySound {
+        /// The qualified sound id, as sent in [`ServerMessage::SoundTable`].
+        sound: String,
+        /// Where it happens, in world blocks. Ignored when `entity` is set.
+        pos: [f64; 3],
+        /// How far it carries, in blocks, for the client's attenuation.
+        radius: f32,
+        /// How loud, multiplying the sound's registered gain.
+        gain: f32,
+        /// An entity to follow, if the sound should move with one.
+        entity: Option<u64>,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -1317,6 +1373,41 @@ fn check_occupancy(edit: &Edit) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Bounds a sound table, and the ids in it.
+fn check_sounds(sounds: &[SoundDef]) -> Result<(), ProtocolError> {
+    check_len("sound_table", sounds.len(), MAX_SOUNDS)?;
+    for sound in sounds {
+        check_len("sound_id", sound.id.len(), MAX_ID_BYTES)?;
+    }
+    Ok(())
+}
+
+/// Bounds a play request, including the numbers that reach a mixer.
+///
+/// Charter rule 14: a server is not trusted. A `NaN` gain is not a quiet sound,
+/// it is undefined behaviour in somebody's ears.
+fn check_play(message: &ServerMessage) -> Result<(), ProtocolError> {
+    let ServerMessage::PlaySound {
+        sound,
+        pos,
+        radius,
+        gain,
+        ..
+    } = message
+    else {
+        return Ok(());
+    };
+    check_len("sound_id", sound.len(), MAX_ID_BYTES)?;
+    if !pos.iter().all(|value| value.is_finite()) || !radius.is_finite() || !gain.is_finite() {
+        return Err(ProtocolError::FieldTooLarge {
+            field: "play_sound",
+            len: 0,
+            limit: 0,
+        });
+    }
+    Ok(())
+}
+
 /// Bounds every string in an action table.
 ///
 /// Its own function because `validate_server_message` is at clippy's line limit,
@@ -1446,6 +1537,8 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         ServerMessage::BlockDelta { edit, .. } => check_occupancy(edit)?,
 
         ServerMessage::ActionTable { actions } => check_actions(actions)?,
+        ServerMessage::SoundTable { sounds } => check_sounds(sounds)?,
+        message @ ServerMessage::PlaySound { .. } => check_play(message)?,
 
         ServerMessage::HelloAck { .. }
         | ServerMessage::AuthChallenge { .. }

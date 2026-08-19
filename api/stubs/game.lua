@@ -456,6 +456,41 @@ function game.get_tool(player) end
 ---@return boolean took
 function game.set_tool(player, tool) end
 
+---Fields accepted by `game.register_sound`.
+---@class Tiamot.SoundSpec
+---@field id string Required. Namespaced with your mod id automatically.
+---@field file string Required. Path inside your mod directory, e.g. "sounds/break.ogg". Ogg Vorbis.
+---@field gain number? Loudness multiplier on the file's own level. Default 1.
+---@field pitch_variance number? How much to vary the pitch each play, as a fraction. Default 0, which makes a repeated sound machine-like.
+
+---Registers a sound. Registration window only.
+---
+---The file travels to clients by hash, through the same content pipeline a
+---block texture uses — you ship the file in your mod directory and the engine
+---does the rest.
+---@param spec Tiamot.SoundSpec
+function game.register_sound(spec) end
+
+---Fields accepted by `game.play_sound`.
+---@class Tiamot.PlaySpec
+---@field sound string Required. A sound id; unqualified means your own.
+---@field pos { x: number, y: number, z: number } Required. Where it happens, in world blocks. Ignored when `entity` is set.
+---@field radius number? How far it carries, in blocks. Default 16, capped at 512. Players outside are not sent it at all.
+---@field gain number? Loudness multiplier on the sound's registered gain. Default 1.
+---@field entity integer? An entity to follow, if the sound should move with one.
+
+---Plays a sound for everyone close enough to hear it.
+---
+---Returns how many players were told — which is NOT a promise anybody heard
+---it: a client may have it muted, may still be fetching the file, or may have
+---refused it as a poisoned asset.
+---
+---A careless number is clamped rather than refused: `0/0` is a quiet NaN in Lua
+---and would otherwise reach a mixer.
+---@param spec Tiamot.PlaySpec
+---@return integer told
+function game.play_sound(spec) end
+
 ---A walkable route between two points, or why there is not one.
 ---
 ---Navigation is **block resolution** and deliberately simple (Sub-Node Contract

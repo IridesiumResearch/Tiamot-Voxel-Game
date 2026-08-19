@@ -867,6 +867,12 @@ pub trait ScriptVm: Sized {
     /// anything yet.
     fn set_tools_access(&mut self, access: std::sync::Arc<dyn crate::dig::Tools>);
 
+    /// Points `game.play_sound` at the connected players.
+    ///
+    /// Called once, after the server exists. Until then a request is dropped —
+    /// a mod making a noise during worldgen has nobody to make it for.
+    fn set_sound_access(&mut self, access: std::sync::Arc<dyn crate::sound::Access>);
+
     /// Points the entity API at the server's store.
     ///
     /// The same seam as [`Self::set_fluid_access`], for the same reason: the
@@ -1042,6 +1048,9 @@ pub trait ScriptVm: Sized {
 
     /// Tools registered during the loading window, ordered by id.
     fn registered_tools(&self) -> Vec<Tool>;
+
+    /// Every sound the loaded mods registered, in load order.
+    fn registered_sounds(&self) -> Vec<crate::sound::Sound>;
 
     /// Every action the loaded mods registered, in load order.
     ///

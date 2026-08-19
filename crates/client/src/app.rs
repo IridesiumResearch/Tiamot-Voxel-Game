@@ -677,6 +677,15 @@ pub struct App {
     actions: crate::input::Actions,
     /// What each action is bound to.
     bindings: crate::input::Bindings,
+    /// Every sound the server's mods registered.
+    sounds: Vec<tiamot_core::proto::SoundDef>,
+    /// Sounds this client has been told about and not yet played.
+    ///
+    /// A queue rather than an immediate call, because playing one belongs to
+    /// the audio backend and this is the frame loop. Charter rule 4's scope
+    /// note applies: none of this is simulation, so nothing here has to be
+    /// deterministic.
+    heard: Vec<crate::net::Event>,
     /// Whether the settings screen is showing.
     settings_open: bool,
     /// The action waiting for a key, while the settings screen captures one.
@@ -907,6 +916,8 @@ impl App {
             config,
             actions: crate::input::Actions::engine(),
             bindings,
+            sounds: Vec::new(),
+            heard: Vec::new(),
             settings_open: false,
             rebinding: None,
             bindings_dirty: false,
@@ -1807,6 +1818,20 @@ impl App {
         }
     }
 
+    /// Every sound the server's mods registered.
+    #[must_use]
+    pub fn sounds(&self) -> &[tiamot_core::proto::SoundDef] {
+        &self.sounds
+    }
+
+    /// Takes the sounds heard since the last call.
+    ///
+    /// Drained rather than read, because each one is played exactly once and a
+    /// frame that read the list twice would play everything twice.
+    pub fn take_heard(&mut self) -> Vec<crate::net::Event> {
+        std::mem::take(&mut self.heard)
+    }
+
     /// Whether the settings screen is showing.
     #[must_use]
     pub fn settings_open(&self) -> bool {
@@ -2340,6 +2365,13 @@ impl App {
                 }
 
                 Event::Actions { actions } => self.adopt_actions(actions),
+
+                // Recorded now, played later: the audio backend is the next
+                // piece of Task 13, and until it lands a client knows what a
+                // server's sounds ARE without being able to make one.
+                Event::Sounds { sounds } => self.sounds = sounds,
+
+                Event::PlaySound { .. } => self.heard.push(event),
 
                 Event::Tools { tools } => {
                     // The default first, so a player who never touches the tool

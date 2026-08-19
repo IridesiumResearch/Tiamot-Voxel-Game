@@ -100,6 +100,8 @@ pub struct Shared {
     /// Charter rule 11: the engine owns bindings and a mod owns only the name,
     /// so this is the whole of what a mod gets to say about controls.
     pub action_table: Vec<tiamot_core::proto::ActionDef>,
+    /// Every sound the mods registered, for the join tables.
+    pub sound_table: Vec<tiamot_core::proto::SoundDef>,
 
     /// Ticks in a full day, or 0 if no mod registered a sky.
     pub sky_day_length: u32,
@@ -1476,6 +1478,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 tools: &shared.tool_table,
                 fluids: &shared.fluid_table,
                 actions: &shared.action_table,
+                sounds: &shared.sound_table,
                 sky: (shared.sky_day_length, &shared.sky_keyframes),
                 allowlist: &allowlist,
                 max_players: shared.max_players,
@@ -1810,6 +1813,7 @@ mod tests {
             materials: Vec::new(),
             tool_table: Vec::new(),
             action_table: Vec::new(),
+            sound_table: Vec::new(),
             fluid_table: Vec::new(),
             sky_day_length: 0,
             sky_keyframes: Vec::new(),

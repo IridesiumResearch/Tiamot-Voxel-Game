@@ -1364,6 +1364,33 @@ impl Bot {
     /// # Errors
     ///
     /// [`BotError`] if the message cannot be sent.
+    /// Every sound the server has told this bot to play, in arrival order.
+    ///
+    /// The whole of what Task 13's delivery criterion can assert: a bot has no
+    /// speakers, and whether a noise came out is the [H] half. What IS testable
+    /// is that the right players were told and the wrong ones were not.
+    #[must_use]
+    pub fn sounds_heard(&self) -> Vec<(String, [f64; 3])> {
+        self.received()
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerMessage::PlaySound { sound, pos, .. } => Some((sound, pos)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The sounds a server's mods registered.
+    #[must_use]
+    pub fn sound_table(&self) -> Option<Vec<tiamot_core::proto::SoundDef>> {
+        self.received()
+            .into_iter()
+            .find_map(|message| match message {
+                ServerMessage::SoundTable { sounds } => Some(sounds),
+                _ => None,
+            })
+    }
+
     pub async fn action(&mut self, id: &str, pressed: bool) -> Result<(), BotError> {
         self.send(&tiamot_core::proto::ClientMessage::Action {
             id: id.to_owned(),

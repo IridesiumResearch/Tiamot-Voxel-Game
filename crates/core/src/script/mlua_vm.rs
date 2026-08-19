@@ -237,6 +237,8 @@ pub struct MluaVm {
     fluid: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::fluid::Access>>>>,
     /// Where `game.get_tool` and `game.set_tool` reach, once there are players.
     tools: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::dig::Tools>>>>,
+    /// Where `game.play_sound` reaches, once there are players to hear it.
+    sounds: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::sound::Access>>>>,
     /// Where `game.set_block` sends its edits, once there is a world.
     edits: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::script::WorldEdit>>>>,
     /// Where the `game.*_entity` calls reach, once there is a world.
@@ -510,6 +512,7 @@ impl ScriptVm for MluaVm {
             light: std::sync::Arc::new(std::sync::Mutex::new(None)),
             fluid: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tools: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            sounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
             storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sight: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -570,6 +573,33 @@ impl ScriptVm for MluaVm {
         if let Ok(mut slot) = self.tools.lock() {
             *slot = Some(access);
         }
+    }
+
+    fn set_sound_access(&mut self, access: std::sync::Arc<dyn crate::sound::Access>) {
+        if let Ok(mut slot) = self.sounds.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn registered_sounds(&self) -> Vec<crate::sound::Sound> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.sounds") else {
+            return Vec::new();
+        };
+        // A sequence, so iterating it is load order — the order the settings
+        // screen and the content pipeline both want.
+        registry
+            .sequence_values::<Table>()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                Some(crate::sound::Sound {
+                    id: entry.get("id").ok()?,
+                    mod_id: entry.get("mod_id").ok()?,
+                    file: entry.get("file").ok()?,
+                    gain: entry.get("gain").unwrap_or(1.0),
+                    pitch_variance: entry.get("pitch_variance").unwrap_or(0.0),
+                })
+            })
+            .collect()
     }
 
     fn set_entity_access(&mut self, access: std::sync::Arc<dyn crate::ent::Access>) {
@@ -1291,6 +1321,78 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))
     }
 
+    /// The `game.register_sound` and `game.play_sound` functions.
+    ///
+    /// Registration is bounded by the freeze like every other registry (charter
+    /// rule 9). Playing is not: it happens during a tick, for ever.
+    fn install_sound(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let owner = mod_id.to_owned();
+        let register_sound = self
+            .lua
+            .create_function(move |lua, spec: Table| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                let id: String = spec.get("id")?;
+                let entry = lua.create_table()?;
+                entry.set(
+                    "id",
+                    qualify_id(&owner, &id).map_err(mlua::Error::external)?,
+                )?;
+                entry.set("mod_id", owner.clone())?;
+                entry.set("file", spec.get::<String>("file")?)?;
+                entry.set("gain", spec.get::<Option<f32>>("gain")?.unwrap_or(1.0))?;
+                entry.set(
+                    "pitch_variance",
+                    spec.get::<Option<f32>>("pitch_variance")?.unwrap_or(0.0),
+                )?;
+                let sounds: Table = lua.named_registry_value("tiamot.sounds")?;
+                sounds.push(entry)?;
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_sound", register_sound)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
+        let slot = std::sync::Arc::clone(&self.sounds);
+        let play_sound = self
+            .lua
+            .create_function(move |_, spec: Table| {
+                let sound: String = spec.get("sound")?;
+                // Unqualified means the caller's own, the way every other id in
+                // this API works — a mod naming its own sound should not have
+                // to repeat its own name.
+                let sound = if sound.contains(':') {
+                    sound
+                } else {
+                    qualify_id(&owner, &sound).map_err(mlua::Error::external)?
+                };
+                let pos: Table = spec.get("pos")?;
+                let request = crate::sound::sanitise(crate::sound::PlayRequest {
+                    sound,
+                    pos: [pos.get("x")?, pos.get("y")?, pos.get("z")?],
+                    radius: spec.get::<Option<f32>>("radius")?.unwrap_or(16.0),
+                    gain: spec.get::<Option<f32>>("gain")?.unwrap_or(1.0),
+                    entity: spec.get::<Option<u64>>("entity")?,
+                });
+                // How many were told, which is the mod's only feedback — and
+                // deliberately not a promise anybody HEARD it.
+                let told = slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|access| access.play(&request)));
+                Ok(told.unwrap_or(0))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("play_sound", play_sound)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// The `game.get_tool` and `game.set_tool` functions.
     ///
     /// Both take a player UUID in hex, the way `game.entity` reports one and
@@ -1474,6 +1576,7 @@ impl MluaVm {
 
         self.install_entity_step_hook(mod_id, game)?;
         self.install_tools(game)?;
+        self.install_sound(mod_id, game)?;
 
         // The two cancellable hooks. Registered exactly like `on_tick` — one
         // callback per mod, ordered by load order — so a mod author has one
@@ -2301,6 +2404,7 @@ impl MluaVm {
         let block_textures = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let generators = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let actions = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        let sounds = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.blocks", blocks)
             .map_err(|err| self.vm_error(&err))?;
@@ -2342,6 +2446,9 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.actions", actions)
+            .map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.sounds", sounds)
             .map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.next_material", self.next_material)

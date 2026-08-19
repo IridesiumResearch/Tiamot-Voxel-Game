@@ -253,6 +253,12 @@ pub struct JoinContext<'a> {
     /// NOT in here — a client already has those, and a server does not get to
     /// redefine what jump means. See [`crate::proto::ActionDef`].
     pub actions: &'a [crate::proto::ActionDef],
+    /// Every sound the loaded mods registered, in load order.
+    ///
+    /// Charter rule 1 again: the engine has no sounds of its own, so a client
+    /// that was not told this would have nothing to play. Empty is a world
+    /// nobody made a noise in. See [`crate::proto::SoundDef`].
+    pub sounds: &'a [crate::proto::SoundDef],
     /// The sky a mod registered: how long a day is, and its keyframes.
     ///
     /// A day length of zero with no keyframes means no mod registered one,
@@ -690,6 +696,12 @@ impl Session {
                 ServerMessage::ActionTable {
                     actions: context.actions.to_vec(),
                 },
+                // And the sounds, last: a client fetches the files by hash
+                // afterwards, so this is the message that tells it what to ask
+                // for.
+                ServerMessage::SoundTable {
+                    sounds: context.sounds.to_vec(),
+                },
             ],
             close: false,
             action: Action::None,
@@ -863,6 +875,7 @@ mod tests {
             fluids: &[],
             tools: &[],
             actions: &[],
+            sounds: &[],
             sky: (0, &[]),
             allowlist,
             max_players: 50,
@@ -960,7 +973,9 @@ mod tests {
         // engine owns the key (charter rule 11), so the names have to reach the
         // client before it draws a frame in which those keys do nothing.
         assert!(matches!(sent[7], ServerMessage::ActionTable { .. }));
-        assert!(matches!(sent[8], ServerMessage::JoinWorld { .. }));
+        // And the sounds, for the sixth: the engine has none of its own.
+        assert!(matches!(sent[8], ServerMessage::SoundTable { .. }));
+        assert!(matches!(sent[9], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]

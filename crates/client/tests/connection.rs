@@ -161,6 +161,8 @@ struct Seen {
     /// The tool table, which charter rule 1 says only the mods can supply.
     tools: Vec<tiamot_core::proto::ToolDef>,
     actions: Vec<tiamot_core::proto::ActionDef>,
+    sounds: Vec<tiamot_core::proto::SoundDef>,
+    heard: u32,
     /// The sky, which charter rule 1 says the same about.
     sky: Option<client::sky::Sky>,
     /// The most recent time of day the server sent.
@@ -215,6 +217,9 @@ impl Seen {
             // Recorded like the tools table: this harness asserts on what
             // arrives, and an action set is one of the things that does.
             Event::Actions { actions } => self.actions = actions,
+            Event::Sounds { sounds } => self.sounds = sounds,
+            // Recorded like everything else this harness asserts on.
+            Event::PlaySound { .. } => self.heard += 1,
             Event::Chat { .. } => {}
         }
     }

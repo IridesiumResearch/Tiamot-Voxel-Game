@@ -139,6 +139,32 @@ pub enum Event {
         tools: Vec<tiamot_core::proto::ToolDef>,
     },
 
+    /// Every sound the server's mods registered.
+    ///
+    /// Sent once, on join. The files arrive afterwards through the content
+    /// pipeline, by hash, exactly as textures do.
+    Sounds {
+        /// The sounds, in mod load order.
+        sounds: Vec<tiamot_core::proto::SoundDef>,
+    },
+
+    /// Something happened near enough to hear.
+    ///
+    /// The server has already decided this player is in earshot; what it
+    /// sounds like from where they are standing is the client's business.
+    PlaySound {
+        /// The qualified sound id.
+        sound: String,
+        /// Where it happened, in world blocks.
+        pos: [f64; 3],
+        /// How far it carries, for attenuation.
+        radius: f32,
+        /// How loud, multiplying the sound's registered gain.
+        gain: f32,
+        /// An entity to follow, if it should move.
+        entity: Option<u64>,
+    },
+
     /// Every action the server's mods registered.
     ///
     /// Sent once, on join. The engine's own actions are not in here — the
@@ -1021,6 +1047,26 @@ async fn session(
 
             ServerMessage::ActionTable { actions } => {
                 let _ = events.send(Event::Actions { actions });
+            }
+
+            ServerMessage::SoundTable { sounds } => {
+                let _ = events.send(Event::Sounds { sounds });
+            }
+
+            ServerMessage::PlaySound {
+                sound,
+                pos,
+                radius,
+                gain,
+                entity,
+            } => {
+                let _ = events.send(Event::PlaySound {
+                    sound,
+                    pos,
+                    radius,
+                    gain,
+                    entity,
+                });
             }
 
             ServerMessage::FluidTable { fluids } => {

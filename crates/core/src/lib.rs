@@ -85,6 +85,7 @@ pub mod script;
 pub mod session;
 pub mod sight;
 pub mod sky;
+pub mod sound;
 pub mod storage;
 pub mod tick;
 

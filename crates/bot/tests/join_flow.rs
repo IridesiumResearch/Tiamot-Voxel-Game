@@ -120,6 +120,10 @@ fn a_bot_completes_the_whole_join_flow() {
             // names have to reach the thing that owns keys before it draws a
             // frame in which those keys do nothing.
             "ActionTable",
+            // Protocol v17, last of the registration tables: the engine has no
+            // sounds of its own either, and a client fetches the files by hash
+            // after being told what to ask for.
+            "SoundTable",
             "JoinWorld",
         ];
         assert!(
@@ -516,6 +520,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::FluidTable { .. } => "FluidTable",
         ServerMessage::SkyTable { .. } => "SkyTable",
         ServerMessage::ActionTable { .. } => "ActionTable",
+        ServerMessage::SoundTable { .. } => "SoundTable",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",
         _ => "other",
