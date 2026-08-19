@@ -61,7 +61,7 @@ impl Bus {
 }
 
 /// How loud each bus is, and the master over all of them.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Volumes {
     /// Multiplies every bus.
     pub master: f32,

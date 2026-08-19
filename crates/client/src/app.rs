@@ -688,6 +688,8 @@ pub struct App {
     /// note applies: none of this is simulation, so nothing here has to be
     /// deterministic.
     heard: Vec<crate::net::Event>,
+    /// Whether the volumes have changed since they were written out.
+    volumes_dirty: bool,
     /// Whether the settings screen is showing.
     settings_open: bool,
     /// The action waiting for a key, while the settings screen captures one.
@@ -910,6 +912,10 @@ impl App {
             crate::render::sky_colour(),
             f32::from(config.view_distance) * tiamot_core::CHUNK_BLOCKS as f32,
         );
+        // Opened before `config` is moved into the struct below. Never fails:
+        // a machine with no sound device runs the game silently.
+        let mixer = crate::audio::Mixer::open(config.volumes.clone());
+
         Self {
             // Until the server says otherwise, assume it grants what was
             // asked. A client that drew no world until the grant arrived would
@@ -919,8 +925,9 @@ impl App {
             actions: crate::input::Actions::engine(),
             bindings,
             sounds: Vec::new(),
-            mixer: crate::audio::Mixer::open(crate::audio::Volumes::default()),
+            mixer,
             heard: Vec::new(),
+            volumes_dirty: false,
             settings_open: false,
             rebinding: None,
             bindings_dirty: false,
@@ -1893,6 +1900,34 @@ impl App {
     /// The audio backend, for the settings screen's volume sliders.
     pub fn mixer_mut(&mut self) -> &mut crate::audio::Mixer {
         &mut self.mixer
+    }
+
+    /// The config this client started with.
+    ///
+    /// Handed out so the window can write a changed setting back without the
+    /// `App` learning where the file is.
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Whether there is a sound device at all.
+    ///
+    /// Shown on the settings screen, because "the volume is up and I hear
+    /// nothing" and "this machine has no audio" look identical otherwise.
+    #[must_use]
+    pub fn audio_available(&self) -> bool {
+        self.mixer.available()
+    }
+
+    /// Notes that the volumes changed and should be written out.
+    pub fn mark_volumes_dirty(&mut self) {
+        self.volumes_dirty = true;
+    }
+
+    /// Whether the volumes need saving, clearing the flag.
+    pub fn take_volumes_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.volumes_dirty)
     }
 
     /// Whether the settings screen is showing.

@@ -762,6 +762,7 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
     let mut reset: Option<String> = None;
     let mut reset_all = false;
     let mut close = false;
+    let mut volumes_changed = false;
 
     egui::Window::new("Controls")
         .collapsible(false)
@@ -820,6 +821,33 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
                         ui.separator();
                     }
                 });
+            ui.separator();
+            ui.heading("volume");
+            // **Live, not on close.** A slider you cannot hear while dragging
+            // is a slider you have to guess at, so every change goes straight
+            // to the mixer and the file is written when the screen closes.
+            let mut volumes = app.mixer_mut().volumes().clone();
+            let mut changed = ui
+                .add(egui::Slider::new(&mut volumes.master, 0.0..=1.0).text("master"))
+                .changed();
+            for bus in client::audio::Bus::ALL {
+                let level = volumes.buses.entry(bus.name().to_owned()).or_insert(0.8);
+                changed |= ui
+                    .add(egui::Slider::new(level, 0.0..=1.0).text(bus.name()))
+                    .changed();
+            }
+            if changed {
+                app.mixer_mut().set_volumes(volumes);
+                volumes_changed = true;
+            }
+            if !app.audio_available() {
+                ui.label(
+                    egui::RichText::new("no audio device found; the game is running silently")
+                        .color(egui::Color32::LIGHT_YELLOW),
+                );
+            }
+
+            ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Reset all").clicked() {
                     reset_all = true;
@@ -841,6 +869,9 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
     }
     if close {
         app.toggle_settings();
+    }
+    if volumes_changed {
+        app.mark_volumes_dirty();
     }
 }
 
@@ -890,6 +921,17 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     surface
         .egui_state
         .handle_platform_output(&surface.window, output.platform_output);
+
+    // Volumes live in `client.toml` beside the other settings. Saved on the
+    // same "the App raises a flag, the window knows the path" split as the
+    // bindings below.
+    if surface.app.take_volumes_dirty() {
+        let mut config = surface.app.config().clone();
+        config.volumes = surface.app.mixer_mut().volumes().clone();
+        if let Err(err) = config.save(std::path::Path::new(CONFIG_FILE)) {
+            tracing::warn!(%err, "could not save the volume settings");
+        }
+    }
 
     // **The window saves, because the window is what knows the path.** The
     // `App` raises a flag when a binding changes and this writes it out at most

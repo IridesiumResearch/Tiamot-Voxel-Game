@@ -317,6 +317,15 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerChoice,
 
+    /// How loud each mixer bus is.
+    ///
+    /// In the config rather than in `bindings.toml` because it is a setting
+    /// like the field of view, not a control mapping — and because a player who
+    /// hand-edits one file to turn the music down should find it where the
+    /// other settings are.
+    #[serde(default)]
+    pub volumes: crate::audio::Volumes,
+
     /// The display name to claim on join.
     ///
     /// A display string only. Identity is the Ed25519 key and the UUID derived
@@ -434,6 +443,30 @@ impl Config {
         Ok(config)
     }
 
+    /// Writes the config back out.
+    ///
+    /// **Rewrites the whole file, comments and all.** That is why the settings
+    /// screen only ever calls this for values it owns — a player who
+    /// hand-edited `client.toml` to add a comment about which server is which
+    /// would lose it, and losing somebody's notes to save a volume slider is a
+    /// bad trade. Key bindings avoid the problem entirely by living in their
+    /// own file.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError`] if the file cannot be written or the config cannot be
+    /// serialised.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        let text = toml::to_string_pretty(self).map_err(|err| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: err.to_string(),
+        })?;
+        std::fs::write(path, text).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
     /// Reads a config file, or returns the defaults if it does not exist.
     ///
     /// A missing config is the normal first-run state and must not be an error:
@@ -516,6 +549,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            volumes: crate::audio::Volumes::default(),
             server: ServerChoice::default(),
             display_name: Self::default_display_name(),
             world_path: Self::default_world_path(),
