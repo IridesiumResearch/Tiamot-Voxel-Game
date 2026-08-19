@@ -412,3 +412,17 @@ fn dump_the_splat() {
         println!("wrote {}", path.display());
     }
 }
+
+#[test]
+#[ignore = "timing aid: prints a measurement rather than asserting anything"]
+fn what_the_shoreline_skirt_costs() {
+    let start = std::time::Instant::now();
+    let runs = 200;
+    let mut quads = 0;
+    for _ in 0..runs {
+        let mesh = splat();
+        quads = mesh.fluid_vertices.len() / 4;
+    }
+    let each = start.elapsed() / runs;
+    println!("splat fixture: {each:?} per mesh, {quads} fluid quads");
+}

@@ -257,7 +257,7 @@ impl SubNodeGrid {
                         &mut heights,
                         local,
                         material,
-                        depth,
+                        Some(depth),
                     );
                 }
                 continue;
@@ -301,7 +301,7 @@ impl SubNodeGrid {
                     &mut heights,
                     local,
                     material,
-                    depth,
+                    Some(depth),
                 );
             }
         }
@@ -347,6 +347,10 @@ impl SubNodeGrid {
                 }
             }
             walls = Some(blocked);
+
+            // **The shoreline skirt.** See [`shoreline_skirt`].
+            let skirt = shoreline_skirt(heights.as_deref(), walls.as_deref(), last, fluid);
+            fill_skirt(&mut materials, &mut columns, &mut wet, &mut heights, skirt);
         }
 
         let mut grid = Self {
@@ -688,6 +692,95 @@ impl<T: FluidFill + ?Sized> FluidFill for &T {
 /// geometry: it merges, it occludes, it takes corner light. The one thing it is
 /// NOT is collision — the physics reads fluid from the fluid layer, never from
 /// a mesh.
+/// **The shoreline skirt**: one ring of dry blocks, filled so the
+/// surface has somewhere to come down to.
+///
+/// `surface_at` averages the blocks meeting at a corner, and the
+/// outermost vertex a pond HAS is the one on the wet/dry boundary —
+/// two wet blocks and two dry ones, which averages to half the rim's
+/// height however dry blocks are counted. So a shoreline ended in
+/// half a block of vertical milk, and no change to the averaging
+/// rule could have moved it: the surface simply had no vertex
+/// further out to descend to. Reported twice from a running game,
+/// the second time after a fix that only improved the CORNER case
+/// (one wet block against three dry, which does come down).
+///
+/// This is that missing vertex. A dry, open-air block beside milk is
+/// filled like any wet block and kept OUT of `heights`, so the four
+/// blocks meeting at its outer corners are all dry and average to
+/// zero — the milk runs out to the floor across the skirt instead of
+/// stopping in mid-air. Its inner corners are the old boundary
+/// vertices and are unchanged, so the pond itself keeps its shape
+/// and only gains an edge.
+///
+/// A wall is not skirted: `blocked` is the same authority
+/// `surface_at` asks, so milk poured against stone still meets the
+/// stone at its own level rather than running out under it.
+///
+/// **Known gap: a chunk with no milk of its own draws no skirt**,
+/// because this whole pass hangs off `heights.is_some()` and the
+/// shell above it. A pond whose last wet block is the last block of
+/// a chunk therefore still ends in the old half-block cliff on that
+/// one side. Fixing it means probing `fluid.fill` across a dry
+/// chunk's shell, which is the cost the shell pass exists to avoid,
+/// so it wants its own decision rather than being smuggled in here.
+fn shoreline_skirt(
+    heights: Option<&[u8]>,
+    walls: Option<&[bool]>,
+    last: i32,
+    fluid: &impl FluidFill,
+) -> Vec<(LocalBlock, u16)> {
+    let mut skirt = Vec::new();
+    for bz in 0..last {
+        for by in 0..last {
+            for bx in 0..last {
+                let Some(index) = height_index(bx, by, bz) else {
+                    continue;
+                };
+                // Already milk, or terrain the milk is held in by.
+                if heights.is_some_and(|heights| heights[index] != 0)
+                    || walls.is_some_and(|walls| walls[index])
+                {
+                    continue;
+                }
+                // The first lateral neighbour holding milk lends its material:
+                // a skirt is that pond's milk, run thin.
+                for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let (nx, nz) = (bx + dx, bz + dz);
+                    let Some(nindex) = height_index(nx, by, nz) else {
+                        continue;
+                    };
+                    if heights.is_none_or(|heights| heights[nindex] == 0) {
+                        continue;
+                    }
+                    if let Some((material, _)) = fluid.fill(nx, by, nz) {
+                        skirt.push((LocalBlock::new(bx as u32, by as u32, bz as u32), material));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    skirt
+}
+
+/// Lays each skirt block into the lattice.
+///
+/// Separate from collecting them because filling writes the very occupancy the
+/// collection loop reads a neighbour's height from — a skirt block that grew
+/// its own skirt would creep a ring outward on every pass.
+fn fill_skirt(
+    materials: &mut [u16],
+    columns: &mut [Vec<u64>; 3],
+    wet: &mut Option<[Vec<u64>; 3]>,
+    heights: &mut Option<Vec<u8>>,
+    skirt: Vec<(LocalBlock, u16)>,
+) {
+    for (local, material) in skirt {
+        fill_fluid(materials, columns, wet, heights, local, material, None);
+    }
+}
+
 fn fill_fluid(
     materials: &mut [u16],
     columns: &mut [Vec<u64>; 3],
@@ -695,7 +788,7 @@ fn fill_fluid(
     heights: &mut Option<Vec<u8>>,
     local: LocalBlock,
     material: u16,
-    depth: u8,
+    depth: Option<u8>,
 ) {
     let base_x = local.x as usize * SUBNODES_PER_AXIS as usize;
     let base_y = local.y as usize * SUBNODES_PER_AXIS as usize;
@@ -729,13 +822,20 @@ fn fill_fluid(
     // now the highest a surface can be asked to sit — where the old rounding
     // only nearly did, and clamped a corner that wanted to rise above its own
     // block into a crack.
-    let height = (u32::from(depth) * FULL_BLOCK / tiamot_core::UNITS_PER_BLOCK).min(FULL_BLOCK);
-    let heights = heights.get_or_insert_with(|| vec![0u8; PADDED_BLOCKS.pow(3)]);
-    // At least one unit: zero is how `block_height` says "dry", and a puddle
-    // that exists to the physics and to `get_fluid` but not to the mesher is the
-    // worst outcome available here.
-    if let Some(index) = height_index(local.x as i32, local.y as i32, local.z as i32) {
-        heights[index] = u8::try_from(height).unwrap_or(u8::MAX).max(1);
+    // **`None` is a shoreline skirt**, and the whole of what makes one work: the
+    // cells are filled exactly like any wet block's, and the block is left out
+    // of `heights`, so every corner average around it — including its own outer
+    // one — reads it as dry and counts it as zero. See the skirt pass in
+    // `from_chunk_with_fluid`.
+    if let Some(depth) = depth {
+        let height = (u32::from(depth) * FULL_BLOCK / tiamot_core::UNITS_PER_BLOCK).min(FULL_BLOCK);
+        let heights = heights.get_or_insert_with(|| vec![0u8; PADDED_BLOCKS.pow(3)]);
+        // At least one unit: zero is how `block_height` says "dry", and a puddle
+        // that exists to the physics and to `get_fluid` but not to the mesher is
+        // the worst outcome available here.
+        if let Some(index) = height_index(local.x as i32, local.y as i32, local.z as i32) {
+            heights[index] = u8::try_from(height).unwrap_or(u8::MAX).max(1);
+        }
     }
 
     for cy in 0..SUBNODES_PER_AXIS as usize {
@@ -1812,6 +1912,64 @@ mod tests {
         }
         fn solid(&self, x: i32, y: i32, z: i32) -> bool {
             x == 6 && y == 4 && (3..=5).contains(&z)
+        }
+    }
+
+    #[test]
+    fn a_shoreline_reaches_the_floor_rather_than_stopping_half_way() {
+        // **Reported a second time, after the fix that was supposed to settle
+        // it**: "when i place it down it pools out but the edge is always a
+        // little over half a block high."
+        //
+        // The averaging rule was not the reason. A pond's outermost vertex is
+        // the one on the wet/dry boundary, where two of the four blocks meeting
+        // at it are wet — so it lands at half the rim height no matter what a
+        // dry block contributes, and the surface had no vertex further out to
+        // come down to. `a_shoreline_comes_down_to_the_floor_and_a_wall_does_not`
+        // passed throughout, because the CORNER of a pond has three dry blocks
+        // and does come down; the long straight edge a player actually looks at
+        // does not.
+        //
+        // The skirt supplies the missing vertex. This test is written on the
+        // mesh rather than on `surface_at` because that is where the previous
+        // one could not see the bug: it is the drop on a real vertex, in the
+        // buffer that reaches the GPU.
+        let mesh = mesh_chunk(&empty(), &Neighbours::open(), Absent::Air, &DAY, &Shore);
+        let per_axis = SUBNODES_PER_AXIS as usize;
+
+        // The pond fills blocks 3..=5, and block 6 is its wall. So the milk's
+        // open shoreline runs along x = 3, and the skirt is block 2 — whose
+        // outer face of vertices, at x = 2 blocks, has nothing but dry air
+        // around it.
+        let outer: Vec<u16> = mesh
+            .fluid_vertices
+            .iter()
+            .filter(|vertex| vertex.face() == (1, true))
+            .filter(|vertex| {
+                let (x, _, z) = vertex.position();
+                // Away from the pond's own corners in z, so this is the
+                // straight edge and not the case that already worked.
+                x as usize == 2 * per_axis && z as usize == 4 * per_axis
+            })
+            .map(super::FluidVertex::drop)
+            .collect();
+
+        assert!(
+            !outer.is_empty(),
+            "no fluid surface was drawn over the skirt, so the milk still ends \
+             at the last wet block"
+        );
+        // A full drop puts the surface on the floor of the block row: the milk
+        // has run out to nothing, which is what "goes to zero at its edges"
+        // means.
+        let floor = u16::try_from(FULL_BLOCK).expect("a block fits in u16");
+        for drop in &outer {
+            assert_eq!(
+                *drop,
+                floor,
+                "the shoreline stopped {} above the floor instead of reaching it",
+                floor - drop
+            );
         }
     }
 
