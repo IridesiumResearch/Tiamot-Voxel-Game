@@ -33,6 +33,18 @@ fn main() {
     write(&root.join("core_blocks/sounds/step.wav"), Recipe::step());
     // Milk: poured, and swum in.
     write(&root.join("core_milk/sounds/pour.wav"), Recipe::splash());
+
+    // **And seeds for `fuzz/ogg_ingest`.** A fuzzer starting from noise spends
+    // its whole budget failing the container check and never reaches the
+    // decoder; starting from a real file it mutates a valid header into an
+    // invalid one, which is where the interesting answers are.
+    //
+    // WAV rather than Ogg for the reason the sounds are: no encoder here. A
+    // real `.ogg` dropped into the same directory is strictly better and the
+    // fuzz target says so.
+    let corpus = std::path::Path::new("fuzz/corpus/ogg_ingest");
+    write(&corpus.join("click.wav"), Recipe::click());
+    write(&corpus.join("thud.wav"), Recipe::thud());
 }
 
 /// Renders a recipe and writes it, creating parent directories.

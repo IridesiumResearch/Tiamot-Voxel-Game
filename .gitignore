@@ -23,6 +23,16 @@
 # those is reproducible in minutes and is not worth carrying in the history.
 /fuzz/corpus/gltf_ingest/*
 !/fuzz/corpus/gltf_ingest/*.glb
+
+# The audio corpus, on the same rule and for the same reason: a WAV seed is a
+# few kilobytes and a fuzzer derives megabytes from it in minutes. The named
+# files are the seed set (`cargo run -p client --example write_reference_sounds`)
+# plus anything that has ever crashed the decoder. `.ogg` is listed as well as
+# `.wav` because a real Vorbis file is the seed this most wants and cannot
+# generate — see `fuzz/fuzz_targets/ogg_ingest.rs`.
+/fuzz/corpus/ogg_ingest/*
+!/fuzz/corpus/ogg_ingest/*.wav
+!/fuzz/corpus/ogg_ingest/*.ogg
 /fuzz/coverage/
 /fuzz/Cargo.lock
 

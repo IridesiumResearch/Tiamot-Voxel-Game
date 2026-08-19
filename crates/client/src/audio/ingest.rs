@@ -214,13 +214,36 @@ pub fn decode(bytes: &[u8], limits: Limits) -> Result<Clip, AudioError> {
         });
     }
 
+    // **The container is checked by hand before Symphonia sees the bytes.**
+    //
+    // Found by `fuzz/ogg_ingest` within a minute of its first CI run: an ID3v2
+    // tag reaches `symphonia-metadata`, whose extended-header parser reads
+    // `(restrictions & 0x40) >> 5` — which is 0 or **2** — into a match that
+    // handles only 0 and 1, and calls `unreachable!()` otherwise. The mask
+    // should be `0x20`. It is an upstream bug and a server could send it
+    // deliberately.
+    //
+    // `decode_isolated` already contains the damage, but a panic caught is
+    // still a decode worker torn down by a stranger. So this refuses anything
+    // that is not one of the two containers actually decoded here, which also
+    // makes the accepted set explicit rather than "whatever Symphonia probes
+    // for" — a set that grows silently with every dependency bump.
+    //
+    // The same pre-validation the glTF reader uses, for the same reason:
+    // catching a panic is not the same as not reaching one.
+    let ogg = bytes.starts_with(b"OggS");
+    let wav = bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE");
+    if !ogg && !wav {
+        return Err(AudioError::NotOgg("not an Ogg or WAV container".to_owned()));
+    }
+
     let source = std::io::Cursor::new(bytes.to_vec());
     let stream = MediaSourceStream::new(
         Box::new(source),
         symphonia::core::io::MediaSourceStreamOptions::default(),
     );
     let mut hint = Hint::new();
-    hint.with_extension("ogg");
+    hint.with_extension(if ogg { "ogg" } else { "wav" });
 
     let probed = symphonia::default::get_probe()
         .format(
@@ -339,6 +362,49 @@ mod tests {
                 bytes.len()
             );
         }
+    }
+
+    #[test]
+    fn a_container_this_does_not_decode_is_refused_before_it_is_parsed() {
+        // **Found by the fuzz target on its first CI run.** An ID3v2 tag
+        // reaches `symphonia-metadata`, whose extended-header parser computes
+        // `(restrictions & 0x40) >> 5` — 0 or 2 — and matches only 0 and 1,
+        // calling `unreachable!()` otherwise. Upstream's mask is wrong, and a
+        // server could send that deliberately.
+        //
+        // `decode_isolated` contains it, but a panic caught is still a decode
+        // worker torn down by a stranger, so the bytes never get there.
+        for prefix in [
+            b"ID3\x04\x00\x40".as_slice(),
+            b"ID3\x03\x00\xff".as_slice(),
+            b"fLaC".as_slice(),
+            b"\xff\xfb".as_slice(),
+            b"RIFFxxxxAVI ".as_slice(),
+        ] {
+            let mut bytes = prefix.to_vec();
+            bytes.extend_from_slice(&[0u8; 128]);
+            let err = decode(&bytes, Limits::default())
+                .expect_err("a container this does not decode was accepted");
+            assert!(
+                matches!(err, AudioError::NotOgg(_)),
+                "refused for the wrong reason: {err}"
+            );
+        }
+
+        // And the two that ARE decoded still get through to a real parse,
+        // which is what stops this check from being a way to refuse everything.
+        let wav = crate::audio::synth::wav(crate::audio::synth::Recipe::click());
+        assert!(decode(&wav, Limits::default()).is_ok(), "a WAV was refused");
+        // A truncated Ogg is refused by the PARSER, not by the magic check —
+        // a different error, which is how we know it got past this.
+        let ogg = b"OggS\x00\x02\x00\x00\x00\x00";
+        assert!(
+            !matches!(
+                decode(ogg, Limits::default()),
+                Err(AudioError::NotOgg(ref reason)) if reason.contains("container")
+            ),
+            "an Ogg header was refused by the magic check rather than parsed"
+        );
     }
 
     #[test]
