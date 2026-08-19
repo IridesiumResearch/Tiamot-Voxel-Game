@@ -29,7 +29,7 @@ run_micro() {
 run_macro() {
   echo "=== macro benchmark ==="
   cargo build --release -p bot
-  ./target/release/bot bench --rounds 120 --json "$OUT/macro.json"
+  ./target/release/bot bench --rounds 360 --json "$OUT/macro.json"
   echo "wrote $OUT/macro.json"
 }
 
@@ -38,7 +38,7 @@ run_gate() {
   cargo build --release -p bot
   # The workload must match the baseline's, or the comparison measures the
   # parameters rather than the server. `bot bench` refuses a mismatch.
-  ./target/release/bot bench --rounds 120 --json "$OUT/macro.json" --baseline "$BASELINE"
+  ./target/release/bot bench --rounds 360 --json "$OUT/macro.json" --baseline "$BASELINE"
 }
 
 case "$MODE" in
