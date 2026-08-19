@@ -454,6 +454,11 @@ const ENGINE_ACTIONS: &[(&str, &str, Option<Input>)] = &[
         Some(Input::Mouse(MouseButton::Right)),
     ),
     (
+        "engine:settings",
+        "Controls and settings",
+        Some(Input::Key(KeyCode::F1)),
+    ),
+    (
         "engine:menu",
         "Release the cursor",
         Some(Input::Key(KeyCode::Escape)),
@@ -611,6 +616,81 @@ mod tests {
             source: Source::Mod(id.split(':').next().unwrap_or("mod").to_owned()),
             default,
         }
+    }
+
+    #[test]
+    fn a_rebind_moves_the_action_and_leaves_every_other_one_alone() {
+        // **The settings flow, without the settings screen.** The task asks for
+        // the binding model to be factored so the rebinding path is testable
+        // headlessly, and this is that test: what the screen does is call these
+        // three methods and read the list back.
+        let mut actions = Actions::engine();
+        actions
+            .register(mod_action(
+                "core_tools:chisel_mode",
+                Some(Input::Key(KeyCode::KeyC)),
+            ))
+            .expect("register");
+        let mut bindings = Bindings::default();
+
+        // Rebind the mod's action onto a key the engine already uses. Allowed:
+        // a conflict is reported, not refused, or a player could never swap two
+        // bindings without a scratch key.
+        bindings.bind("core_tools:chisel_mode", Input::Key(KeyCode::KeyW));
+        let conflicts = bindings.conflicts(&actions);
+        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
+
+        // Move it somewhere free, and the clash goes with it.
+        bindings.bind("core_tools:chisel_mode", Input::Key(KeyCode::KeyM));
+        assert!(bindings.conflicts(&actions).is_empty());
+        assert_eq!(
+            bindings
+                .action_for(&actions, Input::Key(KeyCode::KeyM))
+                .map(|action| action.id.as_str()),
+            Some("core_tools:chisel_mode")
+        );
+        // And walking forward is untouched throughout, which is the property a
+        // player actually cares about when they rebind one thing.
+        assert_eq!(
+            bindings.get(&actions, "engine:move_forward"),
+            Some(Input::Key(KeyCode::KeyW))
+        );
+
+        // Reset-all returns everything, including the mod's, to its default.
+        bindings.reset_all();
+        assert_eq!(
+            bindings.get(&actions, "core_tools:chisel_mode"),
+            Some(Input::Key(KeyCode::KeyC))
+        );
+        assert!(!bindings.is_custom("core_tools:chisel_mode"));
+    }
+
+    #[test]
+    fn a_binding_file_survives_the_mod_that_asked_for_it_going_away() {
+        // **Why bindings key on the ACTION.** A player rebinds a mod's control,
+        // then joins a server without that mod. The entry is one nobody looks
+        // up rather than one that renumbers everything after it, and the
+        // engine's own bindings are undisturbed.
+        let mut bindings = Bindings::default();
+        bindings.bind("core_tools:chisel_mode", Input::Key(KeyCode::KeyM));
+        bindings.bind("engine:jump", Input::Key(KeyCode::KeyJ));
+        let written = toml::to_string(&bindings).expect("serialise");
+
+        // A server with no mods at all.
+        let actions = Actions::engine();
+        let read: Bindings = toml::from_str(&written).expect("parse");
+        assert_eq!(
+            read.get(&actions, "engine:jump"),
+            Some(Input::Key(KeyCode::KeyJ)),
+            "an engine binding was disturbed by a mod going away"
+        );
+        assert!(
+            read.action_for(&actions, Input::Key(KeyCode::KeyM))
+                .is_none(),
+            "a key bound to an absent mod's action still triggers something"
+        );
+        // And the entry is still there for when that server is joined again.
+        assert!(read.is_custom("core_tools:chisel_mode"));
     }
 
     #[test]

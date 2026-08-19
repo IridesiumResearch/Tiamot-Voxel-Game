@@ -276,6 +276,13 @@ impl ApplicationHandler for Client {
                     self.grabbed = grab(&surface.window, true);
                     return;
                 }
+                // The same rule for the mouse: a capture owns the button.
+                if surface.app.rebinding().is_some() {
+                    if pressed {
+                        surface.app.capture(Control::Mouse(button));
+                    }
+                    return;
+                }
                 let Some(action) = surface.app.action_for(Control::Mouse(button)) else {
                     return;
                 };
@@ -314,6 +321,28 @@ impl ApplicationHandler for Client {
                 // registry which ACTION this position is bound to and acts on
                 // that — charter rule 11, and the reason a mod can add a
                 // control without the client learning a new key.
+                // **While a capture is waiting, the key belongs to it.**
+                if surface.app.rebinding().is_some() {
+                    if !pressed {
+                        // The release of the key that was just bound, or of the
+                        // one that opened the prompt. Neither is a binding.
+                        return;
+                    }
+                    // Escape abandons the capture rather than binding itself.
+                    // A player who opened the prompt by accident needs a way
+                    // out that is not "bind something", and it is checked
+                    // BEFORE the capture or it would bind Escape.
+                    if code == winit::keyboard::KeyCode::Escape {
+                        surface.app.cancel_rebind();
+                        return;
+                    }
+                    // Otherwise this key is the answer. Taken here rather than
+                    // acted on, or rebinding would also fire whatever the key
+                    // currently does — at best a jump, at worst the very thing
+                    // being rebound away from.
+                    surface.app.capture(Control::Key(code));
+                    return;
+                }
                 let Some(action) = surface.app.action_for(Control::Key(code)) else {
                     return;
                 };
@@ -325,6 +354,15 @@ impl ApplicationHandler for Client {
                     "engine:jump" => self.held.up = pressed,
                     "engine:sneak" | "engine:sneak_alt" => self.held.down = pressed,
                     "engine:sprint" => self.held.sprint = pressed,
+                    "engine:settings" if pressed => {
+                        surface.app.toggle_settings();
+                        // The cursor has to come back to click anything.
+                        self.grabbed = if surface.app.settings_open() {
+                            !grab(&surface.window, false)
+                        } else {
+                            grab(&surface.window, true)
+                        };
+                    }
                     "engine:menu" if pressed => {
                         self.grabbed = !grab(&surface.window, false);
                     }
@@ -662,6 +700,141 @@ fn elapsed_ms(since: std::time::Instant) -> f32 {
     since.elapsed().as_secs_f32() * 1000.0
 }
 
+/// Draws the controls screen, and applies whatever the player clicked.
+///
+/// **Every binding says which mod asked for it** — that is Task 13's
+/// attribution criterion, and `Actions::by_source` is the one place that
+/// decides. The engine's own controls are a group like any other rather than an
+/// unlabelled remainder.
+///
+/// The whole of the model behind this is in `client::input` and is tested
+/// there without a window, which is what the task asks for: the screen only
+/// reads a list and reports clicks.
+fn draw_settings(app: &mut App, ctx: &egui::Context) {
+    // Collected before the panel runs, because drawing borrows the registry
+    // and the buttons need `&mut App` to act.
+    #[derive(Clone)]
+    struct Row {
+        id: String,
+        description: String,
+        binding: String,
+        custom: bool,
+        conflicted: bool,
+    }
+    let conflicts = app.bindings().conflicts(app.actions());
+    let conflicting: std::collections::BTreeSet<&str> = conflicts
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().map(String::as_str))
+        .collect();
+    let groups: Vec<(String, Vec<Row>)> = app
+        .actions()
+        .by_source()
+        .into_iter()
+        .map(|(source, actions)| {
+            let rows = actions
+                .into_iter()
+                .map(|action| Row {
+                    binding: app
+                        .bindings()
+                        .get(app.actions(), &action.id)
+                        .map_or_else(|| "—".to_owned(), |input| input.to_string()),
+                    custom: app.bindings().is_custom(&action.id),
+                    conflicted: conflicting.contains(action.id.as_str()),
+                    id: action.id.clone(),
+                    description: action.description.clone(),
+                })
+                .collect();
+            (source.label().to_owned(), rows)
+        })
+        .collect();
+    let waiting = app.rebinding().map(ToOwned::to_owned);
+
+    let mut rebind: Option<String> = None;
+    let mut reset: Option<String> = None;
+    let mut reset_all = false;
+    let mut close = false;
+
+    egui::Window::new("Controls")
+        .collapsible(false)
+        .default_width(520.0)
+        .show(ctx, |ui| {
+            if let Some(id) = &waiting {
+                ui.label(
+                    egui::RichText::new(format!("Press a key for {id} — Escape to cancel"))
+                        .color(egui::Color32::LIGHT_YELLOW),
+                );
+                ui.separator();
+            }
+            if !conflicts.is_empty() {
+                for (input, ids) in &conflicts {
+                    ui.label(
+                        egui::RichText::new(format!("{input} is bound to {}", ids.join(", ")))
+                            .color(egui::Color32::LIGHT_RED),
+                    );
+                }
+                ui.separator();
+            }
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    for (source, rows) in &groups {
+                        // **The attribution.** A player can see which mod wants
+                        // every binding they are being offered.
+                        ui.heading(source);
+                        for row in rows {
+                            ui.horizontal(|ui| {
+                                let label = if row.description.is_empty() {
+                                    row.id.clone()
+                                } else {
+                                    row.description.clone()
+                                };
+                                ui.add_sized([300.0, 18.0], egui::Label::new(label).truncate());
+                                let text = egui::RichText::new(&row.binding);
+                                let text = if row.conflicted {
+                                    text.color(egui::Color32::LIGHT_RED)
+                                } else {
+                                    text
+                                };
+                                if ui
+                                    .add_sized([120.0, 18.0], egui::Button::new(text))
+                                    .clicked()
+                                {
+                                    rebind = Some(row.id.clone());
+                                }
+                                // Only where there is something to undo, so the row
+                                // says at a glance which bindings are the player's.
+                                if row.custom && ui.small_button("reset").clicked() {
+                                    reset = Some(row.id.clone());
+                                }
+                            });
+                        }
+                        ui.separator();
+                    }
+                });
+            ui.horizontal(|ui| {
+                if ui.button("Reset all").clicked() {
+                    reset_all = true;
+                }
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        });
+
+    if let Some(id) = rebind {
+        app.begin_rebind(&id);
+    }
+    if let Some(id) = reset {
+        app.reset_binding(&id);
+    }
+    if reset_all {
+        app.reset_all_bindings();
+    }
+    if close {
+        app.toggle_settings();
+    }
+}
+
 /// Draws the HUD over the frame that has just been rendered.
 ///
 /// A second render pass that loads rather than clears, so it composites onto
@@ -672,8 +845,12 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     let warnings: Vec<String> = surface.app.warnings().to_vec();
     let joined = surface.app.joined();
 
+    let settings_open = surface.app.settings_open();
     let output = surface.egui.run_ui(raw, |root| {
         let context = root.ctx().clone();
+        if settings_open {
+            draw_settings(&mut surface.app, &context);
+        }
         egui::Area::new(egui::Id::new("hud"))
             .fixed_pos(egui::pos2(8.0, 8.0))
             .interactable(false)
@@ -704,6 +881,20 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     surface
         .egui_state
         .handle_platform_output(&surface.window, output.platform_output);
+
+    // **The window saves, because the window is what knows the path.** The
+    // `App` raises a flag when a binding changes and this writes it out at most
+    // once a frame — a rebind is a click, so there is nothing to batch, and a
+    // failed write is reported rather than retried because the likeliest cause
+    // is a read-only directory that will not fix itself.
+    if surface.app.take_bindings_dirty()
+        && let Err(err) = surface
+            .app
+            .bindings()
+            .save(std::path::Path::new(BINDINGS_FILE))
+    {
+        tracing::warn!(%err, "could not save the key bindings");
+    }
 
     let gpu = surface.app.renderer().gpu();
     let pixels_per_point = surface.window.scale_factor() as f32;

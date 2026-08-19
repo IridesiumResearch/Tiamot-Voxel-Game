@@ -677,6 +677,20 @@ pub struct App {
     actions: crate::input::Actions,
     /// What each action is bound to.
     bindings: crate::input::Bindings,
+    /// Whether the settings screen is showing.
+    settings_open: bool,
+    /// The action waiting for a key, while the settings screen captures one.
+    ///
+    /// While this is set the window sends EVERY press here instead of acting on
+    /// it, which is what lets a player rebind a key that is already bound to
+    /// something — including the key that opens this screen.
+    rebinding: Option<String>,
+    /// Whether the bindings have changed since they were last written out.
+    ///
+    /// The `App` does not know where the file is — the window does — so it
+    /// raises a flag rather than saving, and the window writes it. One place
+    /// knows the path and one place knows the state.
+    bindings_dirty: bool,
     connection: Connection,
     renderer: Renderer,
     store: ChunkStore,
@@ -893,6 +907,9 @@ impl App {
             config,
             actions: crate::input::Actions::engine(),
             bindings,
+            settings_open: false,
+            rebinding: None,
+            bindings_dirty: false,
             connection,
             renderer,
             store: ChunkStore::new(),
@@ -1788,6 +1805,72 @@ impl App {
                 tracing::warn!(%err, "a server's action was refused");
             }
         }
+    }
+
+    /// Whether the settings screen is showing.
+    #[must_use]
+    pub fn settings_open(&self) -> bool {
+        self.settings_open
+    }
+
+    /// Opens or closes the settings screen.
+    ///
+    /// Closing abandons a capture in progress: a player who opened the rebind
+    /// prompt and changed their mind should not have the next key they press
+    /// swallowed by a screen that is no longer there.
+    pub fn toggle_settings(&mut self) {
+        self.settings_open = !self.settings_open;
+        if !self.settings_open {
+            self.rebinding = None;
+        }
+    }
+
+    /// The action currently waiting for a key, if any.
+    #[must_use]
+    pub fn rebinding(&self) -> Option<&str> {
+        self.rebinding.as_deref()
+    }
+
+    /// Starts waiting for a key to bind to this action.
+    pub fn begin_rebind(&mut self, id: &str) {
+        self.rebinding = Some(id.to_owned());
+    }
+
+    /// Abandons a capture without binding anything.
+    pub fn cancel_rebind(&mut self) {
+        self.rebinding = None;
+    }
+
+    /// Offers a physical input to a capture in progress.
+    ///
+    /// Returns whether it was taken. The window asks this FIRST and acts on the
+    /// input only if the answer is no — otherwise rebinding a key would also
+    /// fire whatever that key currently does, which is at best a jump and at
+    /// worst the thing being rebound away from.
+    pub fn capture(&mut self, input: crate::input::Input) -> bool {
+        let Some(id) = self.rebinding.take() else {
+            return false;
+        };
+        self.bindings.bind(&id, input);
+        self.bindings_dirty = true;
+        true
+    }
+
+    /// Returns one action to its default.
+    pub fn reset_binding(&mut self, id: &str) {
+        self.bindings.reset(id);
+        self.bindings_dirty = true;
+    }
+
+    /// Returns every action to its default.
+    pub fn reset_all_bindings(&mut self) {
+        self.bindings.reset_all();
+        self.bindings_dirty = true;
+    }
+
+    /// Whether the bindings need writing out, clearing the flag.
+    pub fn take_bindings_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.bindings_dirty)
     }
 
     /// Which action an input is bound to, by id.
