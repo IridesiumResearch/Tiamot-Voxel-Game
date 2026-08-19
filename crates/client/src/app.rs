@@ -668,6 +668,15 @@ fn ray_box(origin: [f32; 3], direction: [f32; 3], min: [f32; 3], max: [f32; 3]) 
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
     config: Config,
+    /// Every named action: the engine's, plus whatever the server's mods added.
+    ///
+    /// Here rather than in the window because this is where a server's messages
+    /// land — `Event::Actions` arrives on join and the window only ever reads
+    /// the result. Charter rule 11's split, in the type layout: the client owns
+    /// bindings, and a mod owns nothing but the name.
+    actions: crate::input::Actions,
+    /// What each action is bound to.
+    bindings: crate::input::Bindings,
     connection: Connection,
     renderer: Renderer,
     store: ChunkStore,
@@ -844,7 +853,26 @@ pub struct App {
 impl App {
     /// Builds an app around an already-open connection and renderer.
     #[must_use]
-    pub fn new(config: Config, connection: Connection, mut renderer: Renderer) -> Self {
+    pub fn new(config: Config, connection: Connection, renderer: Renderer) -> Self {
+        Self::with_bindings(
+            config,
+            connection,
+            renderer,
+            crate::input::Bindings::default(),
+        )
+    }
+
+    /// As [`App::new`], with the player's saved key bindings.
+    ///
+    /// Separate so tests and the bot can build an `App` without a bindings file
+    /// on disk, which is the overwhelmingly common case for both.
+    #[must_use]
+    pub fn with_bindings(
+        config: Config,
+        connection: Connection,
+        mut renderer: Renderer,
+        bindings: crate::input::Bindings,
+    ) -> Self {
         let camera = Camera {
             fov_y: config.fov_degrees.to_radians(),
             ..Camera::default()
@@ -863,6 +891,8 @@ impl App {
             // flash empty for a round trip on every join.
             granted_view: config.view(),
             config,
+            actions: crate::input::Actions::engine(),
+            bindings,
             connection,
             renderer,
             store: ChunkStore::new(),
@@ -1723,6 +1753,92 @@ impl App {
         self.renderer.set_selection(&corners);
     }
 
+    /// Replaces the mod-registered actions with a server's.
+    ///
+    /// Its own method because `pump_network` is at clippy's line limit, and
+    /// because the two ways this can go wrong both want explaining.
+    fn adopt_actions(&mut self, actions: Vec<tiamot_core::proto::ActionDef>) {
+        // A fresh server, a fresh set. `clear_mods` keeps the
+        // engine's own: those are the client's and outlive any
+        // connection.
+        self.actions.clear_mods();
+        for def in actions {
+            let default = crate::input::parse_key(&def.default_key);
+            if default.is_none() && !def.default_key.is_empty() {
+                // **Dropped, not refused.** A server naming a key
+                // this build has never heard of is a mod written
+                // against a newer winit, and the action is still
+                // perfectly usable once the player binds it. A join
+                // that failed over a key name would be worse.
+                tracing::warn!(
+                    action = %def.id,
+                    key = %def.default_key,
+                    "a mod asked for a default key this client does not know"
+                );
+            }
+            let action = crate::input::Action {
+                id: def.id,
+                description: def.description,
+                source: crate::input::Source::Mod(def.mod_id),
+                default,
+            };
+            if let Err(err) = self.actions.register(action) {
+                // A server sending the same id twice, or claiming
+                // `engine:`. Neither is fatal to the session.
+                tracing::warn!(%err, "a server's action was refused");
+            }
+        }
+    }
+
+    /// Which action an input is bound to, by id.
+    ///
+    /// Owned rather than borrowed because the caller acts on the answer, and
+    /// acting means `&mut self` — a borrow of the registry cannot still be
+    /// alive at that point. One small allocation per key press.
+    #[must_use]
+    pub fn action_for(&self, input: crate::input::Input) -> Option<String> {
+        self.bindings
+            .action_for(&self.actions, input)
+            .map(|action| action.id.clone())
+    }
+
+    /// Every action, for the settings screen.
+    #[must_use]
+    pub fn actions(&self) -> &crate::input::Actions {
+        &self.actions
+    }
+
+    /// The bindings, for the settings screen to change.
+    pub fn bindings_mut(&mut self) -> &mut crate::input::Bindings {
+        &mut self.bindings
+    }
+
+    /// The bindings, for the settings screen to show.
+    #[must_use]
+    pub fn bindings(&self) -> &crate::input::Bindings {
+        &self.bindings
+    }
+
+    /// Reports a mod-registered action to the server.
+    ///
+    /// **Engine actions never come through here.** Walking, digging and placing
+    /// travel as their own messages, which the server already judges; a client
+    /// that could report `engine:jump` as an action would be telling the server
+    /// something it is supposed to decide for itself (charter rule 2).
+    pub fn send_action(&mut self, id: &str, pressed: bool) {
+        let is_mods = self
+            .actions
+            .get(id)
+            .is_some_and(|action| matches!(action.source, crate::input::Source::Mod(_)));
+        if !is_mods {
+            return;
+        }
+        self.connection.send(Command::Action {
+            id: id.to_owned(),
+            pressed,
+        });
+    }
+
     /// Cycles to the next registered tool and tells the server.
     ///
     /// Nothing happens with no tools, which is a world nobody can dig in —
@@ -2139,6 +2255,8 @@ impl App {
                 Event::DigProgress { target, progress } => {
                     self.dig = Some((target, progress));
                 }
+
+                Event::Actions { actions } => self.adopt_actions(actions),
 
                 Event::Tools { tools } => {
                     // The default first, so a player who never touches the tool

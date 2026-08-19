@@ -233,7 +233,8 @@ function Stream:next_bool() end
 ---Fields accepted by `game.register_action`.
 ---@class Tiamot.ActionSpec
 ---@field id string Required. Namespaced with your mod id automatically.
----@field default_key string? Suggested default binding. The engine owns bindings; mods never read keys.
+---@field default_key string? Suggested default binding, as a key name: "KeyF", "Space", "BracketLeft". The engine owns bindings; mods never read keys, and there is deliberately no way to ask which key a player chose.
+---@field description string? One line for the settings screen, shown beside your mod's name.
 
 ---The mod API.
 ---
@@ -406,6 +407,29 @@ function game.line_of_sight(from, to) end
 ---```
 ---@param callback fun(event: { player: string, name: string })
 function game.register_on_player_join(callback) end
+
+---Called when a player presses or releases one of YOUR registered actions.
+---
+---Charter rule 11: you are told WHAT was done, never which key did it. There is
+---no key in the event and there is not going to be — a mod that branched on the
+---key would make rebinding change behaviour rather than just controls.
+---
+---Both edges arrive, so a "hold to..." control is written by watching
+---`pressed`. Only actions YOUR server registered arrive; the engine's own
+---controls (moving, digging, placing) are not actions and never appear here.
+---
+---Runs on the simulation thread inside the tick, before the entity step, so a
+---mod that flips a mode here sees it while stepping its own mobs.
+---
+---```lua
+---game.register_on_action(function(event)
+---    if event.id == "my_mod:shout" and event.pressed then
+---        game.log(event.player .. " shouted")
+---    end
+---end)
+---```
+---@param callback fun(event: { player: string, id: string, pressed: boolean })
+function game.register_on_action(callback) end
 
 ---A walkable route between two points, or why there is not one.
 ---

@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -125,6 +125,14 @@ pub const MAX_ID_BYTES: usize = 128;
 /// making a client allocate for a herd that does not exist — charter rule 14 —
 /// and the server splits legitimately larger sets across messages.
 pub const MAX_ENTITIES_PER_MESSAGE: usize = 4096;
+
+/// Most actions a server may declare in one [`ServerMessage::ActionTable`].
+///
+/// Charter rule 14: a server is not trusted. Each entry costs the client a row
+/// in the settings screen and a string it holds for the session, so the cap is
+/// generous for any real mod set and finite against one that is not. A hundred
+/// mods with ten controls each fits.
+pub const MAX_ACTIONS: usize = 1024;
 
 /// A `BLAKE3` content hash.
 pub type ContentHash = [u8; 32];
@@ -316,6 +324,36 @@ pub struct ToolDef {
     pub brush: String,
     /// Whether this is what a player digs with holding nothing.
     pub default: bool,
+}
+
+/// A named action a mod registered, as the client needs to see it.
+///
+/// # Why the client is told this at all
+///
+/// Charter rule 11: a mod registers a NAME and the engine owns the key. The
+/// client is the thing that owns keys, so the names have to reach it — and with
+/// them the mod that asked, because a settings screen that cannot say who wants
+/// a binding is a list of ids a player has no way to judge.
+///
+/// The default is a STRING and not a key type. `crates/core` must never depend
+/// on winit (charter rule 3), so the engine carries the name winit would use —
+/// `"KeyW"`, `"Space"` — and the client turns it into a `KeyCode`. A default it
+/// cannot parse is dropped rather than refused: an action nobody can trigger
+/// until it is bound is a worse outcome than a join that fails, but only just,
+/// and it is the one that leaves the player able to fix it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActionDef {
+    /// The qualified id, e.g. `"core_tools:chisel_mode"`.
+    pub id: String,
+    /// One line for the settings screen. Empty when the mod did not say.
+    pub description: String,
+    /// The mod that registered it, for attribution in the UI.
+    pub mod_id: String,
+    /// The binding the mod suggests, as a winit `KeyCode` name.
+    ///
+    /// Empty means the mod shipped it unbound, which is legitimate: the player
+    /// binds it or it does nothing.
+    pub default_key: String,
 }
 
 /// One material in the world's id table, as the client needs to see it.
@@ -564,6 +602,25 @@ pub enum ClientMessage {
     Punch {
         /// The entity being hit, as the server named it.
         entity: u64,
+    },
+    /// A mod-registered action was pressed or released.
+    ///
+    /// **Appended at the end** (protocol v16).
+    ///
+    /// Only actions the server itself registered are accepted — see the
+    /// server's handler. The engine's own controls never come through here:
+    /// walking is [`ClientMessage::PlayerInput`] and digging is
+    /// [`ClientMessage::StartDig`], both of which the server already judges.
+    /// A client that could name any action would be able to invent one.
+    ///
+    /// Held actions send both edges, so a mod can implement a "while held"
+    /// control. Rate limiting is the server's, and is documented there: a
+    /// client that spams this is spending the server's Lua budget.
+    Action {
+        /// The qualified action id, as sent in [`ServerMessage::ActionTable`].
+        id: String,
+        /// Whether it went down (`true`) or came up (`false`).
+        pressed: bool,
     },
 }
 
@@ -905,6 +962,17 @@ pub enum ServerMessage {
         /// One entry per entity that moved.
         entities: Vec<EntityDelta>,
     },
+    /// The actions a server's mods registered, sent once on join.
+    ///
+    /// **Appended at the end** (protocol v16).
+    ///
+    /// Empty is the ordinary case for a server whose mods add no controls, and
+    /// is not an error. The engine's own actions are NOT in here: the client
+    /// already has them and a server does not get to redefine what jump means.
+    ActionTable {
+        /// Every mod-registered action, in load order.
+        actions: Vec<ActionDef>,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -1165,6 +1233,11 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ProtocolErro
 /// [`ProtocolError::FieldTooLarge`] naming the offending field.
 pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolError> {
     match message {
+        ClientMessage::Action { id, .. } => {
+            // An id a client chose. Bounded before it is looked up, so a peer
+            // cannot spend the server's memory naming an action nobody has.
+            check_len("action_id", id.len(), MAX_ID_BYTES)?;
+        }
         ClientMessage::SelectTool { tool: Some(tool) } => {
             // An id is a string from a peer. Bounded like a display name, and
             // for the same reason: it is stored and echoed.
@@ -1240,6 +1313,33 @@ fn check_occupancy(edit: &Edit) -> Result<(), ProtocolError> {
             len: occupancy.count_ones() as usize,
             limit: crate::UNITS_PER_BLOCK as usize,
         });
+    }
+    Ok(())
+}
+
+/// Bounds every string in an action table.
+///
+/// Its own function because `validate_server_message` is at clippy's line limit,
+/// and because the caps are the interesting part: charter rule 14 says a server
+/// is not trusted, and each of these strings is one the client keeps for the
+/// session and shows in its settings screen.
+fn check_actions(actions: &[ActionDef]) -> Result<(), ProtocolError> {
+    check_len("action_table", actions.len(), MAX_ACTIONS)?;
+    for action in actions {
+        check_len("action_id", action.id.len(), MAX_ID_BYTES)?;
+        check_len("action_mod_id", action.mod_id.len(), MAX_ID_BYTES)?;
+        check_len(
+            "action_description",
+            action.description.len(),
+            MAX_CHAT_BYTES,
+        )?;
+        // A key NAME, not a key. Bounded like a display name, which is the
+        // shape it is — winit's longest is well inside this.
+        check_len(
+            "action_default_key",
+            action.default_key.len(),
+            MAX_NAME_BYTES,
+        )?;
     }
     Ok(())
 }
@@ -1344,6 +1444,8 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         // addresses cells a block does not have would be applied to the
         // client's own copy of the world.
         ServerMessage::BlockDelta { edit, .. } => check_occupancy(edit)?,
+
+        ServerMessage::ActionTable { actions } => check_actions(actions)?,
 
         ServerMessage::HelloAck { .. }
         | ServerMessage::AuthChallenge { .. }

@@ -252,6 +252,21 @@ impl Generator {
         }
     }
 
+    /// Tells the mods a player used one of their registered actions.
+    ///
+    /// Named `did_` rather than `may_` because there is nothing to permit: the
+    /// key is already down and no mod can un-press it. The outcome carries only
+    /// which mods errored, which is what disables them (charter rule 10).
+    pub fn did_action(
+        &mut self,
+        event: &tiamot_core::script::ActionEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().action(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
     /// Tells the mods a flow was blocked.
     ///
     /// Nothing is being asked — the flow already failed — so the outcome

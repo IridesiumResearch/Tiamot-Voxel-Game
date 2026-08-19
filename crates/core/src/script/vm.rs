@@ -519,6 +519,28 @@ pub struct Sky {
     pub start_time: f32,
 }
 
+/// A named action a mod registered.
+///
+/// Charter rule 11: a mod registers a NAME, the engine owns the key. This is
+/// the whole of what a mod gets to say about controls — there is deliberately
+/// no way to ask which key it ended up on, because a mod that could ask would
+/// start branching on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Action {
+    /// The qualified action id, e.g. `"core_tools:chisel_mode"`.
+    pub id: String,
+    /// One line for the settings screen. Empty when the mod did not say.
+    pub description: String,
+    /// The mod that registered it, for attribution in the client's UI.
+    pub mod_id: String,
+    /// The binding the mod suggests, as a winit `KeyCode` name.
+    ///
+    /// A STRING, because `crates/core` must never depend on winit (charter
+    /// rule 3). The client parses it and warns about one it does not know.
+    /// Empty means the mod shipped it unbound.
+    pub default_key: String,
+}
+
 /// A tool a mod registered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tool {
@@ -635,6 +657,24 @@ pub struct JoinEvent {
     pub player: [u8; 32],
     /// What they are currently called on this server.
     pub name: String,
+}
+
+/// A player pressed or released an action their server's mod registered.
+///
+/// **An observation, not a veto.** The player pressed a key; nothing a mod says
+/// can un-press it. The outcome exists only so a misbehaving mod is disabled
+/// the way it is everywhere else (charter rule 10).
+///
+/// Charter rule 11 in one struct: the mod is told WHAT was done, never which
+/// key did it. There is no field here for a key and there is not going to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionEvent {
+    /// Who did it, canonically — the UUID, never the display name (rule 13).
+    pub player: [u8; 32],
+    /// The qualified action id, e.g. `"core_tools:chisel_mode"`.
+    pub id: String,
+    /// Whether it went down (`true`) or came up (`false`).
+    pub pressed: bool,
 }
 
 /// Fluid pressing against something it cannot get into.
@@ -941,6 +981,13 @@ pub trait ScriptVm: Sized {
     /// [`Self::dig_complete`] documents, and for the same reason.
     fn punch(&mut self, event: &PunchEvent) -> HookOutcome;
 
+    /// Tells every registered `on_action` that a player used one.
+    ///
+    /// **An observation, not a veto**, like [`Self::fluid_flow`]: the key is
+    /// already down. The outcome carries only whether the mod errored, which is
+    /// what disables it.
+    fn action(&mut self, event: &ActionEvent) -> HookOutcome;
+
     /// Tells every registered `on_fluid_flow` that a flow was blocked.
     ///
     /// **An observation, not a veto.** The flow has already failed to happen and
@@ -987,6 +1034,12 @@ pub trait ScriptVm: Sized {
 
     /// Tools registered during the loading window, ordered by id.
     fn registered_tools(&self) -> Vec<Tool>;
+
+    /// Every action the loaded mods registered, in load order.
+    ///
+    /// Load order rather than sorted, because that is the order the settings
+    /// screen groups mods in and it is the only order a player can predict.
+    fn registered_actions(&self) -> Vec<Action>;
 
     /// The sky a mod registered, if any.
     ///

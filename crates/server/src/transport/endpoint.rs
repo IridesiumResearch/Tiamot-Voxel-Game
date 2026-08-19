@@ -95,6 +95,11 @@ pub struct Shared {
     pub tool_table: Vec<tiamot_core::proto::ToolDef>,
     /// Every fluid the mods registered, for the join tables.
     pub fluid_table: Vec<tiamot_core::proto::FluidDef>,
+    /// Every action the mods registered, for the join tables.
+    ///
+    /// Charter rule 11: the engine owns bindings and a mod owns only the name,
+    /// so this is the whole of what a mod gets to say about controls.
+    pub action_table: Vec<tiamot_core::proto::ActionDef>,
 
     /// Ticks in a full day, or 0 if no mod registered a sky.
     pub sky_day_length: u32,
@@ -143,6 +148,12 @@ pub struct Shared {
     /// both belong to the tick thread. Two connections punching at once would
     /// otherwise resolve in whichever order the OS woke them.
     pub punches: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, u64)>>,
+    /// Mod-registered actions waiting to be handed to the mods.
+    ///
+    /// Queued on the connection thread and drained by the tick, like every
+    /// other thing a client asks for: running a Lua hook on the network thread
+    /// would put a mod's runtime inside a connection's read loop.
+    pub actions: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, String, bool)>>,
 
     /// World edits queued by the operator rather than by a player.
     ///
@@ -907,6 +918,47 @@ impl Shared {
         true
     }
 
+    /// Queues a mod-registered action, if it is one this server has.
+    ///
+    /// **Two limits, both deliberate and both documented here** because charter
+    /// rule 14 says a client is not trusted:
+    ///
+    /// 1. **The id must be registered.** A client that could name any string
+    ///    would reach the Lua dispatcher with it, and every unknown id would
+    ///    cost a hook run and a table. Checked against the same table the
+    ///    client was sent, so there is nothing to guess.
+    /// 2. **The queue is capped** at `MAX_QUEUED_EDITS`, shared with edits and
+    ///    punches. A client spamming a key spends its own tick's worth of slots
+    ///    and is dropped after that, rather than growing the server's memory
+    ///    until the tick catches up. Dropping is right: an action is an EVENT,
+    ///    and a player who genuinely pressed a key that many times in 50 ms did
+    ///    not.
+    ///
+    /// Returns whether it was queued, which the caller does not currently use —
+    /// a refused action is not worth a disconnection, because the ordinary
+    /// cause is a mod that unregistered between one tick and the next.
+    pub fn queue_action(&self, actor: PlayerUuid, id: String, pressed: bool) -> bool {
+        if !self.action_table.iter().any(|action| action.id == id) {
+            return false;
+        }
+        let Ok(mut queue) = self.actions.lock() else {
+            return false;
+        };
+        if queue.len() >= MAX_QUEUED_EDITS {
+            return false;
+        }
+        queue.push_back((actor, id, pressed));
+        true
+    }
+
+    /// Takes the actions waiting to be handed to the mods.
+    pub fn drain_actions(&self) -> Vec<(PlayerUuid, String, bool)> {
+        self.actions
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
     /// Takes the punches waiting to be judged.
     pub fn drain_punches(&self) -> Vec<(PlayerUuid, u64)> {
         self.punches
@@ -1423,6 +1475,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 materials: &shared.materials,
                 tools: &shared.tool_table,
                 fluids: &shared.fluid_table,
+                actions: &shared.action_table,
                 sky: (shared.sky_day_length, &shared.sky_keyframes),
                 allowlist: &allowlist,
                 max_players: shared.max_players,
@@ -1581,6 +1634,11 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
             Action::Punch { entity } => {
                 if let Some(uuid) = session.uuid() {
                     shared.queue_punch(uuid, *entity);
+                }
+            }
+            Action::Action { id, pressed } => {
+                if let Some(uuid) = session.uuid() {
+                    shared.queue_action(uuid, id.clone(), *pressed);
                 }
             }
             Action::SelectTool { tool } => {
@@ -1751,6 +1809,7 @@ mod tests {
             mod_set_fingerprint: 0,
             materials: Vec::new(),
             tool_table: Vec::new(),
+            action_table: Vec::new(),
             fluid_table: Vec::new(),
             sky_day_length: 0,
             sky_keyframes: Vec::new(),
@@ -1762,6 +1821,7 @@ mod tests {
             control: Control::new(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            actions: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             outbound: tokio::sync::broadcast::channel(16).0,

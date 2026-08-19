@@ -580,6 +580,23 @@ impl ServerHandle {
                 default: tool.default,
             })
             .collect();
+        // Charter rule 11: a mod registers a NAME and the engine owns the key,
+        // so this list is names — and the client, which owns keys, is the thing
+        // that needs it.
+        let action_table: Vec<tiamot_core::proto::ActionDef> = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_actions())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|action| tiamot_core::proto::ActionDef {
+                id: action.id,
+                description: action.description,
+                mod_id: action.mod_id,
+                default_key: action.default_key,
+            })
+            .collect();
+        info!(actions = action_table.len(), "action table built");
+
         info!(
             materials = materials.len(),
             textured = materials.iter().filter(|m| m.texture.is_some()).count(),
@@ -782,6 +799,7 @@ impl ServerHandle {
             mods,
             materials,
             tool_table,
+            action_table,
             fluid_table,
             sky_day_length: sky.0,
             sky_keyframes: sky.1,
@@ -800,6 +818,7 @@ impl ServerHandle {
             control: control.clone(),
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            actions: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -1924,6 +1943,26 @@ impl ServerHandle {
                             });
                             for (mod_id, err) in &verdict.faults {
                                 error!(mod_id = %mod_id, "mod disabled after an on_punch failure: {err}");
+                            }
+                        }
+
+                        // **Mod-registered actions, before the mods' entity
+                        // logic.** A mod that flips a mode on a key press and
+                        // reads that mode while stepping its mobs should see
+                        // this tick's press, not the last one's.
+                        //
+                        // Charter rule 11 ends here: the mod is told the action
+                        // and never the key. Whether the id is real was settled
+                        // at the edge by `queue_action`, against the same table
+                        // the client was sent.
+                        for (uuid, id, pressed) in shared.drain_actions() {
+                            let verdict = source.did_action(&tiamot_core::script::ActionEvent {
+                                player: *uuid.as_bytes(),
+                                id,
+                                pressed,
+                            });
+                            for (mod_id, err) in &verdict.faults {
+                                error!(mod_id = %mod_id, "mod disabled after an on_action failure: {err}");
                             }
                         }
 

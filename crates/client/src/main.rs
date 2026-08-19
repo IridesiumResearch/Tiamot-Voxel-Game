@@ -22,7 +22,7 @@ use std::sync::Arc;
 use client::app::{App, Input, Phases, Teleport};
 use client::cache::ContentCache;
 use client::config::{Config, ServerChoice};
-use client::input::{Actions, Bindings, Input as Control};
+use client::input::{Bindings, Input as Control};
 use client::net::Connection;
 use client::render::{COLOUR_FORMAT, Gpu, Renderer};
 use tiamot_core::identity::Identity;
@@ -124,8 +124,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         embedded,
         window: None,
         held: Held::default(),
-        actions: Actions::engine(),
-        bindings,
+        bindings: Some(bindings),
         last_frame: std::time::Instant::now(),
         pending_teleport: None,
         grabbed: false,
@@ -195,10 +194,12 @@ struct Client {
     embedded: Option<tiamot_server::ServerHandle>,
     window: Option<Surface>,
     held: Held,
-    /// Every action the client knows about: the engine's, and a server's mods'.
-    actions: Actions,
-    /// What each of them is bound to.
-    bindings: Bindings,
+    /// The player's saved bindings, until the `App` exists to hold them.
+    ///
+    /// Read from disk before a window is created and handed over at
+    /// construction, because the registry lives on the `App` — that is where a
+    /// server's `ActionTable` lands.
+    bindings: Option<Bindings>,
     last_frame: std::time::Instant,
     pending_teleport: Option<Teleport>,
     grabbed: bool,
@@ -275,13 +276,10 @@ impl ApplicationHandler for Client {
                     self.grabbed = grab(&surface.window, true);
                     return;
                 }
-                let Some(action) = self
-                    .bindings
-                    .action_for(&self.actions, Control::Mouse(button))
-                else {
+                let Some(action) = surface.app.action_for(Control::Mouse(button)) else {
                     return;
                 };
-                match action.id.as_str() {
+                match action.as_str() {
                     // Held, not clicked: a dig takes a second or two of ticks
                     // and the server counts them. Releasing cancels, which is
                     // why the state is tracked rather than acted on once.
@@ -316,11 +314,10 @@ impl ApplicationHandler for Client {
                 // registry which ACTION this position is bound to and acts on
                 // that — charter rule 11, and the reason a mod can add a
                 // control without the client learning a new key.
-                let Some(action) = self.bindings.action_for(&self.actions, Control::Key(code))
-                else {
+                let Some(action) = surface.app.action_for(Control::Key(code)) else {
                     return;
                 };
-                match action.id.as_str() {
+                match action.as_str() {
                     "engine:move_forward" => self.held.forward = pressed,
                     "engine:move_back" => self.held.back = pressed,
                     "engine:move_left" => self.held.left = pressed,
@@ -388,12 +385,17 @@ impl ApplicationHandler for Client {
                             }
                         }
                     }
-                    id if pressed => {
-                        if let Some(slot) = hotbar_slot(id) {
+                    id => {
+                        if let Some(slot) = hotbar_slot(id).filter(|_| pressed) {
                             surface.app.select_slot(slot);
+                        } else {
+                            // Anything else is a mod's, and the mod is told
+                            // BOTH edges so it can implement a held control.
+                            // `send_action` drops engine ids, so an unhandled
+                            // arm above cannot leak onto the wire.
+                            surface.app.send_action(id, pressed);
                         }
                     }
-                    _ => {}
                 }
             }
 
@@ -482,7 +484,12 @@ impl Client {
             window,
             surface,
             app: {
-                let mut app = App::new(self.config.clone(), connection, renderer);
+                let mut app = App::with_bindings(
+                    self.config.clone(),
+                    connection,
+                    renderer,
+                    self.bindings.take().unwrap_or_default(),
+                );
                 // So the HUD reports the mode in force rather than the flag that
                 // asked for one. See `configure_surface`.
                 app.set_present_mode(present_mode);

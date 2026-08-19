@@ -115,6 +115,11 @@ fn a_bot_completes_the_whole_join_flow() {
             // sky of its own, so a client not told this would draw one frame of
             // whatever it guessed.
             "SkyTable",
+            // Protocol v16. Last of the registration tables: charter rule 11
+            // means a mod registers a NAME and the engine owns the key, so the
+            // names have to reach the thing that owns keys before it draws a
+            // frame in which those keys do nothing.
+            "ActionTable",
             "JoinWorld",
         ];
         assert!(
@@ -510,6 +515,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::ToolTable { .. } => "ToolTable",
         ServerMessage::FluidTable { .. } => "FluidTable",
         ServerMessage::SkyTable { .. } => "SkyTable",
+        ServerMessage::ActionTable { .. } => "ActionTable",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",
         _ => "other",

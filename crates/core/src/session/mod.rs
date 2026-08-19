@@ -119,6 +119,19 @@ pub enum Action {
         entity: u64,
     },
 
+    /// A mod-registered action was pressed or released.
+    ///
+    /// The session does no checking beyond the phase and the protocol's length
+    /// cap: whether this id is one the server actually registered is a question
+    /// about the loaded mods, which the session does not have. The server's
+    /// handler answers it — see `Population::action`.
+    Action {
+        /// The qualified action id.
+        id: String,
+        /// Whether it went down or came up.
+        pressed: bool,
+    },
+
     /// Record a movement/look input for the next tick.
     Input {
         /// The tick the client believes it is on.
@@ -130,6 +143,21 @@ pub enum Action {
         /// Action bitfield.
         actions: u32,
     },
+}
+
+impl Action {
+    /// A mod-registered action, pressed or released.
+    ///
+    /// A constructor rather than a struct literal at the call site, because
+    /// `Session::handle` is at clippy's line limit and this is the arm that
+    /// pushed it over.
+    #[must_use]
+    fn pressed(id: &str, pressed: bool) -> Self {
+        Self::Action {
+            id: id.to_owned(),
+            pressed,
+        }
+    }
 }
 
 /// What the transport should do after [`Session::handle`].
@@ -217,6 +245,14 @@ pub struct JoinContext<'a> {
     /// nothing to draw it as. Empty is a world with no fluid, which is most of
     /// them. See [`crate::proto::FluidDef`].
     pub fluids: &'a [crate::proto::FluidDef],
+    /// Every action the loaded mods registered, in load order.
+    ///
+    /// Charter rule 11: a mod registers a name and the engine owns the key, so
+    /// the names have to reach the thing that owns keys. Empty is the ordinary
+    /// case for a mod set that adds no controls. The engine's own actions are
+    /// NOT in here — a client already has those, and a server does not get to
+    /// redefine what jump means. See [`crate::proto::ActionDef`].
+    pub actions: &'a [crate::proto::ActionDef],
     /// The sky a mod registered: how long a day is, and its keyframes.
     ///
     /// A day length of zero with no keyframes means no mod registered one,
@@ -288,6 +324,33 @@ impl Session {
     #[must_use]
     pub fn display_name(&self) -> Option<&str> {
         self.claimed_name.as_deref()
+    }
+
+    /// The in-world commands that are a straight translation into an [`Action`].
+    ///
+    /// Split out of [`Session::handle`], which was at clippy's line limit and
+    /// was doing two different jobs: deciding whether a message is allowed in
+    /// this phase, and saying what it means. This is the second.
+    ///
+    /// `None` for anything that is not one of these, so the caller falls
+    /// through to its own arms.
+    fn in_world(message: &ClientMessage) -> Option<Response> {
+        Some(match message {
+            ClientMessage::StartDig { target } => Response::act(Action::Dig {
+                target: Some(*target),
+            }),
+            ClientMessage::CancelDig => Response::act(Action::Dig { target: None }),
+            ClientMessage::Punch { entity } => Response::act(Action::Punch { entity: *entity }),
+            ClientMessage::Action { id, pressed } => Response::act(Action::pressed(id, *pressed)),
+            ClientMessage::SelectTool { tool } => {
+                Response::act(Action::SelectTool { tool: tool.clone() })
+            }
+            ClientMessage::Place { target, material } => Response::act(Action::Place {
+                target: *target,
+                material: *material,
+            }),
+            _ => return None,
+        })
     }
 
     /// Handles one decoded client message.
@@ -362,24 +425,10 @@ impl Session {
             (Phase::InWorld, ClientMessage::Chat { text }) => {
                 Response::act(Action::Chat { text: text.clone() })
             }
-            (Phase::InWorld, ClientMessage::StartDig { target }) => Response::act(Action::Dig {
-                target: Some(*target),
-            }),
-            (Phase::InWorld, ClientMessage::CancelDig) => {
-                Response::act(Action::Dig { target: None })
-            }
-            (Phase::InWorld, ClientMessage::Punch { entity }) => {
-                Response::act(Action::Punch { entity: *entity })
-            }
-            (Phase::InWorld, ClientMessage::SelectTool { tool }) => {
-                Response::act(Action::SelectTool { tool: tool.clone() })
-            }
-            (Phase::InWorld, ClientMessage::Place { target, material }) => {
-                Response::act(Action::Place {
-                    target: *target,
-                    material: *material,
-                })
-            }
+            // The plain in-world commands, lifted out together: each is a
+            // one-line translation into an `Action` for the tick thread to
+            // carry out, and `handle` was exactly at clippy's line limit.
+            (Phase::InWorld, message) if let Some(response) = Self::in_world(message) => response,
 
             (
                 Phase::InWorld,
@@ -633,6 +682,14 @@ impl Session {
                     day_length_ticks: context.sky.0,
                     keyframes: context.sky.1.to_vec(),
                 },
+                // Last of the registration tables, and appended here rather
+                // than slotted in beside the tools it resembles: the join
+                // sequence is pinned by tests on both sides of the wire, and
+                // inserting into the middle of it renumbers every message after
+                // the insertion point for no benefit.
+                ServerMessage::ActionTable {
+                    actions: context.actions.to_vec(),
+                },
             ],
             close: false,
             action: Action::None,
@@ -771,6 +828,7 @@ impl Session {
             ClientMessage::Disconnect => "Disconnect",
             ClientMessage::StartDig { .. } => "StartDig",
             ClientMessage::CancelDig => "CancelDig",
+            ClientMessage::Action { .. } => "Action",
             ClientMessage::SelectTool { .. } => "SelectTool",
             ClientMessage::Place { .. } => "Place",
             ClientMessage::ViewDistance { .. } => "ViewDistance",
@@ -804,6 +862,7 @@ mod tests {
             materials: &[],
             fluids: &[],
             tools: &[],
+            actions: &[],
             sky: (0, &[]),
             allowlist,
             max_players: 50,
@@ -897,7 +956,11 @@ mod tests {
         // client not told this would draw one frame of whatever it guessed
         // before being corrected.
         assert!(matches!(sent[6], ServerMessage::SkyTable { .. }));
-        assert!(matches!(sent[7], ServerMessage::JoinWorld { .. }));
+        // And the actions, for the fifth: a mod registers a NAME and the
+        // engine owns the key (charter rule 11), so the names have to reach the
+        // client before it draws a frame in which those keys do nothing.
+        assert!(matches!(sent[7], ServerMessage::ActionTable { .. }));
+        assert!(matches!(sent[8], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]

@@ -113,6 +113,35 @@ pub enum RegisterError {
     Reserved(String),
 }
 
+/// Turns a mod's `default_key` name into a physical key.
+///
+/// **The one place a string from a server becomes a `KeyCode`.** `crates/core`
+/// must not depend on winit (charter rule 3), so the mod API and the protocol
+/// carry the NAME — `"KeyW"`, `"Space"` — and this is where it lands.
+///
+/// Implemented through winit's own `Deserialize` rather than a table written
+/// here, so the set of names this accepts is exactly the set winit defines and
+/// cannot drift out of step with it as winit adds keys.
+///
+/// `None` for a name this build does not know, which is a mod written against a
+/// newer winit and is a warning rather than an error — the action still works
+/// the moment a player binds it.
+#[must_use]
+pub fn parse_key(name: &str) -> Option<Input> {
+    if name.is_empty() {
+        return None;
+    }
+    // serde's own string deserialiser: a bare string is exactly what a unit
+    // variant looks like, and `KeyCode` is one. No JSON crate, and — since the
+    // name comes from a server — no formatting an untrusted string into a
+    // document that would then have to be escaped.
+    let name: serde::de::value::StrDeserializer<'_, serde::de::value::Error> =
+        serde::de::IntoDeserializer::into_deserializer(name);
+    <KeyCode as serde::Deserialize>::deserialize(name)
+        .ok()
+        .map(Input::Key)
+}
+
 /// Why a bindings file could not be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum BindingsError {
@@ -581,6 +610,30 @@ mod tests {
             description: "a mod's action".to_owned(),
             source: Source::Mod(id.split(':').next().unwrap_or("mod").to_owned()),
             default,
+        }
+    }
+
+    #[test]
+    fn a_mods_key_name_becomes_a_key_and_a_strange_one_does_not() {
+        // **The one place a string from a server becomes a `KeyCode`.** Charter
+        // rule 3 keeps winit out of `crates/core`, so the mod API and the
+        // protocol carry the name and this is where it lands.
+        assert_eq!(parse_key("KeyF"), Some(Input::Key(KeyCode::KeyF)));
+        assert_eq!(parse_key("Space"), Some(Input::Key(KeyCode::Space)));
+
+        // Empty means "the mod shipped it unbound", not "the mod is broken".
+        assert_eq!(parse_key(""), None);
+
+        // A name this build does not know is a mod written against a newer
+        // winit: the action still works the moment a player binds it, so this
+        // is a warning at the call site rather than a refused join.
+        assert_eq!(parse_key("KeyThatDoesNotExist"), None);
+
+        // And the reason this goes through serde rather than a format string:
+        // the name comes from a server, so it is hostile input. None of these
+        // may panic, escape into a document, or be mistaken for a real key.
+        for hostile in ["\"", "\\", "a\nb", "{}", "[]", "\0", "KeyW\"]"] {
+            assert_eq!(parse_key(hostile), None, "accepted {hostile:?}");
         }
     }
 

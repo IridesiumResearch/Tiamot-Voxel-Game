@@ -82,6 +82,10 @@ const JOINERS: &str = "tiamot.joiners";
 
 /// Hook name used in registry keys and in fault messages.
 const HOOK_JOIN: &str = "on_player_join";
+/// The registry key holding every `on_action` callback.
+const ACTORS: &str = "tiamot.actors";
+/// What an `on_action` hook is called in errors.
+const HOOK_ACTION: &str = "on_action";
 
 /// Hook name used in registry keys and in fault messages.
 const HOOK_PUNCH: &str = "on_punch";
@@ -825,6 +829,17 @@ impl ScriptVm for MluaVm {
         self.run_hook(HOOK_JOIN, JOINERS, &table)
     }
 
+    fn action(&mut self, event: &crate::script::ActionEvent) -> HookOutcome {
+        let Ok(table) = self.hook_event(event.player).and_then(|table| {
+            table.set("id", event.id.as_str())?;
+            table.set("pressed", event.pressed)?;
+            Ok(table)
+        }) else {
+            return HookOutcome::allow();
+        };
+        self.run_hook(HOOK_ACTION, ACTORS, &table)
+    }
+
     fn fluid_flow(&mut self, event: &crate::script::FluidFlowEvent) -> HookOutcome {
         let Ok(table) = self.lua.create_table().and_then(|table| {
             // Block coordinates on both, and named so that nobody has to guess
@@ -1039,6 +1054,28 @@ impl ScriptVm for MluaVm {
         tools
     }
 
+    fn registered_actions(&self) -> Vec<super::vm::Action> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.actions") else {
+            return Vec::new();
+        };
+        // A sequence, not a map: `register_action` pushes, so iterating it in
+        // order is load order — which is what the settings screen groups by and
+        // the only order a player can predict. `registered_tools` sorts because
+        // its list reaches the simulation; this one reaches a screen.
+        registry
+            .sequence_values::<Table>()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                Some(super::vm::Action {
+                    id: entry.get("id").ok()?,
+                    description: entry.get("description").unwrap_or_default(),
+                    mod_id: entry.get("mod_id").unwrap_or_default(),
+                    default_key: entry.get("default_key").unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
     fn registered_sky(&self) -> Option<Sky> {
         let registry = self
             .lua
@@ -1205,6 +1242,11 @@ impl MluaVm {
             self.hook_registrar(mod_id, HOOK_JOIN, JOINERS)?,
         )
         .map_err(|err| self.vm_error(&err))?;
+        game.set(
+            "register_on_action",
+            self.hook_registrar(mod_id, HOOK_ACTION, ACTORS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
         Ok(())
     }
 
@@ -1238,6 +1280,53 @@ impl MluaVm {
                 Ok(())
             })
             .map_err(|err| self.vm_error(&err))
+    }
+
+    /// The `game.register_action` function, built once per mod environment.
+    ///
+    /// Its own method for the same reason the hook registrars are: it captures
+    /// the owning mod id, and `install_registration` is at clippy's line limit.
+    /// The name is still set with a literal at the call site, because
+    /// `scripts/check-stubs.sh` finds the API surface by grepping for
+    /// `game.set("...")` and a name built in a loop is one it cannot see.
+    fn action_registrar(&self, mod_id: &str) -> Result<mlua::Function, ScriptError> {
+        let owner = mod_id.to_owned();
+        let registrar = self
+            .lua
+            .create_function(move |lua, spec: Table| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                let id: String = spec.get("id")?;
+                let entry = lua.create_table()?;
+                entry.set(
+                    "id",
+                    qualify_id(&owner, &id).map_err(mlua::Error::external)?,
+                )?;
+                entry.set("mod_id", owner.clone())?;
+                entry.set(
+                    "description",
+                    spec.get::<Option<String>>("description")?
+                        .unwrap_or_default(),
+                )?;
+                // The engine does not check this against a key list: it cannot,
+                // because `crates/core` must not know what a key is (charter
+                // rule 3). The client parses it and warns about one it does not
+                // recognise — see `client::input::parse_key`.
+                entry.set(
+                    "default_key",
+                    spec.get::<Option<String>>("default_key")?
+                        .unwrap_or_default(),
+                )?;
+                let actions: Table = lua.named_registry_value("tiamot.actions")?;
+                actions.push(entry)?;
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(registrar)
     }
 
     /// The `register_*` family, live only during the registration window.
@@ -1328,23 +1417,7 @@ impl MluaVm {
         // shape to learn rather than three.
         self.install_cancellable_hooks(mod_id, game)?;
 
-        let owner = mod_id.to_owned();
-        let register_action = self
-            .lua
-            .create_function(move |lua, spec: Table| {
-                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
-                if frozen {
-                    return Err(mlua::Error::external(format!(
-                        "mod `{owner}`: registration is closed"
-                    )));
-                }
-                let id: String = spec.get("id")?;
-                let actions: Table = lua.named_registry_value("tiamot.actions")?;
-                actions.push(qualify_id(&owner, &id).map_err(mlua::Error::external)?)?;
-                Ok(())
-            })
-            .map_err(|err| self.vm_error(&err))?;
-        game.set("register_action", register_action)
+        game.set("register_action", self.action_registrar(mod_id)?)
             .map_err(|err| self.vm_error(&err))?;
         Ok(())
     }
@@ -2195,7 +2268,7 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.entity_steppers", steppers)
             .map_err(|err| self.vm_error(&err))?;
-        for list in [DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS] {
+        for list in [DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS, ACTORS] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
             self.lua
                 .set_named_registry_value(list, table)
@@ -3686,6 +3759,88 @@ mod tests {
         assert!(vm.dig_complete(&a_dig()).allowed);
         vm.eval_in("second", "assert(ran == true, 'the second hook never ran')")
             .expect("both hooks should have run");
+    }
+
+    #[test]
+    fn an_action_reaches_the_hook_with_both_edges_and_never_a_key() {
+        // **Charter rule 11, asserted rather than promised**: the mod is told
+        // WHAT was done and never which key did it. There is no key field here
+        // and a mod must not be able to find one — a mod that could ask would
+        // branch on it, and then rebinding would change behaviour rather than
+        // just controls.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "referee",
+            "seen = {}\ngame.register_on_action(function(e) seen[#seen + 1] = e end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        for pressed in [true, false] {
+            let event = crate::script::ActionEvent {
+                player: [0x33; 32],
+                id: "referee:chisel_mode".to_owned(),
+                pressed,
+            };
+            // An observation, not a veto: the key is already down.
+            assert!(vm.action(&event).allowed, "an action was vetoed");
+        }
+
+        vm.eval_in(
+            "referee",
+            "assert(#seen == 2, 'both edges must arrive, got ' .. #seen)\n\
+             assert(seen[1].player == string.rep('33', 32), 'player')\n\
+             assert(seen[1].id == 'referee:chisel_mode', 'id')\n\
+             assert(seen[1].pressed == true, 'the press')\n\
+             assert(seen[2].pressed == false, 'the release')\n\
+             for k in pairs(seen[1]) do\n\
+               assert(k ~= 'key' and k ~= 'keycode' and k ~= 'default_key',\n\
+                 'the engine told a mod which key was pressed: ' .. k)\n\
+             end",
+        )
+        .expect("the hook should see both edges and no key");
+    }
+
+    #[test]
+    fn a_registered_action_carries_its_mod_and_its_suggested_key() {
+        // What reaches the client: the id qualified with the mod that asked,
+        // so a settings screen can attribute every binding it offers, and the
+        // suggested key as a NAME — `crates/core` must not know what a key is
+        // (charter rule 3), so it never parses this.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core_tools",
+            "game.register_action{ id = 'chisel_mode', default_key = 'KeyC', \
+             description = 'Hold to chisel' }",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let actions = vm.registered_actions();
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].id, "core_tools:chisel_mode");
+        assert_eq!(actions[0].mod_id, "core_tools");
+        assert_eq!(actions[0].default_key, "KeyC");
+        assert_eq!(actions[0].description, "Hold to chisel");
+    }
+
+    #[test]
+    fn an_action_registered_after_freeze_is_refused() {
+        // Charter rule 9: the registration window closes and stays closed.
+        let mut vm = vm();
+        load(&mut vm, "late", "").expect("load");
+        vm.freeze().expect("freeze");
+        let err = vm
+            .eval_in("late", "game.register_action{ id = 'too_late' }")
+            .expect_err("registration was accepted after freeze");
+        // The reason is in the cause chain rather than the top line, which
+        // reads "mod `late` errored in eval" — so look at the whole thing.
+        assert!(
+            format!("{err:?}").contains("registration is closed"),
+            "the error did not say why: {err:?}"
+        );
     }
 
     #[test]

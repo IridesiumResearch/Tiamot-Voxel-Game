@@ -160,6 +160,7 @@ struct Seen {
     states: Vec<client::predict::Authoritative>,
     /// The tool table, which charter rule 1 says only the mods can supply.
     tools: Vec<tiamot_core::proto::ToolDef>,
+    actions: Vec<tiamot_core::proto::ActionDef>,
     /// The sky, which charter rule 1 says the same about.
     sky: Option<client::sky::Sky>,
     /// The most recent time of day the server sent.
@@ -211,6 +212,9 @@ impl Seen {
             Event::DigProgress { .. } => {}
             Event::Inventory { .. } => {}
             Event::Tools { tools } => self.tools = tools,
+            // Recorded like the tools table: this harness asserts on what
+            // arrives, and an action set is one of the things that does.
+            Event::Actions { actions } => self.actions = actions,
             Event::Chat { .. } => {}
         }
     }

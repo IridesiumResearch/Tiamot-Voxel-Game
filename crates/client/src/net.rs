@@ -139,6 +139,16 @@ pub enum Event {
         tools: Vec<tiamot_core::proto::ToolDef>,
     },
 
+    /// Every action the server's mods registered.
+    ///
+    /// Sent once, on join. The engine's own actions are not in here — the
+    /// client already has those and a server does not get to say what jump
+    /// means (charter rule 11).
+    Actions {
+        /// The actions, in mod load order.
+        actions: Vec<tiamot_core::proto::ActionDef>,
+    },
+
     /// What the player is carrying, in **units** (charter rule 5).
     ///
     /// Whole, not a delta: an inventory is tens of stacks at most, and a delta
@@ -327,6 +337,17 @@ pub enum Command {
         target: tiamot_core::SubNodePos,
         /// Which material, as a world material id.
         material: u16,
+    },
+
+    /// Report that a mod-registered action was pressed or released.
+    ///
+    /// Only actions a server registered — the engine's own controls travel as
+    /// movement, digging and placement, all of which the server already judges.
+    Action {
+        /// The qualified action id.
+        id: String,
+        /// Whether it went down or came up.
+        pressed: bool,
     },
     /// Leave.
     Disconnect,
@@ -998,6 +1019,10 @@ async fn session(
                 let _ = events.send(Event::Tools { tools });
             }
 
+            ServerMessage::ActionTable { actions } => {
+                let _ = events.send(Event::Actions { actions });
+            }
+
             ServerMessage::FluidTable { fluids } => {
                 let _ = events.send(Event::Fluids { fluids });
             }
@@ -1138,6 +1163,7 @@ fn to_wire(command: Command) -> ClientMessage {
             vertical,
         },
         Command::Place { target, material } => ClientMessage::Place { target, material },
+        Command::Action { id, pressed } => ClientMessage::Action { id, pressed },
         Command::Disconnect => ClientMessage::Disconnect,
         // Unreachable: the session loop applies it and never gets here. A
         // panic rather than a placeholder message, because sending SOMETHING
