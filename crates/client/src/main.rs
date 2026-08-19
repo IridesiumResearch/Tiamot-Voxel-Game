@@ -22,17 +22,25 @@ use std::sync::Arc;
 use client::app::{App, Input, Phases, Teleport};
 use client::cache::ContentCache;
 use client::config::{Config, ServerChoice};
+use client::input::{Actions, Bindings, Input as Control};
 use client::net::Connection;
 use client::render::{COLOUR_FORMAT, Gpu, Renderer};
 use tiamot_core::identity::Identity;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::PhysicalKey;
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// The config file, relative to the working directory.
 const CONFIG_FILE: &str = "client.toml";
+
+/// Where key bindings live, beside the config.
+///
+/// Its own file rather than a section of `client.toml`: the settings screen
+/// rewrites it whenever a player rebinds something, and rewriting a file that
+/// also holds hand-edited server details would lose their comments.
+const BINDINGS_FILE: &str = "bindings.toml";
 
 /// Starting window size.
 const DEFAULT_SIZE: (u32, u32) = (1280, 720);
@@ -64,6 +72,7 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load_or_default(std::path::Path::new(CONFIG_FILE))?;
+    let bindings = Bindings::load_or_default(std::path::Path::new(BINDINGS_FILE))?;
     let data = config.data_dir();
     std::fs::create_dir_all(&data)?;
 
@@ -115,6 +124,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         embedded,
         window: None,
         held: Held::default(),
+        actions: Actions::engine(),
+        bindings,
         last_frame: std::time::Instant::now(),
         pending_teleport: None,
         grabbed: false,
@@ -184,6 +195,10 @@ struct Client {
     embedded: Option<tiamot_server::ServerHandle>,
     window: Option<Surface>,
     held: Held,
+    /// Every action the client knows about: the engine's, and a server's mods'.
+    actions: Actions,
+    /// What each of them is bound to.
+    bindings: Bindings,
     last_frame: std::time::Instant,
     pending_teleport: Option<Teleport>,
     grabbed: bool,
@@ -251,18 +266,26 @@ impl ApplicationHandler for Client {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
-                match button {
-                    // Click to look FIRST. Until the cursor is grabbed a click
-                    // is the player asking for mouse-look, not asking to dig a
-                    // hole in whatever happens to be under an unaimed
-                    // crosshair.
-                    MouseButton::Left if pressed && !self.grabbed => {
-                        self.grabbed = grab(&surface.window, true);
-                    }
+                // **Click to look FIRST, and before any action lookup.** Until
+                // the cursor is grabbed a click is the player asking for
+                // mouse-look, not asking to dig a hole under an unaimed
+                // crosshair — and that is a property of the window rather than
+                // of whatever `engine:dig` happens to be bound to.
+                if button == MouseButton::Left && pressed && !self.grabbed {
+                    self.grabbed = grab(&surface.window, true);
+                    return;
+                }
+                let Some(action) = self
+                    .bindings
+                    .action_for(&self.actions, Control::Mouse(button))
+                else {
+                    return;
+                };
+                match action.id.as_str() {
                     // Held, not clicked: a dig takes a second or two of ticks
                     // and the server counts them. Releasing cancels, which is
-                    // why the state has to be tracked rather than acted on once.
-                    MouseButton::Left => {
+                    // why the state is tracked rather than acted on once.
+                    "engine:dig" => {
                         self.digging = pressed;
                         if !pressed {
                             surface.app.stop_digging();
@@ -270,7 +293,7 @@ impl ApplicationHandler for Client {
                     }
                     // A single action, unlike digging. Repeating while held
                     // would build a wall out of one click.
-                    MouseButton::Right if pressed && self.grabbed => surface.app.place(),
+                    "engine:place" if pressed && self.grabbed => surface.app.place(),
                     _ => {}
                 }
             }
@@ -286,120 +309,91 @@ impl ApplicationHandler for Client {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    match code {
-                        KeyCode::KeyW => self.held.forward = pressed,
-                        KeyCode::KeyS => self.held.back = pressed,
-                        KeyCode::KeyA => self.held.left = pressed,
-                        KeyCode::KeyD => self.held.right = pressed,
-                        KeyCode::Space => self.held.up = pressed,
-                        KeyCode::ShiftLeft | KeyCode::ControlLeft => self.held.down = pressed,
-                        KeyCode::ShiftRight => self.held.sprint = pressed,
-                        KeyCode::Escape if pressed => {
-                            self.grabbed = !grab(&surface.window, false);
-                        }
-                        // The floating-origin check from Task 08's acceptance
-                        // criteria. F8 goes out, F7 comes home. The world
-                        // travels with the camera, so a working floating origin
-                        // shows an identical picture from coordinates fifty
-                        // thousand blocks away — the HUD's position is what
-                        // moves, and the frame is what must not.
-                        //
-                        // Bound on a letter as well as a function key: F7 and
-                        // F8 sit under Fn-lock or a vendor media overlay on a
-                        // lot of Windows laptops, and the failure is silent —
-                        // the key simply never arrives, which reads as "the
-                        // teleport is broken" rather than "the key was eaten".
-                        KeyCode::F8 | KeyCode::KeyT if pressed => {
-                            self.pending_teleport = Some(Teleport::Far);
-                        }
-                        KeyCode::F7 | KeyCode::KeyH if pressed => {
-                            self.pending_teleport = Some(Teleport::Home);
-                        }
-                        // Cycles the tool. A cycle rather than a fixed key
-                        // per tool, because the engine does not know how many
-                        // there are — charter rule 1 puts that entirely in the
-                        // mods, and a server could register twenty.
-                        KeyCode::KeyR if pressed => surface.app.next_tool(),
-                        // Cycles the lighting mode, live — Task 10's criterion
-                        // that switching needs no restart. On a letter as well
-                        // as a function key for the same reason the teleport
-                        // keys are: F5 is under a vendor overlay on plenty of
-                        // laptops, and a key that never arrives reads as a
-                        // broken feature.
-                        KeyCode::F5 | KeyCode::KeyL if pressed => {
-                            surface.app.cycle_lighting_mode();
-                        }
-                        // Shadow resolution, off through high. Its own control
-                        // rather than part of the lighting mode: the cascades
-                        // are the largest thing the client allocates and the
-                        // right setting depends entirely on the card.
-                        KeyCode::KeyK if pressed => surface.app.cycle_shadow_quality(),
-                        KeyCode::KeyB if pressed => {
-                            let on = surface.app.toggle_chunk_borders();
-                            tracing::info!(on, "chunk borders");
-                        }
-                        // Temporary, for tracking sources while Task 11 is
-                        // built: a source and a full flow block look identical,
-                        // so from inside a pond there is no telling which block
-                        // is feeding it.
-                        KeyCode::KeyN if pressed => {
-                            let on = surface.app.toggle_fluid_sources();
-                            tracing::info!(on, "fluid source outlines");
-                        }
-                        // Scrubbing the sky by hand, for looking at shadows at
-                        // an hour that is not the one the server is at. A
-                        // twentieth of a day a press, so a full circuit is
-                        // twenty presses and dawn is findable.
-                        // Page keys as well as brackets: bracket keys sit in
-                        // different places on different layouts and the failure
-                        // is silent — the key simply never arrives, which reads
-                        // as "the time control does not work". The same
-                        // reasoning as the teleport keys' letter fallbacks.
-                        KeyCode::BracketLeft | KeyCode::PageDown if pressed => {
-                            surface.app.nudge_time(-0.05);
-                        }
-                        KeyCode::BracketRight | KeyCode::PageUp if pressed => {
-                            surface.app.nudge_time(0.05);
-                        }
-                        KeyCode::Backslash | KeyCode::Home if pressed => {
-                            surface.app.resync_time();
-                        }
-                        // Third person, so there is something in the frame that
-                        // moves and casts a shadow. There is no player model
-                        // until Task 12; this draws the collision box.
-                        KeyCode::F6 | KeyCode::KeyV if pressed => {
-                            surface.app.toggle_third_person();
-                        }
-                        // One of every block, laid out where you are looking.
-                        // Singleplayer only, and through the embedded server's
-                        // own handle rather than over the wire — a client
-                        // cannot edit a world it is a guest in, and this does
-                        // not make it one. See `App::debug_material_row`.
-                        KeyCode::KeyG if pressed => {
-                            if let Some(server) = self.embedded.as_ref() {
-                                for (pos, material) in surface.app.debug_material_row() {
-                                    server.seed_block(pos, material);
-                                }
+                let PhysicalKey::Code(code) = event.physical_key else {
+                    return;
+                };
+                // **The window no longer knows what a key means.** It asks the
+                // registry which ACTION this position is bound to and acts on
+                // that — charter rule 11, and the reason a mod can add a
+                // control without the client learning a new key.
+                let Some(action) = self.bindings.action_for(&self.actions, Control::Key(code))
+                else {
+                    return;
+                };
+                match action.id.as_str() {
+                    "engine:move_forward" => self.held.forward = pressed,
+                    "engine:move_back" => self.held.back = pressed,
+                    "engine:move_left" => self.held.left = pressed,
+                    "engine:move_right" => self.held.right = pressed,
+                    "engine:jump" => self.held.up = pressed,
+                    "engine:sneak" | "engine:sneak_alt" => self.held.down = pressed,
+                    "engine:sprint" => self.held.sprint = pressed,
+                    "engine:menu" if pressed => {
+                        self.grabbed = !grab(&surface.window, false);
+                    }
+                    // The floating-origin check from Task 08's criteria: out
+                    // and home. The world travels with the camera, so a working
+                    // floating origin shows an identical picture from fifty
+                    // thousand blocks away — the HUD's position moves and the
+                    // frame must not.
+                    "engine:teleport_far" | "engine:teleport_far_alt" if pressed => {
+                        self.pending_teleport = Some(Teleport::Far);
+                    }
+                    "engine:teleport_home" | "engine:teleport_home_alt" if pressed => {
+                        self.pending_teleport = Some(Teleport::Home);
+                    }
+                    // A cycle rather than a key per tool, because the engine
+                    // does not know how many there are — charter rule 1 puts
+                    // that in the mods and a server could register twenty.
+                    "engine:next_tool" if pressed => surface.app.next_tool(),
+                    "engine:lighting_mode" | "engine:lighting_mode_alt" if pressed => {
+                        surface.app.cycle_lighting_mode();
+                    }
+                    // Its own control rather than part of the lighting mode:
+                    // the cascades are the largest thing the client allocates
+                    // and the right setting depends entirely on the card.
+                    "engine:shadow_quality" if pressed => surface.app.cycle_shadow_quality(),
+                    "engine:third_person" | "engine:third_person_alt" if pressed => {
+                        surface.app.toggle_third_person();
+                    }
+                    "engine:chunk_borders" if pressed => {
+                        let on = surface.app.toggle_chunk_borders();
+                        tracing::info!(on, "chunk borders");
+                    }
+                    // Temporary, for tracking sources: a source and a full flow
+                    // block look identical, so from inside a pond there is no
+                    // telling which block is feeding it.
+                    "engine:fluid_sources" if pressed => {
+                        let on = surface.app.toggle_fluid_sources();
+                        tracing::info!(on, "fluid source outlines");
+                    }
+                    // A twentieth of a day a press, so a full circuit is twenty
+                    // presses and dawn is findable.
+                    "engine:time_back" | "engine:time_back_alt" if pressed => {
+                        surface.app.nudge_time(-0.05);
+                    }
+                    "engine:time_forward" | "engine:time_forward_alt" if pressed => {
+                        surface.app.nudge_time(0.05);
+                    }
+                    "engine:time_resync" | "engine:time_resync_alt" if pressed => {
+                        surface.app.resync_time();
+                    }
+                    // Singleplayer only, and through the embedded server's own
+                    // handle rather than over the wire — a client cannot edit a
+                    // world it is a guest in, and this does not make it one.
+                    "engine:material_row" if pressed => {
+                        if let Some(server) = self.embedded.as_ref() {
+                            for (pos, material) in surface.app.debug_material_row() {
+                                server.seed_block(pos, material);
                             }
                         }
-                        // The hotbar's number keys. `Digit1` is slot 0.
-                        KeyCode::Digit1
-                        | KeyCode::Digit2
-                        | KeyCode::Digit3
-                        | KeyCode::Digit4
-                        | KeyCode::Digit5
-                        | KeyCode::Digit6
-                        | KeyCode::Digit7
-                        | KeyCode::Digit8
-                        | KeyCode::Digit9
-                            if pressed =>
-                        {
-                            let slot = code as usize - KeyCode::Digit1 as usize;
+                    }
+                    id if pressed => {
+                        if let Some(slot) = hotbar_slot(id) {
                             surface.app.select_slot(slot);
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
 
@@ -809,6 +803,16 @@ fn configure_surface(
     if vsync { "on (Fifo)" } else { "OFF (auto)" }
 }
 
+/// The hotbar slot an action id selects, if it is a hotbar action.
+///
+/// Parsed from the id rather than matched arm by arm, because the nine of them
+/// differ only by a digit and nine arms is nine chances to write the wrong one.
+/// `engine:hotbar_1` is slot 0, the way `Digit1` was.
+fn hotbar_slot(id: &str) -> Option<usize> {
+    let slot: usize = id.strip_prefix("engine:hotbar_")?.parse().ok()?;
+    slot.checked_sub(1)
+}
+
 /// Grabs or releases the cursor, reporting whether it is now grabbed.
 ///
 /// Confined first, locked second: Wayland supports one and X11 the other, and
@@ -826,4 +830,27 @@ fn grab(window: &Window, grab: bool) -> bool {
         .is_ok();
     window.set_cursor_visible(!grabbed);
     grabbed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hotbar_slot;
+
+    #[test]
+    fn a_hotbar_action_names_the_slot_it_selects() {
+        // `engine:hotbar_1` is slot 0, the way `Digit1` was before the window
+        // stopped knowing about keys.
+        assert_eq!(hotbar_slot("engine:hotbar_1"), Some(0));
+        assert_eq!(hotbar_slot("engine:hotbar_9"), Some(8));
+        // Not a hotbar action, and — the case that matters — a malformed one.
+        // Parsed rather than matched arm by arm, so the parse has to refuse
+        // what it cannot answer instead of selecting a slot nobody has.
+        assert_eq!(hotbar_slot("engine:jump"), None);
+        assert_eq!(hotbar_slot("engine:hotbar_"), None);
+        assert_eq!(hotbar_slot("engine:hotbar_x"), None);
+        // Slot zero has no meaning: the hotbar is one-based in the id and
+        // zero-based in the array, and `checked_sub` is what stops
+        // `hotbar_0` wrapping to `usize::MAX`.
+        assert_eq!(hotbar_slot("engine:hotbar_0"), None);
+    }
 }

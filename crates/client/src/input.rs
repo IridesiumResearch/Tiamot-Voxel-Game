@@ -113,6 +113,35 @@ pub enum RegisterError {
     Reserved(String),
 }
 
+/// Why a bindings file could not be read or written.
+#[derive(Debug, thiserror::Error)]
+pub enum BindingsError {
+    /// The file exists and could not be read, or could not be written.
+    #[error("bindings file `{path}`: {source}")]
+    Read {
+        /// The file.
+        path: std::path::PathBuf,
+        /// What the filesystem said.
+        source: std::io::Error,
+    },
+    /// The file exists and is not valid TOML, or names something unknown.
+    #[error("bindings file `{path}` is not valid: {source}")]
+    Parse {
+        /// The file.
+        path: std::path::PathBuf,
+        /// What the parser said.
+        source: Box<toml::de::Error>,
+    },
+    /// The bindings could not be turned into TOML.
+    #[error("bindings could not be written to `{path}`: {source}")]
+    Write {
+        /// The file.
+        path: std::path::PathBuf,
+        /// What the serialiser said.
+        source: Box<toml::ser::Error>,
+    },
+}
+
 /// Every action the client knows about, engine and mod alike.
 #[derive(Debug, Clone, Default)]
 pub struct Actions {
@@ -275,6 +304,51 @@ impl Bindings {
             .find(|action| self.get(actions, &action.id) == Some(input))
     }
 
+    /// Reads a bindings file, or the defaults if there is not one yet.
+    ///
+    /// A missing file is not an error — a fresh install has no bindings and the
+    /// defaults are exactly right. A file that exists and is malformed IS an
+    /// error, for the same reason `Config::load_or_default` treats one that
+    /// way: silently ignoring it leaves a player wondering why the keys they
+    /// set do nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BindingsError`] for anything but the file being absent.
+    pub fn load_or_default(path: &std::path::Path) -> Result<Self, BindingsError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => {
+                return Err(BindingsError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        toml::from_str(&text).map_err(|source| BindingsError::Parse {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })
+    }
+
+    /// Writes the player's choices out.
+    ///
+    /// # Errors
+    ///
+    /// [`BindingsError`] if the file cannot be written or the map cannot be
+    /// serialised.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), BindingsError> {
+        let text = toml::to_string_pretty(self).map_err(|source| BindingsError::Write {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })?;
+        std::fs::write(path, text).map_err(|source| BindingsError::Read {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
     /// Every input bound to more than one action.
     ///
     /// Reported rather than refused. A player mid-rebind is briefly in conflict
@@ -329,6 +403,11 @@ const ENGINE_ACTIONS: &[(&str, &str, Option<Input>)] = &[
         "engine:sneak",
         "Sneak",
         Some(Input::Key(KeyCode::ShiftLeft)),
+    ),
+    (
+        "engine:sneak_alt",
+        "Sneak (alternate)",
+        Some(Input::Key(KeyCode::ControlLeft)),
     ),
     (
         "engine:sprint",
