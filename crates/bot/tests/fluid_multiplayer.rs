@@ -174,6 +174,34 @@ fn fingerprint(layer: &FluidLayer) -> u64 {
     )
 }
 
+/// Pumps both bots until they describe the same fluid, or the timeout expires.
+///
+/// The two-peer counterpart of [`until`]. Polling ONE bot is not enough here:
+/// whichever is behind needs its own messages delivered before it can agree,
+/// and a loop that only drains the fast one waits for a state the slow one is
+/// never given the chance to reach.
+async fn until_agreed(
+    clean: &mut Bot,
+    lossy: &mut Bot,
+    timeout: Duration,
+    chunk: ChunkPos,
+) -> bool {
+    let agreed =
+        |clean: &Bot, lossy: &Bot| match (clean.fluid_layer(chunk), lossy.fluid_layer(chunk)) {
+            (Some(ours), Some(theirs)) => fingerprint(&ours) == fingerprint(&theirs),
+            _ => false,
+        };
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if agreed(clean, lossy) {
+            return true;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(25), clean.recv()).await;
+        let _ = tokio::time::timeout(Duration::from_millis(25), lossy.recv()).await;
+    }
+    agreed(clean, lossy)
+}
+
 #[test]
 fn a_second_client_recovers_the_pond_over_a_lossy_link() {
     let (server, _root) = start("keyframe-recovery");
@@ -224,14 +252,22 @@ fn a_second_client_recovers_the_pond_over_a_lossy_link() {
         // **The layers, not just the one block.** A client that got the source
         // and missed the flow around it would pass the assertion above and be
         // wrong everywhere else.
-        let their = lossy.fluid_layer(chunk).expect("a layer arrived");
-        let ours = clean.fluid_layer(chunk).expect("a layer arrived");
-        assert_eq!(
-            fingerprint(&their),
-            fingerprint(&ours),
-            "the two clients disagree about the chunk's fluid: clean {:?} against lossy {:?}",
-            ours.filled(),
-            their.filled()
+        //
+        // **Waited for rather than sampled.** Each bot passed its own `until`
+        // at its own moment, and the lossy one is 75 ms and a fifth of its
+        // messages behind — so reading both layers at one instant compares two
+        // views of a pond that is still arriving. It fails as "clean 4 against
+        // lossy 5", which reads as a replication bug and is a stopwatch
+        // problem: seen on the macOS runner, where the timing differs enough to
+        // catch it. What the keyframe scheme actually promises is that the two
+        // CONVERGE, so that is what is asserted.
+        let agreed = until_agreed(&mut clean, &mut lossy, Duration::from_secs(20), chunk).await;
+        assert!(
+            agreed,
+            "the two clients never agreed about the chunk's fluid: clean {:?} \
+             against lossy {:?}",
+            clean.fluid_layer(chunk).map(|layer| layer.filled()),
+            lossy.fluid_layer(chunk).map(|layer| layer.filled())
         );
 
         clean.disconnect().await;
