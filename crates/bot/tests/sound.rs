@@ -176,3 +176,84 @@ fn a_registered_sound_reaches_the_client_with_its_file_and_its_gain() {
     });
     server.stop();
 }
+
+/// The reference mods, rather than the fixture above.
+fn start_reference(name: &str) -> ServerHandle {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("the repository root");
+    ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: scratch(name),
+        max_players: 4,
+        allowlist: Allowlist::open(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(repo.join("game")),
+        seed: Some(9),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("start")
+}
+
+#[test]
+fn breaking_a_block_makes_a_noise_where_the_block_was() {
+    // **The end of the chain, through the shipped mods.** A player digs, the
+    // mod plays a sound, the server decides who is close enough, and the client
+    // is told — with the position of the BLOCK rather than of the player, which
+    // is the whole reason the engine carries one.
+    //
+    // What it sounds like is the [H] half and this cannot ask about it.
+    let server = start_reference("break-noise");
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Digger").await.expect("join");
+
+        // A block of the reference set's plain solid, within reach.
+        let solid = bot
+            .material_table()
+            .expect("material table")
+            .into_iter()
+            .find(|entry| entry.name.ends_with(":white"))
+            .map(|entry| entry.id)
+            .expect("the reference mods should register a solid block");
+        let at = tiamot_core::BlockPos::new(2, 5, 2);
+        assert!(server.seed_block(at, solid), "the world should seed");
+        bot.move_to(2.0, 0.0, 4.0).await.expect("walk into reach");
+        bot.sleep_ticks(4).await;
+
+        bot.dig_block(at).await.expect("dig");
+        pump(&mut bot, 20).await;
+
+        let heard = bot.sounds_heard();
+        let (sound, pos) = heard
+            .iter()
+            .find(|(sound, _)| sound == "core_tools:break")
+            .expect("digging a block should have made a noise");
+        assert_eq!(sound, "core_tools:break");
+
+        // The middle of the block that was dug, not the player who dug it.
+        // Somebody else standing nearby has to hear it from the right side.
+        let expected = [
+            f64::from(at.x) + 0.5,
+            f64::from(at.y) + 0.5,
+            f64::from(at.z) + 0.5,
+        ];
+        for axis in 0..3 {
+            assert!(
+                (pos[axis] - expected[axis]).abs() < 0.6,
+                "the sound came from {pos:?} rather than the block at {expected:?}"
+            );
+        }
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}

@@ -139,6 +139,10 @@ game.register_on_fluid_flow(function(event)
     )
 end)
 
+-- Milk has a voice too. Louder and further than a block, because a pour is
+-- what a player is looking for when they are trying to find the source.
+game.register_sound{ id = "pour", file = "sounds/pour.wav", gain = 0.8, pitch_variance = 0.15 }
+
 game.register_on_place(function(event)
     if event.material ~= MILK then
         -- Somebody placing an ordinary block. Nothing to do with us; returning
@@ -171,6 +175,11 @@ game.register_on_place(function(event)
         game.log("scooped milk at " .. at.x .. "," .. at.y .. "," .. at.z)
     else
         game.set_fluid(at, { fluid = "core_milk:milk", source = true })
+        game.play_sound{
+            sound = "pour",
+            pos = { x = at.x + 0.5, y = at.y + 0.5, z = at.z + 0.5 },
+            radius = 28,
+        }
         game.log("poured milk at " .. at.x .. "," .. at.y .. "," .. at.z)
     end
 

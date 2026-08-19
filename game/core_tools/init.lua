@@ -81,3 +81,38 @@ game.register_on_action(function(event)
 end)
 
 game.log("registered the core_tools:chisel_mode action")
+
+-- **The noises digging makes.** Charter rule 1: the engine has no sounds of its
+-- own, so a world where nobody registers these is a silent world — correct
+-- rather than broken.
+--
+-- Both are the same recipe today. They are fixtures: `game/` is reference
+-- implementations and test fixtures, and a real game ships recordings.
+game.register_sound{ id = "break", file = "sounds/break.wav", gain = 0.9, pitch_variance = 0.12 }
+game.register_sound{ id = "place", file = "sounds/place.wav", gain = 0.7, pitch_variance = 0.08 }
+
+-- Played where the block was, not where the player is: a sound made at the
+-- listener is a sound with no direction, and the whole point of the engine
+-- knowing a position is that somebody else standing nearby hears it from the
+-- right side.
+--
+-- Cell coordinates come in and world blocks go out — three cells to a block on
+-- each axis (charter rule 5), and the half puts the sound in the middle of the
+-- block rather than on its corner.
+local function centre_of(event)
+    return {
+        x = (event.x + 0.5) / 3,
+        y = (event.y + 0.5) / 3,
+        z = (event.z + 0.5) / 3,
+    }
+end
+
+game.register_on_dig_complete(function(event)
+    game.play_sound{ sound = "break", pos = centre_of(event), radius = 24 }
+    -- Returning nothing allows the dig. A sound is an observation, and a mod
+    -- that vetoed a dig because it made a noise would be a strange mod.
+end)
+
+game.register_on_place(function(event)
+    game.play_sound{ sound = "place", pos = centre_of(event), radius = 20 }
+end)

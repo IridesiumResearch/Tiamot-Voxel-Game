@@ -193,9 +193,19 @@ kira = { version = "0.12", default-features = false, features = ["cpal"] }
 # compiled in, let alone reachable from a hostile file.
 #
 # MPL-2.0, which `deny.toml` already allows and which is GPLv3-compatible.
+# `wav`/`pcm` beside ogg/vorbis so the engine can SYNTHESISE audio rather than
+# commit it. A binary blob in a repo is not source (the same argument that made
+# `engine:humanoid` a table of measurements rather than a committed `.glb`), and
+# there is no Vorbis encoder in Rust worth carrying — but a WAV is a header and
+# some samples, so a reference sound can be a function.
+#
+# It also closes the hole that mattered: without an encoder, nothing could prove
+# this decoder ACCEPTS a good file, only that it refuses bad ones.
 symphonia = { version = "0.5", default-features = false, features = [
     "ogg",
     "vorbis",
+    "wav",
+    "pcm",
 ] }
 
 # HUD text. Immediate-mode, so there is no widget tree to keep in sync with the

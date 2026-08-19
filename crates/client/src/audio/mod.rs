@@ -9,6 +9,7 @@
 
 pub mod ingest;
 pub mod mixer;
+pub mod synth;
 
 pub use ingest::{AudioError, Clip, Limits};
 pub use mixer::{Bus, Mixer, Placement, Volumes, place};
