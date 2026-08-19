@@ -196,13 +196,21 @@ impl path::Access for Shared {
         };
 
         let (route, spent) = path::search_counted(world, from, to, &options);
-        self.allowance
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |left| Some(left.saturating_sub(spent)),
-            )
-            .ok();
+        // A saturating subtract, spelled out. `fetch_update` says this in one
+        // call and is deprecated on nightly in favour of a `try_update` that
+        // stable does not have yet — and the fuzz job builds this crate on
+        // nightly with `-D warnings`, so a version that compiles warning-free
+        // on both toolchains has to avoid the name entirely. The closure here
+        // never failed anyway: it returned `Some` unconditionally.
+        let mut left = self.allowance.load(std::sync::atomic::Ordering::Relaxed);
+        while let Err(actual) = self.allowance.compare_exchange_weak(
+            left,
+            left.saturating_sub(spent),
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            left = actual;
+        }
         route
     }
 }
