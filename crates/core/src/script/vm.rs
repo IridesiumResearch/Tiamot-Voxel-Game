@@ -859,6 +859,14 @@ pub trait ScriptVm: Sized {
     /// there is no fluid anywhere, which is true — see [`crate::fluid::Access`].
     fn set_fluid_access(&mut self, access: std::sync::Arc<dyn crate::fluid::Access>);
 
+    /// Points `game.get_tool` and `game.set_tool` at the connected players.
+    ///
+    /// Called once, after the server exists. Until then `get_tool` answers a
+    /// bare hand and `set_tool` is dropped — a mod calling either during
+    /// worldgen is early rather than wrong, since there is nobody holding
+    /// anything yet.
+    fn set_tools_access(&mut self, access: std::sync::Arc<dyn crate::dig::Tools>);
+
     /// Points the entity API at the server's store.
     ///
     /// The same seam as [`Self::set_fluid_access`], for the same reason: the

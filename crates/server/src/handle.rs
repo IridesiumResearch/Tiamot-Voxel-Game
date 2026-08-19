@@ -1043,6 +1043,17 @@ impl ServerHandle {
                             // the same window.
                             host.vm_mut()
                                 .set_path_access(std::sync::Arc::new(sight.handle()));
+                            // And what each player is holding, which is how a
+                            // mod builds a control that changes how digging
+                            // behaves — `core_tools:chisel_mode` is exactly
+                            // that. Installed HERE and not only in the VM's
+                            // tests: `game.set_block` was dead on every real
+                            // server for three tasks because it was wired up in
+                            // tests alone, and this is the same shape.
+                            host.vm_mut()
+                                .set_tools_access(std::sync::Arc::new(HeldTools {
+                                    shared: std::sync::Arc::clone(&shared),
+                                }));
                             crate::world::Generator::Mods(Box::new(
                                 crate::world::ModGenerator::new(host),
                             ))
@@ -2408,5 +2419,46 @@ impl Drop for ServerHandle {
         if self.simulation.is_some() || self.network.is_some() {
             self.shutdown();
         }
+    }
+}
+
+/// `game.get_tool` and `game.set_tool`, backed by the connected players.
+///
+/// The seam from [`tiamot_core::dig::Tools`]. Which tool a player holds lives
+/// with their body, above `core`, and the VM lives inside it (charter rule 3).
+struct HeldTools {
+    shared: std::sync::Arc<crate::transport::endpoint::Shared>,
+}
+
+impl tiamot_core::dig::Tools for HeldTools {
+    fn tool(&self, player: [u8; 32]) -> Option<String> {
+        let uuid = tiamot_core::identity::PlayerUuid::from_bytes(player);
+        let bodies = self.shared.bodies.lock().ok()?;
+        bodies.get(&uuid).and_then(|body| body.tool.clone())
+    }
+
+    fn set_tool(&self, player: [u8; 32], tool: Option<&str>) -> bool {
+        let uuid = tiamot_core::identity::PlayerUuid::from_bytes(player);
+        // **Refused rather than stored** when the tool is one no mod
+        // registered: a tool id that never resolves is a dig that silently
+        // never progresses, which is far harder to diagnose than a `false`.
+        if let Some(id) = tool
+            && !self.shared.tools.contains_key(id)
+        {
+            return false;
+        }
+        // A player who is not connected is refused for the same reason — a mod
+        // that swapped a tool on somebody who had left would be writing state
+        // nobody owns.
+        let connected = self
+            .shared
+            .bodies
+            .lock()
+            .is_ok_and(|bodies| bodies.contains_key(&uuid));
+        if !connected {
+            return false;
+        }
+        self.shared.select_tool(&uuid, tool.map(ToOwned::to_owned));
+        true
     }
 }

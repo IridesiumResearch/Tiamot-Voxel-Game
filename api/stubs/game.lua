@@ -431,6 +431,31 @@ function game.register_on_player_join(callback) end
 ---@param callback fun(event: { player: string, id: string, pressed: boolean })
 function game.register_on_action(callback) end
 
+---The tool a player is holding, or nil for a bare hand.
+---
+---Takes a player UUID in hex, the way a hook event reports one (charter rule
+---13): key on the UUID, never the display name.
+---
+---Answers nil during worldgen, when nobody is holding anything yet.
+---@param player string
+---@return string? tool The qualified tool id, e.g. "core_tools:chisel".
+function game.get_tool(player) end
+
+---Puts a tool in a player's hand. `nil` is a bare hand.
+---
+---A tool decides what a dig REMOVES and what a placement WRITES, so this is how
+---a mod builds a control that changes how digging behaves. If you swap somebody
+---to another tool for the duration of a key, read `game.get_tool` first and put
+---back what was there — assuming a bare hand takes the tool off anyone who had
+---chosen one.
+---
+---Returns false for a tool nobody registered, or a player who is not connected;
+---an unresolvable tool would be a dig that silently never progresses.
+---@param player string
+---@param tool string? The qualified tool id, or nil for a bare hand.
+---@return boolean took
+function game.set_tool(player, tool) end
+
 ---A walkable route between two points, or why there is not one.
 ---
 ---Navigation is **block resolution** and deliberately simple (Sub-Node Contract

@@ -44,3 +44,40 @@ game.register_tool{
 }
 
 game.log("registered core_tools:hand and core_tools:chisel")
+
+-- **A mod-registered control, which is the whole of what charter rule 11 gives
+-- a mod.** The mod names an action and suggests a key; the engine owns the
+-- binding and a player may move it anywhere. There is deliberately no way to
+-- ask which key it ended up on — a mod that could ask would branch on it, and
+-- then rebinding would change behaviour rather than just controls.
+game.register_action{
+    id = "chisel_mode",
+    default_key = "KeyC",
+    description = "Hold to chisel: swaps to the chisel while held, and back on release",
+}
+
+-- What the action DOES, which is a mod's business and not the engine's.
+--
+-- Held rather than toggled, so both edges are used and a player cannot get
+-- stuck in a mode they did not notice entering. What they were holding is
+-- remembered rather than assumed: putting back "a bare hand" would quietly
+-- take the chisel off somebody who had chosen it with the tool key.
+game.register_on_action(function(event)
+    if event.id ~= "core_tools:chisel_mode" then
+        -- Somebody else's action. Every mod is told about every action so that
+        -- one mod can react to another's control, which is worth more than the
+        -- filtering it costs each of them.
+        return
+    end
+
+    local key = "held_before:" .. event.player
+    if event.pressed then
+        game.storage.set(key, game.get_tool(event.player) or "core_tools:hand")
+        game.set_tool(event.player, "core_tools:chisel")
+    else
+        game.set_tool(event.player, game.storage.get(key) or "core_tools:hand")
+        game.storage.set(key, nil)
+    end
+end)
+
+game.log("registered the core_tools:chisel_mode action")

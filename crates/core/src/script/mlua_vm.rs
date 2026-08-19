@@ -235,6 +235,8 @@ pub struct MluaVm {
     /// is installed before the world exists, so the closures capture this and
     /// read whatever is in it at call time.
     fluid: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::fluid::Access>>>>,
+    /// Where `game.get_tool` and `game.set_tool` reach, once there are players.
+    tools: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::dig::Tools>>>>,
     /// Where `game.set_block` sends its edits, once there is a world.
     edits: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::script::WorldEdit>>>>,
     /// Where the `game.*_entity` calls reach, once there is a world.
@@ -507,6 +509,7 @@ impl ScriptVm for MluaVm {
             next_material: 2,
             light: std::sync::Arc::new(std::sync::Mutex::new(None)),
             fluid: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            tools: std::sync::Arc::new(std::sync::Mutex::new(None)),
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
             storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sight: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -559,6 +562,12 @@ impl ScriptVm for MluaVm {
 
     fn set_fluid_access(&mut self, access: std::sync::Arc<dyn crate::fluid::Access>) {
         if let Ok(mut slot) = self.fluid.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_tools_access(&mut self, access: std::sync::Arc<dyn crate::dig::Tools>) {
+        if let Ok(mut slot) = self.tools.lock() {
             *slot = Some(access);
         }
     }
@@ -1282,6 +1291,59 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))
     }
 
+    /// The `game.get_tool` and `game.set_tool` functions.
+    ///
+    /// Both take a player UUID in hex, the way `game.entity` reports one and
+    /// the way every hook event names a player (charter rule 13): mod state
+    /// keys on the UUID, never the display name.
+    ///
+    /// Before the seam is installed — during worldgen — `get_tool` answers a
+    /// bare hand and `set_tool` is dropped, because there is nobody holding
+    /// anything yet. Same rule as `game.set_block` and `game.get_fluid`.
+    fn install_tools(&self, game: &Table) -> Result<(), ScriptError> {
+        let slot = std::sync::Arc::clone(&self.tools);
+        let get_tool = self
+            .lua
+            .create_function(move |_, uuid: String| {
+                let player = crate::identity::PlayerUuid::from_hex(&uuid).map_err(|_| {
+                    mlua::Error::external(
+                        "get_tool takes a player UUID in hex, as a hook event reports one",
+                    )
+                })?;
+                let held = slot.lock().ok().and_then(|slot| {
+                    slot.as_ref()
+                        .and_then(|tools| tools.tool(*player.as_bytes()))
+                });
+                Ok(held)
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("get_tool", get_tool)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.tools);
+        let set_tool = self
+            .lua
+            .create_function(move |_, (uuid, tool): (String, Option<String>)| {
+                let player = crate::identity::PlayerUuid::from_hex(&uuid).map_err(|_| {
+                    mlua::Error::external(
+                        "set_tool takes a player UUID in hex, as a hook event reports one",
+                    )
+                })?;
+                let took = slot.lock().ok().and_then(|slot| {
+                    slot.as_ref()
+                        .map(|tools| tools.set_tool(*player.as_bytes(), tool.as_deref()))
+                });
+                // `false` for a tool nobody registered or a player who is not
+                // connected, so a mod can tell "refused" from "done" rather
+                // than discovering it when a dig never progresses.
+                Ok(took.unwrap_or(false))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("set_tool", set_tool)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// The `game.register_action` function, built once per mod environment.
     ///
     /// Its own method for the same reason the hook registrars are: it captures
@@ -1411,6 +1473,7 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
 
         self.install_entity_step_hook(mod_id, game)?;
+        self.install_tools(game)?;
 
         // The two cancellable hooks. Registered exactly like `on_tick` — one
         // callback per mod, ordered by load order — so a mod author has one

@@ -196,6 +196,34 @@ impl Dig {
     }
 }
 
+/// Where `game.get_tool` and `game.set_tool` reach.
+///
+/// The same seam shape as [`crate::storage::Access`] and
+/// [`crate::ent::Access`], and for the same reason: which tool a player is
+/// holding lives with the connected bodies, above `core`, and the VM lives
+/// inside it (charter rule 3).
+///
+/// # Why a mod may set this at all
+///
+/// A tool decides what a dig REMOVES and what a placement WRITES, so it is the
+/// one piece of a player's state a mod needs in order to build a control that
+/// changes how digging behaves — the reference `core_tools:chisel_mode` is
+/// exactly that. Reading it back matters just as much: a mod that swaps the
+/// tool for the duration of a held key has to put back what was there, and
+/// guessing "a bare hand" would take a tool off any player who was already
+/// holding one.
+pub trait Tools: Send + Sync {
+    /// The tool a player is holding, or `None` for a bare hand.
+    fn tool(&self, player: [u8; 32]) -> Option<String>;
+
+    /// Puts a tool in a player's hand. `None` is a bare hand.
+    ///
+    /// Returns whether it took: a tool no mod registered, or a player who is
+    /// not connected, is refused rather than stored, because a tool id that
+    /// never resolves would be a dig that silently never progresses.
+    fn set_tool(&self, player: [u8; 32], tool: Option<&str>) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
