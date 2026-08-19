@@ -57,4 +57,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ogg_ingest"
+path = "fuzz_targets/ogg_ingest.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

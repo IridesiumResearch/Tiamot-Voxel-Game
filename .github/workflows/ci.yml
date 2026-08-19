@@ -223,6 +223,20 @@ jobs:
             --target x86_64-unknown-linux-gnu \
             -- -max_total_time=60 -rss_limit_mb=2048
 
+      # Task 13's Ogg Vorbis decoder, and the audio half of charter rule 14: a
+      # client decodes sound files pushed by servers it does not trust. Lands in
+      # the same task the decoder does rather than being deferred to hardening.
+      #
+      # NOT well seeded yet: there is no Vorbis encoder in this repository, so
+      # the corpus has no valid `.ogg` to mutate and this mostly exercises the
+      # container parser. That is still hostile input, and the seed gap is
+      # recorded in the target's own docs.
+      - name: Fuzz the Ogg decoder (smoke)
+        run: |
+          cargo +nightly fuzz run ogg_ingest \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=60 -rss_limit_mb=2048
+
       # From Task 07 onward this is how every task's `game/` mods are validated.
       # It boots no world and binds no socket: a mod API that cannot be checked
       # without a running server is an API with a usability bug.
