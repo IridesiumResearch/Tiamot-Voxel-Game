@@ -679,6 +679,8 @@ pub struct App {
     bindings: crate::input::Bindings,
     /// Every sound the server's mods registered.
     sounds: Vec<tiamot_core::proto::SoundDef>,
+    /// The audio backend, or a silent stand-in where there is no device.
+    mixer: crate::audio::Mixer,
     /// Sounds this client has been told about and not yet played.
     ///
     /// A queue rather than an immediate call, because playing one belongs to
@@ -917,6 +919,7 @@ impl App {
             actions: crate::input::Actions::engine(),
             bindings,
             sounds: Vec::new(),
+            mixer: crate::audio::Mixer::open(crate::audio::Volumes::default()),
             heard: Vec::new(),
             settings_open: false,
             rebinding: None,
@@ -1832,6 +1835,66 @@ impl App {
         std::mem::take(&mut self.heard)
     }
 
+    /// Plays everything the server has said is within earshot.
+    ///
+    /// **Called once a frame, from the frame loop**, because a sound's place is
+    /// relative to where the camera is NOW: a queue drained on the network task
+    /// would spatialise every sound against wherever the player happened to be
+    /// when the packet arrived.
+    ///
+    /// A sound whose file has not finished decoding is DROPPED rather than
+    /// deferred. It has already happened — playing a block break two seconds
+    /// late is worse than not playing it, and the file is ready for the next
+    /// one.
+    pub fn play_heard(&mut self) {
+        if self.heard.is_empty() {
+            return;
+        }
+        let (x, y, z) = self.camera.position.to_world();
+        let listener = [x, y, z];
+        let forward = self.camera.forward();
+        let right = self.camera.right();
+        let forward = [forward.x, forward.y, forward.z];
+        let right = [right.x, right.y, right.z];
+
+        for event in std::mem::take(&mut self.heard) {
+            let crate::net::Event::PlaySound {
+                sound,
+                pos,
+                radius,
+                gain,
+                entity,
+            } = event
+            else {
+                continue;
+            };
+            // A sound attached to an entity comes from wherever that entity is
+            // being DRAWN, which is the interpolated position and is a thing
+            // only the client has. Falling back to the position the server
+            // sent when the entity is unknown — it despawned, or has not
+            // arrived yet — because a sound in roughly the right place beats
+            // silence.
+            let at = entity
+                .and_then(|id| self.entities.get(id))
+                .and_then(crate::entities::Entity::latest)
+                .map_or(pos, |pose| {
+                    tiamot_core::ent::Transform::at(pose.chunk, pose.local).to_world()
+                });
+            let placement = crate::audio::place(at, listener, forward, right, radius, gain);
+            // Everything a mod plays is an effect for now. Ambient, music and
+            // UI are buses a mod cannot yet name — `register_sound` gains a
+            // `bus` field when there is a mod that wants one, rather than
+            // before.
+            self.mixer
+                .play(&sound, crate::audio::Bus::Effects, placement);
+        }
+    }
+
+    /// The audio backend, for the settings screen's volume sliders.
+    pub fn mixer_mut(&mut self) -> &mut crate::audio::Mixer {
+        &mut self.mixer
+    }
+
     /// Whether the settings screen is showing.
     #[must_use]
     pub fn settings_open(&self) -> bool {
@@ -2372,6 +2435,12 @@ impl App {
                 Event::Sounds { sounds } => self.sounds = sounds,
 
                 Event::PlaySound { .. } => self.heard.push(event),
+
+                // Decoded and ready. Handed straight to the mixer, which holds
+                // it even with no sound device — whether an asset decoded is a
+                // property of the asset, and the tests ask on machines that
+                // have no speakers.
+                Event::SoundReady { id, clip } => self.mixer.insert(id, clip),
 
                 Event::Tools { tools } => {
                     // The default first, so a player who never touches the tool

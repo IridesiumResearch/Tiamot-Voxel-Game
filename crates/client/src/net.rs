@@ -148,6 +148,18 @@ pub enum Event {
         sounds: Vec<tiamot_core::proto::SoundDef>,
     },
 
+    /// A sound has been fetched and decoded, and can now be played.
+    ///
+    /// Arrives after the join rather than before it: a client should be in the
+    /// world while its audio is still loading, not staring at nothing until a
+    /// sound file it may never hear has arrived.
+    SoundReady {
+        /// The qualified sound id.
+        id: String,
+        /// The decoded samples.
+        clip: crate::audio::Clip,
+    },
+
     /// Something happened near enough to hear.
     ///
     /// The server has already decided this player is in earshot; what it
@@ -678,6 +690,10 @@ async fn session(
     // the network bad without any of the code below knowing. Unimpaired — the
     // only case in production — it is a direct write.
     let mut send = tiamot_server::transport::Link::new(send);
+
+    // The sound table, kept so an arriving content chunk can be matched to the
+    // sound that wanted it.
+    let mut awaited_sounds: Vec<tiamot_core::proto::SoundDef> = Vec::new();
     send.impair(impairment);
 
     let _ = events.send(Event::Connected {
@@ -890,6 +906,18 @@ async fn session(
                 total_len,
                 data,
             } => {
+                // A sound's file may be what just arrived. Checked before the
+                // material bookkeeping below, which only knows about textures.
+                if let Some(sound) = awaited_sounds.iter().find(|sound| sound.file == Some(hash)) {
+                    let sound = sound.clone();
+                    let cache = cache.clone();
+                    let events = events.clone();
+                    // Deferred by a beat so the slice is written first; the
+                    // helper simply does nothing if it is not there yet.
+                    tokio::spawn(async move {
+                        decode_when_ready(&sound, &cache, &events);
+                    });
+                }
                 match accept_slice(&mut pending, &cache, hash, offset, total_len, &data) {
                     Ok(true) => pending.outstanding = pending.outstanding.saturating_sub(1),
                     Ok(false) => {}
@@ -1050,6 +1078,23 @@ async fn session(
             }
 
             ServerMessage::SoundTable { sounds } => {
+                // **Fetched after the join, not before it.** The material
+                // textures gate the join because a world drawn without them is
+                // a grid of grey; a world with no sound yet is merely quiet.
+                let wanted: Vec<tiamot_core::proto::ContentHash> =
+                    sounds.iter().filter_map(|sound| sound.file).collect();
+                let missing = cache.missing(&wanted);
+                for sound in &sounds {
+                    decode_when_ready(sound, &cache, &events);
+                }
+                if !missing.is_empty()
+                    && let Err(err) = send
+                        .write(&ClientMessage::ContentRequest { hashes: missing })
+                        .await
+                {
+                    say(format!("could not ask for sounds: {err}"));
+                }
+                awaited_sounds = sounds.clone();
                 let _ = events.send(Event::Sounds { sounds });
             }
 
@@ -1150,6 +1195,44 @@ fn accept_slice(
 /// Decoding happens here, on the network thread, rather than in the render
 /// loop: it is unbounded work on untrusted input, and the render loop's job is
 /// to keep pace.
+/// Decodes a sound if its file is in the cache, and says so.
+///
+/// **Charter rule 14's worker with panic isolation.** The decode happens off
+/// this task — a poisoned asset must not stall a connection — and through
+/// `decode_isolated`, so a panic disables that one sound rather than the
+/// client. The warning is per server and per sound, which is what the rule
+/// asks for.
+fn decode_when_ready(
+    sound: &tiamot_core::proto::SoundDef,
+    cache: &ContentCache,
+    events: &mpsc::UnboundedSender<Event>,
+) {
+    let Some(hash) = sound.file else {
+        // A mod named a file that is not in its directory. The server already
+        // logged it; there is nothing here to fetch.
+        return;
+    };
+    let Some(bytes) = cache.get(&hash) else {
+        return;
+    };
+    let id = sound.id.clone();
+    let events = events.clone();
+    // A real worker, not this task: decoding a minute of audio is milliseconds
+    // of work that has no business inside a network read loop.
+    tokio::task::spawn_blocking(move || {
+        match crate::audio::decode_isolated(&bytes, crate::audio::Limits::default()) {
+            Ok(clip) => {
+                let _ = events.send(Event::SoundReady { id, clip });
+            }
+            Err(err) => {
+                let _ = events.send(Event::Warning(format!(
+                    "sound `{id}` could not be decoded and is disabled: {err}"
+                )));
+            }
+        }
+    });
+}
+
 fn emit_materials(pending: &mut Pending, events: &mpsc::UnboundedSender<Event>) {
     let mut images = BTreeMap::new();
     for entry in &pending.table {

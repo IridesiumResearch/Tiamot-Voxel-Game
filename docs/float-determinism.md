@@ -238,6 +238,21 @@ the one place nobody can measure it and buy an agreement nobody needs.
 module that wants one is a module that should ask whether it belongs in `core`
 at all.
 
+### Audio (Task 13)
+
+`crates/client::audio` uses `log10` to turn an amplitude into the decibels its
+backend thinks in, and `sqrt` to measure how far away a sound is. Both are on
+the banned list and both are fine here, for the reason the Scope section gives:
+**audio is presentation.**
+
+It is worth saying why this one cannot become a problem even by accident. The
+sound API is one-way — a mod calls `game.play_sound` and gets back a count of
+who was told, and there is no call that asks how loud anything was. So no
+simulation state can depend on an audio float, whatever the client computes.
+The lint fires because `clippy.toml` is workspace-wide rather than
+crate-scoped, which is a property of clippy and not a claim about this code;
+the exemption is at the use site and names this section.
+
 ---
 
 ## Enforcement

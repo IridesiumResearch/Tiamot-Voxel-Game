@@ -8,8 +8,10 @@
 //! (`core::sound`), and everything about how that becomes a noise is here.
 
 pub mod ingest;
+pub mod mixer;
 
 pub use ingest::{AudioError, Clip, Limits};
+pub use mixer::{Bus, Mixer, Placement, Volumes, place};
 
 /// Decodes a sound with panic isolation.
 ///

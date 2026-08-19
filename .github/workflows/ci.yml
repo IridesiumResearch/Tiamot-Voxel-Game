@@ -32,6 +32,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Task 13's audio backend reaches the OS sound device through `cpal`,
+      # which needs ALSA's headers to BUILD on Linux — not to run. There is no
+      # sound card on a runner and none is wanted: the client opens a mixer if
+      # it can and carries on silently if it cannot.
+      #
+      # This is not the charter rule 14 exception it looks like. That rule
+      # forbids C bindings in the ASSET path, where a stranger's bytes are
+      # parsed; ALSA is the operating system's audio API and decodes nothing.
+      # Every byte a server sends still goes through Symphonia.
+      - name: Audio build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
       # Honours rust-toolchain.toml, so the pinned version is the one used.
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
@@ -123,6 +138,12 @@ jobs:
           # check-dco.sh walks the commits under review, so it needs more than
           # a shallow clone.
           fetch-depth: 0
+
+      # The fuzz targets link the client, which links the audio backend.
+      - name: Audio build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
 
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install

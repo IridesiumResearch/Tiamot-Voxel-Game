@@ -643,6 +643,15 @@ impl Client {
         }
         phases.network = elapsed_ms(phase);
 
+        // **Played here rather than where they arrive**, because a sound's
+        // place is relative to where the camera is NOW. Draining this on the
+        // network task would spatialise every sound against wherever the
+        // player happened to be standing when the packet landed.
+        //
+        // Not timed as its own phase: starting a sound is handing a buffer to
+        // kira's thread, which is the point of kira having one.
+        surface.app.play_heard();
+
         let phase = std::time::Instant::now();
         surface.app.remesh();
         phases.remesh = elapsed_ms(phase);

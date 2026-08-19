@@ -96,6 +96,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # `cargo bench --workspace` builds the client, which links the audio
+      # backend, which needs ALSA's headers on Linux. Nothing here plays a
+      # sound — a runner has no device and the client carries on silently.
+      - name: Audio build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
       # Not gated. Criterion's own noise threshold is tuned for a quiet machine,
       # and a shared runner is not one; these are for reading a trend, not for
       # blocking a merge.
