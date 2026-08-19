@@ -414,15 +414,52 @@ fn dump_the_splat() {
 }
 
 #[test]
-#[ignore = "timing aid: prints a measurement rather than asserting anything"]
-fn what_the_shoreline_skirt_costs() {
-    let start = std::time::Instant::now();
-    let runs = 200;
-    let mut quads = 0;
-    for _ in 0..runs {
-        let mesh = splat();
-        quads = mesh.fluid_vertices.len() / 4;
-    }
-    let each = start.elapsed() / runs;
-    println!("splat fixture: {each:?} per mesh, {quads} fluid quads");
+fn a_shoreline_stands_no_wall_of_milk_under_its_own_surface() {
+    // **Reported from a running game**, looking at the skirt: "there are still
+    // full single quads that render at full height at the edges of the puddle,
+    // like a big ring around the shoreline."
+    //
+    // A fluid side face is several quads stacked up a block, and only the
+    // TOPMOST vertex was pulled down to the surface. Every quad below it stayed
+    // pinned to the lattice, so the milk's cross-section never followed its own
+    // surface down: a wall of milk standing under a surface that had already
+    // come down. Inside a pond those faces are culled and it cannot be seen —
+    // around the outside of one it is a ring.
+    //
+    // The skirt did not cause it, it made it plain: a skirt block's surface is
+    // ON the floor, so the whole of its side face was left standing.
+    //
+    // Measured on this fixture: the tallest standing edge in a dry block was
+    // **16 fine units**, a third of a block, and is now **one** — a forty-eighth,
+    // which is integer rounding in the surface rather than geometry anybody
+    // would see. The bound is that one unit, so the ring reappearing at a third
+    // of a block fails by a factor of sixteen.
+    let mesh = splat();
+    let per_axis = tiamot_core::SUBNODES_PER_AXIS;
+    let fine = 48 / per_axis;
+
+    let tallest = mesh
+        .fluid_vertices
+        .iter()
+        // Side faces only: a top face lying flat on the floor is the shoreline
+        // working, not a wall.
+        .filter(|vertex| vertex.face().0 != 1)
+        .filter(|vertex| {
+            let (x, _, z) = vertex.position();
+            // Dry blocks only — the skirt ring and beyond.
+            !wet((x / per_axis) as i32, POOL, (z / per_axis) as i32)
+        })
+        .map(|vertex| {
+            let (_, y, _) = vertex.position();
+            ((y % per_axis) * fine).saturating_sub(u32::from(vertex.drop()))
+        })
+        .max()
+        .unwrap_or(0);
+
+    assert!(
+        tallest <= 1,
+        "the shoreline leaves {tallest} fine units of milk standing in a dry \
+         block whose surface is the floor — the ring of full-height quads \
+         reported around a puddle"
+    );
 }

@@ -1050,8 +1050,31 @@ fn fluid_buffers(quads: &[Quad], grid: &SubNodeGrid) -> (Vec<FluidVertex>, Vec<u
                 // out flat because half its vertices never moved.
                 //
                 // So: any of the four below is milk, none of the four above is.
+                // **Every vertex above the surface comes down to it**, not
+                // just the topmost one. A side face is often several quads
+                // stacked up the block, and while only the highest vertex
+                // moved, the ones below it stayed pinned to the lattice — so
+                // the milk's cross-section did not follow its own surface and a
+                // shoreline kept a wall of milk standing under it. That is the
+                // "very high edges" report, in its second and more literal
+                // form: a ring of full-height quads around a pool.
+                //
+                // A vertex at or below the surface still does not move, because
+                // `saturating_sub` gives it zero — which is what the old
+                // `!wet_above` test was reaching for. It is redundant now and
+                // was never quite the question: a vertex with milk above it
+                // sits in a full block, whose surface is the lattice top, so
+                // the arithmetic already answers zero.
                 let wet_below = fluid_touches(grid, x, below as u32, z);
-                let wet_above = fluid_touches(grid, x, y, z);
+                // **Milk in the block ROW above**, not milk in the next cell
+                // up. A wet block is full on the lattice, so a vertex halfway
+                // up one always has milk immediately above it and the old test
+                // pinned every mid-block vertex to the lattice — which is the
+                // stack of undropped quads described above. What the test is
+                // actually for is a column of milk standing in the pool: there
+                // is no surface under more milk, and that vertex must not move.
+                let above = ((by + 1) * per_axis as i32).max(0) as u32;
+                let wet_above = fluid_touches(grid, x, above, z);
                 let drop = if wet_below && !wet_above {
                     let lattice = ((below % per_axis) as u32 + 1) * FINE;
                     let surface = grid.surface_at(x as usize, z as usize, by);
