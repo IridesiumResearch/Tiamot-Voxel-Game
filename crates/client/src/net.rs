@@ -1429,6 +1429,7 @@ mod tests {
                 id: *id,
                 name: (*name).to_owned(),
                 texture: *texture,
+                step_sound: None,
             })
             .collect()
     }

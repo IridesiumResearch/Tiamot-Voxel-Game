@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -397,6 +397,16 @@ pub struct SoundDef {
 /// no other need to run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterialDef {
+    /// The sound a footstep on this material makes, if a mod named one.
+    ///
+    /// **Played by the client, from its own movement**, so it needs no round
+    /// trip and no event: a player's own footsteps are the one sound in the
+    /// game whose timing they will notice being late. Other players' steps come
+    /// from their entity, like every other sound.
+    ///
+    /// `None` is a silent material, which is every material until a mod says
+    /// otherwise (charter rule 1).
+    pub step_sound: Option<String>,
     /// The world id that appears in chunk blobs.
     pub id: u16,
     /// The canonical string id, e.g. `"core:white"`.
@@ -2269,11 +2279,13 @@ mod tests {
                     id: 0,
                     name: "engine:air".to_owned(),
                     texture: None,
+                    step_sound: None,
                 },
                 MaterialDef {
                     id: 2,
                     name: "core:white".to_owned(),
                     texture: Some([9u8; 32]),
+                    step_sound: None,
                 },
             ],
         };

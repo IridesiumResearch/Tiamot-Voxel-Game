@@ -238,6 +238,13 @@ pub use crate::dig::Brush;
 pub struct BlockRules {
     /// The qualified block id.
     pub block: String,
+    /// The sound a footstep on this block makes, if the mod named one.
+    ///
+    /// A qualified sound id. `None` means walking on it is silent, which is a
+    /// legitimate answer and the one every block gets until a mod says
+    /// otherwise — charter rule 1: the engine has no opinion about what stone
+    /// sounds like.
+    pub step_sound: Option<String>,
     /// Seconds to break with a bare hand.
     ///
     /// A default rather than an absence: every block has *some* hardness, and

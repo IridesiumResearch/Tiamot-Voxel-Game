@@ -52,8 +52,14 @@ fn material_table(
     map: &tiamot_core::persist::idmap::MaterialMap,
     content: &tiamot_core::content::ContentIndex,
     textures: &[tiamot_core::script::BlockTexture],
+    block_rules: &[tiamot_core::script::BlockRules],
 ) -> Vec<tiamot_core::proto::MaterialDef> {
     use std::collections::BTreeMap;
+
+    let rules: BTreeMap<&str, &tiamot_core::script::BlockRules> = block_rules
+        .iter()
+        .map(|rules| (rules.block.as_str(), rules))
+        .collect();
 
     let by_block: BTreeMap<&str, &tiamot_core::script::BlockTexture> = textures
         .iter()
@@ -82,6 +88,10 @@ fn material_table(
             });
             Some(tiamot_core::proto::MaterialDef {
                 id,
+                // What walking on it sounds like, if the mod said. The client
+                // plays its own footsteps from its own movement, so this is the
+                // only way it can know.
+                step_sound: rules.get(name).and_then(|rules| rules.step_sound.clone()),
                 name: name.to_owned(),
                 texture,
             })
@@ -558,11 +568,19 @@ impl ServerHandle {
             .as_ref()
             .map(|loaded| loaded.vm().registered_block_textures())
             .unwrap_or_default();
+        // The mods' own rules, read here as well as below: the material table
+        // carries the step sound, which is the only way a client can know what
+        // walking on something sounds like.
+        let block_rules = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_block_rules())
+            .unwrap_or_default();
         let materials = material_table(
             &registry,
             world.materials(),
             &content_index,
             &block_textures,
+            &block_rules,
         );
         // Charter rule 1: the engine has no tools of its own, so this list is
         // whatever the mods registered and nothing else. A client is told it

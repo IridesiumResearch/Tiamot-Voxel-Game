@@ -688,6 +688,12 @@ pub struct App {
     /// note applies: none of this is simulation, so nothing here has to be
     /// deterministic.
     heard: Vec<crate::net::Event>,
+    /// What each material sounds like to walk on, by world material id.
+    step_sounds: std::collections::BTreeMap<u16, String>,
+    /// Distance walked since the last footstep, in blocks.
+    stride: f32,
+    /// Where the body was when that distance was last measured.
+    last_step_at: [f32; 3],
     /// Whether the volumes have changed since they were written out.
     volumes_dirty: bool,
     /// Whether the settings screen is showing.
@@ -927,6 +933,9 @@ impl App {
             sounds: Vec::new(),
             mixer,
             heard: Vec::new(),
+            step_sounds: std::collections::BTreeMap::new(),
+            stride: 0.0,
+            last_step_at: [0.0; 3],
             volumes_dirty: false,
             settings_open: false,
             rebinding: None,
@@ -1791,6 +1800,23 @@ impl App {
         self.renderer.set_selection(&corners);
     }
 
+    /// Records the names and footstep sounds from a material table.
+    ///
+    /// Split out because `pump_network` is at clippy's line limit. The step
+    /// sounds live in their own map rather than being looked up through the
+    /// table: a footstep is decided every couple of blocks walked, and a scan
+    /// each time would be work for nothing.
+    fn adopt_materials(&mut self, table: &[tiamot_core::proto::MaterialDef]) {
+        self.materials = table
+            .iter()
+            .map(|entry| (entry.id, entry.name.clone()))
+            .collect();
+        self.step_sounds = table
+            .iter()
+            .filter_map(|entry| entry.step_sound.clone().map(|sound| (entry.id, sound)))
+            .collect();
+    }
+
     /// Replaces the mod-registered actions with a server's.
     ///
     /// Its own method because `pump_network` is at clippy's line limit, and
@@ -1895,6 +1921,108 @@ impl App {
             self.mixer
                 .play(&sound, crate::audio::Bus::Effects, placement);
         }
+    }
+
+    /// Plays the player's own footsteps, chosen by what is underfoot.
+    ///
+    /// **Client-side, from its own movement, with no round trip.** A player's
+    /// own footsteps are the one sound in the game whose lateness they would
+    /// notice, and asking the server would put a round trip between the foot
+    /// and the noise. Everybody else's steps come from their entity, like every
+    /// other sound.
+    ///
+    /// Paced by DISTANCE rather than by time, so walking and sprinting sound
+    /// like walking and sprinting without the interval being tuned twice. A
+    /// player standing still and turning makes no noise, which a timer would
+    /// get wrong.
+    pub fn play_footsteps(&mut self) {
+        /// Blocks between footfalls. Roughly a stride.
+        const STRIDE: f32 = 2.2;
+
+        let Some(body) = self.predictor.as_ref().map(super::predict::Predictor::body) else {
+            return;
+        };
+        if !body.on_ground {
+            // In the air. The distance travelled while falling does not count,
+            // or landing after a long jump would fire several steps at once.
+            self.stride = 0.0;
+            return;
+        }
+
+        let moved = {
+            let last = self.last_step_at;
+            let now = body.position;
+            self.last_step_at = now;
+            let offset = [now[0] - last[0], now[2] - last[2]];
+            // Horizontal only: a lift going up is not a walk.
+            (offset[0] * offset[0] + offset[1] * offset[1]).sqrt()
+        };
+        // A teleport is not a walk either. Anything absurd resets the count
+        // rather than firing a burst of steps.
+        if moved > STRIDE {
+            self.stride = 0.0;
+            return;
+        }
+        self.stride += moved;
+        if self.stride < STRIDE {
+            return;
+        }
+        self.stride = 0.0;
+
+        // What is under the foot, a little below it: standing ON a block means
+        // the player's feet are at its top face, so sampling at the feet finds
+        // the air they are standing in.
+        let Some(material) = self.material_under_feet() else {
+            return;
+        };
+        let Some(sound) = self.step_sounds.get(&material).cloned() else {
+            // A material no mod gave a voice. Silent, which is every material
+            // until somebody says otherwise (charter rule 1).
+            return;
+        };
+
+        // At the listener, so it is centred and unattenuated: these are the
+        // player's own feet, and panning them would be strange.
+        let placement = crate::audio::Placement {
+            gain: 1.0,
+            pan: 0.0,
+            brightness: 1.0,
+        };
+        self.mixer
+            .play(&sound, crate::audio::Bus::Effects, placement);
+    }
+
+    /// The material the player is standing on, if the chunk is loaded.
+    fn material_under_feet(&self) -> Option<u16> {
+        let body = self
+            .predictor
+            .as_ref()
+            .map(super::predict::Predictor::body)?;
+        let origin = self.camera.position.chunk;
+        // A quarter of a block below the feet: inside the block being stood on
+        // rather than in the air above it.
+        let world = tiamot_core::ent::Transform::at(origin, body.position).to_world();
+        let block = tiamot_core::BlockPos::new(
+            tiamot_core::detgen::floor_to_i32(world[0] as f32),
+            tiamot_core::detgen::floor_to_i32(world[1] as f32 - 0.25),
+            tiamot_core::detgen::floor_to_i32(world[2] as f32),
+        );
+        let chunk = self.store.get(block.chunk())?;
+        // The CELL under the foot, not the block: a chiselled block is mostly
+        // air, and a player standing on the one cell left of it is standing on
+        // that cell's material rather than on the block's nominal one.
+        // The CELL under the foot, not the block: a chiselled block is mostly
+        // air, and somebody standing on the one cell left of it is standing on
+        // that cell's material rather than on the block's nominal one.
+        //
+        // `rem_euclid` rather than a cast, because the fraction of a NEGATIVE
+        // coordinate is negative and would index cell −2.
+        let cell_of = |value: f64| ((value.rem_euclid(1.0) * 3.0) as u32).min(2);
+        let view = chunk.get_block_local(block.local());
+        // The TOP layer of the block below, which is the surface being walked
+        // on — the two beneath it are inside the ground.
+        let cell = view.subnode_at(cell_of(world[0]), 2, cell_of(world[2]));
+        (!cell.is_air()).then(|| cell.get())
     }
 
     /// The audio backend, for the settings screen's volume sliders.
@@ -2356,10 +2484,7 @@ impl App {
                 }
 
                 Event::Materials { table, images } => {
-                    self.materials = table
-                        .iter()
-                        .map(|entry| (entry.id, entry.name.clone()))
-                        .collect();
+                    self.adopt_materials(&table);
                     self.renderer.set_atlas(&build_atlas(&table, &images));
                     // Every mesh drawn before this sampled the placeholder
                     // atlas. In practice the table arrives before any chunk,
@@ -3410,11 +3535,13 @@ mod tests {
                 id: 0,
                 name: "engine:air".to_owned(),
                 texture: None,
+                step_sound: None,
             },
             MaterialDef {
                 id: 5,
                 name: "core:white".to_owned(),
                 texture: Some([0u8; 32]),
+                step_sound: None,
             },
         ];
         let mut images = BTreeMap::new();
@@ -3444,6 +3571,7 @@ mod tests {
             id: 2,
             name: "mod:untextured".to_owned(),
             texture: None,
+            step_sound: None,
         }];
         let atlas = build_atlas(&table, &BTreeMap::new());
 

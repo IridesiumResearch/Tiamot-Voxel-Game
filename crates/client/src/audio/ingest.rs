@@ -198,6 +198,30 @@ fn check_header(
     Ok((channels, sample_rate))
 }
 
+/// Finds a RIFF chunk's payload by its four-character id.
+///
+/// Its own walk rather than trusting the file's own offsets: a length field is
+/// a number a stranger chose, so every step is bounded against what actually
+/// arrived. `None` for a chunk that is absent or truncated, which the caller
+/// turns into a refusal.
+fn find_chunk(bytes: &[u8], id: [u8; 4]) -> Option<&[u8]> {
+    // Past "RIFF", the length, and "WAVE".
+    let mut at = 12usize;
+    while at + 8 <= bytes.len() {
+        let kind = bytes.get(at..at + 4)?;
+        let len = u32::from_le_bytes(bytes.get(at + 4..at + 8)?.try_into().ok()?) as usize;
+        let start = at + 8;
+        let end = start.checked_add(len)?.min(bytes.len());
+        if kind == id {
+            return bytes.get(start..end);
+        }
+        // Chunks are word-aligned, and a zero length must still advance or this
+        // walks the same header for ever.
+        at = start.checked_add(len + (len & 1))?;
+    }
+    None
+}
+
 /// Decodes an Ogg Vorbis file into samples.
 ///
 /// # Errors
@@ -235,6 +259,32 @@ pub fn decode(bytes: &[u8], limits: Limits) -> Result<Clip, AudioError> {
     let wav = bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE");
     if !ogg && !wav {
         return Err(AudioError::NotOgg("not an Ogg or WAV container".to_owned()));
+    }
+
+    // **And the WAV format chunk, before Symphonia builds a `TimeBase` from
+    // it.** Found by the fuzz target's second CI run: `TimeBase::new` panics
+    // outright on a zero numerator or denominator, and a WAV header declaring
+    // zero channels or zero hertz reaches it during the PROBE — before the
+    // header checks further down get a look.
+    //
+    // Symphonia is pure Rust and memory-safe, so this is a denial of service
+    // rather than a corruption. It is still a decode worker a stranger can tear
+    // down at will, so the two fields that panic are read here first. A guard,
+    // not a second parser.
+    if wav {
+        let fmt = find_chunk(bytes, *b"fmt ")
+            .ok_or_else(|| AudioError::NotOgg("a WAV with no format chunk".to_owned()))?;
+        let channels = fmt
+            .get(2..4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map_or(0, u16::from_le_bytes);
+        let rate = fmt
+            .get(4..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map_or(0, u32::from_le_bytes);
+        if channels == 0 || rate == 0 {
+            return Err(AudioError::NoTrack);
+        }
     }
 
     let source = std::io::Cursor::new(bytes.to_vec());
@@ -405,6 +455,36 @@ mod tests {
             ),
             "an Ogg header was refused by the magic check rather than parsed"
         );
+    }
+
+    #[test]
+    fn a_wav_header_declaring_nothing_is_refused_before_the_probe() {
+        // **The fuzz target's second find.** `TimeBase::new` panics outright on
+        // a zero numerator or denominator, and a WAV declaring zero channels or
+        // zero hertz reaches it during the PROBE — before the header checks
+        // further down get a look at anything.
+        //
+        // Built by corrupting a real file rather than by hand, so the rest of
+        // the container stays valid and the refusal is provably about these two
+        // fields rather than about something else being malformed.
+        let good = crate::audio::synth::wav(crate::audio::synth::Recipe::click());
+        assert!(
+            decode(&good, Limits::default()).is_ok(),
+            "the fixture is bad"
+        );
+
+        // The `fmt ` payload begins at byte 20: format, then channels at 22,
+        // then the sample rate at 24.
+        for (offset, width, label) in [(22usize, 2usize, "channels"), (24, 4, "hertz")] {
+            let mut broken = good.clone();
+            for byte in &mut broken[offset..offset + width] {
+                *byte = 0;
+            }
+            assert!(
+                decode(&broken, Limits::default()).is_err(),
+                "a WAV declaring zero {label} was accepted, and Symphonia panics on it"
+            );
+        }
     }
 
     #[test]

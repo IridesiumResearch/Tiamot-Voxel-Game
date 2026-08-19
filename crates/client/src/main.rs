@@ -651,6 +651,7 @@ impl Client {
         // Not timed as its own phase: starting a sound is handing a buffer to
         // kira's thread, which is the point of kira having one.
         surface.app.play_heard();
+        surface.app.play_footsteps();
 
         let phase = std::time::Instant::now();
         surface.app.remesh();

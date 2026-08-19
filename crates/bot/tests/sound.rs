@@ -257,3 +257,64 @@ fn breaking_a_block_makes_a_noise_where_the_block_was() {
     });
     server.stop();
 }
+
+#[test]
+fn a_material_carries_the_sound_of_walking_on_it() {
+    // **Criterion 1's second half: selection BY MATERIAL.** The client plays
+    // its own footsteps from its own movement — no round trip, because a
+    // player's own steps are the one sound whose lateness they would notice —
+    // so the only way it can know what stone sounds like is the material table.
+    //
+    // Asserted on the table rather than on a noise, which is what a bot can
+    // see. That the client then plays it is `App::play_footsteps`, and how it
+    // SOUNDS is the [H] half.
+    let server = start_reference("step-material");
+    block_on(async {
+        let bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        let mut bot = bot;
+        bot.join("Walker").await.expect("join");
+
+        let table = bot.material_table().expect("material table");
+        let white = table
+            .iter()
+            .find(|entry| entry.name.ends_with(":white"))
+            .expect("the reference mods should register a solid block");
+        // `core:step`, not `core_blocks:step` — the DIRECTORY is `core_blocks`
+        // and the mod's declared id is `core`. Worth pinning: a sound id built
+        // from the wrong one resolves to nothing and fails silently, which is
+        // exactly how this test failed the first time it was written.
+        let step_id = white
+            .step_sound
+            .clone()
+            .expect("the block's step sound did not reach the client, so nothing it walks on can make a noise");
+        assert_eq!(step_id, "core:step");
+
+        // And the sound it names is one the client was actually given, or the
+        // lookup would find an id with no file behind it.
+        let sounds = bot.sound_table().expect("sound table");
+        let step = sounds
+            .iter()
+            .find(|sound| sound.id == step_id)
+            .expect("the step sound should be registered");
+        assert!(
+            step.file.is_some(),
+            "the step sound has no file, so there is nothing to decode"
+        );
+
+        // A material nobody gave a voice is silent rather than wrong — which is
+        // every material until a mod says otherwise (charter rule 1).
+        assert!(
+            table.iter().any(|entry| entry.step_sound.is_none()),
+            "every material has a step sound, so the silent case is untested"
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}

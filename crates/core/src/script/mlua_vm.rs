@@ -1025,6 +1025,9 @@ impl ScriptVm for MluaVm {
                     *id,
                     BlockRules {
                         block: block.clone(),
+                        step_sound: entry.as_ref().and_then(|entry| {
+                            entry.get::<Option<String>>("step_sound").ok().flatten()
+                        }),
                         hardness,
                         dominance,
                         drops,
@@ -2612,6 +2615,47 @@ impl MluaVm {
 /// A free function rather than the closure it used to be, so the closure is one
 /// line and this can be read without scrolling past the rest of the
 /// registration API.
+/// Refuses a block spec with a field the engine does not know.
+///
+/// A typo in `hardness` should say so rather than silently taking the default.
+/// Its own function because `register_block` is at clippy's line limit — and it
+/// earns the separation: adding `sounds` to `BLOCK_FIELDS` was forgotten once,
+/// and the mod failed to load with exactly the message this produces.
+fn check_block_fields(id: &str, spec: &Table) -> mlua::Result<()> {
+    for pair in spec.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !BLOCK_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "register_block(\"{id}\"): unknown field `{name}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Records the sound a block makes underfoot, if the mod named one.
+///
+/// Its own function because `register_block` is at clippy's line limit. Only
+/// `step` for now: breaking and placing are already events a mod can hook, and
+/// a hook can choose a noise with more context than a table could carry.
+fn step_sound_of(owner: &str, spec: &Table, entry: &Table) -> mlua::Result<()> {
+    if let Some(sounds) = spec.get::<Option<Table>>("sounds")?
+        && let Some(step) = sounds.get::<Option<String>>("step")?
+    {
+        // Unqualified means the caller's own, like every other id here.
+        let step = if step.contains(':') {
+            step
+        } else {
+            qualify_id(owner, &step).map_err(mlua::Error::external)?
+        };
+        entry.set("step_sound", step)?;
+    }
+    Ok(())
+}
+
 fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
     let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
     if frozen {
@@ -2624,19 +2668,7 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
         .get("id")
         .map_err(|_| mlua::Error::external("register_block: missing required field `id`"))?;
 
-    // Unknown fields are an error naming the field: a typo in `hardness`
-    // should say so, not silently take the default.
-    for pair in spec.pairs::<Value, Value>() {
-        let (key, _) = pair?;
-        if let Value::String(name) = key {
-            let name = name.to_string_lossy();
-            if !BLOCK_FIELDS.contains(&name.as_ref()) {
-                return Err(mlua::Error::external(format!(
-                    "register_block(\"{id}\"): unknown field `{name}`"
-                )));
-            }
-        }
-    }
+    check_block_fields(&id, spec)?;
 
     let qualified = qualify_id(owner, &id).map_err(mlua::Error::external)?;
 
@@ -2685,6 +2717,9 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
         }
         let drops: Option<Table> = spec.get("drops")?;
         let entry = lua.create_table()?;
+
+        step_sound_of(owner, spec, &entry)?;
+
         if let Some(hardness) = hardness {
             entry.set("hardness", hardness)?;
         }
@@ -3231,7 +3266,7 @@ const FLUID_FIELDS: [&str; 7] = [
 ];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
-const BLOCK_FIELDS: [&str; 9] = [
+const BLOCK_FIELDS: [&str; 10] = [
     "id",
     "name",
     "drops",
@@ -3241,6 +3276,7 @@ const BLOCK_FIELDS: [&str; 9] = [
     "tags",
     "textures",
     "light_emit",
+    "sounds",
 ];
 
 /// Keys the `textures` sub-table accepts.

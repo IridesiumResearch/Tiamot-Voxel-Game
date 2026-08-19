@@ -7,8 +7,14 @@
 -- to prove that block registration works through the public mod API, and to
 -- give the worldgen reference mod something to place.
 
+-- What walking on it sounds like. The client plays its own footsteps from its
+-- own movement — no round trip, because a player's own steps are the one sound
+-- whose lateness they would notice.
+game.register_sound{ id = "step", file = "sounds/step.wav", gain = 0.5, pitch_variance = 0.2 }
+
 game.register_block{
     id = "white",
+    sounds = { step = "step" },
     name = "White",
     description = "A featureless solid block.",
     -- Paths are relative to this mod's own directory, and the file is pushed

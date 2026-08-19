@@ -115,18 +115,37 @@ fn took(bot: &Bot, at: BlockPos) -> Took {
 /// dig by hand and lets whatever is held decide what comes out.
 async fn dig_with_whatever_is_held(bot: &mut Bot, at: BlockPos) -> Took {
     let centre = SubNodePos::new(at.x * 3 + 1, at.y * 3 + 1, at.z * 3 + 1);
-    bot.send(&ClientMessage::StartDig { target: centre })
-        .await
-        .expect("the dig should reach the server");
 
+    // **Re-sent while waiting, the way `Bot::dig_block` does it.** A dig
+    // re-aimed at the same cell is the same dig and costs nothing to repeat,
+    // and a single `StartDig` can be refused — for reach, most often — leaving
+    // this to wait out its whole deadline for a block that was never coming.
+    //
+    // That is exactly how it failed on the macOS runner: `move_to` reports an
+    // INTENT, so on a machine where the walk had not finished the dig was out
+    // of reach, refused once, and the test read `Nothing` and blamed the tool.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut next_send = tokio::time::Instant::now();
     while tokio::time::Instant::now() < deadline {
         let outcome = took(bot, at);
         if outcome != Took::Nothing {
             return outcome;
         }
+        if tokio::time::Instant::now() >= next_send {
+            bot.send(&ClientMessage::StartDig { target: centre })
+                .await
+                .expect("the dig should reach the server");
+            next_send = tokio::time::Instant::now() + Duration::from_millis(500);
+        }
         let _ = tokio::time::timeout(Duration::from_millis(50), bot.recv()).await;
     }
+    // Nothing happened in twenty seconds. Whatever the server said about it is
+    // far more useful than the bare `Nothing` this would otherwise report.
+    let notices = bot.notices();
+    assert!(
+        notices.is_empty(),
+        "the dig never landed and the server said: {notices:?}"
+    );
     Took::Nothing
 }
 

@@ -125,6 +125,7 @@ function Stream:next_bool() end
 ---@field drops table<string, integer>? Overrides what breaking it yields: block id to UNITS (27 to a block). Omit for the ordinary rule — the block drops itself, 27 units whole or one per occupied sub-node. Bare ids are namespaced with your mod id.
 ---@field tags string[]? Arbitrary tags for other mods to match on.
 ---@field textures Tiamot.BlockTextures? Which images clients draw this block with.
+---@field sounds { step: string }? What this block sounds like underfoot. The client plays its own footsteps from its own movement, so this is the only way it can know. Unqualified ids mean your own mod's.
 ---@field light_emit Tiamot.LightEmit? Light this block gives off. Omit for anything that is not a lamp.
 
 ---How `dominance` decides a mixed block's hardness.
