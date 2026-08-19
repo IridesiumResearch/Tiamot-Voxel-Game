@@ -149,15 +149,29 @@ game.register_on_place(function(event)
 
     local at = { x = event.x, y = event.y, z = event.z }
     local there = game.get_fluid(at)
-    if there.empty then
-        game.set_fluid(at, { fluid = "core_milk:milk", source = true })
-        game.log("poured milk at " .. at.x .. "," .. at.y .. "," .. at.z)
-    else
+    -- **A SOURCE is what a bucket takes back, not any milk at all.**
+    --
+    -- Reported from a running game: "I do not seem to be able to place a water
+    -- source inside flowing water — I should be able to right click on the
+    -- block behind the flowing water and place another source right inside the
+    -- current puddle." Quite so, and the reason it did not work was here rather
+    -- than in the engine: this used to scoop whenever the block held anything,
+    -- so pouring into a spreading puddle emptied that one block instead of
+    -- feeding it — and the puddle immediately refilled from the original
+    -- source, so it read as the click doing nothing at all.
+    --
+    -- Flow is milk that is only passing through. Pouring into it leaves a
+    -- second spring in the middle of the pool, which is what a bucket should
+    -- do and what widening a pool requires.
+    if there.source then
         -- Clearing the source is what makes the rest drain: every flow block
         -- downstream loses its parent and empties a level per fluid tick, which
         -- is the behaviour most worth being able to watch happen.
         game.set_fluid(at, { level = 0 })
         game.log("scooped milk at " .. at.x .. "," .. at.y .. "," .. at.z)
+    else
+        game.set_fluid(at, { fluid = "core_milk:milk", source = true })
+        game.log("poured milk at " .. at.x .. "," .. at.y .. "," .. at.z)
     end
 
     -- Cancel the terrain write. The block was only ever a way of naming what to
