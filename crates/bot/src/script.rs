@@ -68,6 +68,15 @@ pub enum Command {
     MoveTo(f32, f32, f32),
     /// Send a chat line.
     Chat(String),
+    /// Press or release a mod-registered action, by id.
+    ///
+    /// **The convergence Task 13 asks for.** A bot presses the same named
+    /// action a player presses, so a scenario exercises the path a human does
+    /// rather than a parallel one that can rot without anybody noticing. It
+    /// takes the ID and not a key for exactly the reason charter rule 11 gives
+    /// mods names instead of keys: a script written against a key would break
+    /// the moment somebody rebound it.
+    Action(String, bool),
     /// Wait for the server to advance.
     SleepTicks(u32),
     /// Ask for the current inventory.
@@ -232,6 +241,9 @@ pub fn run_script(source: &str, name: &str, channel: Channel) -> Result<ScriptOu
 
     bind!("join", String, |_lua, name| Command::Join(name));
     bind!("chat", String, |_lua, text| Command::Chat(text));
+    bind!("action", (String, bool), |_lua, p| Command::Action(
+        p.0, p.1
+    ));
     bind!("sleep_ticks", u32, |_lua, ticks| Command::SleepTicks(ticks));
     bind!("dig_block", (i32, i32, i32), |_lua, p| Command::DigBlock(
         BlockPos::new(p.0, p.1, p.2)
@@ -384,6 +396,37 @@ mod tests {
         // Dropping the channel ends the stub's loop.
         let seen = stub.join().expect("stub thread");
         (outcome, seen)
+    }
+
+    #[test]
+    fn a_script_presses_a_mods_action_by_name() {
+        // **The converged pathway.** A scenario presses the same named action a
+        // player presses, so it exercises the human path rather than a parallel
+        // one that can rot without anybody noticing.
+        //
+        // By ID and not by key, for the reason charter rule 11 gives mods names
+        // instead of keys: a script written against a key would break the
+        // moment somebody rebound it, and rebinding must change controls
+        // without changing behaviour.
+        let (outcome, commands) = run_with_stub(
+            "bot.join('Alice')\n\
+             bot.action('core_tools:chisel_mode', true)\n\
+             bot.dig_subnode(1, 2, 3)\n\
+             bot.action('core_tools:chisel_mode', false)\n\
+             bot.disconnect()",
+        );
+
+        assert!(outcome.passed, "{:?}", outcome.failure);
+        assert_eq!(
+            commands,
+            vec![
+                Command::Join("Alice".to_owned()),
+                Command::Action("core_tools:chisel_mode".to_owned(), true),
+                Command::DigSubNode(SubNodePos::new(1, 2, 3)),
+                Command::Action("core_tools:chisel_mode".to_owned(), false),
+                Command::Disconnect,
+            ]
+        );
     }
 
     #[test]

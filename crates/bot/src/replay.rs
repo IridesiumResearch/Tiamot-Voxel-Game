@@ -68,6 +68,22 @@ pub fn parse(text: &str) -> Result<Vec<Recorded>, String> {
 
         let rest: Vec<&str> = parts.collect();
         let command = match verb {
+            "action" => {
+                let id = rest
+                    .first()
+                    .ok_or_else(|| format!("line {number}: action needs an id and up/down"))?;
+                let edge = rest.get(1).copied().unwrap_or("down");
+                let pressed = match edge {
+                    "down" => true,
+                    "up" => false,
+                    other => {
+                        return Err(format!(
+                            "line {number}: action takes `down` or `up`, not `{other}`"
+                        ));
+                    }
+                };
+                Command::Action((*id).to_owned(), pressed)
+            }
             "dig_block" => Command::DigBlock(block_pos(&rest, number)?),
             "dig_subnode" => Command::DigSubNode(subnode_pos(&rest, number)?),
             "place" => {
@@ -128,6 +144,12 @@ pub fn render(recorded: &[Recorded]) -> String {
     for entry in recorded {
         use std::fmt::Write as _;
         let _ = match &entry.command {
+            Command::Action(id, pressed) => writeln!(
+                out,
+                "{} action {id} {}",
+                entry.tick,
+                if *pressed { "down" } else { "up" }
+            ),
             Command::DigBlock(pos) => writeln!(
                 out,
                 "{} dig_block {} {} {}",
@@ -186,6 +208,7 @@ pub async fn run(mut bot: Bot, recorded: &[Recorded], name: &str) -> Result<usiz
         previous_tick = entry.tick;
 
         match &entry.command {
+            Command::Action(id, pressed) => bot.action(id, *pressed).await?,
             Command::DigBlock(pos) => bot.dig_block(*pos).await?,
             Command::DigSubNode(pos) => bot.dig_subnode(*pos).await?,
             Command::Place(pos, material) => bot.place(*pos, *material).await?,
@@ -256,6 +279,16 @@ mod tests {
             Recorded {
                 tick: 5,
                 command: Command::DigBlock(BlockPos::new(1, 2, 3)),
+            },
+            // Both edges of a mod's action: a recording that rendered only the
+            // press would replay a key held down for ever.
+            Recorded {
+                tick: 6,
+                command: Command::Action("core_tools:chisel_mode".to_owned(), true),
+            },
+            Recorded {
+                tick: 7,
+                command: Command::Action("core_tools:chisel_mode".to_owned(), false),
             },
             Recorded {
                 tick: 9,

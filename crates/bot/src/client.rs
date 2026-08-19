@@ -1350,6 +1350,28 @@ impl Bot {
     /// # Errors
     ///
     /// [`BotError::Frame`] if the write fails.
+    /// Presses or releases a mod-registered action, by id.
+    ///
+    /// **The same path a player's keyboard takes.** A client turns a key into
+    /// an action id and sends that; this sends the id directly, which is what
+    /// makes a bot scenario exercise the human path rather than a parallel one.
+    /// Charter rule 11 is why it can: the id is the thing that travels, and no
+    /// part of the server knows or cares which key produced it.
+    ///
+    /// Only actions the server registered are accepted — it refuses anything
+    /// else at the edge — and the engine's own controls are not actions at all.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError`] if the message cannot be sent.
+    pub async fn action(&mut self, id: &str, pressed: bool) -> Result<(), BotError> {
+        self.send(&tiamot_core::proto::ClientMessage::Action {
+            id: id.to_owned(),
+            pressed,
+        })
+        .await
+    }
+
     pub async fn place_from_inventory(
         &mut self,
         target: tiamot_core::SubNodePos,

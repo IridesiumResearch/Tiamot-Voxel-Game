@@ -65,6 +65,10 @@ async fn execute(bot: &mut Bot, command: &Command) -> Result<Reply, BotError> {
             bot.join(name).await?;
             Ok(Reply::Done)
         }
+        Command::Action(id, pressed) => {
+            bot.action(id, *pressed).await?;
+            Ok(Reply::Done)
+        }
         Command::DigBlock(pos) => {
             bot.dig_block(*pos).await?;
             Ok(Reply::Done)

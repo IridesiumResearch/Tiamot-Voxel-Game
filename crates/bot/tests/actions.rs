@@ -242,3 +242,43 @@ fn a_server_refuses_an_action_it_never_registered() {
     });
     server.stop();
 }
+
+#[test]
+fn a_bot_script_drives_the_action_the_same_way_a_keyboard_does() {
+    // **Criterion 5's convergence, asserted rather than asserted-about.** The
+    // bot presses the action by NAME, exactly as the client does after it turns
+    // a key into an id — no parallel path, so a scenario cannot keep passing
+    // while the path a player uses rots.
+    //
+    // Charter rule 11 is what makes this possible: the id is the thing that
+    // travels, and no part of the server knows which key produced it. A script
+    // written against a key would break the moment somebody rebound it.
+    let server = start("bot-script-action");
+    block_on(async {
+        let mut bot = join(&server, "Scripted").await;
+        let solid = solid_id(&bot).await;
+        let at = BlockPos::new(2, 5, 2);
+        assert!(server.seed_block(at, solid), "the world should seed");
+        bot.move_to(2.0, 0.0, 4.0).await.expect("walk into reach");
+        bot.sleep_ticks(4).await;
+
+        // The bot's own API, which is what a recorded scenario replays.
+        bot.action("core_tools:chisel_mode", true)
+            .await
+            .expect("press");
+        bot.sleep_ticks(2).await;
+
+        assert_eq!(
+            dig_with_whatever_is_held(&mut bot, at).await,
+            Took::Cell,
+            "a bot pressing the action by id did not get the chisel, so the \
+             bot's path and a player's have come apart"
+        );
+
+        bot.action("core_tools:chisel_mode", false)
+            .await
+            .expect("release");
+        bot.disconnect().await;
+    });
+    server.stop();
+}
