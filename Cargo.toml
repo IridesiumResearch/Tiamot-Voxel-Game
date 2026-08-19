@@ -164,11 +164,15 @@ pollster = "0.4"
 # Dropping the feature answers both at once and costs only the title bar, and
 # only on Wayland compositors that do not draw one themselves. Revisit in Task
 # 14 if the client wants decorations it draws itself.
+# `serde` is Task 13's: key bindings persist by action id, and the input they
+# name is written as `KeyCode`'s own variant — "KeyW", "Space" — rather than a
+# table this repo would have to keep in step with winit's key list by hand.
 winit = { version = "0.30", default-features = false, features = [
     "rwh_06",
     "x11",
     "wayland",
     "wayland-dlopen",
+    "serde",
 ] }
 # HUD text. Immediate-mode, so there is no widget tree to keep in sync with the
 # world — the HUD is written out fresh each frame from what the frame already

@@ -40,6 +40,7 @@ pub mod cache;
 pub mod camera;
 pub mod config;
 pub mod entities;
+pub mod input;
 pub mod mesher;
 pub mod net;
 pub mod predict;
