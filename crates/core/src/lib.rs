@@ -88,6 +88,7 @@ pub mod sky;
 pub mod sound;
 pub mod storage;
 pub mod tick;
+pub mod ui;
 
 pub use block::{BlockContent, BlockValue, BlockView, Cells, SlotIndex};
 pub use chunk::Chunk;
