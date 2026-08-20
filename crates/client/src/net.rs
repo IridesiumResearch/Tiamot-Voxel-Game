@@ -158,6 +158,8 @@ pub enum Event {
         id: String,
         /// The decoded samples.
         clip: crate::audio::Clip,
+        /// The level and pitch variance the mod registered for it.
+        voice: crate::audio::Voice,
     },
 
     /// Something happened near enough to hear.
@@ -1240,13 +1242,14 @@ fn decode_when_ready(
         return;
     };
     let id = sound.id.clone();
+    let voice = crate::audio::Voice::of(sound);
     let events = events.clone();
     // A real worker, not this task: decoding a minute of audio is milliseconds
     // of work that has no business inside a network read loop.
     tokio::task::spawn_blocking(move || {
         match crate::audio::decode_isolated(&bytes, crate::audio::Limits::default()) {
             Ok(clip) => {
-                let _ = events.send(Event::SoundReady { id, clip });
+                let _ = events.send(Event::SoundReady { id, clip, voice });
             }
             Err(err) => {
                 let _ = events.send(Event::Warning(format!(

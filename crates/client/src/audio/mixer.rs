@@ -173,11 +173,67 @@ pub fn place(
     }
 }
 
+/// What a mod asked a sound to sound like, from `register_sound`.
+///
+/// Separate from [`Clip`], which is what the FILE contains: one is the decoded
+/// samples, the other is the mod's opinion about them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Voice {
+    /// A multiplier on the file's own level.
+    pub gain: f32,
+    /// How much to vary the pitch each play, as a fraction of it.
+    ///
+    /// `0.0` plays it identically every time, which is what makes a repeated
+    /// footstep sound like a machine.
+    pub pitch_variance: f32,
+}
+
+impl Default for Voice {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            pitch_variance: 0.0,
+        }
+    }
+}
+
+impl Voice {
+    /// The voice a server declared, with its numbers brought into range.
+    ///
+    /// Charter rule 14: these came off the wire. A negative gain is not a quiet
+    /// sound and a pitch variance of 40 is not a sound at all, so both are
+    /// clamped here rather than trusted into a backend.
+    #[must_use]
+    pub fn of(sound: &tiamot_core::proto::SoundDef) -> Self {
+        Self {
+            gain: if sound.gain.is_finite() {
+                sound.gain.clamp(0.0, 4.0)
+            } else {
+                1.0
+            },
+            pitch_variance: if sound.pitch_variance.is_finite() {
+                sound.pitch_variance.clamp(0.0, 0.5)
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+/// A decoded sound and the mod's opinion about how to play it.
+#[derive(Debug, Clone)]
+struct Loaded {
+    clip: Clip,
+    voice: Voice,
+}
+
 /// The audio backend, or nothing if this machine has no sound device.
 pub struct Mixer {
     manager: Option<kira::AudioManager>,
     /// Decoded sounds, by qualified id.
-    clips: BTreeMap<String, Clip>,
+    clips: BTreeMap<String, Loaded>,
+    /// Advances once per play, so successive plays of one sound differ.
+    plays: u64,
     /// How loud each bus is.
     volumes: Volumes,
 }
@@ -209,6 +265,7 @@ impl Mixer {
         Self {
             manager,
             clips: BTreeMap::new(),
+            plays: 0,
             volumes,
         }
     }
@@ -234,8 +291,13 @@ impl Mixer {
     ///
     /// Held even with no device: whether a sound decoded is a property of the
     /// asset and the test suite asks about it on machines with no speakers.
-    pub fn insert(&mut self, id: String, clip: Clip) {
-        self.clips.insert(id, clip);
+    ///
+    /// `voice` is what the MOD asked for — its own level and how much to vary
+    /// the pitch. Carried here rather than applied at the call site because
+    /// every caller would otherwise have to remember to, and one of them
+    /// (footsteps) did not.
+    pub fn insert(&mut self, id: String, clip: Clip, voice: Voice) {
+        self.clips.insert(id, Loaded { clip, voice });
     }
 
     /// Whether this sound has been decoded and is ready.
@@ -256,17 +318,61 @@ impl Mixer {
         self.clips.is_empty()
     }
 
+    /// A pitch offset in `[-variance, +variance]`, different each play.
+    ///
+    /// A counter through a bit-mixer rather than `rand`: audio is outside
+    /// charter rule 4 entirely, so nothing here needs a real generator, and a
+    /// sequence a test can predict is worth more than one it cannot. The client
+    /// gains no dependency for it.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a pitch wobble; the low 24 bits are all that is read"
+    )]
+    fn jitter(&mut self, variance: f32) -> f32 {
+        if variance <= 0.0 {
+            return 0.0;
+        }
+        self.plays = self.plays.wrapping_add(1);
+        // splitmix64's finalising avalanche, which spreads a counter well
+        // enough that consecutive plays do not sound related.
+        let mut x = self.plays.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        // Into [-1, 1], then scaled.
+        let unit = ((x >> 40) as f32) / 8_388_608.0 - 1.0;
+        unit * variance
+    }
+
     /// Plays a loaded sound, placed for the listener.
     ///
     /// Returns whether anything was started. `false` covers all the ordinary
     /// reasons — no device, a sound still being fetched, a placement out of
     /// earshot — none of which is an error worth reporting to a player.
     pub fn play(&mut self, id: &str, bus: Bus, placement: Placement) -> bool {
-        let volume = self.volumes.of(bus) * placement.gain;
+        let Some(voice) = self.clips.get(id).map(|loaded| loaded.voice) else {
+            return false;
+        };
+        // **The mod's own level, and then the player's.** `register_sound`'s
+        // `gain` is what the mod says this sound is worth relative to its file;
+        // the bus volume is what the player says the bus is worth. Both, in
+        // that order.
+        let volume = self.volumes.of(bus) * placement.gain * voice.gain;
         if volume <= 0.0 {
             return false;
         }
-        let Some(clip) = self.clips.get(id) else {
+        // **Pitch variance is why a repeated footstep is not a machine.** A
+        // sound played identically twenty times a minute reads as a sample on a
+        // loop, which is exactly what a mod sets `pitch_variance` to avoid.
+        //
+        // Charter rule 4 exempts audio explicitly, so this may use an ordinary
+        // generator — but it is a plain counter-driven hash rather than `rand`
+        // so a test can predict it and the client gains no dependency.
+        let rate = f64::from(1.0 + self.jitter(voice.pitch_variance));
+        // Re-borrowed after the jitter, which needs `&mut self` for its counter.
+        let Some(clip) = self.clips.get(id).map(|loaded| &loaded.clip) else {
             return false;
         };
         let Some(manager) = self.manager.as_mut() else {
@@ -297,7 +403,8 @@ impl Mixer {
             frames: frames.into(),
             settings: kira::sound::static_sound::StaticSoundSettings::new()
                 .volume(kira::Decibels(amplitude_to_db(volume)))
-                .panning(kira::Panning(placement.pan)),
+                .panning(kira::Panning(placement.pan))
+                .playback_rate(kira::PlaybackRate(rate)),
             slice: None,
         };
         manager.play(sound).is_ok()
@@ -406,6 +513,90 @@ mod tests {
     }
 
     #[test]
+    fn a_mods_gain_and_pitch_variance_are_not_ignored() {
+        // **Both fields were dead.** `register_sound` took them, the protocol
+        // carried them, and the client read neither — so every sound played at
+        // its file's level and at exactly one pitch, which is what makes a
+        // repeated footstep sound like a machine.
+        let quiet = Voice {
+            gain: 0.0,
+            pitch_variance: 0.0,
+        };
+        let mut mixer = Mixer::open(Volumes::default());
+        mixer.insert(
+            "test:silent".to_owned(),
+            Clip {
+                samples: vec![0.5; 32],
+                channels: 1,
+                sample_rate: 48_000,
+            },
+            quiet,
+        );
+        // A mod that registered a gain of zero gets silence, and the refusal
+        // happens before any frame conversion — which is only observable as
+        // `false`, but it is the same `false` a missing device gives, so this
+        // asserts the clip IS loaded to tell the two apart.
+        assert!(mixer.holds("test:silent"));
+        assert!(!mixer.play(
+            "test:silent",
+            Bus::Effects,
+            Placement {
+                gain: 1.0,
+                pan: 0.0,
+                brightness: 1.0,
+            }
+        ));
+
+        // And the jitter itself: inside the band, and not the same twice.
+        let mut mixer = Mixer::open(Volumes::default());
+        let rolls: Vec<f32> = (0..64).map(|_| mixer.jitter(0.2)).collect();
+        for roll in &rolls {
+            assert!(
+                roll.abs() <= 0.2,
+                "a pitch offset of {roll} is outside the variance asked for"
+            );
+        }
+        assert!(
+            rolls
+                .windows(2)
+                .any(|pair| (pair[0] - pair[1]).abs() > f32::EPSILON),
+            "every play got the same pitch, which is the machine-gun sound this prevents"
+        );
+        // Zero variance is exactly one pitch, which is a mod's right to ask for.
+        assert!(
+            (0..8).all(|_| mixer.jitter(0.0).abs() < f32::EPSILON),
+            "a sound with no variance was varied anyway"
+        );
+    }
+
+    /// A server's numbers are a claim, and these two reach a backend.
+    #[test]
+    fn a_hostile_voice_is_brought_into_range() {
+        let wild = tiamot_core::proto::SoundDef {
+            id: "evil:sound".to_owned(),
+            mod_id: "evil".to_owned(),
+            file: None,
+            gain: f32::INFINITY,
+            pitch_variance: 40.0,
+        };
+        let voice = Voice::of(&wild);
+        assert!((voice.gain - 1.0).abs() < f32::EPSILON, "{voice:?}");
+        assert!(
+            (voice.pitch_variance - 0.5).abs() < f32::EPSILON,
+            "{voice:?}"
+        );
+
+        let negative = tiamot_core::proto::SoundDef {
+            gain: -3.0,
+            pitch_variance: f32::NAN,
+            ..wild
+        };
+        let voice = Voice::of(&negative);
+        assert!(voice.gain.abs() < f32::EPSILON, "{voice:?}");
+        assert!(voice.pitch_variance.abs() < f32::EPSILON, "{voice:?}");
+    }
+
+    #[test]
     fn a_mixer_without_a_device_is_silent_rather_than_broken() {
         // The property every headless test depends on, and the reason `open`
         // cannot fail: a machine with no sound card should run the game.
@@ -417,6 +608,7 @@ mod tests {
                 channels: 1,
                 sample_rate: 48_000,
             },
+            Voice::default(),
         );
         assert!(mixer.holds("test:thud"));
         assert_eq!(mixer.len(), 1);

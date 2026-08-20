@@ -2615,7 +2615,7 @@ impl App {
                 // it even with no sound device — whether an asset decoded is a
                 // property of the asset, and the tests ask on machines that
                 // have no speakers.
-                Event::SoundReady { id, clip } => self.mixer.insert(id, clip),
+                Event::SoundReady { id, clip, voice } => self.mixer.insert(id, clip, voice),
 
                 Event::Tools { tools } => {
                     // The default first, so a player who never touches the tool
