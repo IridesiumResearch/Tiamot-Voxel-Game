@@ -2074,6 +2074,24 @@ impl ServerHandle {
                             else {
                                 continue;
                             };
+                            // **A slot click is applied HERE, before the mod
+                            // hears about it.** The server's inventory is the
+                            // authority, and the mod is told what happened
+                            // rather than asked to make it happen — so a mod
+                            // that ignores the event still cannot leave the
+                            // player's items in a state nobody agreed to.
+                            if let tiamot_core::proto::DialogEvent::Clicked {
+                                view, index, click
+                            } = &event
+                                && shared.click_slot(&uuid, view, usize::from(*index), *click)
+                            {
+                                // Every view, not just the clicked one: a
+                                // shift-click moves a stack BETWEEN views, so
+                                // telling the client about one of them leaves
+                                // the other showing something that has moved.
+                                let _ = shared
+                                    .push_entity_messages(&uuid, shared.view_updates(&uuid));
+                            }
                             let closing = matches!(
                                 event,
                                 tiamot_core::proto::DialogEvent::Closed
@@ -2588,6 +2606,7 @@ impl tiamot_core::dig::Tools for HeldTools {
 }
 
 /// `game.show_dialog`, delivered to one player.
+/// `game.show_dialog`, delivered to one player.
 ///
 /// The seam from [`tiamot_core::ui::host::Access`]. Unlike a sound, there is no
 /// deciding who to tell: a dialog is opened on one screen, by UUID, and nobody
@@ -2656,6 +2675,13 @@ impl tiamot_core::ui::host::Access for Screens {
         if !overflowed && let Ok(mut owners) = self.owners.lock() {
             owners.insert((request.player.clone(), request.form.clone()), owner);
         }
+        // **Seed the slots with the dialog.** A dialog with an `item_grid` in
+        // it would otherwise draw empty boxes until something else marked the
+        // inventory dirty, and "my chest looks empty" is indistinguishable from
+        // a bug.
+        let _ = self
+            .shared
+            .push_entity_messages(&uuid, self.shared.view_updates(&uuid));
         !overflowed
     }
 

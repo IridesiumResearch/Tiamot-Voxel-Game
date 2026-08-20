@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -1170,6 +1170,30 @@ pub enum ServerMessage {
         /// Which dialog.
         form: String,
     },
+
+    /// What one inventory view holds, for the slots a dialog draws.
+    ///
+    /// **Appended at the end** (protocol v21).
+    ///
+    /// Separate from [`ServerMessage::InventoryUpdate`], which says what a
+    /// player HAS — one consolidated stack per material, which is what a hotbar
+    /// wants. This says where it is, which is what a screen wants. The server
+    /// derives the first from the second, so they cannot disagree.
+    ///
+    /// Sent whole, for the reason `InventoryUpdate` is: a view is small, and a
+    /// delta stream that dropped a message would leave a player looking at a
+    /// slot the server does not believe is there.
+    ViewUpdate {
+        /// Which view, e.g. `"player:main"`.
+        view: String,
+        /// Each slot's material and units, or `None` for an empty slot.
+        slots: Vec<Option<(u16, u32)>>,
+        /// What is on the player's cursor, if anything.
+        ///
+        /// Server-held: a move is two half-gestures, and a client that owned
+        /// the middle of one could invent items by lying about what it took.
+        held: Option<(u16, u32)>,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -1570,6 +1594,22 @@ fn check_play(message: &ServerMessage) -> Result<(), ProtocolError> {
 /// and because the caps are the interesting part: charter rule 14 says a server
 /// is not trusted, and each of these strings is one the client keeps for the
 /// session and shows in its settings screen.
+/// Bounds an inventory view a server sent.
+///
+/// Its own function because `validate_server_message` sits at clippy's line
+/// limit — a real constraint here rather than a lint being obeyed.
+fn check_view(view: &str, slots: &[Option<(u16, u32)>]) -> Result<(), ProtocolError> {
+    check_len("view", view.len(), MAX_ID_BYTES)?;
+    // A server claiming a million slots is a server making the client allocate
+    // a million slots (charter rule 14). The cap is the dialog schema's, so a
+    // view can always be shown by a single grid.
+    check_len(
+        "view_slots",
+        slots.len(),
+        crate::ui::Limits::default().grid_slots,
+    )
+}
+
 /// Bounds a dialog a server sent, and the tree in it.
 ///
 /// Its own function because `validate_server_message` sits at clippy's line
@@ -1739,6 +1779,7 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
             check_dialog(form, Some(tree))?;
         }
         ServerMessage::CloseDialog { form } => check_dialog(form, None)?,
+        ServerMessage::ViewUpdate { view, slots, .. } => check_view(view, slots)?,
         ServerMessage::ActionTable { actions } => check_actions(actions)?,
         ServerMessage::SoundTable { sounds } => check_sounds(sounds)?,
         message @ ServerMessage::PlaySound { .. } => check_play(message)?,

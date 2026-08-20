@@ -39,6 +39,19 @@ pub struct Raised {
     pub event: DialogEvent,
 }
 
+/// What one inventory view holds, as the server last said.
+///
+/// The client draws this and never edits it. A click sends a request; the slots
+/// change when a `ViewUpdate` says they did. That is the whole of why an
+/// inventory cannot be desynced by a client that lies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewContents {
+    /// Each slot's material and units, or `None` where it is empty.
+    pub slots: Vec<Option<(u16, u32)>>,
+    /// What is on the cursor.
+    pub held: Option<(u16, u32)>,
+}
+
 /// Per-widget state the tree itself cannot carry.
 #[derive(Debug, Default)]
 struct Local {
@@ -152,13 +165,14 @@ impl Dialogs {
         &mut self,
         ctx: &egui::Context,
         open: &BTreeMap<String, Tree>,
+        views: &BTreeMap<String, ViewContents>,
         area: (f32, f32),
     ) -> Vec<Raised> {
         self.retain_open(open);
         let mut raised = Vec::new();
         for (form, tree) in open {
             let local = self.forms.entry(form.clone()).or_default();
-            raised.extend(draw_form(ctx, form, tree, local, area));
+            raised.extend(draw_form(ctx, form, tree, local, views, area));
         }
         raised
     }
@@ -170,6 +184,7 @@ fn draw_form(
     form: &str,
     tree: &Tree,
     local: &mut Local,
+    views: &BTreeMap<String, ViewContents>,
     area: (f32, f32),
 ) -> Vec<Raised> {
     let mut raised = Vec::new();
@@ -191,7 +206,7 @@ fn draw_form(
             // The tree and its rectangles are walked TOGETHER, by index, so a
             // renderer cannot pair a widget with somebody else's rectangle —
             // which a flat list plus a separate traversal invites.
-            paint(ui, origin, tree, 0, &laid, form, local, &mut raised);
+            paint(ui, origin, tree, 0, &laid, form, local, views, &mut raised);
             ui.allocate_space(egui::vec2(
                 laid.rect.w as f32,
                 (laid.rect.h as f32).min(area.1 * 0.75),
@@ -222,6 +237,7 @@ fn paint(
     laid: &Laid,
     form: &str,
     local: &mut Local,
+    views: &BTreeMap<String, ViewContents>,
     raised: &mut Vec<Raised>,
 ) {
     let Some(node) = tree.nodes.get(index) else {
@@ -232,10 +248,12 @@ fn paint(
         egui::vec2(laid.rect.w as f32, laid.rect.h as f32),
     );
     paint_background(ui, rect, &node.style);
-    paint_widget(ui, rect, node, form, local, raised);
+    paint_widget(ui, rect, node, form, local, views, raised);
 
     for (child, child_laid) in tree.children_of(index).zip(&laid.children) {
-        paint(ui, origin, tree, child, child_laid, form, local, raised);
+        paint(
+            ui, origin, tree, child, child_laid, form, local, views, raised,
+        );
     }
 }
 
@@ -291,6 +309,7 @@ fn paint_widget(
     node: &Node,
     form: &str,
     local: &mut Local,
+    views: &BTreeMap<String, ViewContents>,
     raised: &mut Vec<Raised>,
 ) {
     let paint = Paint {
@@ -336,14 +355,23 @@ fn paint_widget(
                 .rect_filled(bar, 2.0, egui::Color32::from_rgb(90, 160, 90));
         }
         Widget::ItemSlot { view, index } => {
-            paint_slot(ui, rect, view, *index, form, raised);
+            paint_slot(ui, rect, view, *index, form, views, &paint, raised);
         }
         Widget::ItemGrid {
             view,
             columns,
             first,
             count,
-        } => paint_grid(ui, rect, view, (*columns, *first, *count), form, raised),
+        } => paint_grid(
+            ui,
+            rect,
+            view,
+            (*columns, *first, *count),
+            form,
+            views,
+            &paint,
+            raised,
+        ),
         // Drawn by their children, or by nothing at all.
         Widget::Container { .. } | Widget::Scroll | Widget::Spacer | Widget::Image { .. } => {}
     }
@@ -585,12 +613,18 @@ fn paint_text_input(
 }
 
 /// A rectangle of slots from one view.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a widget painter takes its widget, its box, and where events go"
+)]
 fn paint_grid(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     view: &str,
     shape: (u16, u16, u16),
     form: &str,
+    views: &BTreeMap<String, ViewContents>,
+    paint: &Paint,
     raised: &mut Vec<Raised>,
 ) {
     let (columns, first, count) = shape;
@@ -602,7 +636,7 @@ fn paint_grid(
             egui::vec2(SLOT as f32, SLOT as f32),
         );
         let index = first.saturating_add(u16::try_from(offset).unwrap_or(0));
-        paint_slot(ui, slot, view, index, form, raised);
+        paint_slot(ui, slot, view, index, form, views, paint, raised);
     }
 }
 
@@ -610,13 +644,21 @@ fn paint_grid(
 ///
 /// **What it reports is a gesture.** Which stack moves where is the server's
 /// decision, taken against its own inventory — see
-/// [`tiamot_core::proto::DialogEvent::Clicked`].
+/// [`tiamot_core::proto::DialogEvent::Clicked`]. What it DRAWS is likewise the
+/// server's last word: this never edits a slot locally, so a client that lied
+/// about a click still sees the truth a moment later.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a widget painter takes its widget, its box, and where events go"
+)]
 fn paint_slot(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     view: &str,
     index: u16,
     form: &str,
+    views: &BTreeMap<String, ViewContents>,
+    paint: &Paint,
     raised: &mut Vec<Raised>,
 ) {
     let inner = rect.shrink(2.0);
@@ -629,6 +671,41 @@ fn paint_slot(
         egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
         egui::StrokeKind::Inside,
     );
+
+    // What the server last said is in it.
+    if let Some((material, units)) = views
+        .get(view)
+        .and_then(|contents| contents.slots.get(usize::from(index)).copied().flatten())
+    {
+        // A block of colour standing in for the item, keyed off the material id
+        // so two materials look different. Textured slots want the atlas, which
+        // is the renderer's and a later change.
+        let tint = egui::Color32::from_rgb(
+            60u8.wrapping_add(material.wrapping_mul(37) as u8),
+            90u8.wrapping_add(material.wrapping_mul(59) as u8),
+            120u8.wrapping_add(material.wrapping_mul(17) as u8),
+        );
+        ui.painter().rect_filled(inner.shrink(6.0), 2.0, tint);
+        // **Charter rule 5's display rule, and the only place the 27 shows.**
+        // Blocks and spare nodes, never a raw unit count: a player thinks in
+        // blocks, and `1+13` is what forty units actually is.
+        let (blocks, nodes) = tiamot_core::inventory::display(units);
+        let label = if nodes == 0 {
+            blocks.to_string()
+        } else if blocks == 0 {
+            format!("+{nodes}")
+        } else {
+            format!("{blocks}+{nodes}")
+        };
+        ui.painter().text(
+            inner.right_bottom() - egui::vec2(2.0, 2.0),
+            egui::Align2::RIGHT_BOTTOM,
+            label,
+            egui::FontId::proportional(11.0),
+            paint.colour,
+        );
+    }
+
     let click = if response.clicked() {
         let shift = ui.input(|i| i.modifiers.shift);
         Some(if shift { Click::ShiftLeft } else { Click::Left })
@@ -649,8 +726,6 @@ fn paint_slot(
     }
 }
 
-/// The direction and alignment names, re-exported so the renderer's tests can
-/// build trees without reaching past this module.
 #[cfg(test)]
 mod tests {
     use tiamot_core::ui::{Align, Direction};

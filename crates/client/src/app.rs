@@ -694,6 +694,12 @@ pub struct App {
     /// message is: sending happens on the network side, and the renderer runs
     /// inside a frame.
     dialog_events: Vec<crate::dialog::Raised>,
+    /// What each inventory view holds, as the server last said.
+    ///
+    /// The server's answer, not the client's belief: a slot moves when the
+    /// server says it moved, which is why a click sends a request and this
+    /// arrives afterwards.
+    views: std::collections::BTreeMap<String, crate::dialog::ViewContents>,
     /// Dialogs the server has open on this player's screen, by form name.
     ///
     /// A `BTreeMap` so the draw order is the same every frame: two dialogs
@@ -952,6 +958,7 @@ impl App {
             bindings,
             sounds: Vec::new(),
             dialogs: std::collections::BTreeMap::new(),
+            views: std::collections::BTreeMap::new(),
             dialog_events: Vec::new(),
             mixer,
             heard: Vec::new(),
@@ -1941,6 +1948,26 @@ impl App {
         }
     }
 
+    /// Records what a view holds.
+    ///
+    /// Its own method because `pump_network` sits at clippy's line limit — the
+    /// same reason `adopt_materials`, `adopt_actions` and `adopt_dialog` are.
+    fn adopt_view(
+        &mut self,
+        view: String,
+        slots: Vec<Option<(u16, u32)>>,
+        held: Option<(u16, u32)>,
+    ) {
+        self.views
+            .insert(view, crate::dialog::ViewContents { slots, held });
+    }
+
+    /// What each inventory view holds, as the server last said.
+    #[must_use]
+    pub const fn views(&self) -> &std::collections::BTreeMap<String, crate::dialog::ViewContents> {
+        &self.views
+    }
+
     /// The dialogs a server has open on this screen, in a stable order.
     #[must_use]
     pub const fn dialogs(&self) -> &std::collections::BTreeMap<String, tiamot_core::ui::Tree> {
@@ -2695,6 +2722,7 @@ impl App {
                 // piece of Task 13, and until it lands a client knows what a
                 // server's sounds ARE without being able to make one.
                 Event::Sounds { sounds } => self.sounds = sounds,
+                Event::View { view, slots, held } => self.adopt_view(view, slots, held),
                 Event::Dialog { form, tree } => self.adopt_dialog(form, Some(*tree)),
                 Event::DialogClosed { form } => self.adopt_dialog(form, None),
 

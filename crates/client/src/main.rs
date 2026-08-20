@@ -947,7 +947,10 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // server sent: `client::dialog` walks the tree and the rectangles
         // `core::ui` computed for it. See that module for why the layout is
         // not egui's.
-        let raised = surface.dialogs.draw(&context, surface.app.dialogs(), size);
+        let raised =
+            surface
+                .dialogs
+                .draw(&context, surface.app.dialogs(), surface.app.views(), size);
         surface.app.raise_dialog_events(raised);
         egui::Area::new(egui::Id::new("hud"))
             .fixed_pos(egui::pos2(8.0, 8.0))

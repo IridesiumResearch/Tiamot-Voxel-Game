@@ -179,6 +179,16 @@ pub enum Event {
         form: String,
     },
 
+    /// What one inventory view holds, for the slots a dialog draws.
+    View {
+        /// Which view.
+        view: String,
+        /// Each slot, or `None` where it is empty.
+        slots: Vec<Option<(u16, u32)>>,
+        /// What is on the cursor.
+        held: Option<(u16, u32)>,
+    },
+
     /// Something happened near enough to hear.
     ///
     /// The server has already decided this player is in earshot; what it
@@ -889,6 +899,9 @@ async fn session(
             }
             ServerMessage::CloseDialog { form } => {
                 let _ = events.send(Event::DialogClosed { form });
+            }
+            ServerMessage::ViewUpdate { view, slots, held } => {
+                let _ = events.send(Event::View { view, slots, held });
             }
             ServerMessage::AuthChallenge { nonce } => {
                 let signature =

@@ -186,6 +186,7 @@ impl Seen {
                 self.images = images;
             }
             Event::Joined { spawn, .. } => self.joined = Some(spawn),
+            Event::View { .. } => {}
             Event::Dialog { form, tree } => {
                 self.dialogs.insert(form, *tree);
             }

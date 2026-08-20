@@ -219,9 +219,8 @@ pub struct Shared {
     ///
     /// Digging credits it and placing debits it, so the 27-unit arithmetic of
     /// charter rule 5 is a round trip rather than a one-way accumulation.
-    pub inventories: std::sync::Mutex<
-        std::collections::BTreeMap<PlayerUuid, Vec<tiamot_core::inventory::Stack>>,
-    >,
+    pub inventories:
+        std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, tiamot_core::inventory::Slots>>,
 
     /// Players whose inventory changed and have not been told yet.
     pub inventory_dirty: std::sync::Mutex<std::collections::BTreeSet<PlayerUuid>>,
@@ -487,6 +486,8 @@ pub const CHUNKS_PER_TICK: usize = 16;
 pub const CHUNKS_IN_FLIGHT_PER_CLIENT: usize = 4;
 
 /// Most chunk requests that may be queued before new ones are refused.
+use tiamot_core::inventory::{PLAYER_HOTBAR, PLAYER_MAIN};
+
 pub const MAX_QUEUED_CHUNK_REQUESTS: usize = 512;
 
 /// How many unapplied edits may be queued before new ones are dropped.
@@ -618,7 +619,7 @@ impl Shared {
         let Some(held) = inventories.get_mut(uuid) else {
             return 0;
         };
-        let taken = tiamot_core::inventory::debit(held, material, units);
+        let taken = held.take(PLAYER_MAIN, material, units);
         if taken > 0
             && let Ok(mut dirty) = self.inventory_dirty.lock()
         {
@@ -1044,9 +1045,12 @@ impl Shared {
             return;
         }
         if let Ok(mut inventories) = self.inventories.lock() {
-            let held = inventories.entry(uuid).or_default();
-            let merged = tiamot_core::inventory::consolidate(held.drain(..).chain(stacks));
-            *held = merged;
+            let held = inventories
+                .entry(uuid)
+                .or_insert_with(tiamot_core::inventory::Slots::for_player);
+            for stack in stacks {
+                held.insert(PLAYER_MAIN, stack);
+            }
         }
         if let Ok(mut dirty) = self.inventory_dirty.lock() {
             dirty.insert(uuid);
@@ -1058,8 +1062,83 @@ impl Shared {
     pub fn inventory_of(&self, uuid: &PlayerUuid) -> Vec<tiamot_core::inventory::Stack> {
         self.inventories
             .lock()
-            .map(|inventories| inventories.get(uuid).cloned().unwrap_or_default())
+            .map(|inventories| {
+                inventories
+                    .get(uuid)
+                    .map(|slots| slots.consolidated(PLAYER_MAIN))
+                    .unwrap_or_default()
+            })
             .unwrap_or_default()
+    }
+
+    /// One `ViewUpdate` per view a player has.
+    ///
+    /// Built here rather than at each call site so the two halves of an
+    /// inventory — what you have and where it is — always leave together.
+    #[must_use]
+    pub fn view_updates(&self, uuid: &PlayerUuid) -> Vec<ServerMessage> {
+        let Some(slots) = self.slots_of(uuid) else {
+            return Vec::new();
+        };
+        let held = slots.grab.held.map(|stack| (stack.material.0, stack.units));
+        slots
+            .views
+            .iter()
+            .map(|view| ServerMessage::ViewUpdate {
+                view: view.name.clone(),
+                slots: view
+                    .slots
+                    .iter()
+                    .map(|slot| slot.map(|stack| (stack.material.0, stack.units)))
+                    .collect(),
+                held,
+            })
+            .collect()
+    }
+
+    /// A player's slots, for a dialog to click on.
+    #[must_use]
+    pub fn slots_of(&self, uuid: &PlayerUuid) -> Option<tiamot_core::inventory::Slots> {
+        self.inventories.lock().ok()?.get(uuid).cloned()
+    }
+
+    /// Applies a slot click to a player's inventory, on the server's own copy.
+    ///
+    /// **The whole authority story in one function.** A client says which view
+    /// and which slot it clicked; this is where that becomes a change, against
+    /// state the client cannot reach. A click on a slot that is not there does
+    /// nothing (charter rule 14), and the caller learns nothing changed.
+    pub fn click_slot(
+        &self,
+        uuid: &PlayerUuid,
+        view: &str,
+        index: usize,
+        click: tiamot_core::proto::Click,
+    ) -> bool {
+        let Ok(mut inventories) = self.inventories.lock() else {
+            return false;
+        };
+        let Some(slots) = inventories.get_mut(uuid) else {
+            return false;
+        };
+        let changed = match click {
+            tiamot_core::proto::Click::Left => slots.left_click(view, index),
+            tiamot_core::proto::Click::Right => slots.right_click(view, index),
+            tiamot_core::proto::Click::ShiftLeft => {
+                // Only between a player's own views for now. A mod's container
+                // becomes a destination when views can be mod-owned.
+                let other = if view == PLAYER_MAIN {
+                    PLAYER_HOTBAR
+                } else {
+                    PLAYER_MAIN
+                };
+                slots.shift_click(view, index, other)
+            }
+        };
+        if changed && let Ok(mut dirty) = self.inventory_dirty.lock() {
+            dirty.insert(*uuid);
+        }
+        changed
     }
 
     /// Takes and clears the dirty flag for one player.
@@ -1391,6 +1470,14 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                         .map(|stack| (stack.material.0, stack.units))
                         .collect();
                     frame::write(&mut send, &ServerMessage::InventoryUpdate { stacks }).await?;
+                    // **And where it all is**, on the same flag. The two are
+                    // derived from one set of slots, so sending one without the
+                    // other is how a dialog ends up showing a stack the hotbar
+                    // says is gone. Digging with an inventory screen open is
+                    // exactly that case.
+                    for message in shared.view_updates(&uuid) {
+                        frame::write(&mut send, &message).await?;
+                    }
                 }
                 // Follow the player before serving chunks, so a move and the
                 // terrain it needs happen on the same beat rather than a tick

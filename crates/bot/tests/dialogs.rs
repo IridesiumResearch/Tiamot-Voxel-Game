@@ -287,3 +287,183 @@ fn a_forged_event_for_a_dialog_nobody_opened_changes_nothing() {
     });
     server.stop();
 }
+
+#[test]
+fn splitting_a_stack_in_a_dialog_respects_the_twenty_seven_unit_arithmetic() {
+    // **Criterion 4, end to end.** The unit tests in `core::inventory::slots`
+    // prove the arithmetic; this proves the arithmetic is what a real click on
+    // a real server actually runs.
+    //
+    // The bot digs to acquire material — there is no grant — so the amount is
+    // whatever a block yields, and the assertions are about the RELATIONSHIP
+    // between the halves rather than about a number chosen here.
+    let server = start("split", write_shop("split"));
+    block_on(async {
+        let mut bot = join(&server, "Splitter").await;
+        bot.recv_until(|m| matches!(m, tiamot_core::proto::ServerMessage::ShowDialog { .. }))
+            .await
+            .expect("no dialog arrived");
+
+        // Dig a block of ground so there is something in slot 0. `y = -1` is
+        // the surface: `fill_below_heightmap(0)` fills everything BELOW zero,
+        // so the topmost solid block is the one under the player's feet.
+        bot.dig_block(tiamot_core::BlockPos::new(0, -1, 0))
+            .await
+            .expect("dig");
+
+        let before = bot
+            .until_view("player:main", |slots| {
+                slots.first().is_some_and(Option::is_some)
+            })
+            .await
+            .expect("the dug block never reached a slot");
+        let (material, units) = before[0].expect("a stack in slot 0");
+        assert!(units > 1, "need more than one unit to halve, got {units}");
+
+        // Right-click it: half into the hand, half left behind.
+        bot.dialog_event(
+            "shop:till",
+            DialogEvent::Clicked {
+                view: "player:main".to_owned(),
+                index: 0,
+                click: Click::Right,
+            },
+        )
+        .await
+        .expect("send");
+
+        let after = bot
+            .until_view("player:main", |slots| {
+                slots
+                    .first()
+                    .and_then(|slot| *slot)
+                    .is_none_or(|(_, u)| u < units)
+            })
+            .await
+            .expect("the split never happened");
+
+        let behind = after[0].map_or(0, |(_, u)| u);
+        let held = bot.held().map_or(0, |(_, u)| u);
+        assert_eq!(
+            behind + held,
+            units,
+            "the split invented or destroyed units: {behind} + {held} != {units}"
+        );
+        assert_eq!(behind, units / 2, "the half left behind is units / 2");
+        assert!(
+            held >= behind,
+            "the larger half should be in the hand: {held} held against {behind} behind"
+        );
+        assert_eq!(
+            bot.held().map(|(m, _)| m),
+            Some(material),
+            "the material changed"
+        );
+
+        // And putting it back down merges it whole again — which is the
+        // property that makes the split reversible rather than merely even.
+        bot.dialog_event(
+            "shop:till",
+            DialogEvent::Clicked {
+                view: "player:main".to_owned(),
+                index: 0,
+                click: Click::Left,
+            },
+        )
+        .await
+        .expect("send");
+        let merged = bot
+            .until_view("player:main", |slots| {
+                slots
+                    .first()
+                    .and_then(|slot| *slot)
+                    .is_some_and(|(_, u)| u == units)
+            })
+            .await
+            .expect("the halves never merged back");
+        assert_eq!(merged[0], Some((material, units)));
+        assert_eq!(bot.held(), None, "the hand should be empty after placing");
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn a_forged_slot_move_cannot_invent_items() {
+    // **Criterion 3's inventory half.** A client can send any slot index and
+    // any view name it likes. None of them may create a unit, because the
+    // server applies the click to ITS OWN slots and a click on a slot that is
+    // not there is a click on nothing.
+    let server = start("forgeslot", write_shop("forgeslot"));
+    block_on(async {
+        let mut bot = join(&server, "Cheat").await;
+        bot.recv_until(|m| matches!(m, tiamot_core::proto::ServerMessage::ShowDialog { .. }))
+            .await
+            .expect("no dialog arrived");
+        bot.dig_block(tiamot_core::BlockPos::new(0, -1, 0))
+            .await
+            .expect("dig");
+        let before = bot
+            .until_view("player:main", |slots| {
+                slots.first().is_some_and(Option::is_some)
+            })
+            .await
+            .expect("the dug block never reached a slot");
+        let total: u64 = before.iter().flatten().map(|(_, u)| u64::from(*u)).sum();
+
+        for (view, index) in [
+            ("player:main", 9999u16),
+            ("player:hotbar", 9999),
+            ("nosuch:view", 0),
+            ("", 0),
+        ] {
+            for click in [Click::Left, Click::Right, Click::ShiftLeft] {
+                bot.dialog_event(
+                    "shop:till",
+                    DialogEvent::Clicked {
+                        view: view.to_owned(),
+                        index,
+                        click,
+                    },
+                )
+                .await
+                .expect("send");
+            }
+        }
+
+        // An honest click LAST, so its effect proves the server processed
+        // everything before it — otherwise "nothing changed" passes whenever
+        // the server is merely slow.
+        bot.dialog_event(
+            "shop:till",
+            DialogEvent::Clicked {
+                view: "player:main".to_owned(),
+                index: 0,
+                click: Click::Left,
+            },
+        )
+        .await
+        .expect("send");
+        let after = bot
+            .until_view("player:main", |slots| {
+                slots.first().and_then(|slot| *slot).is_none()
+            })
+            .await
+            .expect("the honest click never landed, so this test proves nothing");
+
+        let now: u64 = after
+            .iter()
+            .flatten()
+            .map(|(_, u)| u64::from(*u))
+            .sum::<u64>()
+            + bot.held().map_or(0, |(_, u)| u64::from(u));
+        assert_eq!(
+            now, total,
+            "a forged slot move changed how many units exist"
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}

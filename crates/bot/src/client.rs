@@ -1416,6 +1416,61 @@ impl Bot {
             .collect()
     }
 
+    /// What the server last said each inventory view holds.
+    ///
+    /// The LAST word per view, not every update: a test wants the current
+    /// state, and the history is only noise.
+    #[must_use]
+    pub fn views(&self) -> std::collections::BTreeMap<String, Vec<Option<(u16, u32)>>> {
+        let mut latest = std::collections::BTreeMap::new();
+        for message in self.received() {
+            if let ServerMessage::ViewUpdate { view, slots, .. } = message {
+                latest.insert(view, slots);
+            }
+        }
+        latest
+    }
+
+    /// What the server last said is on this player's cursor.
+    #[must_use]
+    pub fn held(&self) -> Option<(u16, u32)> {
+        self.received()
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerMessage::ViewUpdate { held, .. } => Some(held),
+                _ => None,
+            })
+            .next_back()
+            .flatten()
+    }
+
+    /// Waits until a view satisfies `want`, and returns it.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Unexpected`] if it never does within the patience.
+    pub async fn until_view(
+        &mut self,
+        view: &str,
+        want: impl Fn(&[Option<(u16, u32)>]) -> bool,
+    ) -> Result<Vec<Option<(u16, u32)>>, BotError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(slots) = self.views().get(view)
+                && want(slots)
+            {
+                return Ok(slots.clone());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(BotError::Unexpected {
+                    expected: "a view matching the condition",
+                    got: format!("view `{view}` never satisfied it"),
+                });
+            }
+            self.recv().await?;
+        }
+    }
+
     /// Sends a raw dialog event, exactly as a client would.
     ///
     /// **The forgery seam.** A test uses this to send an event for a form the

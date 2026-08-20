@@ -29,6 +29,7 @@
 //! and `proptest` asserts it does not.
 
 use super::Stack;
+use crate::material::MaterialId;
 
 /// A named run of slots.
 ///
@@ -90,7 +91,28 @@ pub struct Slots {
     pub grab: Grab,
 }
 
+/// The engine's own view names.
+///
+/// Namespaced `player:` because charter rule 8 applies to these as much as to a
+/// mod's, and because a mod naming its container `main` must not collide.
+pub const PLAYER_MAIN: &str = "player:main";
+/// The nine slots a player selects between with the number keys.
+pub const PLAYER_HOTBAR: &str = "player:hotbar";
+
 impl Slots {
+    /// The views every player has.
+    ///
+    /// `player:main` starts empty and GROWS as material arrives — see
+    /// [`Slots::insert`]. The hotbar is nine, because that is what the engine's
+    /// `engine:hotbar_1`..`_9` actions select between.
+    #[must_use]
+    pub fn for_player() -> Self {
+        Self {
+            views: vec![View::empty(PLAYER_MAIN, 0), View::empty(PLAYER_HOTBAR, 9)],
+            grab: Grab::default(),
+        }
+    }
+
     /// Finds a view by name.
     #[must_use]
     pub fn view(&self, name: &str) -> Option<&View> {
@@ -214,6 +236,84 @@ impl Slots {
         // being quietly eaten.
         self.views[from].slots[index] = (!moving.is_empty()).then_some(moving);
         true
+    }
+
+    /// Puts a stack into a view, filling matching stacks then empty slots.
+    ///
+    /// **Never lossy.** If the view has no room, it GROWS — a player digging
+    /// their thirty-seventh material must not have it vanish because a screen
+    /// shows thirty-six slots. How many a mod chooses to display is a question
+    /// about its `item_grid`, not about what the player owns.
+    ///
+    /// Returns whether anything was added, which is what marks the view dirty.
+    pub fn insert(&mut self, view: &str, mut stack: Stack) -> bool {
+        if stack.is_empty() {
+            return false;
+        }
+        let Some(at) = self.index_of(view) else {
+            return false;
+        };
+        for slot in self.views[at].slots.iter_mut().flatten() {
+            if slot.material != stack.material {
+                continue;
+            }
+            let giving = stack.units.min(u32::MAX - slot.units);
+            if giving > 0
+                && let Ok(part) = stack.split(giving)
+            {
+                let _ = slot.merge(part);
+            }
+            if stack.is_empty() {
+                return true;
+            }
+        }
+        if let Some(empty) = self.views[at].slots.iter_mut().find(|slot| slot.is_none()) {
+            *empty = Some(stack);
+        } else {
+            self.views[at].slots.push(Some(stack));
+        }
+        true
+    }
+
+    /// Takes up to `units` of a material out of a view, returning how many.
+    ///
+    /// Walks slots in order, so a player spending material empties the stack
+    /// they can see first rather than one chosen by a hash.
+    pub fn take(&mut self, view: &str, material: MaterialId, units: u32) -> u32 {
+        let Some(at) = self.index_of(view) else {
+            return 0;
+        };
+        let mut left = units;
+        for slot in &mut self.views[at].slots {
+            if left == 0 {
+                break;
+            }
+            let Some(stack) = slot else { continue };
+            if stack.material != material {
+                continue;
+            }
+            let taking = stack.units.min(left);
+            if let Ok(part) = stack.split(taking) {
+                left -= part.units;
+            }
+            if stack.is_empty() {
+                *slot = None;
+            }
+        }
+        units - left
+    }
+
+    /// A view's contents as consolidated stacks, one per material.
+    ///
+    /// The shape the rest of the server already speaks: `InventoryUpdate` and
+    /// the hotbar want "what do I have", not "where is it". Derived rather than
+    /// stored, so there is one source of truth and it is the slots.
+    #[must_use]
+    pub fn consolidated(&self, view: &str) -> Vec<Stack> {
+        let Some(view) = self.view(view) else {
+            return Vec::new();
+        };
+        super::consolidate(view.slots.iter().flatten().copied())
     }
 
     /// The view holding `index`, if both the view and the slot exist.
@@ -395,6 +495,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn inserting_more_than_fits_grows_the_view_rather_than_losing_it() {
+        // **The regression this rules out.** A consolidated inventory had no
+        // size at all, so moving to slots could silently cap what a player can
+        // own. How many slots a mod DISPLAYS is a question about its
+        // `item_grid`; what the player owns is not.
+        let mut inv = Slots {
+            views: vec![View::empty("player:main", 2)],
+            grab: Grab::default(),
+        };
+        for material in 2..8u16 {
+            assert!(inv.insert(
+                "player:main",
+                Stack::new(MaterialId(material), 10).expect("stack")
+            ));
+        }
+        assert_eq!(
+            inv.total_units(),
+            60,
+            "a stack was lost when the view filled"
+        );
+        assert_eq!(
+            inv.view("player:main").expect("view").slots.len(),
+            6,
+            "the view should have grown"
+        );
+    }
+
+    #[test]
+    fn inserting_tops_up_a_matching_stack_before_taking_a_slot() {
+        let mut inv = Slots {
+            views: vec![View {
+                name: "player:main".to_owned(),
+                slots: vec![stack(STONE, 5), None],
+            }],
+            grab: Grab::default(),
+        };
+        inv.insert("player:main", Stack::new(STONE, 7).expect("stack"));
+        assert_eq!(at(&inv, "player:main", 0).expect("topped up").units, 12);
+        assert!(
+            at(&inv, "player:main", 1).is_none(),
+            "an empty slot was used anyway"
+        );
+    }
+
+    #[test]
+    fn taking_spends_slots_in_order_and_reports_what_it_got() {
+        let mut inv = Slots {
+            views: vec![View {
+                name: "player:main".to_owned(),
+                slots: vec![stack(STONE, 5), stack(DIRT, 9), stack(STONE, 4)],
+            }],
+            grab: Grab::default(),
+        };
+        // Spanning two slots, first one emptied.
+        assert_eq!(inv.take("player:main", STONE, 7), 7);
+        assert!(
+            at(&inv, "player:main", 0).is_none(),
+            "an emptied slot must be None"
+        );
+        assert_eq!(at(&inv, "player:main", 2).expect("partial").units, 2);
+        assert_eq!(inv.total_units(), 11);
+
+        // Asking for more than there is takes what there is and says so.
+        assert_eq!(inv.take("player:main", STONE, 99), 2);
+        assert_eq!(inv.take("player:main", STONE, 1), 0);
+        // A material nobody has, and a view nobody has.
+        assert_eq!(inv.take("player:main", MaterialId(77), 5), 0);
+        assert_eq!(inv.take("nosuch:view", DIRT, 5), 0);
+        assert_eq!(inv.total_units(), 9, "only the dirt should be left");
+    }
+
+    #[test]
+    fn consolidating_gives_one_stack_per_material() {
+        // The shape the rest of the server speaks. Derived from the slots
+        // rather than stored beside them, so there is one source of truth.
+        let inv = Slots {
+            views: vec![View {
+                name: "player:main".to_owned(),
+                slots: vec![stack(STONE, 5), stack(DIRT, 9), None, stack(STONE, 4)],
+            }],
+            grab: Grab::default(),
+        };
+        let held = inv.consolidated("player:main");
+        assert_eq!(held.len(), 2, "{held:?}");
+        assert_eq!(
+            held.iter().map(|s| u64::from(s.units)).sum::<u64>(),
+            18,
+            "consolidating changed the total"
+        );
+        assert!(inv.consolidated("nosuch:view").is_empty());
     }
 
     #[test]
