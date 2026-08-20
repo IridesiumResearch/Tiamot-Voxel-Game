@@ -382,16 +382,26 @@ impl Mixer {
         // kira wants its own frame type, and this is where the decoded samples
         // become one. Built per play rather than cached because a `StaticSound`
         // carries its own settings and the pan differs every time.
+        //
+        // **The treble comes off HERE**, which is the one place it can. kira's
+        // filters are track effects, and a per-play cutoff would need a track
+        // per sound; the samples are already being walked to build the frames,
+        // so a one-pole low-pass over that walk is very nearly free and stays
+        // entirely under this crate's control.
+        let mut low = Filter::new(placement.brightness);
         let frames: Vec<kira::Frame> = match clip.channels {
             1 => clip
                 .samples
                 .iter()
-                .map(|sample| kira::Frame::from_mono(*sample))
+                .map(|sample| kira::Frame::from_mono(low.mono(*sample)))
                 .collect(),
             _ => clip
                 .samples
                 .chunks_exact(clip.channels as usize)
-                .map(|frame| kira::Frame::new(frame[0], frame[1]))
+                .map(|frame| {
+                    let (left, right) = low.stereo(frame[0], frame[1]);
+                    kira::Frame::new(left, right)
+                })
                 .collect(),
         };
         if frames.is_empty() {
@@ -408,6 +418,57 @@ impl Mixer {
             slice: None,
         };
         manager.play(sound).is_ok()
+    }
+}
+
+/// A one-pole low-pass, the treble half of "far away".
+///
+/// Distance eating treble is most of why something distant sounds distant
+/// rather than merely quiet, and [`place`] has computed that number — as
+/// `Placement::brightness` — since the day it was written. Nothing applied it
+/// until 2026-08-20: the test asserted the ARITHMETIC and there was no ear on
+/// the other end of it.
+///
+/// One pole is the right amount of filter for this. It is a gentle 6 dB/octave
+/// roll-off, it costs one multiply-add per sample, and the alternative — a
+/// steep filter — makes a distant sound muffled rather than distant.
+struct Filter {
+    /// How much of each new sample is taken. `1.0` passes everything.
+    alpha: f32,
+    /// The running value, per channel.
+    held: (f32, f32),
+}
+
+impl Filter {
+    /// A filter for this brightness, where `1.0` is no filtering at all.
+    fn new(brightness: f32) -> Self {
+        Self {
+            alpha: if brightness.is_finite() {
+                brightness.clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
+            held: (0.0, 0.0),
+        }
+    }
+
+    /// One mono sample.
+    fn mono(&mut self, sample: f32) -> f32 {
+        if self.alpha >= 1.0 {
+            return sample;
+        }
+        self.held.0 += self.alpha * (sample - self.held.0);
+        self.held.0
+    }
+
+    /// One stereo frame. Each side keeps its own history or the image collapses.
+    fn stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
+        if self.alpha >= 1.0 {
+            return (left, right);
+        }
+        self.held.0 += self.alpha * (left - self.held.0);
+        self.held.1 += self.alpha * (right - self.held.1);
+        self.held
     }
 }
 
@@ -510,6 +571,57 @@ mod tests {
         // arrive silent.
         volumes.buses.remove("music");
         assert!((volumes.of(Bus::Music) - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_dim_placement_actually_removes_treble() {
+        // **`brightness` was computed and never used.** `place` produced it,
+        // `distance_eats_treble_but_never_all_of_it` asserted the arithmetic,
+        // and no sample was ever filtered by it — so a distant sound was quiet
+        // but not distant.
+        //
+        // Measured as total swing between neighbouring samples, which is what
+        // "treble" means for a signal: an alternating series is the fastest a
+        // sampled signal can move, and a low-pass has to slow it down.
+        let alternating: Vec<f32> = (0..256)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let swing = |alpha: f32| {
+            let mut filter = Filter::new(alpha);
+            let out: Vec<f32> = alternating.iter().map(|s| filter.mono(*s)).collect();
+            out.windows(2).map(|p| (p[1] - p[0]).abs()).sum::<f32>()
+        };
+
+        let open = swing(1.0);
+        let dim = swing(0.25);
+        assert!(
+            dim < open * 0.5,
+            "a brightness of 0.25 barely changed the signal: {dim} against {open}"
+        );
+        // And full brightness is EXACTLY the input, not merely close to it: a
+        // sound at the listener must not be quietly filtered.
+        let mut filter = Filter::new(1.0);
+        for sample in &alternating {
+            assert!(
+                (filter.mono(*sample) - sample).abs() < f32::EPSILON,
+                "full brightness altered a sample"
+            );
+        }
+        // A hostile number is not a filter setting.
+        assert!((Filter::new(f32::NAN).alpha - 1.0).abs() < f32::EPSILON);
+        assert!(Filter::new(-5.0).alpha.abs() < f32::EPSILON);
+
+        // Stereo keeps a history per side, or the image collapses to mono.
+        let mut filter = Filter::new(0.3);
+        let mut last = (0.0, 0.0);
+        for i in 0..64 {
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            last = filter.stereo(sign, -sign);
+        }
+        assert!(
+            (last.0 - last.1).abs() > f32::EPSILON,
+            "the two channels converged, so they shared a history"
+        );
     }
 
     #[test]
