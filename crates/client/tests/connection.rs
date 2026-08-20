@@ -171,6 +171,7 @@ struct Seen {
     /// The radius the server said it is streaming at.
     view_distance: Option<(u8, u8)>,
     entities: client::entities::Entities,
+    dialogs: std::collections::BTreeMap<String, tiamot_core::ui::Tree>,
 }
 
 impl Seen {
@@ -185,6 +186,12 @@ impl Seen {
                 self.images = images;
             }
             Event::Joined { spawn, .. } => self.joined = Some(spawn),
+            Event::Dialog { form, tree } => {
+                self.dialogs.insert(form, *tree);
+            }
+            Event::DialogClosed { form } => {
+                self.dialogs.remove(&form);
+            }
             Event::Chunk(chunk) => self.store.insert(*chunk),
             Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
             Event::ChunkFluid(pos, layer) => self.store.set_fluid(pos, *layer),

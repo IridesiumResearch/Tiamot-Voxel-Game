@@ -840,6 +840,7 @@ impl Session {
             ClientMessage::Disconnect => "Disconnect",
             ClientMessage::StartDig { .. } => "StartDig",
             ClientMessage::CancelDig => "CancelDig",
+            ClientMessage::DialogEvent { .. } => "DialogEvent",
             ClientMessage::Action { .. } => "Action",
             ClientMessage::SelectTool { .. } => "SelectTool",
             ClientMessage::Place { .. } => "Place",

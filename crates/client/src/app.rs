@@ -679,6 +679,11 @@ pub struct App {
     bindings: crate::input::Bindings,
     /// Every sound the server's mods registered.
     sounds: Vec<tiamot_core::proto::SoundDef>,
+    /// Dialogs the server has open on this player's screen, by form name.
+    ///
+    /// A `BTreeMap` so the draw order is the same every frame: two dialogs
+    /// open at once should not swap places because a hash changed.
+    dialogs: std::collections::BTreeMap<String, tiamot_core::ui::Tree>,
     /// The audio backend, or a silent stand-in where there is no device.
     mixer: crate::audio::Mixer,
     /// Sounds this client has been told about and not yet played.
@@ -931,6 +936,7 @@ impl App {
             actions: crate::input::Actions::engine(),
             bindings,
             sounds: Vec::new(),
+            dialogs: std::collections::BTreeMap::new(),
             mixer,
             heard: Vec::new(),
             step_sounds: std::collections::BTreeMap::new(),
@@ -1860,6 +1866,31 @@ impl App {
         &self.sounds
     }
 
+    /// Opens or replaces a dialog.
+    ///
+    /// Its own method because `pump_network` sits at clippy's line limit — the
+    /// same reason `adopt_materials` and `adopt_actions` are separate.
+    ///
+    /// A whole tree replaces the old one rather than patching it: a dialog is
+    /// small, and a patch stream that dropped a message would leave a player
+    /// looking at something the server does not believe is there.
+    fn adopt_dialog(&mut self, form: String, tree: Option<tiamot_core::ui::Tree>) {
+        match tree {
+            Some(tree) => {
+                self.dialogs.insert(form, tree);
+            }
+            None => {
+                self.dialogs.remove(&form);
+            }
+        }
+    }
+
+    /// The dialogs a server has open on this screen, in a stable order.
+    #[must_use]
+    pub const fn dialogs(&self) -> &std::collections::BTreeMap<String, tiamot_core::ui::Tree> {
+        &self.dialogs
+    }
+
     /// Takes the sounds heard since the last call.
     ///
     /// Drained rather than read, because each one is played exactly once and a
@@ -2608,6 +2639,8 @@ impl App {
                 // piece of Task 13, and until it lands a client knows what a
                 // server's sounds ARE without being able to make one.
                 Event::Sounds { sounds } => self.sounds = sounds,
+                Event::Dialog { form, tree } => self.adopt_dialog(form, Some(*tree)),
+                Event::DialogClosed { form } => self.adopt_dialog(form, None),
 
                 Event::PlaySound { .. } => self.heard.push(event),
 

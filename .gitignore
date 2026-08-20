@@ -34,6 +34,16 @@
 /fuzz/corpus/ogg_ingest/*
 !/fuzz/corpus/ogg_ingest/*.wav
 !/fuzz/corpus/ogg_ingest/*.ogg
+# The dialog corpus, on the same rule as the two above. A seed is a few dozen
+# bytes and five minutes of fuzzing left 1,131 derived entries — which went into
+# a commit once before this rule existed. The named files are the seed set
+# (`cargo run -p tiamot-core --example dialog_seeds`) plus anything that has
+# ever crashed the target; everything a fuzzer derives from those is
+# reproducible in minutes and is not worth carrying in the history.
+/fuzz/corpus/dialog_schema/*
+!/fuzz/corpus/dialog_schema/seed-*.bin
+!/fuzz/corpus/dialog_schema/regression-*.bin
+
 /fuzz/coverage/
 /fuzz/Cargo.lock
 

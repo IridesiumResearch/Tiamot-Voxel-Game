@@ -257,6 +257,17 @@ jobs:
             --target x86_64-unknown-linux-gnu \
             -- -max_total_time=60 -rss_limit_mb=2048
 
+      # Task 14's dialog schema, and the largest hostile-input surface after
+      # glTF: a TREE, which nests and branches. The flat representation is what
+      # makes it safe to decode at all — a recursive one overflows the stack on
+      # decode, on drop, and inside the very walk meant to bound its depth — and
+      # this is what keeps that true.
+      - name: Fuzz the dialog schema (smoke)
+        run: |
+          cargo +nightly fuzz run dialog_schema \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=60 -rss_limit_mb=2048
+
       # **The crashing input, or the finding is only a stack trace.**
       # `fuzz/artifacts/` is gitignored, so until this existed a crash found
       # only on CI could not be reproduced without re-fuzzing locally and

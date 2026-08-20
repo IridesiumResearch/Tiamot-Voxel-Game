@@ -162,6 +162,23 @@ pub enum Event {
         voice: crate::audio::Voice,
     },
 
+    /// A server opened or replaced a dialog.
+    ///
+    /// The tree has already passed [`tiamot_core::ui::check`] — the decoder
+    /// refuses one that has not, so nothing downstream has to wonder.
+    Dialog {
+        /// The mod's name for it, echoed on every event.
+        form: String,
+        /// What to draw.
+        tree: Box<tiamot_core::ui::Tree>,
+    },
+
+    /// A server closed a dialog.
+    DialogClosed {
+        /// Which one.
+        form: String,
+    },
+
     /// Something happened near enough to hear.
     ///
     /// The server has already decided this player is in earshot; what it
@@ -853,6 +870,17 @@ async fn session(
         };
 
         match message {
+            ServerMessage::ShowDialog { form, tree }
+            | ServerMessage::UpdateDialog { form, tree } => {
+                // Validated at decode, so this is a tree that passed `check`.
+                let _ = events.send(Event::Dialog {
+                    form,
+                    tree: Box::new(tree),
+                });
+            }
+            ServerMessage::CloseDialog { form } => {
+                let _ = events.send(Event::DialogClosed { form });
+            }
             ServerMessage::AuthChallenge { nonce } => {
                 let signature =
                     identity.sign(&challenge_payload(&nonce, &fingerprint, PROTOCOL_VERSION));

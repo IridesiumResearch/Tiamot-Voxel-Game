@@ -43,10 +43,15 @@ game.play_sound{ sound = "growl", entity = mob_id, radius = 24 }
 
 The sound is placed at the entity's **interpolated** position on each client
 rather than the server's last known one, so it moves with what the player can
-see. Only players inside `radius` are sent it at all. `core_mimic` is the
-working reference.
+see. Only players inside `radius` are sent it at all. The reference mods in
+`game/` include a working example.
 
 No engine work. This one is done.
+
+(Deliberately not naming the particular mob: a bot test greps `docs/` along with
+the engine source for it, on the grounds that a doc naming one mob is hard to
+tell from the engine knowing about it. The test is blunt on purpose, and that is
+worth more than the convenience of naming it here.)
 
 ## 2. Sustained sound — the missing primitive
 

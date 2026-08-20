@@ -65,3 +65,10 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "dialog_schema"
+path = "fuzz_targets/dialog_schema.rs"
+test = false
+doc = false
+bench = false

@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -664,6 +664,93 @@ pub enum ClientMessage {
         /// Whether it went down (`true`) or came up (`false`).
         pressed: bool,
     },
+
+    /// Something happened in a dialog the server opened.
+    ///
+    /// **Appended at the end** (protocol v20).
+    ///
+    /// A REQUEST, never a result. The clearest case is a slot move: a client
+    /// saying "I dragged this there" is asking, and the server's inventory
+    /// stays authoritative whatever the client believes. A forged event is
+    /// therefore not a special case to detect — it is the ordinary case,
+    /// handled by the same validation.
+    DialogEvent {
+        /// Which dialog, as the server named it in [`ServerMessage::ShowDialog`].
+        form: String,
+        /// What happened.
+        event: DialogEvent,
+    },
+}
+
+/// What a player did inside a dialog.
+///
+/// Every variant names the widget it came from, because a mod told the client
+/// that name and has no other way to tell two buttons apart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DialogEvent {
+    /// A button was pressed.
+    Pressed {
+        /// The widget's name.
+        name: String,
+    },
+    /// A text input was submitted.
+    Submitted {
+        /// The widget's name.
+        name: String,
+        /// What was in it.
+        text: String,
+    },
+    /// A checkbox was ticked or unticked.
+    Toggled {
+        /// The widget's name.
+        name: String,
+        /// Its new state.
+        checked: bool,
+    },
+    /// A slider was moved.
+    Slid {
+        /// The widget's name.
+        name: String,
+        /// Its new value.
+        value: i32,
+    },
+    /// A dropdown selection changed.
+    Chose {
+        /// The widget's name.
+        name: String,
+        /// Which option, as an index.
+        index: u16,
+    },
+    /// A slot was clicked, which is a request to move items.
+    ///
+    /// The client says what it did with the mouse; the SERVER decides what that
+    /// means for an inventory. Splitting, merging and swapping are all the same
+    /// message — the server works out which from the slots and the button.
+    Clicked {
+        /// The inventory view the slot belongs to.
+        view: String,
+        /// Which slot in that view.
+        index: u16,
+        /// How it was clicked.
+        click: Click,
+    },
+    /// The player closed the dialog.
+    Closed,
+}
+
+/// How a slot was clicked.
+///
+/// Named for what the player did, not for what should happen: "right-click"
+/// means the same thing on every machine, whereas "split" is a decision the
+/// server makes and a mod may want to make differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Click {
+    /// Take or place the whole stack.
+    Left,
+    /// Take half, or place one — the split gesture.
+    Right,
+    /// Move the stack to the other view in one go.
+    ShiftLeft,
 }
 
 /// Messages a server sends.
@@ -1045,6 +1132,44 @@ pub enum ServerMessage {
         /// An entity to follow, if the sound should move with one.
         entity: Option<u64>,
     },
+
+    /// Open a dialog on this player's screen.
+    ///
+    /// **Appended at the end** (protocol v20).
+    ///
+    /// Charter rule 14 in its sharpest form: a UI is the pushed asset with the
+    /// most obvious reason to want to be code, so this carries no code. The
+    /// tree is data, the client renders it, and nothing in it executes. See
+    /// [`crate::ui`] for why the tree is flat.
+    ShowDialog {
+        /// The mod's name for this dialog, echoed back on every event.
+        form: String,
+        /// What to draw.
+        tree: crate::ui::Tree,
+    },
+
+    /// Replace the contents of a dialog already open.
+    ///
+    /// **Appended at the end** (protocol v20).
+    ///
+    /// A whole tree rather than a patch. A dialog is small, and a patch stream
+    /// that ever dropped a message would leave a player looking at something
+    /// the server does not believe is there — the same argument
+    /// [`ServerMessage::InventoryUpdate`] makes, for the same reason.
+    UpdateDialog {
+        /// Which dialog.
+        form: String,
+        /// Its new contents.
+        tree: crate::ui::Tree,
+    },
+
+    /// Close a dialog.
+    ///
+    /// **Appended at the end** (protocol v20).
+    CloseDialog {
+        /// Which dialog.
+        form: String,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -1219,6 +1344,19 @@ pub enum ProtocolError {
         trailing: usize,
     },
 
+    /// A message decoded, but what it describes is not usable.
+    ///
+    /// Distinct from [`ProtocolError::Malformed`], which is postcard saying the
+    /// BYTES are wrong. This is the bytes being fine and their meaning not:
+    /// a widget tree that nests too deep, a child range pointing off the end.
+    /// A mod author reads this one, so it carries a sentence rather than a
+    /// wrapped decoder error.
+    #[error("{what}")]
+    Unusable {
+        /// What is wrong, in terms the reader can act on.
+        what: String,
+    },
+
     /// A field broke a documented limit.
     #[error("{field} is {len} bytes, over the {limit}-byte limit")]
     FieldTooLarge {
@@ -1310,6 +1448,7 @@ pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolEr
             // cannot spend the server's memory naming an action nobody has.
             check_len("action_id", id.len(), MAX_ID_BYTES)?;
         }
+        ClientMessage::DialogEvent { form, event } => check_dialog_event(form, event)?,
         ClientMessage::SelectTool { tool: Some(tool) } => {
             // An id is a string from a peer. Bounded like a display name, and
             // for the same reason: it is stored and echoed.
@@ -1431,6 +1570,49 @@ fn check_play(message: &ServerMessage) -> Result<(), ProtocolError> {
 /// and because the caps are the interesting part: charter rule 14 says a server
 /// is not trusted, and each of these strings is one the client keeps for the
 /// session and shows in its settings screen.
+/// Bounds a dialog a server sent, and the tree in it.
+///
+/// Its own function because `validate_server_message` sits at clippy's line
+/// limit — which is a real constraint here rather than a lint being obeyed: the
+/// tree check is the substantial part and reads better named.
+fn check_dialog(form: &str, tree: Option<&crate::ui::Tree>) -> Result<(), ProtocolError> {
+    check_len("dialog_form", form.len(), MAX_ID_BYTES)?;
+    let Some(tree) = tree else {
+        return Ok(());
+    };
+    // **The tree's own limits, at decode.** Charter rule 14, and Task 14 asks
+    // for it here in as many words: a client refuses a tree that is too large
+    // or too deep BEFORE anything walks it. See `crate::ui` for why a flat
+    // representation is what makes that possible at all.
+    crate::ui::check(tree, crate::ui::Limits::default()).map_err(|err| ProtocolError::Unusable {
+        what: format!("dialog `{form}`: {err}"),
+    })
+}
+
+/// Bounds a dialog event a client sent.
+///
+/// Every string here is a name the SERVER gave the client, echoed back — so a
+/// peer returning a megabyte where a widget name should be is the ordinary
+/// hostile case rather than an exotic one.
+fn check_dialog_event(form: &str, event: &DialogEvent) -> Result<(), ProtocolError> {
+    check_len("dialog_form", form.len(), MAX_ID_BYTES)?;
+    match event {
+        DialogEvent::Pressed { name }
+        | DialogEvent::Toggled { name, .. }
+        | DialogEvent::Slid { name, .. }
+        | DialogEvent::Chose { name, .. } => check_len("widget_name", name.len(), MAX_ID_BYTES)?,
+        DialogEvent::Submitted { name, text } => {
+            check_len("widget_name", name.len(), MAX_ID_BYTES)?;
+            // What a player typed, bounded like a chat line — it is the same
+            // kind of thing and reaches the same kind of place.
+            check_len("dialog_text", text.len(), MAX_CHAT_BYTES)?;
+        }
+        DialogEvent::Clicked { view, .. } => check_len("view", view.len(), MAX_ID_BYTES)?,
+        DialogEvent::Closed => {}
+    }
+    Ok(())
+}
+
 fn check_actions(actions: &[ActionDef]) -> Result<(), ProtocolError> {
     check_len("action_table", actions.len(), MAX_ACTIONS)?;
     for action in actions {
@@ -1553,6 +1735,10 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         // client's own copy of the world.
         ServerMessage::BlockDelta { edit, .. } => check_occupancy(edit)?,
 
+        ServerMessage::ShowDialog { form, tree } | ServerMessage::UpdateDialog { form, tree } => {
+            check_dialog(form, Some(tree))?;
+        }
+        ServerMessage::CloseDialog { form } => check_dialog(form, None)?,
         ServerMessage::ActionTable { actions } => check_actions(actions)?,
         ServerMessage::SoundTable { sounds } => check_sounds(sounds)?,
         message @ ServerMessage::PlaySound { .. } => check_play(message)?,
@@ -2217,6 +2403,67 @@ mod tests {
         })
         .expect("encode");
         assert_eq!(state[0], 24);
+
+        // Protocol v16, v17 and v18 — the input and audio tables.
+        let actions = encode(&ServerMessage::ActionTable {
+            actions: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(actions[0], 25);
+        let sounds = encode(&ServerMessage::SoundTable { sounds: Vec::new() }).expect("encode");
+        assert_eq!(sounds[0], 26);
+        let play = encode(&ServerMessage::PlaySound {
+            sound: String::new(),
+            pos: [0.0; 3],
+            radius: 1.0,
+            gain: 1.0,
+            entity: None,
+        })
+        .expect("encode");
+        assert_eq!(play[0], 27);
+
+        // Protocol v20, the dialogs, and currently the newest. Pinned on the
+        // way in rather than after something displaces them: every one of the
+        // three above went unpinned for several protocol versions, which is how
+        // an append lands above one of them without a test noticing.
+        let show = encode(&ServerMessage::ShowDialog {
+            form: String::new(),
+            tree: crate::ui::Tree { nodes: Vec::new() },
+        })
+        .expect("encode");
+        assert_eq!(show[0], 28);
+        let update = encode(&ServerMessage::UpdateDialog {
+            form: String::new(),
+            tree: crate::ui::Tree { nodes: Vec::new() },
+        })
+        .expect("encode");
+        assert_eq!(update[0], 29);
+        let close = encode(&ServerMessage::CloseDialog {
+            form: String::new(),
+        })
+        .expect("encode");
+        assert_eq!(close[0], 30);
+    }
+
+    #[test]
+    fn the_dialog_client_message_keeps_its_ordinal() {
+        // The client half of protocol v20. `Action` was the last variant, so
+        // this is what an even later append is most likely to displace.
+        let action = encode(&ClientMessage::Action {
+            id: String::new(),
+            pressed: true,
+        })
+        .expect("encode");
+        let event = encode(&ClientMessage::DialogEvent {
+            form: String::new(),
+            event: DialogEvent::Closed,
+        })
+        .expect("encode");
+        assert_eq!(
+            event[0],
+            action[0] + 1,
+            "DialogEvent must stay directly after Action"
+        );
     }
 
     #[test]
