@@ -84,8 +84,10 @@ const JOINERS: &str = "tiamot.joiners";
 const HOOK_JOIN: &str = "on_player_join";
 /// The registry key holding every `on_action` callback.
 const ACTORS: &str = "tiamot.actors";
+const DIALOGISTS: &str = "tiamot.dialogists";
 /// What an `on_action` hook is called in errors.
 const HOOK_ACTION: &str = "on_action";
+const HOOK_DIALOG: &str = "on_dialog_event";
 
 /// Hook name used in registry keys and in fault messages.
 const HOOK_PUNCH: &str = "on_punch";
@@ -239,6 +241,8 @@ pub struct MluaVm {
     tools: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::dig::Tools>>>>,
     /// Where `game.play_sound` reaches, once there are players to hear it.
     sounds: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::sound::Access>>>>,
+    /// The server's dialog API, installed once the world is running.
+    dialogs: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::ui::host::Access>>>>,
     /// Where `game.set_block` sends its edits, once there is a world.
     edits: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::script::WorldEdit>>>>,
     /// Where the `game.*_entity` calls reach, once there is a world.
@@ -513,6 +517,7 @@ impl ScriptVm for MluaVm {
             fluid: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tools: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            dialogs: std::sync::Arc::new(std::sync::Mutex::new(None)),
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
             storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sight: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -577,6 +582,12 @@ impl ScriptVm for MluaVm {
 
     fn set_sound_access(&mut self, access: std::sync::Arc<dyn crate::sound::Access>) {
         if let Ok(mut slot) = self.sounds.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_dialog_access(&mut self, access: std::sync::Arc<dyn crate::ui::host::Access>) {
+        if let Ok(mut slot) = self.dialogs.lock() {
             *slot = Some(access);
         }
     }
@@ -877,6 +888,20 @@ impl ScriptVm for MluaVm {
             return HookOutcome::allow();
         };
         self.run_hook(HOOK_ACTION, ACTORS, &table)
+    }
+
+    fn dialog_event(&mut self, event: &crate::script::DialogEvent) -> HookOutcome {
+        let Ok(table) = self.hook_event(event.player).and_then(|table| {
+            table.set("form", event.form.as_str())?;
+            dialog_event_fields(&self.lua, &table, &event.event)?;
+            Ok(table)
+        }) else {
+            return HookOutcome::allow();
+        };
+        // **One mod, not the list.** Every other hook here runs everybody who
+        // registered; this runs only the mod that owns the dialog, because its
+        // events are private to it.
+        self.run_owner_hook(HOOK_DIALOG, &event.mod_id, &table)
     }
 
     fn fluid_flow(&mut self, event: &crate::script::FluidFlowEvent) -> HookOutcome {
@@ -1289,6 +1314,15 @@ impl MluaVm {
             self.hook_registrar(mod_id, HOOK_ACTION, ACTORS)?,
         )
         .map_err(|err| self.vm_error(&err))?;
+        // **No list for this one.** Every other hook appends the mod to a
+        // registry list so `run_hook` can call everyone; a dialog event goes to
+        // its owner alone, so the callback is stored under the mod's key and
+        // there is nobody to enumerate.
+        game.set(
+            "register_on_dialog_event",
+            self.hook_registrar(mod_id, HOOK_DIALOG, DIALOGISTS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
         Ok(())
     }
 
@@ -1394,6 +1428,85 @@ impl MluaVm {
         game.set("play_sound", play_sound)
             .map_err(|err| self.vm_error(&err))?;
         Ok(())
+    }
+
+    /// The `game.show_dialog`, `update_dialog` and `close_dialog` functions.
+    ///
+    /// # Ownership, and why the form name is qualified
+    ///
+    /// A dialog belongs to the mod that opened it, and the form name is
+    /// namespaced with that mod's id like every other id (charter rule 8). Two
+    /// mods can then both call a form `"inventory"` without colliding, and no
+    /// mod can name a form into another's namespace to receive their events —
+    /// which would mean watching what a player typed into somebody else's text
+    /// field.
+    fn install_dialogs(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        // **Registered by literal name, twice, rather than in a loop.**
+        // `scripts/check-stubs.sh` proves every engine function is documented by
+        // scanning for `game.set("...")`, and a loop over a name variable is
+        // invisible to it — which it duly reported. A static check that can be
+        // defeated by a loop is worth more than the four lines the loop saved.
+        let show = self.dialog_shower(mod_id, false)?;
+        game.set("show_dialog", show)
+            .map_err(|err| self.vm_error(&err))?;
+        let update = self.dialog_shower(mod_id, true)?;
+        game.set("update_dialog", update)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
+        let slot = std::sync::Arc::clone(&self.dialogs);
+        let close = self
+            .lua
+            .create_function(move |_, spec: Table| {
+                let player: String = spec.get("player")?;
+                let form: String = spec.get("form")?;
+                let form = qualify_id(&owner, &form).map_err(mlua::Error::external)?;
+                let closed = slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|access| access.close(&player, &form)));
+                Ok(closed.unwrap_or(false))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("close_dialog", close)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
+    /// The body behind `show_dialog` and `update_dialog`, which differ only in
+    /// whether they replace a dialog already open.
+    fn dialog_shower(&self, mod_id: &str, update: bool) -> Result<mlua::Function, ScriptError> {
+        let owner = mod_id.to_owned();
+        let slot = std::sync::Arc::clone(&self.dialogs);
+        {
+            self.lua
+                .create_function(move |_, spec: Table| {
+                    let player: String = spec.get("player")?;
+                    let form: String = spec.get("form")?;
+                    let form = qualify_id(&owner, &form).map_err(mlua::Error::external)?;
+                    let tree: Table = spec.get("tree")?;
+                    let tree = widget_tree(&tree)?;
+                    // **Checked before it leaves the mod's call stack.** The
+                    // client checks it again on arrival — it does not trust
+                    // this server — but a mod that built a tree too deep or too
+                    // wide should hear about it here, where the message can
+                    // name what it did.
+                    crate::ui::check(&tree, crate::ui::Limits::default())
+                        .map_err(mlua::Error::external)?;
+                    let request = crate::ui::host::ShowRequest {
+                        player,
+                        form,
+                        tree,
+                        update,
+                    };
+                    let shown = slot
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.as_ref().map(|access| access.show(&request)));
+                    Ok(shown.unwrap_or(false))
+                })
+                .map_err(|err| self.vm_error(&err))
+        }
     }
 
     /// The `game.get_tool` and `game.set_tool` functions.
@@ -1580,6 +1693,7 @@ impl MluaVm {
         self.install_entity_step_hook(mod_id, game)?;
         self.install_tools(game)?;
         self.install_sound(mod_id, game)?;
+        self.install_dialogs(mod_id, game)?;
 
         // The two cancellable hooks. Registered exactly like `on_tick` — one
         // callback per mod, ordered by load order — so a mod author has one
@@ -2495,6 +2609,43 @@ impl MluaVm {
     /// author who forgot a `return` would silently make their block
     /// unbreakable, and the engine cannot tell that apart from a deliberate
     /// veto.
+    /// Runs one mod's hook, rather than everyone who registered.
+    ///
+    /// The dialog case. Shares `run_hook`'s error handling by construction —
+    /// a one-mod list — so a mod that throws inside a dialog event is disabled
+    /// exactly like one that throws anywhere else, rather than through a second
+    /// copy of that logic which would drift.
+    fn run_owner_hook(&mut self, hook: &str, mod_id: &str, event: &Table) -> HookOutcome {
+        if self.faulted.contains(mod_id) {
+            return HookOutcome::allow();
+        }
+        let Ok(callback) = self
+            .lua
+            .named_registry_value::<mlua::Function>(&Self::hook_key(hook, mod_id))
+        else {
+            // The mod never registered one, which is ordinary: a dialog with
+            // only labels in it needs no handler.
+            return HookOutcome::allow();
+        };
+        let mut outcome = HookOutcome::allow();
+        if self.arm_budget(self.limits.instructions_per_call).is_err() {
+            return outcome;
+        }
+        let result = callback.call::<mlua::Value>(event.clone());
+        self.disarm_budget();
+        if let Err(err) = result {
+            let error = Self::classify(&err, mod_id, hook);
+            self.faulted.insert(mod_id.to_owned());
+            tracing::error!(
+                mod_id = %mod_id,
+                error = %error,
+                "disabling mod after a {hook} failure"
+            );
+            outcome.faults.push((mod_id.to_owned(), error));
+        }
+        outcome
+    }
+
     fn run_hook(&mut self, hook: &str, list: &str, event: &Table) -> HookOutcome {
         let Ok(registered) = self.lua.named_registry_value::<Table>(list) else {
             // No list means nothing ever registered for this hook, which is the
@@ -3347,6 +3498,320 @@ fn validate_texture_path(block: &str, path: &str) -> Result<String, String> {
 /// `namespace:name` form is allowed only when the namespace is the mod's own —
 /// otherwise any mod could register `core:white` and shadow the engine's
 /// reference blocks.
+/// Turns a mod's nested Lua table into a [`crate::ui::Tree`].
+///
+/// # Why this is strict
+///
+/// A mod is careless rather than hostile, and the two want opposite treatment.
+/// A hostile tree is refused silently and the connection carries on; a mod's
+/// mistake wants a message naming the widget and the field, because the
+/// alternative is a dialog that renders as a blank box and a mod author with
+/// nowhere to start.
+///
+/// So an unknown widget type, an unknown field, and a field of the wrong type
+/// are all errors here — at `show_dialog`, in the mod's own call stack — rather
+/// than something the client is asked to make sense of. That is the
+/// forward-compatibility rule Task 14 asks for: **unknown widget tag = clean
+/// error to the mod, not a client crash.**
+///
+/// Depth is bounded as it descends. A mod can write a table that nests as
+/// deeply as Lua allows, and this recurses, so it stops at the same limit the
+/// wire format enforces.
+/// Puts a dialog event's own fields on the table a mod receives.
+///
+/// Named for what the player did — `kind = "pressed"`, `"clicked"` — rather
+/// than for what should happen, which is the same choice `proto::Click` makes
+/// and for the same reason: the gesture is the fact, the consequence is a
+/// decision the mod may want to make differently.
+fn dialog_event_fields(
+    lua: &Lua,
+    table: &Table,
+    event: &crate::proto::DialogEvent,
+) -> mlua::Result<()> {
+    use crate::proto::{Click, DialogEvent};
+    let _ = lua;
+    match event {
+        DialogEvent::Pressed { name } => {
+            table.set("kind", "pressed")?;
+            table.set("name", name.as_str())?;
+        }
+        DialogEvent::Submitted { name, text } => {
+            table.set("kind", "submitted")?;
+            table.set("name", name.as_str())?;
+            table.set("text", text.as_str())?;
+        }
+        DialogEvent::Toggled { name, checked } => {
+            table.set("kind", "toggled")?;
+            table.set("name", name.as_str())?;
+            table.set("checked", *checked)?;
+        }
+        DialogEvent::Slid { name, value } => {
+            table.set("kind", "slid")?;
+            table.set("name", name.as_str())?;
+            table.set("value", *value)?;
+        }
+        DialogEvent::Chose { name, index } => {
+            table.set("kind", "chose")?;
+            table.set("name", name.as_str())?;
+            // One-based, because this is a Lua index into the options table the
+            // mod itself wrote. Off-by-one here would be silent and constant.
+            table.set("index", u32::from(*index) + 1)?;
+        }
+        DialogEvent::Clicked { view, index, click } => {
+            table.set("kind", "clicked")?;
+            table.set("view", view.as_str())?;
+            table.set("index", u32::from(*index) + 1)?;
+            table.set(
+                "click",
+                match click {
+                    Click::Left => "left",
+                    Click::Right => "right",
+                    Click::ShiftLeft => "shift_left",
+                },
+            )?;
+        }
+        DialogEvent::Closed => table.set("kind", "closed")?,
+    }
+    Ok(())
+}
+
+fn widget_tree(spec: &Table) -> mlua::Result<crate::ui::Tree> {
+    let build = widget_build(spec, 0)?;
+    Ok(build.flatten())
+}
+
+/// One widget and its children, `depth` levels down.
+fn widget_build(spec: &Table, depth: usize) -> mlua::Result<crate::ui::Build> {
+    let limits = crate::ui::Limits::default();
+    if depth >= limits.depth {
+        return Err(mlua::Error::external(format!(
+            "dialog nests deeper than {} widgets",
+            limits.depth
+        )));
+    }
+    for pair in spec.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !WIDGET_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "dialog widget: unknown field `{name}`"
+                )));
+            }
+        }
+    }
+
+    let kind: String = spec.get("type")?;
+    let widget = widget_of(&kind, spec)?;
+    let node = crate::ui::Node {
+        widget,
+        name: spec.get::<Option<String>>("name")?.unwrap_or_default(),
+        style: widget_style(spec)?,
+        grow: spec.get::<Option<u16>>("grow")?.unwrap_or(0),
+        size: spec.get::<Option<u16>>("size")?,
+        cross_size: spec.get::<Option<u16>>("cross_size")?,
+        children: crate::ui::Children::default(),
+    };
+
+    let mut children = Vec::new();
+    if let Some(list) = spec.get::<Option<Table>>("children")? {
+        for child in list.sequence_values::<Table>() {
+            children.push(widget_build(&child?, depth + 1)?);
+        }
+    }
+    Ok(crate::ui::Build::of(node, children))
+}
+
+/// The widget itself, from its `type` and the fields that type uses.
+fn widget_of(kind: &str, spec: &Table) -> mlua::Result<crate::ui::Widget> {
+    use crate::ui::Widget;
+    let text = |key: &str| -> mlua::Result<String> {
+        Ok(spec.get::<Option<String>>(key)?.unwrap_or_default())
+    };
+    Ok(match kind {
+        "container" => Widget::Container {
+            direction: match spec
+                .get::<Option<String>>("direction")?
+                .unwrap_or_else(|| "column".to_owned())
+                .as_str()
+            {
+                "row" => crate::ui::Direction::Row,
+                "column" => crate::ui::Direction::Column,
+                other => {
+                    return Err(mlua::Error::external(format!(
+                        "container direction must be `row` or `column`, not `{other}`"
+                    )));
+                }
+            },
+            gap: spec.get::<Option<u16>>("gap")?.unwrap_or(0),
+            padding: spec.get::<Option<u16>>("padding")?.unwrap_or(0),
+            align: match spec
+                .get::<Option<String>>("align")?
+                .unwrap_or_else(|| "start".to_owned())
+                .as_str()
+            {
+                "start" => crate::ui::Align::Start,
+                "center" => crate::ui::Align::Center,
+                "end" => crate::ui::Align::End,
+                "stretch" => crate::ui::Align::Stretch,
+                other => {
+                    return Err(mlua::Error::external(format!(
+                        "container align must be start, center, end or stretch, not `{other}`"
+                    )));
+                }
+            },
+        },
+        "label" => Widget::Label {
+            text: text("text")?,
+        },
+        "button" => Widget::Button {
+            text: text("text")?,
+        },
+        "image" => Widget::Image {
+            hash: content_hash(spec, "hash")?,
+        },
+        "text_input" => Widget::TextInput {
+            initial: text("initial")?,
+            placeholder: text("placeholder")?,
+        },
+        "checkbox" => Widget::Checkbox {
+            text: text("text")?,
+            checked: spec.get::<Option<bool>>("checked")?.unwrap_or(false),
+        },
+        "slider" => Widget::Slider {
+            min: spec.get::<Option<i32>>("min")?.unwrap_or(0),
+            max: spec.get::<Option<i32>>("max")?.unwrap_or(100),
+            value: spec.get::<Option<i32>>("value")?.unwrap_or(0),
+        },
+        "dropdown" => Widget::Dropdown {
+            options: spec
+                .get::<Option<Vec<String>>>("options")?
+                .unwrap_or_default(),
+            selected: spec.get::<Option<u16>>("selected")?.unwrap_or(0),
+        },
+        "item_slot" => Widget::ItemSlot {
+            view: spec.get::<String>("view")?,
+            index: spec.get::<Option<u16>>("index")?.unwrap_or(0),
+        },
+        "item_grid" => Widget::ItemGrid {
+            view: spec.get::<String>("view")?,
+            columns: spec.get::<Option<u16>>("columns")?.unwrap_or(9),
+            first: spec.get::<Option<u16>>("first")?.unwrap_or(0),
+            count: spec.get::<Option<u16>>("count")?.unwrap_or(0),
+        },
+        "scroll" => Widget::Scroll,
+        "spacer" => Widget::Spacer,
+        "progress" => Widget::Progress {
+            permille: spec.get::<Option<u16>>("permille")?.unwrap_or(0),
+        },
+        other => {
+            // **The forward-compatibility rule, and where it belongs.** A
+            // client cannot render a widget it has never heard of, and the
+            // only party who can fix that is the mod author — so they are told
+            // here, by name, in their own call stack, rather than a client
+            // being handed something it must refuse.
+            return Err(mlua::Error::external(format!(
+                "dialog widget: unknown type `{other}`"
+            )));
+        }
+    })
+}
+
+/// A style table, all of it optional.
+fn widget_style(spec: &Table) -> mlua::Result<crate::ui::Style> {
+    let Some(style) = spec.get::<Option<Table>>("style")? else {
+        return Ok(crate::ui::Style::default());
+    };
+    for pair in style.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !STYLE_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "dialog style: unknown field `{name}`"
+                )));
+            }
+        }
+    }
+    Ok(crate::ui::Style {
+        background: colour(&style, "background")?,
+        border: colour(&style, "border")?,
+        nine_slice: style
+            .get::<Option<Table>>("nine_slice")?
+            .map(|_| content_hash(&style, "nine_slice"))
+            .transpose()?,
+        text_colour: colour(&style, "text_colour")?,
+        text_size: style.get::<Option<u16>>("text_size")?,
+    })
+}
+
+/// `{ r, g, b, a }`, with alpha optional.
+fn colour(table: &Table, key: &str) -> mlua::Result<Option<[u8; 4]>> {
+    let Some(list) = table.get::<Option<Vec<u8>>>(key)? else {
+        return Ok(None);
+    };
+    if list.len() < 3 || list.len() > 4 {
+        return Err(mlua::Error::external(format!(
+            "`{key}` wants three or four numbers, got {}",
+            list.len()
+        )));
+    }
+    Ok(Some([
+        list[0],
+        list[1],
+        list[2],
+        list.get(3).copied().unwrap_or(255),
+    ]))
+}
+
+/// A 32-byte content hash, as a table of numbers.
+fn content_hash(table: &Table, key: &str) -> mlua::Result<[u8; 32]> {
+    let bytes: Vec<u8> = table.get(key)?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| mlua::Error::external(format!("`{key}` must be 32 bytes of content hash")))
+}
+
+/// Keys a widget table accepts. Same rule as `BLOCK_FIELDS`: a typo is an
+/// error, because the alternative is a silently ignored field.
+const WIDGET_FIELDS: [&str; 27] = [
+    "type",
+    "name",
+    "style",
+    "grow",
+    "size",
+    "cross_size",
+    "children",
+    "direction",
+    "gap",
+    "padding",
+    "align",
+    "permille",
+    "text",
+    "hash",
+    "initial",
+    "placeholder",
+    "checked",
+    "min",
+    "max",
+    "value",
+    "options",
+    "selected",
+    "view",
+    "index",
+    "columns",
+    "first",
+    "count",
+];
+
+/// Keys a style table accepts.
+const STYLE_FIELDS: [&str; 5] = [
+    "background",
+    "border",
+    "nine_slice",
+    "text_colour",
+    "text_size",
+];
+
 fn qualify_id(mod_id: &str, id: &str) -> Result<String, String> {
     match id.split_once(':') {
         None => Ok(format!("{mod_id}:{id}")),
@@ -3364,6 +3829,175 @@ mod tests {
 
     fn vm() -> MluaVm {
         MluaVm::new(VmLimits::default()).expect("create vm")
+    }
+
+    /// Shows a dialog and captures what the server was asked to show.
+    #[derive(Default)]
+    struct Screen {
+        shown: std::sync::Mutex<Vec<crate::ui::host::ShowRequest>>,
+        closed: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::ui::host::Access for Screen {
+        fn show(&self, request: &crate::ui::host::ShowRequest) -> bool {
+            if let Ok(mut shown) = self.shown.lock() {
+                shown.push(request.clone());
+            }
+            true
+        }
+
+        fn close(&self, player: &str, form: &str) -> bool {
+            if let Ok(mut closed) = self.closed.lock() {
+                closed.push((player.to_owned(), form.to_owned()));
+            }
+            true
+        }
+    }
+
+    /// Loads a mod that shows `tree`, and returns what reached the server.
+    fn show(source: &str) -> Result<Vec<crate::ui::host::ShowRequest>, ScriptError> {
+        let mut vm = vm();
+        let screen = std::sync::Arc::new(Screen::default());
+        vm.set_dialog_access(
+            std::sync::Arc::clone(&screen) as std::sync::Arc<dyn crate::ui::host::Access>
+        );
+        load(&mut vm, "shop", source)?;
+        let shown = screen.shown.lock().expect("lock").clone();
+        Ok(shown)
+    }
+
+    #[test]
+    fn a_mods_nested_table_becomes_a_flat_tree() {
+        // Tier one's mod-facing contract: a nested table in, a flat tree out,
+        // with the index-ordering invariant established by construction.
+        let shown = show(
+            r#"
+            game.show_dialog{
+              player = "abc",
+              form = "shop",
+              tree = {
+                type = "container", direction = "column", gap = 4, padding = 8,
+                children = {
+                  { type = "label", text = "Buy" },
+                  { type = "button", name = "ok", text = "OK" },
+                },
+              },
+            }
+            "#,
+        )
+        .expect("load");
+        assert_eq!(shown.len(), 1, "the dialog never reached the server");
+        let request = &shown[0];
+        // Namespaced with the mod's own id, like every other id (rule 8).
+        assert_eq!(request.form, "shop:shop");
+        assert_eq!(request.player, "abc");
+        assert!(!request.update, "show_dialog should not be an update");
+
+        let tree = &request.tree;
+        assert_eq!(tree.nodes.len(), 3, "root and two children");
+        assert!(
+            crate::ui::check(tree, crate::ui::Limits::default()).is_ok(),
+            "a tree built from Lua did not pass the checker"
+        );
+        // The invariant, asserted rather than assumed.
+        for (index, node) in tree.nodes.iter().enumerate() {
+            if node.children.count > 0 {
+                assert!(
+                    node.children.first as usize > index,
+                    "child {} is not after parent {index}",
+                    node.children.first
+                );
+            }
+        }
+        assert_eq!(tree.nodes[2].name, "ok");
+    }
+
+    #[test]
+    fn a_mods_mistake_in_a_dialog_names_what_is_wrong() {
+        // **The forward-compatibility rule, where it belongs.** A client cannot
+        // render a widget it has never heard of, and the only party who can fix
+        // that is the mod author — so the error happens in their call stack,
+        // naming the field, rather than a client being handed something it can
+        // only refuse.
+        let cases = [
+            (
+                r#"tree = { type = "buton", text = "hi" }"#,
+                "unknown type `buton`",
+            ),
+            (
+                r#"tree = { type = "label", txet = "hi" }"#,
+                "unknown field `txet`",
+            ),
+            (
+                r#"tree = { type = "container", direction = "diagonal" }"#,
+                "direction must be",
+            ),
+            (
+                r#"tree = { type = "container", align = "middle" }"#,
+                "align must be",
+            ),
+            (
+                r#"tree = { type = "label", style = { colour = {1,2,3} } }"#,
+                "unknown field `colour`",
+            ),
+        ];
+        for (tree, expected) in cases {
+            let source = format!("game.show_dialog{{ player = \"a\", form = \"f\", {tree} }}");
+            let err = show(&source).expect_err("a malformed dialog was accepted");
+            // The DETAIL, not the Display string: a script error displays as
+            // "mod `shop` errored in init.lua" and carries the backend's
+            // message separately, so a mod author sees both.
+            let (ScriptError::Load { detail, .. } | ScriptError::Runtime { detail, .. }) = &err
+            else {
+                panic!("expected a script error carrying detail, got {err:?}");
+            };
+            assert!(
+                detail.contains(expected),
+                "error for `{tree}` should mention `{expected}`, said: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dialog_too_deep_is_refused_in_the_mods_own_call_stack() {
+        // A mod can nest a Lua table as deep as it likes, and the conversion
+        // recurses. It stops at the same limit the wire format enforces, and
+        // says so where the author can see it.
+        let depth = crate::ui::Limits::default().depth + 4;
+        let mut tree = String::from(r#"{ type = "label", text = "deep" }"#);
+        for _ in 0..depth {
+            tree = format!(r#"{{ type = "container", children = {{ {tree} }} }}"#);
+        }
+        let source = format!("game.show_dialog{{ player = \"a\", form = \"f\", tree = {tree} }}");
+        let err = show(&source).expect_err("an over-deep dialog was accepted");
+        let (ScriptError::Load { detail, .. } | ScriptError::Runtime { detail, .. }) = &err else {
+            panic!("expected a script error carrying detail, got {err:?}");
+        };
+        assert!(detail.contains("nests deeper"), "said: {detail}");
+    }
+
+    #[test]
+    fn closing_a_dialog_names_the_same_form_showing_it_did() {
+        // A mod closes what it opened, so both ends must qualify the name the
+        // same way — an easy thing to get wrong in one place only.
+        let mut vm = vm();
+        let screen = std::sync::Arc::new(Screen::default());
+        vm.set_dialog_access(
+            std::sync::Arc::clone(&screen) as std::sync::Arc<dyn crate::ui::host::Access>
+        );
+        load(
+            &mut vm,
+            "shop",
+            r#"
+            game.show_dialog{ player = "abc", form = "till", tree = { type = "spacer" } }
+            game.close_dialog{ player = "abc", form = "till" }
+            "#,
+        )
+        .expect("load");
+        let shown = screen.shown.lock().expect("lock");
+        let closed = screen.closed.lock().expect("lock");
+        assert_eq!(shown[0].form, "shop:till");
+        assert_eq!(closed[0], ("abc".to_owned(), "shop:till".to_owned()));
     }
 
     fn load(vm: &mut MluaVm, id: &str, source: &str) -> Result<(), ScriptError> {

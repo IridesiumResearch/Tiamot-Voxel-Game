@@ -47,6 +47,7 @@
 //! Lua — and is caught when the mod builds the tree, with a message naming it,
 //! rather than travelling to a client that cannot draw it.
 
+pub mod host;
 mod layout;
 mod limits;
 #[cfg(test)]

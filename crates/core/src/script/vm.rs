@@ -684,6 +684,26 @@ pub struct ActionEvent {
     pub pressed: bool,
 }
 
+/// Something a player did inside a dialog a mod opened.
+///
+/// # Why this carries the owning mod
+///
+/// A dialog belongs to whoever opened it, and only that mod is told about its
+/// events. Anything else would let one mod watch what a player typed into
+/// another's text field, or act on a button it did not put there. The server
+/// records the owner when the dialog opens and routes on it here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DialogEvent {
+    /// Who did it, canonically — the UUID, never the display name (rule 13).
+    pub player: [u8; 32],
+    /// The mod that owns the dialog, and the only one told.
+    pub mod_id: String,
+    /// The qualified form name, e.g. `"core_ui:inventory"`.
+    pub form: String,
+    /// What happened.
+    pub event: crate::proto::DialogEvent,
+}
+
 /// Fluid pressing against something it cannot get into.
 ///
 /// # Why the hook is about the flow that DIDN'T happen
@@ -880,6 +900,13 @@ pub trait ScriptVm: Sized {
     /// a mod making a noise during worldgen has nobody to make it for.
     fn set_sound_access(&mut self, access: std::sync::Arc<dyn crate::sound::Access>);
 
+    /// Points `game.show_dialog` and friends at the connected players.
+    ///
+    /// The same seam as [`Self::set_sound_access`], for the same reason: the
+    /// API is installed before there is anybody to show a dialog to, and a mod
+    /// opening one during worldgen has no screen to open it on.
+    fn set_dialog_access(&mut self, access: std::sync::Arc<dyn crate::ui::host::Access>);
+
     /// Points the entity API at the server's store.
     ///
     /// The same seam as [`Self::set_fluid_access`], for the same reason: the
@@ -1008,6 +1035,17 @@ pub trait ScriptVm: Sized {
     /// already down. The outcome carries only whether the mod errored, which is
     /// what disables it.
     fn action(&mut self, event: &ActionEvent) -> HookOutcome;
+
+    /// Tells the OWNING mod that something happened in its dialog.
+    ///
+    /// **Only the owner**, unlike every other hook here, which tells everyone
+    /// who registered. A dialog's events are private to the mod that opened it
+    /// — see [`DialogEvent`].
+    ///
+    /// An observation rather than a veto: the player has already clicked. What
+    /// the click MEANS — whether a stack moves — is the server's decision, made
+    /// after this and against its own inventory.
+    fn dialog_event(&mut self, event: &DialogEvent) -> HookOutcome;
 
     /// Tells every registered `on_fluid_flow` that a flow was blocked.
     ///

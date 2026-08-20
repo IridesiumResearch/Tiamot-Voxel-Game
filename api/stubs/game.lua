@@ -464,6 +464,109 @@ function game.set_tool(player, tool) end
 ---@field gain number? Loudness multiplier on the file's own level. Default 1.
 ---@field pitch_variance number? How much to vary the pitch each play, as a fraction. Default 0, which makes a repeated sound machine-like.
 
+---One widget in a dialog tree.
+---
+---`type` decides which other fields are read; an unknown type or an unknown
+---field is an error naming it, rather than something a client is asked to make
+---sense of. Nesting is through `children`, and is limited to 32 deep.
+---
+---Types: `container`, `label`, `button`, `image`, `text_input`, `checkbox`,
+---`slider`, `dropdown`, `item_slot`, `item_grid`, `scroll`, `spacer`,
+---`progress`.
+---@class Tiamot.Widget
+---@field type string Required. One of the types above.
+---@field name string? What events from this widget carry, so you can tell two buttons apart.
+---@field children Tiamot.Widget[]? Only for `container` and `scroll`.
+---@field style Tiamot.WidgetStyle?
+---@field grow integer? Share of the parent's leftover space. 0 takes only what it needs.
+---@field size integer? Fixed size along the parent's direction, in virtual pixels.
+---@field cross_size integer? Fixed size across it.
+---@field direction string? `container`: "row" or "column". Default "column".
+---@field gap integer? `container`: space between children.
+---@field padding integer? `container`: space inside its own edges.
+---@field align string? `container`: "start", "center", "end" or "stretch".
+---@field text string? `label`, `button`, `checkbox`.
+---@field hash integer[]? `image`: 32 bytes of content hash.
+---@field initial string? `text_input`: what is in it to begin with.
+---@field placeholder string? `text_input`: shown when empty.
+---@field checked boolean? `checkbox`.
+---@field min integer? `slider`.
+---@field max integer? `slider`.
+---@field value integer? `slider`.
+---@field options string[]? `dropdown`.
+---@field selected integer? `dropdown`: which option, one-based.
+---@field view string? `item_slot`, `item_grid`: which inventory view.
+---@field index integer? `item_slot`: which slot, one-based.
+---@field columns integer? `item_grid`: slots per row.
+---@field first integer? `item_grid`: the first slot shown, one-based.
+---@field count integer? `item_grid`: how many slots.
+---@field permille integer? `progress`: how full, 0 to 1000.
+
+---What a widget may say about how it looks. Deliberately small.
+---@class Tiamot.WidgetStyle
+---@field background integer[]? `{r, g, b}` or `{r, g, b, a}`.
+---@field border integer[]? Same shape. The width is the client's.
+---@field nine_slice integer[]? 32 bytes of content hash, stretched around the widget.
+---@field text_colour integer[]? Same shape as `background`.
+---@field text_size integer? In virtual pixels; the client keeps it legible.
+
+---Fields accepted by `game.show_dialog` and `game.update_dialog`.
+---@class Tiamot.DialogSpec
+---@field player string Required. The player's UUID — never their display name (charter rule 13).
+---@field form string Required. Your name for this dialog, namespaced with your mod id automatically.
+---@field tree Tiamot.Widget Required. The root widget.
+
+---Shows a dialog on a player's screen.
+---
+---**No code crosses the wire.** The tree is data; the client renders it and
+---executes nothing. That is why the widget set is fixed and why an unknown type
+---is an error here rather than something the client has to refuse.
+---
+---The dialog belongs to you: only your mod is told about its events, so no
+---other mod can watch what a player types into your text field or act on your
+---buttons. That is also why `form` is namespaced — two mods may both use
+---"inventory" without colliding.
+---
+---Returns whether the player was there to show it to, which is NOT a promise it
+---rendered.
+---@param spec Tiamot.DialogSpec
+---@return boolean shown
+function game.show_dialog(spec) end
+
+---Replaces the contents of a dialog already open.
+---
+---A whole tree, not a patch: a dialog is small, and a patch stream that ever
+---dropped a message would leave a player looking at something you do not
+---believe is there.
+---@param spec Tiamot.DialogSpec
+---@return boolean shown
+function game.update_dialog(spec) end
+
+---Closes a dialog you opened.
+---@param spec { player: string, form: string }
+---@return boolean closed
+function game.close_dialog(spec) end
+
+---Called when a player does something in one of YOUR dialogs.
+---
+---Only your own: a dialog's events are private to the mod that opened it.
+---
+---`event.kind` says what the player did, and which other fields are set:
+---
+---  - `"pressed"` — `name`
+---  - `"submitted"` — `name`, `text`
+---  - `"toggled"` — `name`, `checked`
+---  - `"slid"` — `name`, `value`
+---  - `"chose"` — `name`, `index` (one-based)
+---  - `"clicked"` — `view`, `index` (one-based), `click` ("left", "right", "shift_left")
+---  - `"closed"` — nothing else
+---
+---**Every one is a REQUEST, never a result.** A slot click says what the player
+---did with the mouse; whether any item moves is the server's decision, taken
+---against its own inventory. A client saying "I moved this" does not make it so.
+---@param callback fun(event: { player: string, form: string, kind: string, name: string?, text: string?, checked: boolean?, value: integer?, index: integer?, view: string?, click: string? })
+function game.register_on_dialog_event(callback) end
+
 ---Registers a sound. Registration window only.
 ---
 ---The file travels to clients by hash, through the same content pipeline a
