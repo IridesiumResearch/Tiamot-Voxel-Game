@@ -1935,18 +1935,20 @@ impl App {
     /// like walking and sprinting without the interval being tuned twice. A
     /// player standing still and turning makes no noise, which a timer would
     /// get wrong.
-    pub fn play_footsteps(&mut self) {
+    #[must_use]
+    pub fn play_footsteps(&mut self) -> Option<String> {
         /// Blocks between footfalls. Roughly a stride.
         const STRIDE: f32 = 2.2;
 
-        let Some(body) = self.predictor.as_ref().map(super::predict::Predictor::body) else {
-            return;
-        };
+        let body = self
+            .predictor
+            .as_ref()
+            .map(super::predict::Predictor::body)?;
         if !body.on_ground {
             // In the air. The distance travelled while falling does not count,
             // or landing after a long jump would fire several steps at once.
             self.stride = 0.0;
-            return;
+            return None;
         }
 
         let moved = {
@@ -1961,25 +1963,21 @@ impl App {
         // rather than firing a burst of steps.
         if moved > STRIDE {
             self.stride = 0.0;
-            return;
+            return None;
         }
         self.stride += moved;
         if self.stride < STRIDE {
-            return;
+            return None;
         }
         self.stride = 0.0;
 
         // What is under the foot, a little below it: standing ON a block means
         // the player's feet are at its top face, so sampling at the feet finds
         // the air they are standing in.
-        let Some(material) = self.material_under_feet() else {
-            return;
-        };
-        let Some(sound) = self.step_sounds.get(&material).cloned() else {
-            // A material no mod gave a voice. Silent, which is every material
-            // until somebody says otherwise (charter rule 1).
-            return;
-        };
+        let material = self.material_under_feet()?;
+        // A material no mod gave a voice is silent, which is every material
+        // until somebody says otherwise (charter rule 1).
+        let sound = self.step_sounds.get(&material).cloned()?;
 
         // At the listener, so it is centred and unattenuated: these are the
         // player's own feet, and panning them would be strange.
@@ -1990,15 +1988,24 @@ impl App {
         };
         self.mixer
             .play(&sound, crate::audio::Bus::Effects, placement);
+        Some(sound)
     }
 
     /// The material the player is standing on, if the chunk is loaded.
-    fn material_under_feet(&self) -> Option<u16> {
-        let body = self
-            .predictor
-            .as_ref()
-            .map(super::predict::Predictor::body)?;
-        let origin = self.camera.position.chunk;
+    pub fn material_under_feet(&self) -> Option<u16> {
+        let predictor = self.predictor.as_ref()?;
+        let body = predictor.body();
+        // **The predictor's origin, because that is the frame `body.position`
+        // is in.** `Predictor::origin` is defined as the chunk those local
+        // coordinates are relative to, and `settle` keeps them inside it.
+        //
+        // This read `self.camera.position.chunk` before. That is a presentation
+        // value — it follows the eye, and `follow_body` builds it in the frame
+        // the world is DRAWN in rather than the one the store is keyed by. It
+        // was measured to agree here in every case tried, teleport included, so
+        // this is not a bug being fixed; it is an incidental agreement being
+        // replaced by the frame the value actually belongs to.
+        let origin = predictor.origin();
         // A quarter of a block below the feet: inside the block being stood on
         // rather than in the air above it.
         let world = tiamot_core::ent::Transform::at(origin, body.position).to_world();
@@ -2008,9 +2015,6 @@ impl App {
             tiamot_core::detgen::floor_to_i32(world[2] as f32),
         );
         let chunk = self.store.get(block.chunk())?;
-        // The CELL under the foot, not the block: a chiselled block is mostly
-        // air, and a player standing on the one cell left of it is standing on
-        // that cell's material rather than on the block's nominal one.
         // The CELL under the foot, not the block: a chiselled block is mostly
         // air, and somebody standing on the one cell left of it is standing on
         // that cell's material rather than on the block's nominal one.
@@ -2023,6 +2027,17 @@ impl App {
         // on — the two beneath it are inside the ground.
         let cell = view.subnode_at(cell_of(world[0]), 2, cell_of(world[2]));
         (!cell.is_air()).then(|| cell.get())
+    }
+
+    /// The audio backend, to ask what it holds.
+    ///
+    /// Read-only, and the seam a test uses to ask the only question that
+    /// matters about a sound: did it reach the thing that plays it. The tables
+    /// can be perfect while the mixer is empty, which is exactly how two
+    /// delivery bugs stayed invisible.
+    #[must_use]
+    pub const fn mixer(&self) -> &crate::audio::Mixer {
+        &self.mixer
     }
 
     /// The audio backend, for the settings screen's volume sliders.

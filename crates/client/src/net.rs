@@ -906,20 +906,44 @@ async fn session(
                 total_len,
                 data,
             } => {
-                // A sound's file may be what just arrived. Checked before the
-                // material bookkeeping below, which only knows about textures.
-                if let Some(sound) = awaited_sounds.iter().find(|sound| sound.file == Some(hash)) {
-                    let sound = sound.clone();
-                    let cache = cache.clone();
-                    let events = events.clone();
-                    // Deferred by a beat so the slice is written first; the
-                    // helper simply does nothing if it is not there yet.
-                    tokio::spawn(async move {
-                        decode_when_ready(&sound, &cache, &events);
-                    });
-                }
                 match accept_slice(&mut pending, &cache, hash, offset, total_len, &data) {
-                    Ok(true) => pending.outstanding = pending.outstanding.saturating_sub(1),
+                    Ok(true) => {
+                        pending.outstanding = pending.outstanding.saturating_sub(1);
+                        // **A sound's file may be what just completed, and this
+                        // is the only moment it is safe to say so.**
+                        //
+                        // This used to run BEFORE `accept_slice`, on a spawned
+                        // task, on the reasoning that the spawn deferred it by
+                        // enough of a beat for the slice to be written first.
+                        // `tokio::spawn` promises no such ordering. When the
+                        // task won the race, `decode_when_ready` found nothing
+                        // in the cache, returned quietly — and nothing ever
+                        // retried, so that sound stayed silent for the whole
+                        // session while its file sat decoded-never in the cache.
+                        //
+                        // A per-sound race is the worst shape this could take:
+                        // it made some sounds work and others not, differently
+                        // each run, which reads like a mod problem rather than
+                        // a client one. `accept_slice` returns `Ok(true)` only
+                        // after `cache.put` has succeeded, so here the bytes are
+                        // certainly there. The decode itself still happens off
+                        // this task — `decode_when_ready` spawns it — so charter
+                        // rule 14's isolated worker is unchanged.
+                        //
+                        // **`filter`, not `find`.** Content is addressed by
+                        // hash, so two sounds whose files are byte-identical
+                        // share one — and the reference mods have exactly that
+                        // pair, `core_tools:break` and `core_tools:place`.
+                        // Decoding only the first left the second silent for
+                        // ever, which is the same silence as the race above and
+                        // a completely different cause.
+                        for sound in awaited_sounds
+                            .iter()
+                            .filter(|sound| sound.file == Some(hash))
+                        {
+                            decode_when_ready(sound, &cache, &events);
+                        }
+                    }
                     Ok(false) => {}
                     Err(reason) => {
                         pending.outstanding = pending.outstanding.saturating_sub(1);

@@ -1564,3 +1564,133 @@ fn the_frame_log_records_every_column_it_promises() {
         rows.len()
     );
 }
+
+/// Every sound a server registers reaches the mixer, and walking makes noise.
+///
+/// # Why this test exists
+///
+/// Two bugs, both silent, both found only because somebody played the game and
+/// said footsteps made no sound. Neither was in the footstep logic, which was
+/// correct the whole time — `play_footsteps` chose the right material and paced
+/// itself properly. The sounds simply were not there to play.
+///
+/// 1. **A race.** The decode was kicked off from the `ContentChunk` arm on a
+///    spawned task, BEFORE `accept_slice` wrote the bytes into the cache, on the
+///    reasoning that spawning deferred it far enough. It does not. When the task
+///    won, the decode found nothing, returned quietly, and nothing retried.
+/// 2. **A shared hash.** Content is addressed by content hash, and
+///    `core_tools:break` and `core_tools:place` ship byte-identical files. The
+///    dispatch used `find`, so the second sound was never decoded.
+///
+/// Both produced the same symptom and neither produced a warning. What makes
+/// them catchable is asserting on the MIXER — the place a sound has to reach to
+/// be audible — rather than on the tables, which were right in both cases and
+/// which is all the bot tests could see.
+#[test]
+fn every_registered_sound_reaches_the_mixer_and_walking_makes_noise() {
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("sounds-reach-the-mixer");
+    let mut app = client("sounds-reach-the-mixer", &server, gpu);
+    assert!(
+        run_frames(&mut app, |app| app.joined() && app.meshed_chunks() >= 4),
+        "the client never joined: {:?}",
+        app.warnings()
+    );
+
+    // Sounds are fetched AFTER the join — textures gate it, sound does not — so
+    // this waits for them rather than assuming they arrived with the world.
+    let arrived = run_frames(&mut app, |app| {
+        !app.sounds().is_empty()
+            && app
+                .sounds()
+                .iter()
+                .all(|sound| sound.file.is_none() || app.mixer().holds(&sound.id))
+    });
+    let table: Vec<(String, bool)> = app
+        .sounds()
+        .iter()
+        .map(|sound| (sound.id.clone(), sound.file.is_some()))
+        .collect();
+    assert!(
+        arrived,
+        "not every sound reached the mixer: {:?}, mixer holds {}",
+        table,
+        app.mixer().len()
+    );
+    assert!(
+        !table.is_empty(),
+        "the reference mods register sounds, so an empty table is a delivery failure"
+    );
+    // The pair that shares a content hash, named so a future change that makes
+    // them differ does not quietly retire the case they cover.
+    for id in ["core_tools:break", "core_tools:place"] {
+        assert!(
+            app.mixer().holds(id),
+            "{id} never reached the mixer; those two ship identical files and so share one hash"
+        );
+    }
+
+    // And the footstep path end to end: walking on the reference worldgen's
+    // terrain, which is `core:white`, and that block declares a step sound.
+    assert!(
+        app.mixer().holds("core:step"),
+        "the step sound never reached the mixer, so nothing walked on can be heard"
+    );
+    let walk = Input {
+        forward: 1.0,
+        ..Input::default()
+    };
+    let mut fired = 0usize;
+    for _ in 0..600 {
+        assert!(
+            app.pump_network(),
+            "the connection ended: {:?}",
+            app.warnings()
+        );
+        app.remesh();
+        app.advance(walk, 1.0 / 60.0);
+        if app.play_footsteps().is_some() {
+            fired += 1;
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    assert!(
+        fired > 0,
+        "walking across the world fired no footsteps at all"
+    );
+
+    // **And after a debug teleport**, which moves the frame the world is drawn
+    // in out from under the player. Footsteps read a block position out of the
+    // body's local coordinates, so anything that shifts a frame is worth one
+    // cheap assertion — this does NOT currently discriminate between the two
+    // origins that arithmetic could use (both were measured to work), it just
+    // pins that walking still makes noise 50,000 blocks out.
+    let jump = Input {
+        teleport: Some(Teleport::Far),
+        ..Input::default()
+    };
+    app.advance(jump, 1.0 / 60.0);
+    assert!(
+        run_frames(&mut app, |app| app.meshed_chunks() >= 4),
+        "the world never came back after the teleport: {:?}",
+        app.warnings()
+    );
+    let mut after = 0usize;
+    for _ in 0..600 {
+        assert!(
+            app.pump_network(),
+            "the connection ended: {:?}",
+            app.warnings()
+        );
+        app.remesh();
+        app.advance(walk, 1.0 / 60.0);
+        if app.play_footsteps().is_some() {
+            after += 1;
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    assert!(after > 0, "no footsteps fired after a debug teleport");
+
+    app.shutdown();
+    server.stop();
+}
