@@ -66,8 +66,11 @@ silence.
 **The mechanism:** a play call that returns a handle, and operations on it —
 stop, fade, set gain. That handle has to survive on both sides: the server knows
 it started a sound, the client owns the voice actually playing. A mod that
-crashes or unloads must not leave a sound running for ever, so handles need to
-die with their owner the way `game.storage` entries do.
+crashes or unloads must not leave a sound running for ever, so a handle has to
+be owned by something that ends — the entity, the player's session, the mod
+itself — and be cleaned up when that does. It is the OPPOSITE of
+`game.storage`, which is deliberately persistent and survives restarts: a held
+sound is session state and must never outlive the thing holding it.
 
 ## 3. A bus a mod can name
 
@@ -121,9 +124,11 @@ more than audio.
 
 "Wind in tree biomes" has no engine-side referent. `crates/core/src/detgen`
 provides seeded noise and nothing else, and
-`crates/core/tests/determinism.rs` asserts that the words `biome`, `tree`,
-`ore`, `cave` and `terrain` do not appear in the engine's noise layer — a test
-whose whole purpose is to keep content out of `core`.
+`determinism.rs`'s `detgen_contains_no_terrain_policy` reads every source file
+in `src/detgen` and fails if any of `grass dirt stone sand water biome tree ore
+cave terrain` appears in one — a test whose whole purpose is to keep content out
+of `core`, "because this is exactly the kind of thing that arrives one
+convenient helper at a time".
 
 A mod that wants wind in wooded country answers "is this wooded" from its own
 worldgen data. The engine's job is to make the *sound* expressible, and to let a
