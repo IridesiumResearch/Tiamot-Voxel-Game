@@ -267,6 +267,21 @@ impl Generator {
         }
     }
 
+    /// Tells the OWNING mod that something happened in its dialog.
+    ///
+    /// Named `did_` for the same reason as [`Self::did_action`]: the click has
+    /// happened and no mod can un-click it. What the click MEANS — whether a
+    /// stack moves — is decided after this, against the server's own inventory.
+    pub fn did_dialog_event(
+        &mut self,
+        event: &tiamot_core::script::DialogEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().dialog_event(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
     /// Tells the mods a flow was blocked.
     ///
     /// Nothing is being asked — the flow already failed — so the outcome

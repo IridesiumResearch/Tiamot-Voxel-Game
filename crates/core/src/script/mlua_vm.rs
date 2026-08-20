@@ -2552,7 +2552,13 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.entity_steppers", steppers)
             .map_err(|err| self.vm_error(&err))?;
-        for list in [DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS, ACTORS] {
+        // **Every list a `register_on_*` appends to.** A hook whose list is
+        // missing makes `hook_registrar` fail, which disables the mod at load
+        // with no clue as to why — which is exactly what `DIALOGISTS` did when
+        // it was added to the constants and forgotten here.
+        for list in [
+            DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS, ACTORS, DIALOGISTS,
+        ] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
             self.lua
                 .set_named_registry_value(list, table)
@@ -3864,6 +3870,44 @@ mod tests {
         load(&mut vm, "shop", source)?;
         let shown = screen.shown.lock().expect("lock").clone();
         Ok(shown)
+    }
+
+    #[test]
+    fn every_register_on_hook_can_actually_be_registered() {
+        // **The failure this catches has no useful symptom.** A `register_on_*`
+        // whose registry list was never created fails inside
+        // `hook_registrar`, so the MOD fails to load — and what a mod author
+        // sees is "errored in init.lua" pointing at a line that is fine.
+        //
+        // `register_on_dialog_event` did exactly that: the list constant was
+        // added, the table was not, and three bot tests hung waiting for a
+        // dialog from a mod that had been disabled at load.
+        //
+        // Enumerated rather than derived, so adding a hook and forgetting its
+        // list fails HERE, with a name.
+        let hooks = [
+            // The real names, taken from `game.set(...)` rather than from
+            // memory: the first draft of this test invented `register_on_dig`,
+            // which does not exist, and duly failed on a hook that was fine.
+            "register_on_dig_complete",
+            "register_on_place",
+            "register_on_punch",
+            "register_on_fluid_flow",
+            "register_on_player_join",
+            "register_on_action",
+            "register_on_dialog_event",
+        ];
+        for hook in hooks {
+            let mut vm = vm();
+            let source = format!("game.{hook}(function(event) end)");
+            if let Err(err) = load(&mut vm, "t", &source) {
+                let (ScriptError::Load { detail, .. } | ScriptError::Runtime { detail, .. }) = &err
+                else {
+                    panic!("`{hook}`: {err:?}");
+                };
+                panic!("`{hook}` could not be registered: {detail}");
+            }
+        }
     }
 
     #[test]

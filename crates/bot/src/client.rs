@@ -1391,6 +1391,48 @@ impl Bot {
             })
     }
 
+    /// Every dialog the server has opened or replaced, in arrival order.
+    #[must_use]
+    pub fn dialogs(&self) -> Vec<(String, tiamot_core::ui::Tree)> {
+        self.received()
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerMessage::ShowDialog { form, tree }
+                | ServerMessage::UpdateDialog { form, tree } => Some((form, tree)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every dialog the server has closed.
+    #[must_use]
+    pub fn closed_dialogs(&self) -> Vec<String> {
+        self.received()
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerMessage::CloseDialog { form } => Some(form),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sends a raw dialog event, exactly as a client would.
+    ///
+    /// **The forgery seam.** A test uses this to send an event for a form the
+    /// server never opened, or a slot nobody owns — which is what a hostile
+    /// client does, and what the server has to survive.
+    pub async fn dialog_event(
+        &mut self,
+        form: &str,
+        event: tiamot_core::proto::DialogEvent,
+    ) -> Result<(), BotError> {
+        self.send(&tiamot_core::proto::ClientMessage::DialogEvent {
+            form: form.to_owned(),
+            event,
+        })
+        .await
+    }
+
     pub async fn action(&mut self, id: &str, pressed: bool) -> Result<(), BotError> {
         self.send(&tiamot_core::proto::ClientMessage::Action {
             id: id.to_owned(),
@@ -1508,7 +1550,14 @@ impl Bot {
     }
 
     /// Whether a matching block delta has been seen.
-    fn saw_block(&self, pos: tiamot_core::BlockPos, material: u16) -> bool {
+    /// Whether a block delta for this position and material has arrived.
+    ///
+    /// Public so a test can assert a mark did NOT appear — the shape every
+    /// "the server refused it" test needs, and one `expect_block` cannot give
+    /// because waiting for something that should never happen has no deadline
+    /// that means anything.
+    #[must_use]
+    pub fn saw_block(&self, pos: tiamot_core::BlockPos, material: u16) -> bool {
         self.received().iter().rev().any(|message| {
             matches!(
                 message,

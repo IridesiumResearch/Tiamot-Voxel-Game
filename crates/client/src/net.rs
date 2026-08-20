@@ -364,6 +364,15 @@ pub enum Command {
         /// The cell under the crosshair, or `None` to cancel.
         target: Option<tiamot_core::SubNodePos>,
     },
+    /// Report something a player did in a dialog.
+    ///
+    /// A request, never a result — the server decides what it means.
+    Dialog {
+        /// Which dialog.
+        form: String,
+        /// What happened.
+        event: tiamot_core::proto::DialogEvent,
+    },
     /// Hit an entity the crosshair is on.
     Punch {
         /// The entity, as the server named it when it spawned.
@@ -1348,6 +1357,7 @@ fn to_wire(command: Command) -> ClientMessage {
         },
         Command::Place { target, material } => ClientMessage::Place { target, material },
         Command::Action { id, pressed } => ClientMessage::Action { id, pressed },
+        Command::Dialog { form, event } => ClientMessage::DialogEvent { form, event },
         Command::Disconnect => ClientMessage::Disconnect,
         // Unreachable: the session loop applies it and never gets here. A
         // panic rather than a placeholder message, because sending SOMETHING

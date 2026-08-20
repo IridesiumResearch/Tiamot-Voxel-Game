@@ -132,6 +132,19 @@ pub enum Action {
         pressed: bool,
     },
 
+    /// Something happened in a dialog.
+    ///
+    /// The session checks the phase and the protocol's length caps and nothing
+    /// else. Whether this form is open, whether the player owns it, and what a
+    /// slot click MEANS are all questions about server state — see the server's
+    /// handler.
+    Dialog {
+        /// Which dialog.
+        form: String,
+        /// What the player did.
+        event: crate::proto::DialogEvent,
+    },
+
     /// Record a movement/look input for the next tick.
     Input {
         /// The tick the client believes it is on.
@@ -348,6 +361,10 @@ impl Session {
             ClientMessage::CancelDig => Response::act(Action::Dig { target: None }),
             ClientMessage::Punch { entity } => Response::act(Action::Punch { entity: *entity }),
             ClientMessage::Action { id, pressed } => Response::act(Action::pressed(id, *pressed)),
+            ClientMessage::DialogEvent { form, event } => Response::act(Action::Dialog {
+                form: form.clone(),
+                event: event.clone(),
+            }),
             ClientMessage::SelectTool { tool } => {
                 Response::act(Action::SelectTool { tool: tool.clone() })
             }

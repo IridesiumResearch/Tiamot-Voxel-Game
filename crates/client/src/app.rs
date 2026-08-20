@@ -129,6 +129,15 @@ const FLAT_DAYLIGHT: crate::shade::Uniform =
 /// How far behind the player the third-person camera sits, in blocks.
 const THIRD_PERSON_DISTANCE: f64 = 4.0;
 
+/// Most dialog events held while waiting to send them.
+///
+/// A player mashing buttons on a stalled connection must not grow this without
+/// limit. Generous for anything a human does between two network sends, and
+/// finite against a client that cannot reach its server at all — the oldest are
+/// kept and the excess dropped, because the first click is the one that meant
+/// something.
+const MAX_QUEUED_DIALOG_EVENTS: usize = 256;
+
 const INPUT_LEAD: u64 = 4;
 
 /// One frame's row in the per-frame log, and where it is going.
@@ -679,6 +688,12 @@ pub struct App {
     bindings: crate::input::Bindings,
     /// Every sound the server's mods registered.
     sounds: Vec<tiamot_core::proto::SoundDef>,
+    /// Dialog events the player has raised and the server has not been told.
+    ///
+    /// Queued rather than sent immediately for the reason every other client
+    /// message is: sending happens on the network side, and the renderer runs
+    /// inside a frame.
+    dialog_events: Vec<crate::dialog::Raised>,
     /// Dialogs the server has open on this player's screen, by form name.
     ///
     /// A `BTreeMap` so the draw order is the same every frame: two dialogs
@@ -937,6 +952,7 @@ impl App {
             bindings,
             sounds: Vec::new(),
             dialogs: std::collections::BTreeMap::new(),
+            dialog_events: Vec::new(),
             mixer,
             heard: Vec::new(),
             step_sounds: std::collections::BTreeMap::new(),
@@ -1882,6 +1898,46 @@ impl App {
             None => {
                 self.dialogs.remove(&form);
             }
+        }
+    }
+
+    /// Sends every queued dialog event to the server.
+    ///
+    /// Called once a frame, after the dialogs have been drawn. Only for forms
+    /// the server actually has open: a client that raised an event for a dialog
+    /// closed in the meantime is describing something that no longer exists,
+    /// and the server would refuse it anyway.
+    pub fn flush_dialog_events(&mut self) {
+        for raised in std::mem::take(&mut self.dialog_events) {
+            let closing = matches!(raised.event, tiamot_core::proto::DialogEvent::Closed);
+            if !closing && !self.dialogs.contains_key(&raised.form) {
+                continue;
+            }
+            self.connection.send(crate::net::Command::Dialog {
+                form: raised.form,
+                event: raised.event,
+            });
+        }
+    }
+
+    /// Takes the dialog events raised since the last call, to send them.
+    ///
+    /// Drained rather than read: each one is a request the server acts on once,
+    /// and a frame that read the list twice would ask twice.
+    pub fn take_dialog_events(&mut self) -> Vec<crate::dialog::Raised> {
+        std::mem::take(&mut self.dialog_events)
+    }
+
+    /// Records what a player did to a dialog.
+    ///
+    /// Bounded by [`MAX_QUEUED_DIALOG_EVENTS`]: a client that cannot reach its
+    /// server must not grow this without limit while it tries.
+    pub fn raise_dialog_events(&mut self, events: Vec<crate::dialog::Raised>) {
+        for event in events {
+            if self.dialog_events.len() >= MAX_QUEUED_DIALOG_EVENTS {
+                return;
+            }
+            self.dialog_events.push(event);
         }
     }
 

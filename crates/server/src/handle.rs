@@ -868,6 +868,7 @@ impl ServerHandle {
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
             actions: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            dialog_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -1028,6 +1029,9 @@ impl ServerHandle {
                     // it is deliberately lent.
                     let sight = crate::lease::Lease::new();
 
+                    // Who owns each open dialog, for routing its events back.
+                    // `None` on a server with no mods, which cannot open one.
+                    let mut dialog_screens: Option<std::sync::Arc<Screens>> = None;
                     // Either the mods generate terrain, or there are no mods
                     // and the world is air. Both are legitimate.
                     let mut source = match host {
@@ -1108,6 +1112,20 @@ impl ServerHandle {
                                 .set_sound_access(std::sync::Arc::new(Earshot {
                                     shared: std::sync::Arc::clone(&shared),
                                 }));
+                            // And whose screen a mod's dialogs open on. Kept
+                            // by this loop as well as by the VM, because
+                            // routing an event back needs the owner and the
+                            // VM's copy is behind the script boundary.
+                            let screens = std::sync::Arc::new(Screens {
+                                shared: std::sync::Arc::clone(&shared),
+                                owners: std::sync::Mutex::new(
+                                    std::collections::BTreeMap::new(),
+                                ),
+                            });
+                            host.vm_mut()
+                                .set_dialog_access(std::sync::Arc::clone(&screens)
+                                    as std::sync::Arc<dyn tiamot_core::ui::host::Access>);
+                            dialog_screens = Some(std::sync::Arc::clone(&screens));
                             crate::world::Generator::Mods(Box::new(
                                 crate::world::ModGenerator::new(host),
                             ))
@@ -1386,6 +1404,18 @@ impl ServerHandle {
                                             .and_then(|online| online.get(uuid).cloned())
                                             .unwrap_or_default(),
                                     });
+                                }
+                            }
+                            // A player who left takes their open dialogs with
+                            // them. Without this the owner map keeps a row per
+                            // form per player for the life of the server, and a
+                            // rejoining player could receive an event routed by
+                            // an ownership nobody holds any more.
+                            if let Some(screens) = dialog_screens.as_ref() {
+                                for uuid in &known_players {
+                                    if !present.contains(uuid) {
+                                        screens.forget_player(&uuid.to_hex());
+                                    }
                                 }
                             }
                             known_players.retain(|uuid| present.contains(uuid));
@@ -2031,6 +2061,46 @@ impl ServerHandle {
                             }
                         }
 
+                        // And the dialogs. Delivered to the OWNER alone —
+                        // `Screens` recorded who opened each form, and an
+                        // event for a form nobody owns is a client describing
+                        // a dialog that is not open, which is dropped rather
+                        // than guessed at.
+                        for (uuid, form, event) in shared.drain_dialog_events() {
+                            let player = uuid.to_hex();
+                            let Some(owner) = dialog_screens
+                                .as_ref()
+                                .and_then(|screens| screens.owner_of(&player, &form))
+                            else {
+                                continue;
+                            };
+                            let closing = matches!(
+                                event,
+                                tiamot_core::proto::DialogEvent::Closed
+                            );
+                            let verdict =
+                                source.did_dialog_event(&tiamot_core::script::DialogEvent {
+                                    player: *uuid.as_bytes(),
+                                    mod_id: owner,
+                                    form: form.clone(),
+                                    event,
+                                });
+                            for (mod_id, err) in &verdict.faults {
+                                error!(mod_id = %mod_id, "mod disabled after an on_dialog_event failure: {err}");
+                            }
+                            // A player closing a dialog closes it, whatever the
+                            // mod does about it. Otherwise a mod that ignored
+                            // the event would leave the form owned for ever and
+                            // the player unable to reopen it.
+                            if closing && let Some(screens) = dialog_screens.as_ref() {
+                                tiamot_core::ui::host::Access::close(
+                                    screens.as_ref(),
+                                    &player,
+                                    &form,
+                                );
+                            }
+                        }
+
                         // **The mods' own entity logic, before the physics.**
                         //
                         // A mod sets `drive` and the step that follows acts on
@@ -2514,6 +2584,96 @@ impl tiamot_core::dig::Tools for HeldTools {
         }
         self.shared.select_tool(&uuid, tool.map(ToOwned::to_owned));
         true
+    }
+}
+
+/// `game.show_dialog`, delivered to one player.
+///
+/// The seam from [`tiamot_core::ui::host::Access`]. Unlike a sound, there is no
+/// deciding who to tell: a dialog is opened on one screen, by UUID, and nobody
+/// else is told it exists.
+///
+/// **Who owns which form is recorded here**, because that is what routes the
+/// events back. A dialog's events go to the mod that opened it and to no other
+/// (see `ui::host::Owner`), and the only way to know the owner later is to have
+/// written it down when it opened.
+struct Screens {
+    shared: std::sync::Arc<crate::transport::endpoint::Shared>,
+    /// Who opened each open dialog, by (player UUID, form).
+    owners: std::sync::Mutex<std::collections::BTreeMap<(String, String), String>>,
+}
+
+impl Screens {
+    /// The mod that owns an open dialog, if one does.
+    fn owner_of(&self, player: &str, form: &str) -> Option<String> {
+        self.owners
+            .lock()
+            .ok()?
+            .get(&(player.to_owned(), form.to_owned()))
+            .cloned()
+    }
+
+    /// Forgets every dialog a departing player had open.
+    fn forget_player(&self, player: &str) {
+        if let Ok(mut owners) = self.owners.lock() {
+            owners.retain(|(uuid, _), _| uuid != player);
+        }
+    }
+}
+
+impl tiamot_core::ui::host::Access for Screens {
+    fn show(&self, request: &tiamot_core::ui::host::ShowRequest) -> bool {
+        // The owner is the namespace of the form, which `qualify_id` has
+        // already guaranteed is the calling mod's own.
+        let owner = request
+            .form
+            .split_once(':')
+            .map_or_else(|| request.form.clone(), |(owner, _)| owner.to_owned());
+        let message = if request.update {
+            tiamot_core::proto::ServerMessage::UpdateDialog {
+                form: request.form.clone(),
+                tree: request.tree.clone(),
+            }
+        } else {
+            tiamot_core::proto::ServerMessage::ShowDialog {
+                form: request.form.clone(),
+                tree: request.tree.clone(),
+            }
+        };
+        // A mod names a player by their canonical UUID hex (charter rule 13).
+        // A name that is not one is a mod's mistake, and the honest answer is
+        // "nobody was shown it" rather than an error nobody can act on.
+        let Ok(uuid) = tiamot_core::identity::PlayerUuid::from_hex(&request.player) else {
+            return false;
+        };
+        // **`push_entity_messages` returns whether the queue OVERFLOWED**, not
+        // whether it sent — a bare `bool` whose `true` is the failure. Read
+        // the other way round, this recorded no owners at all and every event
+        // came back to a dialog nobody owned.
+        let overflowed = self
+            .shared
+            .push_entity_messages(&uuid, std::iter::once(message));
+        if !overflowed && let Ok(mut owners) = self.owners.lock() {
+            owners.insert((request.player.clone(), request.form.clone()), owner);
+        }
+        !overflowed
+    }
+
+    fn close(&self, player: &str, form: &str) -> bool {
+        let was_open = self.owners.lock().is_ok_and(|mut owners| {
+            owners
+                .remove(&(player.to_owned(), form.to_owned()))
+                .is_some()
+        });
+        if let Ok(uuid) = tiamot_core::identity::PlayerUuid::from_hex(player) {
+            let _ = self.shared.push_entity_messages(
+                &uuid,
+                std::iter::once(tiamot_core::proto::ServerMessage::CloseDialog {
+                    form: form.to_owned(),
+                }),
+            );
+        }
+        was_open
     }
 }
 

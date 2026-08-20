@@ -144,6 +144,9 @@ struct Surface {
     egui: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    /// Local state for the server's dialogs — what is half-typed into a field,
+    /// which is the client's business and not the server's.
+    dialogs: client::dialog::Dialogs,
     size: (u32, u32),
 }
 
@@ -556,6 +559,7 @@ impl Client {
             egui,
             egui_state,
             egui_renderer,
+            dialogs: client::dialog::Dialogs::default(),
             size,
         })
     }
@@ -652,6 +656,8 @@ impl Client {
         // kira's thread, which is the point of kira having one.
         surface.app.play_heard();
         let _ = surface.app.play_footsteps();
+        // After the HUD raised them last frame; before the next draw does.
+        surface.app.flush_dialog_events();
 
         let phase = std::time::Instant::now();
         surface.app.remesh();
@@ -928,11 +934,21 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     let joined = surface.app.joined();
 
     let settings_open = surface.app.settings_open();
+    let size = (
+        surface.window.inner_size().width as f32,
+        surface.window.inner_size().height as f32,
+    );
     let output = surface.egui.run_ui(raw, |root| {
         let context = root.ctx().clone();
         if settings_open {
             draw_settings(&mut surface.app, &context);
         }
+        // **Server dialogs, drawn from data.** Nothing here executes anything a
+        // server sent: `client::dialog` walks the tree and the rectangles
+        // `core::ui` computed for it. See that module for why the layout is
+        // not egui's.
+        let raised = surface.dialogs.draw(&context, surface.app.dialogs(), size);
+        surface.app.raise_dialog_events(raised);
         egui::Area::new(egui::Id::new("hud"))
             .fixed_pos(egui::pos2(8.0, 8.0))
             .interactable(false)

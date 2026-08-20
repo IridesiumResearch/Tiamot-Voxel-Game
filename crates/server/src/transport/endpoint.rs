@@ -156,6 +156,10 @@ pub struct Shared {
     /// other thing a client asks for: running a Lua hook on the network thread
     /// would put a mod's runtime inside a connection's read loop.
     pub actions: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, String, bool)>>,
+    /// Dialog events waiting for the tick to hand to the owning mods.
+    pub dialog_events: std::sync::Mutex<
+        std::collections::VecDeque<(PlayerUuid, String, tiamot_core::proto::DialogEvent)>,
+    >,
 
     /// World edits queued by the operator rather than by a player.
     ///
@@ -953,6 +957,41 @@ impl Shared {
         true
     }
 
+    /// Queues a dialog event for the tick to hand to the owning mod.
+    ///
+    /// **Queued rather than delivered here**, the same as every other thing a
+    /// client asks for: mods run on the tick thread, in a fixed order, and two
+    /// connection tasks calling into the VM at once would resolve in whichever
+    /// order the OS woke them.
+    ///
+    /// Bounded like the action queue. A client clicking a button as fast as it
+    /// can must not be able to make the server hold an unbounded list.
+    pub fn queue_dialog_event(
+        &self,
+        actor: PlayerUuid,
+        form: String,
+        event: tiamot_core::proto::DialogEvent,
+    ) -> bool {
+        let Ok(mut queue) = self.dialog_events.lock() else {
+            return false;
+        };
+        if queue.len() >= MAX_QUEUED_EDITS {
+            return false;
+        }
+        queue.push_back((actor, form, event));
+        true
+    }
+
+    /// Takes the dialog events waiting to be handed to the mods.
+    pub fn drain_dialog_events(
+        &self,
+    ) -> Vec<(PlayerUuid, String, tiamot_core::proto::DialogEvent)> {
+        self.dialog_events
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
     /// Takes the actions waiting to be handed to the mods.
     pub fn drain_actions(&self) -> Vec<(PlayerUuid, String, bool)> {
         self.actions
@@ -1644,6 +1683,11 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     shared.queue_action(uuid, id.clone(), *pressed);
                 }
             }
+            Action::Dialog { form, event } => {
+                if let Some(uuid) = session.uuid() {
+                    shared.queue_dialog_event(uuid, form.clone(), event.clone());
+                }
+            }
             Action::SelectTool { tool } => {
                 if let Some(uuid) = session.uuid() {
                     shared.select_tool(&uuid, tool.clone());
@@ -1826,6 +1870,7 @@ mod tests {
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
             actions: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            dialog_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             outbound: tokio::sync::broadcast::channel(16).0,

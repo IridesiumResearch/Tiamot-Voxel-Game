@@ -40,6 +40,7 @@ pub mod audio;
 pub mod cache;
 pub mod camera;
 pub mod config;
+pub mod dialog;
 pub mod entities;
 pub mod input;
 pub mod mesher;
