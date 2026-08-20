@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -373,6 +373,12 @@ pub struct ActionDef {
 pub struct SoundDef {
     /// The qualified id, e.g. `"core_tools:break"`.
     pub id: String,
+    /// The mod that registered it, for attribution in the UI.
+    ///
+    /// Carried rather than split back out of `id`, so the settings screen
+    /// attributes a sound the same way it attributes a binding: from what the
+    /// server said, not from a client-side guess about a namespace.
+    pub mod_id: String,
     /// The content hash of the audio file, or `None` if the mod named one that
     /// is not in its directory — the client plays nothing rather than guessing.
     pub file: Option<ContentHash>,
@@ -1388,6 +1394,7 @@ fn check_sounds(sounds: &[SoundDef]) -> Result<(), ProtocolError> {
     check_len("sound_table", sounds.len(), MAX_SOUNDS)?;
     for sound in sounds {
         check_len("sound_id", sound.id.len(), MAX_ID_BYTES)?;
+        check_len("sound_mod_id", sound.mod_id.len(), MAX_ID_BYTES)?;
     }
     Ok(())
 }

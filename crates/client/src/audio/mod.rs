@@ -40,3 +40,66 @@ pub fn decode_isolated(bytes: &[u8], limits: Limits) -> Result<Clip, AudioError>
         ))
     })
 }
+
+/// Sounds grouped by the mod that registered them, for the settings screen.
+///
+/// **The attribution criterion, the sound half.** Its twin is
+/// [`crate::input::Actions::by_source`], and the two agree deliberately: groups
+/// come out in first-appearance order, so mods appear in load order rather than
+/// alphabetically, and the answer comes from what the server said rather than
+/// from splitting a namespace back out of an id.
+///
+/// A borrowed view, because the screen only reads it — the table itself belongs
+/// to the session and is replaced wholesale when a player joins somewhere else.
+#[must_use]
+pub fn by_mod(
+    sounds: &[tiamot_core::proto::SoundDef],
+) -> Vec<(&str, Vec<&tiamot_core::proto::SoundDef>)> {
+    let mut groups: Vec<(&str, Vec<&tiamot_core::proto::SoundDef>)> = Vec::new();
+    for sound in sounds {
+        if let Some(group) = groups.iter_mut().find(|(id, _)| *id == sound.mod_id) {
+            group.1.push(sound);
+        } else {
+            groups.push((&sound.mod_id, vec![sound]));
+        }
+    }
+    groups
+}
+
+#[cfg(test)]
+mod tests {
+    use tiamot_core::proto::SoundDef;
+
+    fn sound(id: &str, mod_id: &str) -> SoundDef {
+        SoundDef {
+            id: id.to_owned(),
+            mod_id: mod_id.to_owned(),
+            file: None,
+            gain: 1.0,
+            pitch_variance: 0.0,
+        }
+    }
+
+    /// Every sound lands under the mod that registered it, and a mod that
+    /// registered several appears once.
+    #[test]
+    fn sounds_group_under_the_mod_that_registered_them() {
+        let sounds = [
+            sound("core_tools:break", "core_tools"),
+            sound("core_milk:splash", "core_milk"),
+            sound("core_tools:place", "core_tools"),
+        ];
+        let groups = super::by_mod(&sounds);
+        assert_eq!(groups.len(), 2, "two mods, two groups");
+        assert_eq!(groups[0].0, "core_tools", "load order, not alphabetical");
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, "core_milk");
+        assert_eq!(groups[1].1.len(), 1);
+    }
+
+    /// A server whose mods make no noise is the ordinary case, not an error.
+    #[test]
+    fn no_sounds_is_no_groups() {
+        assert!(super::by_mod(&[]).is_empty());
+    }
+}

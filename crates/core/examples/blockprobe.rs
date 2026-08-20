@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Iridesium
+// SPDX-License-Identifier: GPL-3.0-only
+
 use tiamot_core::script::ScriptVm;
 
 fn main() {

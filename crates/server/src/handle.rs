@@ -636,6 +636,7 @@ impl ServerHandle {
                 }
                 tiamot_core::proto::SoundDef {
                     id: sound.id,
+                    mod_id: sound.mod_id,
                     file,
                     gain: sound.gain,
                     pitch_variance: sound.pitch_variance,

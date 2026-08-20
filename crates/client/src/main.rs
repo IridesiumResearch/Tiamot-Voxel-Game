@@ -710,6 +710,45 @@ fn elapsed_ms(since: std::time::Instant) -> f32 {
     since.elapsed().as_secs_f32() * 1000.0
 }
 
+/// Lists every sound a server's mods registered, under the mod that asked for it.
+///
+/// **The attribution criterion, the sound half** — its twin is the binding list
+/// above, and [`client::audio::by_mod`] is the one place that decides who owns
+/// what. Collapsed by default: a player opens this screen to change a control
+/// or a volume, and consults the list only when they want to know what a
+/// server has taught the client to say.
+///
+/// A sound whose file the server never had is called out rather than hidden.
+/// The client plays nothing for it, and silence with no explanation is the
+/// hardest kind of audio fault to report.
+fn draw_sound_attribution(app: &App, ui: &mut egui::Ui) {
+    let groups = client::audio::by_mod(app.sounds());
+    ui.separator();
+    let heading = if groups.is_empty() {
+        "sounds — none; this server's mods make no noise".to_owned()
+    } else {
+        format!("sounds ({})", app.sounds().len())
+    };
+    egui::CollapsingHeader::new(heading)
+        .id_salt("sound-attribution")
+        .show(ui, |ui| {
+            for (mod_id, sounds) in &groups {
+                ui.heading(*mod_id);
+                for sound in sounds {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([300.0, 18.0], egui::Label::new(&sound.id).truncate());
+                        if sound.file.is_none() {
+                            ui.label(
+                                egui::RichText::new("file missing").color(egui::Color32::LIGHT_RED),
+                            );
+                        }
+                    });
+                }
+                ui.separator();
+            }
+        });
+}
+
 /// Draws the controls screen, and applies whatever the player clicked.
 ///
 /// **Every binding says which mod asked for it** — that is Task 13's
@@ -847,6 +886,8 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
                         .color(egui::Color32::LIGHT_YELLOW),
                 );
             }
+
+            draw_sound_attribution(app, ui);
 
             ui.separator();
             ui.horizontal(|ui| {
