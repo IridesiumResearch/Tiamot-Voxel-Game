@@ -14,6 +14,10 @@
 //! drops. [`break_block`] is the conservation law, and the property test
 //! `units_conserved` asserts it against arbitrary block contents.
 
+pub mod slots;
+
+pub use slots::{Grab, Slots, View};
+
 use crate::UNITS_PER_BLOCK;
 use crate::block::{BlockView, SUBNODES_PER_BLOCK};
 use crate::material::MaterialId;
