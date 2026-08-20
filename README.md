@@ -64,6 +64,32 @@ plan to support it.
 
 ## Building
 
+### System dependencies
+
+**On Linux, the client needs ALSA's headers**, because that is the operating
+system's audio API and the client links an audio backend:
+
+```sh
+sudo apt install pkg-config libasound2-dev        # Debian, Ubuntu
+sudo dnf install pkgconf-pkg-config alsa-lib-devel # Fedora
+sudo pacman -S pkgconf alsa-lib                    # Arch
+```
+
+Without them the build fails in `alsa-sys`'s build script with *"The pkg-config
+command could not be found"* or a missing `alsa.pc`, long before any Tiamot code
+compiles.
+
+This is **not** an exception to charter rule 14's pure-Rust decoder policy. That
+rule governs the *asset* path, where a stranger's bytes are parsed; ALSA decodes
+nothing and every byte a server sends still goes through Symphonia. See
+[`docs/float-determinism.md`](docs/float-determinism.md) for the audio section.
+
+**Windows and macOS need nothing extra** — WASAPI and CoreAudio ship with the
+system. **The server needs none of this on any platform**: it is headless, links
+no audio backend, and `cargo build -p server` works on a bare machine.
+
+### Then
+
 ```sh
 cargo build --workspace
 cargo test --workspace

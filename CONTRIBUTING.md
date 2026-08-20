@@ -39,6 +39,10 @@ sign-off.
 
 ## Before you open a pull request
 
+On Linux, install the client's system dependencies first — see
+[README's *System dependencies*](README.md#system-dependencies). Without them
+the build fails inside `alsa-sys` before any Tiamot code compiles.
+
 Run what CI runs:
 
 ```
