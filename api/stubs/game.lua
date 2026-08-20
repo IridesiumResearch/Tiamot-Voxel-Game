@@ -460,7 +460,7 @@ function game.set_tool(player, tool) end
 ---Fields accepted by `game.register_sound`.
 ---@class Tiamot.SoundSpec
 ---@field id string Required. Namespaced with your mod id automatically.
----@field file string Required. Path inside your mod directory, e.g. "sounds/break.ogg". Ogg Vorbis.
+---@field file string Required. Path inside your mod directory, e.g. "sounds/break.ogg". Ogg Vorbis or WAV — see the limits below.
 ---@field gain number? Loudness multiplier on the file's own level. Default 1.
 ---@field pitch_variance number? How much to vary the pitch each play, as a fraction. Default 0, which makes a repeated sound machine-like.
 
@@ -468,7 +468,22 @@ function game.set_tool(player, tool) end
 ---
 ---The file travels to clients by hash, through the same content pipeline a
 ---block texture uses — you ship the file in your mod directory and the engine
----does the rest.
+---does the rest. Two mods shipping byte-identical files send those bytes once.
+---
+---**Formats: Ogg Vorbis or WAV, and prefer Ogg.** A client decodes files from
+---servers it has no reason to trust, so the WAV path refuses anything whose
+---structure has more than one reading: exactly one `fmt ` chunk, a RIFF size
+---that matches the file, and chunks that account for it exactly. A WAV straight
+---out of an encoder passes; one carrying trailing editor metadata may not.
+---
+---**Limits, all checked before anything is allocated:** 4 MiB per file, at most
+---8 channels, at most 192 kHz, and at most a minute at 48 kHz. Anything longer
+---is music, which wants streaming rather than a decoded buffer, and streaming
+---does not exist yet.
+---
+---A file that is missing, oversized or malformed disables that ONE sound, with
+---a warning naming the server. It never refuses the join and never stops the
+---client.
 ---@param spec Tiamot.SoundSpec
 function game.register_sound(spec) end
 
