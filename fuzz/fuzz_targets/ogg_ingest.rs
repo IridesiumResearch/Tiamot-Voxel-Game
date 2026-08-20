@@ -26,9 +26,15 @@
 //! **Seeding**: a fuzzer starting from random bytes spends its entire budget
 //! failing the `OggS` magic check. There is no Vorbis ENCODER in this
 //! repository — the trick the glTF target uses, of building a model in Rust and
-//! emitting one, has no equivalent here — so the corpus wants a real `.ogg`
-//! dropped into `fuzz/corpus/ogg_ingest/` before this finds anything deep.
-//! Until then it explores the container parser, which is itself hostile input.
+//! emitting one, has no equivalent here — so `tone.ogg` is COMMITTED to
+//! `fuzz/corpus/ogg_ingest/` rather than generated. It is worth what it costs:
+//! seeded, this target covers **3,312 edges against 930** without it, which is
+//! the difference between exercising the container parser and reaching the
+//! Vorbis decoder underneath.
+//!
+//! The `regression-*.wav` seeds are inputs that have crashed this target. Both
+//! were WAVs, not Oggs — `decode` accepts two containers and this fuzzes all of
+//! it, which the name does not say.
 //!
 //! Run: `cargo +nightly fuzz run ogg_ingest`
 #![no_main]

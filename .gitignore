@@ -29,7 +29,8 @@
 # files are the seed set (`cargo run -p client --example write_reference_sounds`)
 # plus anything that has ever crashed the decoder. `.ogg` is listed as well as
 # `.wav` because a real Vorbis file is the seed this most wants and cannot
-# generate — see `fuzz/fuzz_targets/ogg_ingest.rs`.
+# generate — `tone.ogg` is committed for exactly that reason. See
+# `fuzz/fuzz_targets/ogg_ingest.rs`.
 /fuzz/corpus/ogg_ingest/*
 !/fuzz/corpus/ogg_ingest/*.wav
 !/fuzz/corpus/ogg_ingest/*.ogg

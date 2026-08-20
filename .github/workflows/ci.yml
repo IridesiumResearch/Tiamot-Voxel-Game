@@ -248,10 +248,9 @@ jobs:
       # client decodes sound files pushed by servers it does not trust. Lands in
       # the same task the decoder does rather than being deferred to hardening.
       #
-      # NOT well seeded yet: there is no Vorbis encoder in this repository, so
-      # the corpus has no valid `.ogg` to mutate and this mostly exercises the
-      # container parser. That is still hostile input, and the seed gap is
-      # recorded in the target's own docs.
+      # Seeded with a committed `tone.ogg`, because nothing here can encode
+      # Vorbis. That seed is what makes this reach the decoder rather than
+      # stopping at the container parser — 3,312 edges against 930 without it.
       - name: Fuzz the Ogg decoder (smoke)
         run: |
           cargo +nightly fuzz run ogg_ingest \

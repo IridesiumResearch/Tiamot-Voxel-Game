@@ -705,26 +705,34 @@ mod tests {
         assert!(outcome.is_err(), "garbage decoded to a clip");
     }
 
-    /// Where a real Ogg Vorbis file goes, if somebody puts one there.
+    /// A real Ogg Vorbis file — a one-second 440 Hz tone with a 10 ms fade at
+    /// each end so the encoder is not handed a click.
+    ///
+    /// Committed rather than generated, because nothing in this repository can
+    /// encode Vorbis. To remake it:
+    ///
+    /// ```text
+    /// oggenc -q 3 -o crates/client/tests/fixtures/tone.ogg tone.wav
+    /// # or, with ffmpeg:
+    /// ffmpeg -f lavfi -i "sine=frequency=440:duration=1" \
+    ///        -c:a libvorbis crates/client/tests/fixtures/tone.ogg
+    /// ```
+    ///
+    /// The same file is in `fuzz/corpus/ogg_ingest/` — the seed that lets the
+    /// fuzz target reach the Vorbis decoder instead of stopping at the
+    /// container parser.
     const FIXTURE: &str = "tests/fixtures/tone.ogg";
 
     #[test]
     fn a_real_ogg_file_decodes_to_samples() {
-        // **The gap worth naming.** Every other test here proves this decoder
-        // REFUSES things. None of them proves it accepts a good file, and a
-        // decoder that refused everything would pass all of them.
+        // **The gap this closes.** Every other test here proves the decoder
+        // REFUSES things, and a decoder that refused everything would pass all
+        // of them. This is the one that proves it accepts a good file — and
+        // until 2026-08-20 it had never run, because the fixture did not exist.
         //
-        // There is no Vorbis encoder in this repository and none in the
-        // container it is developed in, so the fixture cannot be generated the
-        // way the glTF corpus is — `model::build::to_glb` has no counterpart
-        // here. Drop a real file at the path below and this starts asserting:
-        //
-        //     ffmpeg -f lavfi -i "sine=frequency=440:duration=1" \
-        //            -c:a libvorbis crates/client/tests/fixtures/tone.ogg
-        //
-        // Skipped rather than failed when it is absent, because a test that
-        // cannot run is not the same as a test that failed — but it is reported
-        // either way, so the gap does not go quiet.
+        // Still skipped rather than failed if the file goes missing: a test that
+        // cannot run is not the same as a test that failed. It says so loudly,
+        // so the gap cannot go quiet again.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
         let Ok(bytes) = std::fs::read(&path) else {
             eprintln!(
