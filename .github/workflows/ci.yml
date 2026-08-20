@@ -258,6 +258,23 @@ jobs:
             --target x86_64-unknown-linux-gnu \
             -- -max_total_time=60 -rss_limit_mb=2048
 
+      # **The crashing input, or the finding is only a stack trace.**
+      # `fuzz/artifacts/` is gitignored, so until this existed a crash found
+      # only on CI could not be reproduced without re-fuzzing locally and
+      # hoping to rediscover the same input. That happened once (2026-08-20)
+      # and cost more than this step will ever cost.
+      #
+      # `if: failure()` so it runs for whichever target above went red, and
+      # every target writes into the same directory.
+      - name: Keep whatever crashed a fuzz target
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+
       # From Task 07 onward this is how every task's `game/` mods are validated.
       # It boots no world and binds no socket: a mod API that cannot be checked
       # without a running server is an API with a usability bug.

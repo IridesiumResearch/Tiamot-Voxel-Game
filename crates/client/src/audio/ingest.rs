@@ -198,28 +198,100 @@ fn check_header(
     Ok((channels, sample_rate))
 }
 
-/// Finds a RIFF chunk's payload by its four-character id.
+/// Walks a RIFF file's chunks, refusing anything whose structure is ambiguous.
 ///
-/// Its own walk rather than trusting the file's own offsets: a length field is
-/// a number a stranger chose, so every step is bounded against what actually
-/// arrived. `None` for a chunk that is absent or truncated, which the caller
-/// turns into a refusal.
-fn find_chunk(bytes: &[u8], id: [u8; 4]) -> Option<&[u8]> {
+/// # Why this is strict rather than clever
+///
+/// The obvious guard reads the format chunk and checks the two fields that
+/// panic. Two fuzz findings in one session killed that idea: a file with a
+/// SECOND `fmt ` chunk (the guard read the first, Symphonia read the second),
+/// and then a file whose bogus chunk length derailed this walk while Symphonia
+/// still reached a later `fmt `.
+///
+/// The lesson is that a guard which must agree with the decoder about which
+/// bytes are the format chunk is a guard coupled to a dependency's internals,
+/// and that coupling loses: any disagreement is a bypass, and a byte-exact
+/// re-implementation of somebody else's parser is not a guard, it is a second
+/// parser with its own bugs.
+///
+/// So this does not try to predict Symphonia. It insists the file leave nothing
+/// to predict:
+///
+/// - the declared RIFF size accounts for the file exactly,
+/// - the chunk walk lands exactly on the end rather than overrunning or
+///   stopping short,
+/// - there is exactly one `fmt ` chunk and at least one `data` chunk.
+///
+/// A file that satisfies all three has one possible reading, so Symphonia's
+/// reading and this one are the same reading. Anything else is refused —
+/// including files that are merely unusual rather than hostile, which is the
+/// right trade for bytes a stranger sent.
+///
+/// Returns the sole format chunk's payload.
+fn wav_format_chunk(bytes: &[u8]) -> Result<&[u8], AudioError> {
+    let refuse = |why: &str| AudioError::NotOgg(format!("a WAV this does not accept: {why}"));
+
+    // The declared size covers everything after "RIFF" and its own four bytes.
+    let declared = bytes
+        .get(4..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| refuse("no RIFF size"))? as usize;
+    if declared != bytes.len() - 8 {
+        return Err(refuse("the RIFF size does not match the file"));
+    }
+
+    let mut format: Option<&[u8]> = None;
+    let mut formats = 0usize;
+    let mut has_data = false;
     // Past "RIFF", the length, and "WAVE".
     let mut at = 12usize;
-    while at + 8 <= bytes.len() {
-        let kind = bytes.get(at..at + 4)?;
-        let len = u32::from_le_bytes(bytes.get(at + 4..at + 8)?.try_into().ok()?) as usize;
+    while at < bytes.len() {
+        // A remainder too short to hold a header is exactly the leftover this
+        // refuses: the file ends in bytes that are not a chunk.
+        let (Some(kind), Some(len)) = (
+            bytes.get(at..at + 4),
+            bytes
+                .get(at + 4..at + 8)
+                .and_then(|raw| raw.try_into().ok())
+                .map(|raw| u32::from_le_bytes(raw) as usize),
+        ) else {
+            return Err(refuse("a chunk header runs past the end"));
+        };
         let start = at + 8;
-        let end = start.checked_add(len)?.min(bytes.len());
-        if kind == id {
-            return bytes.get(start..end);
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| refuse("a chunk length overflows"))?;
+        let Some(payload) = bytes.get(start..end) else {
+            return Err(refuse("a chunk runs past the end"));
+        };
+        if kind == b"fmt " {
+            formats += 1;
+            format = Some(payload);
+        }
+        if kind == b"data" {
+            has_data = true;
         }
         // Chunks are word-aligned, and a zero length must still advance or this
         // walks the same header for ever.
-        at = start.checked_add(len + (len & 1))?;
+        at = end
+            .checked_add(len & 1)
+            .ok_or_else(|| refuse("a chunk length overflows"))?;
     }
-    None
+
+    // `at == len + 1` is the pad byte of a final odd-length chunk that the
+    // writer left off. Common in the wild, and NOT ambiguous: there is no
+    // further chunk either way, so both readings end in the same place.
+    if at != bytes.len() && at != bytes.len() + 1 {
+        return Err(refuse("the chunks do not account for the file exactly"));
+    }
+    if formats != 1 {
+        return Err(refuse("there is not exactly one format chunk"));
+    }
+    if !has_data {
+        return Err(refuse("there is no data chunk"));
+    }
+    format.ok_or_else(|| refuse("there is no format chunk"))
 }
 
 /// Decodes an Ogg Vorbis file into samples.
@@ -261,19 +333,22 @@ pub fn decode(bytes: &[u8], limits: Limits) -> Result<Clip, AudioError> {
         return Err(AudioError::NotOgg("not an Ogg or WAV container".to_owned()));
     }
 
-    // **And the WAV format chunk, before Symphonia builds a `TimeBase` from
-    // it.** Found by the fuzz target's second CI run: `TimeBase::new` panics
-    // outright on a zero numerator or denominator, and a WAV header declaring
-    // zero channels or zero hertz reaches it during the PROBE — before the
-    // header checks further down get a look.
+    // **And the WAV structure, before Symphonia builds a `TimeBase` from it.**
+    // Found by the fuzz target's second CI run: `TimeBase::new` panics outright
+    // on a zero numerator or denominator, and a WAV header declaring zero
+    // channels or zero hertz reaches it during the PROBE — before the header
+    // checks further down get a look.
     //
     // Symphonia is pure Rust and memory-safe, so this is a denial of service
     // rather than a corruption. It is still a decode worker a stranger can tear
-    // down at will, so the two fields that panic are read here first. A guard,
-    // not a second parser.
+    // down at will.
+    //
+    // [`wav_format_chunk`] carries the reasoning for why this refuses an
+    // ambiguous file outright instead of trying to read the same format chunk
+    // Symphonia will. The short version: two findings in one session proved
+    // that predicting another parser is a game the guard loses.
     if wav {
-        let fmt = find_chunk(bytes, *b"fmt ")
-            .ok_or_else(|| AudioError::NotOgg("a WAV with no format chunk".to_owned()))?;
+        let fmt = wav_format_chunk(bytes)?;
         let channels = fmt
             .get(2..4)
             .and_then(|bytes| bytes.try_into().ok())
@@ -372,6 +447,140 @@ pub fn decode(bytes: &[u8], limits: Limits) -> Result<Clip, AudioError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wav_whose_structure_is_ambiguous_is_refused() {
+        // **Where the fuzz target's second and third findings landed.** Both
+        // were files carrying two `fmt ` chunks, and both defeated a guard that
+        // read "the" format chunk and checked its fields — first by putting the
+        // zeroed one second, then by derailing the walk that looked for it.
+        //
+        // So the property is no longer "the guard finds the same chunk
+        // Symphonia does". It is that a file with more than one reading is not
+        // read at all.
+        let good = crate::audio::synth::wav(crate::audio::synth::Recipe::click());
+        assert!(
+            decode(&good, Limits::default()).is_ok(),
+            "an ordinary WAV was refused"
+        );
+
+        // A second format chunk, appended. Valid on its own terms; ambiguous.
+        let mut second = Vec::new();
+        second.extend_from_slice(b"fmt ");
+        second.extend_from_slice(&16u32.to_le_bytes());
+        second.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        second.extend_from_slice(&1u16.to_le_bytes()); // channels
+        second.extend_from_slice(&0u32.to_le_bytes()); // ZERO hertz
+        second.extend_from_slice(&0u32.to_le_bytes()); // byte rate
+        second.extend_from_slice(&2u16.to_le_bytes()); // block align
+        second.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+
+        // Appended WITH the RIFF size corrected, so the refusal is provably
+        // about the duplicate chunk rather than about a size mismatch.
+        let mut doubled = good.clone();
+        doubled.extend_from_slice(&second);
+        let size = u32::try_from(doubled.len() - 8).expect("fixture is small");
+        doubled[4..8].copy_from_slice(&size.to_le_bytes());
+        assert!(
+            decode(&doubled, Limits::default()).is_err(),
+            "a WAV with two format chunks was accepted"
+        );
+
+        // Trailing bytes the chunk walk cannot account for. Three of them,
+        // because eight zeroes ARE accountable — they read as an empty chunk
+        // with an odd name, which has exactly one reading and is therefore
+        // allowed. What is refused is a remainder too short to be a header.
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(&[0u8; 3]);
+        let size = u32::try_from(trailing.len() - 8).expect("fixture is small");
+        trailing[4..8].copy_from_slice(&size.to_le_bytes());
+        assert!(
+            decode(&trailing, Limits::default()).is_err(),
+            "a WAV with unaccounted trailing bytes was accepted"
+        );
+
+        // A final odd-length chunk whose pad byte the writer left off. Common
+        // in the wild, unambiguous, and so accepted rather than refused.
+        let mut unpadded = good.clone();
+        unpadded.extend_from_slice(b"LIST");
+        unpadded.extend_from_slice(&1u32.to_le_bytes());
+        unpadded.push(0);
+        let size = u32::try_from(unpadded.len() - 8).expect("fixture is small");
+        unpadded[4..8].copy_from_slice(&size.to_le_bytes());
+        assert!(
+            decode(&unpadded, Limits::default()).is_ok(),
+            "a WAV missing only its final pad byte was refused"
+        );
+
+        // A RIFF size that disagrees with the file it describes.
+        let mut lying = good.clone();
+        lying[4..8].copy_from_slice(&9999u32.to_le_bytes());
+        assert!(
+            decode(&lying, Limits::default()).is_err(),
+            "a WAV whose declared size was wrong was accepted"
+        );
+    }
+
+    #[test]
+    fn every_reference_sound_still_decodes() {
+        // **The other half of a strictness guard.** `wav_format_chunk` refuses
+        // ambiguous files, and the way that fails is by growing strict enough
+        // to refuse real ones. These are the four sounds the reference mods
+        // actually ship, read off disk rather than synthesised, so tightening
+        // the guard past what the project's own assets satisfy fails here
+        // rather than in somebody's ears.
+        for name in [
+            "core_blocks/sounds/step.wav",
+            "core_milk/sounds/pour.wav",
+            "core_tools/sounds/break.wav",
+            "core_tools/sounds/place.wav",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../game")
+                .join(name);
+            let bytes = std::fs::read(&path).expect("a reference sound is missing");
+            assert!(
+                decode(&bytes, Limits::default()).is_ok(),
+                "{name} was refused by the ingest guard"
+            );
+        }
+    }
+
+    #[test]
+    fn the_exact_inputs_the_fuzzer_crashed_on_are_refused() {
+        // Both findings, kept as bytes rather than read from
+        // `fuzz/corpus/ogg_ingest/` so this test does not depend on the fuzzer
+        // being installed or its corpus being present. The same two files are
+        // in the corpus as named `regression-*.wav` seeds so the fuzzer keeps
+        // mutating around them.
+        //
+        // The first put a zeroed `fmt ` chunk SECOND; the second derailed the
+        // chunk walk with a bogus length so it never reached the zeroed one at
+        // all. Different bypasses, one guard, and neither is about the fields —
+        // both files are simply ambiguous.
+        let two_format_chunks: &[u8] = &[
+            82, 73, 70, 70, 36, 15, 0, 0, 87, 65, 86, 69, 102, 109, 116, 32, 16, 0, 0, 0, 1, 0, 1,
+            0, 128, 187, 0, 0, 0, 87, 65, 86, 188, 0, 16, 0, 100, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0,
+            1, 0, 0, 0, 86, 69, 102, 109, 116, 32, 16, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 8, 1, 0,
+            2, 0, 24, 0, 0, 0,
+        ];
+        let derailed_chunk_walk: &[u8] = &[
+            82, 73, 70, 70, 0, 0, 36, 15, 87, 65, 86, 69, 102, 109, 116, 32, 18, 0, 0, 0, 6, 0, 1,
+            0, 36, 87, 0, 0, 0, 83, 255, 255, 255, 73, 70, 70, 6, 0, 36, 15, 87, 65, 86, 69, 102,
+            109, 116, 32, 18, 0, 0, 0, 6, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 36, 87, 0, 0,
+            0, 83, 255, 255, 255, 65, 1, 129, 2, 0, 24, 0, 100, 79, 79, 79, 79, 254, 246, 190, 185,
+        ];
+        for (name, bytes) in [
+            ("two format chunks", two_format_chunks),
+            ("a derailed chunk walk", derailed_chunk_walk),
+        ] {
+            assert!(
+                decode(bytes, Limits::default()).is_err(),
+                "the input with {name} decoded to a clip"
+            );
+        }
+    }
 
     #[test]
     fn a_file_over_the_size_limit_is_refused_before_it_is_parsed() {
