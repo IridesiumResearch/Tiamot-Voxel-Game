@@ -259,6 +259,18 @@ fn fog_amount(distance: f32) -> f32 {
 // decides how much of a wall blooms rather than how bright the bloom is.
 const EMISSIVE_GAIN: f32 = 1.2;
 
+// How far mode 3 pushes a coloured light away from grey.
+//
+// 1.0 is the colour the light actually has. Above that is a deliberate
+// exaggeration, and the reason to want one is that a lamp is a small bright
+// thing surrounded by daylight: the eye reads it against its surroundings, and
+// a hue that is technically correct reads as washed out next to a white world.
+//
+// The gate is `a_lamps_colour_survives_mode_threes_tonemap`, which measures
+// mode 3's distance from grey against mode 2's. Too high and a warm lamp turns
+// into a red one and the weak channel clamps at zero, taking the hue with it.
+const EMISSIVE_SATURATION: f32 = 1.45;
+
 // How much of the original brightness survives the steeper falloff, at the
 // source. Squaring a level in 0..1 only ever darkens, so without this a lamp
 // standing next to you is dimmer than it was; 1.35 puts its brightest ring back
@@ -414,6 +426,24 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
     block = mix(vec3<f32>(steep), block, sqrt(peak));
     if (globals.lighting_mode == 2u) {
         block = block * EMISSIVE_GAIN;
+        // **And more colour than the light literally carries.**
+        //
+        // Reported from the window twice. The first time the cause was real —
+        // the tonemap rolled r, g and b off separately and drained the hue out
+        // of the brightest things — and fixing that put mode 3 slightly ahead
+        // of mode 2. It was still not enough, and the second report is not a
+        // bug: it is a look.
+        //
+        // So this is a deliberate exaggeration and is written as one. Each
+        // channel is pushed away from the colour's own perceived brightness,
+        // which stretches the gap between the strongest and weakest channels
+        // while leaving a neutral lamp exactly neutral — a white lamp has
+        // nothing to saturate and must not acquire a tint.
+        //
+        // Mode 3 only. Mode 2 has no headroom above white and would simply
+        // clip the boosted channel, turning a warmer lamp into a flatter one.
+        let grey = vec3<f32>(luma(block));
+        block = max(mix(grey, block, EMISSIVE_SATURATION), vec3<f32>(0.0));
     }
     let lit = max(daylight, block);
     // A floor under the darkest cave, so a dark room is legible rather than

@@ -1246,6 +1246,130 @@ fn a_pond_can_be_seen_through() {
     );
 }
 
+/// A floor with a wall standing on it, so a cast shadow is a large flat area
+/// that can be measured against the lit floor beside it.
+///
+/// The stock `scene` has one block standing proud, whose shadow is about one
+/// block of a frame that is mostly floor — which is why
+/// `a_low_sun_casts_longer_shadows_than_a_high_one` can only assert a one
+/// percent change in the average and cannot say whether anybody could SEE it.
+fn wall_scene() -> Vec<Chunk> {
+    let mut chunks = Vec::with_capacity(9);
+    for cx in 0..3 {
+        for cz in 0..3 {
+            let pos = ChunkPos::new(cx, 0, cz);
+            let corner = BlockPos::from_chunk_corner(pos);
+            let at = |dx: i32, dy: i32, dz: i32| {
+                BlockPos::new(corner.x + dx, corner.y + dy, corner.z + dz)
+            };
+            let mut chunk = Chunk::new(pos, MaterialId::AIR);
+            for x in 0..16 {
+                for z in 0..16 {
+                    for y in 0..8 {
+                        chunk
+                            .set_block(at(x, y, z), BlockValue::Uniform(STONE))
+                            .expect("in chunk");
+                    }
+                }
+            }
+            // A wall eight blocks tall along z, at world x = 16.
+            if cx == 1 {
+                for z in 0..16 {
+                    for y in 8..16 {
+                        chunk
+                            .set_block(at(0, y, z), BlockValue::Uniform(STONE))
+                            .expect("in chunk");
+                    }
+                }
+            }
+            chunks.push(chunk);
+        }
+    }
+    chunks
+}
+
+#[test]
+fn a_wall_throws_a_shadow_dark_enough_to_see() {
+    // **Reported from the window: "the shadows seem to have gone missing".**
+    //
+    // They had not. The reference world is a flat plane of one material, and a
+    // flat plane has nothing to cast a shadow — every surface faces the sky and
+    // nothing occludes anything. What was missing was geometry, not shadows.
+    //
+    // But finding that out took a rendered frame, because the only shadow test
+    // there was measures a one percent change in a frame average. That number
+    // cannot distinguish "a shadow nobody can see" from "no shadow", which is
+    // exactly the question that was asked. This one measures CONTRAST: the
+    // shadowed floor against the lit floor beside it, both in the same frame.
+    let Some(gpu) = gpu() else { return };
+    let chunks = wall_scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Straight down over the floor east of the wall.
+    let mut camera = Camera {
+        position: Position::from_world(20.0, 40.0, 24.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -1.5);
+
+    // **The same floor twice, with the sun on either side of the wall.**
+    //
+    // Measuring one frame would fold in the wall's own unlit faces, which are
+    // dark in every mode and have nothing to do with a cast shadow — the first
+    // version of this test measured those and reported mode 2 shadowing things
+    // it has no map for. Moving only the sun makes the geometry cancel: the
+    // same pixels are shadowed in one frame and lit in the other.
+    // Which of these puts the shadow on the sampled half depends on the yaw
+    // convention, and the test does not need to know: `casting` is simply the
+    // one that darkens it, and mode 2 is the control that says the difference
+    // is a shadow rather than the shading of a floor that faces the sky either
+    // way.
+    let casting = [-0.80_f32, -0.45, 0.0];
+    let clear = [0.80_f32, -0.45, 0.0];
+
+    // The floor east of the wall, which is the right half of a frame taken
+    // from above it. Kept clear of the wall itself.
+    let floor = |frame: &Image| {
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for y in (HEIGHT / 4)..(HEIGHT * 3 / 4) {
+            for x in (WIDTH * 3 / 5)..(WIDTH * 9 / 10) {
+                let p = frame.pixel(x, y).expect("pixel");
+                sum += (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / (3.0 * 255.0);
+                n += 1.0;
+            }
+        }
+        sum / n
+    };
+
+    let ratio = |renderer: &mut Renderer, mode| {
+        renderer.set_lighting_mode(mode);
+        renderer.set_sun(1.0, [1.0, 1.0, 1.0], casting);
+        let shadowed = floor(&target.capture(renderer, &camera).expect("capture"));
+        renderer.set_sun(1.0, [1.0, 1.0, 1.0], clear);
+        let lit = floor(&target.capture(renderer, &camera).expect("capture"));
+        shadowed / lit
+    };
+
+    let mode2 = ratio(&mut renderer, LightingMode::Classic);
+    let mode3 = ratio(&mut renderer, LightingMode::Beautiful);
+
+    // Measured on lavapipe: mode 2 lands at 1.00 — its floor does not care
+    // which side the sun is on, because a generic shadow only knows which way a
+    // face points and every one of these points up. Mode 3 lands at 0.72.
+    assert!(
+        mode2 > 0.97,
+        "mode 2's floor changed by more than rounding ({mode2}) when only the sun moved, so it \
+         is shadowing something it has no map for"
+    );
+    assert!(
+        mode3 < 0.85,
+        "mode 3's shadowed floor is {mode3} of the same floor lit, which is not a shadow \
+         anybody would notice — mode 2, which casts none at all, measures {mode2}"
+    );
+}
+
 #[test]
 fn a_lamps_colour_survives_mode_threes_tonemap() {
     // **Reported from the window: "Lights in light mode 3 should be more
@@ -1295,18 +1419,25 @@ fn a_lamps_colour_survives_mode_threes_tonemap() {
          coloured enough for the comparison below to mean anything"
     );
 
-    // Measured on lavapipe: mode 2 lands at 0.26 and mode 3 at 0.30 — mode 3
-    // comes out MORE saturated than the mode with no tonemap at all, because
-    // mode 2 has no headroom and simply clips its two bright channels to 1.0
-    // while mode 3 rolls them down together and keeps the ratio.
+    // Measured on lavapipe: mode 2 lands at 0.26 and mode 3 at 0.47.
     //
-    // With the roll-off applied per channel instead, mode 3 measured 0.17 —
-    // barely two thirds of mode 2's. That is the reported bug, and it is what
-    // this bound fails on.
+    // The history in three numbers. With the tonemap's roll-off applied per
+    // channel, mode 3 measured 0.17 — barely two thirds of mode 2's, and that
+    // was the first report of "almost white". Rolling off the peak instead put
+    // it at 0.30, ahead of the mode with no tonemap at all, because mode 2 has
+    // no headroom and simply clips its two bright channels while mode 3 rolls
+    // them down together and keeps the ratio.
+    //
+    // It was reported AGAIN, which is the interesting part: 0.30 is a faithful
+    // rendering of the light and still reads as washed out, because a lamp is a
+    // small warm thing seen against a large white world. `EMISSIVE_SATURATION`
+    // is the deliberate exaggeration that answers it, and 0.47 is where it
+    // lands. The bound below is a floor rather than a window: a change that
+    // quietly took the colour back out is the regression worth catching.
     assert!(
-        tonemapped > untonemapped * 0.95,
+        tonemapped > untonemapped * 1.4,
         "mode 3 kept {tonemapped} of the lamp's colour against mode 2's {untonemapped} — the \
-         tonemap is draining the highlights toward white"
+         highlights are draining toward white again"
     );
 
     // And the hue itself, not merely how much of it there is: this lamp is warm,
