@@ -172,6 +172,8 @@ struct Seen {
     view_distance: Option<(u8, u8)>,
     entities: client::entities::Entities,
     dialogs: std::collections::BTreeMap<String, tiamot_core::ui::Tree>,
+    /// HUD scripts the server pushed, with their source, in arrival order.
+    hud_scripts: Vec<(String, String)>,
 }
 
 impl Seen {
@@ -187,6 +189,9 @@ impl Seen {
             }
             Event::Joined { spawn, .. } => self.joined = Some(spawn),
             Event::View { .. } => {}
+            Event::HudScript { mod_id, source } => {
+                self.hud_scripts.push((mod_id, source));
+            }
             Event::Dialog { form, tree } => {
                 self.dialogs.insert(form, *tree);
             }
@@ -586,4 +591,121 @@ fn connecting_to_nothing_fails_with_an_address_rather_than_hanging() {
         err.to_string().contains("127.0.0.1:1"),
         "the error must name what it could not reach: {err}"
     );
+}
+
+#[test]
+fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
+    // **Task 14's first criterion, both halves.** The claim is that the default
+    // hotbar is a MOD's — so the way to test it is to take the mod away and
+    // watch the hotbar go while everything else keeps working.
+    //
+    // The positive half first, or the negative half proves nothing: a test that
+    // only checked "no HUD without the mod" would pass on a client that could
+    // not draw a HUD at all.
+    let server = start("hud-present");
+    let home = Home::new("hud-present");
+    let mut connection = home.open(&server);
+    let mut seen = Seen::default();
+
+    assert!(
+        pump(&mut connection, &mut seen, |seen| !seen
+            .hud_scripts
+            .is_empty()
+            && seen.joined.is_some()),
+        "the server never pushed a HUD script; warnings={:?}",
+        seen.warnings
+    );
+
+    let (mod_id, source) = seen.hud_scripts[0].clone();
+    assert_eq!(mod_id, "core_ui");
+
+    // The source arrived, so run it — in the same sandbox the client runs it
+    // in, which is headless and is why this can be asserted without a window.
+    // What is under test is that the REFERENCE MOD draws a hotbar, not that the
+    // VM works; that has its own tests in `tiamot_core::script::hud_vm`.
+    let mut vm =
+        tiamot_core::script::HudVm::new(tiamot_core::script::HudLimits::default()).expect("hud vm");
+    vm.load(&mod_id, &source)
+        .expect("core_ui's HUD script loads");
+
+    let state = tiamot_core::hud::State {
+        selected: 1,
+        carried: vec![
+            tiamot_core::hud::Carried {
+                material: tiamot_core::MaterialId(3),
+                name: "core_blocks:white".to_owned(),
+                units: 27,
+            },
+            tiamot_core::hud::Carried {
+                material: tiamot_core::MaterialId(4),
+                name: "core_blocks:black".to_owned(),
+                // Charter rule 5's example: forty units is one block and
+                // thirteen spare nodes, and the HUD must say so.
+                units: 40,
+            },
+        ],
+        ..tiamot_core::hud::State::default()
+    };
+    let faults = vm.draw(&state);
+    assert!(faults.is_empty(), "core_ui's HUD faulted: {faults:?}");
+
+    let (icons, labels) = vm
+        .with_frame(|frame| {
+            let icons = frame
+                .commands()
+                .iter()
+                .filter(|command| matches!(command, tiamot_core::hud::Command::Icon { .. }))
+                .count();
+            let labels: Vec<String> = frame
+                .commands()
+                .iter()
+                .filter_map(|command| match command {
+                    tiamot_core::hud::Command::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
+            (icons, labels)
+        })
+        .expect("a frame");
+
+    assert_eq!(icons, 2, "one icon per carried stack");
+    assert!(
+        labels.iter().any(|label| label == "1+13"),
+        "the 27-unit display should reach the hotbar, got {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|label| label == "1"),
+        "a whole block shows as a whole block, got {labels:?}"
+    );
+
+    connection.shutdown();
+    assert!(server.stop());
+
+    // The negative half. Delete the mod and a client is told about no scripts
+    // at all — which is what "minimal engine HUD only" means. The crosshair,
+    // chat and the settings screen are the window's and are not on this path.
+    let server = start_without("hud-absent", "core_ui");
+    let home = Home::new("hud-absent");
+    let mut connection = home.open(&server);
+    let mut seen = Seen::default();
+
+    assert!(
+        pump(&mut connection, &mut seen, |seen| seen.joined.is_some()),
+        "the client never joined; warnings={:?}",
+        seen.warnings
+    );
+    assert!(
+        seen.hud_scripts.is_empty(),
+        "with core_ui removed nothing should push a HUD, got {:?}",
+        seen.hud_scripts
+    );
+    // And the world is otherwise unharmed: this is a hotbar going away, not a
+    // client losing its terrain.
+    assert!(
+        !seen.table.is_empty(),
+        "the material table should still arrive"
+    );
+
+    connection.shutdown();
+    assert!(server.stop());
 }

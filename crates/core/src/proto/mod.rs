@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -140,6 +140,16 @@ pub const MAX_ACTIONS: usize = 1024;
 /// session, so this is generous for any real mod set and finite against one
 /// that is not.
 pub const MAX_SOUNDS: usize = 1024;
+
+/// Most HUD scripts a server may push in one [`ServerMessage::HudScripts`].
+///
+/// Far tighter than the other tables, and deliberately so: every entry here is
+/// CODE that will run on the player's machine sixty times a second. A mod set
+/// needing more than a handful of HUD scripts is describing something other
+/// than a HUD, and the client's own [`crate::script::HudLimits::scripts`]
+/// refuses past its own smaller number anyway — this is the bound that stops a
+/// hostile server making a client allocate the list at all.
+pub const MAX_HUD_SCRIPTS: usize = 32;
 
 /// A `BLAKE3` content hash.
 pub type ContentHash = [u8; 32];
@@ -386,6 +396,33 @@ pub struct SoundDef {
     pub gain: f32,
     /// How much to vary the pitch per play, as a fraction.
     pub pitch_variance: f32,
+}
+
+/// A HUD script a mod wants the client to run.
+///
+/// # This is the one thing on the wire that is code
+///
+/// Everything else a server sends is data a client interprets — a widget tree,
+/// a sound file, a chunk. This is a Lua source file that will run on the
+/// player's machine, and it is the tier-2 half of Task 14's trust model
+/// (charter rule 10): a HARD sandbox with no filesystem, no network, no `os`,
+/// no `io`, no `load` at all, and an instruction and memory ceiling per FRAME.
+///
+/// It travels by hash through the same content pipeline as a texture or a
+/// sound, so a client that already has it fetches nothing, and the bytes are
+/// hostile input like every other pushed asset.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HudScriptDef {
+    /// The mod that pushed it, for attribution when it misbehaves.
+    ///
+    /// Carried rather than inferred, for the reason [`SoundDef::mod_id`] is: a
+    /// warning saying which mod's HUD went over budget must name what the
+    /// SERVER said, not what a client guessed from a namespace.
+    pub mod_id: String,
+    /// The content hash of the Lua source, or `None` if the mod named a file
+    /// that is not in its directory — the client runs nothing rather than
+    /// guessing.
+    pub file: Option<ContentHash>,
 }
 
 /// One material in the world's id table, as the client needs to see it.
@@ -1194,6 +1231,24 @@ pub enum ServerMessage {
         /// the middle of one could invent items by lying about what it took.
         held: Option<(u16, u32)>,
     },
+
+    /// The HUD scripts a server's mods want the client to run.
+    ///
+    /// **Appended at the end** (protocol v22).
+    ///
+    /// Sent once on join, after the tables a HUD reads — a script asking what
+    /// the player is carrying before the material table has arrived would draw
+    /// a hotbar of numbers. Empty is the ordinary case: a server whose mods
+    /// draw no HUD, which is every server before this task.
+    ///
+    /// Running these is the CLIENT's decision. It is told what a server wants
+    /// and applies its own limits; nothing here obliges it to execute
+    /// anything.
+    HudScripts {
+        /// Every pushed script, in mod load order — which is the order they
+        /// draw in, so a mod loaded later draws on top.
+        scripts: Vec<HudScriptDef>,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -1553,6 +1608,20 @@ fn check_occupancy(edit: &Edit) -> Result<(), ProtocolError> {
 }
 
 /// Bounds a sound table, and the ids in it.
+/// Bounds a pushed HUD script table.
+///
+/// The SOURCE is not checked here and cannot be: it arrives later, by hash,
+/// through the content pipeline, and what makes it safe is the sandbox it runs
+/// in rather than anything a decoder could see. What is bounded here is what
+/// this message can make a client allocate before any of that.
+fn check_hud_scripts(scripts: &[HudScriptDef]) -> Result<(), ProtocolError> {
+    check_len("hud_scripts", scripts.len(), MAX_HUD_SCRIPTS)?;
+    for script in scripts {
+        check_len("hud_script_mod_id", script.mod_id.len(), MAX_ID_BYTES)?;
+    }
+    Ok(())
+}
+
 fn check_sounds(sounds: &[SoundDef]) -> Result<(), ProtocolError> {
     check_len("sound_table", sounds.len(), MAX_SOUNDS)?;
     for sound in sounds {
@@ -1782,6 +1851,7 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         ServerMessage::ViewUpdate { view, slots, .. } => check_view(view, slots)?,
         ServerMessage::ActionTable { actions } => check_actions(actions)?,
         ServerMessage::SoundTable { sounds } => check_sounds(sounds)?,
+        ServerMessage::HudScripts { scripts } => check_hud_scripts(scripts)?,
         message @ ServerMessage::PlaySound { .. } => check_play(message)?,
 
         ServerMessage::HelloAck { .. }
@@ -2445,6 +2515,16 @@ mod tests {
         .expect("encode");
         assert_eq!(state[0], 24);
 
+        // The tables and messages from v16 onwards, pinned in their own
+        // function: this one is at clippy's 100-line ceiling and an ordinal
+        // that cannot be pinned because the test is too long is an ordinal
+        // that goes unpinned, which is the exact failure this whole test
+        // exists to prevent.
+        pin_the_later_variants();
+    }
+
+    /// Ordinals 25 onwards. See the call site for why they are not up there.
+    fn pin_the_later_variants() {
         // Protocol v16, v17 and v18 — the input and audio tables.
         let actions = encode(&ServerMessage::ActionTable {
             actions: Vec::new(),
@@ -2484,6 +2564,24 @@ mod tests {
         })
         .expect("encode");
         assert_eq!(close[0], 30);
+
+        // Protocol v21. Unpinned when it landed, which is the habit this
+        // comment block exists to break — it was the newest variant for one
+        // task and would have been displaced silently by the next append.
+        let view = encode(&ServerMessage::ViewUpdate {
+            view: String::new(),
+            slots: Vec::new(),
+            held: None,
+        })
+        .expect("encode");
+        assert_eq!(view[0], 31);
+
+        // Protocol v22, the pushed HUD scripts, and currently the newest.
+        let scripts = encode(&ServerMessage::HudScripts {
+            scripts: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(scripts[0], 32);
     }
 
     #[test]

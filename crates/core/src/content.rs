@@ -149,11 +149,51 @@ impl ContentIndex {
     ///
     /// [`ContentError`] if a file cannot be read or a size limit is exceeded.
     pub fn add_mod(&mut self, mod_id: &str, dir: &Path) -> Result<ContentHash, ContentError> {
+        self.add_mod_with(mod_id, dir, &[])
+    }
+
+    /// Indexes one mod's directory, plus files it explicitly asked to publish.
+    ///
+    /// # Why an opt-in list exists at all
+    ///
+    /// [`is_distributable`] is an allowlist of extensions and `.lua` is not on
+    /// it, deliberately: server mod code can hold admin logic, allowlists or
+    /// tokens, and a client has no business receiving it. That must not change.
+    ///
+    /// But a HUD script IS Lua a client has to receive, so it is published the
+    /// other way round — **per file, because a mod named it**, rather than per
+    /// extension. `game.register_hud_script("hud.lua")` is the only way a `.lua`
+    /// file ever reaches a client, and a mod that does not call it publishes
+    /// none of its code.
+    ///
+    /// `extra` paths are mod-supplied strings, which is exactly what
+    /// [`ContentIndex::hash_of`]'s design goes out of its way to keep away from
+    /// the filesystem — so each one is canonicalised and checked to land inside
+    /// the mod's own directory before it is read. A path that escapes, does not
+    /// exist, or is not a regular file is skipped silently here and reported by
+    /// the caller, which is the one that knows what asked for it.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError`] if a file cannot be read or a size limit is exceeded.
+    pub fn add_mod_with(
+        &mut self,
+        mod_id: &str,
+        dir: &Path,
+        extra: &[String],
+    ) -> Result<ContentHash, ContentError> {
         // Sorted, so the fingerprint does not depend on directory iteration
         // order — which is not stable across filesystems, and would make two
         // identical servers look different to a client.
         let mut paths = Vec::new();
         collect(dir, dir, &mut paths)?;
+        for named in extra {
+            if let Some(relative) = resolve_inside(dir, named)
+                && !paths.contains(&relative)
+            {
+                paths.push(relative);
+            }
+        }
         paths.sort();
 
         let mut total = 0u64;
@@ -324,6 +364,28 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Conten
     Ok(())
 }
 
+/// Resolves a mod-supplied relative path against the mod's own directory.
+///
+/// Returns the path relative to `dir`, or `None` for anything that escapes it,
+/// does not exist, or is not a regular file. Checked after canonicalisation, so
+/// `..` and symlinks are both covered rather than just the obvious textual
+/// form — the same rule `require` follows inside the VM.
+fn resolve_inside(dir: &Path, named: &str) -> Option<PathBuf> {
+    let root = dir.canonicalize().ok()?;
+    let candidate = root.join(named.replace('\\', "/")).canonicalize().ok()?;
+    // Redundant with the `strip_prefix` below, which is what actually refuses
+    // an escape — verified by removing each in turn. Kept because it states the
+    // rule where a reader looks for it, and because a later change that stopped
+    // returning a relative path would otherwise take the guard with it.
+    if !candidate.starts_with(&root) {
+        return None;
+    }
+    if !candidate.metadata().ok()?.is_file() {
+        return None;
+    }
+    candidate.strip_prefix(&root).ok().map(Path::to_path_buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +403,88 @@ mod tests {
             std::fs::create_dir_all(parent).expect("parent");
         }
         std::fs::write(path, bytes).expect("write");
+    }
+
+    #[test]
+    fn a_named_lua_file_is_published_and_an_unnamed_one_is_not() {
+        // The whole rule in one test: `.lua` is not distributable by extension,
+        // so a mod's server code stays on the server — and the ONE file it
+        // named for the client is published anyway.
+        let dir = scratch("named");
+        write(&dir, "init.lua", b"-- admin logic, allowlists, tokens");
+        write(&dir, "hud.lua", b"hud.on_draw(function() end)");
+
+        let mut index = ContentIndex::new();
+        index
+            .add_mod_with("m", &dir, &["hud.lua".to_owned()])
+            .expect("index");
+
+        assert!(
+            index.hash_of("m", "hud.lua").is_some(),
+            "a named HUD script should be published"
+        );
+        assert!(
+            index.hash_of("m", "init.lua").is_none(),
+            "and everything else the mod runs should not be"
+        );
+    }
+
+    #[test]
+    fn a_named_path_cannot_escape_the_mod_directory() {
+        // `hash_of` is careful never to let a mod-supplied string reach the
+        // filesystem. `add_mod_with` has to, because the whole point is to read
+        // a file the mod named — so this is where that care has to be repeated.
+        // A mod publishing the server's private files to every joining player
+        // is the failure this prevents.
+        let root = scratch("escape");
+        let dir = root.join("mod");
+        std::fs::create_dir_all(&dir).expect("mod dir");
+        write(&dir, "hud.lua", b"hud.on_draw(function() end)");
+        write(&root, "secret.toml", b"rcon_password = 'hunter2'");
+
+        let mut index = ContentIndex::new();
+        index
+            .add_mod_with(
+                "m",
+                &dir,
+                &[
+                    "../secret.toml".to_owned(),
+                    "/etc/passwd".to_owned(),
+                    "nothing/here.lua".to_owned(),
+                    "hud.lua".to_owned(),
+                ],
+            )
+            .expect("index");
+
+        assert!(
+            index.hash_of("m", "hud.lua").is_some(),
+            "the honest one still works, or this test proves nothing"
+        );
+        assert!(index.hash_of("m", "../secret.toml").is_none());
+        assert!(index.hash_of("m", "secret.toml").is_none());
+        assert!(index.hash_of("m", "/etc/passwd").is_none());
+        assert_eq!(
+            index.len(),
+            1,
+            "only the file inside the mod directory is indexed"
+        );
+    }
+
+    #[test]
+    fn naming_a_file_changes_the_mods_fingerprint() {
+        // The fingerprint is what tells a client whether it already has
+        // everything. A published file outside it would be a file a client
+        // could believe it had when it did not.
+        let dir = scratch("fingerprint");
+        write(&dir, "hud.lua", b"hud.on_draw(function() end)");
+
+        let without = ContentIndex::new()
+            .add_mod("m", &dir)
+            .expect("index without");
+        let with = ContentIndex::new()
+            .add_mod_with("m", &dir, &["hud.lua".to_owned()])
+            .expect("index with");
+        assert_ne!(without, with);
     }
 
     #[test]

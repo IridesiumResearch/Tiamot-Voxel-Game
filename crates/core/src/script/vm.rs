@@ -1121,6 +1121,16 @@ pub trait ScriptVm: Sized {
     /// Every sound the loaded mods registered, in load order.
     fn registered_sounds(&self) -> Vec<crate::sound::Sound>;
 
+    /// Every HUD script the loaded mods registered, in load order.
+    ///
+    /// Load order is DRAW order on the client, so this is a sequence rather
+    /// than a map: a mod loaded later draws over one loaded earlier, which is
+    /// the same rule the rest of the mod system uses to resolve a conflict.
+    ///
+    /// Empty is the ordinary case — a mod set that draws no HUD of its own, and
+    /// a client that then shows the engine's crosshair and nothing more.
+    fn registered_hud_scripts(&self) -> Vec<crate::hud::ScriptFile>;
+
     /// Every action the loaded mods registered, in load order.
     ///
     /// Load order rather than sorted, because that is the order the settings

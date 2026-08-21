@@ -615,6 +615,58 @@ function game.register_on_dialog_event(callback) end
 ---@param spec Tiamot.SoundSpec
 function game.register_sound(spec) end
 
+---Registers a HUD script this mod wants clients to run. Registration window only.
+---
+---**This is the only thing your mod can send that RUNS on a player's machine**,
+---and the rules are correspondingly tight. Everything else — dialogs, sounds,
+---textures — is data a client interprets. A HUD is not expressible as data: a
+---health bar's length is a *function* of the health, and putting "a function of"
+---on the wire would mean inventing a worse language than Lua.
+---
+---The file travels by hash through the same content pipeline a texture uses.
+---Ship `hud.lua` in your mod directory and name it here. **One per mod, last
+---call wins** — the client budgets per script per frame, so two scripts from one
+---mod would quietly buy you twice a one-script mod's budget. Concatenate
+---instead.
+---
+---Inside the script you have `hud` and a small standard library, and **nothing
+---else**: no `os`, no `io`, no `require`, no `load`, no `coroutine`, no
+---filesystem, no network. This is an allow-list, not a deny-list — a future Lua
+---version cannot add a capability into it by existing.
+---
+---```lua
+---game.register_hud_script("hud.lua")
+---```
+---
+---and in `hud.lua`:
+---
+---```lua
+---hud.on_draw(function(state)
+---    hud.hide_builtin("crosshair")
+---    for index, slot in ipairs(state.carried) do
+---        hud.icon{ anchor = "bottom", x = (index - 1) * 56 - 224, y = 72, size = 48,
+---                  material = slot.material }
+---        hud.text{ anchor = "bottom", x = (index - 1) * 56 - 224, y = 26,
+---                  text = slot.blocks .. "+" .. slot.nodes, size = 18 }
+---    end
+---end)
+---```
+---
+---**Your callback runs once a frame with a budget of about 200,000
+---instructions.** Go over it and that frame's drawing is discarded whole — a
+---half-drawn hotbar is worse than none — the player is shown a warning naming
+---your mod, and the script sits out twelve frames. Five strikes and it is
+---switched off for the session. Draw; do not compute.
+---
+---`state` is read-only and small on purpose: your own position, facing, time of
+---day, what you carry, what you are looking at, the dig in progress, the tool in
+---hand. It is not a way to read terrain the player cannot see.
+---
+---Chat and the settings screen are not in `hud.hide_builtin` and never will be —
+---moderation and rebinding have to work whatever a server pushes.
+---@param file string Path to the Lua file inside your mod directory.
+function game.register_hud_script(file) end
+
 ---Fields accepted by `game.play_sound`.
 ---@class Tiamot.PlaySpec
 ---@field sound string Required. A sound id; unqualified means your own.

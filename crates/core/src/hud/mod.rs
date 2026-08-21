@@ -51,5 +51,19 @@
 mod frame;
 mod state;
 
+/// A HUD script a mod asked the engine to push to clients.
+///
+/// The mod names a file; the server turns it into a content hash at freeze,
+/// exactly as it does a sound's. Nothing here is the source — the bytes travel
+/// through the content pipeline, and a mod that names a file it does not have
+/// gets a logged error and a client that runs nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptFile {
+    /// The mod that registered it, and whose directory `file` is relative to.
+    pub mod_id: String,
+    /// The file inside that mod's directory, e.g. `"hud.lua"`.
+    pub file: String,
+}
+
 pub use frame::{Anchor, Builtin, Command, Fill, Frame, HudError, Limits, Mark, VIRTUAL_HEIGHT};
 pub use state::{Carried, HeldTool, Look, State};

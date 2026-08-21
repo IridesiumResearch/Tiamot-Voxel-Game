@@ -64,6 +64,7 @@ fn the_reference_mods_load_in_dependency_order() {
             "core_mimic",
             "core_sky",
             "core_tools",
+            "core_ui",
             "core_worldgen"
         ],
         "core_worldgen depends on core and must load after it; core_milk depends on nothing \

@@ -771,6 +771,199 @@ fn draw_sound_attribution(app: &App, ui: &mut egui::Ui) {
         });
 }
 
+/// Draws what the pushed HUD scripts asked for, and the engine's crosshair.
+///
+/// # The engine's HUD is three things, and this draws one of them
+///
+/// Criterion 1 of Task 14: delete every mod and what is left is a crosshair,
+/// chat, and the settings screen. The hotbar, the dig readout, anything a game
+/// wants — those are a mod's, drawn from `core::hud` commands, and they go when
+/// the mod goes. That is why the crosshair is here in the window rather than in
+/// `game/core_ui`: it must survive with zero mods loaded.
+///
+/// # Virtual pixels to real ones
+///
+/// A script draws on a canvas [`tiamot_core::hud::VIRTUAL_HEIGHT`] tall and as
+/// wide as this window's aspect ratio makes it. Everything scales by the height
+/// alone, so a HUD is the same apparent size on every monitor and anchors take
+/// care of the width. Points rather than physical pixels, because egui works in
+/// points and DPI is its problem, not the script's.
+fn draw_hud_scripts(app: &mut App, ctx: &egui::Context) {
+    app.run_hud_scripts();
+
+    // `content_rect`, not `viewport_rect`: a HUD anchored to the bottom edge
+    // must not sit under an OS status bar or a display notch. A crosshair in
+    // the middle would not care; a hotbar 16 up from the bottom would.
+    let screen = ctx.content_rect();
+    let scale = screen.height() / f32::from(tiamot_core::hud::VIRTUAL_HEIGHT);
+    let virtual_width = if scale > 0.0 {
+        screen.width() / scale
+    } else {
+        0.0
+    };
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("hud_scripts"),
+    ));
+
+    let hides_crosshair = app
+        .hud_frame(|frame| {
+            for command in frame.commands() {
+                paint_hud_command(&painter, command, virtual_width, scale);
+            }
+            frame.hides(tiamot_core::hud::Builtin::Crosshair)
+        })
+        .unwrap_or(false);
+
+    if !hides_crosshair {
+        paint_crosshair(&painter, screen.center(), scale);
+    }
+}
+
+/// The engine's crosshair: two strokes, and nothing a mod has to provide.
+fn paint_crosshair(painter: &egui::Painter, centre: egui::Pos2, scale: f32) {
+    // Sized in virtual pixels like everything else, so it does not become a
+    // speck on a tall monitor.
+    let arm = 10.0 * scale;
+    let gap = 3.0 * scale;
+    // White with a dark edge underneath, because a crosshair on a white world
+    // is invisible — which is exactly the world this engine's reference mods
+    // build.
+    for (colour, width) in [
+        (egui::Color32::from_black_alpha(160), 3.0 * scale),
+        (egui::Color32::WHITE, 1.0 * scale),
+    ] {
+        let stroke = egui::Stroke::new(width, colour);
+        for (from, to) in [
+            (
+                egui::pos2(centre.x - arm, centre.y),
+                egui::pos2(centre.x - gap, centre.y),
+            ),
+            (
+                egui::pos2(centre.x + gap, centre.y),
+                egui::pos2(centre.x + arm, centre.y),
+            ),
+            (
+                egui::pos2(centre.x, centre.y - arm),
+                egui::pos2(centre.x, centre.y - gap),
+            ),
+            (
+                egui::pos2(centre.x, centre.y + gap),
+                egui::pos2(centre.x, centre.y + arm),
+            ),
+        ] {
+            painter.line_segment([from, to], stroke);
+        }
+    }
+}
+
+/// Paints one draw command.
+///
+/// **Nothing here decides anything.** Every clamp, limit and refusal already
+/// happened in `core::hud` where it could be tested without a window; this walks
+/// a list and paints it.
+fn paint_hud_command(
+    painter: &egui::Painter,
+    command: &tiamot_core::hud::Command,
+    virtual_width: f32,
+    scale: f32,
+) {
+    use tiamot_core::hud::Command;
+
+    let place = |anchor: tiamot_core::hud::Anchor, x: i16, y: i16| {
+        let (vx, vy) = anchor.resolve(virtual_width, x, y);
+        egui::pos2(vx * scale, vy * scale)
+    };
+    let rgba = |colour: tiamot_core::ui::Colour| {
+        egui::Color32::from_rgba_unmultiplied(colour[0], colour[1], colour[2], colour[3])
+    };
+
+    match command {
+        Command::Text {
+            anchor,
+            x,
+            y,
+            text,
+            size,
+            colour,
+        } => {
+            painter.text(
+                place(*anchor, *x, *y),
+                egui::Align2::LEFT_TOP,
+                text,
+                egui::FontId::proportional(f32::from(*size) * scale),
+                rgba(*colour),
+            );
+        }
+        Command::Rect {
+            anchor,
+            x,
+            y,
+            w,
+            h,
+            colour,
+        } => {
+            let min = place(*anchor, *x, *y);
+            let size = egui::vec2(f32::from(*w) * scale, f32::from(*h) * scale);
+            painter.rect_filled(egui::Rect::from_min_size(min, size), 0.0, rgba(*colour));
+        }
+        Command::Bar {
+            anchor,
+            x,
+            y,
+            w,
+            h,
+            fill,
+            colour,
+            background,
+        } => {
+            let min = place(*anchor, *x, *y);
+            let size = egui::vec2(f32::from(*w) * scale, f32::from(*h) * scale);
+            painter.rect_filled(egui::Rect::from_min_size(min, size), 0.0, rgba(*background));
+            let filled = egui::vec2(size.x * fill.fraction(), size.y);
+            painter.rect_filled(egui::Rect::from_min_size(min, filled), 0.0, rgba(*colour));
+        }
+        Command::Icon {
+            anchor,
+            x,
+            y,
+            size,
+            material,
+        } => {
+            let min = place(*anchor, *x, *y);
+            let extent = egui::vec2(f32::from(*size) * scale, f32::from(*size) * scale);
+            let rect = egui::Rect::from_min_size(min, extent);
+            painter.rect_filled(rect, 2.0, client::dialog::material_tint(material.0));
+            painter.rect_stroke(
+                rect,
+                2.0,
+                egui::Stroke::new(scale, egui::Color32::from_black_alpha(120)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        Command::Image {
+            anchor, x, y, w, h, ..
+        } => {
+            // **Visible rather than silent.** Content images are not bridged
+            // into egui yet — the atlas is the world renderer's texture and
+            // tier-1 `Widget::Image` does not draw one either. A script that
+            // asked for a picture gets a placeholder it can SEE, because an
+            // image that draws nothing is indistinguishable from a script that
+            // never ran.
+            let min = place(*anchor, *x, *y);
+            let size = egui::vec2(f32::from(*w) * scale, f32::from(*h) * scale);
+            let rect = egui::Rect::from_min_size(min, size);
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 0, 200));
+            painter.rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(scale, egui::Color32::BLACK),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+}
+
 /// Draws the chat history, and the input line when it is open.
 ///
 /// **Engine-native, and that is a decision.** Task 14 puts chat in the engine
@@ -1036,6 +1229,10 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
                 .draw(&context, surface.app.dialogs(), surface.app.views(), size);
         surface.app.raise_dialog_events(raised);
         draw_chat(&mut surface.app, &context);
+        // **Last, so a script's HUD sits over the world and under a dialog.**
+        // A dialog is a thing a player is interacting with; a HUD is a thing
+        // they are reading past.
+        draw_hud_scripts(&mut surface.app, &context);
         egui::Area::new(egui::Id::new("hud"))
             .fixed_pos(egui::pos2(8.0, 8.0))
             .interactable(false)

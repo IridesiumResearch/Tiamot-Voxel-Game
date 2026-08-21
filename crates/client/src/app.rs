@@ -723,6 +723,13 @@ pub struct App {
     dialogs: std::collections::BTreeMap<String, tiamot_core::ui::Tree>,
     /// The audio backend, or a silent stand-in where there is no device.
     mixer: crate::audio::Mixer,
+    /// The sandbox that runs pushed HUD scripts, if one could be built.
+    ///
+    /// `None` means the Lua runtime itself would not start, which is an engine
+    /// fault rather than a mod one — the client goes on drawing its own HUD and
+    /// says so once, because a client that refused to run without a scripting
+    /// VM would be a client nobody could play on.
+    hud_vm: Option<tiamot_core::script::HudVm>,
     /// Sounds this client has been told about and not yet played.
     ///
     /// A queue rather than an immediate call, because playing one belongs to
@@ -999,6 +1006,14 @@ impl App {
             spawn: None,
             joined: false,
             warnings: Vec::new(),
+            hud_vm: match tiamot_core::script::HudVm::new(tiamot_core::script::HudLimits::default())
+            {
+                Ok(vm) => Some(vm),
+                Err(err) => {
+                    tracing::warn!(%err, "no HUD script runtime; pushed HUDs will not run");
+                    None
+                }
+            },
             fps: 0.0,
             last_dt: 0.0,
             pacing: Pacing::default(),
@@ -2801,6 +2816,8 @@ impl App {
                 // piece of Task 13, and until it lands a client knows what a
                 // server's sounds ARE without being able to make one.
                 Event::Sounds { sounds } => self.sounds = sounds,
+
+                Event::HudScript { mod_id, source } => self.adopt_hud_script(&mod_id, &source),
                 Event::View { view, slots, held } => self.adopt_view(view, slots, held),
                 Event::Dialog { form, tree } => self.adopt_dialog(form, Some(*tree)),
                 Event::DialogClosed { form } => self.adopt_dialog(form, None),
@@ -2813,22 +2830,7 @@ impl App {
                 // have no speakers.
                 Event::SoundReady { id, clip, voice } => self.mixer.insert(id, clip, voice),
 
-                Event::Tools { tools } => {
-                    // The default first, so a player who never touches the tool
-                    // key is holding whatever the mods call a bare hand.
-                    self.held_tool = tools.iter().position(|tool| tool.default).unwrap_or(0);
-                    self.tools = tools;
-                    // **Recorded, not announced.** The table arrives while the
-                    // session is still `Authenticated`, and `SelectTool` is only
-                    // valid in world — replying here got the client disconnected
-                    // with "SelectTool is not valid in phase Authenticated".
-                    //
-                    // There is nothing to announce anyway: a player who has
-                    // selected nothing digs with the server's own default, which
-                    // is the same tool this just picked. The first `next_tool`
-                    // is the first time the two could disagree, and that is when
-                    // it is sent.
-                }
+                Event::Tools { tools } => self.adopt_tools(tools),
 
                 Event::Inventory { stacks } => {
                     self.carried = stacks;
@@ -3488,6 +3490,133 @@ impl App {
             "LMB dig · RMB place · R: tool · 1-9/wheel: slot · T/F8: jump 50,000 · H/F7: home"
                 .to_owned(),
         ]
+    }
+
+    /// Adopts the tool table a server's mods registered.
+    ///
+    /// **Recorded, not announced.** The table arrives while the session is
+    /// still `Authenticated`, and `SelectTool` is only valid in world —
+    /// replying here got the client disconnected with "`SelectTool` is not
+    /// valid in phase Authenticated".
+    ///
+    /// There is nothing to announce anyway: a player who has selected nothing
+    /// digs with the server's own default, which is the same tool this picks.
+    /// The first `next_tool` is the first time the two could disagree, and that
+    /// is when it is sent.
+    fn adopt_tools(&mut self, tools: Vec<tiamot_core::proto::ToolDef>) {
+        // The default first, so a player who never touches the tool key is
+        // holding whatever the mods call a bare hand.
+        self.held_tool = tools.iter().position(|tool| tool.default).unwrap_or(0);
+        self.tools = tools;
+    }
+
+    /// Loads a HUD script a server pushed.
+    ///
+    /// **Nothing about this is optional for the client.** A refused script is a
+    /// warning naming the mod, not a refused connection: a server whose HUD
+    /// will not load is a server with a worse HUD, and a client that dropped
+    /// the world over it would be unplayable on the day a mod shipped a typo.
+    fn adopt_hud_script(&mut self, mod_id: &str, source: &str) {
+        let Some(vm) = self.hud_vm.as_mut() else {
+            self.warn(format!(
+                "`{mod_id}` pushed a HUD script, but this client has no script runtime to run it                  in"
+            ));
+            return;
+        };
+        if let Err(err) = vm.load(mod_id, source) {
+            self.warn(format!("`{mod_id}`'s HUD script would not load: {err}"));
+        }
+    }
+
+    /// Runs every pushed HUD script for this frame.
+    ///
+    /// Called once a frame, from the renderer, because that is what "immediate
+    /// mode" means: nothing a script drew last frame survives into this one.
+    /// Faults come back here and become warnings, which is the only place the
+    /// player sees them.
+    pub fn run_hud_scripts(&mut self) {
+        let Some(state) = self.hud_state() else {
+            return;
+        };
+        let Some(vm) = self.hud_vm.as_mut() else {
+            return;
+        };
+        let faults = vm.draw(&state);
+        for fault in faults {
+            self.warn(fault.message);
+        }
+    }
+
+    /// What the pushed scripts drew, for the renderer.
+    ///
+    /// `None` when there is no runtime at all. An empty frame is not the same
+    /// thing and is the ordinary case on a server that pushes no HUD.
+    pub fn hud_frame<T>(&self, visit: impl FnOnce(&tiamot_core::hud::Frame) -> T) -> Option<T> {
+        self.hud_vm.as_ref().and_then(|vm| vm.with_frame(visit))
+    }
+
+    /// Everything a HUD script is allowed to know, this frame.
+    ///
+    /// `None` before the player exists — there is no situation to describe yet,
+    /// and a script asked about one would draw a hotbar of zeroes.
+    fn hud_state(&self) -> Option<tiamot_core::hud::State> {
+        let predictor = self.predictor.as_ref()?;
+        let (x, y, z) = self.camera.position.to_world();
+        let carried = self
+            .carried
+            .iter()
+            .map(|(id, units)| tiamot_core::hud::Carried {
+                material: tiamot_core::MaterialId(*id),
+                // The string id, because that is what is canonical (charter
+                // rule 8) and the number is per-session. A script showing a
+                // name shows this one.
+                name: self
+                    .materials
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{id}")),
+                units: *units,
+            })
+            .collect();
+        let voxels = phys::Voxels::new(&self.store, predictor.origin());
+        let looking_at = self.looking_at().map(|hit| {
+            let material = voxels
+                .material(hit.cell[0], hit.cell[1], hit.cell[2])
+                .unwrap_or(tiamot_core::MaterialId::AIR);
+            tiamot_core::hud::Look {
+                cell: hit.cell,
+                material,
+                name: self
+                    .materials
+                    .get(&material.0)
+                    .cloned()
+                    .unwrap_or_else(|| format!("#{}", material.0)),
+            }
+        });
+        Some(tiamot_core::hud::State {
+            position: [x, y, z],
+            yaw: self.camera.yaw,
+            pitch: self.camera.pitch,
+            time_of_day: self.sky_time(),
+            selected: self.selected,
+            carried,
+            looking_at,
+            // Per-mille, and the cast saturates on a non-finite progress the
+            // way `Fill` expects — a dig progress is a server number and this
+            // is the last place it is a float.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a saturating cast into a value `Fill` then clamps"
+            )]
+            dig: self
+                .dig
+                .map(|(_, progress)| tiamot_core::hud::Fill::per_mille((progress * 1000.0) as i32)),
+            tool: self.held_tool().map(|tool| tiamot_core::hud::HeldTool {
+                id: tool.id.clone(),
+                name: tool.name.clone(),
+                brush: tool.brush.clone(),
+            }),
+        })
     }
 
     /// Warnings the player should see, newest last.

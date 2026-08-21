@@ -377,6 +377,27 @@ fn paint_widget(
     }
 }
 
+/// The colour that stands in for a material until the atlas is bridged in.
+///
+/// **Shared with the tier-2 HUD's `Icon` command**, so a mod's hotbar and the
+/// engine's inventory slots show the same material as the same colour. Two
+/// independent hashes of the same id would be the sort of difference a player
+/// notices and nobody can explain.
+#[must_use]
+pub fn material_tint(material: u16) -> egui::Color32 {
+    // Keyed off the id so two materials look different. Textured slots want the
+    // atlas, which is the world renderer's texture and a later change.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a deliberate hash into a byte"
+    )]
+    egui::Color32::from_rgb(
+        60u8.wrapping_add(material.wrapping_mul(37) as u8),
+        90u8.wrapping_add(material.wrapping_mul(59) as u8),
+        120u8.wrapping_add(material.wrapping_mul(17) as u8),
+    )
+}
+
 /// A button, and the press it reports.
 fn paint_button(
     ui: &mut egui::Ui,
@@ -677,15 +698,8 @@ fn paint_slot(
         .get(view)
         .and_then(|contents| contents.slots.get(usize::from(index)).copied().flatten())
     {
-        // A block of colour standing in for the item, keyed off the material id
-        // so two materials look different. Textured slots want the atlas, which
-        // is the renderer's and a later change.
-        let tint = egui::Color32::from_rgb(
-            60u8.wrapping_add(material.wrapping_mul(37) as u8),
-            90u8.wrapping_add(material.wrapping_mul(59) as u8),
-            120u8.wrapping_add(material.wrapping_mul(17) as u8),
-        );
-        ui.painter().rect_filled(inner.shrink(6.0), 2.0, tint);
+        ui.painter()
+            .rect_filled(inner.shrink(6.0), 2.0, material_tint(material));
         // **Charter rule 5's display rule, and the only place the 27 shows.**
         // Blocks and spare nodes, never a raw unit count: a player thinks in
         // blocks, and `1+13` is what forty units actually is.

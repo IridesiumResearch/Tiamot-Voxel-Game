@@ -148,6 +148,19 @@ pub enum Event {
         sounds: Vec<tiamot_core::proto::SoundDef>,
     },
 
+    /// A pushed HUD script has arrived and is ready to run.
+    ///
+    /// One event per script rather than one for the table, because they arrive
+    /// separately: the table names hashes, and each file completes when it
+    /// completes. A script whose file never arrives simply never runs, which is
+    /// the same shape as a sound whose file never arrives never playing.
+    HudScript {
+        /// The mod that pushed it, for attribution when it misbehaves.
+        mod_id: String,
+        /// The Lua source, already checked for being text.
+        source: String,
+    },
+
     /// A sound has been fetched and decoded, and can now be played.
     ///
     /// Arrives after the join rather than before it: a client should be in the
@@ -732,6 +745,7 @@ async fn session(
     // The sound table, kept so an arriving content chunk can be matched to the
     // sound that wanted it.
     let mut awaited_sounds: Vec<tiamot_core::proto::SoundDef> = Vec::new();
+    let mut awaited_hud_scripts: Vec<tiamot_core::proto::HudScriptDef> = Vec::new();
     send.impair(impairment);
 
     let _ = events.send(Event::Connected {
@@ -995,6 +1009,16 @@ async fn session(
                         {
                             decode_when_ready(sound, &cache, &events);
                         }
+
+                        // Same moment, same reason, and `filter` for the same
+                        // reason too: two mods pushing byte-identical scripts
+                        // share one hash, and `find` would run only the first.
+                        for script in awaited_hud_scripts
+                            .iter()
+                            .filter(|script| script.file == Some(hash))
+                        {
+                            offer_hud_script(script, &cache, &events);
+                        }
                     }
                     Ok(false) => {}
                     Err(reason) => {
@@ -1174,6 +1198,28 @@ async fn session(
                 let _ = events.send(Event::Sounds { sounds });
             }
 
+            ServerMessage::HudScripts { scripts } => {
+                // The same pipeline as a sound, for the same reason: by hash,
+                // after the join, and a client that already has the bytes asks
+                // for nothing. What makes this one different is that the bytes
+                // are CODE — which is handled where it runs, in the sandbox,
+                // not here.
+                let wanted: Vec<tiamot_core::proto::ContentHash> =
+                    scripts.iter().filter_map(|script| script.file).collect();
+                let missing = cache.missing(&wanted);
+                for script in &scripts {
+                    offer_hud_script(script, &cache, &events);
+                }
+                if !missing.is_empty()
+                    && let Err(err) = send
+                        .write(&ClientMessage::ContentRequest { hashes: missing })
+                        .await
+                {
+                    say(format!("could not ask for the HUD scripts: {err}"));
+                }
+                awaited_hud_scripts = scripts;
+            }
+
             ServerMessage::PlaySound {
                 sound,
                 pos,
@@ -1278,6 +1324,54 @@ fn accept_slice(
 /// `decode_isolated`, so a panic disables that one sound rather than the
 /// client. The warning is per server and per sound, which is what the rule
 /// asks for.
+/// Longest pushed HUD script the client will hand to the sandbox.
+///
+/// Checked before the source is turned into a `String`, because charter rule 14
+/// says the bound goes before the allocation, not after it. Sixty-four kilobytes
+/// of Lua is a very large HUD; anything past it is not one.
+const MAX_HUD_SCRIPT_BYTES: usize = 64 * 1024;
+
+/// Hands a pushed HUD script to the app, if its file has arrived.
+///
+/// **This is the one asset the client executes**, so what it checks is what
+/// makes it text rather than what makes it valid: the bytes are bounded before
+/// being copied and refused unless they are UTF-8. Everything else that keeps
+/// this safe — no filesystem, no network, no `load`, an instruction ceiling per
+/// frame — is the sandbox's, in `tiamot_core::script::HudVm`, because those are
+/// properties of running it and not of reading it.
+fn offer_hud_script(
+    script: &tiamot_core::proto::HudScriptDef,
+    cache: &ContentCache,
+    events: &mpsc::UnboundedSender<Event>,
+) {
+    let Some(hash) = script.file else {
+        // A mod named a file that is not in its directory. The server logged
+        // it; there is nothing to fetch and nothing to run.
+        return;
+    };
+    let Some(bytes) = cache.get(&hash) else {
+        return;
+    };
+    let mod_id = script.mod_id.clone();
+    if bytes.len() > MAX_HUD_SCRIPT_BYTES {
+        let _ = events.send(Event::Warning(format!(
+            "`{mod_id}`'s HUD script is {} bytes, over the {MAX_HUD_SCRIPT_BYTES} a client will              run; it is disabled",
+            bytes.len()
+        )));
+        return;
+    }
+    match String::from_utf8(bytes) {
+        Ok(source) => {
+            let _ = events.send(Event::HudScript { mod_id, source });
+        }
+        Err(_) => {
+            let _ = events.send(Event::Warning(format!(
+                "`{mod_id}`'s HUD script is not text and is disabled"
+            )));
+        }
+    }
+}
+
 fn decode_when_ready(
     sound: &tiamot_core::proto::SoundDef,
     cache: &ContentCache,

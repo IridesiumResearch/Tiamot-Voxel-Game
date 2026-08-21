@@ -22,8 +22,9 @@
 use std::path::PathBuf;
 
 use tiamot_core::proto::{
-    ClientMessage, DisconnectReason, Edit, MaterialDef, ModEntry, PROTOCOL_VERSION, ServerMessage,
-    WireSignature, encode,
+    ActionDef, ClientMessage, DisconnectReason, Edit, EntityDef, EntityDelta, FluidDef,
+    HudScriptDef, MaterialDef, ModEntry, PROTOCOL_VERSION, ServerMessage, SkyFrame, SkyGrade,
+    SoundDef, WireSignature, encode,
 };
 use tiamot_core::{BlockPos, ChunkPos, SubNodePos};
 
@@ -51,6 +52,54 @@ fn main() {
     }
 
     println!("wrote {written} seeds to {}", out.display());
+}
+
+/// A small widget tree: a container with two children.
+///
+/// Nested and index-addressed, which is what the decoder's limits are about —
+/// an empty tree exercises the envelope and nothing else.
+fn sample_tree() -> tiamot_core::ui::Tree {
+    use tiamot_core::ui::{Align, Children, Direction, Node, Style, Tree, Widget};
+    Tree {
+        nodes: vec![
+            Node {
+                widget: Widget::Container {
+                    direction: Direction::Column,
+                    gap: 8,
+                    padding: 8,
+                    align: Align::Start,
+                },
+                name: "root".to_owned(),
+                style: Style::default(),
+                grow: 1,
+                size: None,
+                cross_size: None,
+                children: Children { first: 1, count: 2 },
+            },
+            Node {
+                widget: Widget::Label {
+                    text: "Inventory".to_owned(),
+                },
+                name: "title".to_owned(),
+                style: Style::default(),
+                grow: 0,
+                size: None,
+                cross_size: None,
+                children: Children { first: 0, count: 0 },
+            },
+            Node {
+                widget: Widget::Button {
+                    text: "Close".to_owned(),
+                },
+                name: "close".to_owned(),
+                style: Style::default(),
+                grow: 0,
+                size: None,
+                cross_size: None,
+                children: Children { first: 0, count: 0 },
+            },
+        ],
+    }
 }
 
 /// One encoding of every `ClientMessage` variant.
@@ -470,6 +519,125 @@ fn server_messages() -> Vec<Vec<u8>> {
         ServerMessage::ChunkLight {
             pos: ChunkPos::new(1, 1, 1),
             light: Vec::new(),
+        },
+        // **Everything from protocol v9 to v22 was unseeded until Task 14.**
+        // The corpus stopped at v8, so the fuzzer had been starting from a
+        // decoder two years of tasks out of date — running clean and proving
+        // nothing about seventeen variants. That is CONTRIBUTING's step 4
+        // skipped four more times, the same way v4 and v5 skipped it. Every
+        // variant below is here so the next append has somewhere to sit.
+        ServerMessage::SkyTable {
+            day_length_ticks: 24_000,
+            keyframes: vec![SkyFrame {
+                time: 0.5,
+                sky: [0.4, 0.6, 0.9],
+                sun: [1.0, 0.98, 0.9],
+                intensity: 1.0,
+                grade: SkyGrade::NONE,
+            }],
+        },
+        ServerMessage::TimeOfDay { time: 0.25 },
+        ServerMessage::ChunkFluid {
+            pos: ChunkPos::new(2, -1, 4),
+            fluid: vec![0x01, 0x02, 0x03, 0x04],
+        },
+        ServerMessage::FluidTable {
+            fluids: vec![FluidDef {
+                id: 1,
+                name: "core_milk:milk".to_owned(),
+                material: 4,
+                depths: [1, 2, 3, 4, 5, 6, 7, 8],
+                color: [240, 240, 230],
+            }],
+        },
+        ServerMessage::ViewDistance {
+            horizontal: 8,
+            vertical: 4,
+        },
+        ServerMessage::EntitySpawn {
+            entities: vec![EntityDef {
+                id: 9,
+                chunk: ChunkPos::new(0, 0, 0),
+                local: [1.0, 2.0, 3.0],
+                velocity: [0.0; 3],
+                yaw: 128,
+                pitch: -32,
+                anim: 1,
+                model: Some("core_mimic:chest".to_owned()),
+                collider: Some([0.6, 1.8]),
+                nametag: Some("a mimic".to_owned()),
+            }],
+        },
+        ServerMessage::EntityDespawn {
+            entities: vec![9, 10, 11],
+        },
+        ServerMessage::EntityState {
+            tick: 42,
+            entities: vec![EntityDelta {
+                id: 9,
+                chunk: ChunkPos::new(0, 0, 0),
+                local: [1.5, 2.0, 3.0],
+                velocity: [0.1, 0.0, 0.0],
+                yaw: 130,
+                pitch: -30,
+                anim: 2,
+            }],
+        },
+        ServerMessage::ActionTable {
+            actions: vec![ActionDef {
+                id: "core_tools:chisel_mode".to_owned(),
+                description: "Switch the chisel".to_owned(),
+                mod_id: "core_tools".to_owned(),
+                default_key: "KeyR".to_owned(),
+            }],
+        },
+        ServerMessage::SoundTable {
+            sounds: vec![SoundDef {
+                id: "core_tools:break".to_owned(),
+                mod_id: "core_tools".to_owned(),
+                file: Some([0xEE; 32]),
+                gain: 1.0,
+                pitch_variance: 0.1,
+            }],
+        },
+        ServerMessage::PlaySound {
+            sound: "core_tools:break".to_owned(),
+            pos: [10.0, 64.0, -3.0],
+            radius: 16.0,
+            gain: 1.0,
+            entity: Some(9),
+        },
+        // A dialog with a real tree rather than an empty one: the tree is
+        // nested, indexed and bounded, which is the part with something to
+        // find in it.
+        ServerMessage::ShowDialog {
+            form: "core_ui:inventory".to_owned(),
+            tree: sample_tree(),
+        },
+        ServerMessage::UpdateDialog {
+            form: "core_ui:inventory".to_owned(),
+            tree: sample_tree(),
+        },
+        ServerMessage::CloseDialog {
+            form: "core_ui:inventory".to_owned(),
+        },
+        ServerMessage::ViewUpdate {
+            view: "player:main".to_owned(),
+            slots: vec![Some((3, 40)), None, Some((4, 27))],
+            held: Some((3, 13)),
+        },
+        ServerMessage::HudScripts {
+            scripts: vec![
+                HudScriptDef {
+                    mod_id: "core_ui".to_owned(),
+                    file: Some([0xAA; 32]),
+                },
+                // The shape a mod produces by naming a file it does not have.
+                HudScriptDef {
+                    mod_id: "broken".to_owned(),
+                    file: None,
+                },
+            ],
         },
     ];
     messages.iter().filter_map(|m| encode(m).ok()).collect()

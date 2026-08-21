@@ -510,8 +510,18 @@ impl ServerHandle {
                     // file edited while the server runs is served under its old
                     // hash, which is the one thing content addressing exists to
                     // make impossible.
+                    // What each mod asked to publish beyond the extension
+                    // allowlist. `.lua` is not distributable by extension —
+                    // server mod code has no business on a client — so a HUD
+                    // script reaches one only because the mod named it.
+                    let declared = loaded.vm().registered_hud_scripts();
                     for entry in &loaded.resolved().order {
-                        match content_index.add_mod(&entry.id, &entry.dir) {
+                        let extra: Vec<String> = declared
+                            .iter()
+                            .filter(|script| script.mod_id == entry.id)
+                            .map(|script| script.file.clone())
+                            .collect();
+                        match content_index.add_mod_with(&entry.id, &entry.dir, &extra) {
                             Ok(fingerprint) => mods.push(ModEntry {
                                 id: entry.id.clone(),
                                 version: entry.version.to_string(),
@@ -644,6 +654,32 @@ impl ServerHandle {
             })
             .collect();
         info!(sounds = sound_table.len(), "sound table built");
+
+        // Charter rule 10's tier 2: a mod may push a script that DRAWS. The
+        // file travels by hash like a sound's, and what makes it safe is the
+        // sandbox on the other end — the server does not run these and never
+        // reads them.
+        let hud_scripts: Vec<tiamot_core::proto::HudScriptDef> = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_hud_scripts())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|script| {
+                let file = content_index.hash_of(&script.mod_id, &script.file);
+                if file.is_none() {
+                    error!(
+                        mod_id = %script.mod_id,
+                        path = %script.file,
+                        "HUD script is not in the mod directory; clients will draw nothing for it"
+                    );
+                }
+                tiamot_core::proto::HudScriptDef {
+                    mod_id: script.mod_id,
+                    file,
+                }
+            })
+            .collect();
+        info!(hud_scripts = hud_scripts.len(), "HUD script table built");
 
         info!(
             materials = materials.len(),
@@ -849,6 +885,7 @@ impl ServerHandle {
             tool_table,
             action_table,
             sound_table,
+            hud_scripts,
             fluid_table,
             sky_day_length: sky.0,
             sky_keyframes: sky.1,

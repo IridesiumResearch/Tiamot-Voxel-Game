@@ -124,6 +124,12 @@ fn a_bot_completes_the_whole_join_flow() {
             // sounds of its own either, and a client fetches the files by hash
             // after being told what to ask for.
             "SoundTable",
+            // Protocol v22, and the last of them. The one message here that
+            // names CODE — a HUD script a client may run in a hard sandbox
+            // (charter rule 10). After every table a HUD reads, so a script
+            // asking what the player carries is not asking before the material
+            // table arrived.
+            "HudScripts",
             "JoinWorld",
         ];
         assert!(
@@ -521,6 +527,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::SkyTable { .. } => "SkyTable",
         ServerMessage::ActionTable { .. } => "ActionTable",
         ServerMessage::SoundTable { .. } => "SoundTable",
+        ServerMessage::HudScripts { .. } => "HudScripts",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",
         _ => "other",

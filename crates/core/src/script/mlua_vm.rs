@@ -565,6 +565,24 @@ impl ScriptVm for MluaVm {
             .collect()
     }
 
+    fn registered_hud_scripts(&self) -> Vec<crate::hud::ScriptFile> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.hud_scripts") else {
+            return Vec::new();
+        };
+        // Load order, which is DRAW order on the client: a mod loaded later
+        // draws on top of one loaded earlier.
+        registry
+            .sequence_values::<Table>()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                Some(crate::hud::ScriptFile {
+                    mod_id: entry.get("mod_id").ok()?,
+                    file: entry.get("file").ok()?,
+                })
+            })
+            .collect()
+    }
+
     fn set_entity_access(&mut self, access: std::sync::Arc<dyn crate::ent::Access>) {
         if let Ok(mut slot) = self.entities.lock() {
             *slot = Some(access);
@@ -1359,6 +1377,37 @@ impl MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("register_sound", register_sound)
+            .map_err(|err| self.vm_error(&err))?;
+
+        // **One per mod, and the last one wins.** A mod with two HUD scripts is
+        // a mod that should concatenate them: the client budgets per script per
+        // frame, so two scripts from one mod would quietly buy it twice the
+        // budget of a mod that shipped one.
+        let owner = mod_id.to_owned();
+        let register_hud = self
+            .lua
+            .create_function(move |lua, file: String| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                let scripts: Table = lua.named_registry_value("tiamot.hud_scripts")?;
+                for existing in scripts.clone().sequence_values::<Table>().flatten() {
+                    if existing.get::<String>("mod_id").ok().as_deref() == Some(owner.as_str()) {
+                        existing.set("file", file)?;
+                        return Ok(());
+                    }
+                }
+                let entry = lua.create_table()?;
+                entry.set("mod_id", owner.clone())?;
+                entry.set("file", file)?;
+                scripts.push(entry)?;
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_hud_script", register_hud)
             .map_err(|err| self.vm_error(&err))?;
 
         let owner = mod_id.to_owned();
@@ -2489,6 +2538,7 @@ impl MluaVm {
         let generators = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let actions = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let sounds = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        let hud_scripts = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.blocks", blocks)
             .map_err(|err| self.vm_error(&err))?;
@@ -2539,6 +2589,9 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.sounds", sounds)
+            .map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.hud_scripts", hud_scripts)
             .map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.next_material", self.next_material)

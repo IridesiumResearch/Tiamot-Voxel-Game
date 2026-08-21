@@ -272,6 +272,16 @@ pub struct JoinContext<'a> {
     /// that was not told this would have nothing to play. Empty is a world
     /// nobody made a noise in. See [`crate::proto::SoundDef`].
     pub sounds: &'a [crate::proto::SoundDef],
+    /// Every HUD script the loaded mods want the client to run, in load order.
+    ///
+    /// **The one thing in this list that is code.** Everything else a join
+    /// sends is data; these are Lua sources a client MAY choose to run, in a
+    /// sandbox with no filesystem, no network and a per-frame instruction
+    /// ceiling (charter rule 10). Empty is the ordinary case, and a client that
+    /// ignored this entirely would still be a working client — which is the
+    /// property that makes pushing code acceptable at all.
+    /// See [`crate::proto::HudScriptDef`].
+    pub hud_scripts: &'a [crate::proto::HudScriptDef],
     /// The sky a mod registered: how long a day is, and its keyframes.
     ///
     /// A day length of zero with no keyframes means no mod registered one,
@@ -719,6 +729,13 @@ impl Session {
                 ServerMessage::SoundTable {
                     sounds: context.sounds.to_vec(),
                 },
+                // And the HUD scripts, after every table a HUD reads. A script
+                // asking what the player is carrying before the material table
+                // had arrived would draw a hotbar of numbers — and it is only
+                // one message later, so the ordering is free.
+                ServerMessage::HudScripts {
+                    scripts: context.hud_scripts.to_vec(),
+                },
             ],
             close: false,
             action: Action::None,
@@ -894,6 +911,7 @@ mod tests {
             tools: &[],
             actions: &[],
             sounds: &[],
+            hud_scripts: &[],
             sky: (0, &[]),
             allowlist,
             max_players: 50,
@@ -993,7 +1011,8 @@ mod tests {
         assert!(matches!(sent[7], ServerMessage::ActionTable { .. }));
         // And the sounds, for the sixth: the engine has none of its own.
         assert!(matches!(sent[8], ServerMessage::SoundTable { .. }));
-        assert!(matches!(sent[9], ServerMessage::JoinWorld { .. }));
+        assert!(matches!(sent[9], ServerMessage::HudScripts { .. }));
+        assert!(matches!(sent[10], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]
