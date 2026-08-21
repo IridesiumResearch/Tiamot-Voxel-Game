@@ -3507,6 +3507,14 @@ impl App {
         /// Lifted clear of the surface, in blocks. The same lesson the
         /// shoreline taught: a quad coplanar with the face under it fights it.
         const LIFT: f32 = 0.02;
+        /// How wide the disc is at the ground, as a radius in blocks.
+        ///
+        /// Doubled from 0.4 after a look from the window: a disc the width of
+        /// the body reads as a smudge under your feet rather than as a shadow,
+        /// because the soft rim eats most of it. Wider than the caster is what
+        /// makes it look like light arriving from more than one direction,
+        /// which is what an ambient shadow is.
+        const RADIUS: f32 = 0.8;
 
         let Some(predictor) = self.predictor.as_ref() else {
             self.renderer.set_blobs(&[]);
@@ -3521,7 +3529,7 @@ impl App {
         // The player first, then everything drawn. Feet in cells relative to
         // the predictor's own chunk, which is the space `Voxels` reads in.
         let mut feet: Vec<([f32; 3], f32)> = Vec::with_capacity(self.entities.len() + 1);
-        feet.push((predictor.body().position, 0.4));
+        feet.push((predictor.body().position, RADIUS));
         for (_, entity) in self.entities.iter() {
             let Some(pose) = entity.pose(now) else {
                 continue;
@@ -3543,7 +3551,7 @@ impl App {
                     pose.local[1] + shift(1, pose.chunk.y) as f32,
                     pose.local[2] + shift(2, pose.chunk.z) as f32,
                 ],
-                0.4,
+                RADIUS,
             ));
         }
 
