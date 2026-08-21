@@ -94,6 +94,17 @@ shadow_quality = "medium"
 # unsynchronised loop trades the former for the latter.
 vsync = true
 
+# The debug overlay: frame timings, the worst-frame breakdown, memory, the
+# adapter and the present mode. On by default, and also a checkbox on the
+# settings screen (F1) and a key (F3).
+#
+# It is not a developer-only build. Charter rule 18 makes frame PACING the
+# metric and calls integrated graphics best-effort, which means the people best
+# placed to measure it are players on hardware nobody upstream will ever own —
+# and they need the instrument. If you report a stutter, this is the readout to
+# paste.
+debug_overlay = true
+
 # Vertical field of view, in degrees. Must be between 1 and 179.
 fov_degrees = 70.0
 

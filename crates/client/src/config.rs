@@ -370,6 +370,22 @@ pub struct Config {
     #[serde(default = "Config::default_vsync")]
     pub vsync: bool,
 
+    /// Whether the debug overlay is on the screen.
+    ///
+    /// **In a shipped build, and reachable from the settings screen** — not a
+    /// developer-only overlay compiled out or hidden behind an undocumented
+    /// key. Every frame-pacing question this project has answered was answered
+    /// by somebody reading these numbers off their own screen and pasting them
+    /// back, and charter rule 18 makes pacing the metric while naming
+    /// integrated graphics as best-effort. The people best placed to measure it
+    /// are players on hardware nobody here will ever see, and they need the
+    /// instrument.
+    ///
+    /// On by default for that reason: an instrument nobody knows exists is an
+    /// instrument nobody uses.
+    #[serde(default = "Config::default_debug_overlay")]
+    pub debug_overlay: bool,
+
     /// Vertical field of view, in degrees.
     #[serde(default = "Config::default_fov_degrees")]
     pub fov_degrees: f32,
@@ -407,6 +423,10 @@ impl Config {
     }
 
     const fn default_vsync() -> bool {
+        true
+    }
+
+    const fn default_debug_overlay() -> bool {
         true
     }
 
@@ -559,6 +579,7 @@ impl Default for Config {
             lighting_mode: LightingMode::default(),
             shadow_quality: ShadowQuality::default(),
             vsync: Self::default_vsync(),
+            debug_overlay: Self::default_debug_overlay(),
             fov_degrees: Self::default_fov_degrees(),
             mouse_sensitivity: Self::default_mouse_sensitivity(),
             fly_speed: Self::default_fly_speed(),
@@ -610,6 +631,26 @@ mod tests {
         // Singleplayer must work with no config file at all — that is the
         // first-run experience.
         assert_eq!(Config::default().server, ServerChoice::Embedded);
+    }
+
+    #[test]
+    fn the_debug_overlay_is_on_unless_a_player_turned_it_off() {
+        // Charter rule 18's instrument ships and is on: an instrument nobody
+        // knows exists is an instrument nobody uses, and every frame-pacing
+        // question so far was answered by somebody reading it off their screen.
+        assert!(Config::default().debug_overlay);
+
+        // Absent means the default, so a config written before this setting
+        // existed keeps the overlay rather than silently losing it.
+        let path = temp_config("overlay-absent", "server = \"embedded\"\n");
+        assert!(Config::load(&path).expect("valid config").debug_overlay);
+
+        // And a player who turned it off gets it left off.
+        let path = temp_config(
+            "overlay-off",
+            "server = \"embedded\"\ndebug_overlay = false\n",
+        );
+        assert!(!Config::load(&path).expect("valid config").debug_overlay);
     }
 
     #[test]

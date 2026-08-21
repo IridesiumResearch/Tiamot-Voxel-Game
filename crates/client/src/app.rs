@@ -2287,6 +2287,27 @@ impl App {
         self.settings_open
     }
 
+    /// Whether the debug overlay is being drawn.
+    ///
+    /// Charter rule 18's instrument, and it ships. See
+    /// [`crate::config::Config::debug_overlay`] for why it is not a
+    /// developer-only build.
+    #[must_use]
+    pub const fn debug_overlay(&self) -> bool {
+        self.config.debug_overlay
+    }
+
+    /// Turns the debug overlay on or off, and remembers the choice.
+    pub fn set_debug_overlay(&mut self, on: bool) {
+        if self.config.debug_overlay == on {
+            return;
+        }
+        self.config.debug_overlay = on;
+        // The same flag the volume sliders use: the `App` says the settings
+        // changed and the window, which is what knows the path, writes them.
+        self.volumes_dirty = true;
+    }
+
     /// Opens or closes the settings screen.
     ///
     /// Closing abandons a capture in progress: a player who opened the rebind

@@ -381,6 +381,10 @@ impl ApplicationHandler for Client {
                         self.held = Held::default();
                         self.grabbed = !grab(&surface.window, false);
                     }
+                    "engine:debug_overlay" if pressed => {
+                        let on = !surface.app.debug_overlay();
+                        surface.app.set_debug_overlay(on);
+                    }
                     "engine:menu" if pressed => {
                         surface.app.set_chat_open(false);
                         self.grabbed = !grab(&surface.window, false);
@@ -1172,6 +1176,25 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
             draw_sound_attribution(app, ui);
 
             ui.separator();
+            ui.heading("display");
+            // **The debug overlay ships, and lives here.** Charter rule 18
+            // makes frame pacing the metric, and every pacing question so far
+            // was answered by somebody reading these numbers off their own
+            // screen. A player on hardware nobody here will ever own is the
+            // person best placed to measure it, so the instrument is in the
+            // menu rather than behind a build flag or an undocumented key.
+            let mut overlay = app.debug_overlay();
+            if ui
+                .checkbox(
+                    &mut overlay,
+                    "Debug overlay (frame timings, memory, adapter)",
+                )
+                .changed()
+            {
+                app.set_debug_overlay(overlay);
+            }
+
+            ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Reset all").clicked() {
                     reset_all = true;
@@ -1205,7 +1228,14 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
 /// the world instead of replacing it.
 fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     let raw = surface.egui_state.take_egui_input(&surface.window);
-    let lines = surface.app.hud();
+    // Empty when the overlay is off. The warnings and the joining notice below
+    // are NOT part of it — those tell a player something is wrong, and a player
+    // who turned off a frame-timing readout did not ask to stop being told.
+    let lines = if surface.app.debug_overlay() {
+        surface.app.hud()
+    } else {
+        Vec::new()
+    };
     let warnings: Vec<String> = surface.app.warnings().to_vec();
     let joined = surface.app.joined();
 
@@ -1233,6 +1263,9 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // A dialog is a thing a player is interacting with; a HUD is a thing
         // they are reading past.
         draw_hud_scripts(&mut surface.app, &context);
+        if lines.is_empty() && warnings.is_empty() && joined {
+            return;
+        }
         egui::Area::new(egui::Id::new("hud"))
             .fixed_pos(egui::pos2(8.0, 8.0))
             .interactable(false)
@@ -1264,9 +1297,10 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         .egui_state
         .handle_platform_output(&surface.window, output.platform_output);
 
-    // Volumes live in `client.toml` beside the other settings. Saved on the
-    // same "the App raises a flag, the window knows the path" split as the
-    // bindings below.
+    // Volumes and the debug-overlay toggle live in `client.toml` beside the
+    // other settings. Saved on the same "the App raises a flag, the window
+    // knows the path" split as the bindings below. One flag for both: they are
+    // the same file, and a second flag would be a second chance to forget one.
     if surface.app.take_volumes_dirty() {
         let mut config = surface.app.config().clone();
         config.volumes = surface.app.mixer_mut().volumes().clone();
