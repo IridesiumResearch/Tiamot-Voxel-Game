@@ -762,6 +762,12 @@ pub struct App {
     volumes_dirty: bool,
     /// Whether the settings screen is showing.
     settings_open: bool,
+    /// Whether the pause menu is on the screen.
+    ///
+    /// **Escape opens a menu rather than only releasing the cursor.** Releasing
+    /// it was all Escape did, so the settings screen was reachable by one
+    /// undocumented function key and the interface had no front door at all.
+    menu_open: bool,
     /// The action waiting for a key, while the settings screen captures one.
     ///
     /// While this is set the window sends EVERY press here instead of acting on
@@ -1009,6 +1015,7 @@ impl App {
             last_step_at: [0.0; 3],
             volumes_dirty: false,
             settings_open: false,
+            menu_open: false,
             rebinding: None,
             bindings_dirty: false,
             connection,
@@ -2436,6 +2443,63 @@ impl App {
         self.settings_open
     }
 
+    /// Whether the pause menu is on the screen.
+    #[must_use]
+    pub const fn menu_open(&self) -> bool {
+        self.menu_open
+    }
+
+    /// Opens or closes the pause menu.
+    ///
+    /// Closing it closes the controls screen with it: the controls are a page
+    /// OF the menu, and leaving them up over the world after the menu had gone
+    /// would be a screen with no way back.
+    pub fn set_menu_open(&mut self, open: bool) {
+        self.menu_open = open;
+        if !open {
+            self.settings_open = false;
+            self.rebinding = None;
+        }
+    }
+
+    /// How large the interface is drawn.
+    #[must_use]
+    pub const fn ui_scale(&self) -> f32 {
+        self.config.ui_scale
+    }
+
+    /// Sets the interface scale, clamped to what a player can recover from.
+    pub fn set_ui_scale(&mut self, scale: f32) {
+        let scale = if scale.is_finite() {
+            scale.clamp(
+                *crate::config::UI_SCALE_RANGE.start(),
+                *crate::config::UI_SCALE_RANGE.end(),
+            )
+        } else {
+            return;
+        };
+        if (self.config.ui_scale - scale).abs() < f32::EPSILON {
+            return;
+        }
+        self.config.ui_scale = scale;
+        self.volumes_dirty = true;
+    }
+
+    /// Whether the HUD is drawn.
+    #[must_use]
+    pub const fn hud_visible(&self) -> bool {
+        self.config.hud_visible
+    }
+
+    /// Shows or hides the HUD, and remembers the choice.
+    pub fn set_hud_visible(&mut self, visible: bool) {
+        if self.config.hud_visible == visible {
+            return;
+        }
+        self.config.hud_visible = visible;
+        self.volumes_dirty = true;
+    }
+
     /// Whether the debug overlay is being drawn.
     ///
     /// Charter rule 18's instrument, and it ships. See
@@ -2455,6 +2519,11 @@ impl App {
         // The same flag the volume sliders use: the `App` says the settings
         // changed and the window, which is what knows the path, writes them.
         self.volumes_dirty = true;
+    }
+
+    /// Opens the controls screen, from the menu.
+    pub const fn open_settings(&mut self) {
+        self.settings_open = true;
     }
 
     /// Opens or closes the settings screen.

@@ -305,6 +305,14 @@ impl ShadowQuality {
     }
 }
 
+/// How far the interface may be scaled, either way.
+///
+/// A scale of zero is an interface nobody can see with no way to get it back,
+/// and an enormous one is a single button filling the screen. Both are
+/// unrecoverable from inside the game, which is why this is a refusal at load
+/// rather than a clamp.
+pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
+
 /// Client configuration.
 ///
 /// Unknown fields are rejected rather than ignored, for the same reason the
@@ -386,6 +394,29 @@ pub struct Config {
     #[serde(default = "Config::default_debug_overlay")]
     pub debug_overlay: bool,
 
+    /// How large the interface is drawn, as a multiplier.
+    ///
+    /// **One scale for the whole interface**, which is what a player means by
+    /// the setting: the inventory, the menu, chat, and a mod's HUD all move
+    /// together. A mod's virtual canvas is still
+    /// [`tiamot_core::hud::VIRTUAL_HEIGHT`] tall — this scales the canvas, not
+    /// the contract.
+    ///
+    /// Bounded by [`UI_SCALE_RANGE`]. Default `1.25` rather than `1.0`: the dialogs were reported from the
+    /// window as too small, and a default nobody has to find is worth more than
+    /// a setting everybody has to change.
+    #[serde(default = "Config::default_ui_scale")]
+    pub ui_scale: f32,
+
+    /// Whether the HUD is drawn at all.
+    ///
+    /// Covers the crosshair and everything a mod's HUD script draws. **Not
+    /// chat**, and not the settings screen: moderation depends on a player
+    /// being able to read what is said, and a screen that could be turned off
+    /// with no way to turn it back on is a trap.
+    #[serde(default = "Config::default_hud_visible")]
+    pub hud_visible: bool,
+
     /// Vertical field of view, in degrees.
     #[serde(default = "Config::default_fov_degrees")]
     pub fov_degrees: f32,
@@ -427,6 +458,14 @@ impl Config {
     }
 
     const fn default_debug_overlay() -> bool {
+        true
+    }
+
+    const fn default_ui_scale() -> f32 {
+        1.25
+    }
+
+    const fn default_hud_visible() -> bool {
         true
     }
 
@@ -535,6 +574,18 @@ impl Config {
                 self.fov_degrees
             )));
         }
+        // A scale of zero is an interface nobody can see and no way to get it
+        // back; an enormous one is one button filling the screen. Both are a
+        // config typo rather than a choice, and both are unrecoverable from
+        // inside the game.
+        if !self.ui_scale.is_finite() || !(UI_SCALE_RANGE).contains(&self.ui_scale) {
+            return Err(invalid(format!(
+                "ui_scale must be between {} and {}, not {}",
+                UI_SCALE_RANGE.start(),
+                UI_SCALE_RANGE.end(),
+                self.ui_scale
+            )));
+        }
         if !self.mouse_sensitivity.is_finite() || self.mouse_sensitivity <= 0.0 {
             return Err(invalid(format!(
                 "mouse_sensitivity must be positive, not {}",
@@ -580,6 +631,8 @@ impl Default for Config {
             shadow_quality: ShadowQuality::default(),
             vsync: Self::default_vsync(),
             debug_overlay: Self::default_debug_overlay(),
+            ui_scale: Self::default_ui_scale(),
+            hud_visible: Self::default_hud_visible(),
             fov_degrees: Self::default_fov_degrees(),
             mouse_sensitivity: Self::default_mouse_sensitivity(),
             fly_speed: Self::default_fly_speed(),
@@ -651,6 +704,47 @@ mod tests {
             "server = \"embedded\"\ndebug_overlay = false\n",
         );
         assert!(!Config::load(&path).expect("valid config").debug_overlay);
+    }
+
+    #[test]
+    fn the_interface_scale_defaults_bigger_than_one_and_is_bounded() {
+        // Reported from the window: the inventory is too small. A default
+        // nobody has to find is worth more than a setting everybody changes.
+        assert!(Config::default().ui_scale > 1.0);
+        assert!(UI_SCALE_RANGE.contains(&Config::default().ui_scale));
+
+        // Absent means the default, so a config written before this existed
+        // gets the better size rather than the old one.
+        let path = temp_config("scale-absent", "server = \"embedded\"\n");
+        assert!(
+            (Config::load(&path).expect("valid config").ui_scale - Config::default().ui_scale)
+                .abs()
+                < f32::EPSILON
+        );
+
+        // **Refused rather than clamped.** A scale of zero is an interface
+        // nobody can see and no way to get it back — the one setting a player
+        // cannot recover from inside the game, so a typo must not start.
+        for bad in ["0.0", "12.0", "-1.0"] {
+            let path = temp_config(
+                &format!("scale-bad-{bad}"),
+                &format!("server = \"embedded\"\nui_scale = {bad}\n"),
+            );
+            let err = Config::load(&path).expect_err("an unusable scale should refuse to load");
+            assert!(
+                err.to_string().contains("ui_scale") || {
+                    let source = std::error::Error::source(&err).map(ToString::to_string);
+                    source.is_some_and(|text| text.contains("ui_scale"))
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_hud_can_be_turned_off_and_stays_off() {
+        assert!(Config::default().hud_visible);
+        let path = temp_config("hud-off", "server = \"embedded\"\nhud_visible = false\n");
+        assert!(!Config::load(&path).expect("valid config").hud_visible);
     }
 
     #[test]

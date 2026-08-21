@@ -371,10 +371,19 @@ impl ApplicationHandler for Client {
                     "engine:jump" => self.held.up = pressed,
                     "engine:sneak" | "engine:sneak_alt" => self.held.down = pressed,
                     "engine:sprint" => self.held.sprint = pressed,
+                    // **The shortcut still works, and lands in the same place
+                    // Escape does.** F1 opens the menu WITH the controls page
+                    // showing rather than the controls on their own, so closing
+                    // them always leaves a player somewhere they can act — and
+                    // Escape always gets them out, whichever key let them in.
                     "engine:settings" if pressed => {
-                        surface.app.toggle_settings();
+                        let showing = surface.app.settings_open();
+                        surface.app.set_menu_open(!showing);
+                        if !showing {
+                            surface.app.open_settings();
+                        }
                         // The cursor has to come back to click anything.
-                        self.grabbed = if surface.app.settings_open() {
+                        self.grabbed = if surface.app.menu_open() {
                             !grab(&surface.window, false)
                         } else {
                             grab(&surface.window, true)
@@ -393,9 +402,23 @@ impl ApplicationHandler for Client {
                         let on = !surface.app.debug_overlay();
                         surface.app.set_debug_overlay(on);
                     }
+                    // **Escape is the front door.** It used to only release the
+                    // cursor, which left the settings screen reachable by one
+                    // undocumented function key and the interface with no way
+                    // in. Now it opens a menu — and closes chat, a dialog's
+                    // grab, or the menu itself, whichever is in the way.
                     "engine:menu" if pressed => {
-                        surface.app.set_chat_open(false);
-                        self.grabbed = !grab(&surface.window, false);
+                        if surface.app.chat_open() {
+                            surface.app.set_chat_open(false);
+                        } else {
+                            let open = !surface.app.menu_open();
+                            surface.app.set_menu_open(open);
+                        }
+                        self.grabbed = if surface.app.menu_open() {
+                            !grab(&surface.window, false)
+                        } else {
+                            grab(&surface.window, true)
+                        };
                     }
                     // The floating-origin check from Task 08's criteria: out
                     // and home. The world travels with the camera, so a working
@@ -615,7 +638,7 @@ impl Client {
             self.released_for_dialog = false;
             // Only if nothing else still wants it. Taking the cursor back into
             // the settings screen would be the same bug from the other side.
-            if !surface.app.settings_open() && !surface.app.chat_open() {
+            if !surface.app.menu_open() && !surface.app.chat_open() {
                 self.grabbed = grab(&surface.window, true);
             }
         }
@@ -828,6 +851,12 @@ fn draw_sound_attribution(app: &App, ui: &mut egui::Ui) {
 /// points and DPI is its problem, not the script's.
 fn draw_hud_scripts(app: &mut App, ctx: &egui::Context) {
     app.run_hud_scripts();
+
+    // **Off means off, crosshair included** — but never chat, which is drawn
+    // elsewhere and is not the HUD's to hide (see `core::hud::Builtin`).
+    if !app.hud_visible() {
+        return;
+    }
 
     // `content_rect`, not `viewport_rect`: a HUD anchored to the bottom edge
     // must not sit under an OS status bar or a display notch. A crosshair in
@@ -1087,6 +1116,81 @@ fn draw_chat(app: &mut App, ctx: &egui::Context) {
 /// The whole of the model behind this is in `client::input` and is tested
 /// there without a window, which is what the task asks for: the screen only
 /// reads a list and reports clicks.
+/// The pause menu: the interface's front door.
+///
+/// # Why this exists at all
+///
+/// Escape used to release the cursor and nothing else, so the only way into the
+/// settings was one undocumented function key. Reported from the window as the
+/// controls screen being hard to reach and janky when it got there.
+///
+/// Everything here is a page or a switch, and the two switches are the ones a
+/// player reaches for most: whether the HUD is drawn and whether the debug
+/// overlay is. **Chat is not among them** — moderation depends on a player
+/// being able to read what is said, so it cannot be switched off from a menu
+/// any more than a mod can hide it.
+fn draw_menu(app: &mut App, ctx: &egui::Context) {
+    let mut resume = false;
+    let mut controls = false;
+    let mut scale = app.ui_scale();
+    let mut hud = app.hud_visible();
+    let mut overlay = app.debug_overlay();
+
+    // A centred panel sized to its contents, the same shape a server's dialog
+    // gets — the engine's own screens should not look like a different game
+    // from the ones a mod opens.
+    let screen = ctx.content_rect();
+    egui::Window::new("Menu")
+        .collapsible(false)
+        .resizable(false)
+        .title_bar(false)
+        .default_pos(egui::pos2(
+            screen.center().x - 150.0,
+            screen.center().y - 150.0,
+        ))
+        .default_width(300.0)
+        .show(ctx, |ui| {
+            ui.vertical_centered_justified(|ui| {
+                ui.add_space(6.0);
+                ui.heading("Paused");
+                ui.add_space(10.0);
+                if ui.button("Resume").clicked() {
+                    resume = true;
+                }
+                if ui.button("Controls and audio").clicked() {
+                    controls = true;
+                }
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+            });
+
+            // **Interface scale, live.** A scale you cannot see while dragging
+            // is a scale you have to guess at, and this is the one setting
+            // whose effect is the slider itself.
+            ui.add(
+                egui::Slider::new(
+                    &mut scale,
+                    *client::config::UI_SCALE_RANGE.start()..=*client::config::UI_SCALE_RANGE.end(),
+                )
+                .text("interface scale"),
+            );
+            ui.checkbox(&mut hud, "Show HUD");
+            ui.checkbox(&mut overlay, "Debug overlay");
+            ui.add_space(6.0);
+        });
+
+    app.set_ui_scale(scale);
+    app.set_hud_visible(hud);
+    app.set_debug_overlay(overlay);
+    if controls {
+        app.open_settings();
+    }
+    if resume {
+        app.set_menu_open(false);
+    }
+}
+
 fn draw_settings(app: &mut App, ctx: &egui::Context) {
     // Collected before the panel runs, because drawing borrows the registry
     // and the buttons need `&mut App` to act.
@@ -1132,10 +1236,25 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
     let mut close = false;
     let mut volumes_changed = false;
 
+    // **A centred panel, like the inventory.** It was a bare egui window
+    // wherever egui felt like putting it, which is what "janky" meant: it
+    // opened off to one side, it could be dragged half off the screen, and it
+    // had no relationship to anything else the game draws. Sized and placed the
+    // same way a server's dialog is, so the engine's screens and a mod's look
+    // like they belong to one game.
+    let screen = ctx.content_rect();
     egui::Window::new("Controls")
         .collapsible(false)
-        .default_width(520.0)
+        .resizable(false)
+        .title_bar(false)
+        .default_pos(egui::pos2(
+            screen.center().x - 280.0,
+            (screen.center().y - 300.0).max(8.0),
+        ))
+        .default_width(560.0)
         .show(ctx, |ui| {
+            ui.heading("Controls and audio");
+            ui.separator();
             if let Some(id) = &waiting {
                 ui.label(
                     egui::RichText::new(format!("Press a key for {id} — Escape to cancel"))
@@ -1282,12 +1401,21 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     let joined = surface.app.joined();
 
     let settings_open = surface.app.settings_open();
+    let menu_open = surface.app.menu_open();
     let size = (
         surface.window.inner_size().width as f32,
         surface.window.inner_size().height as f32,
     );
     let output = surface.egui.run_ui(raw, |root| {
         let context = root.ctx().clone();
+        // **One scale for the whole interface**, applied here rather than by
+        // every panel: egui works in points, and the zoom factor is what a
+        // point is worth. A mod's HUD scales with it — see `draw_hud_scripts`,
+        // which measures its canvas in the same points.
+        context.set_zoom_factor(surface.app.ui_scale());
+        if menu_open {
+            draw_menu(&mut surface.app, &context);
+        }
         if settings_open {
             draw_settings(&mut surface.app, &context);
         }

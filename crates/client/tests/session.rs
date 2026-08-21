@@ -1760,3 +1760,65 @@ fn the_chat_box_asks_for_focus_once_and_a_line_reaches_the_server() {
     app.shutdown();
     server.stop();
 }
+
+#[test]
+fn the_menu_is_the_front_door_and_closing_it_closes_what_it_opened() {
+    // **Reported from the window: the controls screen is janky and hard to
+    // reach.** It was reachable only by one undocumented function key, because
+    // Escape released the cursor and did nothing else.
+    //
+    // The state machine that fixes it is small and easy to get wrong in a way
+    // that strands a player: a screen open over the world with no way back.
+    // This is that machine, without a window.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("menu");
+    let mut app = client("menu", &server, gpu);
+    assert!(
+        run_frames(&mut app, App::joined),
+        "never joined: {:?}",
+        app.warnings()
+    );
+
+    assert!(!app.menu_open());
+    assert!(!app.settings_open());
+
+    app.set_menu_open(true);
+    assert!(app.menu_open());
+
+    // Controls are a PAGE of the menu, not a screen beside it.
+    app.open_settings();
+    assert!(app.settings_open());
+    assert!(app.menu_open(), "opening a page must not close the menu");
+
+    // And closing the menu takes the page with it. Leaving the controls up
+    // over the world after the menu had gone is the stranding case.
+    app.set_menu_open(false);
+    assert!(!app.settings_open());
+    assert!(!app.menu_open());
+
+    // The two switches the menu owns, both persisted through the same flag the
+    // volume sliders use.
+    assert!(app.hud_visible());
+    app.set_hud_visible(false);
+    assert!(!app.hud_visible());
+    assert!(
+        app.take_volumes_dirty(),
+        "a changed setting must be written out, or it is forgotten on restart"
+    );
+
+    // The scale is clamped rather than obeyed: it is the one setting a player
+    // cannot recover from if it goes wrong.
+    let sane = app.ui_scale();
+    app.set_ui_scale(f32::NAN);
+    assert!(
+        (app.ui_scale() - sane).abs() < f32::EPSILON,
+        "a NaN scale must be ignored, not adopted"
+    );
+    app.set_ui_scale(1000.0);
+    assert!(app.ui_scale() <= *client::config::UI_SCALE_RANGE.end());
+    app.set_ui_scale(0.0);
+    assert!(app.ui_scale() >= *client::config::UI_SCALE_RANGE.start());
+
+    app.shutdown();
+    server.stop();
+}

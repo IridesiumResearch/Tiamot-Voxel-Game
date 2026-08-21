@@ -105,6 +105,17 @@ vsync = true
 # paste.
 debug_overlay = true
 
+# How large the interface is drawn: the menu, the inventory, chat, and a mod's
+# HUD all scale together. Between 0.5 and 3.0; a value outside that refuses to
+# load rather than being clamped, because an interface you cannot see is one you
+# cannot fix from inside the game.
+ui_scale = 1.25
+
+# Whether the HUD is drawn at all — the crosshair and everything a mod's HUD
+# script puts on the screen. Chat is NOT part of this and cannot be hidden.
+# Also a checkbox in the pause menu (Escape).
+hud_visible = true
+
 # Vertical field of view, in degrees. Must be between 1 and 179.
 fov_degrees = 70.0
 
