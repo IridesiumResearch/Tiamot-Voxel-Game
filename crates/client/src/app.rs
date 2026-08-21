@@ -3234,21 +3234,37 @@ impl App {
                 eye[1] - f64::from(back.y) * THIRD_PERSON_DISTANCE,
                 eye[2] - f64::from(back.z) * THIRD_PERSON_DISTANCE,
             );
-            // The body, in the camera-relative blocks the renderer wants, with
-            // the box's corner offset so it stands centred on the feet rather
-            // than beside them.
-            let half = f64::from(crate::render::BODY_WIDTH_CELLS) / (2.0 * cells);
-            let feet = [
-                f64::from(corner.x) + f64::from(local[0]) / cells - half,
-                f64::from(corner.y) + f64::from(local[1]) / cells,
-                f64::from(corner.z) + f64::from(local[2]) / cells - half,
-            ];
-            let at = self.camera.position.offset_to(feet);
-            self.renderer.set_body(Some(at));
         } else {
             self.camera.position = Position::from_world(eye[0], eye[1], eye[2]);
-            self.renderer.set_body(None);
         }
+
+        // **The body's position is set in both views; only its VISIBILITY
+        // changes.**
+        //
+        // Reported from the window: "my single block character does not have a
+        // shadow". It did not, because in first person the body was not handed
+        // to the renderer at all — and a body the renderer does not know about
+        // cannot be drawn into a shadow cascade either. Seeing your own shadow
+        // on the ground beside you is most of what tells you where you are
+        // standing, and it is the one shadow a player looks at constantly.
+        //
+        // So the renderer is always told where the body is, and told separately
+        // whether to draw it in the world pass. In first person it casts and is
+        // not drawn, which is what every game does and what a player expects
+        // without being able to say why.
+        //
+        // The corner offset puts the box centred on the feet rather than beside
+        // them.
+        let half = f64::from(crate::render::BODY_WIDTH_CELLS) / (2.0 * cells);
+        let feet = [
+            f64::from(corner.x) + f64::from(local[0]) / cells - half,
+            f64::from(corner.y) + f64::from(local[1]) / cells,
+            f64::from(corner.z) + f64::from(local[2]) / cells - half,
+        ];
+        let at = self.camera.position.offset_to(feet);
+        self.renderer.set_body(Some(at));
+        self.renderer.set_body_visible(self.third_person);
+
         // After the camera has settled, because every offset is relative to it.
         self.place_entities();
     }

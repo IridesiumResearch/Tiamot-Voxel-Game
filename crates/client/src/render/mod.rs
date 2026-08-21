@@ -689,6 +689,12 @@ pub struct Renderer {
     /// not allocate at all.
     skinned_shadow: Option<wgpu::RenderPipeline>,
     body_at: Option<[f32; 3]>,
+    /// Whether the world pass draws the body, as opposed to only the cascades.
+    ///
+    /// **Position and visibility are separate on purpose.** In first person the
+    /// body is where it is and casts a shadow, and drawing it would put the
+    /// inside of the player's own head across the frame.
+    body_visible: bool,
     /// Where every entity in view is this frame, camera-relative, in cells.
     ///
     /// Rebuilt each frame from the interpolation buffer, because that is what
@@ -747,19 +753,8 @@ impl Renderer {
             build_selection_pipeline(&gpu, &selection_shader, &bind_layout, COLOUR_FORMAT);
         let body_buffers = upload_mesh(&gpu, &body_mesh());
 
-        let selection_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("selection"),
-            size: (SELECTION_CAPACITY * size_of::<[f32; 3]>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let border_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("chunk-borders"),
-            size: (CHUNK_BORDER_CAPACITY * size_of::<[f32; 3]>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let selection_buffer = line_buffer(&gpu, "selection", SELECTION_CAPACITY);
+        let border_buffer = line_buffer(&gpu, "chunk-borders", CHUNK_BORDER_CAPACITY);
 
         let globals = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -844,7 +839,7 @@ impl Renderer {
             // 08's scenes assumed and what a world with no sky mod gets.
             sun_intensity: 1.0,
             sun_colour: [1.0, 1.0, 1.0, 1.0],
-            sun_direction: [0.0, -0.970_142_5, 0.242_535_62],
+            sun_direction: NOON,
             sky_colour: sky_colour(),
             // Ungraded until a sky says otherwise, which keeps a world with no
             // sky mod exactly what it was before grading existed.
@@ -858,6 +853,7 @@ impl Renderer {
             body: body_buffers,
             entities_at: Vec::new(),
             body_at: None,
+            body_visible: false,
         })
     }
 
@@ -914,6 +910,13 @@ impl Renderer {
     /// position would be the one thing in the frame that did not.
     pub const fn set_body(&mut self, at: Option<[f32; 3]>) {
         self.body_at = at;
+    }
+
+    /// Whether the world pass draws the body, as opposed to only the cascades.
+    ///
+    /// Set every frame beside [`Renderer::set_body`]; see [`Renderer::body_visible`].
+    pub const fn set_body_visible(&mut self, visible: bool) {
+        self.body_visible = visible;
     }
 
     /// Where every entity in view is this frame, camera-relative, in cells.
@@ -1557,8 +1560,8 @@ impl Renderer {
     /// float positions and a skeleton, which the packed voxel vertex cannot
     /// express — see `render::skinned`. This is the client's own debug body and
     /// nothing else.
-    fn draw_bodies(&self, pass: &mut wgpu::RenderPass<'_>, chunks: usize) {
-        if self.body_at.is_none() {
+    fn draw_bodies(&self, pass: &mut wgpu::RenderPass<'_>, chunks: usize, in_world: bool) {
+        if self.body_at.is_none() || (in_world && !self.body_visible) {
             return;
         }
         let instance = chunks as u32;
@@ -1577,7 +1580,26 @@ impl Renderer {
         let Some(shadows) = self.post.as_ref().and_then(graph::Post::shadows) else {
             return;
         };
-        shadows.render(encoder, |pass, _cascade| {
+
+        // **One sweep, not two, and that is the whole of this function's
+        // history.**
+        //
+        // Figures need a different pipeline from terrain, so this used to make
+        // a second `shadows.render` call for them. Every call begins a render
+        // pass per cascade with `LoadOp::Clear`, so the second sweep wiped the
+        // depth the first had just written — and the cascades ended up holding
+        // the mobs and nothing else.
+        //
+        // Reported from the window exactly as that reads: "the stalker mob DOES
+        // have a shadow", a built tower does not, and neither does the player's
+        // own body. It only happened with a figure on screen, which is why the
+        // offscreen shadow tests — which draw no figures, so the second sweep
+        // never ran — were all green while the game had no terrain shadows at
+        // all.
+        //
+        // Two pipelines inside one pass is the fix and also the safer shape:
+        // there is no second `render` call to get the load op wrong in.
+        shadows.render(encoder, |pass, cascade| {
             pass.set_vertex_buffer(1, self.instances.slice(..));
             for (index, pos) in visible.iter().enumerate() {
                 let Some(mesh) = self.chunks.get(pos) else {
@@ -1589,24 +1611,23 @@ impl Renderer {
                 pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
             }
             // And the client's own debug body.
-            self.draw_bodies(pass, visible.len());
-        });
+            // `false`: the cascades take the body whether or not the world
+            // pass draws it, which is what gives a first-person player a
+            // shadow.
+            self.draw_bodies(pass, visible.len(), false);
 
-        // Figures cast too, in their own pipeline and therefore in their own
-        // sweep of the cascades. **A mob with no shadow floats**, which is the
-        // one thing about a drawn body that everybody notices immediately.
-        if self.skinned.drawn() > 0
-            && let Some(skinned_shadow) = self.skinned_shadow.as_ref()
-        {
-            shadows.render(encoder, |pass, cascade| {
-                let Some(bind) = shadows.cascade_bind(cascade) else {
-                    return;
-                };
+            // Figures, in their own pipeline. **A mob with no shadow floats**,
+            // which is the one thing about a drawn body that everybody notices
+            // immediately — and it is what led to the two sweeps above.
+            if self.skinned.drawn() > 0
+                && let Some(skinned_shadow) = self.skinned_shadow.as_ref()
+                && let Some(bind) = shadows.cascade_bind(cascade)
+            {
                 pass.set_pipeline(skinned_shadow);
                 pass.set_bind_group(1, bind, &[]);
                 self.skinned.draw(pass);
-            });
-        }
+            }
+        });
     }
 
     /// Renders one frame into `target`.
@@ -1714,7 +1735,7 @@ impl Renderer {
                 pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
             }
 
-            self.draw_bodies(&mut pass, visible.len());
+            self.draw_bodies(&mut pass, visible.len(), true);
 
             // Figures, in their own pipeline. After the terrain because they
             // are opaque and depth-tested either way, and before the fluid
@@ -1992,6 +2013,29 @@ fn fluid_vertex_layout() -> [wgpu::VertexBufferLayout<'static>; 2] {
         },
     ]
 }
+
+/// A vertex buffer of line endpoints, written every frame.
+///
+/// The selection outline and the chunk borders want the same thing and were
+/// two copies of it; extracted when `Renderer::new` went over clippy's line
+/// ceiling, which is the fifth time this task that appending to a long function
+/// was the wrong move.
+fn line_buffer(gpu: &Gpu, label: &'static str, capacity: usize) -> wgpu::Buffer {
+    gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (capacity * size_of::<[f32; 3]>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Where the sun sits before a sky mod says otherwise: down, and a little to
+/// one side.
+///
+/// Straight down would give every vertical face the same light and collapse
+/// every shadow to nothing, which is the same reason `client::sky` tilts its
+/// arc. The two numbers agree deliberately.
+const NOON: [f32; 3] = [0.0, -0.970_142_5, 0.242_535_62];
 
 /// The world pipeline with the shadow cascades bound as a second group.
 ///

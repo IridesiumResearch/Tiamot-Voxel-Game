@@ -1371,6 +1371,81 @@ fn a_wall_throws_a_shadow_dark_enough_to_see() {
 }
 
 #[test]
+fn a_figure_on_screen_does_not_take_the_terrains_shadows_with_it() {
+    // **The bug this exists for, reported from the window: "the stalker mob
+    // DOES have a shadow", a built tower does not, and neither does the
+    // player's own body.**
+    //
+    // Figures need a different pipeline from terrain, so `fill_cascades` made a
+    // second `Shadows::render` call for them — and every call begins its
+    // per-cascade pass with `LoadOp::Clear`. The second sweep wiped the depth
+    // the first had just written, so the cascades held the mobs and nothing
+    // else.
+    //
+    // **Every existing shadow test was green throughout**, because none of them
+    // draws a figure, so the second sweep never ran. That is the whole reason
+    // this test sets one and the others do not: the fault is not in either path
+    // alone, it is in having two of them.
+    let Some(gpu) = gpu() else { return };
+    let chunks = wall_scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+
+    let mut camera = Camera {
+        position: Position::from_world(20.0, 40.0, 24.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -1.5);
+
+    // The same measurement `a_wall_throws_a_shadow_dark_enough_to_see` makes:
+    // one floor, two sun positions, so the wall's own faces cancel.
+    let floor = |frame: &Image| {
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for y in (HEIGHT / 4)..(HEIGHT * 3 / 4) {
+            for x in (WIDTH * 3 / 5)..(WIDTH * 9 / 10) {
+                let p = frame.pixel(x, y).expect("pixel");
+                sum += (f32::from(p[0]) + f32::from(p[1]) + f32::from(p[2])) / (3.0 * 255.0);
+                n += 1.0;
+            }
+        }
+        sum / n
+    };
+    let ratio = |renderer: &mut Renderer| {
+        renderer.set_sun(1.0, [1.0, 1.0, 1.0], [-0.80, -0.45, 0.0]);
+        let shadowed = floor(&target.capture(renderer, &camera).expect("capture"));
+        renderer.set_sun(1.0, [1.0, 1.0, 1.0], [0.80, -0.45, 0.0]);
+        let lit = floor(&target.capture(renderer, &camera).expect("capture"));
+        shadowed / lit
+    };
+
+    let alone = ratio(&mut renderer);
+    assert!(
+        alone < 0.85,
+        "the wall casts nothing even with no figures ({alone}), so this test cannot say \
+         anything about what a figure does to it"
+    );
+
+    // Somewhere well away from the sampled floor, so the figure's own pixels
+    // and its own shadow are not what is being measured.
+    renderer.set_entities(vec![client::render::skinned::Figure {
+        offset: [-8.0, -32.0, -8.0],
+        yaw: 0.0,
+        anim: 0,
+        phase: 0.0,
+    }]);
+    let peopled = ratio(&mut renderer);
+    renderer.set_entities(Vec::new());
+
+    assert!(
+        peopled < 0.85,
+        "the wall's shadow is {peopled} of the lit floor with a figure on screen against \
+         {alone} without one — drawing a figure erased the terrain's shadows"
+    );
+}
+
+#[test]
 fn a_lamps_colour_survives_mode_threes_tonemap() {
     // **Reported from the window: "Lights in light mode 3 should be more
     // saturated. right now they look almost white."** They were, and the cause
@@ -1859,6 +1934,7 @@ fn the_debug_body_is_actually_drawn_and_actually_casts() {
         .capture(&mut renderer, &viewpoint())
         .expect("capture");
     renderer.set_body(Some(where_it_stands));
+    renderer.set_body_visible(true);
     let with = target
         .capture(&mut renderer, &viewpoint())
         .expect("capture");
@@ -1892,6 +1968,18 @@ fn the_debug_body_is_actually_drawn_and_actually_casts() {
         .capture(&mut renderer, &viewpoint())
         .expect("capture");
 
+    // **And with the body INVISIBLE, which is what first person is.**
+    //
+    // Reported from the window: "my single block character does not have a
+    // shadow". It did not, because first person did not hand the body to the
+    // renderer at all — and a body the renderer does not know about cannot
+    // reach a cascade either. Position and visibility are separate now, and
+    // this is the half that says so: the frame must still darken.
+    renderer.set_body_visible(false);
+    let cast_only = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
     // The floor is darker with the body there: its own pixels plus the shadow
     // it throws. Measured over the whole frame so it does not depend on knowing
     // where the shadow lands.
@@ -1904,6 +1992,13 @@ fn the_debug_body_is_actually_drawn_and_actually_casts() {
         "the floor is {} with the body and {} without it, so the body reaches the world pass \
          but not the shadow pass",
         ground(&shadowed),
+        ground(&unshadowed)
+    );
+    assert!(
+        ground(&cast_only) < ground(&unshadowed),
+        "the floor is {} with an invisible body and {} with no body at all, so a first-person \
+         player casts no shadow",
+        ground(&cast_only),
         ground(&unshadowed)
     );
 }
