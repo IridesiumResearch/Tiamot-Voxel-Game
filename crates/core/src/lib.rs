@@ -68,6 +68,7 @@ pub mod detgen;
 pub mod dig;
 pub mod ent;
 pub mod fluid;
+pub mod hud;
 pub mod identity;
 pub mod interest;
 pub mod inventory;

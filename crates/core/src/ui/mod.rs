@@ -56,4 +56,4 @@ mod tree;
 
 pub use layout::{Laid, Measure, Rect, layout};
 pub use limits::{Limits, UiError, check};
-pub use tree::{Align, Build, Children, Direction, Node, Style, Tree, Widget};
+pub use tree::{Align, Build, Children, Colour, Direction, Node, Style, Tree, Widget};
