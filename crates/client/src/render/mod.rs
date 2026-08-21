@@ -638,6 +638,21 @@ pub struct Renderer {
     /// code against its float target rather than loading a second copy.
     world_shader: wgpu::ShaderModule,
     selection_shader: wgpu::ShaderModule,
+    /// The blob-shadow pipeline, and what it draws this frame.
+    ///
+    /// Compiled against the swapchain format; mode 3 draws the world into a
+    /// float target and uses the second one.
+    blob_pipeline: wgpu::RenderPipeline,
+    /// The same pipeline compiled for mode 3's float target.
+    ///
+    /// Two pipelines rather than a seventh member of `world_pass_target`'s
+    /// tuple: a blob is one quad and one shader, and threading it through the
+    /// post chain's own pipeline set would be more plumbing than the thing it
+    /// carries.
+    blob_pipeline_hdr: wgpu::RenderPipeline,
+    blobs: wgpu::Buffer,
+    blob_count: u32,
+    blob_capacity: usize,
     /// Mode 3's targets and post chain, built when that mode is showing and
     /// dropped when it is not.
     ///
@@ -746,6 +761,8 @@ impl Renderer {
         let fluid_pipeline =
             build_fluid_pipeline(&gpu, &shader, &[Some(&bind_layout)], COLOUR_FORMAT);
 
+        let (blob_pipeline, blob_pipeline_hdr, blobs) = build_blobs(&gpu, &bind_layout);
+
         let selection_shader = gpu
             .device
             .create_shader_module(wgpu::include_wgsl!("selection.wgsl"));
@@ -834,6 +851,11 @@ impl Renderer {
             shadow_quality: crate::config::ShadowQuality::default(),
             world_shader: shader,
             selection_shader,
+            blob_pipeline,
+            blob_pipeline_hdr,
+            blobs,
+            blob_count: 0,
+            blob_capacity: BLOB_CAPACITY,
             post: None,
             // Full daylight until a sky says otherwise, which is what Task
             // 08's scenes assumed and what a world with no sky mod gets.
@@ -1091,6 +1113,49 @@ impl Renderer {
         for (_, mesh) in std::mem::take(&mut self.chunks) {
             self.pool.give_mesh(mesh);
         }
+    }
+
+    /// Sets the blob shadows to draw this frame.
+    ///
+    /// Each is a centre already lifted clear of the surface it lies on, a
+    /// radius, and an opacity — all worked out by the caller, which is the only
+    /// thing that knows where the ground under a body is.
+    ///
+    /// **Every frame, like the entity list.** A blob is where a body is now;
+    /// there is nothing to keep between frames.
+    pub fn set_blobs(&mut self, blobs: &[([f32; 3], f32, f32)]) {
+        let instances: Vec<Blob> = blobs
+            .iter()
+            .take(self.blob_capacity)
+            .map(|(centre, radius, opacity)| Blob {
+                centre: [centre[0], centre[1], centre[2], 0.0],
+                shape: [*radius, *opacity, 0.0, 0.0],
+            })
+            .collect();
+        self.blob_count = u32::try_from(instances.len()).unwrap_or(0);
+        if !instances.is_empty() {
+            self.gpu
+                .queue
+                .write_buffer(&self.blobs, 0, bytemuck::cast_slice(&instances));
+        }
+    }
+
+    /// Draws the blob shadows, if there are any.
+    fn draw_blobs(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.blob_count == 0 {
+            return;
+        }
+        let pipeline = if self.post.is_some() {
+            &self.blob_pipeline_hdr
+        } else {
+            &self.blob_pipeline
+        };
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.blobs.slice(..));
+        // Six vertices built in the vertex stage from `vertex_index`; the
+        // instance is the only per-body data.
+        pass.draw(0..6, 0..self.blob_count);
     }
 
     /// Sets the outline to draw, as camera-relative boxes in **cells**.
@@ -1737,6 +1802,11 @@ impl Renderer {
 
             self.draw_bodies(&mut pass, visible.len(), true);
 
+            // **After the terrain, before the fluid.** A blob is a mark on the
+            // ground, so it goes over what it is marking; milk is above the
+            // ground and should be able to cover it.
+            self.draw_blobs(&mut pass);
+
             // Figures, in their own pipeline. After the terrain because they
             // are opaque and depth-tested either way, and before the fluid
             // because the fluid is blended and has to come last.
@@ -1884,6 +1954,128 @@ fn build_selection_pipeline(
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+}
+
+/// Most blob shadows one frame will draw.
+///
+/// One per body in view. Far more than a populated area holds, and a hard
+/// ceiling on a buffer that is written every frame from a list a server
+/// controls the length of.
+const BLOB_CAPACITY: usize = 512;
+
+/// One blob shadow, as the shader reads it.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Blob {
+    /// Camera-relative position of the disc's centre, in blocks. w unused.
+    centre: [f32; 4],
+    /// Radius in blocks in x, opacity in y. Two spare, because a vertex
+    /// attribute is a `vec4` either way.
+    shape: [f32; 4],
+}
+
+/// Everything the blob pass needs: two pipelines and a buffer.
+///
+/// Grouped into one function because `Renderer::new` went over clippy's line
+/// ceiling again — the sixth time this task. The shader is not kept: nothing
+/// recompiles a blob pipeline after startup, since both target formats are
+/// known here.
+fn build_blobs(
+    gpu: &Gpu,
+    bind_layout: &wgpu::BindGroupLayout,
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::Buffer) {
+    let shader = gpu
+        .device
+        .create_shader_module(wgpu::include_wgsl!("blob.wgsl"));
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("blob-shadows"),
+        size: (BLOB_CAPACITY * size_of::<Blob>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (
+        build_blob_pipeline(gpu, &shader, bind_layout, COLOUR_FORMAT),
+        build_blob_pipeline(gpu, &shader, bind_layout, graph::HDR_FORMAT),
+        buffer,
+    )
+}
+
+/// The blob-shadow pipeline: one instanced quad per body, blended dark.
+///
+/// **Alpha-blended and depth-tested but not depth-writing**, like the fluid
+/// pass and for the same reason: it is a mark on a surface rather than a
+/// surface, so it must not occlude anything drawn after it.
+fn build_blob_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    bind_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let layout = gpu
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("blob-pipeline-layout"),
+            bind_group_layouts: &[Some(bind_layout)],
+            immediate_size: 0,
+        });
+
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("blob"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vertex_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: size_of::<Blob>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: size_of::<[f32; 4]>() as u64,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fragment_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                // Seen from below as well as above: a player standing on glass
+                // over a drop should still be grounded to whoever is under it.
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),

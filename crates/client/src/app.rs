@@ -3394,6 +3394,7 @@ impl App {
 
         // After the camera has settled, because every offset is relative to it.
         self.place_entities();
+        self.place_blobs();
     }
 
     /// Places every entity in view for this frame.
@@ -3407,6 +3408,104 @@ impl App {
     /// is the only correct way to subtract two positions in a floating origin
     /// (charter rule 7) — the entity and the camera may be in different chunks,
     /// and subtracting their local parts would compare nothing.
+    /// Places a blob shadow under the player and under every drawn entity.
+    ///
+    /// # Why an engine with real shadows still wants these
+    ///
+    /// The cascades answer one question — is the SUN blocked — and only in
+    /// lighting mode 3. Everywhere else, and for every light that is not the
+    /// sun, a body has nothing anchoring it to the ground and reads as
+    /// hovering. It reads that way most strongly indoors and at night, which is
+    /// exactly where a player is looking hardest at where their feet are.
+    ///
+    /// Reported from the window: no shadow from a light block, and a request
+    /// for "a generic floating ambient occlusion shadow below me" instead. This
+    /// is that, and it is deliberately not an approximation of a sun shadow: it
+    /// is round, it is under you, and it does not move with the sun.
+    ///
+    /// # The ground is found by probing, not by asking
+    ///
+    /// Nothing tells the client what a body is standing on — `on_ground` is a
+    /// boolean and an entity has not even got that. So this walks down from the
+    /// feet a few blocks looking for the first solid cell. A body over a drop
+    /// gets no blob at all, which is right: there is no ground under it to mark.
+    fn place_blobs(&mut self) {
+        /// How far down to look for ground, in blocks. Past this a body is over
+        /// a drop and casts nothing.
+        const REACH: f32 = 4.0;
+        /// How dark the disc is directly underfoot.
+        const OPACITY: f32 = 0.45;
+        /// Lifted clear of the surface, in blocks. The same lesson the
+        /// shoreline taught: a quad coplanar with the face under it fights it.
+        const LIFT: f32 = 0.02;
+
+        let Some(predictor) = self.predictor.as_ref() else {
+            self.renderer.set_blobs(&[]);
+            return;
+        };
+        let origin = predictor.origin();
+        let voxels = phys::Voxels::new(&self.store, origin);
+        #[expect(clippy::cast_precision_loss, reason = "three, as a float")]
+        let cells = tiamot_core::SUBNODES_PER_AXIS as f32;
+        let now = self.since_start.elapsed();
+
+        // The player first, then everything drawn. Feet in cells relative to
+        // the predictor's own chunk, which is the space `Voxels` reads in.
+        let mut feet: Vec<([f32; 3], f32)> = Vec::with_capacity(self.entities.len() + 1);
+        feet.push((predictor.body().position, 0.4));
+        for (_, entity) in self.entities.iter() {
+            let Some(pose) = entity.pose(now) else {
+                continue;
+            };
+            // Into the predictor's chunk frame, which is what `Voxels` indexes.
+            let span = tiamot_core::CHUNK_SUBNODES as i32;
+            let shift = |axis: usize, chunk: i32| {
+                (chunk
+                    - match axis {
+                        0 => origin.x,
+                        1 => origin.y,
+                        _ => origin.z,
+                    })
+                    * span
+            };
+            feet.push((
+                [
+                    pose.local[0] + shift(0, pose.chunk.x) as f32,
+                    pose.local[1] + shift(1, pose.chunk.y) as f32,
+                    pose.local[2] + shift(2, pose.chunk.z) as f32,
+                ],
+                0.4,
+            ));
+        }
+
+        let mut blobs = Vec::with_capacity(feet.len());
+        for (at, radius) in feet {
+            let Some(ground) = ground_below(&voxels, at, REACH * cells) else {
+                continue;
+            };
+            let above = (at[1] - ground) / cells;
+            // Fading and shrinking with height is what makes a jump read as a
+            // jump: the disc is the one thing on screen that says how far off
+            // the ground you are.
+            let closeness = 1.0 - (above / REACH).clamp(0.0, 1.0);
+            if closeness <= 0.0 {
+                continue;
+            }
+            let corner = tiamot_core::BlockPos::from_chunk_corner(self.drawn_at(origin));
+            let world = [
+                f64::from(corner.x) + f64::from(at[0]) / f64::from(cells),
+                f64::from(corner.y) + f64::from(ground) / f64::from(cells) + f64::from(LIFT),
+                f64::from(corner.z) + f64::from(at[2]) / f64::from(cells),
+            ];
+            blobs.push((
+                self.camera.position.offset_to(world),
+                radius * (0.6 + 0.4 * closeness),
+                OPACITY * closeness,
+            ));
+        }
+        self.renderer.set_blobs(&blobs);
+    }
+
     fn place_entities(&mut self) {
         let now = self.since_start.elapsed();
         let cells = f64::from(tiamot_core::SUBNODES_PER_AXIS);
@@ -3855,6 +3954,48 @@ fn human_bytes(bytes: u64) -> String {
 /// The compass direction a yaw points, for the HUD.
 ///
 /// Yaw 0 looks along +z, and the axes are named the way the world is: +x east,
+/// The height of the first solid cell below `at`, in cells, or `None`.
+///
+/// Walks down a cell at a time from just under the feet. Cheap — a handful of
+/// lookups per body per frame — and the alternative is a ray cast answering the
+/// same question with more arithmetic. `None` means a body over a drop, which
+/// correctly casts no blob: there is no ground under it to mark.
+fn ground_below<S: tiamot_core::phys::ChunkLookup>(
+    voxels: &phys::Voxels<'_, S>,
+    at: [f32; 3],
+    reach: f32,
+) -> Option<f32> {
+    // `detgen::floor_to_i32` rather than `f32::floor`: the lint that says so is
+    // scoped to determinism and this is presentation, but there is one spelling
+    // of a floor in this workspace and using the other one here would be a
+    // reader's question every time.
+    let (x, z) = (
+        tiamot_core::detgen::floor_to_i32(at[0]),
+        tiamot_core::detgen::floor_to_i32(at[2]),
+    );
+    let top = tiamot_core::detgen::floor_to_i32(at[1]);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a reach of a few blocks is a small integer"
+    )]
+    let steps = reach.max(0.0) as i32;
+    for step in 0..=steps {
+        let y = top - step;
+        if voxels
+            .material(x, y, z)
+            .is_some_and(|material| material != tiamot_core::MaterialId::AIR)
+        {
+            // The TOP of that cell is the surface the disc lies on.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "cell coordinates are far inside f32's exact integer range"
+            )]
+            return Some((y + 1) as f32);
+        }
+    }
+    None
+}
+
 /// +z north.
 #[must_use]
 pub fn compass(yaw: f32) -> &'static str {

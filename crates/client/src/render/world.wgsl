@@ -498,6 +498,21 @@ fn lighting(input: VertexOut, shadow: f32) -> vec3<f32> {
 // cycle, which is what a terminator looks like.
 const TERMINATOR: f32 = 0.12;
 
+// What share of the shadow range is spent fading the far edge out.
+//
+// The cascades cover 160 blocks and then stop dead, which put a hard line
+// across the ground and made a shadow disappear the moment its caster left
+// range. A fifth of the range is long enough that the fade is not itself an
+// edge, and short enough that shadows still reach nearly as far as they did.
+//
+// **This one has no test, and that is recorded rather than hidden.** Four were
+// written and all four passed with the fade removed: a band average across a
+// rendered frame is dominated by perspective and by how many casters fall in a
+// pixel, and differencing against a shadowless frame did not help because the
+// sampler never reliably lands on floor at 130-160 blocks. A green test that
+// cannot fail is worse than none, so there is none — this wants an eye on it.
+const CASCADE_FADE: f32 = 0.2;
+
 // How many shadow texels the sample point is pushed along the surface normal.
 //
 // **This is what replaced culling front faces in the depth pass.** Recording
@@ -540,6 +555,16 @@ const NORMAL_BIAS_TEXELS: f32 = 1.5;
 // already a bilinear blend of four texels — nine taps behave like a 6x6 kernel.
 // A single tap gives a hard, stair-stepped edge along the shadow map's grid,
 // which on a voxel world reads as geometry that is not there.
+// How much of the shadow map's answer survives at this distance.
+//
+// `1.0` everywhere inside [`CASCADE_FADE`] of the far edge, falling to `0.0` at
+// the edge itself, where there is nothing left to fade from.
+fn cascade_fade(distance: f32) -> f32 {
+    let far = globals.cascade_far.z;
+    let start = far * (1.0 - CASCADE_FADE);
+    return 1.0 - smoothstep(start, far, distance);
+}
+
 fn shadow_factor(input: VertexOut) -> f32 {
     let sunward = -globals.sun_direction.xyz;
     let facing = dot(input.normal, sunward);
@@ -598,11 +623,25 @@ fn shadow_factor(input: VertexOut) -> f32 {
             );
         }
     }
-    // The terminator last, over the map's answer rather than instead of it: a
-    // face nearly edge-on to the sun is both barely lit and barely able to be
+    // The terminator, over the map's answer rather than instead of it: a face
+    // nearly edge-on to the sun is both barely lit and barely able to be
     // sampled correctly, and fading it out covers the second as well as the
     // first.
-    return (sum / 9.0) * smoothstep(0.0, TERMINATOR, facing);
+    let shadowed = (sum / 9.0) * smoothstep(0.0, TERMINATOR, facing);
+
+    // **And the far edge, faded rather than cut.**
+    //
+    // Past the last cascade there is no shadow information and the fragment is
+    // returned lit — which was a hard edge across the ground at exactly
+    // `cascade_far.z`, and a shadow that vanished the instant its caster went
+    // out of range. Reported from the window as shadows that "just vanish".
+    //
+    // Fading toward `band` over the last stretch of the range costs one
+    // smoothstep and turns the edge into something nobody looks at. It fades
+    // toward LIT rather than toward dark for the same reason the two early
+    // returns above do: a fragment with no shadow information guessing
+    // "shadowed" would put a dark ring around the player.
+    return mix(band, shadowed, cascade_fade(input.distance));
 }
 
 // One fragment, given how much sun reaches it.

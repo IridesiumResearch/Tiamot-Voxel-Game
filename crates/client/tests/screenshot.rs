@@ -1371,6 +1371,74 @@ fn a_wall_throws_a_shadow_dark_enough_to_see() {
 }
 
 #[test]
+fn a_blob_shadow_darkens_the_ground_in_every_lighting_mode() {
+    // **Reported from the window: no shadow under the player from a light
+    // block**, and a request for "a generic floating ambient occlusion shadow
+    // below me" instead.
+    //
+    // The cascades answer one question — is the SUN blocked — and only in mode
+    // 3. Everywhere else a body has nothing anchoring it to the ground, which
+    // reads as hovering and reads worst indoors and at night. So the blob is
+    // not an approximation of a sun shadow and is asserted in all three modes:
+    // the mode that has no shadow maps at all is the one that needs it most.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Straight down at bare floor, so what changes is the disc and nothing
+    // else. `viewpoint` looks at the block standing proud, whose own shading
+    // would be in the average.
+    let mut camera = Camera {
+        position: Position::from_world(30.0, 20.0, 30.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -1.5);
+
+    // The middle of the frame, which is the middle of the disc. A wider sample
+    // is mostly the lit floor AROUND it: measured over a third of the frame the
+    // difference is two parts in a thousand, which says nothing.
+    let ground = |renderer: &mut Renderer| {
+        let frame = target.capture(renderer, &camera).expect("capture");
+        let colour = average(
+            &frame,
+            WIDTH * 7 / 16,
+            HEIGHT * 7 / 16,
+            WIDTH * 9 / 16,
+            HEIGHT * 9 / 16,
+        );
+        (colour[0] + colour[1] + colour[2]) / 3.0
+    };
+
+    for mode in [
+        LightingMode::Simple,
+        LightingMode::Classic,
+        LightingMode::Beautiful,
+    ] {
+        renderer.set_lighting_mode(mode);
+        renderer.set_blobs(&[]);
+        let bare = ground(&mut renderer);
+
+        // Camera-relative, directly below the camera, on the floor at y = 8 and
+        // LIFTED clear of it. Placed at exactly 8 the disc is coplanar with the
+        // floor's top face, and the pass compares depth with `Less` — so it
+        // fails outright and draws nothing. The first version of this test did
+        // that and read as "the blob does not work"; the shoreline taught the
+        // same lesson an hour earlier. `App::place_blobs` applies the lift for
+        // real; here it is spelled out.
+        renderer.set_blobs(&[([0.0, -11.98, 0.0], 2.0, 0.45)]);
+        let marked = ground(&mut renderer);
+        renderer.set_blobs(&[]);
+
+        assert!(
+            marked < bare - 0.005,
+            "{mode:?}: the floor is {marked} with a blob under the camera and {bare} \
+             without one, so nothing was drawn"
+        );
+    }
+}
+
+#[test]
 fn a_figure_on_screen_does_not_take_the_terrains_shadows_with_it() {
     // **The bug this exists for, reported from the window: "the stalker mob
     // DOES have a shadow", a built tower does not, and neither does the

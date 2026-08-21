@@ -195,6 +195,21 @@ const FINE: u32 = 16;
 /// The tallest a block's fluid surface can be, in [`FINE`] units. Three cells.
 const FULL_BLOCK: u32 = FINE * SUBNODES_PER_AXIS;
 
+/// How high the surface still stands where it runs out, in [`FINE`] units.
+///
+/// **Not zero, and that is the whole point.** The skirt exists so a pond ends
+/// in a taper rather than a half-block cliff, and it did that by bringing the
+/// outermost vertex down to exactly the floor — which puts the fluid's surface
+/// in the same plane as the terrain's top face. Two coplanar surfaces is
+/// z-fighting, and z-fighting on a shoreline is a rim of flickering speckle
+/// that follows the camera. Reported from the window as the water "glitching"
+/// at the shore.
+///
+/// A sixteenth of a cell is far below anything a player reads as depth — the
+/// shore still looks like it runs out — and it is enough to keep the two
+/// surfaces apart at any distance the fluid is drawn at.
+const SHORE_FILM: u32 = 1;
+
 impl SubNodeGrid {
     /// Expands a chunk, seeding the padding bits from its neighbours.
     ///
@@ -535,7 +550,9 @@ impl SubNodeGrid {
                 total += height;
                 count += 1;
             } else if !self.walled(bx, by, bz) {
-                // Open air: the surface comes down to the floor here.
+                // Open air: the surface comes down at the shore — but not all
+                // the way to the floor. See `SHORE_FILM`.
+                total += SHORE_FILM;
                 count += 1;
             }
         }
@@ -1982,15 +1999,21 @@ mod tests {
             "no fluid surface was drawn over the skirt, so the milk still ends \
              at the last wet block"
         );
-        // A full drop puts the surface on the floor of the block row: the milk
-        // has run out to nothing, which is what "goes to zero at its edges"
-        // means.
-        let floor = u16::try_from(FULL_BLOCK).expect("a block fits in u16");
+        // The surface comes down to a film on the floor of the block row: the
+        // milk has run out to nothing a player can see, which is what "goes to
+        // zero at its edges" means in practice.
+        //
+        // Not all the way to zero, and `SHORE_FILM` says why: a surface in the
+        // same plane as the terrain's top face fails a `Less` depth test on
+        // roughly half its pixels, which is the shoreline speckle reported from
+        // the window. The film is one fine unit of deliberate separation, so a
+        // full drop is `FULL_BLOCK - SHORE_FILM`.
+        let floor = u16::try_from(FULL_BLOCK - SHORE_FILM).expect("a block fits in u16");
         for drop in &outer {
             assert_eq!(
                 *drop,
                 floor,
-                "the shoreline stopped {} above the floor instead of reaching it",
+                "the shoreline stopped {} above the film instead of reaching it",
                 floor - drop
             );
         }

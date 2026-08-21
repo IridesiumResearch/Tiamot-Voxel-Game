@@ -430,10 +430,19 @@ fn a_shoreline_stands_no_wall_of_milk_under_its_own_surface() {
     // ON the floor, so the whole of its side face was left standing.
     //
     // Measured on this fixture: the tallest standing edge in a dry block was
-    // **16 fine units**, a third of a block, and is now **one** — a forty-eighth,
-    // which is integer rounding in the surface rather than geometry anybody
-    // would see. The bound is that one unit, so the ring reappearing at a third
-    // of a block fails by a factor of sixteen.
+    // **16 fine units**, a third of a block, and is now **two** — a
+    // twenty-fourth, which is a film rather than a wall.
+    //
+    // It was one until `SHORE_FILM` landed. The shore used to come down to
+    // exactly the floor, which put the fluid's top face in the same plane as
+    // the terrain's — and the fluid pass compares depth with `Less`, so a
+    // coplanar quad has roughly half its pixels pass and half fail. That is
+    // speckle that crawls as the camera moves, reported from the window as the
+    // water glitching at the shore. The film is one fine unit of deliberate
+    // separation, and it doubles the worst standing edge from one to two.
+    //
+    // The bound is two, so the ring reappearing at a third of a block still
+    // fails by a factor of eight.
     let mesh = splat();
     let per_axis = tiamot_core::SUBNODES_PER_AXIS;
     let fine = 48 / per_axis;
@@ -457,9 +466,55 @@ fn a_shoreline_stands_no_wall_of_milk_under_its_own_surface() {
         .unwrap_or(0);
 
     assert!(
-        tallest <= 1,
+        tallest <= 2,
         "the shoreline leaves {tallest} fine units of milk standing in a dry \
          block whose surface is the floor — the ring of full-height quads \
          reported around a puddle"
+    );
+}
+
+#[test]
+fn the_shore_never_lies_in_the_same_plane_as_the_floor() {
+    // **The property the film exists for, stated directly.**
+    //
+    // The fluid pass compares depth with `Less` and does not write it. A fluid
+    // quad exactly coplanar with the terrain under it therefore has roughly
+    // half its pixels pass and half fail — interpolation across a large quad
+    // lands either side of equal — which is speckle that crawls as the camera
+    // moves. Reported from the window as the water glitching at the shore.
+    //
+    // Asserted on the mesh rather than on a rendered frame: the speckle is a
+    // property of two surfaces being in one plane, and a frame that happened to
+    // resolve it one way on this driver would say nothing about another.
+    let mesh = splat();
+    let per_axis = tiamot_core::SUBNODES_PER_AXIS;
+    let fine = 48 / per_axis;
+
+    // Absolute height of every fluid TOP vertex, in fine units. `drop` is how
+    // far it has been pulled below its own lattice cell, so this is where the
+    // surface actually is — and it does not wrap at a block boundary the way a
+    // per-block height does. The first version of this test measured a
+    // per-block height and counted every brim-full surface as flush, which is
+    // legitimate geometry: a full block's surface IS at the block top, and the
+    // terrain face under it is submerged.
+    //
+    // The plane that matters is the pool's own floor, which is where the
+    // terrain's exposed top face is.
+    let floor_plane = (POOL as u32) * per_axis * fine;
+    let flush = mesh
+        .fluid_vertices
+        .iter()
+        .filter(|vertex| vertex.face().0 == 1)
+        .filter(|vertex| {
+            let (_, y, _) = vertex.position();
+            y * fine - u32::from(vertex.drop()) == floor_plane
+        })
+        .count();
+
+    assert_eq!(
+        flush, 0,
+        "{flush} fluid surface vertices sit exactly in the pool floor's plane, \
+         which is where the terrain's exposed top face is — that is the \
+         z-fighting speckle"
     );
 }
