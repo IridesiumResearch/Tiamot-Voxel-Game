@@ -44,7 +44,16 @@ pub use vm::{
 };
 
 #[cfg(feature = "script")]
+mod budget;
+
+#[cfg(feature = "script")]
+mod hud_vm;
+
+#[cfg(feature = "script")]
 mod mlua_vm;
+
+#[cfg(feature = "script")]
+pub use hud_vm::{Fault, HudLimits, HudVm};
 
 #[cfg(feature = "script")]
 pub use mlua_vm::MluaVm;

@@ -4,8 +4,11 @@
 //! The `mlua`-backed [`ScriptVm`], compiled against exactly one of Lua 5.4,
 //! `LuaJIT`, or Luau.
 //!
-//! **This is the only file in the engine that may name `mlua` types.** CI greps
-//! for it. See [`super`] for why.
+//! **`mlua` types may be named here, in [`super::hud_vm`], and in
+//! [`super::budget`], and nowhere else in `crates/core`.**
+//! `scripts/check-vm-containment.sh` enforces it. Until Task 14 this file said
+//! it was the only one and that CI checked — CI did not, and the claim had
+//! already stopped being true. See [`super`] for why the seam matters.
 //!
 //! # The three backends differ in ways that leak here
 //!
@@ -366,7 +369,7 @@ impl MluaVm {
     /// distinguishable from an ordinary error.
     fn classify(err: &mlua::Error, mod_id: &str, context: &str) -> ScriptError {
         let text = err.to_string();
-        if text.contains(BUDGET_MARKER) {
+        if text.contains(super::budget::MARKER) {
             return ScriptError::BudgetExceeded {
                 mod_id: mod_id.to_owned(),
                 context: context.to_owned(),
@@ -387,59 +390,15 @@ impl MluaVm {
 
     /// Installs the per-call instruction budget.
     ///
-    /// The mechanism differs by backend, which is exactly the kind of thing the
-    /// trait exists to hide from callers.
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "Luau's interrupt API is infallible while the 5.4/LuaJIT hook is not;                   the signature stays uniform so callers do not branch on backend"
-    )]
+    /// Delegates to [`super::budget`], which both VMs in this crate share — the
+    /// backend-conditional hook is one thing to get right, not two.
     fn arm_budget(&self, instructions: u32) -> Result<(), ScriptError> {
-        #[cfg(any(feature = "vm-lua54", feature = "vm-luajit"))]
-        {
-            let limit = u64::from(instructions);
-            let counter = std::cell::Cell::new(0u64);
-            self.lua
-                .set_hook(
-                    mlua::HookTriggers::new().every_nth_instruction(BUDGET_HOOK_STEP),
-                    move |_lua, _debug| {
-                        let used = counter.get() + u64::from(BUDGET_HOOK_STEP);
-                        counter.set(used);
-                        if used > limit {
-                            return Err(mlua::Error::external(BUDGET_MARKER));
-                        }
-                        Ok(mlua::VmState::Continue)
-                    },
-                )
-                .map_err(|err| self.vm_error(&err))?;
-        }
-
-        #[cfg(feature = "vm-luau")]
-        {
-            // Luau has no debug hook; it has an interrupt, called at back-edges
-            // and calls. Coarser than an instruction count but bounded, which is
-            // what the budget is for.
-            let limit = u64::from(instructions) / u64::from(BUDGET_HOOK_STEP);
-            let counter = std::cell::Cell::new(0u64);
-            self.lua.set_interrupt(move |_lua| {
-                let used = counter.get() + 1;
-                counter.set(used);
-                if used > limit {
-                    return Err(mlua::Error::external(BUDGET_MARKER));
-                }
-                Ok(mlua::VmState::Continue)
-            });
-        }
-
-        Ok(())
+        super::budget::arm(&self.lua, instructions).map_err(|err| self.vm_error(&err))
     }
 
     /// Removes the budget, so engine-side work is not counted against a mod.
     fn disarm_budget(&self) {
-        #[cfg(any(feature = "vm-lua54", feature = "vm-luajit"))]
-        self.lua.remove_hook();
-
-        #[cfg(feature = "vm-luau")]
-        self.lua.remove_interrupt();
+        super::budget::disarm(&self.lua);
     }
 
     fn environment(&self, mod_id: &str) -> Result<&Table, ScriptError> {
@@ -452,15 +411,6 @@ impl MluaVm {
             })
     }
 }
-
-/// Marker text used to recognise a budget stop coming back through `mlua`'s
-/// error type, which has no dedicated variant for it.
-const BUDGET_MARKER: &str = "tiamot: instruction budget exceeded";
-
-/// How often the budget hook fires. Checking every instruction would dominate
-/// the runtime; a few thousand keeps the overhead negligible while still
-/// bounding a runaway loop to a fraction of a millisecond.
-const BUDGET_HOOK_STEP: u32 = 4_096;
 
 /// Resolves a `require` name against a mod's directory, refusing to escape it.
 ///

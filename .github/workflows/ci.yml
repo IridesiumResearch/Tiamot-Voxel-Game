@@ -189,6 +189,12 @@ jobs:
       - name: API stub coverage
         run: ./scripts/check-stubs.sh
 
+      # Charter rule 10: the VM sits behind a trait so it can be swapped. Only
+      # the files that ARE the VM layer may name mlua. mlua_vm.rs claimed this
+      # was checked here long before it was.
+      - name: VM containment
+        run: ./scripts/check-vm-containment.sh
+
       # Charter rule 14: the protocol decoder is the engine's front door, and
       # every byte through it came from a peer. A bounded smoke run on every
       # push, not a long campaign — the point is that the target still builds

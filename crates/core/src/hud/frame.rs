@@ -204,18 +204,26 @@ pub enum Command {
 
 /// An engine HUD element a script may take over.
 ///
-/// **Chat is deliberately absent** — see the module docs. A script that could
-/// hide chat could hide a moderator's warning.
+/// # Why this list is one long
+///
+/// It names what the engine actually draws, and the engine draws almost
+/// nothing: a crosshair, chat, and the settings screen. That is Task 14's first
+/// criterion stated as a type — the hotbar, the dig readout and anything else a
+/// game wants are a MOD's, built on this API, and delete the mod and they are
+/// gone. Naming a `Hotbar` here that the renderer does not have would be a
+/// promise nothing could keep, and the first script to hide it would find that
+/// out by nothing happening.
+///
+/// It grows when the engine grows an element, and only then.
+///
+/// **Chat is deliberately absent, and always will be** — see the module docs. A
+/// script that could hide chat could hide a moderator's warning. Settings are
+/// absent for the same reason: they must work with zero mods loaded, so they
+/// cannot be at a mod's mercy either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Builtin {
     /// The crosshair in the middle of the screen.
     Crosshair,
-    /// The engine's carried-materials strip.
-    Hotbar,
-    /// The engine's health readout.
-    Health,
-    /// The bar that fills while a block is being dug.
-    DigProgress,
 }
 
 impl Builtin {
@@ -224,23 +232,21 @@ impl Builtin {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Crosshair => "crosshair",
-            Self::Hotbar => "hotbar",
-            Self::Health => "health",
-            Self::DigProgress => "dig_progress",
         }
     }
 
     /// Parses the name a script used, if it is one.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
-        [
-            Self::Crosshair,
-            Self::Hotbar,
-            Self::Health,
-            Self::DigProgress,
-        ]
-        .into_iter()
-        .find(|builtin| builtin.name() == name)
+        [Self::Crosshair]
+            .into_iter()
+            .find(|builtin| builtin.name() == name)
+    }
+
+    /// Every element there is, for a message that lists them.
+    #[must_use]
+    pub fn all() -> &'static [Self] {
+        &[Self::Crosshair]
     }
 }
 
@@ -293,6 +299,15 @@ pub enum HudError {
         /// The ceiling.
         limit: usize,
     },
+}
+
+/// Where a frame was, so it can be put back there.
+///
+/// Returned by [`Frame::checkpoint`] and handed to [`Frame::rewind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    commands: usize,
+    hidden: usize,
 }
 
 /// What one script drew this frame.
@@ -363,6 +378,41 @@ impl Frame {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty() && self.hidden.is_empty()
+    }
+
+    /// Where the frame is now, for [`Frame::rewind`].
+    #[must_use]
+    pub fn checkpoint(&self) -> Mark {
+        Mark {
+            commands: self.commands.len(),
+            hidden: self.hidden.len(),
+        }
+    }
+
+    /// Discards everything added since a checkpoint.
+    ///
+    /// **Why one frame with rewind, rather than one frame per script.** A
+    /// script that faults halfway through drawing has left a half-drawn HUD,
+    /// and showing that is worse than showing nothing — a hotbar missing its
+    /// last three slots reads as "the game lost my items". Rewinding takes that
+    /// script's whole contribution away and leaves every other script's alone.
+    ///
+    /// A frame each would isolate faults just as well, but it would multiply
+    /// [`Limits::commands`] by however many scripts a server pushed, which is a
+    /// number the server chooses.
+    ///
+    /// Hidden builtins rewind on COUNT rather than by remembering which ones,
+    /// which is exact because [`Frame::hide`] only ever adds.
+    pub fn rewind(&mut self, mark: Mark) {
+        self.commands.truncate(mark.commands);
+        if self.hidden.len() > mark.hidden {
+            // `BTreeSet` has no truncate, and there are at most a handful of
+            // builtins, so rebuilding the prefix is cheaper than tracking
+            // insertion order for a set that never exceeds four entries.
+            let kept: std::collections::BTreeSet<Builtin> =
+                self.hidden.iter().copied().take(mark.hidden).collect();
+            self.hidden = kept;
+        }
     }
 
     /// Empties the frame, keeping the allocation for the next one.
@@ -504,21 +554,56 @@ mod tests {
         // Moderation depends on chat being visible, so there is no spelling of
         // `hide_builtin` that takes it away.
         assert_eq!(Builtin::parse("crosshair"), Some(Builtin::Crosshair));
-        assert_eq!(Builtin::parse("dig_progress"), Some(Builtin::DigProgress));
         assert_eq!(Builtin::parse("chat"), None);
+        assert_eq!(Builtin::parse("settings"), None);
         assert_eq!(Builtin::parse("Crosshair"), None, "names are exact");
     }
 
     #[test]
-    fn clearing_keeps_nothing_and_hiding_survives_only_the_frame_it_was_said_in() {
-        // Immediate mode: a script that stops asking for the hotbar to be
-        // hidden gets the hotbar back, without having to un-hide it.
+    fn rewinding_takes_away_one_scripts_work_and_leaves_the_rest() {
+        // A script that faults halfway through has left a half-drawn HUD, and
+        // a hotbar missing its last three slots reads as lost items.
         let mut frame = Frame::new(Limits::default());
-        frame.hide(Builtin::Hotbar);
+        frame.push(text("the first script")).expect("push");
+        let mark = frame.checkpoint();
+        frame.push(text("half a hotbar")).expect("push");
+        frame.hide(Builtin::Crosshair);
+
+        frame.rewind(mark);
+        assert_eq!(frame.commands().len(), 1, "only the faulting script goes");
+        let Command::Text { text: kept, .. } = &frame.commands()[0] else {
+            panic!("expected text");
+        };
+        assert_eq!(kept, "the first script");
+        assert!(
+            !frame.hides(Builtin::Crosshair),
+            "and the hide it asked for goes with it — the engine draws its own again"
+        );
+    }
+
+    #[test]
+    fn a_rewind_keeps_a_hide_that_was_already_there() {
+        // The other half: an earlier script's hide is not collateral damage
+        // when a later one faults.
+        let mut frame = Frame::new(Limits::default());
+        frame.hide(Builtin::Crosshair);
+        let mark = frame.checkpoint();
+        frame.push(text("the faulting script")).expect("push");
+        frame.rewind(mark);
+        assert!(frame.hides(Builtin::Crosshair));
+        assert!(frame.commands().is_empty());
+    }
+
+    #[test]
+    fn clearing_keeps_nothing_and_hiding_survives_only_the_frame_it_was_said_in() {
+        // Immediate mode: a script that stops asking for the crosshair to be
+        // hidden gets it back, without having to un-hide it.
+        let mut frame = Frame::new(Limits::default());
+        frame.hide(Builtin::Crosshair);
         frame.push(text("hi")).expect("push");
-        assert!(frame.hides(Builtin::Hotbar));
+        assert!(frame.hides(Builtin::Crosshair));
         frame.clear();
         assert!(frame.is_empty());
-        assert!(!frame.hides(Builtin::Hotbar));
+        assert!(!frame.hides(Builtin::Crosshair));
     }
 }
