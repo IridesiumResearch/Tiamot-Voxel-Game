@@ -37,18 +37,21 @@ local open = {}
 
 --- The screen itself.
 ---
---- Two grids over one view: the top three rows are the main inventory, the
---- bottom row is what the hotbar shows. Splitting them is presentation — the
---- server holds one list of slots and does not know this dialog exists.
+--- **Two views, not two halves of one.** `player:main` is where dug material
+--- lands; `player:hotbar` is the nine slots the number keys select between, and
+--- shift-clicking moves a stack between them. An earlier version of this drew
+--- both grids over `player:main` starting at slot 10 — which showed twenty-seven
+--- empty boxes and nothing a player owned, because that is not where their
+--- items are.
 local function screen()
     return {
         type = "container", direction = "column", gap = 6, padding = 10,
         children = {
             { type = "label", text = "Inventory" },
-            { type = "item_grid", view = "player:main", columns = 9, first = 10, count = 27 },
-            { type = "spacer", size = 6 },
-            { type = "item_grid", view = "player:main", columns = 9, first = 1, count = 9 },
-            { type = "button", name = "close", text = "Close" },
+            { type = "item_grid", view = "player:main", columns = 9, first = 1, count = 27 },
+            { type = "spacer", size = 8 },
+            { type = "label", text = "Hotbar" },
+            { type = "item_grid", view = "player:hotbar", columns = 9, first = 1, count = 9 },
         },
     }
 end
@@ -76,10 +79,7 @@ game.register_on_dialog_event(function(event)
     -- time this is called; there is nothing for a mod to do about it. What is
     -- tracked here is only whether the screen is on the player's display, so
     -- the key toggles rather than reopening something already open.
-    if event.kind == "closed" or (event.kind == "pressed" and event.name == "close") then
-        if event.kind == "pressed" then
-            game.close_dialog{ player = event.player, form = "inventory" }
-        end
+    if event.kind == "closed" then
         open[event.player] = nil
     end
 end)

@@ -153,6 +153,80 @@ fn declaring_a_hud_script_publishes_that_file_and_no_other_lua() {
 }
 
 #[test]
+fn what_a_player_digs_shows_up_in_the_slots_core_uis_screen_draws() {
+    // **Reported from the window: "items do not seem to display in my
+    // inventory yet".** Two faults, one symptom. `player:main` started with
+    // zero slots and grew, and the screen drew a grid over slots 10..36 of it —
+    // so a player who had dug one block owned slot 1 of a one-slot view and was
+    // shown twenty-seven boxes that were not it.
+    //
+    // This asserts the whole path: dig, the material lands in the first slot of
+    // `player:main`, and the tree the mod sends is a grid over that view
+    // starting at that slot.
+    let server = start("dug");
+    block_on(async {
+        let mut bot = join(&server, "digger").await;
+
+        // `y = -1` is the surface: `fill_below_heightmap(0)` fills everything
+        // BELOW zero, so the topmost solid block is under the player's feet.
+        bot.dig_block(tiamot_core::BlockPos::new(0, -1, 0))
+            .await
+            .expect("dig");
+        let slots = bot
+            .until_view("player:main", |slots| {
+                slots.first().is_some_and(Option::is_some)
+            })
+            .await
+            .expect("the dug block never reached a slot");
+        let (_, units) = slots[0].expect("a stack in the first slot");
+        assert!(units > 0);
+        assert!(
+            slots.len() >= 27,
+            "a player needs room before the screen can show any, got {} slots",
+            slots.len()
+        );
+
+        // And the screen the mod draws is over that view, from that slot.
+        bot.action("core_ui:inventory", true).await.expect("press");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let tree = loop {
+            if let Some((_, tree)) = bot
+                .dialogs()
+                .into_iter()
+                .find(|(form, _)| form == "core_ui:inventory")
+            {
+                break tree;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the inventory never opened"
+            );
+            bot.recv().await.expect("recv");
+        };
+
+        let grids: Vec<(&str, u16, u16)> = tree
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.widget {
+                tiamot_core::ui::Widget::ItemGrid {
+                    view, first, count, ..
+                } => Some((view.as_str(), *first, *count)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            grids.contains(&("player:main", 0, 27)),
+            "the main grid should start at the first slot a player owns, got {grids:?}"
+        );
+        assert!(
+            grids.iter().any(|(view, _, _)| *view == "player:hotbar"),
+            "and the hotbar is its OWN view, not the tail of the main one: {grids:?}"
+        );
+    });
+    assert!(server.stop());
+}
+
+#[test]
 fn core_uis_inventory_screen_opens_and_closes_on_the_action_it_registered() {
     // Criterion 1's other half, and criterion 2 on the real reference mods
     // rather than a fixture: the inventory screen is a widget TREE, opened by

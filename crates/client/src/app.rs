@@ -708,6 +708,13 @@ pub struct App {
     chat: std::collections::VecDeque<String>,
     /// Whether the chat input line is open and taking keys.
     chat_open: bool,
+    /// Whether the input line still needs to be given keyboard focus.
+    ///
+    /// Set when chat opens and taken once. **Asking every frame is what broke
+    /// sending**: egui reports a single-line field's Enter as `lost_focus`, and
+    /// a field handed focus back every frame never loses it, so Enter did
+    /// nothing at all.
+    chat_focus: bool,
     /// What is typed into it.
     chat_draft: String,
     /// What each inventory view holds, as the server last said.
@@ -984,6 +991,7 @@ impl App {
             views: std::collections::BTreeMap::new(),
             chat: std::collections::VecDeque::new(),
             chat_open: false,
+            chat_focus: false,
             chat_draft: String::new(),
             dialog_events: Vec::new(),
             mixer,
@@ -1212,7 +1220,7 @@ impl App {
         format!(
             "keys: L light · K shadows · V third person · B borders {} · N sources · [ ] time \
              · \\ resync \
-             · G blocks · T/H teleport",
+             · G blocks · Y/H teleport · T chat · E inventory · F1 settings · F3 this",
             if self.renderer.chunk_borders() {
                 "ON"
             } else {
@@ -2026,10 +2034,24 @@ impl App {
 
     /// Opens or closes the chat input, discarding a half-typed line on close.
     pub fn set_chat_open(&mut self, open: bool) {
+        if open && !self.chat_open {
+            // Only on the transition. Re-opening an already-open box would
+            // otherwise steal focus back every time the key repeated.
+            self.chat_focus = true;
+        }
         self.chat_open = open;
         if !open {
             self.chat_draft.clear();
+            self.chat_focus = false;
         }
+    }
+
+    /// Whether the input line should take keyboard focus this frame.
+    ///
+    /// True exactly once per opening. See [`App::chat_focus`] for what asking
+    /// every frame did.
+    pub const fn take_chat_focus(&mut self) -> bool {
+        std::mem::replace(&mut self.chat_focus, false)
     }
 
     /// Sends what is typed, if anything, and closes the input.
@@ -2483,6 +2505,24 @@ impl App {
     pub fn cycle_shadow_quality(&mut self) {
         self.config.shadow_quality = self.config.shadow_quality.next();
         self.renderer.set_shadow_quality(self.config.shadow_quality);
+        // **Say so, because in two of the three modes nothing happens.**
+        //
+        // Shadow maps are mode 3's and only mode 3's — modes 1 and 2 do not
+        // allocate them at all, which is deliberate (Task 10) and invisible.
+        // Reported from the window as "the shadows seem to have gone missing
+        // and pressing K does not make them show up", which is exactly what a
+        // key that silently changes a setting for a mode you are not in looks
+        // like.
+        let mode = self.config.lighting_mode;
+        let quality = self.config.shadow_quality.name();
+        if mode == crate::config::LightingMode::Beautiful {
+            self.warn(format!("shadows: {quality}"));
+        } else {
+            self.warn(format!(
+                "shadows: {quality} — but lighting mode {} draws none. Press L for mode 3.",
+                mode.name()
+            ));
+        }
     }
 
     /// How sharp mode 3's shadows are.

@@ -72,6 +72,10 @@ game.register_on_player_join(function(event)
                 { type = "label", text = "Welcome" },
                 { type = "button", name = "buy", text = "Buy" },
                 { type = "item_grid", view = "player:main", columns = 9, count = 9 },
+                -- One slot addressed by hand, so a test can see what number
+                -- the mod's `index` became on the wire. Slot three of the
+                -- player's own view, one-based like everything a mod writes.
+                { type = "item_slot", name = "third", view = "player:main", index = 3 },
             },
         },
     }
@@ -79,6 +83,10 @@ end)
 
 -- Every event marks the world so a bot can see it happened. The block goes at
 -- a height that depends on WHAT happened, so one position tells them apart.
+--
+-- A CLICK also marks the slot it was told about, at x = the index. That is the
+-- only way to see, from outside, which slot number the mod actually heard —
+-- and until Task 14's play test it was not the one the mod had asked for.
 game.register_on_dialog_event(function(event)
     local y = 0
     if event.kind == "pressed" then y = 4
@@ -87,6 +95,9 @@ game.register_on_dialog_event(function(event)
     end
     if y > 0 then
         game.set_block({ x = 0, y = y, z = 0 }, "shop:counter")
+    end
+    if event.kind == "clicked" then
+        game.set_block({ x = event.index, y = 12, z = 0 }, "shop:counter")
     end
 end)
 "#,
@@ -149,7 +160,9 @@ fn a_server_mod_shows_a_dialog_to_a_client_that_pushed_no_code() {
             "the server sent a tree that fails its own checker"
         );
 
-        // The tree says what the mod wrote: a column, a label, a button, a grid.
+        // The tree says what the mod wrote: a column, a label, a button, a
+        // grid, and the hand-addressed slot
+        // `the_slot_a_mod_is_told_about_is_the_slot_a_mod_asked_for` reads.
         let kinds: Vec<&str> = tree
             .nodes
             .iter()
@@ -158,12 +171,13 @@ fn a_server_mod_shows_a_dialog_to_a_client_that_pushed_no_code() {
                 tiamot_core::ui::Widget::Label { .. } => "label",
                 tiamot_core::ui::Widget::Button { .. } => "button",
                 tiamot_core::ui::Widget::ItemGrid { .. } => "grid",
+                tiamot_core::ui::Widget::ItemSlot { .. } => "slot",
                 _ => "other",
             })
             .collect();
         assert_eq!(
             kinds,
-            vec!["container", "label", "button", "grid"],
+            vec!["container", "label", "button", "grid", "slot"],
             "{kinds:?}"
         );
         // Children after parents — the invariant everything downstream relies on.
@@ -282,6 +296,78 @@ fn a_forged_event_for_a_dialog_nobody_opened_changes_nothing() {
                 "a forged event for a form nobody owns reached the mod: {pos:?}"
             );
         }
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn the_slot_a_mod_is_told_about_is_the_slot_a_mod_asked_for() {
+    // **Found by playing, not by a test.** The tree builder took `item_slot`'s
+    // `index` and `item_grid`'s `first` through as zero-based while the event
+    // hook reported the slot as `index + 1` — so a mod addressed one slot and
+    // heard about its neighbour, and `core_ui`'s inventory screen drew a grid
+    // one slot past everything a player owned.
+    //
+    // The mod's fixture marks `x = event.index` at `y = 12` when a slot is
+    // clicked. The bot clicks the wire's slot zero, which the mod described in
+    // its grid as `first = 1`; the mark must therefore land at `x = 1`.
+    let server = start("slot-index", write_shop("slot-index"));
+    block_on(async {
+        let mut bot = join(&server, "Counter").await;
+        bot.recv_until(|m| matches!(m, tiamot_core::proto::ServerMessage::ShowDialog { .. }))
+            .await
+            .expect("no dialog arrived");
+        let counter = bot
+            .material_table()
+            .expect("a material table")
+            .into_iter()
+            .find(|entry| entry.name == "shop:counter")
+            .map(|entry| entry.id)
+            .expect("the mod registers a counter");
+
+        // **Going out.** The mod wrote `index = 3`; the wire must carry 2.
+        let (_, tree) = bot
+            .dialogs()
+            .into_iter()
+            .find(|(form, _)| form == "shop:till")
+            .expect("the shop's dialog");
+        let slots: Vec<u16> = tree
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.widget {
+                tiamot_core::ui::Widget::ItemSlot { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            slots,
+            vec![2],
+            "a mod's one-based slot three should be the wire's slot two"
+        );
+
+        // **Coming back.** A click on the wire's slot two must be reported to
+        // the mod as slot three, or the two directions disagree and a mod
+        // cannot act on its own screen.
+        bot.dialog_event(
+            "shop:till",
+            DialogEvent::Clicked {
+                view: "player:main".to_owned(),
+                index: 2,
+                click: Click::Left,
+            },
+        )
+        .await
+        .expect("send");
+
+        bot.expect_block(tiamot_core::BlockPos::new(3, 12, 0), counter, PATIENCE)
+            .await
+            .expect("the mod was told about a different slot than the one clicked");
+        assert!(
+            !bot.saw_block(tiamot_core::BlockPos::new(2, 12, 0), counter),
+            "the mod heard the raw wire index rather than its own numbering"
+        );
 
         bot.disconnect().await;
     });

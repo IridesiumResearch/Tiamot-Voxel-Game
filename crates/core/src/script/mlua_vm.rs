@@ -412,6 +412,15 @@ impl MluaVm {
     }
 }
 
+/// Converts a mod's one-based slot number to the zero-based one on the wire.
+///
+/// Absent means the first slot. A zero — which is not a valid one-based index,
+/// but is what a mod used to writing C-shaped code will send — also means the
+/// first slot rather than wrapping to the last.
+fn one_based(value: Option<u16>) -> u16 {
+    value.unwrap_or(1).saturating_sub(1)
+}
+
 /// Resolves a `require` name against a mod's directory, refusing to escape it.
 ///
 /// Returns `None` for anything that leaves the directory — checked after
@@ -3715,14 +3724,22 @@ fn widget_of(kind: &str, spec: &Table) -> mlua::Result<crate::ui::Widget> {
                 .unwrap_or_default(),
             selected: spec.get::<Option<u16>>("selected")?.unwrap_or(0),
         },
+        // **One-based on the way in, because they are one-based on the way
+        // out.** A click event reports its slot as `index + 1`, and until Task
+        // 14's play test these went through unconverted — so a mod wrote
+        // `index = 3`, addressed the fourth slot's neighbour, and was told
+        // `index = 4` when somebody clicked it. `core_ui`'s inventory screen
+        // was written against the documented one-based rule and drew a grid
+        // one slot past everything a player owned, which is what "items do not
+        // seem to display in my inventory" looked like from the window.
         "item_slot" => Widget::ItemSlot {
             view: spec.get::<String>("view")?,
-            index: spec.get::<Option<u16>>("index")?.unwrap_or(0),
+            index: one_based(spec.get::<Option<u16>>("index")?),
         },
         "item_grid" => Widget::ItemGrid {
             view: spec.get::<String>("view")?,
             columns: spec.get::<Option<u16>>("columns")?.unwrap_or(9),
-            first: spec.get::<Option<u16>>("first")?.unwrap_or(0),
+            first: one_based(spec.get::<Option<u16>>("first")?),
             count: spec.get::<Option<u16>>("count")?.unwrap_or(0),
         },
         "scroll" => Widget::Scroll,
@@ -3851,6 +3868,55 @@ fn qualify_id(mod_id: &str, id: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The slot numbers a mod writes, and the ones it is told about, agree.
+    ///
+    /// **They did not, and nobody noticed for a whole task.** `widget_of` took
+    /// `index` and `first` straight through as zero-based while the event
+    /// conversion at `table.set("index", ...)` added one — so a mod addressed
+    /// one slot and heard about its neighbour. It surfaced as `core_ui`'s
+    /// inventory screen showing an empty grid over a player who was carrying
+    /// something, because the grid started one slot past the first.
+    #[test]
+    fn a_slot_number_means_the_same_thing_going_out_as_coming_back() {
+        let lua = Lua::new();
+        let spec = lua.create_table().expect("table");
+        spec.set("type", "item_grid").expect("set");
+        spec.set("view", "player:main").expect("set");
+        spec.set("first", 1).expect("set");
+        spec.set("count", 27).expect("set");
+
+        let widget = widget_of("item_grid", &spec).expect("build");
+        let crate::ui::Widget::ItemGrid { first, .. } = widget else {
+            panic!("expected a grid");
+        };
+        assert_eq!(first, 0, "a mod's first slot is the wire's slot zero");
+    }
+
+    #[test]
+    fn a_slot_number_a_mod_left_out_is_the_first_one() {
+        let lua = Lua::new();
+        let spec = lua.create_table().expect("table");
+        spec.set("type", "item_slot").expect("set");
+        spec.set("view", "player:main").expect("set");
+
+        let crate::ui::Widget::ItemSlot { index, .. } =
+            widget_of("item_slot", &spec).expect("build")
+        else {
+            panic!("expected a slot");
+        };
+        assert_eq!(index, 0);
+
+        // A zero is not a valid one-based index, but it is what somebody used
+        // to C-shaped code will send. It means the first slot, not the last.
+        spec.set("index", 0).expect("set");
+        let crate::ui::Widget::ItemSlot { index, .. } =
+            widget_of("item_slot", &spec).expect("build")
+        else {
+            panic!("expected a slot");
+        };
+        assert_eq!(index, 0, "a zero must not wrap to u16::MAX");
+    }
+
     use super::*;
 
     fn vm() -> MluaVm {

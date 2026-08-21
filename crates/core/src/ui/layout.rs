@@ -302,6 +302,23 @@ fn shrink(mains: &mut [i32], used: i32, available: i32) {
 
 /// A leaf's natural size, or a container's from its children.
 ///
+/// How big a whole tree wants to be, ignoring the box it will be given.
+///
+/// **What a floating dialog is sized from.** Laying a tree out into three
+/// quarters of the window and drawing a window that size gives every dialog the
+/// same size whatever is in it, which is how a two-button prompt ends up
+/// covering the game. Measuring first and laying out into `min(natural, cap)`
+/// gives a window the shape of its contents.
+///
+/// Zero for an empty tree, which has nothing to be the size of.
+#[must_use]
+pub fn natural(tree: &Tree, measure: &dyn Measure) -> (i32, i32) {
+    if tree.nodes.is_empty() {
+        return (0, 0);
+    }
+    natural_of(tree, 0, measure)
+}
+
 /// Containers measure by summing, which is what lets a column inside a row take
 /// only the width it needs.
 ///
@@ -370,7 +387,7 @@ fn natural_at(tree: &Tree, index: usize, measure: &dyn Measure, depth: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::tree::{Align, Build, Direction, Node, Widget};
+    use crate::ui::tree::{Align, Build, Children, Direction, Node, Widget};
 
     /// A measurer with numbers a test chose, which is the point of the trait.
     ///
@@ -389,6 +406,76 @@ mod tests {
                 _ => (10, 10),
             }
         }
+    }
+
+    #[test]
+    fn a_trees_natural_size_is_its_contents_not_the_box_it_is_given() {
+        // **What a floating dialog is sized from.** Laying a tree out into
+        // three quarters of the window and drawing a window that size gives a
+        // two-button prompt the same size as an inventory screen — reported
+        // from the window as an inventory that filled the screen.
+        let tree = Tree {
+            nodes: vec![
+                Node {
+                    widget: Widget::Container {
+                        direction: Direction::Column,
+                        gap: 4,
+                        padding: 8,
+                        align: Align::Start,
+                    },
+                    name: String::new(),
+                    style: Style::default(),
+                    grow: 0,
+                    size: None,
+                    cross_size: None,
+                    children: Children { first: 1, count: 2 },
+                },
+                Node {
+                    widget: Widget::Label {
+                        text: "hello".to_owned(),
+                    },
+                    name: String::new(),
+                    style: Style::default(),
+                    grow: 0,
+                    size: None,
+                    cross_size: None,
+                    children: Children { first: 0, count: 0 },
+                },
+                Node {
+                    widget: Widget::Label {
+                        text: "hi".to_owned(),
+                    },
+                    name: String::new(),
+                    style: Style::default(),
+                    grow: 0,
+                    size: None,
+                    cross_size: None,
+                    children: Children { first: 0, count: 0 },
+                },
+            ],
+        };
+
+        // Two labels stacked: 12 + 4 gap + 12, plus 8 padding each side. The
+        // width is the WIDER label plus padding, not the sum — a column takes
+        // the width it needs, which is the property that makes this usable as a
+        // window size.
+        let (width, height) = natural(&tree, &Ruler);
+        assert_eq!(height, 12 + 4 + 12 + 16);
+        assert_eq!(width, 5 * 8 + 16);
+
+        // And it does not depend on the box: the same tree laid out into a
+        // huge area reports the same natural size.
+        assert_eq!(natural(&tree, &Ruler), (width, height));
+        let laid = layout(&tree, Rect::new(0, 0, 4000, 4000), &Ruler);
+        assert!(
+            laid.rect.w >= width,
+            "a tree given room may take it; that is why the caller measures first"
+        );
+    }
+
+    #[test]
+    fn an_empty_tree_has_no_natural_size() {
+        assert_eq!(natural(&Tree { nodes: Vec::new() }, &Ruler), (0, 0));
     }
 
     fn container(direction: Direction, gap: u16, padding: u16, align: Align) -> Node {

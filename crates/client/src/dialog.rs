@@ -188,29 +188,46 @@ fn draw_form(
     area: (f32, f32),
 ) -> Vec<Raised> {
     let mut raised = Vec::new();
-    // The dialog gets at most three quarters of the window, so a mod cannot
-    // cover the game with one — and at least something, so a small tree is not
-    // laid out into nothing.
-    let width = (area.0 * 0.75).max(160.0) as i32;
-    let height = (area.1 * 0.75).max(120.0) as i32;
+    let ruler = EguiRuler { ctx };
+    // **Sized to its contents, capped at three quarters of the window.**
+    //
+    // Reported from the window: the inventory "does not quite fill up the whole
+    // screen" is what a player wants, and what they got was a panel three
+    // quarters the size of the window whatever was in it. Laying out into the
+    // cap and then allocating that much space gives every dialog the same size
+    // — a two-button prompt as large as an inventory screen.
+    //
+    // So measure the tree first and lay it out into whichever is smaller. A
+    // tree that genuinely wants the room still gets it, and a small one is a
+    // small window.
+    let cap = (
+        (area.0 * 0.75).max(160.0) as i32,
+        (area.1 * 0.75).max(120.0) as i32,
+    );
+    let wanted = tiamot_core::ui::natural(tree, &ruler);
+    let width = wanted.0.clamp(160, cap.0);
+    let height = wanted.1.clamp(120, cap.1);
 
     let mut close = false;
     egui::Window::new(form)
         .collapsible(false)
         .resizable(false)
-        .default_width(f64::from(width) as f32)
+        // Centred, and only as a DEFAULT: a player who drags it somewhere gets
+        // to keep it there, which is what `default_pos` means and `fixed_pos`
+        // would not.
+        .default_pos(egui::pos2(
+            (area.0 - width as f32) / 2.0,
+            (area.1 - height as f32) / 2.0,
+        ))
+        .default_width(width as f32)
         .show(ctx, |ui| {
             let origin = ui.cursor().min;
-            let ruler = EguiRuler { ctx };
             let laid = layout(tree, Rect::new(0, 0, width, height), &ruler);
             // The tree and its rectangles are walked TOGETHER, by index, so a
             // renderer cannot pair a widget with somebody else's rectangle —
             // which a flat list plus a separate traversal invites.
             paint(ui, origin, tree, 0, &laid, form, local, views, &mut raised);
-            ui.allocate_space(egui::vec2(
-                laid.rect.w as f32,
-                (laid.rect.h as f32).min(area.1 * 0.75),
-            ));
+            ui.allocate_space(egui::vec2(laid.rect.w as f32, laid.rect.h as f32));
             if ui.button("Close").clicked() {
                 close = true;
             }

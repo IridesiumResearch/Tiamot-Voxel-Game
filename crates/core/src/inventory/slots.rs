@@ -99,16 +99,33 @@ pub const PLAYER_MAIN: &str = "player:main";
 /// The nine slots a player selects between with the number keys.
 pub const PLAYER_HOTBAR: &str = "player:hotbar";
 
+/// How many slots `player:main` starts with.
+///
+/// **It used to start at zero**, on the reasoning that [`Slots::insert`] grows
+/// it and so nothing could ever be capped. That was true and still is — but
+/// nothing DISPLAYED it then. A dialog showing a grid over a view with two
+/// slots in it draws twenty-five boxes a player cannot put anything into,
+/// because a click on a slot that is not there is correctly ignored. Reported
+/// from the window as "items do not seem to display in my inventory yet".
+///
+/// So a player starts with room, and `insert` still grows past it. This caps
+/// nothing; it only means the room exists before something is in it.
+pub const PLAYER_MAIN_SLOTS: usize = 27;
+
 impl Slots {
     /// The views every player has.
     ///
-    /// `player:main` starts empty and GROWS as material arrives — see
-    /// [`Slots::insert`]. The hotbar is nine, because that is what the engine's
-    /// `engine:hotbar_1`..`_9` actions select between.
+    /// `player:main` starts at [`PLAYER_MAIN_SLOTS`] and GROWS beyond it as
+    /// material arrives — see [`Slots::insert`]. The hotbar is nine, because
+    /// that is what the engine's `engine:hotbar_1`..`_9` actions select
+    /// between.
     #[must_use]
     pub fn for_player() -> Self {
         Self {
-            views: vec![View::empty(PLAYER_MAIN, 0), View::empty(PLAYER_HOTBAR, 9)],
+            views: vec![
+                View::empty(PLAYER_MAIN, PLAYER_MAIN_SLOTS),
+                View::empty(PLAYER_HOTBAR, 9),
+            ],
             grab: Grab::default(),
         }
     }
@@ -495,6 +512,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_fresh_player_has_room_before_they_have_anything() {
+        // **Reported from the window: "items do not seem to display in my
+        // inventory yet".** `player:main` started at zero slots and grew, so a
+        // player who had dug one thing had a one-slot view — and a dialog
+        // drawing a grid over it showed empty boxes for slots that did not
+        // exist, which a click correctly does nothing to.
+        let inv = Slots::for_player();
+        assert_eq!(
+            inv.view(PLAYER_MAIN).map(|view| view.slots.len()),
+            Some(PLAYER_MAIN_SLOTS)
+        );
+        assert_eq!(
+            inv.view(PLAYER_HOTBAR).map(|view| view.slots.len()),
+            Some(9)
+        );
+        assert_eq!(inv.total_units(), 0, "room is not contents");
+    }
+
+    #[test]
+    fn a_starting_size_still_does_not_cap_what_a_player_may_own() {
+        // The reason it started at zero was that growth must not be capped.
+        // Starting with room does not change that, and this is the test that
+        // says so.
+        let mut inv = Slots::for_player();
+        for material in 0..(PLAYER_MAIN_SLOTS as u16 + 5) {
+            assert!(
+                inv.insert(
+                    PLAYER_MAIN,
+                    Stack::new(MaterialId(material + 2), 27).expect("stack")
+                ),
+                "material {material} should fit"
+            );
+        }
+        let held = inv.view(PLAYER_MAIN).expect("main").slots.len();
+        assert!(
+            held > PLAYER_MAIN_SLOTS,
+            "the view should have grown past its starting size, got {held}"
+        );
     }
 
     #[test]

@@ -1694,3 +1694,69 @@ fn every_registered_sound_reaches_the_mixer_and_walking_makes_noise() {
     app.shutdown();
     server.stop();
 }
+
+#[test]
+fn the_chat_box_asks_for_focus_once_and_a_line_reaches_the_server() {
+    // **Reported from the window: "the chat does not seem to fully work".**
+    //
+    // Two things, one symptom. The box took the keys and never sent, because
+    // egui reports a single-line field's Enter as `lost_focus` and the renderer
+    // asked for focus back on EVERY frame — so it never lost it, and Enter
+    // landed on a field that immediately grabbed focus again.
+    //
+    // The renderer's half needs a window. This is the half that does not: the
+    // flag is raised exactly once per opening, which is what makes
+    // `request_focus` a one-shot rather than a loop, and a typed line really
+    // does leave for the server and come back.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("chat");
+    let mut app = client("chat", &server, gpu);
+    assert!(
+        run_frames(&mut app, App::joined),
+        "never joined: {:?}",
+        app.warnings()
+    );
+
+    assert!(!app.chat_open());
+    assert!(
+        !app.take_chat_focus(),
+        "a closed box does not want the keyboard"
+    );
+
+    app.set_chat_open(true);
+    assert!(app.chat_open());
+    assert!(app.take_chat_focus(), "the frame it opens, it asks");
+    assert!(
+        !app.take_chat_focus(),
+        "and never again — asking every frame is what stopped Enter working"
+    );
+
+    // Re-opening an already-open box must not steal focus back, or a repeating
+    // key would fight the caret.
+    app.set_chat_open(true);
+    assert!(!app.take_chat_focus());
+
+    // A line goes out and comes back. `send_chat` closes the box, which is what
+    // pressing Enter should do.
+    app.chat_draft_mut().push_str("hello everybody");
+    app.send_chat();
+    assert!(!app.chat_open(), "sending closes the box");
+    assert!(
+        run_frames(&mut app, |app| app
+            .chat()
+            .any(|line| line.contains("hello everybody"))),
+        "the line never came back from the server: {:?}",
+        app.warnings()
+    );
+
+    // And closing discards a half-typed line rather than leaving it to
+    // reappear the next time the box opens.
+    app.set_chat_open(true);
+    app.chat_draft_mut().push_str("never mind");
+    app.set_chat_open(false);
+    app.set_chat_open(true);
+    assert!(app.chat_draft_mut().is_empty());
+
+    app.shutdown();
+    server.stop();
+}

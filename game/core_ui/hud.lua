@@ -14,6 +14,7 @@
 
 -- Virtual pixels. The canvas is 1080 tall and as wide as the window is; anchors
 -- do the rest, so these numbers mean the same thing on every monitor.
+local SLOTS = 6
 local SLOT = 52
 local GAP = 4
 local PITCH = SLOT + GAP
@@ -22,54 +23,85 @@ local WHITE = { 255, 255, 255, 255 }
 local DIM = { 190, 190, 190, 255 }
 local PANEL = { 0, 0, 0, 130 }
 local SELECTED = { 255, 255, 255, 220 }
+local EMPTY = { 0, 0, 0, 90 }
 
---- Draws the carried stacks, centred along the bottom edge.
+--- Draws the hotbar: a fixed row of slots, filled from what you carry.
+---
+--- **A fixed row, not one box per stack.** It used to draw one slot per carried
+--- material, so a player who had dug one thing saw one box and it moved as they
+--- picked up a second. A hotbar is a place: the slots are always there and the
+--- contents change.
+---
+--- `SLOTS` is this mod's choice and nothing else's. The engine registers
+--- `engine:hotbar_1` to `_9` and clamps a selection to what is carried, so
+--- changing this number changes what is drawn and nothing else breaks.
 local function hotbar(state)
-    local count = #state.carried
-    if count == 0 then
-        hud.text{
-            anchor = "bottom", x = -110, y = 46,
-            text = "carrying nothing — dig something", size = 20, colour = DIM,
-        }
-        return
-    end
-
     -- Centred as a group: the leftmost slot starts half the row's width to the
-    -- left of the middle, so a row of three and a row of nine are both centred.
-    local left = -((count * PITCH) - GAP) / 2
+    -- left of the middle.
+    local left = -((SLOTS * PITCH) - GAP) / 2
 
     hud.rect{
         anchor = "bottom", x = left - 6, y = SLOT + 18,
-        w = (count * PITCH) - GAP + 12, h = SLOT + 12, colour = PANEL,
+        w = (SLOTS * PITCH) - GAP + 12, h = SLOT + 12, colour = PANEL,
     }
 
-    for index, slot in ipairs(state.carried) do
+    -- Above the target line rather than beside it: two hints on one row read
+    -- as one sentence that does not parse.
+    if #state.carried == 0 then
+        hud.text{
+            anchor = "bottom", x = -110, y = SLOT + 64,
+            text = "carrying nothing — dig something", size = 20, colour = DIM,
+        }
+    end
+
+    for index = 1, SLOTS do
+        local slot = state.carried[index]
         local x = left + (index - 1) * PITCH
+
+        -- The empty slot is drawn whether or not anything is in it: that is
+        -- what makes it a place rather than a list.
+        hud.rect{
+            anchor = "bottom", x = x, y = SLOT + 6,
+            w = SLOT, h = SLOT, colour = EMPTY,
+        }
 
         -- The selection marker is a frame BEHIND the icon rather than a border
         -- around it: an outline drawn over the icon eats four pixels of a
-        -- fifty-two pixel picture, which is a lot of a block to lose.
+        -- fifty-two pixel picture, which is a lot of a block to lose. Drawn for
+        -- the selected slot even when it is empty, so the marker never
+        -- disappears.
         if index == state.selected then
             hud.rect{
                 anchor = "bottom", x = x - 3, y = SLOT + 9,
                 w = SLOT + 6, h = SLOT + 6, colour = SELECTED,
             }
+            hud.rect{
+                anchor = "bottom", x = x, y = SLOT + 6,
+                w = SLOT, h = SLOT, colour = EMPTY,
+            }
         end
 
-        hud.icon{ anchor = "bottom", x = x, y = SLOT + 6, size = SLOT, material = slot.material }
+        if slot then
+            hud.icon{
+                anchor = "bottom", x = x, y = SLOT + 6, size = SLOT,
+                material = slot.material,
+            }
 
-        -- Charter rule 5's display, as the engine worked it out. `1+13` is what
-        -- forty units actually is; a raw `40` would be a number about nothing a
-        -- player can hold.
-        local label
-        if slot.nodes == 0 then
-            label = tostring(slot.blocks)
-        elseif slot.blocks == 0 then
-            label = "+" .. slot.nodes
-        else
-            label = slot.blocks .. "+" .. slot.nodes
+            -- Charter rule 5's display, as the engine worked it out. `1+13` is
+            -- what forty units actually is; a raw `40` would be a number about
+            -- nothing a player can hold.
+            local label
+            if slot.nodes == 0 then
+                label = tostring(slot.blocks)
+            elseif slot.blocks == 0 then
+                label = "+" .. slot.nodes
+            else
+                label = slot.blocks .. "+" .. slot.nodes
+            end
+            hud.text{
+                anchor = "bottom", x = x + 2, y = 20, text = label, size = 17, colour = WHITE,
+            }
         end
-        hud.text{ anchor = "bottom", x = x + 2, y = 20, text = label, size = 17, colour = WHITE }
     end
 end
 

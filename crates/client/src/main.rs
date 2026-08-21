@@ -128,6 +128,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         last_frame: std::time::Instant::now(),
         pending_teleport: None,
         grabbed: false,
+        released_for_dialog: false,
         digging: false,
         error: None,
     };
@@ -206,6 +207,13 @@ struct Client {
     last_frame: std::time::Instant,
     pending_teleport: Option<Teleport>,
     grabbed: bool,
+    /// Whether the cursor is free because a server dialog is open.
+    ///
+    /// Tracked rather than recomputed so that a player who pressed Escape while
+    /// a dialog was up does not have the cursor taken back off them when the
+    /// dialog closes. The window releases for a dialog and takes back only what
+    /// it released.
+    released_for_dialog: bool,
     /// Whether the dig button is down.
     ///
     /// Held rather than clicked: a dig is counted in ticks by the server, so
@@ -589,6 +597,28 @@ impl Client {
         let Some(surface) = self.window.as_mut() else {
             return false;
         };
+
+        // **A dialog needs the mouse, and the key that opened it cannot know.**
+        //
+        // Reported from the window: pressing E for the inventory left the
+        // cursor grabbed, so the screen was there and unclickable. The key
+        // could not release it — a mod's dialog opens after a round trip to the
+        // server, so at the moment the key is pressed there is nothing open
+        // yet. Handled here, where the answer is known, on the transition
+        // rather than every frame so a player can still take the cursor back
+        // with Escape while a dialog is up.
+        let dialog_open = !surface.app.dialogs().is_empty();
+        if dialog_open && !self.released_for_dialog {
+            self.grabbed = !grab(&surface.window, false);
+            self.released_for_dialog = true;
+        } else if !dialog_open && self.released_for_dialog {
+            self.released_for_dialog = false;
+            // Only if nothing else still wants it. Taking the cursor back into
+            // the settings screen would be the same bug from the other side.
+            if !surface.app.settings_open() && !surface.app.chat_open() {
+                self.grabbed = grab(&surface.window, true);
+            }
+        }
 
         let now = std::time::Instant::now();
         // Clamped: a frame after a long stall — a breakpoint, a window drag —
@@ -985,6 +1015,7 @@ fn draw_chat(app: &mut App, ctx: &egui::Context) {
         return;
     }
 
+    let focus = app.take_chat_focus();
     let mut send = false;
     let mut close = false;
     egui::Area::new(egui::Id::new("chat"))
@@ -1015,10 +1046,17 @@ fn draw_chat(app: &mut App, ctx: &egui::Context) {
                             .desired_width(420.0)
                             .hint_text("say something"),
                     );
-                    // Focused every frame it is open, so the first keystroke
-                    // after pressing the key lands in the box rather than
-                    // being swallowed while egui decides where focus lives.
-                    response.request_focus();
+                    // **Once, on the frame it opens — never every frame.**
+                    //
+                    // Reported from the window: chat did not work. It took the
+                    // keys and never sent, because egui reports a single-line
+                    // field's Enter as `lost_focus`, and a field handed focus
+                    // back on every frame never loses it. Enter was landing on
+                    // a box that immediately took focus again, so the line sat
+                    // there being typed into for ever.
+                    if focus {
+                        response.request_focus();
+                    }
                     if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         send = true;
                     }
