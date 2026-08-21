@@ -130,6 +130,10 @@ fn a_bot_completes_the_whole_join_flow() {
             // asking what the player carries is not asking before the material
             // table arrived.
             "HudScripts",
+            // Protocol v23, and the last of them: which sound each named event
+            // plays. After the sound table it refers to, so a client never
+            // holds a binding to a sound it has not been told exists.
+            "SoundBindings",
             "JoinWorld",
         ];
         assert!(
@@ -528,6 +532,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::ActionTable { .. } => "ActionTable",
         ServerMessage::SoundTable { .. } => "SoundTable",
         ServerMessage::HudScripts { .. } => "HudScripts",
+        ServerMessage::SoundBindings { .. } => "SoundBindings",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",
         _ => "other",

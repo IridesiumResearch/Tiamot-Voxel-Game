@@ -1121,6 +1121,14 @@ pub trait ScriptVm: Sized {
     /// Every sound the loaded mods registered, in load order.
     fn registered_sounds(&self) -> Vec<crate::sound::Sound>;
 
+    /// Every cue binding the loaded mods declared, in load order.
+    ///
+    /// Load order is precedence: two mods binding the same cue leave the later
+    /// one holding it, which is how the rest of the mod system resolves a
+    /// conflict. Empty is a mod set that makes no noise for any event, which is
+    /// every mod set before this existed.
+    fn registered_bindings(&self) -> Vec<crate::sound::Binding>;
+
     /// Every HUD script the loaded mods registered, in load order.
     ///
     /// Load order is DRAW order on the client, so this is a sequence rather

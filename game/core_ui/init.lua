@@ -83,3 +83,14 @@ game.register_on_dialog_event(function(event)
         open[event.player] = nil
     end
 end)
+
+
+-- The interface's own noise.
+--
+-- Bound rather than played: the client raises `engine:ui_click` when a widget
+-- is actually pressed, because a click that waited for the server to agree it
+-- had happened would arrive after the button had already moved.
+game.register_sound{ id = "click", file = "sounds/click.wav", gain = 0.5 }
+
+game.bind_sound("engine:ui_click", "click")
+game.bind_sound("engine:ui_close", "click")

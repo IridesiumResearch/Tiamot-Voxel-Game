@@ -272,6 +272,12 @@ pub struct JoinContext<'a> {
     /// that was not told this would have nothing to play. Empty is a world
     /// nobody made a noise in. See [`crate::proto::SoundDef`].
     pub sounds: &'a [crate::proto::SoundDef],
+    /// Which sound each named event plays, in load order.
+    ///
+    /// The client needs this and not only the server: the handful of cues the
+    /// ENGINE emits are the player's own actions, and a sound for one of those
+    /// must not wait for a round trip. See [`crate::proto::SoundBinding`].
+    pub sound_bindings: &'a [crate::proto::SoundBinding],
     /// Every HUD script the loaded mods want the client to run, in load order.
     ///
     /// **The one thing in this list that is code.** Everything else a join
@@ -736,6 +742,11 @@ impl Session {
                 ServerMessage::HudScripts {
                     scripts: context.hud_scripts.to_vec(),
                 },
+                // After the sound table it refers to, so a client never holds a
+                // binding to a sound it has not been told exists.
+                ServerMessage::SoundBindings {
+                    bindings: context.sound_bindings.to_vec(),
+                },
             ],
             close: false,
             action: Action::None,
@@ -911,6 +922,7 @@ mod tests {
             tools: &[],
             actions: &[],
             sounds: &[],
+            sound_bindings: &[],
             hud_scripts: &[],
             sky: (0, &[]),
             allowlist,
@@ -1012,7 +1024,8 @@ mod tests {
         // And the sounds, for the sixth: the engine has none of its own.
         assert!(matches!(sent[8], ServerMessage::SoundTable { .. }));
         assert!(matches!(sent[9], ServerMessage::HudScripts { .. }));
-        assert!(matches!(sent[10], ServerMessage::JoinWorld { .. }));
+        assert!(matches!(sent[10], ServerMessage::SoundBindings { .. }));
+        assert!(matches!(sent[11], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]

@@ -82,3 +82,17 @@ game.register_block{
 }
 
 game.log("registered core:crumb and core:pitch")
+
+
+-- The engine's movement cues, given a noise.
+--
+-- **The engine raises these; this mod decides what they sound like.** There is
+-- no jump code a mod could reach and none it needs to: the client watches its
+-- own body leave and meet the ground, and plays whatever is bound here without
+-- waiting for the server. A sound of your own jump arriving a round trip late
+-- reads as a worse sound rather than as latency.
+game.register_sound{ id = "jump", file = "sounds/jump.wav", gain = 0.4, pitch_variance = 0.1 }
+game.register_sound{ id = "land", file = "sounds/land.wav", gain = 0.6, pitch_variance = 0.1 }
+
+game.bind_sound("engine:jump", "jump")
+game.bind_sound("engine:land", "land")

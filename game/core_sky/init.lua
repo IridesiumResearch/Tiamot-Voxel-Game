@@ -86,3 +86,40 @@ game.register_sky{
 }
 
 game.log("registered a " .. DAY_LENGTH_TICKS .. "-tick day")
+
+
+-- ---------------------------------------------------------------------------
+-- Ambience
+-- ---------------------------------------------------------------------------
+--
+-- **The sky mod owns what the day sounds like**, for the same reason it owns
+-- what the day looks like: it is the mod that knows what time it is. Delete
+-- this directory and the world loses its day, its colours and its ambience
+-- together, which is the whole point of it being a mod.
+--
+-- Two loops, one on at a time. `play_loop` REPLACES a loop already running
+-- under the same id, so calling this every tick is safe and is why the code
+-- below does not track what it started.
+
+game.register_sound{ id = "day", file = "sounds/day.wav", gain = 0.25 }
+game.register_sound{ id = "night", file = "sounds/night.wav", gain = 0.3 }
+
+-- Dawn and dusk, matching the keyframes above: the sun is up between these.
+local DAWN, DUSK = 0.25, 0.75
+
+-- Only when it CHANGES. Sending a start every tick would be twenty messages a
+-- second per player for a loop that is already playing — the replace rule makes
+-- that harmless rather than free.
+local playing = nil
+
+game.register_on_tick(function()
+    local time = game.time_of_day()
+    local wanted = (time >= DAWN and time < DUSK) and "day" or "night"
+    if wanted == playing then
+        return
+    end
+    playing = wanted
+    -- `everywhere`: ambience is not somewhere you can walk away from, so it
+    -- takes full gain wherever the player stands and does not pan.
+    game.play_loop{ id = "ambience", sound = wanted, everywhere = true }
+end)

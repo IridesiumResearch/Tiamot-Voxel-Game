@@ -34,6 +34,15 @@ fn main() {
     // Milk: poured, and swum in.
     write(&root.join("core_milk/sounds/pour.wav"), Recipe::splash());
 
+    // The cue system's own reference sounds. `core_sky` owns the day, so it
+    // owns what the day sounds like; the click and the movement noises belong
+    // to the mod that binds the engine's cues.
+    write(&root.join("core_sky/sounds/day.wav"), Recipe::day());
+    write(&root.join("core_sky/sounds/night.wav"), Recipe::night());
+    write(&root.join("core_ui/sounds/click.wav"), Recipe::click());
+    write(&root.join("core_blocks/sounds/jump.wav"), Recipe::step());
+    write(&root.join("core_blocks/sounds/land.wav"), Recipe::thud());
+
     // **And seeds for `fuzz/ogg_ingest`.** A fuzzer starting from noise spends
     // its whole budget failing the container check and never reaches the
     // decoder; starting from a real file it mutates a valid header into an

@@ -104,6 +104,8 @@ pub struct Shared {
     pub sound_table: Vec<tiamot_core::proto::SoundDef>,
     /// The HUD scripts the mods asked to push, in load order.
     pub hud_scripts: Vec<tiamot_core::proto::HudScriptDef>,
+    /// Which sound each named event plays, in load order.
+    pub sound_bindings: Vec<tiamot_core::proto::SoundBinding>,
 
     /// Ticks in a full day, or 0 if no mod registered a sky.
     pub sky_day_length: u32,
@@ -1633,6 +1635,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 actions: &shared.action_table,
                 sounds: &shared.sound_table,
                 hud_scripts: &shared.hud_scripts,
+                sound_bindings: &shared.sound_bindings,
                 sky: (shared.sky_day_length, &shared.sky_keyframes),
                 allowlist: &allowlist,
                 max_players: shared.max_players,
@@ -1975,6 +1978,7 @@ mod tests {
             action_table: Vec::new(),
             sound_table: Vec::new(),
             hud_scripts: Vec::new(),
+            sound_bindings: Vec::new(),
             fluid_table: Vec::new(),
             sky_day_length: 0,
             sky_keyframes: Vec::new(),

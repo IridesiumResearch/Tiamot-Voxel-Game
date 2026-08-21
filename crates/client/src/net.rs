@@ -148,6 +148,39 @@ pub enum Event {
         sounds: Vec<tiamot_core::proto::SoundDef>,
     },
 
+    /// Which sound each named event plays.
+    ///
+    /// Sent once, on join. Most cues are resolved by the server and arrive as
+    /// [`Event::PlaySound`]; this table is what lets the client resolve the
+    /// handful the ENGINE emits — its own jump, its own landing, its own click
+    /// on a button — without a round trip.
+    SoundBindings {
+        /// Every binding, in mod load order. Later wins.
+        bindings: Vec<tiamot_core::proto::SoundBinding>,
+    },
+
+    /// Start a looping sound.
+    StartLoop {
+        /// The mod's name for it, and what stops it.
+        id: String,
+        /// The qualified sound id.
+        sound: String,
+        /// Where it is, in world blocks. Ignored when `everywhere`.
+        pos: [f64; 3],
+        /// How far it carries. Ignored when `everywhere`.
+        radius: f32,
+        /// How loud.
+        gain: f32,
+        /// Heard at full gain wherever the listener stands.
+        everywhere: bool,
+    },
+
+    /// Stop a looping sound.
+    StopLoop {
+        /// The id it was started with.
+        id: String,
+    },
+
     /// A pushed HUD script has arrived and is ready to run.
     ///
     /// One event per script rather than one for the table, because they arrive
@@ -1196,6 +1229,32 @@ async fn session(
                 }
                 awaited_sounds = sounds.clone();
                 let _ = events.send(Event::Sounds { sounds });
+            }
+
+            ServerMessage::SoundBindings { bindings } => {
+                let _ = events.send(Event::SoundBindings { bindings });
+            }
+
+            ServerMessage::StartLoop {
+                id,
+                sound,
+                pos,
+                radius,
+                gain,
+                everywhere,
+            } => {
+                let _ = events.send(Event::StartLoop {
+                    id,
+                    sound,
+                    pos,
+                    radius,
+                    gain,
+                    everywhere,
+                });
+            }
+
+            ServerMessage::StopLoop { id } => {
+                let _ = events.send(Event::StopLoop { id });
             }
 
             ServerMessage::HudScripts { scripts } => {

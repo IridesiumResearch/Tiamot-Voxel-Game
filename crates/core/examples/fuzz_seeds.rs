@@ -626,6 +626,41 @@ fn server_messages() -> Vec<Vec<u8>> {
             slots: vec![Some((3, 40)), None, Some((4, 27))],
             held: Some((3, 13)),
         },
+        // Protocol v23: the cue table and the loops.
+        ServerMessage::SoundBindings {
+            bindings: vec![
+                tiamot_core::proto::SoundBinding {
+                    cue: "engine:jump".to_owned(),
+                    sound: "core_blocks:jump".to_owned(),
+                    mod_id: "core_blocks".to_owned(),
+                },
+                tiamot_core::proto::SoundBinding {
+                    cue: "core_doors:open".to_owned(),
+                    sound: "core_doors:creak".to_owned(),
+                    mod_id: "core_doors".to_owned(),
+                },
+            ],
+        },
+        ServerMessage::StartLoop {
+            id: "core_sky:ambience".to_owned(),
+            sound: "core_sky:night".to_owned(),
+            pos: [0.0; 3],
+            radius: 16.0,
+            gain: 0.3,
+            everywhere: true,
+        },
+        // And the positional shape, which takes a different branch on both ends.
+        ServerMessage::StartLoop {
+            id: "mill:wheel".to_owned(),
+            sound: "mill:creak".to_owned(),
+            pos: [12.0, 64.0, -8.0],
+            radius: 24.0,
+            gain: 1.0,
+            everywhere: false,
+        },
+        ServerMessage::StopLoop {
+            id: "core_sky:ambience".to_owned(),
+        },
         ServerMessage::HudScripts {
             scripts: vec![
                 HudScriptDef {

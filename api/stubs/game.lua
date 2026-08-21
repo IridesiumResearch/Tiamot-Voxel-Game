@@ -615,6 +615,96 @@ function game.register_on_dialog_event(callback) end
 ---@param spec Tiamot.SoundSpec
 function game.register_sound(spec) end
 
+---Binds a sound to a named event. Registration window only.
+---
+---**This is the standard way to give anything a noise.** `register_sound` says
+---a file exists; this says *when it plays*. Keeping them apart is what makes
+---sound a system rather than a habit: the engine and every mod raise named
+---**cues**, and any mod binds any sound to any cue without either side knowing
+---the other exists.
+---
+---A cue you write unqualified becomes your own. A qualified one is taken as
+---written, which is deliberate — binding to another mod's cue is how you
+---re-skin its doors without touching its code.
+---
+---```lua
+----- Your own events.
+---game.bind_sound("door_open", "creak")
+---
+----- The engine's. These are the player's OWN actions, and the client plays
+----- them without waiting for the server, because a sound of something you did
+----- arriving 80 ms late reads as a worse sound rather than as latency.
+---game.bind_sound("engine:jump", "grunt")
+---game.bind_sound("engine:land", "thud")
+---game.bind_sound("engine:ui_click", "click")
+---game.bind_sound("engine:ui_close", "click")
+---```
+---
+---A cue nobody bound is silence, never an error. Raise your cues whether or not
+---anybody has given them a noise; a sound pack is something somebody adds later.
+---@param cue string The event. Unqualified means your own.
+---@param sound string The sound id. Unqualified means your own.
+function game.bind_sound(cue, sound) end
+
+---Raises a cue, playing whatever is bound to it.
+---
+---The same delivery `game.play_sound` has — a radius, and only the players
+---inside it are told — with the sound chosen by the binding table instead of by
+---you. Returns how many players were told, which is 0 when nothing is bound.
+---
+---You may **not** raise an `engine:` cue. Those mean "this player just did
+---this", and the client trusts them without asking anybody.
+---
+---```lua
+---game.cue{ cue = "door_open", pos = pos, radius = 12 }
+---```
+---@param spec { cue: string, pos: { x: number, y: number, z: number }, radius?: number, gain?: number, entity?: integer }
+---@return integer told
+function game.cue(spec) end
+
+---Starts a looping sound. Returns how many players were told.
+---
+---**Ambience is a loop, not a repeated clip.** Day, night, weather, the inside
+---of a cave, a river ten blocks away — none of these are events, and playing a
+---clip over and over means guessing its length and hearing every seam.
+---
+---`everywhere = true` is what makes ambience expressible: no position, no
+---panning, full gain wherever the player stands. Without it the loop sits at
+---`pos` and attenuates over `radius` like anything else.
+---
+---**Starting a loop that is already running replaces it**, so the natural thing
+---to write — making sure the night loop is on, every tick — does not end up
+---with a tick's worth of overlapping copies.
+---
+---```lua
+---game.register_on_tick(function()
+---    if game.time_of_day() > 0.75 then
+---        game.play_loop{ id = "night", sound = "crickets", everywhere = true, gain = 0.6 }
+---    else
+---        game.stop_loop("night")
+---    end
+---end)
+---```
+---@param spec { id: string, sound: string, pos?: { x: number, y: number, z: number }, radius?: number, gain?: number, everywhere?: boolean }
+---@return integer told
+function game.play_loop(spec) end
+
+---Where the day stands: 0 at midnight, 0.5 at noon, wrapping at 1.
+---
+---The same number the sky is drawn from, so a mod crossfading night ambience
+---into day is working from what the player can see. `0.0` in a world whose mods
+---registered no sky, which is a world with no day rather than an error.
+---@return number time
+function game.time_of_day() end
+
+---Stops a looping sound by the id you gave it. Returns how many were told.
+---
+---Stopping one that is not running is not an error, so tidying up on shutdown
+---does not mean remembering what you started.
+---@param id string
+---@return integer told
+function game.stop_loop(id) end
+
 ---Registers a HUD script this mod wants clients to run. Registration window only.
 ---
 ---**This is the only thing your mod can send that RUNS on a player's machine**,

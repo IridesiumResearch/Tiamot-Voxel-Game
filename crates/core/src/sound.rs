@@ -37,6 +37,62 @@ pub struct Sound {
     pub pitch_variance: f32,
 }
 
+/// A sound bound to a named event.
+///
+/// # Why binding is a separate step from registering
+///
+/// `register_sound` says a file exists and what it is called. This says WHEN it
+/// plays. Keeping them apart is what makes the system a system rather than a
+/// convention: the engine and every mod emit named cues, and a mod binds
+/// whatever sound it likes to any of them without either side knowing about the
+/// other. A mod that wants a noise on jumping does not have to find the jump
+/// code — there is no jump code it could reach — and the engine does not have
+/// to know that anybody wanted one.
+///
+/// It also means a mod can re-skin another mod's events, which is charter rule
+/// 1 working the way it is supposed to: the engine carries the mechanism and
+/// the content is somebody's Lua.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    /// The event, e.g. `"engine:jump"` or `"core_doors:open"`.
+    pub cue: String,
+    /// The qualified sound id to play for it.
+    pub sound: String,
+    /// The mod that asked, for attribution in the settings screen.
+    pub mod_id: String,
+}
+
+/// The cues the ENGINE emits, as opposed to the ones mods invent.
+///
+/// # Why a fixed list, and why it is short
+///
+/// A cue only needs to be here if the engine is the only thing that knows the
+/// event happened. Everything a mod can already see — a block broken, a place,
+/// a punch — it can cue itself from the hook it already has, and putting those
+/// here as well would give a mod two ways to make one noise and no way to
+/// choose between them.
+///
+/// What is left is the handful of moments only the client knows about, and it
+/// knows about them because they must not wait for a round trip: your own jump,
+/// your own landing, and your own click on a button. A sound of your own action
+/// arriving 80 ms late does not read as latency, it reads as a different and
+/// worse sound.
+pub const ENGINE_CUES: [&str; 4] = [
+    "engine:jump",
+    "engine:land",
+    "engine:ui_click",
+    "engine:ui_close",
+];
+
+/// Whether a cue name is one the engine reserves.
+///
+/// Mods may BIND to these — that is the point of them — but may not emit them,
+/// or a mod could make every other player's client believe they had jumped.
+#[must_use]
+pub fn is_engine_cue(cue: &str) -> bool {
+    cue.starts_with("engine:")
+}
+
 /// A request to play a sound somewhere in the world.
 ///
 /// **What a mod asks for, not what anybody hears.** Which players are close
@@ -62,6 +118,53 @@ pub struct PlayRequest {
     pub entity: Option<u64>,
 }
 
+/// A looping sound, and where it is heard.
+///
+/// # Ambience is a loop that follows you
+///
+/// `PlayRequest` is a thing that happens; this is a thing that is going ON. Day
+/// and night, weather, the inside of a cave, a river ten blocks away — none of
+/// them are events and none of them can be expressed by playing a clip over and
+/// over, because a mod would have to guess the clip's length and the seams
+/// would be audible.
+///
+/// `everywhere` is what makes ambience possible at all: a loop with no position
+/// plays at full gain wherever the listener stands and does not pan. A mod
+/// crossfading day into night starts two of these and stops one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoopRequest {
+    /// The mod's own handle for it, qualified like every other id.
+    ///
+    /// **The mod names the loop, not the engine.** A server-allocated number
+    /// would have to be given back to Lua and stored somewhere, and a mod that
+    /// lost it could never stop the loop it started. A name a mod chose is a
+    /// name it can always say again.
+    pub id: String,
+    /// The qualified sound id to loop.
+    pub sound: String,
+    /// Where it is, in world blocks. Ignored when `everywhere`.
+    pub pos: [f64; 3],
+    /// How far it carries. Ignored when `everywhere`.
+    pub radius: f32,
+    /// How loud, multiplying the sound's registered gain.
+    pub gain: f32,
+    /// Heard at full gain wherever the listener is, with no panning.
+    pub everywhere: bool,
+}
+
+/// Clamps a loop's numbers the way [`sanitise`] does a one-shot's.
+#[must_use]
+pub fn sanitise_loop(mut request: LoopRequest) -> LoopRequest {
+    request.gain = clamp_finite(request.gain, 0.0, 8.0, 1.0);
+    request.radius = clamp_finite(request.radius, 0.0, MAX_RADIUS, 16.0);
+    for value in &mut request.pos {
+        if !value.is_finite() {
+            *value = 0.0;
+        }
+    }
+    request
+}
+
 /// Where `game.play_sound` reaches.
 ///
 /// The same seam shape as [`crate::storage::Access`] and [`crate::dig::Tools`],
@@ -74,6 +177,33 @@ pub trait Access: Send + Sync {
     /// that anybody HEARD it: a client may have the sound muted, may still be
     /// fetching the file, or may have refused it as a poisoned asset.
     fn play(&self, request: &PlayRequest) -> u32;
+
+    /// Starts a looping sound, returning how many players were told.
+    ///
+    /// Starting a loop that is already running REPLACES it, so a mod that calls
+    /// this every tick does not end up with a tick's worth of overlapping
+    /// copies — which is the mistake ambience invites, because "make sure the
+    /// night loop is playing" is the natural thing to write.
+    fn start_loop(&self, request: &LoopRequest) -> u32;
+
+    /// Where the day stands, from 0 at midnight through 0.5 at noon.
+    ///
+    /// **On this trait rather than a new one**, because the only reason a mod
+    /// needs the time on the SERVER is to decide what should be playing — the
+    /// client already has its own copy for drawing the sky. A mod crossfading
+    /// night into day is the case this exists for, and a second trait for one
+    /// float would be a seam nothing else crosses.
+    ///
+    /// `0.0` in a world whose mods registered no sky, which is a world with no
+    /// day rather than an error.
+    fn time_of_day(&self) -> f32;
+
+    /// Stops a looping sound by the id the mod gave it.
+    ///
+    /// Returns how many players were told. Stopping one that is not running is
+    /// not an error: a mod tidying up on shutdown should not have to remember
+    /// what it started.
+    fn stop_loop(&self, id: &str) -> u32;
 }
 
 /// The largest radius a mod may ask for, in blocks.

@@ -574,6 +574,23 @@ impl ScriptVm for MluaVm {
             .collect()
     }
 
+    fn registered_bindings(&self) -> Vec<crate::sound::Binding> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.bindings") else {
+            return Vec::new();
+        };
+        registry
+            .sequence_values::<Table>()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                Some(crate::sound::Binding {
+                    cue: entry.get("cue").ok()?,
+                    sound: entry.get("sound").ok()?,
+                    mod_id: entry.get("mod_id").ok()?,
+                })
+            })
+            .collect()
+    }
+
     fn registered_hud_scripts(&self) -> Vec<crate::hud::ScriptFile> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.hud_scripts") else {
             return Vec::new();
@@ -1332,13 +1349,37 @@ impl MluaVm {
         list: &'static str,
     ) -> Result<mlua::Function, ScriptError> {
         let owner = mod_id.to_owned();
-        let key = Self::hook_key(hook, mod_id);
+        let hook = hook.to_owned();
+        let key = Self::hook_key(&hook, mod_id);
         self.lua
             .create_function(move |lua, callback: mlua::Function| {
                 let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
                 if frozen {
                     return Err(mlua::Error::external(format!(
                         "mod `{owner}`: registration is closed"
+                    )));
+                }
+                // **A second registration is an error, not a replacement.**
+                //
+                // It used to overwrite the callback and push the mod's id onto
+                // the list again — so a mod that registered `on_player_join`
+                // twice lost its first handler entirely and had its second one
+                // called twice. Silently. Found while writing the cue tests, by
+                // writing exactly the mod an author would write: two unrelated
+                // things to do on join, one `register_` call each.
+                //
+                // Accumulating both would be the friendlier answer and is a
+                // bigger change than it looks — `run_hook` walks one callback
+                // per mod, and a veto hook would need a rule for what happens
+                // when one of a mod's handlers refuses and another does not.
+                // Refusing is the honest interim: it cannot lose anybody's code.
+                if lua
+                    .named_registry_value::<Value>(&key)
+                    .is_ok_and(|held| !held.is_nil())
+                {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}` already registered `{hook}`. One callback per hook per \
+                         mod — combine them into one function."
                     )));
                 }
                 lua.set_named_registry_value(&key, callback)?;
@@ -1451,6 +1492,186 @@ impl MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("play_sound", play_sound)
+            .map_err(|err| self.vm_error(&err))?;
+
+        self.install_cues(mod_id, game)?;
+        Ok(())
+    }
+
+    /// `game.bind_sound`, `game.cue`, `game.play_loop` and `game.stop_loop`.
+    ///
+    /// # The cue is the standardisation
+    ///
+    /// `register_sound` says a file exists. A BINDING says when it plays. Two
+    /// steps rather than one is what turns a pile of `play_sound` calls into a
+    /// system: the engine and every mod emit named events, and any mod binds
+    /// any sound to any of them without either side knowing the other exists.
+    ///
+    /// A mod wanting a noise on jumping does not have to find the jump code —
+    /// there is none it could reach — and the engine does not have to know
+    /// anybody wanted one.
+    fn install_cues(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let owner = mod_id.to_owned();
+        let bind = self
+            .lua
+            .create_function(move |lua, (cue, sound): (String, String)| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                // **A cue may be anybody's; a SOUND is always the caller's own
+                // unless it says otherwise.** Binding to another mod's cue is
+                // the point of the mechanism — re-skinning somebody's door is
+                // exactly charter rule 1 working — so the cue is taken as
+                // written when it is qualified.
+                let cue = if cue.contains(':') {
+                    cue
+                } else {
+                    qualify_id(&owner, &cue).map_err(mlua::Error::external)?
+                };
+                let sound = if sound.contains(':') {
+                    sound
+                } else {
+                    qualify_id(&owner, &sound).map_err(mlua::Error::external)?
+                };
+                let entry = lua.create_table()?;
+                entry.set("cue", cue)?;
+                entry.set("sound", sound)?;
+                entry.set("mod_id", owner.clone())?;
+                let bindings: Table = lua.named_registry_value("tiamot.bindings")?;
+                bindings.push(entry)?;
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("bind_sound", bind)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.sounds);
+        let time_of_day = self
+            .lua
+            .create_function(move |_, ()| {
+                Ok(slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|access| access.time_of_day()))
+                    .unwrap_or(0.0))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("time_of_day", time_of_day)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
+        let slot = std::sync::Arc::clone(&self.sounds);
+        let cue = self
+            .lua
+            .create_function(move |lua, spec: Table| {
+                let cue: String = spec.get("cue")?;
+                let cue = if cue.contains(':') {
+                    cue
+                } else {
+                    qualify_id(&owner, &cue).map_err(mlua::Error::external)?
+                };
+                // **A mod may not emit an engine cue.** These mean "the player
+                // themselves just did this", and the client resolves them
+                // without asking anybody — so a mod that could emit one could
+                // make every client believe somebody had jumped.
+                if crate::sound::is_engine_cue(&cue) {
+                    return Err(mlua::Error::external(format!(
+                        "`{cue}` is the engine's to emit; a mod may bind a sound to it but not \
+                         raise it"
+                    )));
+                }
+                let bindings: Table = lua.named_registry_value("tiamot.bindings")?;
+                // Later wins, so the search runs backwards.
+                let mut sound: Option<String> = None;
+                for entry in bindings.sequence_values::<Table>().flatten() {
+                    if entry.get::<String>("cue").ok().as_deref() == Some(cue.as_str()) {
+                        sound = entry.get::<String>("sound").ok();
+                    }
+                }
+                // **A cue nobody bound is silence, not an error.** That is the
+                // whole point of separating the two: a mod raises its cues
+                // whether or not anybody has given them a noise, and a
+                // sound pack is something somebody adds later.
+                let Some(sound) = sound else {
+                    return Ok(0u32);
+                };
+                let pos: Table = spec.get("pos")?;
+                let request = crate::sound::sanitise(crate::sound::PlayRequest {
+                    sound,
+                    pos: [pos.get("x")?, pos.get("y")?, pos.get("z")?],
+                    radius: spec.get::<Option<f32>>("radius")?.unwrap_or(16.0),
+                    gain: spec.get::<Option<f32>>("gain")?.unwrap_or(1.0),
+                    entity: spec.get::<Option<u64>>("entity")?,
+                });
+                let told = slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|access| access.play(&request)));
+                Ok(told.unwrap_or(0))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("cue", cue).map_err(|err| self.vm_error(&err))?;
+
+        self.install_loops(mod_id, game)
+    }
+
+    /// `game.play_loop` and `game.stop_loop`.
+    fn install_loops(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let owner = mod_id.to_owned();
+        let slot = std::sync::Arc::clone(&self.sounds);
+        let play_loop = self
+            .lua
+            .create_function(move |_, spec: Table| {
+                let id: String = spec.get("id")?;
+                let id = qualify_id(&owner, &id).map_err(mlua::Error::external)?;
+                let sound: String = spec.get("sound")?;
+                let sound = if sound.contains(':') {
+                    sound
+                } else {
+                    qualify_id(&owner, &sound).map_err(mlua::Error::external)?
+                };
+                let everywhere = spec.get::<Option<bool>>("everywhere")?.unwrap_or(false);
+                // Ambience has no position, so a mod writing one should not
+                // have to invent coordinates for it.
+                let pos = match spec.get::<Option<Table>>("pos")? {
+                    Some(pos) => [pos.get("x")?, pos.get("y")?, pos.get("z")?],
+                    None => [0.0, 0.0, 0.0],
+                };
+                let request = crate::sound::sanitise_loop(crate::sound::LoopRequest {
+                    id,
+                    sound,
+                    pos,
+                    radius: spec.get::<Option<f32>>("radius")?.unwrap_or(16.0),
+                    gain: spec.get::<Option<f32>>("gain")?.unwrap_or(1.0),
+                    everywhere,
+                });
+                let told = slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|access| access.start_loop(&request)));
+                Ok(told.unwrap_or(0))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("play_loop", play_loop)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
+        let slot = std::sync::Arc::clone(&self.sounds);
+        let stop_loop = self
+            .lua
+            .create_function(move |_, id: String| {
+                let id = qualify_id(&owner, &id).map_err(mlua::Error::external)?;
+                let told = slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|access| access.stop_loop(&id)));
+                Ok(told.unwrap_or(0))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("stop_loop", stop_loop)
             .map_err(|err| self.vm_error(&err))?;
         Ok(())
     }
@@ -2548,6 +2769,7 @@ impl MluaVm {
         let actions = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let sounds = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let hud_scripts = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        let bindings = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.blocks", blocks)
             .map_err(|err| self.vm_error(&err))?;
@@ -2601,6 +2823,9 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.hud_scripts", hud_scripts)
+            .map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.bindings", bindings)
             .map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.next_material", self.next_material)
@@ -3868,14 +4093,6 @@ fn qualify_id(mod_id: &str, id: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    /// The slot numbers a mod writes, and the ones it is told about, agree.
-    ///
-    /// **They did not, and nobody noticed for a whole task.** `widget_of` took
-    /// `index` and `first` straight through as zero-based while the event
-    /// conversion at `table.set("index", ...)` added one — so a mod addressed
-    /// one slot and heard about its neighbour. It surfaced as `core_ui`'s
-    /// inventory screen showing an empty grid over a player who was carrying
-    /// something, because the grid started one slot past the first.
     #[test]
     fn a_slot_number_means_the_same_thing_going_out_as_coming_back() {
         let lua = Lua::new();

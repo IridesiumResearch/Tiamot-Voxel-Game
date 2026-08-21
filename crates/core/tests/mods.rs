@@ -499,3 +499,51 @@ fn the_resolved_set_has_a_stable_fingerprint() {
         "the mod manifest fingerprint must be stable"
     );
 }
+
+#[test]
+fn a_mod_cannot_register_one_hook_twice() {
+    // **It used to overwrite and double-count.** The callback was stored under
+    // one key per mod per hook, so a second `register_on_player_join` replaced
+    // the first — and the mod's id went onto the caller list again, so the
+    // surviving callback ran TWICE. A mod author writing the obvious thing —
+    // two unrelated jobs on join, one `register_` call each — lost half their
+    // code and had the other half run twice, with nothing said about either.
+    //
+    // Found while writing the cue tests, by writing exactly that mod.
+    let root = scratch("double-hook");
+    write_mod(
+        &root,
+        "twice",
+        "",
+        "game.register_on_player_join(function() end)\n\
+         game.register_on_player_join(function() end)\n",
+    );
+    let host = host_for(&root);
+
+    // Disabled rather than killing the load: a mod fault is that mod's problem
+    // (charter rule 10).
+    let failed = host.failed();
+    assert_eq!(failed.len(), 1, "the mod should have been disabled");
+    let reason = format!("{failed:?}");
+    assert!(
+        reason.contains("already registered"),
+        "the message must say what happened: {reason}"
+    );
+    assert!(
+        reason.contains("on_player_join"),
+        "and WHICH hook, or an author has to guess: {reason}"
+    );
+
+    // The honest half: one registration is still fine.
+    let root = scratch("single-hook");
+    write_mod(
+        &root,
+        "once",
+        "",
+        "game.register_on_player_join(function() end)\n",
+    );
+    assert!(
+        host_for(&root).failed().is_empty(),
+        "one registration must still work, or this test proves nothing"
+    );
+}

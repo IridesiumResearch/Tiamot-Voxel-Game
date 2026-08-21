@@ -232,6 +232,13 @@ pub struct Mixer {
     manager: Option<kira::AudioManager>,
     /// Decoded sounds, by qualified id.
     clips: BTreeMap<String, Loaded>,
+    /// Loops currently running, by the id the mod gave them.
+    ///
+    /// `None` for a loop started with no sound device: the mixer still records
+    /// that it is on, so a later stop is not confused and a headless test can
+    /// assert what is playing. Whether a loop is running is a property of the
+    /// world, not of whether anybody has speakers.
+    loops: BTreeMap<String, Option<kira::sound::static_sound::StaticSoundHandle>>,
     /// Advances once per play, so successive plays of one sound differ.
     plays: u64,
     /// How loud each bus is.
@@ -265,6 +272,7 @@ impl Mixer {
         Self {
             manager,
             clips: BTreeMap::new(),
+            loops: BTreeMap::new(),
             plays: 0,
             volumes,
         }
@@ -418,6 +426,124 @@ impl Mixer {
             slice: None,
         };
         manager.play(sound).is_ok()
+    }
+
+    /// Starts a sound looping under a name, replacing one already running.
+    ///
+    /// # Why replace rather than refuse or stack
+    ///
+    /// "Make sure the night ambience is playing" is the natural thing for a mod
+    /// to write, and the natural place to write it is a tick handler. Stacking
+    /// would give a second of that a hundred overlapping copies; refusing would
+    /// make the mod track what it had started, which is state it should not
+    /// have to keep. Replacing makes the careless version correct.
+    ///
+    /// Returns whether anything is now playing under this id.
+    pub fn start_loop(&mut self, id: &str, sound: &str, bus: Bus, placement: Placement) -> bool {
+        self.stop_loop(id);
+        let Some(voice) = self.clips.get(sound).map(|loaded| loaded.voice) else {
+            return false;
+        };
+        let volume = self.volumes.of(bus) * placement.gain * voice.gain;
+        let Some(clip) = self.clips.get(sound).map(|loaded| &loaded.clip) else {
+            return false;
+        };
+        // No pitch jitter: a loop varying its rate every time it restarts would
+        // wow audibly, and the seam is the one place a loop must not draw
+        // attention to itself.
+        let mut low = Filter::new(placement.brightness);
+        let frames = build_frames(clip, &mut low);
+        if frames.is_empty() {
+            return false;
+        }
+        let Some(manager) = self.manager.as_mut() else {
+            // No device. The loop is still RECORDED as running, so a later
+            // `stop_loop` is not confused and a test on a machine with no
+            // speakers can still assert what is on.
+            self.loops.insert(id.to_owned(), None);
+            return true;
+        };
+        let data = kira::sound::static_sound::StaticSoundData {
+            sample_rate: clip.sample_rate,
+            frames: frames.into(),
+            settings: kira::sound::static_sound::StaticSoundSettings::new()
+                .volume(kira::Decibels(amplitude_to_db(volume)))
+                .panning(kira::Panning(placement.pan))
+                // The whole clip, end to end, for ever. A mod wanting a shorter
+                // loop point trims the file, which is where that decision
+                // belongs — the engine has no way to know where a bar ends.
+                .loop_region(..),
+            slice: None,
+        };
+        match manager.play(data) {
+            Ok(handle) => {
+                self.loops.insert(id.to_owned(), Some(handle));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Stops a loop by the id it was started with.
+    ///
+    /// Returns whether one was running. Stopping one that is not is not an
+    /// error: a mod tidying up should not have to remember what it started.
+    pub fn stop_loop(&mut self, id: &str) -> bool {
+        match self.loops.remove(id) {
+            Some(Some(mut handle)) => {
+                // A short fade rather than a cut. Stopping a loop dead puts a
+                // click on the end of it, and the one thing worse than
+                // ambience you notice is ambience that stops with a click.
+                handle.stop(kira::Tween {
+                    duration: LOOP_FADE,
+                    ..Default::default()
+                });
+                true
+            }
+            Some(None) => true,
+            None => false,
+        }
+    }
+
+    /// Which loops are running, for the settings screen and for tests.
+    pub fn running_loops(&self) -> impl Iterator<Item = &str> {
+        self.loops.keys().map(String::as_str)
+    }
+
+    /// Stops every loop, for leaving a server.
+    ///
+    /// A loop belongs to the world it was started in. Carrying one across a
+    /// disconnect would leave a player listening to the last server's rain.
+    pub fn stop_all_loops(&mut self) {
+        let ids: Vec<String> = self.loops.keys().cloned().collect();
+        for id in ids {
+            self.stop_loop(&id);
+        }
+    }
+}
+
+/// How long a stopped loop takes to fade out.
+const LOOP_FADE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Turns decoded samples into kira frames, low-passed for distance.
+///
+/// Shared by the one-shot and the loop, which is what stops the two paths
+/// disagreeing about what a clip sounds like.
+fn build_frames(clip: &Clip, low: &mut Filter) -> Vec<kira::Frame> {
+    match clip.channels {
+        1 => clip
+            .samples
+            .iter()
+            .map(|sample| kira::Frame::from_mono(low.mono(*sample)))
+            .collect(),
+        _ => clip
+            .samples
+            .chunks_exact(clip.channels as usize)
+            .map(|frame| {
+                let (left, right) = low.stereo(frame[0], frame[1]);
+                kira::Frame::new(left, right)
+            })
+            .collect(),
     }
 }
 

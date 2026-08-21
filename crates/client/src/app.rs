@@ -730,6 +730,14 @@ pub struct App {
     dialogs: std::collections::BTreeMap<String, tiamot_core::ui::Tree>,
     /// The audio backend, or a silent stand-in where there is no device.
     mixer: crate::audio::Mixer,
+    /// Which sound each named event plays, as the server last said.
+    ///
+    /// Kept as a map rather than the wire's list: load order decides a
+    /// conflict, so the list is folded once on arrival and the LAST binding for
+    /// a cue is the one that survives.
+    cues: std::collections::BTreeMap<String, String>,
+    /// Whether the player was on the ground last frame, for the landing cue.
+    was_on_ground: bool,
     /// The sandbox that runs pushed HUD scripts, if one could be built.
     ///
     /// `None` means the Lua runtime itself would not start, which is an engine
@@ -1014,6 +1022,8 @@ impl App {
             spawn: None,
             joined: false,
             warnings: Vec::new(),
+            cues: std::collections::BTreeMap::new(),
+            was_on_ground: true,
             hud_vm: match tiamot_core::script::HudVm::new(tiamot_core::script::HudLimits::default())
             {
                 Ok(vm) => Some(vm),
@@ -2121,6 +2131,46 @@ impl App {
         let right = [right.x, right.y, right.z];
 
         for event in std::mem::take(&mut self.heard) {
+            // Loops first, because they are the same spatialisation with a
+            // different lifetime and share every number below.
+            match event {
+                crate::net::Event::StopLoop { id } => {
+                    self.mixer.stop_loop(&id);
+                    continue;
+                }
+                crate::net::Event::StartLoop {
+                    id,
+                    sound,
+                    pos,
+                    radius,
+                    gain,
+                    everywhere,
+                } => {
+                    // **Ambience is placed at the listener, not in the world.**
+                    // A loop with no position is not somewhere the player can
+                    // walk away from, so it takes full gain, no pan and no
+                    // distance filtering — which is the difference between
+                    // "night" and "a cricket over there".
+                    let placement = if everywhere {
+                        crate::audio::Placement {
+                            gain,
+                            pan: 0.0,
+                            brightness: 1.0,
+                        }
+                    } else {
+                        crate::audio::place(pos, listener, forward, right, radius, gain)
+                    };
+                    let bus = if everywhere {
+                        crate::audio::Bus::Ambient
+                    } else {
+                        crate::audio::Bus::Effects
+                    };
+                    self.mixer.start_loop(&id, &sound, bus, placement);
+                    continue;
+                }
+                _ => {}
+            }
+
             let crate::net::Event::PlaySound {
                 sound,
                 pos,
@@ -2151,6 +2201,83 @@ impl App {
             self.mixer
                 .play(&sound, crate::audio::Bus::Effects, placement);
         }
+    }
+
+    /// Adopts the consolidated inventory the server sent.
+    ///
+    /// The selection is clamped rather than trusted: the list shrinks when a
+    /// stack is spent, and a selection left pointing past the end would build
+    /// with whatever slid into that position — the sort of bug a player reports
+    /// as "it placed the wrong thing" and nobody can reproduce.
+    fn adopt_inventory(&mut self, stacks: Vec<(u16, u32)>) {
+        self.carried = stacks;
+        self.selected = self.selected.min(self.carried.len().saturating_sub(1));
+    }
+
+    /// Folds the cue table the server sent.
+    ///
+    /// **Load order decides a conflict**, so inserting in order leaves the last
+    /// binding for each cue holding it — the same rule the rest of the mod
+    /// system resolves a clash by.
+    fn adopt_bindings(&mut self, bindings: Vec<tiamot_core::proto::SoundBinding>) {
+        self.cues = bindings
+            .into_iter()
+            .map(|binding| (binding.cue, binding.sound))
+            .collect();
+    }
+
+    /// Plays whatever a mod bound to a cue, at the listener.
+    ///
+    /// **This is the client half of the cue system.** Most cues are resolved by
+    /// the server and arrive as an ordinary `PlaySound`; these are the ones the
+    /// engine emits about the player themselves, and they must not wait for a
+    /// round trip — a sound of your own action arriving 80 ms late does not
+    /// read as latency, it reads as a worse sound.
+    ///
+    /// Placed at the listener with no pan: it is happening to YOU, so there is
+    /// no direction for it to come from.
+    ///
+    /// Returns the sound that was played, if any. A cue nobody bound is silence
+    /// and not a fault — that is the whole point of separating registering a
+    /// sound from saying when it plays.
+    pub fn play_cue(&mut self, cue: &str, bus: crate::audio::Bus) -> Option<String> {
+        let sound = self.cues.get(cue)?.clone();
+        self.mixer.play(
+            &sound,
+            bus,
+            crate::audio::Placement {
+                gain: 1.0,
+                pan: 0.0,
+                brightness: 1.0,
+            },
+        );
+        Some(sound)
+    }
+
+    /// Raises `engine:jump` and `engine:land` from the player's own body.
+    ///
+    /// **Watched here rather than reported by the window**, because the window
+    /// knows a key went down and not whether the body left the ground: a jump
+    /// pressed against a ceiling makes no noise, and a fall off a ledge lands
+    /// without anybody pressing anything.
+    ///
+    /// Called once a frame beside [`App::play_footsteps`], which is the same
+    /// shape and the same reasoning.
+    pub fn play_movement_cues(&mut self) {
+        let Some(body) = self.predictor.as_ref().map(super::predict::Predictor::body) else {
+            return;
+        };
+        let on_ground = body.on_ground;
+        let was = std::mem::replace(&mut self.was_on_ground, on_ground);
+        if was == on_ground {
+            return;
+        }
+        let cue = if on_ground {
+            "engine:land"
+        } else {
+            "engine:jump"
+        };
+        self.play_cue(cue, crate::audio::Bus::Effects);
     }
 
     /// Plays the player's own footsteps, chosen by what is underfoot.
@@ -2879,11 +3006,19 @@ impl App {
                 Event::Sounds { sounds } => self.sounds = sounds,
 
                 Event::HudScript { mod_id, source } => self.adopt_hud_script(&mod_id, &source),
+
+                Event::SoundBindings { bindings } => self.adopt_bindings(bindings),
+
                 Event::View { view, slots, held } => self.adopt_view(view, slots, held),
                 Event::Dialog { form, tree } => self.adopt_dialog(form, Some(*tree)),
                 Event::DialogClosed { form } => self.adopt_dialog(form, None),
 
-                Event::PlaySound { .. } => self.heard.push(event),
+                // Held for the frame loop, which is the only place a sound can
+                // be spatialised against where the camera is NOW. Loops travel
+                // with them: same placement, different lifetime.
+                Event::PlaySound { .. } | Event::StartLoop { .. } | Event::StopLoop { .. } => {
+                    self.heard.push(event);
+                }
 
                 // Decoded and ready. Handed straight to the mixer, which holds
                 // it even with no sound device — whether an asset decoded is a
@@ -2893,15 +3028,7 @@ impl App {
 
                 Event::Tools { tools } => self.adopt_tools(tools),
 
-                Event::Inventory { stacks } => {
-                    self.carried = stacks;
-                    // Clamped rather than trusted. The list shrinks when a
-                    // stack is spent, and a selection left pointing past the
-                    // end would build with whatever slid into that position —
-                    // which is the sort of bug a player reports as "it placed
-                    // the wrong thing" and nobody can reproduce.
-                    self.selected = self.selected.min(self.carried.len().saturating_sub(1));
-                }
+                Event::Inventory { stacks } => self.adopt_inventory(stacks),
 
                 Event::Chat { text, .. } => self.say(text),
 

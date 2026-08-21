@@ -655,6 +655,21 @@ impl ServerHandle {
             .collect();
         info!(sounds = sound_table.len(), "sound table built");
 
+        // Which sound each named event plays. Charter rule 1 again: the engine
+        // emits cues and has no opinion about what any of them sounds like.
+        let sound_bindings: Vec<tiamot_core::proto::SoundBinding> = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_bindings())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|binding| tiamot_core::proto::SoundBinding {
+                cue: binding.cue,
+                sound: binding.sound,
+                mod_id: binding.mod_id,
+            })
+            .collect();
+        info!(bindings = sound_bindings.len(), "cue bindings built");
+
         // Charter rule 10's tier 2: a mod may push a script that DRAWS. The
         // file travels by hash like a sound's, and what makes it safe is the
         // sandbox on the other end — the server does not run these and never
@@ -885,6 +900,7 @@ impl ServerHandle {
             tool_table,
             action_table,
             sound_table,
+            sound_bindings,
             hud_scripts,
             fluid_table,
             sky_day_length: sky.0,
@@ -2824,6 +2840,87 @@ impl tiamot_core::sound::Access for Earshot {
             }
             // Queued per player rather than broadcast, which is the whole point:
             // the queue is drained on that player's own connection task.
+            let _ = self
+                .shared
+                .push_entity_messages(uuid, std::iter::once(message.clone()));
+            told += 1;
+        }
+        told
+    }
+
+    fn start_loop(&self, request: &tiamot_core::sound::LoopRequest) -> u32 {
+        let message = tiamot_core::proto::ServerMessage::StartLoop {
+            id: request.id.clone(),
+            sound: request.sound.clone(),
+            pos: request.pos,
+            radius: request.radius,
+            gain: request.gain,
+            everywhere: request.everywhere,
+        };
+        // **Ambience reaches everybody; a positional loop reaches its radius.**
+        // A loop with no position has no distance to be outside of, and the
+        // whole reason a mod asks for one is that it should be on wherever the
+        // player is standing.
+        if request.everywhere {
+            self.tell_all(&message)
+        } else {
+            self.tell_within(&message, request.pos, request.radius)
+        }
+    }
+
+    fn time_of_day(&self) -> f32 {
+        self.shared.day_fraction()
+    }
+
+    fn stop_loop(&self, id: &str) -> u32 {
+        // **Told to everybody, whatever the loop's radius was.** A player who
+        // walked out of a positional loop's radius has already been told to
+        // stop it by leaving; a player still inside must be told now. Working
+        // out which is which needs the loop's original position, and keeping a
+        // server-side registry of running loops to answer that would be a
+        // second copy of state the clients already hold. A stop for a loop a
+        // client is not running is a no-op on the client, so the cheap answer
+        // is also the correct one.
+        self.tell_all(&tiamot_core::proto::ServerMessage::StopLoop { id: id.to_owned() })
+    }
+}
+
+impl Earshot {
+    /// Queues a message for every connected player.
+    fn tell_all(&self, message: &tiamot_core::proto::ServerMessage) -> u32 {
+        let Ok(bodies) = self.shared.bodies.lock() else {
+            return 0;
+        };
+        let mut told = 0;
+        for uuid in bodies.keys() {
+            let _ = self
+                .shared
+                .push_entity_messages(uuid, std::iter::once(message.clone()));
+            told += 1;
+        }
+        told
+    }
+
+    /// Queues a message for every player within `radius` of `pos`.
+    fn tell_within(
+        &self,
+        message: &tiamot_core::proto::ServerMessage,
+        pos: [f64; 3],
+        radius: f32,
+    ) -> u32 {
+        let Ok(bodies) = self.shared.bodies.lock() else {
+            return 0;
+        };
+        let radius = f64::from(radius);
+        let mut told = 0;
+        for (uuid, player) in bodies.iter() {
+            let at =
+                tiamot_core::ent::Transform::at(player.origin, player.body.position).to_world();
+            let offset = [at[0] - pos[0], at[1] - pos[1], at[2] - pos[2]];
+            let distance = offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2];
+            if distance > radius * radius {
+                continue;
+            }
             let _ = self
                 .shared
                 .push_entity_messages(uuid, std::iter::once(message.clone()));

@@ -174,6 +174,10 @@ struct Seen {
     dialogs: std::collections::BTreeMap<String, tiamot_core::ui::Tree>,
     /// HUD scripts the server pushed, with their source, in arrival order.
     hud_scripts: Vec<(String, String)>,
+    /// Which sound each named event plays, as the server last said.
+    bindings: Vec<tiamot_core::proto::SoundBinding>,
+    /// Loops currently running, by id.
+    loops: Vec<String>,
 }
 
 impl Seen {
@@ -192,6 +196,9 @@ impl Seen {
             Event::HudScript { mod_id, source } => {
                 self.hud_scripts.push((mod_id, source));
             }
+            Event::SoundBindings { bindings } => self.bindings = bindings,
+            Event::StartLoop { id, .. } => self.loops.push(id),
+            Event::StopLoop { id } => self.loops.retain(|running| *running != id),
             Event::Dialog { form, tree } => {
                 self.dialogs.insert(form, *tree);
             }

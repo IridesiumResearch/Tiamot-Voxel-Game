@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -150,6 +150,14 @@ pub const MAX_SOUNDS: usize = 1024;
 /// refuses past its own smaller number anyway — this is the bound that stops a
 /// hostile server making a client allocate the list at all.
 pub const MAX_HUD_SCRIPTS: usize = 32;
+
+/// Most cue bindings a server may declare in one
+/// [`ServerMessage::SoundBindings`].
+///
+/// One per event a mod wants a noise on. Generous against any real mod set and
+/// finite against a server that would otherwise make a client allocate an
+/// unbounded table before it has drawn a frame.
+pub const MAX_SOUND_BINDINGS: usize = 4096;
 
 /// A `BLAKE3` content hash.
 pub type ContentHash = [u8; 32];
@@ -396,6 +404,24 @@ pub struct SoundDef {
     pub gain: f32,
     /// How much to vary the pitch per play, as a fraction.
     pub pitch_variance: f32,
+}
+
+/// A sound bound to a named event.
+///
+/// **The client needs this, not just the server.** Most cues are resolved
+/// server-side and arrive as an ordinary [`ServerMessage::PlaySound`] — but the
+/// handful the engine emits are the player's OWN actions, and those must not
+/// wait for a round trip. A jump that thuds 80 ms late does not read as
+/// latency, it reads as a worse sound. So the client is told the whole table
+/// and resolves those itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SoundBinding {
+    /// The event, e.g. `"engine:jump"`.
+    pub cue: String,
+    /// The qualified sound id to play for it.
+    pub sound: String,
+    /// The mod that asked, for attribution in the settings screen.
+    pub mod_id: String,
 }
 
 /// A HUD script a mod wants the client to run.
@@ -1249,6 +1275,56 @@ pub enum ServerMessage {
         /// draw in, so a mod loaded later draws on top.
         scripts: Vec<HudScriptDef>,
     },
+
+    /// Which sound each named event plays.
+    ///
+    /// **Appended at the end** (protocol v23).
+    ///
+    /// Sent once on join, after the sound table it refers to. Empty is the
+    /// ordinary case for a mod set that binds nothing, and a client with no
+    /// bindings simply makes no noise for the events it would otherwise have
+    /// resolved itself.
+    SoundBindings {
+        /// Every binding, in mod load order. Later wins, which is the same rule
+        /// the rest of the mod system resolves a conflict by.
+        bindings: Vec<SoundBinding>,
+    },
+
+    /// Start a looping sound, because something is going on nearby.
+    ///
+    /// **Appended at the end** (protocol v23).
+    ///
+    /// Unlike [`ServerMessage::PlaySound`], this is a thing that CONTINUES —
+    /// weather, a cave, night. Starting one already running replaces it, so a
+    /// mod that makes sure its loop is playing every tick does not accumulate a
+    /// tick's worth of copies.
+    StartLoop {
+        /// The mod's own name for this loop, and what stops it.
+        id: String,
+        /// The qualified sound id, as sent in [`ServerMessage::SoundTable`].
+        sound: String,
+        /// Where it is, in world blocks. Ignored when `everywhere`.
+        pos: [f64; 3],
+        /// How far it carries. Ignored when `everywhere`.
+        radius: f32,
+        /// How loud, multiplying the sound's registered gain.
+        gain: f32,
+        /// Heard at full gain wherever the listener stands, with no panning.
+        ///
+        /// What makes ambience expressible: a night loop is not somewhere, it
+        /// is simply on.
+        everywhere: bool,
+    },
+
+    /// Stop a looping sound.
+    ///
+    /// **Appended at the end** (protocol v23).
+    ///
+    /// Stopping one that is not running is not an error on either side.
+    StopLoop {
+        /// The id the mod gave it.
+        id: String,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -1622,6 +1698,69 @@ fn check_hud_scripts(scripts: &[HudScriptDef]) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// The two messages whose floats reach the client's own arithmetic.
+///
+/// A non-finite position propagates into every interpolation it takes part in,
+/// and a dig progress out of range is an index off the end of the crack
+/// texture. Charter rule 14: a server is not trusted merely for being the
+/// server.
+///
+/// Split out of `validate_server_message`, which was at clippy's line ceiling.
+fn check_player_floats(message: &ServerMessage) -> Result<(), ProtocolError> {
+    let bad = |field: &'static str| {
+        Err(ProtocolError::FieldTooLarge {
+            field,
+            len: 0,
+            limit: 0,
+        })
+    };
+    match message {
+        ServerMessage::PlayerState {
+            local, velocity, ..
+        } => {
+            if local.iter().chain(velocity.iter()).any(|v| !v.is_finite()) {
+                return bad("player_state");
+            }
+            Ok(())
+        }
+        ServerMessage::DigProgress { progress, .. } => {
+            if !progress.is_finite() || !(0.0..=1.0).contains(progress) {
+                return bad("dig_progress");
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Bounds the three protocol v23 messages.
+///
+/// One function rather than three arms, because `validate_server_message` was
+/// at clippy's line ceiling again — the fourth time this task that appending to
+/// a well-named function was the wrong move.
+fn check_cue_message(message: &ServerMessage) -> Result<(), ProtocolError> {
+    match message {
+        ServerMessage::SoundBindings { bindings } => check_bindings(bindings),
+        ServerMessage::StartLoop { id, sound, .. } => {
+            check_len("loop_id", id.len(), MAX_ID_BYTES)?;
+            check_len("loop_sound", sound.len(), MAX_ID_BYTES)
+        }
+        ServerMessage::StopLoop { id } => check_len("loop_id", id.len(), MAX_ID_BYTES),
+        _ => Ok(()),
+    }
+}
+
+/// Bounds a cue-binding table.
+fn check_bindings(bindings: &[SoundBinding]) -> Result<(), ProtocolError> {
+    check_len("sound_bindings", bindings.len(), MAX_SOUND_BINDINGS)?;
+    for binding in bindings {
+        check_len("cue", binding.cue.len(), MAX_ID_BYTES)?;
+        check_len("bound_sound", binding.sound.len(), MAX_ID_BYTES)?;
+        check_len("binding_mod_id", binding.mod_id.len(), MAX_ID_BYTES)?;
+    }
+    Ok(())
+}
+
 fn check_sounds(sounds: &[SoundDef]) -> Result<(), ProtocolError> {
     check_len("sound_table", sounds.len(), MAX_SOUNDS)?;
     for sound in sounds {
@@ -1762,29 +1901,8 @@ fn check_actions(actions: &[ActionDef]) -> Result<(), ProtocolError> {
 /// `PlayerState` carries a non-finite coordinate or velocity.
 pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolError> {
     match message {
-        ServerMessage::PlayerState {
-            local, velocity, ..
-        } => {
-            for value in local.iter().chain(velocity.iter()) {
-                if !value.is_finite() {
-                    return Err(ProtocolError::FieldTooLarge {
-                        field: "player_state",
-                        len: 0,
-                        limit: 0,
-                    });
-                }
-            }
-        }
-        ServerMessage::DigProgress { progress, .. } => {
-            // Drives a crack overlay's texture index. A NaN or an out-of-range
-            // value is an index off the end of that texture.
-            if !progress.is_finite() || !(0.0..=1.0).contains(progress) {
-                return Err(ProtocolError::FieldTooLarge {
-                    field: "dig_progress",
-                    len: 0,
-                    limit: 0,
-                });
-            }
+        message @ (ServerMessage::PlayerState { .. } | ServerMessage::DigProgress { .. }) => {
+            check_player_floats(message)?;
         }
         // **Entity positions reach the client's own frame arithmetic**, and a
         // non-finite one propagates into every interpolation it takes part in
@@ -1852,6 +1970,9 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         ServerMessage::ActionTable { actions } => check_actions(actions)?,
         ServerMessage::SoundTable { sounds } => check_sounds(sounds)?,
         ServerMessage::HudScripts { scripts } => check_hud_scripts(scripts)?,
+        message @ (ServerMessage::SoundBindings { .. }
+        | ServerMessage::StartLoop { .. }
+        | ServerMessage::StopLoop { .. }) => check_cue_message(message)?,
         message @ ServerMessage::PlaySound { .. } => check_play(message)?,
 
         ServerMessage::HelloAck { .. }
@@ -2576,12 +2697,31 @@ mod tests {
         .expect("encode");
         assert_eq!(view[0], 31);
 
-        // Protocol v22, the pushed HUD scripts, and currently the newest.
+        // Protocol v22, the pushed HUD scripts.
         let scripts = encode(&ServerMessage::HudScripts {
             scripts: Vec::new(),
         })
         .expect("encode");
         assert_eq!(scripts[0], 32);
+
+        // Protocol v23, the cue table and the loops, and currently the newest.
+        let bindings = encode(&ServerMessage::SoundBindings {
+            bindings: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(bindings[0], 33);
+        let start = encode(&ServerMessage::StartLoop {
+            id: String::new(),
+            sound: String::new(),
+            pos: [0.0; 3],
+            radius: 1.0,
+            gain: 1.0,
+            everywhere: false,
+        })
+        .expect("encode");
+        assert_eq!(start[0], 34);
+        let stop = encode(&ServerMessage::StopLoop { id: String::new() }).expect("encode");
+        assert_eq!(stop[0], 35);
     }
 
     #[test]

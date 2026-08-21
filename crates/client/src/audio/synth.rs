@@ -79,6 +79,39 @@ impl Recipe {
         }
     }
 
+    /// A steady bed: ambience, meant to be looped.
+    ///
+    /// **Loopable, which constrains it more than it sounds.** A tone whose
+    /// waveform does not line up at the seam clicks once per loop, and once per
+    /// loop is exactly the interval at which a click becomes maddening. Almost
+    /// pure noise has no waveform to line up, so the seam is inaudible — which
+    /// is why ambience beds in real games are noise and not tones.
+    ///
+    /// No decay, or it would fade to nothing and loop from silence into full
+    /// volume.
+    #[must_use]
+    pub const fn bed(from_hz: f32, to_hz: f32) -> Self {
+        Self {
+            from_hz,
+            to_hz,
+            seconds: 2.0,
+            noise: 0.97,
+            decay: 0.0,
+        }
+    }
+
+    /// Daytime: a bright, airy bed.
+    #[must_use]
+    pub const fn day() -> Self {
+        Self::bed(900.0, 1100.0)
+    }
+
+    /// Night: lower and darker, the same shape.
+    #[must_use]
+    pub const fn night() -> Self {
+        Self::bed(240.0, 300.0)
+    }
+
     /// A clean tick: the interface.
     #[must_use]
     pub const fn click() -> Self {

@@ -706,6 +706,10 @@ impl Client {
         // kira's thread, which is the point of kira having one.
         surface.app.play_heard();
         let _ = surface.app.play_footsteps();
+        // Jumping and landing, watched from the body rather than from the key:
+        // a jump pressed against a ceiling makes no noise and a fall off a
+        // ledge lands without anybody pressing anything.
+        surface.app.play_movement_cues();
         // After the HUD raised them last frame; before the next draw does.
         surface.app.flush_dialog_events();
 
@@ -1295,6 +1299,15 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
             surface
                 .dialogs
                 .draw(&context, surface.app.dialogs(), surface.app.views(), size);
+        // **The interface makes its own noise, locally.** A click that waited
+        // for the server to agree it had happened would arrive after the button
+        // had already visibly moved. `engine:ui_click` is bound like any other
+        // cue, so a mod set that binds nothing is silent here and that is fine.
+        if !raised.is_empty() {
+            surface
+                .app
+                .play_cue("engine:ui_click", client::audio::Bus::Ui);
+        }
         surface.app.raise_dialog_events(raised);
         draw_chat(&mut surface.app, &context);
         // **Last, so a script's HUD sits over the world and under a dialog.**
