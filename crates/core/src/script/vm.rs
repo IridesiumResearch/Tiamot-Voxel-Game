@@ -684,6 +684,22 @@ pub struct ActionEvent {
     pub pressed: bool,
 }
 
+/// A line a player typed.
+///
+/// # Why chat is engine-native and still hookable
+///
+/// Chat is in the engine because moderation and RCON depend on it: a server
+/// operator must be able to read and stop what is said without every server
+/// having installed the same mod. Mods still get a veto, because "what may be
+/// said here" is policy and policy is content (charter rule 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatEvent {
+    /// Who said it, canonically — the UUID, never the display name (rule 13).
+    pub player: [u8; 32],
+    /// What they typed.
+    pub text: String,
+}
+
 /// Something a player did inside a dialog a mod opened.
 ///
 /// # Why this carries the owning mod
@@ -1046,6 +1062,14 @@ pub trait ScriptVm: Sized {
     /// the click MEANS — whether a stack moves — is the server's decision, made
     /// after this and against its own inventory.
     fn dialog_event(&mut self, event: &DialogEvent) -> HookOutcome;
+
+    /// Asks every registered `on_chat` whether a line may be said.
+    ///
+    /// **A veto, unlike most hooks here.** A mod returning `false` stops the
+    /// line reaching anybody, which is what makes a chat filter expressible —
+    /// and the first refusal wins, so a later mod is not invited to act on a
+    /// message that is not going to be sent.
+    fn chat(&mut self, event: &ChatEvent) -> HookOutcome;
 
     /// Tells every registered `on_fluid_flow` that a flow was blocked.
     ///

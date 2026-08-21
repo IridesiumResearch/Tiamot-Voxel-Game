@@ -457,6 +457,31 @@ function game.get_tool(player) end
 ---@return boolean took
 function game.set_tool(player, tool) end
 
+---Called when a player says something in chat.
+---
+---**A veto.** Returning `false` stops the line reaching anybody, and returning
+---a string stops it and tells the speaker why. That is what makes a chat filter
+---expressible. The first refusal wins, so a later mod is not invited to act on
+---a message that is not going to be sent.
+---
+---Chat itself is ENGINE-native and works with no mods loaded, because
+---moderation and RCON depend on it: an operator must be able to read and stop
+---what is said without every server having installed the same mod. What may be
+---said is policy, and policy is yours (charter rule 1).
+---
+---`player` is the UUID and is the identity — store the UUID, print the name
+---(charter rule 13).
+---
+---```lua
+---game.register_on_chat(function(event)
+---    if event.text:find("spoiler") then
+---        return "not in this world, thank you"
+---    end
+---end)
+---```
+---@param callback fun(event: { player: string, text: string }): boolean|string|nil
+function game.register_on_chat(callback) end
+
 ---Fields accepted by `game.register_sound`.
 ---@class Tiamot.SoundSpec
 ---@field id string Required. Namespaced with your mod id automatically.

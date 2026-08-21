@@ -85,9 +85,11 @@ const HOOK_JOIN: &str = "on_player_join";
 /// The registry key holding every `on_action` callback.
 const ACTORS: &str = "tiamot.actors";
 const DIALOGISTS: &str = "tiamot.dialogists";
+const CHATTERS: &str = "tiamot.chatters";
 /// What an `on_action` hook is called in errors.
 const HOOK_ACTION: &str = "on_action";
 const HOOK_DIALOG: &str = "on_dialog_event";
+const HOOK_CHAT: &str = "on_chat";
 
 /// Hook name used in registry keys and in fault messages.
 const HOOK_PUNCH: &str = "on_punch";
@@ -890,6 +892,16 @@ impl ScriptVm for MluaVm {
         self.run_hook(HOOK_ACTION, ACTORS, &table)
     }
 
+    fn chat(&mut self, event: &crate::script::ChatEvent) -> HookOutcome {
+        let Ok(table) = self.hook_event(event.player).and_then(|table| {
+            table.set("text", event.text.as_str())?;
+            Ok(table)
+        }) else {
+            return HookOutcome::allow();
+        };
+        self.run_hook(HOOK_CHAT, CHATTERS, &table)
+    }
+
     fn dialog_event(&mut self, event: &crate::script::DialogEvent) -> HookOutcome {
         let Ok(table) = self.hook_event(event.player).and_then(|table| {
             table.set("form", event.form.as_str())?;
@@ -1318,6 +1330,11 @@ impl MluaVm {
         // registry list so `run_hook` can call everyone; a dialog event goes to
         // its owner alone, so the callback is stored under the mod's key and
         // there is nobody to enumerate.
+        game.set(
+            "register_on_chat",
+            self.hook_registrar(mod_id, HOOK_CHAT, CHATTERS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
         game.set(
             "register_on_dialog_event",
             self.hook_registrar(mod_id, HOOK_DIALOG, DIALOGISTS)?,
@@ -2557,7 +2574,7 @@ impl MluaVm {
         // with no clue as to why — which is exactly what `DIALOGISTS` did when
         // it was added to the constants and forgotten here.
         for list in [
-            DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS, ACTORS, DIALOGISTS,
+            DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS, ACTORS, DIALOGISTS, CHATTERS,
         ] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
             self.lua

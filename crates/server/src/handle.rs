@@ -869,6 +869,7 @@ impl ServerHandle {
             punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
             actions: std::sync::Mutex::new(std::collections::VecDeque::new()),
             dialog_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            chat: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -2059,6 +2060,39 @@ impl ServerHandle {
                             for (mod_id, err) in &verdict.faults {
                                 error!(mod_id = %mod_id, "mod disabled after an on_action failure: {err}");
                             }
+                        }
+
+                        // Chat, which every mod may veto. Broadcast only if
+                        // nobody refused: a line already sent cannot be unsent,
+                        // which is why this happens here and not on the
+                        // connection task that received it.
+                        for (uuid, text) in shared.drain_chat() {
+                            let verdict = source.may_chat(&tiamot_core::script::ChatEvent {
+                                player: *uuid.as_bytes(),
+                                text: text.clone(),
+                            });
+                            for (mod_id, err) in &verdict.faults {
+                                error!(mod_id = %mod_id, "mod disabled after an on_chat failure: {err}");
+                            }
+                            if !verdict.allowed {
+                                // Told to the speaker alone, so they know it
+                                // did not go out rather than wondering.
+                                let reason = verdict.reason.clone().unwrap_or_else(|| {
+                                    "a mod refused that message".to_owned()
+                                });
+                                let _ = shared.push_entity_messages(
+                                    &uuid,
+                                    std::iter::once(tiamot_core::proto::ServerMessage::Chat {
+                                        from: None,
+                                        text: reason,
+                                    }),
+                                );
+                                continue;
+                            }
+                            shared.broadcast(tiamot_core::proto::ServerMessage::Chat {
+                                from: Some(*uuid.as_bytes()),
+                                text,
+                            });
                         }
 
                         // And the dialogs. Delivered to the OWNER alone —

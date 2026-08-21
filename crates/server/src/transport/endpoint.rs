@@ -156,6 +156,8 @@ pub struct Shared {
     /// other thing a client asks for: running a Lua hook on the network thread
     /// would put a mod's runtime inside a connection's read loop.
     pub actions: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, String, bool)>>,
+    /// Chat waiting for the tick to offer to the mods.
+    pub chat: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, String)>>,
     /// Dialog events waiting for the tick to hand to the owning mods.
     pub dialog_events: std::sync::Mutex<
         std::collections::VecDeque<(PlayerUuid, String, tiamot_core::proto::DialogEvent)>,
@@ -958,6 +960,29 @@ impl Shared {
         true
     }
 
+    /// Queues a line of chat for the tick to offer to the mods.
+    ///
+    /// Bounded like the others: a client typing as fast as it can must not make
+    /// the server hold an unbounded list.
+    pub fn queue_chat(&self, actor: PlayerUuid, text: String) -> bool {
+        let Ok(mut queue) = self.chat.lock() else {
+            return false;
+        };
+        if queue.len() >= MAX_QUEUED_EDITS {
+            return false;
+        }
+        queue.push_back((actor, text));
+        true
+    }
+
+    /// Takes the chat waiting to be offered to the mods.
+    pub fn drain_chat(&self) -> Vec<(PlayerUuid, String)> {
+        self.chat
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+
     /// Queues a dialog event for the tick to hand to the owning mod.
     ///
     /// **Queued rather than delivered here**, the same as every other thing a
@@ -1730,12 +1755,13 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     warn!("edit queue is full; dropping an edit");
                 }
             }
+            // **Queued, not broadcast here.** Mods get a veto on chat, mods
+            // run on the tick thread, and a line already sent cannot be
+            // unsent — so this waits for the tick like every other thing a
+            // client asks for.
             Action::Chat { text } => {
                 if let Some(uuid) = session.uuid() {
-                    shared.broadcast(ServerMessage::Chat {
-                        from: Some(*uuid.as_bytes()),
-                        text: text.clone(),
-                    });
+                    shared.queue_chat(uuid, text.clone());
                 }
             }
             // Filed under the tick it claims, not applied here. The simulation
@@ -1958,6 +1984,7 @@ mod tests {
             punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
             actions: std::sync::Mutex::new(std::collections::VecDeque::new()),
             dialog_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            chat: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             outbound: tokio::sync::broadcast::channel(16).0,

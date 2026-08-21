@@ -458,6 +458,14 @@ const ENGINE_ACTIONS: &[(&str, &str, Option<Input>)] = &[
         "Controls and settings",
         Some(Input::Key(KeyCode::F1)),
     ),
+    // **Engine, not a mod.** Moderation and RCON depend on chat existing
+    // whatever mods a server runs, so the key that opens it is the engine's
+    // and works with zero mods loaded.
+    (
+        "engine:chat",
+        "Say something",
+        Some(Input::Key(KeyCode::KeyT)),
+    ),
     (
         "engine:menu",
         "Release the cursor",
@@ -583,10 +591,15 @@ const ENGINE_ACTIONS: &[(&str, &str, Option<Input>)] = &[
         "Debug: teleport to the far edge",
         Some(Input::Key(KeyCode::F8)),
     ),
+    // **Moved off `T` when chat arrived.** `T` is what a player reaches for to
+    // say something, and a debug laptop fallback is not what should own it.
+    // Changing a DEFAULT is safe by design: the bindings file records only what
+    // a player chose, so anybody who had rebound this keeps their key and
+    // everybody else gets the better one (see `Bindings`).
     (
         "engine:teleport_far_alt",
         "Debug: teleport to the far edge (laptop)",
-        Some(Input::Key(KeyCode::KeyT)),
+        Some(Input::Key(KeyCode::KeyY)),
     ),
     (
         "engine:teleport_home",

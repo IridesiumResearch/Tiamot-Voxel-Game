@@ -349,6 +349,12 @@ impl ApplicationHandler for Client {
                 let Some(action) = surface.app.action_for(Control::Key(code)) else {
                     return;
                 };
+                // **Typing is not walking.** Every action but the ones that
+                // close chat is swallowed while the input line is open, so a
+                // player writing "sssh" does not sneak-strafe across the map.
+                if surface.app.chat_open() && !matches!(action.as_str(), "engine:menu") {
+                    return;
+                }
                 match action.as_str() {
                     "engine:move_forward" => self.held.forward = pressed,
                     "engine:move_back" => self.held.back = pressed,
@@ -366,7 +372,17 @@ impl ApplicationHandler for Client {
                             grab(&surface.window, true)
                         };
                     }
+                    // Chat takes the cursor and the keyboard: a player typing
+                    // "west" must not walk west while they do it. The window
+                    // stops feeding movement to `held` while it is open — see
+                    // where this is checked before the match.
+                    "engine:chat" if pressed => {
+                        surface.app.set_chat_open(true);
+                        self.held = Held::default();
+                        self.grabbed = !grab(&surface.window, false);
+                    }
                     "engine:menu" if pressed => {
+                        surface.app.set_chat_open(false);
                         self.grabbed = !grab(&surface.window, false);
                     }
                     // The floating-origin check from Task 08's criteria: out
@@ -755,6 +771,73 @@ fn draw_sound_attribution(app: &App, ui: &mut egui::Ui) {
         });
 }
 
+/// Draws the chat history, and the input line when it is open.
+///
+/// **Engine-native, and that is a decision.** Task 14 puts chat in the engine
+/// because moderation and RCON depend on it: an operator must be able to read
+/// and stop what is said without every server having installed the same mod.
+/// It therefore works with zero mods loaded, which is what criterion 1's
+/// "minimal engine HUD" means.
+///
+/// Deliberately not a `core::ui` dialog. A dialog belongs to a mod and can be
+/// closed by one; chat cannot be, so it is drawn by the client directly.
+fn draw_chat(app: &mut App, ctx: &egui::Context) {
+    let lines: Vec<String> = app.chat().map(ToOwned::to_owned).collect();
+    let open = app.chat_open();
+    if lines.is_empty() && !open {
+        return;
+    }
+
+    let mut send = false;
+    let mut close = false;
+    egui::Area::new(egui::Id::new("chat"))
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_black_alpha(140))
+                .inner_margin(6.0)
+                .show(ui, |ui| {
+                    // Newest at the bottom, which is where a reader's eye is.
+                    // Only the last few unless the box is open, so chat does
+                    // not cover the world nobody is talking about.
+                    let shown = if open { 12 } else { 5 };
+                    let skip = lines.len().saturating_sub(shown);
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in lines.iter().skip(skip) {
+                                ui.label(egui::RichText::new(line).color(egui::Color32::WHITE));
+                            }
+                        });
+                    if !open {
+                        return;
+                    }
+                    let response = ui.add(
+                        egui::TextEdit::singleline(app.chat_draft_mut())
+                            .desired_width(420.0)
+                            .hint_text("say something"),
+                    );
+                    // Focused every frame it is open, so the first keystroke
+                    // after pressing the key lands in the box rather than
+                    // being swallowed while egui decides where focus lives.
+                    response.request_focus();
+                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        send = true;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        close = true;
+                    }
+                });
+        });
+
+    if send {
+        app.send_chat();
+    } else if close {
+        app.set_chat_open(false);
+    }
+}
+
 /// Draws the controls screen, and applies whatever the player clicked.
 ///
 /// **Every binding says which mod asked for it** — that is Task 13's
@@ -952,6 +1035,7 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
                 .dialogs
                 .draw(&context, surface.app.dialogs(), surface.app.views(), size);
         surface.app.raise_dialog_events(raised);
+        draw_chat(&mut surface.app, &context);
         egui::Area::new(egui::Id::new("hud"))
             .fixed_pos(egui::pos2(8.0, 8.0))
             .interactable(false)

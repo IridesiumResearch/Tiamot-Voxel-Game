@@ -129,6 +129,12 @@ const FLAT_DAYLIGHT: crate::shade::Uniform =
 /// How far behind the player the third-person camera sits, in blocks.
 const THIRD_PERSON_DISTANCE: f64 = 4.0;
 
+/// How many chat lines the client keeps.
+///
+/// A session on a busy server would otherwise hold every line anybody said for
+/// as long as it ran. Enough to scroll back through a conversation.
+const MAX_CHAT_LINES: usize = 200;
+
 /// Most dialog events held while waiting to send them.
 ///
 /// A player mashing buttons on a stalled connection must not grow this without
@@ -694,6 +700,16 @@ pub struct App {
     /// message is: sending happens on the network side, and the renderer runs
     /// inside a frame.
     dialog_events: Vec<crate::dialog::Raised>,
+    /// Chat lines received, newest last.
+    ///
+    /// Engine-native, because moderation and RCON depend on chat existing
+    /// whatever mods a server runs — a chat that arrived with a mod would be a
+    /// chat an operator could not rely on.
+    chat: std::collections::VecDeque<String>,
+    /// Whether the chat input line is open and taking keys.
+    chat_open: bool,
+    /// What is typed into it.
+    chat_draft: String,
     /// What each inventory view holds, as the server last said.
     ///
     /// The server's answer, not the client's belief: a slot moves when the
@@ -959,6 +975,9 @@ impl App {
             sounds: Vec::new(),
             dialogs: std::collections::BTreeMap::new(),
             views: std::collections::BTreeMap::new(),
+            chat: std::collections::VecDeque::new(),
+            chat_open: false,
+            chat_draft: String::new(),
             dialog_events: Vec::new(),
             mixer,
             heard: Vec::new(),
@@ -1962,6 +1981,66 @@ impl App {
             .insert(view, crate::dialog::ViewContents { slots, held });
     }
 
+    /// Records a chat line, keeping the most recent [`MAX_CHAT_LINES`].
+    ///
+    /// A bounded deque rather than a growing list: a session lasting hours on a
+    /// busy server would otherwise hold every line anybody said.
+    fn say(&mut self, text: String) {
+        tracing::info!("{text}");
+        self.chat.push_back(text);
+        while self.chat.len() > MAX_CHAT_LINES {
+            self.chat.pop_front();
+        }
+    }
+
+    /// The chat lines to show, oldest first.
+    pub fn chat(&self) -> impl Iterator<Item = &str> {
+        self.chat.iter().map(String::as_str)
+    }
+
+    /// Whether the chat input is open.
+    #[must_use]
+    pub const fn chat_open(&self) -> bool {
+        self.chat_open
+    }
+
+    /// The line being typed, for the window to render and edit.
+    pub const fn chat_draft_mut(&mut self) -> &mut String {
+        &mut self.chat_draft
+    }
+
+    /// Opens or closes the chat input, discarding a half-typed line on close.
+    pub fn set_chat_open(&mut self, open: bool) {
+        self.chat_open = open;
+        if !open {
+            self.chat_draft.clear();
+        }
+    }
+
+    /// Sends what is typed, if anything, and closes the input.
+    ///
+    /// Trimmed, and an empty line sends nothing: pressing Enter twice is how a
+    /// player closes the box, not how they say nothing loudly.
+    pub fn send_chat(&mut self) {
+        let text = self.chat_draft.trim().to_owned();
+        self.chat_open = false;
+        self.chat_draft.clear();
+        if text.is_empty() {
+            return;
+        }
+        // Bounded before it goes out, because the protocol bounds it on arrival
+        // and a silently truncated message is worse than one refused here.
+        if text.len() > tiamot_core::proto::MAX_CHAT_BYTES {
+            self.warn(format!(
+                "that message is {} bytes, over the {} the protocol allows",
+                text.len(),
+                tiamot_core::proto::MAX_CHAT_BYTES
+            ));
+            return;
+        }
+        self.connection.send(crate::net::Command::Chat(text));
+    }
+
     /// What each inventory view holds, as the server last said.
     #[must_use]
     pub const fn views(&self) -> &std::collections::BTreeMap<String, crate::dialog::ViewContents> {
@@ -2761,7 +2840,7 @@ impl App {
                     self.selected = self.selected.min(self.carried.len().saturating_sub(1));
                 }
 
-                Event::Chat { text, .. } => tracing::info!("{text}"),
+                Event::Chat { text, .. } => self.say(text),
 
                 Event::Warning(text) => self.warn(text),
 

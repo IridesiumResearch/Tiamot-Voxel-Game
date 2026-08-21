@@ -267,6 +267,20 @@ impl Generator {
         }
     }
 
+    /// Asks the mods whether a line of chat may be said.
+    ///
+    /// Named `may_` rather than `did_`, unlike the dialog and action hooks:
+    /// this one is a VETO, and the line does not go out if anybody refuses.
+    pub fn may_chat(
+        &mut self,
+        event: &tiamot_core::script::ChatEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().chat(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
     /// Tells the OWNING mod that something happened in its dialog.
     ///
     /// Named `did_` for the same reason as [`Self::did_action`]: the click has
