@@ -689,6 +689,40 @@ function game.cue(spec) end
 ---@return integer told
 function game.play_loop(spec) end
 
+---Walks an entity one tick toward a place, jumping over what is in the way.
+---
+---**The missing half of pathfinding.** `game.find_path` says which blocks to
+---visit; this turns "the next waypoint is over there" into the drive a body
+---actually takes — including whether to jump, which needs a look at the block in
+---front of the mob's feet and is therefore the engine's job rather than yours.
+---
+---A mob that walks into a one-block step climbs it. Call it every tick with
+---wherever you want the mob to go — the next waypoint of a route, or the player
+---it is following.
+---
+---```lua
+---game.register_on_tick(function()
+---    for _, id in ipairs(game.entities_in_radius(home, 64, "mymod")) do
+---        local target = whoever_it_is_chasing(id)
+---        if target and not game.steer_entity(id, target.pos) then
+---            -- Arrived. Do whatever arriving means.
+---        end
+---    end
+---end)
+---```
+---
+---Returns `true` while it is still going, `false` once it has arrived, and `nil`
+---if the entity is gone or the world could not be looked at this tick — so a
+---plain `if not game.steer_entity(...)` treats "arrived" and "could not ask" the
+---same way, which is usually what you want.
+---
+---Sets the entity's `drive`, so anything you set yourself in the same tick is
+---overwritten. Steer or drive; not both.
+---@param id integer
+---@param target { x: number, y: number, z: number }
+---@return boolean|nil going
+function game.steer_entity(id, target) end
+
 ---Where the day stands: 0 at midnight, 0.5 at noon, wrapping at 1.
 ---
 ---The same number the sky is drawn from, so a mod crossfading night ambience

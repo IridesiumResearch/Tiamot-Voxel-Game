@@ -2049,6 +2049,80 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))
     }
 
+    /// The `game.steer_entity` function.
+    ///
+    /// # One call, because the three parts have to agree
+    ///
+    /// Walking a mob toward something is: read where it is, work out the drive,
+    /// write the drive back. A mod can do the first and the third, and cannot
+    /// do the second — the middle needs a look at the block in front of the
+    /// mob's feet to know whether to jump, which is terrain.
+    ///
+    /// Splitting it into `game.steer(from, to)` and `game.set_entity(id, ...)`
+    /// would be two VM crossings per mob per tick and an invitation to pass the
+    /// wrong position. So it is one call that takes an entity and a place.
+    ///
+    /// Returns `true` while it is still going and `false` once it has arrived,
+    /// so `if not game.steer_entity(id, target) then ... end` is how a mod
+    /// notices it got there. `nil` means the world was not available to look
+    /// at — ask again next tick.
+    fn steerer(&self) -> Result<mlua::Function, ScriptError> {
+        let entities = std::sync::Arc::clone(&self.entities);
+        let paths = std::sync::Arc::clone(&self.paths);
+        self.lua
+            .create_function(move |_, (id, target): (u64, Table)| {
+                let to: [f64; 3] = [target.get("x")?, target.get("y")?, target.get("z")?];
+
+                let Ok(entity_slot) = entities.lock() else {
+                    return Ok(mlua::Value::Nil);
+                };
+                let Some(access) = entity_slot.as_ref() else {
+                    return Ok(mlua::Value::Nil);
+                };
+                let Some(state) = access.get(crate::ent::EntityId(id)) else {
+                    // No such entity. Not an error: a mod steering something a
+                    // moment after it despawned is ordinary, and raising here
+                    // would make every mob loop need a guard.
+                    return Ok(mlua::Value::Nil);
+                };
+                let from = state.transform.to_world();
+                // The body's own height, so a mob does not jump into a ceiling
+                // it cannot fit through. A marker with no collider is one block
+                // tall for this purpose — it has no physics to speak of.
+                // `floor_to_i32` and add one rather than `ceil`: the ceiling
+                // functions are on this crate's determinism deny-list, and one
+                // spelling of a rounding per workspace is worth more than the
+                // exemption this could claim for being presentation-adjacent.
+                let height = state.collider.map_or(1, |shape| {
+                    crate::detgen::floor_to_i32(shape.height).max(1) + 1
+                });
+
+                let Ok(path_slot) = paths.lock() else {
+                    return Ok(mlua::Value::Nil);
+                };
+                let Some(paths) = path_slot.as_ref() else {
+                    return Ok(mlua::Value::Nil);
+                };
+                let Some(steer) = paths.steer(from, to, height) else {
+                    return Ok(mlua::Value::Nil);
+                };
+
+                access.patch(
+                    crate::ent::EntityId(id),
+                    &crate::ent::access::Patch {
+                        drive: Some(crate::phys::Intent {
+                            walk: steer.walk,
+                            jump: steer.jump,
+                            gait: crate::phys::Gait::Walk,
+                        }),
+                        ..Default::default()
+                    },
+                );
+                Ok(mlua::Value::Boolean(!steer.arrived))
+            })
+            .map_err(|err| self.vm_error(&err))
+    }
+
     /// The `game.find_path` function, built once per mod environment.
     ///
     /// # Two returns, because "no" has three meanings
@@ -2633,6 +2707,27 @@ impl MluaVm {
         Ok(())
     }
 
+    /// What a mod may ask about the world it is standing in: sight, routes, and
+    /// the drive that follows one.
+    ///
+    /// Split out of `install_frozen_api`, which was over clippy's line ceiling
+    /// again — the seventh time across these sessions that appending to a
+    /// well-named function was the wrong move.
+    fn install_perception(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let line_of_sight = self.sight_reader(mod_id)?;
+        game.set("line_of_sight", line_of_sight)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let find_path = self.path_finder(mod_id)?;
+        game.set("find_path", find_path)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let steer = self.steerer()?;
+        game.set("steer_entity", steer)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// Everything callable after freeze: lookups, bulk noise, streams, constants.
     fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- frozen-phase API ---------------------------------------------
@@ -2665,13 +2760,7 @@ impl MluaVm {
         game.set("get_light", get_light)
             .map_err(|err| self.vm_error(&err))?;
 
-        let line_of_sight = self.sight_reader(mod_id)?;
-        game.set("line_of_sight", line_of_sight)
-            .map_err(|err| self.vm_error(&err))?;
-
-        let find_path = self.path_finder(mod_id)?;
-        game.set("find_path", find_path)
-            .map_err(|err| self.vm_error(&err))?;
+        self.install_perception(mod_id, game)?;
 
         // The bulk noise entry point. Takes a whole region and returns a native
         // heightmap; there is deliberately no per-sample call.
@@ -4412,6 +4501,23 @@ mod tests {
     }
 
     impl crate::path::Access for Map {
+        fn steer(&self, from: [f64; 3], to: [f64; 3], _height: i32) -> Option<crate::path::Steer> {
+            // No world here, so the direction is all this fixture can answer.
+            // Jumping is what needs terrain, and the tests that care about it
+            // drive a real server.
+            let (dx, dz) = ((to[0] - from[0]) as f32, (to[2] - from[2]) as f32);
+            let length = (dx * dx + dz * dz).sqrt();
+            Some(crate::path::Steer {
+                walk: if length > 0.0 {
+                    [dx / length, dz / length]
+                } else {
+                    [0.0, 0.0]
+                },
+                jump: false,
+                arrived: length <= 0.6,
+            })
+        }
+
         fn find_path(
             &self,
             _from: [f64; 3],

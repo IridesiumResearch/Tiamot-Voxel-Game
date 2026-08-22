@@ -151,6 +151,154 @@ pub enum Route {
 pub trait Access: Send + Sync {
     /// A route between two world points, in world blocks.
     fn find_path(&self, from: [f64; 3], to: [f64; 3], options: Options) -> Route;
+
+    /// The drive that takes a body from `from` toward `to` this tick.
+    ///
+    /// `None` when the world is not available — the same "ask again next tick"
+    /// answer `find_path` gives as [`Route::Unavailable`], and deliberately not
+    /// a stationary drive: a mob told to stand still is different from a mob
+    /// nobody could answer for.
+    fn steer(&self, from: [f64; 3], to: [f64; 3], height: i32) -> Option<Steer>;
+}
+
+/// What a mob should do this tick to get where it is going.
+///
+/// A route says which blocks to visit. This is the other half — turning "the
+/// next waypoint is over there" into the drive a body actually takes — and it
+/// is the half every mod would otherwise write again, badly, because it needs
+/// to look at the world and a mod cannot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Steer {
+    /// Horizontal direction, `[x, z]`, normalised. Zero means "stop steering".
+    pub walk: [f32; 2],
+    /// Whether to jump this tick.
+    pub jump: bool,
+    /// Whether the target is close enough to count as arrived.
+    pub arrived: bool,
+}
+
+/// How close counts as arrived, in blocks.
+///
+/// Roughly a body's width. Tighter and a mob orbits its target for ever,
+/// because it overshoots by more than the tolerance every tick.
+const ARRIVAL: f64 = 0.6;
+
+/// How far ahead to look for something to climb, in blocks.
+///
+/// Half a block: far enough to see the step before walking into it, near enough
+/// that a mob does not jump at a wall it is going to turn away from.
+const LOOK_AHEAD: f64 = 0.5;
+
+/// Works out the drive that takes a body from `from` toward `to`.
+///
+/// # Why jumping is the engine's business
+///
+/// `Intent.jump` has existed since Task 09 and pathfinding has climbed a block
+/// since Task 12, but nothing joined them: a mod could ask for a route and
+/// could ask a body to jump, and had no way to know WHEN — that needs a look at
+/// the block in front of the mob's feet, which is terrain, which a mod cannot
+/// read cheaply and should not have to.
+///
+/// So a mob that walks into a one-block step climbs it. Reported from the
+/// window as the stalker being unable to get out of a hole, which is the same
+/// thing seen from below.
+///
+/// `height` is the body's height in blocks, for the headroom test — a mob that
+/// jumped into a ceiling would bounce in place for ever.
+#[must_use]
+pub fn steer(chunks: &impl ChunkLookup, from: [f64; 3], to: [f64; 3], height: i32) -> Steer {
+    let (dx, dz) = (to[0] - from[0], to[2] - from[2]);
+    let flat = dx * dx + dz * dz;
+    if flat <= ARRIVAL * ARRIVAL {
+        return Steer {
+            walk: [0.0, 0.0],
+            jump: false,
+            arrived: true,
+        };
+    }
+    let length = flat.sqrt();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a unit vector, and steering is not simulation state a hash gate reads"
+    )]
+    let walk = [(dx / length) as f32, (dz / length) as f32];
+
+    // The block just ahead of the feet, in the direction of travel. Looking at
+    // the mob's own block instead would ask whether it is standing inside
+    // something, which is a different and much less useful question.
+    let ahead = [
+        from[0] + dx / length * LOOK_AHEAD,
+        from[1],
+        from[2] + dz / length * LOOK_AHEAD,
+    ];
+    let jump = match block_at(ahead) {
+        Some(front) => {
+            let view = Passability { chunks, height };
+            // Something in the way at foot level, room to stand on top of it,
+            // and a body's worth of headroom over that. All three, or a mob
+            // jumps at a wall it cannot climb — which reads worse than walking
+            // into it, because it looks like it is trying.
+            !view.passable(front) && view.standable(BlockPos::new(front.x, front.y + 1, front.z))
+        }
+        None => false,
+    };
+
+    Steer {
+        walk,
+        jump,
+        arrived: false,
+    }
+}
+
+/// The block a world point is in, or `None` outside the world.
+fn block_at(at: [f64; 3]) -> Option<BlockPos> {
+    let block = BlockPos::new(
+        crate::detgen::floor_to_i32(at[0] as f32),
+        crate::detgen::floor_to_i32(at[1] as f32),
+        crate::detgen::floor_to_i32(at[2] as f32),
+    );
+    block.in_world().then_some(block)
+}
+
+/// The passability tests, without a search's memo tables.
+///
+/// [`Grid`] caches its answers because a search asks about one block many
+/// times; a steer asks about two blocks once, so the cache would cost more than
+/// it saved and the predicates are shared rather than reimplemented.
+struct Passability<'a, C: ChunkLookup> {
+    chunks: &'a C,
+    height: i32,
+}
+
+impl<C: ChunkLookup> Passability<'_, C> {
+    fn passable(&self, block: BlockPos) -> bool {
+        let Some(chunk) = self.chunks.chunk(block.chunk()) else {
+            return false;
+        };
+        match chunk.get_block(block) {
+            None => false,
+            Some(BlockView::Uniform(material)) => material.is_air(),
+            Some(BlockView::Partial {
+                material,
+                occupancy,
+            }) => material.is_air() || occupancy & FLOOR_CELLS == 0,
+            Some(BlockView::Mixed(cells)) => (0..crate::SUBNODES_PER_AXIS)
+                .flat_map(|z| (0..crate::SUBNODES_PER_AXIS).map(move |x| (x, z)))
+                .all(|(x, z)| cells[crate::block::subnode_index(x, 0, z)].is_air()),
+        }
+    }
+
+    fn standable(&self, block: BlockPos) -> bool {
+        if !block.in_world() {
+            return false;
+        }
+        for up in 0..self.height {
+            if !self.passable(BlockPos::new(block.x, block.y + up, block.z)) {
+                return false;
+            }
+        }
+        !self.passable(BlockPos::new(block.x, block.y - 1, block.z))
+    }
 }
 
 /// Searches for a walkable route between two blocks.
@@ -435,6 +583,65 @@ impl<S: ChunkLookup> Terrain<'_, S> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_step_in_the_way_is_jumped_and_open_ground_is_not() {
+        // **Reported from the window: the stalker cannot get out of a hole.**
+        //
+        // `Intent.jump` had existed since Task 09 and pathfinding had climbed a
+        // block since Task 12, and nothing joined them: a mod could ask for a
+        // route and could ask a body to jump, and had no way to know WHEN. That
+        // needs a look at the block in front of the mob's feet, which is
+        // terrain, which a mod cannot read cheaply.
+        let mut world = Loaded::default()
+            .air(ChunkPos::new(0, 0, 0))
+            .floor(0, 0, 12);
+        // A one-block step at x = 4, running across the way.
+        for z in 0..8 {
+            world = world.solid(BlockPos::new(4, 1, z));
+        }
+
+        // Walking east into the step: jump.
+        let at_step = steer(&world, [3.6, 1.0, 2.0], [8.0, 1.0, 2.0], 2);
+        assert!(at_step.jump, "a one-block step was not climbed");
+        assert!(at_step.walk[0] > 0.9, "and it should still be walking east");
+        assert!(!at_step.arrived);
+
+        // Open ground, same direction: no jump. A mob that jumped its way
+        // across a field would look ridiculous, and this is the assertion that
+        // stops "always jump" passing the test above.
+        let open = steer(&world, [1.0, 1.0, 2.0], [3.0, 1.0, 2.0], 2);
+        assert!(!open.jump, "it jumped on flat ground");
+
+        // Arrived: no steering left, and said so.
+        let there = steer(&world, [1.0, 1.0, 2.0], [1.2, 1.0, 2.1], 2);
+        assert!(there.arrived);
+        assert!(
+            there.walk.iter().all(|axis| axis.abs() < f32::EPSILON),
+            "an arrived steer should stop steering, not point somewhere: {:?}",
+            there.walk
+        );
+    }
+
+    #[test]
+    fn a_wall_too_tall_to_climb_is_not_jumped_at() {
+        // A mob bouncing against a cliff reads worse than one walking into it,
+        // because it looks like it is trying. Two blocks is one more than a
+        // body can step up.
+        let mut world = Loaded::default()
+            .air(ChunkPos::new(0, 0, 0))
+            .floor(0, 0, 12);
+        for y in 1..3 {
+            for z in 0..8 {
+                world = world.solid(BlockPos::new(4, y, z));
+            }
+        }
+        let at_wall = steer(&world, [3.6, 1.0, 2.0], [8.0, 1.0, 2.0], 2);
+        assert!(
+            !at_wall.jump,
+            "it tried to jump a two-block wall, which it cannot clear"
+        );
+    }
+
     use std::collections::BTreeMap;
 
     use super::*;

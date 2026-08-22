@@ -163,6 +163,16 @@ impl sight::Access for Shared {
 }
 
 impl path::Access for Shared {
+    fn steer(&self, from: [f64; 3], to: [f64; 3], height: i32) -> Option<path::Steer> {
+        let slot = self.slot.lock().ok()?;
+        let world = slot.as_ref()?;
+        // Unmetered, unlike `find_path`: a steer is two block lookups, not a
+        // search, so there is nothing here worth taking out of the tick's
+        // pathfinding budget — and a mob that could not steer because somebody
+        // else had searched would stop walking for no reason it could see.
+        Some(path::steer(world, from, to, height.max(1)))
+    }
+
     fn find_path(&self, from: [f64; 3], to: [f64; 3], options: path::Options) -> path::Route {
         let Ok(slot) = self.slot.lock() else {
             return path::Route::Unavailable;
