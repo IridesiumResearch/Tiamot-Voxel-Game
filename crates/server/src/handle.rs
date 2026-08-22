@@ -1483,9 +1483,32 @@ impl ServerHandle {
                         // and doing it from a connection task would make the
                         // result depend on which one woke first.
                         for (uuid, target, brush) in shared.digs_in_progress() {
-                            let material = world
-                                .subnode(target, &mut source)
-                                .unwrap_or(tiamot_core::MaterialId::AIR);
+                            // **What is being dug, which is not always the cell
+                            // that was aimed at.**
+                            //
+                            // A block brush takes a block apart one sub-node at
+                            // a time in a scattered order, so the cell under
+                            // the crosshair is very often one of the first to
+                            // go. Reading the material from that cell alone
+                            // meant the dig stopped the moment its own aim
+                            // point crumbled — measured at ten sub-nodes of
+                            // twenty-seven before this distinction existed.
+                            //
+                            // So a block brush asks the BLOCK what it is made
+                            // of and stops when the block is empty; a chisel
+                            // asks its one cell, as it always did.
+                            let material = match brush {
+                                tiamot_core::dig::Brush::SubNode => world
+                                    .subnode(target, &mut source)
+                                    .unwrap_or(tiamot_core::MaterialId::AIR),
+                                tiamot_core::dig::Brush::Block => world
+                                    .block_cells(target.block(), &mut source)
+                                    .ok()
+                                    .and_then(|cells| {
+                                        cells.into_iter().find(|material| !material.is_air())
+                                    })
+                                    .unwrap_or(tiamot_core::MaterialId::AIR),
+                            };
                             if material.is_air() {
                                 // Whatever they aimed at is already gone —
                                 // someone else broke it, or they are digging
@@ -1534,18 +1557,44 @@ impl ServerHandle {
                                     ))
                                 }
                             };
-                            let Some(done) = shared.advance_dig(&uuid, hardness) else {
+                            // **How many sub-nodes are left to take.** A block
+                            // brush comes apart one cell at a time; a chisel
+                            // takes its one cell at the end, as it always did.
+                            let cells = match brush {
+                                tiamot_core::dig::Brush::SubNode => 1,
+                                tiamot_core::dig::Brush::Block => world
+                                    .block_cells(target.block(), &mut source)
+                                    .map(|cells| {
+                                        cells
+                                            .iter()
+                                            .filter(|material| {
+                                                **material != tiamot_core::MaterialId::AIR
+                                            })
+                                            .count()
+                                    })
+                                    .unwrap_or(0)
+                                    as u32,
+                            };
+                            if cells == 0 {
+                                // Nothing there any more — somebody else took
+                                // it, or a mod did. Not an error and not worth
+                                // telling anybody about.
+                                shared.set_dig(&uuid, None);
+                                continue;
+                            }
+                            let Some((chips, done)) = shared.advance_dig(&uuid, hardness, cells)
+                            else {
                                 continue;
                             };
-                            if !done {
+                            if chips == 0 {
                                 continue;
                             }
 
-                            // The mods get a veto, BEFORE anything is removed.
-                            // Refusing afterwards would mean putting the block
-                            // back, and that is not the same as never having
-                            // taken it: the drops are computed and the removal
-                            // is broadcast on the way through.
+                            // The mods get a veto, BEFORE anything is removed —
+                            // and asked once per BITE rather than once per
+                            // block, because each bite is a real removal that
+                            // credits real material. A mod that refuses halfway
+                            // stops the rest without unpicking what has gone.
                             let verdict = source.may_dig(&tiamot_core::script::DigEvent {
                                 player: *uuid.as_bytes(),
                                 target,
@@ -1558,8 +1607,8 @@ impl ServerHandle {
                             if !verdict.allowed {
                                 // The dig is abandoned, not paused: leaving it
                                 // running would re-ask the mods every tick
-                                // forever, and the player would watch a crack
-                                // that never finishes.
+                                // forever, and the player would watch a block
+                                // that never comes apart.
                                 shared.set_dig(&uuid, None);
                                 // Only when the mod supplied one. A silent
                                 // refusal was this path's behaviour before mods
@@ -1575,36 +1624,47 @@ impl ServerHandle {
 
                             // Contract §2 and §9: the brush decides what comes
                             // out, and `break_block` decides what it yields.
-                            let edit = match brush {
-                                tiamot_core::dig::Brush::SubNode => tiamot_core::proto::Edit::SubNode {
-                                    pos: target,
-                                    material: tiamot_core::MaterialId::AIR.0,
-                                },
-                                tiamot_core::dig::Brush::Block => tiamot_core::proto::Edit::Block {
-                                    pos: target.block(),
-                                    material: tiamot_core::MaterialId::AIR.0,
-                                },
+                            let edits = match brush {
+                                tiamot_core::dig::Brush::SubNode => {
+                                    vec![tiamot_core::proto::Edit::SubNode {
+                                        pos: target,
+                                        material: tiamot_core::MaterialId::AIR.0,
+                                    }]
+                                }
+                                // **The block comes apart in a fixed random
+                                // order**, seeded by its own position so every
+                                // client sees the same shape at the same moment
+                                // and a rejoining player sees what is already
+                                // there (charter rule 4's rule for randomness).
+                                tiamot_core::dig::Brush::Block => {
+                                    crumble_bites(&mut world, &mut source, target.block(), chips)
+                                }
                             };
-                            match world.apply(&edit, &mut source) {
-                                Ok((_, removed)) => {
-                                    relight.push(edited_block(&edit));
-                                    // A pond finds out there is somewhere new
-                                    // to go the same way it finds out a wall
-                                    // came down: every edit wakes it, whichever
-                                    // path the edit arrived by.
-                                    fluidics
-                                        .write()
-                                        .expect("fluid lock")
-                                        .touch(edited_block(&edit));
-                                    shared.credit(uuid, removed);
-                                    shared.broadcast(ServerMessage::BlockDelta {
-                                        edit,
-                                        actor: Some(*uuid.as_bytes()),
-                                    });
+                            for edit in edits {
+                                match world.apply(&edit, &mut source) {
+                                    Ok((_, removed)) => {
+                                        relight.push(edited_block(&edit));
+                                        // A pond finds out there is somewhere
+                                        // new to go the same way it finds out a
+                                        // wall came down: every edit wakes it,
+                                        // whichever path the edit arrived by.
+                                        fluidics
+                                            .write()
+                                            .expect("fluid lock")
+                                            .touch(edited_block(&edit));
+                                        shared.credit(uuid, removed);
+                                        shared.broadcast(ServerMessage::BlockDelta {
+                                            edit,
+                                            actor: Some(*uuid.as_bytes()),
+                                        });
+                                    }
+                                    Err(err) => {
+                                        debug!(actor = %uuid.short(), "a dig bite would not apply: {err}");
+                                    }
                                 }
-                                Err(err) => {
-                                    debug!(actor = %uuid.short(), "a completed dig would not apply: {err}");
-                                }
+                            }
+                            if !done {
+                                continue;
                             }
                             shared.set_dig(&uuid, None);
                         }
@@ -2798,6 +2858,58 @@ impl tiamot_core::ui::host::Access for Screens {
 /// tell about one (rule 1).
 struct Earshot {
     shared: std::sync::Arc<crate::transport::endpoint::Shared>,
+}
+
+/// The next `count` sub-nodes to take out of a block, as edits.
+///
+/// # Why the order is fixed and random at once
+///
+/// A block that came apart in index order would peel in flat layers, which
+/// reads as a bug rather than as breaking. A random order reads as material
+/// giving way — but it has to be the SAME order for everybody, or two players
+/// watching one block would see different shapes and a rejoining player would
+/// see neither. `dig::crumble_order` is a seeded stream keyed by the block's own
+/// position, so it is stable across clients, restarts and rejoins.
+///
+/// Cells already gone are skipped, so a block half dug by somebody else carries
+/// on from where it is rather than spending bites on air.
+fn crumble_bites(
+    world: &mut crate::world::World,
+    source: &mut dyn crate::world::ChunkSource,
+    block: tiamot_core::BlockPos,
+    count: u32,
+) -> Vec<tiamot_core::proto::Edit> {
+    let Ok(cells) = world.block_cells(block, source) else {
+        return Vec::new();
+    };
+    let order = tiamot_core::dig::crumble_order(world.seed(), block);
+    let mut edits = Vec::with_capacity(count as usize);
+    for index in order {
+        if edits.len() >= count as usize {
+            break;
+        }
+        let slot = usize::from(index);
+        if cells.get(slot).copied() == Some(tiamot_core::MaterialId::AIR) {
+            continue;
+        }
+        let (dx, dy, dz) = tiamot_core::block::subnode_offset(slot);
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "three, and sub-node offsets of 0, 1 or 2"
+        )]
+        let span = tiamot_core::SUBNODES_PER_AXIS as i32;
+        #[expect(clippy::cast_possible_wrap, reason = "a sub-node offset is 0, 1 or 2")]
+        let pos = tiamot_core::SubNodePos::new(
+            block.x * span + dx as i32,
+            block.y * span + dy as i32,
+            block.z * span + dz as i32,
+        );
+        edits.push(tiamot_core::proto::Edit::SubNode {
+            pos,
+            material: tiamot_core::MaterialId::AIR.0,
+        });
+    }
+    edits
 }
 
 impl tiamot_core::sound::Access for Earshot {

@@ -106,15 +106,16 @@ local function hotbar(state)
 end
 
 --- A bar that fills while a block is being broken.
-local function digging(state)
-    if not state.dig then
-        return
-    end
-    hud.bar{
-        anchor = "centre", x = -90, y = 40,
-        w = 180, h = 8, fill = state.dig,
-        colour = WHITE, background = PANEL,
-    }
+---
+--- **Deliberately not drawn any more.** A block now comes apart as you dig it —
+--- sub-nodes fall away one at a time — so the block itself is the progress
+--- indicator, and a bar beside it is a second, worse answer to the same
+--- question. `state.dig` is still there for a mod that wants one; this one does
+--- not.
+---
+--- Kept as a function rather than deleted so the decision is visible where
+--- somebody would look for it.
+local function digging(_state)
 end
 
 --- What the crosshair is on, and what is in hand to do it with.

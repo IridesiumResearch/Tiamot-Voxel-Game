@@ -825,11 +825,54 @@ impl Bot {
     pub async fn dig_block(&mut self, pos: tiamot_core::BlockPos) -> Result<(), BotError> {
         self.hold_brush(tiamot_core::dig::Brush::Block.name())
             .await?;
+        // **Finished means every sub-node has gone, not one `Edit::Block`.**
+        // A block comes apart a cell at a time now, so digging never emits a
+        // whole-block edit at all — this used to wait for one and timed out on
+        // a block that had visibly finished breaking.
         self.dig_until_gone(
             tiamot_core::SubNodePos::new(pos.x * 3 + 1, pos.y * 3 + 1, pos.z * 3 + 1),
-            |bot| bot.saw_block(pos, tiamot_core::MaterialId::AIR.0),
+            |bot| bot.block_is_empty(pos),
         )
         .await
+    }
+
+    /// Whether every sub-node of a block has been removed, as far as this bot
+    /// has been told.
+    ///
+    /// Counts the distinct `SubNode` edits it has seen, and still honours a
+    /// whole-block edit — a mod's `set_block` can still send one.
+    #[must_use]
+    pub fn block_is_empty(&self, pos: tiamot_core::BlockPos) -> bool {
+        let mut gone = std::collections::BTreeSet::new();
+        for message in self.received() {
+            let ServerMessage::BlockDelta { edit, .. } = message else {
+                continue;
+            };
+            match edit {
+                tiamot_core::proto::Edit::Block {
+                    pos: got,
+                    material: got_material,
+                } if got == pos => {
+                    if got_material == tiamot_core::MaterialId::AIR.0 {
+                        return true;
+                    }
+                    // Filled back in. Anything counted before it is stale.
+                    gone.clear();
+                }
+                tiamot_core::proto::Edit::SubNode {
+                    pos: got,
+                    material: got_material,
+                } if got.block() == pos => {
+                    if got_material == tiamot_core::MaterialId::AIR.0 {
+                        gone.insert((got.x, got.y, got.z));
+                    } else {
+                        gone.remove(&(got.x, got.y, got.z));
+                    }
+                }
+                _ => {}
+            }
+        }
+        gone.len() >= tiamot_core::block::SUBNODES_PER_BLOCK
     }
 
     /// Hits an entity.
@@ -856,6 +899,9 @@ impl Bot {
         /// Long enough for the slowest tool the reference mods register, with
         /// room for a lost message on top.
         const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+        /// How long to keep reading after the block has gone, so the credit
+        /// that arrived with the last bite is in hand.
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
         let deadline = tokio::time::Instant::now() + PATIENCE;
         loop {
@@ -863,6 +909,19 @@ impl Bot {
             let round = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
             while tokio::time::Instant::now() < round {
                 if done(self) {
+                    // **Drain what came with it.** A dig's last bite and the
+                    // inventory update that pays for it are produced in the
+                    // same tick, and the edit is broadcast first — so a caller
+                    // that stopped reading the moment the block emptied would
+                    // see twenty-five units of a twenty-seven unit block and
+                    // report that digging loses material. Two tests did exactly
+                    // that when a block started coming apart in pieces.
+                    let settle = tokio::time::Instant::now() + SETTLE;
+                    while tokio::time::Instant::now() < settle {
+                        let _ =
+                            tokio::time::timeout(std::time::Duration::from_millis(20), self.recv())
+                                .await;
+                    }
                     return Ok(());
                 }
                 let _ =
@@ -1613,6 +1672,13 @@ impl Bot {
     /// that means anything.
     #[must_use]
     pub fn saw_block(&self, pos: tiamot_core::BlockPos, material: u16) -> bool {
+        // **Air arrives two ways now.** A dig takes a block apart one sub-node
+        // at a time and never sends a whole-block edit, so "is it air yet" has
+        // to count the pieces — while "is it stone yet" is still one edit,
+        // because nothing builds a block up a cell at a time.
+        if material == tiamot_core::MaterialId::AIR.0 && self.block_is_empty(pos) {
+            return true;
+        }
         self.received().iter().rev().any(|message| {
             matches!(
                 message,

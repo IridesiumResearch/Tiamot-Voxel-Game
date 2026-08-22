@@ -120,11 +120,12 @@ async fn mine_a_block(bot: &mut Bot, server: &ServerHandle, pos: BlockPos, mater
         .await
         .expect("the seeded block should land");
 
-    bot.select_tool(None).await.expect("bare hand");
-    bot.start_dig(centre_of(pos)).await.expect("start dig");
-    bot.await_inventory(Duration::from_secs(20))
-        .await
-        .expect("the block should be credited");
+    // **`dig_block` rather than a start and one inventory update.** A block
+    // comes apart a sub-node at a time and is credited as it goes, so the FIRST
+    // inventory update now says one unit rather than twenty-seven — which is
+    // what this helper used to wait for, and what made every test below it read
+    // as though mining had lost material.
+    bot.dig_block(pos).await.expect("the block should break");
 }
 
 #[test]

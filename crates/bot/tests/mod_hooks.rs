@@ -161,16 +161,10 @@ async fn dig_and_see(bot: &mut Bot, server: &ServerHandle, pos: BlockPos, materi
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {
         let _ = tokio::time::timeout(Duration::from_millis(200), bot.recv()).await;
-        let removed = bot.received().into_iter().any(|message| {
-            matches!(
-                message,
-                tiamot_core::proto::ServerMessage::BlockDelta {
-                    edit: tiamot_core::proto::Edit::Block { pos: at, material: m },
-                    ..
-                } if at == pos && m == MaterialId::AIR.0
-            )
-        });
-        if removed {
+        // A block comes apart a sub-node at a time now, so "was it removed"
+        // counts the pieces — digging never sends a whole-block edit. A mod's
+        // `set_block` still can, which `block_is_empty` also honours.
+        if bot.block_is_empty(pos) {
             return true;
         }
     }

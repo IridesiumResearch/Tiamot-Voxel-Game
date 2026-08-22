@@ -445,37 +445,80 @@ fn a_player_can_dig_and_then_build_with_what_they_dug() {
         app.remesh();
         app.advance(Input::default(), 1.0 / 60.0);
         app.dig();
-        dug = !app.carried().is_empty();
+        // **A whole block's worth, not merely something.** A block comes apart
+        // a sub-node at a time and is credited as it goes, so the first credit
+        // is now ONE unit — and the placement below wants twenty-seven, because
+        // the brush is a block. Stopping at "carrying anything" left this
+        // trying to build a block out of a single node.
+        dug = app
+            .carried()
+            .first()
+            .is_some_and(|(_, units)| *units >= tiamot_core::UNITS_PER_BLOCK);
         std::thread::sleep(Duration::from_millis(16));
     }
     assert!(
         dug,
-        "digging the ground never credited anything; warnings: {:?}",
+        "digging the ground never credited a whole block; warnings: {:?}",
         app.warnings()
     );
     app.stop_digging();
 
     let carried = app.carried()[0];
-    assert!(carried.1 > 0, "credited an empty stack: {carried:?}");
-
-    // And build with it. Aim at a face rather than the hole just made — the
-    // ground beside it will do — and place.
     assert!(
-        run_frames(&mut app, |app| app.place_target().is_some()),
-        "nothing to place against after digging"
+        carried.1 >= tiamot_core::UNITS_PER_BLOCK,
+        "short: {carried:?}"
     );
-    let placed_at = app.place_target().expect("a face to build on");
-    app.place();
+
+    // **Step back out of the hole first.**
+    //
+    // Collecting a whole block now means digging for long enough that the hole
+    // is a real hole and the body has settled into it — and from in there every
+    // face within reach is one the player is standing in, which the server
+    // correctly refuses to build on and does so silently. A player would take a
+    // step back without thinking about it; so does this.
+    for _ in 0..40 {
+        assert!(app.pump_network(), "the connection ended");
+        app.advance(
+            Input {
+                forward: -1.0,
+                ..Input::default()
+            },
+            1.0 / 60.0,
+        );
+        std::thread::sleep(Duration::from_millis(8));
+    }
+
+    // And build with it. Tried until it lands rather than aimed once: which
+    // face is offered depends on exactly where the body came to rest.
+    let mut placed_at = None;
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline && placed_at.is_none() {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        if let Some(at) = app.place_target() {
+            app.place();
+            for _ in 0..12 {
+                assert!(app.pump_network(), "the connection ended");
+                app.advance(Input::default(), 1.0 / 60.0);
+                std::thread::sleep(Duration::from_millis(16));
+            }
+            if app
+                .store()
+                .get(at.chunk())
+                .and_then(|chunk| chunk.get_subnode(at))
+                .is_some_and(|material| !material.is_air())
+            {
+                placed_at = Some(at);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
 
     assert!(
-        run_frames(&mut app, |app| {
-            app.store()
-                .get(placed_at.chunk())
-                .and_then(|chunk| chunk.get_subnode(placed_at))
-                .is_some_and(|material| !material.is_air())
-        }),
-        "the placed block never appeared at {placed_at:?}; dug {target:?}, carried \
-         {carried:?}, warnings: {:?}",
+        placed_at.is_some(),
+        "nothing could be built after digging {target:?}, carrying {carried:?}; \
+         warnings: {:?}",
         app.warnings()
     );
 

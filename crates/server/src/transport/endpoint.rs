@@ -864,13 +864,21 @@ impl Shared {
     ///
     /// Returns whether it completed, or `None` if they are no longer digging —
     /// they may have cancelled between the snapshot and here.
-    pub fn advance_dig(&self, uuid: &PlayerUuid, hardness: f32) -> Option<bool> {
+    /// Advances a player's dig by one tick, returning how many sub-nodes came
+    /// off and whether that finished the target.
+    ///
+    /// `cells` is how many sub-nodes the target still has — only the caller can
+    /// see the block. A `SubNode` brush passes 1 and behaves exactly as it
+    /// always did: nothing until the timer, then the one cell.
+    pub fn advance_dig(&self, uuid: &PlayerUuid, hardness: f32, cells: u32) -> Option<(u32, bool)> {
         let mut bodies = self.bodies.lock().ok()?;
         let player = bodies.get_mut(uuid)?;
         let speed = self
             .resolve_tool(player.tool.as_deref())
             .map(|tool| tool.speed_multiplier)?;
-        Some(player.dig.as_mut()?.advance(hardness, speed))
+        let dig = player.dig.as_mut()?;
+        let chips = dig.advance(hardness, speed, cells);
+        Some((chips, dig.is_done()))
     }
 
     /// A player's dig progress, for the crack overlay.

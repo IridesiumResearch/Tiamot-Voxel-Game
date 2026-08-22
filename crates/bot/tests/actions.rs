@@ -79,6 +79,11 @@ async fn solid_id(bot: &Bot) -> u16 {
 }
 
 /// What a dig took out: a whole block, one cell, or nothing yet.
+///
+/// **Counted rather than read off one message.** A block brush no longer emits
+/// a single `Edit::Block` — a block comes apart one sub-node at a time, so the
+/// only difference between the two brushes on the wire is how MANY cells go.
+/// A chisel takes one and stops; a bare hand takes all twenty-seven.
 #[derive(Debug, PartialEq, Eq)]
 enum Took {
     Block,
@@ -86,25 +91,29 @@ enum Took {
     Nothing,
 }
 
-fn took(bot: &Bot, at: BlockPos) -> Took {
+/// How many distinct sub-nodes of `at` have been removed so far.
+fn cells_taken(bot: &Bot, at: BlockPos) -> usize {
+    let mut gone = std::collections::BTreeSet::new();
     for message in bot.received() {
         if let ServerMessage::BlockDelta { edit, .. } = message {
             match edit {
+                // Still possible from a mod's `set_block`, and still a whole
+                // block when it happens.
                 tiamot_core::proto::Edit::Block { pos, material }
                     if pos == at && material == tiamot_core::MaterialId::AIR.0 =>
                 {
-                    return Took::Block;
+                    return tiamot_core::block::SUBNODES_PER_BLOCK;
                 }
                 tiamot_core::proto::Edit::SubNode { pos, material }
                     if pos.block() == at && material == tiamot_core::MaterialId::AIR.0 =>
                 {
-                    return Took::Cell;
+                    gone.insert((pos.x, pos.y, pos.z));
                 }
                 _ => {}
             }
         }
     }
-    Took::Nothing
+    gone.len()
 }
 
 /// Digs the middle of a block WITHOUT choosing a tool first.
@@ -124,12 +133,27 @@ async fn dig_with_whatever_is_held(bot: &mut Bot, at: BlockPos) -> Took {
     // That is exactly how it failed on the macOS runner: `move_to` reports an
     // INTENT, so on a machine where the walk had not finished the dig was out
     // of reach, refused once, and the test read `Nothing` and blamed the tool.
+    // **Waited out rather than answered on the first cell.** A block brush
+    // takes twenty-seven bites over the dig's whole duration, so the first
+    // `SubNode` edit says only that digging has started — reading the outcome
+    // there would call every dig a chisel. A chisel settles at one cell and
+    // stays there, so the wait is what tells them apart.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut next_send = tokio::time::Instant::now();
+    let mut settled_at: Option<(usize, tokio::time::Instant)> = None;
     while tokio::time::Instant::now() < deadline {
-        let outcome = took(bot, at);
-        if outcome != Took::Nothing {
-            return outcome;
+        let taken = cells_taken(bot, at);
+        if taken >= tiamot_core::block::SUBNODES_PER_BLOCK {
+            return Took::Block;
+        }
+        // A count that has not moved for a beat is a dig that has finished.
+        match settled_at {
+            Some((count, since)) if count == taken => {
+                if taken > 0 && since.elapsed() > Duration::from_millis(1500) {
+                    return Took::Cell;
+                }
+            }
+            _ => settled_at = Some((taken, tokio::time::Instant::now())),
         }
         if tokio::time::Instant::now() >= next_send {
             bot.send(&ClientMessage::StartDig { target: centre })

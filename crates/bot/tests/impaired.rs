@@ -108,7 +108,16 @@ fn centre_of(pos: BlockPos) -> SubNodePos {
 }
 
 /// Whether the server has broadcast this block as being `material`.
+/// Whether the world has reached `material` at `pos`, as far as this bot knows.
+///
+/// **Air arrives a sub-node at a time now.** A block comes apart under a dig
+/// rather than vanishing, so digging never sends a whole-block edit — the same
+/// distinction `Bot::saw_block` makes, spelled out here because this test
+/// watches the wire directly to see what a lossy link delivered.
 fn saw(bot: &Bot, pos: BlockPos, material: u16) -> bool {
+    if material == MaterialId::AIR.0 && bot.block_is_empty(pos) {
+        return true;
+    }
     bot.received().iter().any(|message| {
         matches!(
             message,

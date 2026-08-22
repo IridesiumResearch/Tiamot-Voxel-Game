@@ -30,6 +30,7 @@ pub mod hardness;
 
 pub use hardness::{Resistance, SUBNODE_SHARE, block_hardness, subnode_hardness};
 
+use crate::block::SUBNODES_PER_BLOCK;
 use crate::coords::SubNodePos;
 
 /// How a tool removes material.
@@ -113,6 +114,18 @@ pub struct Dig {
     brush: Brush,
     /// Ticks spent so far.
     elapsed: u32,
+    /// Sub-nodes already taken off this target.
+    ///
+    /// **A block comes apart rather than vanishing.** See [`Dig::advance`].
+    chipped: u32,
+    /// How many sub-nodes this target had when the dig started.
+    ///
+    /// **Captured once, not read every tick.** The caller counts what is still
+    /// there, and what is still there SHRINKS as the dig eats it — so measuring
+    /// against it would mean the dig thought it was finished halfway through,
+    /// with `chipped` overtaking a falling count. The plan is fixed when the
+    /// dig starts; `0` until the first advance sees the block.
+    total: u32,
     /// Ticks the current target needs, from the last [`Dig::advance`].
     ///
     /// Recomputed every tick rather than fixed at the start, so swapping tools
@@ -128,6 +141,8 @@ impl Dig {
             target,
             brush,
             elapsed: 0,
+            chipped: 0,
+            total: 0,
             needed: 1,
         }
     }
@@ -144,9 +159,12 @@ impl Dig {
         self.brush
     }
 
-    /// How far along, `0.0..=1.0`. What the crack overlay is drawn from.
+    /// How far along, `0.0..=1.0`.
     ///
     /// Derived from the tick counts rather than stored, so nothing accumulates.
+    /// Still sent to clients, and a mod's HUD may still draw it — but it is no
+    /// longer what a player reads a dig from, because the block itself is
+    /// visibly coming apart.
     #[must_use]
     pub fn progress(&self) -> f32 {
         if self.elapsed >= self.needed {
@@ -155,24 +173,82 @@ impl Dig {
         self.elapsed as f32 / self.needed as f32
     }
 
+    /// How many sub-nodes have already come off this target.
+    #[must_use]
+    pub const fn chipped(&self) -> u32 {
+        self.chipped
+    }
+
     /// Ticks spent on this target.
     #[must_use]
     pub const fn elapsed(&self) -> u32 {
         self.elapsed
     }
 
-    /// Advances one tick, returning whether the dig completed.
+    /// Advances one tick, returning how many sub-nodes came off.
     ///
-    /// Completion is reported exactly once: a caller that keeps advancing a
-    /// finished dig gets `false`, because the block is already gone and
-    /// breaking it twice would credit its drops twice.
-    pub fn advance(&mut self, hardness: f32, speed: f32) -> bool {
+    /// # A block comes apart; it does not pop
+    ///
+    /// A dig used to be a timer with a bar over it: nothing happened for a
+    /// second and a half, and then a whole block vanished at once. What a
+    /// player got for stopping halfway was nothing at all.
+    ///
+    /// Now the same total time is divided by the number of sub-nodes in the
+    /// target, and one comes off at each step. **Stopping halfway leaves half a
+    /// block standing and half a block's material in your inventory**, because
+    /// each sub-node is removed and credited as it goes rather than at the end.
+    /// There is nothing to bank and nothing to lose.
+    ///
+    /// `cells` is how many sub-nodes are still there — the caller counts them,
+    /// because only it can see the block. A `SubNode` brush passes 1 and gets
+    /// exactly the old behaviour: one chip, at the end.
+    ///
+    /// The total time is unchanged, so a block takes as long to clear as it
+    /// always did. What changed is that the time is now spent visibly.
+    ///
+    /// Returns `0` on a tick where nothing is due, and never more than `cells`
+    /// in total across a dig: a caller that keeps advancing a finished dig gets
+    /// `0`, because the material is already paid out.
+    pub fn advance(&mut self, hardness: f32, speed: f32, cells: u32) -> u32 {
         self.needed = ticks_to_break(hardness, speed);
-        if self.elapsed >= self.needed {
-            return false;
+        if cells == 0 {
+            return 0;
         }
-        self.elapsed += 1;
-        self.elapsed >= self.needed
+        // The plan, fixed the first time this target is seen. `cells` is what
+        // is LEFT and falls as the dig eats it; measuring against that would
+        // finish the dig halfway through.
+        if self.total == 0 {
+            self.total = cells;
+        }
+        let cells = self.total;
+        if self.chipped >= cells {
+            return 0;
+        }
+        if self.elapsed < self.needed {
+            self.elapsed += 1;
+        }
+
+        // How many should have come off by now, from the share of the time
+        // spent. Integer arithmetic on ticks rather than a float accumulator:
+        // there is nothing to drift, and the last chip lands exactly when the
+        // timer does.
+        let due = if self.elapsed >= self.needed {
+            cells
+        } else {
+            (u64::from(self.elapsed) * u64::from(cells) / u64::from(self.needed)) as u32
+        };
+        let chips = due.saturating_sub(self.chipped).min(cells - self.chipped);
+        self.chipped += chips;
+        chips
+    }
+
+    /// Whether every sub-node of the target has come off.
+    ///
+    /// Against the count captured at the start, not whatever is left now — see
+    /// [`Dig::advance`]. A dig that has not started yet is not done.
+    #[must_use]
+    pub const fn is_done(&self) -> bool {
+        self.total > 0 && self.chipped >= self.total
     }
 
     /// Points the dig at a different cell, discarding progress.
@@ -192,8 +268,54 @@ impl Dig {
         self.target = target;
         self.brush = brush;
         self.elapsed = 0;
+        // The chips do NOT come back — they are already out of the world and in
+        // somebody's inventory. What resets is the clock, and the plan, because
+        // the new target is a different block with a different amount in it.
+        self.chipped = 0;
+        self.total = 0;
         had_progress
     }
+}
+
+/// Which sub-node of a block comes off next, and in what order.
+///
+/// # Why the order is random, and why it is not
+///
+/// A block that came apart in index order would peel in flat layers, which
+/// reads as a bug rather than as breaking. A random order reads as material
+/// giving way.
+///
+/// But it must be the SAME random order for everybody. Two players watching one
+/// block come apart see the same shape at the same moment, a rejoining player
+/// sees what the world already looks like, and the world file does not depend
+/// on who was standing there — so this is a seeded stream keyed by the block's
+/// own position (charter rule 4's rule for randomness), not `rand`.
+///
+/// Returns the cell indices in the order they should be taken. Every index
+/// appears exactly once, so a caller that walks it and skips the empty ones
+/// visits every occupied cell.
+#[must_use]
+pub fn crumble_order(world_seed: u64, block: crate::coords::BlockPos) -> [u8; SUBNODES_PER_BLOCK] {
+    let mut order = [0u8; SUBNODES_PER_BLOCK];
+    for (index, slot) in order.iter_mut().enumerate() {
+        *slot = u8::try_from(index).unwrap_or(0);
+    }
+
+    // Keyed by the BLOCK, through the chunk-stream constructor: two blocks in
+    // one chunk must not crumble identically, and the same block must crumble
+    // the same way every time it is dug.
+    let mut rng = crate::detgen::StreamRng::new(
+        world_seed,
+        crate::coords::ChunkPos::new(block.x, block.y, block.z),
+        "dig:crumble",
+    );
+    // Fisher-Yates, downward, which is the version with no modulo bias when the
+    // bound comes from an unbiased `below`.
+    for index in (1..order.len()).rev() {
+        let swap = rng.below(index as u64 + 1) as usize;
+        order.swap(index, swap);
+    }
+    order
 }
 
 /// Where `game.get_tool` and `game.set_tool` reach.
@@ -254,22 +376,62 @@ mod tests {
     fn a_hardness_of_zero_breaks_in_one_tick_rather_than_dividing_by_zero() {
         assert_eq!(ticks_to_break(0.0, 1.0), 1);
         let mut dig = Dig::start(CELL, Brush::Block);
-        assert!(dig.advance(0.0, 1.0), "should complete immediately");
+        assert_eq!(
+            dig.advance(0.0, 1.0, 1),
+            1,
+            "a one-tick break should take its only cell immediately"
+        );
     }
 
     #[test]
-    fn completion_is_reported_exactly_once() {
-        // Advancing a finished dig again must not report a second break: the
-        // block is already gone, and the caller credits drops on a `true`.
+    fn every_sub_node_is_paid_for_exactly_once() {
+        // Advancing a finished dig again must not chip anything more: the
+        // material is already out of the world and in somebody's inventory, and
+        // a second payout is duplication.
         let mut dig = Dig::start(CELL, Brush::Block);
-        let mut completions = 0;
-        for _ in 0..60 {
-            if dig.advance(1.0, 1.0) {
-                completions += 1;
-            }
+        let mut chips = 0;
+        for _ in 0..200 {
+            chips += dig.advance(1.0, 1.0, 27);
         }
-        assert_eq!(completions, 1, "the block broke {completions} times");
+        assert_eq!(chips, 27, "the block yielded {chips} sub-nodes, not 27");
+        assert!(dig.is_done());
         assert!((dig.progress() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_block_comes_apart_over_the_whole_dig_rather_than_at_the_end() {
+        // **The change, stated as a property.** Half the time spent must have
+        // taken roughly half the block — not none of it, which is what a timer
+        // with a bar over it did.
+        let mut dig = Dig::start(CELL, Brush::Block);
+        let total = ticks_to_break(2.0, 1.0);
+        let mut chips = 0;
+        for _ in 0..total / 2 {
+            chips += dig.advance(2.0, 1.0, 27);
+        }
+        assert!(
+            (11..=16).contains(&chips),
+            "half a dig took {chips} of 27 sub-nodes, which is not half a block"
+        );
+
+        // And what it took is KEPT. Walking away is not losing it.
+        assert_eq!(dig.chipped(), chips);
+    }
+
+    #[test]
+    fn a_sub_node_brush_still_takes_one_thing_at_the_end() {
+        // The chisel is unchanged: one cell, and nothing until the timer is up.
+        let mut dig = Dig::start(CELL, Brush::SubNode);
+        let total = ticks_to_break(1.0, 1.0);
+        for tick in 1..total {
+            assert_eq!(
+                dig.advance(1.0, 1.0, 1),
+                0,
+                "the chisel gave something up on tick {tick}"
+            );
+        }
+        assert_eq!(dig.advance(1.0, 1.0, 1), 1);
+        assert!(dig.is_done());
     }
 
     #[test]
@@ -281,11 +443,12 @@ mod tests {
 
         let mut dig = Dig::start(CELL, Brush::Block);
         let mut ticks = 0;
-        while !dig.advance(2.0, 1.0) {
+        while !dig.is_done() {
+            dig.advance(2.0, 1.0, 27);
             ticks += 1;
             assert!(ticks < 100, "never finished");
         }
-        assert_eq!(ticks + 1, 40, "took {} ticks", ticks + 1);
+        assert_eq!(ticks, 40, "took {ticks} ticks");
     }
 
     #[test]
@@ -294,7 +457,7 @@ mod tests {
         // off the end of the texture is a panic or a garbage frame.
         let mut dig = Dig::start(CELL, Brush::Block);
         for _ in 0..100 {
-            dig.advance(0.1, 4.0);
+            dig.advance(0.1, 4.0, 27);
             assert!(
                 (0.0..=1.0).contains(&dig.progress()),
                 "progress left its range: {}",
@@ -309,7 +472,7 @@ mod tests {
         // them all at once, and the crack they see stops meaning anything.
         let mut dig = Dig::start(CELL, Brush::Block);
         for _ in 0..10 {
-            dig.advance(1.0, 1.0);
+            dig.advance(1.0, 1.0, 27);
         }
         assert!(dig.progress() > 0.4);
 
@@ -328,10 +491,37 @@ mod tests {
         // Switching from a chisel to a bare hand mid-dig means removing a
         // different amount of material, so the work done does not carry.
         let mut dig = Dig::start(CELL, Brush::SubNode);
-        dig.advance(1.0, 1.0);
+        dig.advance(1.0, 1.0, 1);
         assert!(dig.retarget(CELL, Brush::Block), "the brush changed");
         assert_eq!(dig.brush(), Brush::Block);
         assert_eq!(dig.elapsed(), 0);
+    }
+
+    #[test]
+    fn a_block_crumbles_the_same_way_for_everybody_and_differently_from_its_neighbour() {
+        use crate::coords::BlockPos;
+
+        let here = crumble_order(7, BlockPos::new(4, 9, -2));
+
+        // **The same, every time and for everyone.** Two players watching one
+        // block come apart must see the same shape at the same moment, and a
+        // player who rejoins must see what the world already looks like.
+        assert_eq!(here, crumble_order(7, BlockPos::new(4, 9, -2)));
+
+        // Different for the block next to it, or a wall peels in one motion.
+        assert_ne!(here, crumble_order(7, BlockPos::new(5, 9, -2)));
+        // And different in another world, like every other seeded stream.
+        assert_ne!(here, crumble_order(8, BlockPos::new(4, 9, -2)));
+
+        // Every cell exactly once, so a caller walking it reaches all of them.
+        let mut seen = here;
+        seen.sort_unstable();
+        let expected: Vec<u8> = (0..SUBNODES_PER_BLOCK as u8).collect();
+        assert_eq!(seen.as_slice(), expected.as_slice());
+
+        // Not the identity, or the block peels in flat layers — which reads as
+        // a bug rather than as breaking, and is the whole reason for shuffling.
+        assert_ne!(here.as_slice(), expected.as_slice());
     }
 
     #[test]
