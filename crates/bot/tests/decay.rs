@@ -222,3 +222,86 @@ fn a_whole_dig_still_yields_exactly_one_block() {
     });
     assert!(server.stop());
 }
+
+#[test]
+fn a_mod_hears_one_break_per_block_rather_than_one_per_sub_node() {
+    // **Reported from the window: breaking a block sounded like twenty-seven
+    // things breaking.** It did. `on_dig_complete` is one event about one
+    // block, and a mod playing a sound from it is the obvious thing to write —
+    // but the veto was being asked once per BITE, so the hook fired once per
+    // sub-node and the mod made a noise each time.
+    //
+    // Counted by having the mod mark the world once per event, at a height
+    // that says how many it has heard.
+    let root = scratch("counting");
+    let dir = root.join("counter");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"counter\"\nname = \"Counter\"\nversion = \"0.1.0\"\nlicense = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+local stone = game.register_block{ id = "stone", hardness = 1.0 }
+local mark = game.register_block{ id = "mark" }
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(game.flat_heightmap(0), stone)
+end)
+game.register_tool{ id = "hand", brush = "block", speed_multiplier = 1.0, default = true }
+
+-- One block per event, stacked upward. Two events would build a tower.
+local heard = 0
+game.register_on_dig_complete(function(event)
+    heard = heard + 1
+    game.set_block({ x = 0, y = 10 + heard, z = 0 }, "counter:mark")
+end)
+"#,
+    )
+    .expect("script");
+
+    let server = ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: scratch("counting-world"),
+        max_players: 4,
+        allowlist: Allowlist::open(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(root),
+        seed: Some(41),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("start");
+
+    block_on(async {
+        let mut bot = join(&server, "miner").await;
+        let mark = bot
+            .material_table()
+            .expect("a material table")
+            .into_iter()
+            .find(|entry| entry.name == "counter:mark")
+            .map(|entry| entry.id)
+            .expect("the mod registers a mark");
+
+        bot.dig_block(TARGET).await.expect("dig");
+
+        // The first mark says the hook fired at all. Without it the rest of
+        // this proves nothing.
+        bot.expect_block(tiamot_core::BlockPos::new(0, 11, 0), mark, PATIENCE)
+            .await
+            .expect("the mod never heard the dig complete");
+
+        // Settle, then check nothing built a tower.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            let _ = tokio::time::timeout(Duration::from_millis(20), bot.recv()).await;
+        }
+        assert!(
+            !bot.saw_block(tiamot_core::BlockPos::new(0, 12, 0), mark),
+            "the mod was told twice about one block — a break sound would have \
+             played twenty-seven times"
+        );
+    });
+    assert!(server.stop());
+}

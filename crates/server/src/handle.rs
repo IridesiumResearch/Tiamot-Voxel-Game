@@ -1582,25 +1582,34 @@ impl ServerHandle {
                                 shared.set_dig(&uuid, None);
                                 continue;
                             }
-                            let Some((chips, done)) = shared.advance_dig(&uuid, hardness, cells)
-                            else {
+                            let Some(bite) = shared.advance_dig(&uuid, hardness, cells) else {
                                 continue;
                             };
+                            let chips = bite.chips;
                             if chips == 0 {
                                 continue;
                             }
 
-                            // The mods get a veto, BEFORE anything is removed —
-                            // and asked once per BITE rather than once per
-                            // block, because each bite is a real removal that
-                            // credits real material. A mod that refuses halfway
-                            // stops the rest without unpicking what has gone.
-                            let verdict = source.may_dig(&tiamot_core::script::DigEvent {
-                                player: *uuid.as_bytes(),
-                                target,
-                                material,
-                                brush,
-                            });
+                            // **The mods are asked ONCE per block, on the first
+                            // bite.** `on_dig_complete` is one event about one
+                            // block: a mod playing a break sound from it made
+                            // twenty-seven noises for one block when this was
+                            // asked per bite, which is how it was reported.
+                            //
+                            // The first bite rather than the last, so the veto
+                            // still means something — a refusal arrives before
+                            // anything has been removed, which is what "BEFORE
+                            // anything is removed" has always promised.
+                            let verdict = if bite.first {
+                                source.may_dig(&tiamot_core::script::DigEvent {
+                                    player: *uuid.as_bytes(),
+                                    target,
+                                    material,
+                                    brush,
+                                })
+                            } else {
+                                tiamot_core::script::HookOutcome::allow()
+                            };
                             for (mod_id, err) in &verdict.faults {
                                 error!(mod_id = %mod_id, "mod disabled after an on_dig_complete failure: {err}");
                             }
@@ -1663,7 +1672,7 @@ impl ServerHandle {
                                     }
                                 }
                             }
-                            if !done {
+                            if !bite.done {
                                 continue;
                             }
                             shared.set_dig(&uuid, None);

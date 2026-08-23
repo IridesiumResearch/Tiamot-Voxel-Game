@@ -68,6 +68,23 @@ pub enum TransportError {
 }
 
 /// Everything a connection needs that is shared between all of them.
+/// What one tick of digging took out of a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bite {
+    /// Sub-nodes removed this tick. `0` on a tick where nothing was due.
+    pub chips: u32,
+    /// Whether that finished the target.
+    pub done: bool,
+    /// Whether this was the FIRST bite out of this target.
+    ///
+    /// **What the mods are asked on, and only that.** `on_dig_complete` fires
+    /// once per block, not once per sub-node: a mod playing a break sound from
+    /// it made twenty-seven noises for one block, which is how this was
+    /// reported. Asking on the first bite rather than the last also keeps the
+    /// veto meaningful — a refusal arrives before anything has been removed.
+    pub first: bool,
+}
+
 pub struct Shared {
     /// Who exists, and what they are called.
     ///
@@ -870,15 +887,20 @@ impl Shared {
     /// `cells` is how many sub-nodes the target still has — only the caller can
     /// see the block. A `SubNode` brush passes 1 and behaves exactly as it
     /// always did: nothing until the timer, then the one cell.
-    pub fn advance_dig(&self, uuid: &PlayerUuid, hardness: f32, cells: u32) -> Option<(u32, bool)> {
+    pub fn advance_dig(&self, uuid: &PlayerUuid, hardness: f32, cells: u32) -> Option<Bite> {
         let mut bodies = self.bodies.lock().ok()?;
         let player = bodies.get_mut(uuid)?;
         let speed = self
             .resolve_tool(player.tool.as_deref())
             .map(|tool| tool.speed_multiplier)?;
         let dig = player.dig.as_mut()?;
+        let before = dig.chipped();
         let chips = dig.advance(hardness, speed, cells);
-        Some((chips, dig.is_done()))
+        Some(Bite {
+            chips,
+            done: dig.is_done(),
+            first: before == 0 && chips > 0,
+        })
     }
 
     /// A player's dig progress, for the crack overlay.

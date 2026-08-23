@@ -736,6 +736,18 @@ pub struct App {
     /// conflict, so the list is folded once on arrival and the LAST binding for
     /// a cue is the one that survives.
     cues: std::collections::BTreeMap<String, String>,
+    /// The block this dig is locked onto while the button is held.
+    ///
+    /// **A block brush finishes the block it started on.** Sub-nodes come away
+    /// as you dig, so within half a second the raycast is looking THROUGH the
+    /// hole it just made and lands on whatever is behind — which retargets the
+    /// dig, throws away the progress, and starts chewing the next block while
+    /// the first stands half-eaten. Reported from the window exactly that way.
+    ///
+    /// Cleared by releasing the button, and by the block running out. A chisel
+    /// does not lock: taking one named cell is the whole point of it, and
+    /// pointing through a hole to reach the cell behind is what it is for.
+    dig_lock: Option<tiamot_core::SubNodePos>,
     /// Whether the player was on the ground last frame, for the landing cue.
     was_on_ground: bool,
     /// The sandbox that runs pushed HUD scripts, if one could be built.
@@ -1030,6 +1042,7 @@ impl App {
             joined: false,
             warnings: Vec::new(),
             cues: std::collections::BTreeMap::new(),
+            dig_lock: None,
             was_on_ground: true,
             hud_vm: match tiamot_core::script::HudVm::new(tiamot_core::script::HudLimits::default())
             {
@@ -1770,17 +1783,70 @@ impl App {
             self.stop_digging();
             return;
         }
-        let Some(target) = self.dig_target() else {
+        let Some(target) = self.held_dig_target() else {
             return;
         };
+        self.dig_lock = Some(target);
         self.connection.send(Command::Dig {
             target: Some(target),
         });
     }
 
+    /// What this frame's dig is aimed at, honouring the held-button lock.
+    ///
+    /// See [`App::dig_lock`]. The lock survives only while the block it names
+    /// still has something in it — once it is empty the crosshair chooses
+    /// again, so holding the button walks along a wall one whole block at a
+    /// time instead of boring a tunnel through several at once.
+    fn held_dig_target(&self) -> Option<tiamot_core::SubNodePos> {
+        if self.locks_onto_a_block()
+            && let Some(locked) = self.dig_lock
+            && self.block_has_material(locked)
+        {
+            return Some(locked);
+        }
+        self.dig_target()
+    }
+
+    /// Whether the tool in hand takes whole blocks.
+    fn locks_onto_a_block(&self) -> bool {
+        self.held_tool()
+            .is_none_or(|tool| tool.brush != tiamot_core::dig::Brush::SubNode.name())
+    }
+
+    /// Whether the block containing this cell still has any material in it.
+    fn block_has_material(&self, cell: tiamot_core::SubNodePos) -> bool {
+        let Some(predictor) = self.predictor.as_ref() else {
+            return false;
+        };
+        let origin = predictor.origin();
+        let span = tiamot_core::CHUNK_SUBNODES as i32;
+        let block = cell.block();
+        let voxels = phys::Voxels::new(&self.store, origin);
+        let base = [
+            block.x * tiamot_core::SUBNODES_PER_AXIS as i32 - origin.x * span,
+            block.y * tiamot_core::SUBNODES_PER_AXIS as i32 - origin.y * span,
+            block.z * tiamot_core::SUBNODES_PER_AXIS as i32 - origin.z * span,
+        ];
+        let span = i32::from(u8::try_from(tiamot_core::SUBNODES_PER_AXIS).unwrap_or(3));
+        (0..span).any(|z| {
+            (0..span).any(|y| {
+                (0..span).any(|x| {
+                    voxels
+                        .material(base[0] + x, base[1] + y, base[2] + z)
+                        .is_some_and(|material| !material.is_air())
+                })
+            })
+        })
+    }
+
     /// Stops digging, discarding progress.
     pub fn stop_digging(&mut self) {
         self.dig = None;
+        // **The lock is the button, not the block.** Releasing frees the
+        // crosshair even mid-block, which is what makes a half-dug block
+        // something a player can walk away from and come back to.
+        self.dig_lock = None;
         self.connection.send(Command::Dig { target: None });
     }
 
@@ -1818,16 +1884,17 @@ impl App {
     /// Empty when nothing is in reach, which includes the sky.
     #[must_use]
     pub fn selection(&self) -> Vec<tiamot_core::SubNodePos> {
-        let Some(hit) = self.looking_at() else {
-            return Vec::new();
-        };
-        let Some(cell) = self.target_of(hit.cell) else {
+        // **The outline follows the dig, not the crosshair.** While a block
+        // brush is locked onto a block, that block stays highlighted even
+        // though the ray now passes through the hole being made — the outline
+        // is what tells a player which block their button is spending time on,
+        // and having it jump to the one behind while they were still digging
+        // the first was half of what "point through it" looked like.
+        let Some(cell) = self.held_dig_target() else {
             return Vec::new();
         };
 
-        let whole_block = self
-            .held_tool()
-            .is_none_or(|tool| tool.brush != tiamot_core::dig::Brush::SubNode.name());
+        let whole_block = self.locks_onto_a_block();
         if !whole_block {
             return vec![cell];
         }

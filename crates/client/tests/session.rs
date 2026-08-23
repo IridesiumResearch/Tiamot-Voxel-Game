@@ -1865,3 +1865,131 @@ fn the_menu_is_the_front_door_and_closing_it_closes_what_it_opened() {
     app.shutdown();
     server.stop();
 }
+
+#[test]
+fn a_held_dig_finishes_its_block_before_looking_through_the_hole() {
+    // **Reported from the window.** A block comes apart as you dig it, so
+    // within half a second the raycast is looking THROUGH the hole it just made
+    // and lands on whatever is behind. That retargeted the dig, threw away the
+    // progress, and started chewing the next block while the first stood
+    // half-eaten — so holding the button bored a ragged tunnel instead of
+    // clearing one block at a time.
+    //
+    // The lock is the BUTTON, not the block: releasing frees the crosshair
+    // mid-block, which is what makes a half-dug block something a player can
+    // walk away from.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("dig-lock");
+    let mut app = client("dig-lock", &server, gpu);
+    assert!(
+        run_frames(&mut app, |app| app.joined() && app.predicting()),
+        "never joined: {:?}",
+        app.warnings()
+    );
+
+    app.look_down_by(std::f32::consts::FRAC_PI_4);
+    assert!(
+        run_frames(&mut app, |app| app.dig_target().is_some()),
+        "the crosshair found nothing to dig"
+    );
+    // Let the world settle before deciding what "the block it started on"
+    // means: chunks are still arriving, and the first frame's raycast can land
+    // on something that is not there a moment later.
+    for _ in 0..30 {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    // The first press is what takes the lock, so the block it locked onto is
+    // read from the selection AFTER it — not from the raycast before it.
+    app.dig();
+    let first = app
+        .selection()
+        .first()
+        .expect("a selection once digging")
+        .block();
+
+    // Hold the button through a good part of one block's worth of digging —
+    // long enough that sub-nodes have visibly gone and the raw raycast is
+    // looking through the hole, and short enough that the block is not finished.
+    // **Only while the block is still there.** Once it is empty the lock is
+    // meant to release, so checking past that point would assert the opposite
+    // of the intended behaviour — which is exactly what a first version of this
+    // did, over a window slightly longer than one block takes to break.
+    let still_there = |app: &App| {
+        let base = tiamot_core::SubNodePos::new(first.x * 3, first.y * 3, first.z * 3);
+        app.store().get(first.chunk()).is_some_and(|chunk| {
+            (0..3).any(|y| {
+                (0..3).any(|z| {
+                    (0..3).any(|x| {
+                        chunk
+                            .get_subnode(tiamot_core::SubNodePos::new(
+                                base.x + x,
+                                base.y + y,
+                                base.z + z,
+                            ))
+                            .is_some_and(|material| !material.is_air())
+                    })
+                })
+            })
+        })
+    };
+
+    let mut wandered = None;
+    let mut ray_moved = false;
+    for _ in 0..60 {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        app.dig();
+        if !still_there(&app) {
+            break;
+        }
+
+        // The RAW raycast is expected to move: that is the hole opening, and
+        // it is the thing that used to drag the dig with it.
+        if app.dig_target().is_some_and(|aim| aim.block() != first) {
+            ray_moved = true;
+        }
+        // The selection is what the dig is actually spending time on, and what
+        // the player sees. It must not move.
+        if let Some(shown) = app.selection().first()
+            && shown.block() != first
+        {
+            wandered = Some(shown.block());
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    assert!(
+        wandered.is_none(),
+        "the dig moved from {first:?} to {:?} while the button was still held",
+        wandered.expect("checked")
+    );
+    assert!(
+        ray_moved,
+        "the crosshair never once pointed past {first:?}, so the block never \
+         opened up and this test did not exercise the lock at all"
+    );
+
+    // And releasing frees it: the crosshair is the aim again.
+    app.stop_digging();
+    for _ in 0..10 {
+        assert!(app.pump_network(), "the connection ended");
+        app.advance(Input::default(), 1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        app.selection()
+            .first()
+            .is_none_or(|shown| shown.block() != first)
+            || app.dig_target().is_some_and(|aim| aim.block() == first),
+        "releasing the button did not give the crosshair back"
+    );
+
+    app.stop_digging();
+    app.shutdown();
+    assert!(server.stop());
+}
