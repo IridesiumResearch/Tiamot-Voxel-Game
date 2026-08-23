@@ -1646,7 +1646,31 @@ impl ServerHandle {
                                 // and a rejoining player sees what is already
                                 // there (charter rule 4's rule for randomness).
                                 tiamot_core::dig::Brush::Block => {
-                                    crumble_bites(&mut world, &mut source, target.block(), chips)
+                                    // Which side the digger is on, so the block
+                                    // comes apart from the face they can see.
+                                    // Inferred from the eye rather than sent by
+                                    // the client: a normal on the wire would be
+                                    // one more thing a client could lie about,
+                                    // and this is already known here.
+                                    let toward = shared
+                                        .player_eye(&uuid)
+                                        .map_or([0.0, 1.0, 0.0], |(origin, eye)| {
+                                            let at = tiamot_core::ent::Transform::at(origin, eye)
+                                                .to_world();
+                                            let block = target.block();
+                                            [
+                                                at[0] - (f64::from(block.x) + 0.5),
+                                                at[1] - (f64::from(block.y) + 0.5),
+                                                at[2] - (f64::from(block.z) + 0.5),
+                                            ]
+                                        });
+                                    crumble_bites(
+                                        &mut world,
+                                        &mut source,
+                                        target.block(),
+                                        chips,
+                                        toward,
+                                    )
                                 }
                             };
                             for edit in edits {
@@ -2882,16 +2906,21 @@ struct Earshot {
 ///
 /// Cells already gone are skipped, so a block half dug by somebody else carries
 /// on from where it is rather than spending bites on air.
+///
+/// `toward` points from the block to whoever is digging it, so the face they
+/// are looking at comes away first and what is left is resting against the far
+/// side — see [`tiamot_core::dig::crumble_order`].
 fn crumble_bites(
     world: &mut crate::world::World,
     source: &mut dyn crate::world::ChunkSource,
     block: tiamot_core::BlockPos,
     count: u32,
+    toward: [f64; 3],
 ) -> Vec<tiamot_core::proto::Edit> {
     let Ok(cells) = world.block_cells(block, source) else {
         return Vec::new();
     };
-    let order = tiamot_core::dig::crumble_order(world.seed(), block);
+    let order = tiamot_core::dig::crumble_order(world.seed(), block, toward);
     let mut edits = Vec::with_capacity(count as usize);
     for index in order {
         if edits.len() >= count as usize {

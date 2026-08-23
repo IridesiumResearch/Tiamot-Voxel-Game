@@ -718,10 +718,14 @@ function game.play_loop(spec) end
 ---
 ---Sets the entity's `drive`, so anything you set yourself in the same tick is
 ---overwritten. Steer or drive; not both.
+---`gait` takes the same three names `set_entity`'s drive does — `"walk"`,
+---`"sprint"`, `"sneak"` — and an unrecognised one walks, because a typo in a
+---gait should not stop a mob dead.
 ---@param id integer
 ---@param target { x: number, y: number, z: number }
+---@param gait "walk"|"sprint"|"sneak"|nil
 ---@return boolean|nil going
-function game.steer_entity(id, target) end
+function game.steer_entity(id, target, gait) end
 
 ---Where the day stands: 0 at midnight, 0.5 at noon, wrapping at 1.
 ---

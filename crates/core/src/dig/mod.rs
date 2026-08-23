@@ -291,11 +291,30 @@ impl Dig {
 /// on who was standing there — so this is a seeded stream keyed by the block's
 /// own position (charter rule 4's rule for randomness), not `rand`.
 ///
+/// # And it eats from the side you are standing on
+///
+/// `toward` points from the block to whoever is digging it. The cells nearest
+/// that side go first, shuffled within each layer so the face still crumbles
+/// rather than peeling.
+///
+/// **This is what makes a half-dug block look settled.** Dig down at the ground
+/// and the top comes away, leaving the remainder resting on the floor of the
+/// block; dig sideways into a wall and the near face goes, leaving the rest
+/// standing against the back. Nothing moves afterwards, which is the whole
+/// argument for doing it here: the alternative — letting sub-nodes fall
+/// together when a chunk reloads — would make the world depend on when chunks
+/// happened to be evicted, and a world whose contents depend on that is one the
+/// determinism gate cannot check and two players cannot agree on.
+///
 /// Returns the cell indices in the order they should be taken. Every index
 /// appears exactly once, so a caller that walks it and skips the empty ones
 /// visits every occupied cell.
 #[must_use]
-pub fn crumble_order(world_seed: u64, block: crate::coords::BlockPos) -> [u8; SUBNODES_PER_BLOCK] {
+pub fn crumble_order(
+    world_seed: u64,
+    block: crate::coords::BlockPos,
+    toward: [f64; 3],
+) -> [u8; SUBNODES_PER_BLOCK] {
     let mut order = [0u8; SUBNODES_PER_BLOCK];
     for (index, slot) in order.iter_mut().enumerate() {
         *slot = u8::try_from(index).unwrap_or(0);
@@ -315,7 +334,41 @@ pub fn crumble_order(world_seed: u64, block: crate::coords::BlockPos) -> [u8; SU
         let swap = rng.below(index as u64 + 1) as usize;
         order.swap(index, swap);
     }
+
+    // Then near-side first. A STABLE sort, so the shuffle above survives inside
+    // each layer — without that the three cells of a layer would always come
+    // off in index order and the face would peel in stripes.
+    let (axis, near_first) = dominant_axis(toward);
+    order.sort_by_key(|index| {
+        let offset = crate::block::subnode_offset(usize::from(*index));
+        let depth = match axis {
+            0 => offset.0,
+            1 => offset.1,
+            _ => offset.2,
+        };
+        if near_first { 2 - depth } else { depth }
+    });
     order
+}
+
+/// Which way `toward` mostly points, and whether that is the high end.
+///
+/// Approximate on purpose: a player digging from above and slightly to one side
+/// wants the top to come off, not a diagonal. The dominant component is what
+/// "the side you are standing on" means at block scale, and ties fall to the
+/// vertical because looking straight along an axis at a block is the case where
+/// the other two are meaningless.
+fn dominant_axis(toward: [f64; 3]) -> (usize, bool) {
+    let magnitude = [toward[0].abs(), toward[1].abs(), toward[2].abs()];
+    let mut axis = 1;
+    if magnitude[0] > magnitude[axis] {
+        axis = 0;
+    }
+    if magnitude[2] > magnitude[axis] {
+        axis = 2;
+    }
+    // A viewer on the high side of the block eats the high cells first.
+    (axis, toward[axis] >= 0.0)
 }
 
 /// Where `game.get_tool` and `game.set_tool` reach.
@@ -501,27 +554,75 @@ mod tests {
     fn a_block_crumbles_the_same_way_for_everybody_and_differently_from_its_neighbour() {
         use crate::coords::BlockPos;
 
-        let here = crumble_order(7, BlockPos::new(4, 9, -2));
+        const ABOVE: [f64; 3] = [0.0, 4.0, 0.0];
+        let here = crumble_order(7, BlockPos::new(4, 9, -2), ABOVE);
 
         // **The same, every time and for everyone.** Two players watching one
         // block come apart must see the same shape at the same moment, and a
         // player who rejoins must see what the world already looks like.
-        assert_eq!(here, crumble_order(7, BlockPos::new(4, 9, -2)));
+        assert_eq!(here, crumble_order(7, BlockPos::new(4, 9, -2), ABOVE));
 
         // Different for the block next to it, or a wall peels in one motion.
-        assert_ne!(here, crumble_order(7, BlockPos::new(5, 9, -2)));
+        assert_ne!(here, crumble_order(7, BlockPos::new(5, 9, -2), ABOVE));
         // And different in another world, like every other seeded stream.
-        assert_ne!(here, crumble_order(8, BlockPos::new(4, 9, -2)));
+        assert_ne!(here, crumble_order(8, BlockPos::new(4, 9, -2), ABOVE));
 
         // Every cell exactly once, so a caller walking it reaches all of them.
         let mut seen = here;
         seen.sort_unstable();
         let expected: Vec<u8> = (0..SUBNODES_PER_BLOCK as u8).collect();
         assert_eq!(seen.as_slice(), expected.as_slice());
+    }
 
-        // Not the identity, or the block peels in flat layers — which reads as
-        // a bug rather than as breaking, and is the whole reason for shuffling.
-        assert_ne!(here.as_slice(), expected.as_slice());
+    #[test]
+    fn a_block_comes_apart_from_the_side_it_is_being_dug_from() {
+        use crate::coords::BlockPos;
+
+        let block = BlockPos::new(0, 0, 0);
+        // The layer each cell sits in along an axis: 0, 1 or 2.
+        let layer = |index: u8, axis: usize| {
+            let offset = crate::block::subnode_offset(usize::from(index));
+            match axis {
+                0 => offset.0,
+                1 => offset.1,
+                _ => offset.2,
+            }
+        };
+
+        // **From above: the top nine come off first.** What is left rests on
+        // the floor of the block, which is what makes a half-dug hole look
+        // settled rather than hollowed out in the middle.
+        let from_above = crumble_order(3, block, [0.2, 5.0, -0.3]);
+        for index in &from_above[..9] {
+            assert_eq!(layer(*index, 1), 2, "a cell from below came off first");
+        }
+        for index in &from_above[18..] {
+            assert_eq!(layer(*index, 1), 0, "a top cell was left until last");
+        }
+
+        // From below, the same block goes the other way up.
+        let from_below = crumble_order(3, block, [0.0, -5.0, 0.0]);
+        for index in &from_below[..9] {
+            assert_eq!(layer(*index, 1), 0);
+        }
+
+        // And sideways: dig into a wall from the east and the east face goes,
+        // leaving the rest standing against the back of the block.
+        let from_east = crumble_order(3, block, [6.0, 1.0, 0.5]);
+        for index in &from_east[..9] {
+            assert_eq!(layer(*index, 0), 2, "the near face did not come off first");
+        }
+
+        // **Still shuffled inside each layer.** Without a stable sort the three
+        // cells of a row would come off in index order every time and the face
+        // would peel in stripes rather than crumble.
+        let first_layer: Vec<u8> = from_above[..9].to_vec();
+        let mut ordered = first_layer.clone();
+        ordered.sort_unstable();
+        assert_ne!(
+            first_layer, ordered,
+            "the near layer came off in index order, so it peels rather than crumbles"
+        );
     }
 
     #[test]

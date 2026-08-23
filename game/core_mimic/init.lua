@@ -97,27 +97,43 @@ end
 --- and a mob that slides through walls is not eerie, it is broken.
 local function steer(id, self_pos, target, gait, anim)
     local dx, dz = target.x - self_pos.x, target.z - self_pos.z
-    if distance(self_pos, target) < 0.35 then
-        -- **Standing still is ANIM_IDLE**, and it has to be said explicitly:
-        -- `anim or ANIM_IDLE` looks like it does this and does not. Lua's `or`
-        -- falls through on `false` and `nil` only, and every animation tag —
-        -- including zero — is truthy, so that expression is just `anim`. A
-        -- mimic that stopped went on walking on the spot.
+
+    -- **The engine drives; this mod decides where to.**
+    --
+    -- `game.steer_entity` sets the walk direction AND whether to jump, which is
+    -- the part a mod cannot work out for itself: knowing whether to hop needs a
+    -- look at the block in front of the mimic's feet. Doing it by hand here is
+    -- why the mimic could not get out of a hole — it set a direction and never
+    -- once jumped, so a one-block lip held it for ever.
+    local going = game.steer_entity(id, target, gait or "walk")
+
+    if going == false then
+        -- Arrived. **Standing still is ANIM_IDLE**, and it has to be said
+        -- explicitly: `anim or ANIM_IDLE` looks like it does this and does not.
+        -- Lua's `or` falls through on `false` and `nil` only, and every
+        -- animation tag — including zero — is truthy, so that expression is
+        -- just `anim`. A mimic that stopped went on walking on the spot.
         game.set_entity(id, { drive = { walk = { x = 0, z = 0 } }, anim = ANIM_IDLE })
         return
     end
-    -- Magnitude is ignored — the gait decides how fast anything moves — so this
-    -- is a direction and nothing more.
+    if going == nil then
+        -- The mimic is gone, or the world could not be looked at this tick.
+        -- Neither is worth reacting to; ask again next tick.
+        return
+    end
+
+    -- Facing and animation, on top of the drive the engine just set. A patch
+    -- leaves out what it does not name, so this does not undo the steering.
+    --
+    -- **Facing follows travel.** The engine has no opinion about where a mob
+    -- looks — `Transform.yaw` is presentation and nothing in the physics reads
+    -- it — so pointing the body is this mod's job, and a mimic that never
+    -- turned faced north for ever.
+    --
+    -- `atan` is a transcendental, which charter rule 4 bans from the
+    -- SIMULATION. This is not simulation: a heading changes nothing about where
+    -- anything is, and the engine sends it quantised to a byte.
     game.set_entity(id, {
-        drive = { walk = { x = dx, z = dz }, gait = gait or "walk" },
-        -- **Facing follows travel.** The engine has no opinion about where a
-        -- mob looks — `Transform.yaw` is presentation and nothing in the
-        -- physics reads it — so pointing the body is this mod's job, and a
-        -- mimic that never turned faced north for ever.
-        --
-        -- `atan` is a transcendental, which charter rule 4 bans from the
-        -- SIMULATION. This is not simulation: a heading changes nothing about
-        -- where anything is, and the engine sends it quantised to a byte.
         yaw = math.atan(dx, dz),
         anim = anim or ANIM_WALK,
     })

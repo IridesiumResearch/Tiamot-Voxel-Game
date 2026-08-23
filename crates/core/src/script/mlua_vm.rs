@@ -2070,8 +2070,16 @@ impl MluaVm {
         let entities = std::sync::Arc::clone(&self.entities);
         let paths = std::sync::Arc::clone(&self.paths);
         self.lua
-            .create_function(move |_, (id, target): (u64, Table)| {
+            .create_function(move |_, (id, target, gait): (u64, Table, Option<String>)| {
                 let to: [f64; 3] = [target.get("x")?, target.get("y")?, target.get("z")?];
+                // The same three names `set_entity`'s drive takes, so a mod
+                // that knows one knows the other. An unknown one walks rather
+                // than erroring: a typo in a gait should not stop a mob dead.
+                let gait = match gait.as_deref() {
+                    Some("sprint") => crate::phys::Gait::Sprint,
+                    Some("sneak") => crate::phys::Gait::Sneak,
+                    _ => crate::phys::Gait::Walk,
+                };
 
                 let Ok(entity_slot) = entities.lock() else {
                     return Ok(mlua::Value::Nil);
@@ -2113,7 +2121,7 @@ impl MluaVm {
                         drive: Some(crate::phys::Intent {
                             walk: steer.walk,
                             jump: steer.jump,
-                            gait: crate::phys::Gait::Walk,
+                            gait,
                         }),
                         ..Default::default()
                     },
