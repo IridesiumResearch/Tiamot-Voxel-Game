@@ -33,11 +33,87 @@ pub struct Stack {
     pub material: MaterialId,
     /// How much, in units. 27 units is one whole block.
     pub units: u32,
+    /// The arrangement each item of this stack is cut to, if any.
+    ///
+    /// See [`Shape`]. `None` is loose material — what digging yields and what
+    /// a full block places from.
+    pub shape: Option<Shape>,
+}
+
+/// A sub-node arrangement a quantity of material has been cut to.
+///
+/// # Why a stack carries one at all
+///
+/// The engine's headline feature is that a block need not be a cube. Until now
+/// that was only true of blocks in the WORLD: an inventory held loose material
+/// and placing it made a cube, so a shape a player chiselled could not be kept,
+/// carried, stacked or placed again.
+///
+/// A shape is a 27-bit occupancy mask over a block's sub-nodes — the same mask
+/// [`crate::block::BlockContent::Partial`] stores, so placing one is writing
+/// down what is already held rather than converting between two ideas of shape.
+///
+/// # What it costs, and why that keeps charter rule 5
+///
+/// One item of a shape costs [`Shape::cells`] units, so a stack's `units` is
+/// still just units and conservation is still just addition. Ten items of a
+/// five-cell shape is fifty units, and melting them back down gives fifty units
+/// of loose material. **There is no second quantity and no exchange rate.**
+///
+/// # Stacking
+///
+/// Two stacks merge only if they are the same material AND the same shape.
+/// That is the whole of "blocks crafted into the same shape stack": identical
+/// things stack, and a stair and a slab of the same stone are not identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Shape(u32);
+
+impl Shape {
+    /// A shape from a 27-bit occupancy mask.
+    ///
+    /// Returns `None` for empty — nothing to hold — and for full, which is a
+    /// whole block and is `None` by definition: a cube is loose material's own
+    /// arrangement, and giving it a second spelling would mean a full block and
+    /// twenty-seven units of the same stone did not stack.
+    #[must_use]
+    pub const fn new(occupancy: u32) -> Option<Self> {
+        let mask = occupancy & Self::ALL;
+        if mask == 0 || mask == Self::ALL {
+            None
+        } else {
+            Some(Self(mask))
+        }
+    }
+
+    /// Every sub-node of a block, as a mask.
+    pub const ALL: u32 = (1 << UNITS_PER_BLOCK) - 1;
+
+    /// The occupancy mask, for writing into a block.
+    #[must_use]
+    pub const fn occupancy(self) -> u32 {
+        self.0
+    }
+
+    /// How many sub-nodes one item of this shape occupies, which is what one
+    /// costs in units.
+    #[must_use]
+    pub const fn cells(self) -> u32 {
+        self.0.count_ones()
+    }
 }
 
 /// Why a stack operation could not be completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StackError {
+    /// Merging two stacks cut to different shapes.
+    #[error("cannot merge a {left:?} with a {right:?}: different shapes")]
+    ShapeMismatch {
+        /// Shape of the stack being merged into.
+        left: Option<Shape>,
+        /// Shape of the stack being merged in.
+        right: Option<Shape>,
+    },
+
     /// Merging two stacks of different materials.
     #[error("cannot merge {left:?} with {right:?}: different materials")]
     MaterialMismatch {
@@ -72,7 +148,46 @@ impl Stack {
     /// Returns `None` for air or for zero units — neither is a stack.
     #[must_use]
     pub fn new(material: MaterialId, units: u32) -> Option<Self> {
-        (!material.is_air() && units > 0).then_some(Self { material, units })
+        (!material.is_air() && units > 0).then_some(Self {
+            material,
+            units,
+            shape: None,
+        })
+    }
+
+    /// A stack of `count` items cut to `shape`.
+    ///
+    /// The units follow from the shape: one item costs [`Shape::cells`] of
+    /// them, so there is one quantity and no exchange rate.
+    ///
+    /// Returns `None` for air, zero, or an amount that overflows.
+    #[must_use]
+    pub fn shaped(material: MaterialId, shape: Shape, count: u32) -> Option<Self> {
+        let units = count.checked_mul(shape.cells())?;
+        Self::new(material, units).map(|stack| Self {
+            shape: Some(shape),
+            ..stack
+        })
+    }
+
+    /// How many whole items this stack holds.
+    ///
+    /// For loose material that is whole blocks; for a shaped stack it is how
+    /// many of that shape.
+    #[must_use]
+    pub const fn count(&self) -> u32 {
+        let per = match self.shape {
+            Some(shape) => shape.cells(),
+            None => UNITS_PER_BLOCK,
+        };
+        // A shape with no cells is unrepresentable — `Shape::new` refuses an
+        // empty mask — so this is a guard against a `Shape` that cannot exist
+        // rather than a case anything reaches. `match` rather than
+        // `checked_div().unwrap_or()` only because `unwrap_or` is not const.
+        match self.units.checked_div(per) {
+            Some(count) => count,
+            None => 0,
+        }
     }
 
     /// A stack of `blocks` whole blocks.
@@ -95,6 +210,16 @@ impl Stack {
             return Err(StackError::MaterialMismatch {
                 left: self.material,
                 right: other.material,
+            });
+        }
+        // **Same material is not enough.** A stair and a slab of one stone are
+        // not the same thing, and merging them would lose the shape of
+        // whichever went second — the units would survive and the work would
+        // not. This is the whole of "blocks crafted into the same shape stack".
+        if self.shape != other.shape {
+            return Err(StackError::ShapeMismatch {
+                left: self.shape,
+                right: other.shape,
             });
         }
         // Checked rather than saturating: silently capping would destroy
@@ -129,6 +254,7 @@ impl Stack {
         Ok(Self {
             material: self.material,
             units,
+            shape: self.shape,
         })
     }
 
@@ -227,7 +353,17 @@ pub fn break_block(block: BlockView<'_>) -> Vec<Stack> {
                 }
                 match stacks.binary_search_by_key(&material, |stack| stack.material) {
                     Ok(found) => stacks[found].units += 1,
-                    Err(insert_at) => stacks.insert(insert_at, Stack { material, units: 1 }),
+                    // Loose, always: what comes out of a block is material, and
+                    // the shape it happened to be arranged in belonged to the
+                    // block rather than to the stone.
+                    Err(insert_at) => stacks.insert(
+                        insert_at,
+                        Stack {
+                            material,
+                            units: 1,
+                            shape: None,
+                        },
+                    ),
                 }
             }
             stacks
@@ -263,6 +399,7 @@ pub fn removed_units(before: BlockView<'_>, after: BlockView<'_>) -> Vec<Stack> 
                 Stack {
                     material: was,
                     units: 1,
+                    shape: None,
                 },
             ),
         }
@@ -282,7 +419,12 @@ pub fn consolidate(stacks: impl IntoIterator<Item = Stack>) -> Vec<Stack> {
         if stack.is_empty() || stack.material.is_air() {
             continue;
         }
-        match merged.binary_search_by_key(&stack.material, |existing| existing.material) {
+        // Keyed by material AND shape: two shapes of one stone are two stacks,
+        // and sorting by the pair keeps the result ordered without a second
+        // pass. Ascending material first, so drop order is unchanged for the
+        // loose material that is almost all of it.
+        let key = (stack.material, stack.shape);
+        match merged.binary_search_by_key(&key, |existing| (existing.material, existing.shape)) {
             Ok(found) => {
                 if merged[found].merge(stack).is_err() {
                     // Overflow: keep it separate rather than losing material.
@@ -340,6 +482,117 @@ pub fn debit(stacks: &mut Vec<Stack>, material: MaterialId, units: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// A stair-ish shape: the lower half plus one step. Five cells.
+    fn stair() -> Shape {
+        Shape::new(0b101).expect("two cells is a shape")
+    }
+
+    #[test]
+    fn a_shape_is_neither_nothing_nor_a_whole_block() {
+        // Empty has nothing to hold. Full is a cube, which is what loose
+        // material already places — giving it a second spelling would mean a
+        // full block and twenty-seven units of the same stone did not stack.
+        assert!(Shape::new(0).is_none());
+        assert!(Shape::new(Shape::ALL).is_none());
+        assert!(Shape::new(0b111).is_some());
+
+        // Bits past the block are not a shape's business.
+        let clipped = Shape::new(0b1 | (1 << 30)).expect("the low bit survives");
+        assert_eq!(clipped.occupancy(), 0b1);
+    }
+
+    #[test]
+    fn one_item_of_a_shape_costs_its_cells_and_nothing_else() {
+        // **Charter rule 5 with no exchange rate.** A stack's units are units,
+        // whatever it is cut to, so conservation is still addition — and
+        // melting a shaped stack down gives back exactly what went in.
+        let shape = stair();
+        let stack = Stack::shaped(MaterialId(3), shape, 10).expect("a shaped stack");
+        assert_eq!(stack.units, 10 * shape.cells());
+        assert_eq!(stack.count(), 10);
+
+        // Loose material counts in whole blocks, which is the same rule read
+        // with the block as the shape.
+        let loose = Stack::from_blocks(MaterialId(3), 4).expect("four blocks");
+        assert_eq!(loose.count(), 4);
+        assert_eq!(loose.units, 4 * UNITS_PER_BLOCK);
+    }
+
+    #[test]
+    fn the_same_shape_stacks_and_a_different_one_does_not() {
+        // The whole of "blocks crafted into the same shape stack": identical
+        // things stack, and a stair and a slab of one stone are not identical.
+        let shape = stair();
+        let other = Shape::new(0b11).expect("a different shape");
+
+        let mut mine = Stack::shaped(MaterialId(3), shape, 2).expect("stack");
+        assert!(
+            mine.merge(Stack::shaped(MaterialId(3), shape, 3).expect("stack"))
+                .is_ok()
+        );
+        assert_eq!(mine.count(), 5);
+
+        // Same stone, different cut: refused, and the units of whichever went
+        // second are NOT quietly folded in.
+        let before = mine.units;
+        assert!(matches!(
+            mine.merge(Stack::shaped(MaterialId(3), other, 1).expect("stack")),
+            Err(StackError::ShapeMismatch { .. })
+        ));
+        assert_eq!(mine.units, before, "a refused merge changed the stack");
+
+        // And shaped never merges with loose, which is the case that would
+        // otherwise silently turn somebody's work back into rubble.
+        assert!(matches!(
+            mine.merge(Stack::new(MaterialId(3), 27).expect("loose")),
+            Err(StackError::ShapeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn splitting_a_shaped_stack_keeps_the_shape() {
+        let shape = stair();
+        let mut stack = Stack::shaped(MaterialId(3), shape, 4).expect("stack");
+        let taken = stack.split(shape.cells() * 2).expect("split");
+        assert_eq!(taken.shape, Some(shape));
+        assert_eq!(taken.count(), 2);
+        assert_eq!(stack.count(), 2);
+    }
+
+    #[test]
+    fn consolidating_keeps_shapes_apart() {
+        // Two cuts of one stone are two stacks. Keyed by the PAIR, so this does
+        // not depend on which order they arrive in.
+        let shape = stair();
+        let other = Shape::new(0b11).expect("a different shape");
+        let merged = consolidate([
+            Stack::shaped(MaterialId(3), shape, 1).expect("stack"),
+            Stack::new(MaterialId(3), 27).expect("loose"),
+            Stack::shaped(MaterialId(3), other, 1).expect("stack"),
+            Stack::shaped(MaterialId(3), shape, 2).expect("stack"),
+        ]);
+        assert_eq!(merged.len(), 3, "got {merged:?}");
+        let stairs = merged
+            .iter()
+            .find(|stack| stack.shape == Some(shape))
+            .expect("the stairs");
+        assert_eq!(stairs.count(), 3, "two arrivals of one shape should merge");
+    }
+
+    #[test]
+    fn what_comes_out_of_a_block_is_loose_material() {
+        // A shape belongs to the block, not to the stone. Digging a chiselled
+        // block gives rubble, and the arrangement is somebody's work to redo —
+        // which is what makes shape crafting worth doing at all.
+        let mut cells = [MaterialId::AIR; SUBNODES_PER_BLOCK];
+        cells[0] = MaterialId(3);
+        cells[4] = MaterialId(3);
+        let dropped = break_block(BlockView::Mixed(&cells));
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].shape, None);
+        assert_eq!(dropped[0].units, 2);
+    }
+
     use super::*;
     use crate::block::{Cells, EMPTY_CELLS, SUBNODES_PER_BLOCK};
 
@@ -378,7 +631,8 @@ mod tests {
             stacks,
             vec![Stack {
                 material: STONE,
-                units: 27
+                units: 27,
+                shape: None
             }]
         );
     }
@@ -398,7 +652,8 @@ mod tests {
             stacks,
             vec![Stack {
                 material: STONE,
-                units: 3
+                units: 3,
+                shape: None
             }]
         );
     }
@@ -417,15 +672,18 @@ mod tests {
             vec![
                 Stack {
                     material: STONE,
-                    units: 2
+                    units: 2,
+                    shape: None
                 },
                 Stack {
                     material: DIRT,
-                    units: 1
+                    units: 1,
+                    shape: None
                 },
                 Stack {
                     material: GRASS,
-                    units: 1
+                    units: 1,
+                    shape: None
                 },
             ]
         );
@@ -461,11 +719,13 @@ mod tests {
         let mut stack = Stack {
             material: STONE,
             units: 10,
+            shape: None,
         };
         stack
             .merge(Stack {
                 material: STONE,
                 units: 5,
+                shape: None,
             })
             .expect("merge");
         assert_eq!(stack.units, 15);
@@ -476,11 +736,13 @@ mod tests {
         let mut stack = Stack {
             material: STONE,
             units: 10,
+            shape: None,
         };
         let err = stack
             .merge(Stack {
                 material: DIRT,
                 units: 5,
+                shape: None,
             })
             .expect_err("materials differ");
         assert!(matches!(err, StackError::MaterialMismatch { .. }));
@@ -494,11 +756,13 @@ mod tests {
         let mut stack = Stack {
             material: STONE,
             units: u32::MAX,
+            shape: None,
         };
         let err = stack
             .merge(Stack {
                 material: STONE,
                 units: 1,
+                shape: None,
             })
             .expect_err("should overflow");
         assert!(matches!(err, StackError::Overflow { .. }));
@@ -514,13 +778,15 @@ mod tests {
         let mut stack = Stack {
             material: STONE,
             units: 30,
+            shape: None,
         };
         let taken = stack.split(12).expect("split");
         assert_eq!(
             taken,
             Stack {
                 material: STONE,
-                units: 12
+                units: 12,
+                shape: None
             }
         );
         assert_eq!(stack.units, 18);
@@ -531,6 +797,7 @@ mod tests {
         let mut stack = Stack {
             material: STONE,
             units: 30,
+            shape: None,
         };
         let taken = stack.split(30).expect("split");
         assert_eq!(taken.units, 30);
@@ -542,6 +809,7 @@ mod tests {
         let mut stack = Stack {
             material: STONE,
             units: 5,
+            shape: None,
         };
         let err = stack.split(6).expect_err("insufficient");
         assert!(matches!(err, StackError::Insufficient { .. }));
@@ -554,18 +822,22 @@ mod tests {
             Stack {
                 material: GRASS,
                 units: 3,
+                shape: None,
             },
             Stack {
                 material: STONE,
                 units: 4,
+                shape: None,
             },
             Stack {
                 material: GRASS,
                 units: 2,
+                shape: None,
             },
             Stack {
                 material: STONE,
                 units: 1,
+                shape: None,
             },
         ]);
         assert_eq!(
@@ -573,11 +845,13 @@ mod tests {
             vec![
                 Stack {
                     material: STONE,
-                    units: 5
+                    units: 5,
+                    shape: None
                 },
                 Stack {
                     material: GRASS,
-                    units: 5
+                    units: 5,
+                    shape: None
                 },
             ]
         );
@@ -589,10 +863,12 @@ mod tests {
             Stack {
                 material: STONE,
                 units: u32::MAX,
+                shape: None,
             },
             Stack {
                 material: STONE,
                 units: 100,
+                shape: None,
             },
         ]);
         assert_eq!(stacks.len(), 2, "material must not be destroyed");
@@ -605,21 +881,25 @@ mod tests {
             Stack {
                 material: MaterialId::AIR,
                 units: 27,
+                shape: None,
             },
             Stack {
                 material: STONE,
                 units: 0,
+                shape: None,
             },
             Stack {
                 material: STONE,
                 units: 3,
+                shape: None,
             },
         ]);
         assert_eq!(
             stacks,
             vec![Stack {
                 material: STONE,
-                units: 3
+                units: 3,
+                shape: None
             }]
         );
     }

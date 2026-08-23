@@ -14,7 +14,7 @@
 
 -- Virtual pixels. The canvas is 1080 tall and as wide as the window is; anchors
 -- do the rest, so these numbers mean the same thing on every monitor.
-local SLOTS = 6
+local SLOTS = 9
 local SLOT = 52
 local GAP = 4
 local PITCH = SLOT + GAP
@@ -34,7 +34,8 @@ local EMPTY = { 0, 0, 0, 90 }
 ---
 --- `SLOTS` is this mod's choice and nothing else's. The engine registers
 --- `engine:hotbar_1` to `_9` and clamps a selection to what is carried, so
---- changing this number changes what is drawn and nothing else breaks.
+--- changing this number changes what is drawn and nothing else breaks. Nine
+--- matches the keys the engine offers, which is why it is nine.
 local function hotbar(state)
     -- Centred as a group: the leftmost slot starts half the row's width to the
     -- left of the middle.
