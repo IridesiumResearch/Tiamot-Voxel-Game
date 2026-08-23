@@ -87,6 +87,8 @@ pub struct Control {
 #[derive(Debug, Default)]
 struct ControlInner {
     stop: AtomicBool,
+    /// Whether the simulation is suspended. See [`Control::set_paused`].
+    paused: AtomicBool,
     tick: AtomicU64,
     dropped: AtomicU64,
     /// Longest single tick observed, in microseconds.
@@ -124,6 +126,28 @@ impl Control {
     }
 
     /// Asks the simulation to finish the current tick and stop.
+    /// Suspends or resumes the simulation.
+    ///
+    /// **For singleplayer's pause menu**, and only ever set by the client that
+    /// owns an embedded server — a hosted server has other people in it and one
+    /// of them opening a menu must not stop the world.
+    ///
+    /// A paused tick loop reads the clock and throws the reading away, so time
+    /// spent in a menu is not charged to the simulation as debt. Nothing else
+    /// changes: connections stay up, chunks stay resident, and the world simply
+    /// does not advance.
+    pub fn set_paused(&self, paused: bool) {
+        self.inner
+            .paused
+            .store(paused, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the simulation is suspended.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.inner.paused.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn stop(&self) {
         // Release so that everything the caller did before asking to stop is
         // visible to the simulation thread when it observes the flag.
@@ -264,6 +288,20 @@ pub fn run<C: Clock, F: FnMut(u64)>(clock: &mut C, control: &Control, mut step: 
     clock.tick_elapsed();
 
     while !control.stopping() {
+        // **Paused: the clock is read and thrown away.**
+        //
+        // The world not lurching forward on resume is already guaranteed by the
+        // accumulator, which drops ticks rather than chasing them — verified by
+        // removing this line and watching the test still pass. What reading the
+        // clock here actually buys is that a pause is not an INCIDENT: without
+        // it every unpause logs "simulation fell behind", stores the menu's
+        // worth of ticks in the dropped counter, and makes the one metric that
+        // says whether the server is keeping up meaningless for the session.
+        if control.paused() {
+            clock.tick_elapsed();
+            clock.sleep(TICK_DURATION);
+            continue;
+        }
         let elapsed = clock.tick_elapsed();
         let advance = accumulator.advance(elapsed);
 

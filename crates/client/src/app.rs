@@ -774,6 +774,8 @@ pub struct App {
     volumes_dirty: bool,
     /// Whether the settings screen is showing.
     settings_open: bool,
+    /// Whether the player asked to quit from the menu.
+    quit_requested: bool,
     /// Whether the pause menu is on the screen.
     ///
     /// **Escape opens a menu rather than only releasing the cursor.** Releasing
@@ -1028,6 +1030,7 @@ impl App {
             volumes_dirty: false,
             settings_open: false,
             menu_open: false,
+            quit_requested: false,
             rebinding: None,
             bindings_dirty: false,
             connection,
@@ -2514,6 +2517,20 @@ impl App {
     #[must_use]
     pub const fn menu_open(&self) -> bool {
         self.menu_open
+    }
+
+    /// Asks the window to close the game.
+    ///
+    /// A flag rather than an exit call: quitting means saving the world and
+    /// leaving the server cleanly, and the window owns both. Raised here
+    /// because the button is here.
+    pub const fn request_quit(&mut self) {
+        self.quit_requested = true;
+    }
+
+    /// Takes the quit request, if one was made.
+    pub const fn take_quit_request(&mut self) -> bool {
+        std::mem::replace(&mut self.quit_requested, false)
     }
 
     /// Opens or closes the pause menu.

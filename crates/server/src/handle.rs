@@ -2699,6 +2699,22 @@ impl ServerHandle {
     /// Nothing is returned on failure — a thread that panicked has already
     /// logged. This returns `false` if either thread panicked, so a caller can
     /// treat the save as suspect.
+    /// Suspends or resumes the simulation.
+    ///
+    /// **Singleplayer's pause.** Only meaningful for an embedded server: a
+    /// hosted one has other people in it, and one of them opening a menu must
+    /// not stop the world for everybody. The client only calls this when it
+    /// owns the server it is talking to.
+    pub fn set_paused(&self, paused: bool) {
+        self.control.set_paused(paused);
+    }
+
+    /// Whether the simulation is suspended.
+    #[must_use]
+    pub fn paused(&self) -> bool {
+        self.control.paused()
+    }
+
     pub fn stop(mut self) -> bool {
         self.shutdown()
     }

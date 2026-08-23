@@ -200,10 +200,11 @@ fn draw_form(
     // So measure the tree first and lay it out into whichever is smaller. A
     // tree that genuinely wants the room still gets it, and a small one is a
     // small window.
-    let cap = (
-        (area.0 * 0.75).max(160.0) as i32,
-        (area.1 * 0.75).max(120.0) as i32,
-    );
+    // The same sheet the engine's own panels take — see `client::panel`. A
+    // mod's dialog is one of the screens a player reads as part of one system,
+    // so it may be smaller than this and never larger.
+    let sheet = crate::panel::size(area);
+    let cap = (sheet.0 as i32, sheet.1 as i32);
     let wanted = tiamot_core::ui::natural(tree, &ruler);
     let width = wanted.0.clamp(160, cap.0);
     let height = wanted.1.clamp(120, cap.1);

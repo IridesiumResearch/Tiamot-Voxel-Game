@@ -630,6 +630,24 @@ impl Client {
         // yet. Handled here, where the answer is known, on the transition
         // rather than every frame so a player can still take the cursor back
         // with Escape while a dialog is up.
+        // **Singleplayer pauses; a hosted game does not.** `embedded` is only
+        // `Some` when this client owns the server it is talking to — on
+        // somebody else's server there are other people in it, and one of them
+        // opening a menu must not stop the world for everybody.
+        if let Some(server) = self.embedded.as_ref() {
+            let wanted = surface.app.menu_open();
+            if server.paused() != wanted {
+                server.set_paused(wanted);
+            }
+        }
+
+        // Quitting from the menu ends the loop, and `exiting` does the rest:
+        // leave the server, then stop it. Order matters there and it is already
+        // written down once.
+        if surface.app.take_quit_request() {
+            return false;
+        }
+
         let dialog_open = !surface.app.dialogs().is_empty();
         if dialog_open && !self.released_for_dialog {
             self.grabbed = !grab(&surface.window, false);
@@ -1132,23 +1150,25 @@ fn draw_chat(app: &mut App, ctx: &egui::Context) {
 fn draw_menu(app: &mut App, ctx: &egui::Context) {
     let mut resume = false;
     let mut controls = false;
+    let mut quit = false;
     let mut scale = app.ui_scale();
     let mut hud = app.hud_visible();
     let mut overlay = app.debug_overlay();
 
-    // A centred panel sized to its contents, the same shape a server's dialog
-    // gets — the engine's own screens should not look like a different game
-    // from the ones a mod opens.
+    // **The same sheet every other panel gets**: centred, four by three, three
+    // quarters of the window. See `client::panel` for why one shape rather than
+    // four — a player reads these as one system or as four, and they were four.
     let screen = ctx.content_rect();
+    let area = (screen.width(), screen.height());
+    let (width, height) = client::panel::size(area);
+    let (x, y) = client::panel::origin(area);
     egui::Window::new("Menu")
         .collapsible(false)
         .resizable(false)
         .title_bar(false)
-        .default_pos(egui::pos2(
-            screen.center().x - 150.0,
-            screen.center().y - 150.0,
-        ))
-        .default_width(300.0)
+        .movable(false)
+        .fixed_pos(egui::pos2(screen.left() + x, screen.top() + y))
+        .fixed_size(egui::vec2(width, height))
         .show(ctx, |ui| {
             ui.vertical_centered_justified(|ui| {
                 ui.add_space(6.0);
@@ -1157,8 +1177,11 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
                 if ui.button("Resume").clicked() {
                     resume = true;
                 }
-                if ui.button("Controls and audio").clicked() {
+                if ui.button("Settings").clicked() {
                     controls = true;
+                }
+                if ui.button("Quit").clicked() {
+                    quit = true;
                 }
                 ui.add_space(10.0);
                 ui.separator();
@@ -1188,6 +1211,9 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
     }
     if resume {
         app.set_menu_open(false);
+    }
+    if quit {
+        app.request_quit();
     }
 }
 
@@ -1236,22 +1262,21 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
     let mut close = false;
     let mut volumes_changed = false;
 
-    // **A centred panel, like the inventory.** It was a bare egui window
-    // wherever egui felt like putting it, which is what "janky" meant: it
-    // opened off to one side, it could be dragged half off the screen, and it
-    // had no relationship to anything else the game draws. Sized and placed the
-    // same way a server's dialog is, so the engine's screens and a mod's look
-    // like they belong to one game.
+    // **The same sheet the menu gets.** It was a bare egui window wherever egui
+    // felt like putting it, which is what "janky" meant: it opened off to one
+    // side, it could be dragged half off the screen, and it had no relationship
+    // to anything else the game draws.
     let screen = ctx.content_rect();
+    let area = (screen.width(), screen.height());
+    let (width, height) = client::panel::size(area);
+    let (x, y) = client::panel::origin(area);
     egui::Window::new("Controls")
         .collapsible(false)
         .resizable(false)
         .title_bar(false)
-        .default_pos(egui::pos2(
-            screen.center().x - 280.0,
-            (screen.center().y - 300.0).max(8.0),
-        ))
-        .default_width(560.0)
+        .movable(false)
+        .fixed_pos(egui::pos2(screen.left() + x, screen.top() + y))
+        .fixed_size(egui::vec2(width, height))
         .show(ctx, |ui| {
             ui.heading("Controls and audio");
             ui.separator();
