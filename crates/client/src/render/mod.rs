@@ -208,115 +208,12 @@ pub fn sky_colour() -> [f32; 3] {
 
 /// Uploads a mesh into its own pair of buffers.
 ///
-/// For geometry that is not a chunk and never changes — the debug body — so it
-/// does not go through the chunk pool, which exists to recycle buffers for
-/// meshes that are rebuilt constantly.
-fn upload_mesh(gpu: &Gpu, mesh: &Mesh) -> ChunkMesh {
-    let (vertices, indices) = mesh.to_buffers();
-    let vertex_bytes: &[u8] = bytemuck::cast_slice(&vertices);
-    let index_bytes: &[u8] = bytemuck::cast_slice(&indices);
-
-    let vertex_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("body-vertices"),
-        size: vertex_bytes.len() as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let index_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("body-indices"),
-        size: index_bytes.len() as u64,
-        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    gpu.queue.write_buffer(&vertex_buffer, 0, vertex_bytes);
-    gpu.queue.write_buffer(&index_buffer, 0, index_bytes);
-
-    ChunkMesh {
-        vertices: vertex_buffer,
-        indices: index_buffer,
-        index_count: u32::try_from(indices.len()).unwrap_or(0),
-        // The debug body is a box, and a box holds no milk.
-        fluid: None,
-        used_bytes: (vertex_bytes.len() + index_bytes.len()) as u64,
-    }
-}
-
 /// How wide the debug body is, in cells.
 ///
 /// Rounded from the real AABB: 1.8 cells wide becomes 2, because a quad's
 /// extents are whole cells. A tenth of a block wider than the body it stands
 /// in, which nothing depends on — it is a shadow caster, not a hitbox.
 pub const BODY_WIDTH_CELLS: u8 = 2;
-
-/// A box the size of a player, for third-person view and for casting a shadow.
-///
-/// # Why the engine draws this at all
-///
-/// Entities are Task 12 and there is no player model. But a world with nothing
-/// in it that MOVES has no moving shadow, and "do the cascades look right" is a
-/// question you cannot answer by looking at a static pillar — the artefacts
-/// that matter (edges crawling, the near cascade's bias, a caster leaving its
-/// own shadow behind) all need something walking about.
-///
-/// So: a box, in the shape of the collision AABB, drawn only in third person.
-/// It is not a placeholder for a player model and should not grow into one;
-/// when Task 12 brings real entities this goes.
-///
-/// # Why it is built from quads rather than meshed
-///
-/// The mesher's job is a chunk of voxels. This is six faces at known positions,
-/// and running it through a mesher would mean inventing a voxel grid to hold
-/// something already known.
-fn body_mesh() -> Mesh {
-    use crate::mesher::Quad;
-    use crate::shade::Shade;
-
-    const WIDTH: u8 = BODY_WIDTH_CELLS;
-    const HEIGHT: u8 = 5;
-    /// The atlas slot it is drawn with. Slot 2 is the first real material in
-    /// every world this ships with, and a body that used the placeholder would
-    /// be magenta.
-    const MATERIAL: u16 = 2;
-
-    let lit = Shade {
-        light: [tiamot_core::light::Light::DAYLIGHT; 4],
-        // Full daylight lands exactly on a level, so there is no quarter of one
-        // left over.
-        fine: [0; 4],
-        // Fully open: a floating box has nothing boxing it in, and giving it
-        // occlusion would darken its corners for no geometric reason.
-        occlusion: [3; 4],
-    };
-    let mut quads = Vec::with_capacity(6);
-    // A positive face sits at `w + 1` — see `Mesh::to_buffers` — so the far
-    // side of a box spanning cells `0..n` is quad `w = n - 1`, not `n`. Writing
-    // the extent there stretches the box a cell past itself on three sides.
-    for (axis, positive, w, du, dv) in [
-        (0u8, false, 0, HEIGHT, WIDTH),
-        (0, true, WIDTH - 1, HEIGHT, WIDTH),
-        (1, false, 0, WIDTH, WIDTH),
-        (1, true, HEIGHT - 1, WIDTH, WIDTH),
-        (2, false, 0, WIDTH, HEIGHT),
-        (2, true, WIDTH - 1, WIDTH, HEIGHT),
-    ] {
-        quads.push(Quad {
-            axis,
-            positive,
-            w,
-            u: 0,
-            v: 0,
-            du,
-            dv,
-            material: MATERIAL,
-            shade: lit,
-        });
-    }
-    Mesh {
-        quads,
-        fluid_vertices: Vec::new(),
-        fluid_indices: Vec::new(),
-    }
-}
 
 /// One chunk's camera-relative offset, as an instance attribute.
 #[repr(C)]
@@ -698,17 +595,7 @@ pub struct Renderer {
     drawn: usize,
     /// How many chunks the last frame drew into the cascades.
     cast: usize,
-    /// The debug body's mesh, built once, and where it is this frame.
-    ///
-    /// `None` in first person, which is every frame until somebody asks for
-    /// third — a box drawn around the camera is a box drawn inside the player's
-    /// head, and all you see is its inside faces.
-    body: ChunkMesh,
-    /// Skinned figures — every entity and every other player.
-    ///
-    /// Beside the box rather than replacing it: the box is still what the
-    /// client's own debug body draws as, and a figure whose model failed to
-    /// load has to fall back to something.
+    /// Skinned figures — every entity, every other player, and now this one.
     skinned: skinned::Skinned,
     /// The figure pipeline for the swapchain format. Mode 3 keeps its own,
     /// compiled against the float target, in `post`.
@@ -720,6 +607,15 @@ pub struct Renderer {
     /// not allocate at all.
     skinned_shadow: Option<wgpu::RenderPipeline>,
     body_at: Option<[f32; 3]>,
+    /// The player's own figure, drawn last so the world pass can leave it out.
+    ///
+    /// **Their own body, on the same rig everybody else already sees them on.**
+    /// Other players arrive as entities and are drawn as `engine:humanoid`; the
+    /// local player was a hard-coded box, because their body has to move at
+    /// prediction rate rather than at the entity stream's twenty hertz and that
+    /// local path never learned the rig. The box was always marked as debug —
+    /// "should not grow into one; when Task 12 brings real entities this goes".
+    player: Option<skinned::Figure>,
     /// Whether the world pass draws the body, as opposed to only the cascades.
     ///
     /// **Position and visibility are separate on purpose.** In first person the
@@ -784,7 +680,6 @@ impl Renderer {
             .create_shader_module(wgpu::include_wgsl!("selection.wgsl"));
         let selection_pipeline =
             build_selection_pipeline(&gpu, &selection_shader, &bind_layout, COLOUR_FORMAT);
-        let body_buffers = upload_mesh(&gpu, &body_mesh());
 
         let selection_buffer = line_buffer(&gpu, "selection", SELECTION_CAPACITY);
         let border_buffer = line_buffer(&gpu, "chunk-borders", CHUNK_BORDER_CAPACITY);
@@ -890,9 +785,9 @@ impl Renderer {
             fog_end: f32::MAX,
             drawn: 0,
             cast: 0,
-            body: body_buffers,
             entities_at: Vec::new(),
             body_at: None,
+            player: None,
             body_visible: false,
         })
     }
@@ -959,20 +854,32 @@ impl Renderer {
         self.body_visible = visible;
     }
 
-    /// Where every entity in view is this frame, camera-relative, in cells.
+    /// The player's own figure, or `None` for a client not drawing one.
     ///
-    /// # The box is a stand-in, and a deliberate one
-    ///
-    /// Entities are drawn with the same box mesh the player's own body uses —
-    /// which is the collision AABB, not a figure. The packed vertex format
-    /// positions to a **sub-node cell**, six bits an axis, and a humanoid is
-    /// 5.4 cells tall and 1.8 wide: there is no sub-cell resolution in that
-    /// format to put a head, a torso and two arms in. A figure needs float
-    /// positions and its own pipeline, which is what the skinned rig brings.
-    ///
-    /// So this is honest rather than finished: it puts entities on screen, at
-    /// the right size, in the right place, moving the way they really move —
-    /// which is everything except what they look like.
+    /// **Placed last of all the figures**, which is what lets the world pass
+    /// leave it out in first person while the cascades keep it — see
+    /// [`skinned::Skinned::draw_first`].
+    pub fn set_player(&mut self, figure: Option<skinned::Figure>) {
+        self.player = figure;
+    }
+
+    /// Where every figure this frame is, the player's own last.
+    fn figures(&self) -> Vec<skinned::Figure> {
+        let mut all = self.entities_at.clone();
+        all.extend(self.player);
+        all
+    }
+
+    /// How many figures the world pass draws, as opposed to the cascades.
+    const fn visible_figures(&self, total: usize) -> usize {
+        if self.player.is_some() && !self.body_visible {
+            total.saturating_sub(1)
+        } else {
+            total
+        }
+    }
+
+    /// Where every entity in view is this frame, camera-relative, in blocks.
     pub fn set_entities(&mut self, figures: Vec<skinned::Figure>) {
         self.entities_at = figures;
     }
@@ -1712,30 +1619,6 @@ impl Renderer {
         }
     }
 
-    /// Draws the player's own body and every entity in view.
-    ///
-    /// **One implementation, called from both passes.** The direct path and the
-    /// post chain each build their own render pass, and the first version of
-    /// this put the entity draw in only one of them — so entities were invisible
-    /// in two of the three lighting modes and present in the third, which reads
-    /// as a lighting bug rather than a missing draw call.
-    ///
-    /// It rides the chunks' instance array: the body's offset is the one after
-    /// the last chunk's, which is what an instance offset is for.
-    ///
-    /// **Entities are no longer drawn here.** They are skinned figures with
-    /// float positions and a skeleton, which the packed voxel vertex cannot
-    /// express — see `render::skinned`. This is the client's own debug body and
-    /// nothing else.
-    fn draw_bodies(&self, pass: &mut wgpu::RenderPass<'_>, instance: u32, in_world: bool) {
-        if self.body_at.is_none() || (in_world && !self.body_visible) {
-            return;
-        }
-        pass.set_vertex_buffer(0, self.body.vertices.slice(..));
-        pass.set_index_buffer(self.body.indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
-    }
-
     /// Draws every shadow CASTER into every cascade.
     ///
     /// The same meshes and the same instance buffer as the world pass, drawn
@@ -1778,12 +1661,6 @@ impl Renderer {
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, *instance..*instance + 1);
             }
-            // And the client's own debug body.
-            // `false`: the cascades take the body whether or not the world
-            // pass draws it, which is what gives a first-person player a
-            // shadow.
-            self.draw_bodies(pass, culled.body, false);
-
             // Figures, in their own pipeline. **A mob with no shadow floats**,
             // which is the one thing about a drawn body that everybody notices
             // immediately — and it is what led to the two sweeps above.
@@ -1842,9 +1719,8 @@ impl Renderer {
         // instances and the same palette, which is what makes a figure appear
         // in the same place in the world and in its own shadow — posing per
         // pass would let the two disagree by a frame.
-        let figures = std::mem::take(&mut self.entities_at);
+        let figures = self.figures();
         self.skinned.prepare(&self.gpu, &figures);
-        self.entities_at = figures;
 
         let mut encoder = self
             .gpu
@@ -1902,8 +1778,6 @@ impl Renderer {
                 pass.draw_indexed(0..mesh.index_count, 0, *instance..*instance + 1);
             }
 
-            self.draw_bodies(&mut pass, culled.body, true);
-
             // **After the terrain, before the fluid.** A blob is a mark on the
             // ground, so it goes over what it is marking; milk is above the
             // ground and should be able to cover it.
@@ -1915,7 +1789,8 @@ impl Renderer {
             if self.skinned.drawn() > 0 {
                 pass.set_pipeline(skinned_pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
-                self.skinned.draw(&mut pass);
+                self.skinned
+                    .draw_first(&mut pass, self.visible_figures(self.skinned.drawn()));
 
                 // **Put the chunks' instance array back.** A figure's instances
                 // live in slot 1 too, and `draw_fluid` below sets only slot 0

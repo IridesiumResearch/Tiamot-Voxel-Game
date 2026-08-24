@@ -1976,11 +1976,25 @@ fn an_occluded_corner_loses_its_colour_rather_than_keeping_it_dimly() {
     );
 }
 
+/// A figure standing still where the test puts it.
+fn player_at(offset: [f32; 3]) -> client::render::skinned::Figure {
+    client::render::skinned::Figure {
+        offset,
+        yaw: 0.0,
+        anim: 0,
+        phase: 0.0,
+    }
+}
+
 #[test]
-fn the_debug_body_is_actually_drawn_and_actually_casts() {
+fn the_players_own_figure_is_actually_drawn_and_actually_casts() {
     // Reported from the window as "I am not seeing any shadow on me", which has
-    // two possible causes and they need telling apart: the box is not being
-    // drawn at all, or it is drawn and does not reach the shadow map.
+    // two possible causes and they need telling apart: the player is not being
+    // drawn at all, or they are drawn and do not reach the shadow map.
+    //
+    // **It used to be a box**, hard-coded in the renderer and marked as debug.
+    // It is now the same `engine:humanoid` every other player has always been
+    // drawn as; the claim this makes is unchanged.
     //
     // Both are checked here from a fixed camera, so nothing depends on where a
     // predicted body happened to be.
@@ -2001,14 +2015,15 @@ fn the_debug_body_is_actually_drawn_and_actually_casts() {
     let without = target
         .capture(&mut renderer, &viewpoint())
         .expect("capture");
+    renderer.set_player(Some(player_at(where_it_stands)));
     renderer.set_body(Some(where_it_stands));
     renderer.set_body_visible(true);
     let with = target
         .capture(&mut renderer, &viewpoint())
         .expect("capture");
     // Counted pixels rather than the perceptual hash, and the difference
-    // matters: the body is two cells wide and five tall, which is about forty
-    // pixels at this resolution, and the hash averages the frame into a 16x16
+    // matters: a figure is under two blocks tall, which is a few dozen pixels
+    // at this resolution, and the hash averages the frame into a 16x16
     // grid precisely so that something that small cannot move it. The hash is
     // the right tool for "did the world stop drawing" and the wrong one for
     // "is this one small object present".
@@ -2027,10 +2042,12 @@ fn the_debug_body_is_actually_drawn_and_actually_casts() {
     // than under itself.
     renderer.set_lighting_mode(LightingMode::Beautiful);
     renderer.set_sun(1.0, [1.0, 1.0, 1.0], [0.75, -0.35, 0.55]);
+    renderer.set_player(None);
     renderer.set_body(None);
     let unshadowed = target
         .capture(&mut renderer, &viewpoint())
         .expect("capture");
+    renderer.set_player(Some(player_at(where_it_stands)));
     renderer.set_body(Some(where_it_stands));
     let shadowed = target
         .capture(&mut renderer, &viewpoint())
@@ -2042,7 +2059,9 @@ fn the_debug_body_is_actually_drawn_and_actually_casts() {
     // shadow". It did not, because first person did not hand the body to the
     // renderer at all — and a body the renderer does not know about cannot
     // reach a cascade either. Position and visibility are separate now, and
-    // this is the half that says so: the frame must still darken.
+    // this is the half that says so: the frame must still darken. The figure
+    // is placed LAST of all of them so the world pass can ask for one fewer —
+    // see `skinned::Skinned::draw_first`.
     renderer.set_body_visible(false);
     let cast_only = target
         .capture(&mut renderer, &viewpoint())

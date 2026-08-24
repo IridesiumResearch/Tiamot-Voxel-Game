@@ -144,6 +144,16 @@ const MAX_CHAT_LINES: usize = 200;
 /// five of these nine.
 const HOTBAR_SLOTS: usize = 9;
 
+/// Below this the player's figure stands still, in cells per tick.
+///
+/// Not zero: a body resting against geometry keeps a hair of velocity from the
+/// solver, and a figure that walked on the spot whenever somebody leant on a
+/// wall would look broken in a way nobody could describe.
+const IDLE_SPEED: f32 = 0.05;
+
+/// Above this it runs rather than walks, in cells per tick.
+const RUN_SPEED: f32 = 0.55;
+
 /// Most dialog events held while waiting to send them.
 ///
 /// A player mashing buttons on a stalled connection must not grow this without
@@ -3655,17 +3665,24 @@ impl App {
         // not drawn, which is what every game does and what a player expects
         // without being able to say why.
         //
-        // The corner offset puts the box centred on the feet rather than beside
-        // them.
-        let half = f64::from(crate::render::BODY_WIDTH_CELLS) / (2.0 * cells);
         let feet = [
-            f64::from(corner.x) + f64::from(local[0]) / cells - half,
+            f64::from(corner.x) + f64::from(local[0]) / cells,
             f64::from(corner.y) + f64::from(local[1]) / cells,
-            f64::from(corner.z) + f64::from(local[2]) / cells - half,
+            f64::from(corner.z) + f64::from(local[2]) / cells,
         ];
         let at = self.camera.position.offset_to(feet);
         self.renderer.set_body(Some(at));
         self.renderer.set_body_visible(self.third_person);
+        self.renderer
+            .set_player(Some(crate::render::skinned::Figure {
+                offset: at,
+                // The camera's yaw, not the server's: the body turns with the
+                // look, at prediction rate, which is the whole reason the local
+                // player is not simply read back off the entity stream.
+                yaw: self.camera.yaw,
+                anim: self.gait(),
+                phase: self.since_start.elapsed().as_secs_f32(),
+            }));
 
         // After the camera has settled, because every offset is relative to it.
         self.place_entities();
@@ -3787,6 +3804,32 @@ impl App {
             ));
         }
         self.renderer.set_blobs(&blobs);
+    }
+
+    /// Which clip the player's own figure is playing.
+    ///
+    /// **Derived here rather than sent.** The server tags an entity's animation
+    /// and the client plays it, but the local player's body moves at prediction
+    /// rate — a gait arriving at twenty hertz would lag every start and stop by
+    /// up to a frame and a half of walking.
+    fn gait(&self) -> u8 {
+        use tiamot_core::ent::AnimTag;
+        let Some(predictor) = self.predictor.as_ref() else {
+            return AnimTag::IDLE.0;
+        };
+        let velocity = predictor.body().velocity;
+        // Horizontal only, and squared: falling is not walking, a player
+        // stepping off a ledge should not break into a run on the way down, and
+        // `hypot` is on the determinism ban list even here where it would be
+        // harmless — one rule, everywhere, is what keeps it a rule.
+        let speed = velocity[0] * velocity[0] + velocity[2] * velocity[2];
+        if speed < IDLE_SPEED * IDLE_SPEED {
+            AnimTag::IDLE.0
+        } else if speed > RUN_SPEED * RUN_SPEED {
+            AnimTag::RUN.0
+        } else {
+            AnimTag::WALK.0
+        }
     }
 
     fn place_entities(&mut self) {

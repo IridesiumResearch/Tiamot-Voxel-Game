@@ -247,14 +247,26 @@ impl Skinned {
     /// The caller has already set the pipeline and whatever group 0 or 1 that
     /// pipeline wants; this binds the palette and the geometry.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if self.drawn == 0 || self.index_count == 0 {
+        self.draw_first(pass, self.drawn);
+    }
+
+    /// Draws the first `count` figures.
+    ///
+    /// **For the one figure that is in the world without being visible in it:
+    /// the player's own.** In first person their body still blocks the sun and
+    /// still stands on the ground, so the cascades and the blob need it — but
+    /// drawing it would fill the screen with the inside of a head. It is placed
+    /// last, so the world pass asks for one fewer than the shadow pass does.
+    pub fn draw_first(&self, pass: &mut wgpu::RenderPass<'_>, count: usize) {
+        let count = count.min(self.drawn);
+        if count == 0 || self.index_count == 0 {
             return;
         }
         pass.set_bind_group(2, &self.palette_bind, &[]);
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_vertex_buffer(1, self.instances.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
-        let count = u32::try_from(self.drawn).unwrap_or(0);
+        let count = u32::try_from(count).unwrap_or(0);
         pass.draw_indexed(0..self.index_count, 0, 0..count);
     }
 
