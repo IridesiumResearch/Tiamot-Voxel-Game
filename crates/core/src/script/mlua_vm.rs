@@ -4114,6 +4114,14 @@ fn dialog_event_fields(
             // mod itself wrote. Off-by-one here would be silent and constant.
             table.set("index", u32::from(*index) + 1)?;
         }
+        DialogEvent::Chiselled { name, shape } => {
+            table.set("kind", "chiselled")?;
+            table.set("name", name.as_str())?;
+            // The raw mask, not a `Shape` — an editor can be chiselled to
+            // nothing, and a mod deciding what to do about that is the whole
+            // reason it hears about every change rather than only valid ones.
+            table.set("shape", *shape)?;
+        }
         DialogEvent::Clicked { view, index, click } => {
             table.set("kind", "clicked")?;
             table.set("view", view.as_str())?;
@@ -4266,6 +4274,14 @@ fn widget_of(kind: &str, spec: &Table) -> mlua::Result<crate::ui::Widget> {
         },
         "scroll" => Widget::Scroll,
         "spacer" => Widget::Spacer,
+        // **A full block by default**, because chiselling is subtraction: an
+        // editor that opened empty would have nothing to take a cell off.
+        "shape_editor" => Widget::ShapeEditor {
+            shape: spec
+                .get::<Option<u32>>("shape")?
+                .unwrap_or(crate::inventory::Shape::ALL),
+            material: spec.get::<Option<u16>>("material")?.unwrap_or(1),
+        },
         "progress" => Widget::Progress {
             permille: spec.get::<Option<u16>>("permille")?.unwrap_or(0),
         },
@@ -4338,7 +4354,7 @@ fn content_hash(table: &Table, key: &str) -> mlua::Result<[u8; 32]> {
 
 /// Keys a widget table accepts. Same rule as `BLOCK_FIELDS`: a typo is an
 /// error, because the alternative is a silently ignored field.
-const WIDGET_FIELDS: [&str; 27] = [
+const WIDGET_FIELDS: [&str; 29] = [
     "type",
     "name",
     "style",
@@ -4366,6 +4382,12 @@ const WIDGET_FIELDS: [&str; 27] = [
     "columns",
     "first",
     "count",
+    // Protocol v25's shape editor. **Adding a widget means adding its fields
+    // here too**, and forgetting is silent from the engine's side and total
+    // from the mod's: the tree is refused wholesale with "unknown field", so
+    // the dialog simply never opens. Caught by the bot test that opens one.
+    "shape",
+    "material",
 ];
 
 /// Keys a style table accepts.

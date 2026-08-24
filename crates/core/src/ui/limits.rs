@@ -287,6 +287,20 @@ fn check_node(node: &Node, limits: Limits) -> Result<(), UiError> {
                 });
             }
         }
+        Widget::ShapeEditor { shape, .. } => {
+            // **A mask with bits above the twenty-seventh is a mod that has
+            // misunderstood the field**, and telling it so is cheaper than
+            // silently masking them off and having it wonder why cell 31 never
+            // appears. Charter rule 14's spirit applied to a mod's own tree:
+            // refuse what cannot be meant.
+            if shape & !crate::inventory::Shape::ALL != 0 {
+                return Err(UiError::Malformed {
+                    what: format!(
+                        "shape editor mask {shape:#x} has bits outside a block's 27 sub-nodes"
+                    ),
+                });
+            }
+        }
         Widget::Container { .. } | Widget::Image { .. } | Widget::Scroll | Widget::Spacer => {}
     }
     Ok(())

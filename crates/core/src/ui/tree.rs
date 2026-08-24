@@ -153,6 +153,42 @@ pub enum Widget {
         /// How full, in thousandths. Integer for the same reason a slider is.
         permille: u16,
     },
+    /// A block a player can chisel, and the shape they chiselled it to.
+    ///
+    /// **Appended at the end** (protocol v25). These are position-encoded on
+    /// the wire, so a variant filed tidily beside `ItemGrid` would renumber
+    /// everything below it — the one change this format does not survive.
+    ///
+    /// # Why the engine draws this and a mod does not
+    ///
+    /// Everything else here is a rectangle. This is twenty-seven cells drawn in
+    /// perspective with a picking rule, and a mod cannot express that with
+    /// labels and buttons — nor should it have to, since the cells it is
+    /// editing are the same [`crate::inventory::Shape`] mask the engine places
+    /// blocks from. The MEANING is still the mod's: what a shape costs, what it
+    /// is worth, whether there is a bench you have to stand at.
+    ///
+    /// The gesture matches the world's, because a player already knows it:
+    /// left-click removes the nearest cell along the line of sight, right-click
+    /// puts one back in front of it. Chiselling only ever removes from the
+    /// outside, so nothing is ever hidden from the tool that would reach it.
+    ///
+    /// Reports [`crate::proto::DialogEvent::Chiselled`] with the whole mask
+    /// rather than which cell moved: the client has to keep the mask anyway to
+    /// stay responsive, and a mod handed the whole thing can never rebuild a
+    /// different one from events that arrived out of order.
+    ShapeEditor {
+        /// Which cells are filled, as the 27-bit mask indexed `x + 3*y + 9*z`.
+        ///
+        /// Not a [`crate::inventory::Shape`], which refuses both the empty mask
+        /// and the full one: a full block is where chiselling STARTS and an
+        /// empty one is where it can end up. Turning a mask into a shape is the
+        /// mod's step, and the point at which "you have chiselled it away to
+        /// nothing" is something a player can be told.
+        shape: u32,
+        /// Which material the filled cells are drawn as.
+        material: u16,
+    },
 }
 
 /// Where a node's children live in the [`Tree`]'s flat list.

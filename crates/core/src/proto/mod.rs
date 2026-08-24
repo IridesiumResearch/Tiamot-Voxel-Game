@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -82,6 +82,11 @@ pub const PROTOCOL_VERSION: u32 = 24;
 // stream. They are also PER PLAYER rather than broadcast — which entities
 // somebody can see is their own interest set, and sending everyone every mob
 // would make a populated world cost the square of the people watching it.
+// v25 (post-14): appended `Widget::ShapeEditor` and `DialogEvent::Chiselled`.
+// Both APPENDED at the end of their enums, which this format makes safe — but
+// the version still moves, because a v24 client handed a tree holding a variant
+// it has never heard of cannot draw it, and "cannot draw it" for a widget in
+// the middle of a crafting screen is a screen with a hole in it.
 // v24 (post-14): `InventoryUpdate`, `ViewUpdate` and `ClientMessage::Place`
 // carry a SHAPE. `(u16, u32)` became `StackDef`, which is a FIELD CHANGE on
 // existing messages rather than an appended variant — the one shape of change
@@ -835,6 +840,28 @@ pub enum DialogEvent {
     },
     /// The player closed the dialog.
     Closed,
+    /// A block in a shape editor was chiselled.
+    ///
+    /// **Appended below `Closed`** (protocol v25) rather than filed beside the
+    /// other widget events, because these are position-encoded: slipping a
+    /// variant into the middle renumbers every one after it, which is the one
+    /// change this format does not survive.
+    ///
+    /// **The whole mask, not which cell moved.** The client keeps the mask
+    /// anyway so a click can land before the server has heard about it, and a
+    /// mod handed the whole thing can never rebuild a different shape from
+    /// events that arrived out of order.
+    ///
+    /// The same 27-bit occupancy a block is stored with and a stack is cut to
+    /// — see [`crate::inventory::Shape`] — except that it may be empty or full,
+    /// which are the two states a shape cannot be and an editor must be able to
+    /// reach.
+    Chiselled {
+        /// The widget's name.
+        name: String,
+        /// Which cells are filled, indexed `x + 3*y + 9*z`.
+        shape: u32,
+    },
 }
 
 /// How a slot was clicked.
@@ -1887,7 +1914,10 @@ fn check_dialog_event(form: &str, event: &DialogEvent) -> Result<(), ProtocolErr
         DialogEvent::Pressed { name }
         | DialogEvent::Toggled { name, .. }
         | DialogEvent::Slid { name, .. }
-        | DialogEvent::Chose { name, .. } => check_len("widget_name", name.len(), MAX_ID_BYTES)?,
+        | DialogEvent::Chose { name, .. }
+        | DialogEvent::Chiselled { name, .. } => {
+            check_len("widget_name", name.len(), MAX_ID_BYTES)?;
+        }
         DialogEvent::Submitted { name, text } => {
             check_len("widget_name", name.len(), MAX_ID_BYTES)?;
             // What a player typed, bounded like a chat line — it is the same
@@ -2682,6 +2712,156 @@ mod tests {
         // that goes unpinned, which is the exact failure this whole test
         // exists to prevent.
         pin_the_later_variants();
+    }
+
+    /// **The two enums NESTED inside a message, which the pins above miss.**
+    ///
+    /// `ClientMessage::DialogEvent` has had a pinned ordinal since v20 and its
+    /// payload has not — so `DialogEvent` and `Widget` could be reordered
+    /// freely and every ordinal test would stay green while a client and a
+    /// server disagreed about what a click was. Found appending
+    /// `DialogEvent::Chiselled` in v25, where the natural place to file it was
+    /// beside the other widget events and directly above `Closed`.
+    #[test]
+    fn nested_dialog_variant_ordinals_are_pinned() {
+        let ordinal = |event: &DialogEvent| encode(event).expect("encode")[0];
+        assert_eq!(
+            ordinal(&DialogEvent::Pressed {
+                name: String::new()
+            }),
+            0
+        );
+        assert_eq!(
+            ordinal(&DialogEvent::Submitted {
+                name: String::new(),
+                text: String::new(),
+            }),
+            1
+        );
+        assert_eq!(
+            ordinal(&DialogEvent::Toggled {
+                name: String::new(),
+                checked: false,
+            }),
+            2
+        );
+        assert_eq!(
+            ordinal(&DialogEvent::Slid {
+                name: String::new(),
+                value: 0,
+            }),
+            3
+        );
+        assert_eq!(
+            ordinal(&DialogEvent::Chose {
+                name: String::new(),
+                index: 0,
+            }),
+            4
+        );
+        assert_eq!(
+            ordinal(&DialogEvent::Clicked {
+                view: String::new(),
+                index: 0,
+                click: Click::Left,
+            }),
+            5
+        );
+        assert_eq!(ordinal(&DialogEvent::Closed), 6);
+        // Protocol v25, appended below `Closed` rather than filed tidily.
+        assert_eq!(
+            ordinal(&DialogEvent::Chiselled {
+                name: String::new(),
+                shape: 0,
+            }),
+            7
+        );
+    }
+
+    /// The widget set, for the same reason and with the same history.
+    #[test]
+    fn widget_variant_ordinals_are_pinned() {
+        use crate::ui::{Align, Direction, Widget};
+
+        let ordinal = |widget: &Widget| encode(widget).expect("encode")[0];
+        assert_eq!(
+            ordinal(&Widget::Container {
+                direction: Direction::Column,
+                gap: 0,
+                padding: 0,
+                align: Align::Start,
+            }),
+            0
+        );
+        assert_eq!(
+            ordinal(&Widget::Label {
+                text: String::new()
+            }),
+            1
+        );
+        assert_eq!(
+            ordinal(&Widget::Button {
+                text: String::new()
+            }),
+            2
+        );
+        assert_eq!(ordinal(&Widget::Image { hash: [0; 32] }), 3);
+        assert_eq!(
+            ordinal(&Widget::TextInput {
+                initial: String::new(),
+                placeholder: String::new(),
+            }),
+            4
+        );
+        assert_eq!(
+            ordinal(&Widget::Checkbox {
+                text: String::new(),
+                checked: false,
+            }),
+            5
+        );
+        assert_eq!(
+            ordinal(&Widget::Slider {
+                min: 0,
+                max: 0,
+                value: 0
+            }),
+            6
+        );
+        assert_eq!(
+            ordinal(&Widget::Dropdown {
+                options: Vec::new(),
+                selected: 0,
+            }),
+            7
+        );
+        assert_eq!(
+            ordinal(&Widget::ItemSlot {
+                view: String::new(),
+                index: 0,
+            }),
+            8
+        );
+        assert_eq!(
+            ordinal(&Widget::ItemGrid {
+                view: String::new(),
+                columns: 0,
+                first: 0,
+                count: 0,
+            }),
+            9
+        );
+        assert_eq!(ordinal(&Widget::Scroll), 10);
+        assert_eq!(ordinal(&Widget::Spacer), 11);
+        assert_eq!(ordinal(&Widget::Progress { permille: 0 }), 12);
+        // Protocol v25, appended at the end rather than beside `ItemGrid`.
+        assert_eq!(
+            ordinal(&Widget::ShapeEditor {
+                shape: 0,
+                material: 0
+            }),
+            13
+        );
     }
 
     /// Ordinals 25 onwards. See the call site for why they are not up there.

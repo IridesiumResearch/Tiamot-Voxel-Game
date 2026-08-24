@@ -68,6 +68,21 @@ struct Local {
     dropdown: BTreeMap<String, u16>,
     /// Whether each checkbox is ticked.
     checked: BTreeMap<String, bool>,
+    /// What each shape editor has been chiselled to, by widget name.
+    ///
+    /// Held locally for the same reason a dragged slider is: a chisel that
+    /// waited for the server to agree it happened would land a tick late, and
+    /// carving is a run of clicks rather than one. The mod is told after every
+    /// change and its next tree wins — see [`Local::adopted`].
+    shape: BTreeMap<String, u32>,
+    /// Which shape the server last SAID each editor holds.
+    ///
+    /// Without this the local mask would never let go: a mod that reset an
+    /// editor, or opened it on a different block, would send a tree the client
+    /// quietly ignored because it already had an opinion. Comparing against
+    /// what the server said last is how "the mod changed it" is told apart
+    /// from "the mod is repeating itself".
+    adopted: BTreeMap<String, u32>,
 }
 
 /// Every open dialog's local state.
@@ -142,6 +157,9 @@ impl Measure for EguiRuler<'_> {
                 (columns * SLOT, rows.max(1) * SLOT)
             }
             Widget::Progress { .. } => (120, 12),
+            // Square, and large: this is the widget a player carves in, and
+            // the cells are twenty-seven ninths of it.
+            Widget::ShapeEditor { .. } => (192, 192),
             // Containers measure from their children in `core::ui`, and a
             // spacer wants nothing — all three are "no intrinsic size".
             Widget::Spacer | Widget::Container { .. } | Widget::Scroll => (0, 0),
@@ -417,9 +435,166 @@ fn paint_widget(
             &paint,
             raised,
         ),
+        Widget::ShapeEditor { shape, material } => {
+            paint_shape_editor(ui, rect, node, (*shape, *material), &paint, local, raised);
+        }
         // Drawn by their children, or by nothing at all.
         Widget::Container { .. } | Widget::Scroll | Widget::Spacer | Widget::Image { .. } => {}
     }
+}
+
+/// A block being chiselled, and the cell the player took off it.
+///
+/// # The two masks
+///
+/// What is DRAWN is the local mask, so a click lands under the cursor rather
+/// than a tick later — carving is a run of clicks and each one waiting for a
+/// round trip would feel like carving through treacle. What is AUTHORITATIVE
+/// is still the mod's: every change is reported, and a tree carrying a shape
+/// different from the last one the server sent replaces the local mask
+/// outright. That is how a "reset" button, or opening the editor on another
+/// block, gets through.
+///
+/// # The gesture
+///
+/// Left-click removes the nearest cell along the line of sight and right-click
+/// puts one back against the face that was clicked, which is what digging and
+/// placing already do in the world. Removal never needs to reach a cell it
+/// cannot see, because taking the visible one reveals the next.
+fn paint_shape_editor(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    node: &Node,
+    state: (u32, u16),
+    paint: &Paint,
+    local: &mut Local,
+    raised: &mut Vec<Raised>,
+) {
+    let (sent, material) = state;
+    // The mod's word, when the mod has changed its mind.
+    if local.adopted.get(&node.name) != Some(&sent) {
+        local.adopted.insert(node.name.clone(), sent);
+        local.shape.insert(node.name.clone(), sent);
+    }
+    let mut mask = local.shape.get(&node.name).copied().unwrap_or(sent);
+
+    // Square, and centred: the projection fits a six-by-six box and stretching
+    // it would put the cells' faces out of true with each other.
+    let side = rect.width().min(rect.height());
+    let area = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+    let response = ui.allocate_rect(rect, egui::Sense::click());
+
+    for (x, y, z) in crate::shape_view::draw_order(mask) {
+        for face in [
+            crate::shape_view::Face::Front,
+            crate::shape_view::Face::Right,
+            crate::shape_view::Face::Top,
+        ] {
+            let corners = crate::shape_view::face_corners(area, x, y, z, face);
+            paint_cell_face(ui.painter(), corners, paint.icons, material, face);
+        }
+    }
+
+    let clicked = if response.clicked() {
+        Some(false)
+    } else if response.secondary_clicked() {
+        Some(true)
+    } else {
+        None
+    };
+    if let Some(adding) = clicked
+        && let Some(at) = response.interact_pointer_pos()
+    {
+        mask = match crate::shape_view::pick(area, mask, at) {
+            Some(((x, y, z), face)) if adding => crate::shape_view::restore(mask, x, y, z, face),
+            Some(((x, y, z), _)) => crate::shape_view::chisel(mask, x, y, z),
+            // Nothing under the cursor. A right click on an empty block seeds
+            // the middle cell, so a player who chiselled everything away is not
+            // left with a screen they cannot get out of.
+            None if adding && mask == 0 => crate::shape_view::seed(),
+            None => mask,
+        };
+        if local.shape.insert(node.name.clone(), mask) != Some(mask) {
+            paint.raise(
+                raised,
+                DialogEvent::Chiselled {
+                    name: node.name.clone(),
+                    shape: mask,
+                },
+            );
+        }
+    }
+}
+
+/// One face of one cell: the block's own texture, on a parallelogram.
+///
+/// A textured mesh rather than a flat polygon, because a shape editor that
+/// showed untextured lozenges would be asking the player to imagine what they
+/// were carving. The four screen corners take the four corners of the
+/// material's atlas tile, in the same order, so the tile follows the
+/// projection's skew instead of being drawn square and floating.
+///
+/// Falls back to the flat tint when there is no atlas — the frames before the
+/// material table arrives, exactly as a slot does.
+fn paint_cell_face(
+    painter: &egui::Painter,
+    corners: [egui::Pos2; 4],
+    icons: crate::icons::Icons<'_>,
+    material: u16,
+    face: crate::shape_view::Face,
+) {
+    let outline = egui::Stroke::new(1.0, egui::Color32::from_black_alpha(90));
+    if let Some((texture, uv)) = icons.of(material) {
+        // **Grey, not the material's colour.** A mesh multiplies its vertex
+        // colour into the tile, so anything but neutral would apply the hashed
+        // stand-in colour ON TOP of the real texture and tint every block
+        // towards its own id.
+        let tint = shade(egui::Color32::WHITE, face);
+        let mut mesh = egui::Mesh::with_texture(texture);
+        let uvs = [
+            uv.left_top(),
+            uv.right_top(),
+            uv.right_bottom(),
+            uv.left_bottom(),
+        ];
+        for (corner, uv) in corners.iter().zip(uvs) {
+            mesh.colored_vertex(*corner, tint);
+            mesh.vertices.last_mut().expect("just pushed").uv = uv;
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
+        painter.add(egui::Shape::closed_line(corners.to_vec(), outline));
+    } else {
+        // No atlas yet: the same scaling on the hashed colour, which still
+        // reads as three planes.
+        let tint = shade(material_tint(material), face);
+        painter.add(egui::Shape::convex_polygon(corners.to_vec(), tint, outline));
+    }
+}
+
+/// How light one face of a cell is.
+///
+/// Three fixed levels rather than a light calculation: the point is that the
+/// three visible faces read as three planes, and a player looking at a shape
+/// needs to see its corners, not to know where the sun is.
+fn shade(base: egui::Color32, face: crate::shape_view::Face) -> egui::Color32 {
+    let scale = match face {
+        crate::shape_view::Face::Top => 1.0,
+        crate::shape_view::Face::Right => 0.78,
+        crate::shape_view::Face::Front => 0.6,
+    };
+    let channel = |value: u8| {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a scaled colour channel, clamped into a byte"
+        )]
+        {
+            (f32::from(value) * scale).clamp(0.0, 255.0) as u8
+        }
+    };
+    egui::Color32::from_rgb(channel(base.r()), channel(base.g()), channel(base.b()))
 }
 
 /// The colour that stands in for a material when there is no atlas.

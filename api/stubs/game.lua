@@ -555,7 +555,7 @@ function game.register_on_chat(callback) end
 ---
 ---Types: `container`, `label`, `button`, `image`, `text_input`, `checkbox`,
 ---`slider`, `dropdown`, `item_slot`, `item_grid`, `scroll`, `spacer`,
----`progress`.
+---`progress`, `shape_editor`.
 ---@class Tiamot.Widget
 ---@field type string Required. One of the types above.
 ---@field name string? What events from this widget carry, so you can tell two buttons apart.
@@ -584,6 +584,8 @@ function game.register_on_chat(callback) end
 ---@field first integer? `item_grid`: the first slot shown, one-based.
 ---@field count integer? `item_grid`: how many slots.
 ---@field permille integer? `progress`: how full, 0 to 1000.
+---@field shape integer? `shape_editor`: the 27-bit occupancy mask, indexed `x + 3*y + 9*z`. Defaults to a whole block.
+---@field material integer? `shape_editor`: which material the cells are drawn as.
 
 ---What a widget may say about how it looks. Deliberately small.
 ---@class Tiamot.WidgetStyle
@@ -630,6 +632,23 @@ function game.update_dialog(spec) end
 ---@return boolean closed
 function game.close_dialog(spec) end
 
+---# The shape editor
+---
+---`{ type = "shape_editor", shape = <mask>, material = <id> }` draws a block as
+---twenty-seven cells and lets the player chisel it. Left-click takes off the
+---nearest cell, right-click puts one back against the face that was clicked —
+---the same gesture as digging and placing, because a player already knows it.
+---
+---Every change reports `"chiselled"` with the WHOLE mask. The client draws its
+---own copy so a click lands immediately, and adopts yours again whenever you
+---send a tree with a different `shape` — so a "reset" button is just
+---`game.update_dialog` with the mask you want.
+---
+---The mask may be empty or full, which a `game.give` shape may not be: a whole
+---block is where chiselling starts, an empty one is where it can end up, and
+---deciding what either means is yours. `shape` counts its own cells, so an item
+---of that cut costs that many units.
+---
 ---Called when a player does something in one of YOUR dialogs.
 ---
 ---Only your own: a dialog's events are private to the mod that opened it.
@@ -642,12 +661,13 @@ function game.close_dialog(spec) end
 ---  - `"slid"` — `name`, `value`
 ---  - `"chose"` — `name`, `index` (one-based)
 ---  - `"clicked"` — `view`, `index` (one-based), `click` ("left", "right", "shift_left")
+---  - `"chiselled"` — `name`, `shape` (the whole 27-bit mask)
 ---  - `"closed"` — nothing else
 ---
 ---**Every one is a REQUEST, never a result.** A slot click says what the player
 ---did with the mouse; whether any item moves is the server's decision, taken
 ---against its own inventory. A client saying "I moved this" does not make it so.
----@param callback fun(event: { player: string, form: string, kind: string, name: string?, text: string?, checked: boolean?, value: integer?, index: integer?, view: string?, click: string? })
+---@param callback fun(event: { player: string, form: string, kind: string, name: string?, text: string?, checked: boolean?, value: integer?, index: integer?, view: string?, click: string?, shape: integer? })
 function game.register_on_dialog_event(callback) end
 
 ---Registers a sound. Registration window only.

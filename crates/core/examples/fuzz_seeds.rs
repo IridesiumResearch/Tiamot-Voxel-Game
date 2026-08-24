@@ -22,9 +22,9 @@
 use std::path::PathBuf;
 
 use tiamot_core::proto::{
-    ActionDef, ClientMessage, DisconnectReason, Edit, EntityDef, EntityDelta, FluidDef,
-    HudScriptDef, MaterialDef, ModEntry, PROTOCOL_VERSION, ServerMessage, SkyFrame, SkyGrade,
-    SoundDef, WireSignature, encode,
+    ActionDef, Click, ClientMessage, DialogEvent, DisconnectReason, Edit, EntityDef, EntityDelta,
+    FluidDef, HudScriptDef, MaterialDef, ModEntry, PROTOCOL_VERSION, ServerMessage, SkyFrame,
+    SkyGrade, SoundDef, WireSignature, encode,
 };
 use tiamot_core::{BlockPos, ChunkPos, SubNodePos};
 
@@ -74,7 +74,7 @@ fn sample_tree() -> tiamot_core::ui::Tree {
                 grow: 1,
                 size: None,
                 cross_size: None,
-                children: Children { first: 1, count: 2 },
+                children: Children { first: 1, count: 3 },
             },
             Node {
                 widget: Widget::Label {
@@ -92,6 +92,21 @@ fn sample_tree() -> tiamot_core::ui::Tree {
                     text: "Close".to_owned(),
                 },
                 name: "close".to_owned(),
+                style: Style::default(),
+                grow: 0,
+                size: None,
+                cross_size: None,
+                children: Children { first: 0, count: 0 },
+            },
+            // Protocol v25's widget, so a tree the fuzzer mutates has one in
+            // it: its mask is the only widget field with a range narrower than
+            // its type.
+            Node {
+                widget: Widget::ShapeEditor {
+                    shape: 0b0000_0001_1111,
+                    material: 3,
+                },
+                name: "cut".to_owned(),
                 style: Style::default(),
                 grow: 0,
                 size: None,
@@ -277,6 +292,72 @@ fn client_messages() -> Vec<Vec<u8>> {
         // Protocol v15.
         ClientMessage::Punch { entity: 0 },
         ClientMessage::Punch { entity: u64::MAX },
+        // **Every dialog event**, which had NO seeds at all until protocol
+        // v25 — the whole family of messages a client sends back from a
+        // server's own interface, every string of which the server echoed to
+        // it and is now reading again.
+        ClientMessage::DialogEvent {
+            form: "core_ui:inventory".to_owned(),
+            event: DialogEvent::Pressed {
+                name: "close".to_owned(),
+            },
+        },
+        ClientMessage::DialogEvent {
+            form: "shop".to_owned(),
+            event: DialogEvent::Submitted {
+                name: "search".to_owned(),
+                text: "x".repeat(64),
+            },
+        },
+        ClientMessage::DialogEvent {
+            form: "shop".to_owned(),
+            event: DialogEvent::Toggled {
+                name: "auto".to_owned(),
+                checked: true,
+            },
+        },
+        ClientMessage::DialogEvent {
+            form: "shop".to_owned(),
+            event: DialogEvent::Slid {
+                name: "amount".to_owned(),
+                value: i32::MIN,
+            },
+        },
+        ClientMessage::DialogEvent {
+            form: "shop".to_owned(),
+            event: DialogEvent::Chose {
+                name: "kind".to_owned(),
+                index: u16::MAX,
+            },
+        },
+        ClientMessage::DialogEvent {
+            form: "core_ui:inventory".to_owned(),
+            event: DialogEvent::Clicked {
+                view: "player:main".to_owned(),
+                index: 26,
+                click: Click::ShiftLeft,
+            },
+        },
+        ClientMessage::DialogEvent {
+            form: "core_ui:inventory".to_owned(),
+            event: DialogEvent::Closed,
+        },
+        // Protocol v25, and a mask with every bit set above the block's
+        // twenty-seven — the shape the validator has to refuse.
+        ClientMessage::DialogEvent {
+            form: "bench:craft".to_owned(),
+            event: DialogEvent::Chiselled {
+                name: "cut".to_owned(),
+                shape: 0b0000_0111,
+            },
+        },
+        ClientMessage::DialogEvent {
+            form: "bench:craft".to_owned(),
+            event: DialogEvent::Chiselled {
+                name: "cut".to_owned(),
+                shape: u32::MAX,
+            },
+        },
     ];
     messages.iter().filter_map(|m| encode(m).ok()).collect()
 }

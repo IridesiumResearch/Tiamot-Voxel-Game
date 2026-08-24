@@ -75,7 +75,28 @@ game.register_on_player_join(function(event)
     game.give(event.player, { material = "bench:stone", count = 2 })
 end)
 
+-- The shape editor, and what a mod does with what comes back from it.
+--
+-- The cut starts as whatever the player chiselled; before they have chiselled
+-- anything it is the whole block, which is not a cut at all.
+local chiselled = {}
+
 game.register_on_chat(function(event)
+    if event.text == "bench" then
+        game.show_dialog{
+            player = event.player,
+            form = "craft",
+            tree = {
+                type = "container",
+                children = {
+                    { type = "label", text = "Chisel it" },
+                    { type = "shape_editor", name = "cut", material = game.get_block_id("bench:stone") },
+                    { type = "button", name = "make", text = "Make" },
+                },
+            },
+        }
+        return false
+    end
     if event.text ~= "craft" then
         return
     end
@@ -90,6 +111,35 @@ game.register_on_chat(function(event)
     game.give(event.player, { material = "bench:stone", shape = STAIR, count = 5 })
     game.give(event.player, { material = "bench:stone", units = 2 })
     return false
+end)
+
+game.register_on_dialog_event(function(event)
+    if event.kind == "chiselled" then
+        chiselled[event.player] = event.shape
+        return
+    end
+    if event.kind ~= "pressed" or event.name ~= "make" then
+        return
+    end
+    local shape = chiselled[event.player]
+    if not shape or shape == 0 then
+        return
+    end
+    -- One item of whatever they carved, paid for in units.
+    local cells = 0
+    for bit = 0, 26 do
+        if shape & (1 << bit) ~= 0 then
+            cells = cells + 1
+        end
+    end
+    local spent = game.take(event.player, { material = "bench:stone", units = cells })
+    if spent < cells then
+        if spent > 0 then
+            game.give(event.player, { material = "bench:stone", units = spent })
+        end
+        return
+    end
+    game.give(event.player, { material = "bench:stone", shape = shape, count = 1 })
 end)
 "#,
     )
@@ -295,6 +345,98 @@ fn a_recipe_that_cannot_be_afforded_puts_back_exactly_what_it_took() {
                 "a recipe that could not be afforded made something anyway: {after:?}"
             );
         }
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn what_a_player_chisels_is_what_the_mod_gets_back() {
+    // **The shape editor's whole round trip.** The client reports the mask it
+    // carved, the mod decides what that costs and hands back a stack cut to
+    // it, and the stack comes down the wire carrying the same mask. Nothing
+    // here is the engine's opinion about crafting — the engine's part is that
+    // the mask survives every hop unchanged.
+    //
+    // The chisel itself is sent as the message a real click produces; where
+    // that click lands on screen is `client::shape_view`'s business and is
+    // tested there, without a server.
+    const CARVED: u32 = 0b1010_0101;
+
+    let server = start("bench", write_bench("bench"));
+    block_on(async {
+        let mut bot = join(&server, "Carver").await;
+        inventory_where(&mut bot, |stacks| total(stacks) >= 54)
+            .await
+            .expect("the starting kit never arrived");
+
+        bot.chat("bench").await.expect("send");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        // **The qualified form**, as the server named it. A mod writes
+        // `form = "craft"` and the engine namespaces it with the mod id, and
+        // an event sent back under the short name belongs to no dialog.
+        let (form, editor) = loop {
+            if let Some(found) = bot
+                .dialogs()
+                .into_iter()
+                .find(|(form, _)| form.ends_with("craft"))
+            {
+                break found;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the mod's bench never opened"
+            );
+            bot.recv().await.expect("recv");
+        };
+        let opened = editor
+            .nodes
+            .iter()
+            .find_map(|node| match node.widget {
+                tiamot_core::ui::Widget::ShapeEditor { shape, .. } => Some(shape),
+                _ => None,
+            })
+            .expect("the bench has a shape editor in it");
+        assert_eq!(
+            opened,
+            tiamot_core::inventory::Shape::ALL,
+            "an editor that opens empty has nothing to chisel"
+        );
+
+        bot.dialog_event(
+            &form,
+            tiamot_core::proto::DialogEvent::Chiselled {
+                name: "cut".to_owned(),
+                shape: CARVED,
+            },
+        )
+        .await
+        .expect("send");
+        bot.dialog_event(
+            &form,
+            tiamot_core::proto::DialogEvent::Pressed {
+                name: "make".to_owned(),
+            },
+        )
+        .await
+        .expect("send");
+
+        let after = inventory_where(&mut bot, |stacks| {
+            stacks.iter().any(|stack| stack.shape == CARVED)
+        })
+        .await
+        .expect("the carved shape never came back");
+        let made = after
+            .iter()
+            .find(|stack| stack.shape == CARVED)
+            .expect("checked above");
+        assert_eq!(
+            made.units,
+            CARVED.count_ones(),
+            "one item of a four-cell cut is four units"
+        );
+        assert_eq!(total(&after), 54, "carving invented or destroyed units");
 
         bot.disconnect().await;
     });
