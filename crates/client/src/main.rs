@@ -603,11 +603,8 @@ impl Client {
                             app.open_settings();
                         }
                         // The cursor has to come back to click anything.
-                        self.grabbed = if app.menu_open() {
-                            !grab(window, false)
-                        } else {
-                            grab(window, true)
-                        };
+                        let wanted = wants_cursor(app.menu_open(), app.chat_open(), false);
+                        self.grabbed = grab(window, wanted);
                     }
                     // Chat takes the cursor and the keyboard: a player typing
                     // "west" must not walk west while they do it. The window
@@ -616,7 +613,7 @@ impl Client {
                     "engine:chat" if pressed => {
                         app.set_chat_open(true);
                         self.held = Held::default();
-                        self.grabbed = !grab(window, false);
+                        self.grabbed = grab(window, wants_cursor(false, true, false));
                     }
                     "engine:debug_overlay" if pressed => {
                         let on = !app.debug_overlay();
@@ -634,11 +631,8 @@ impl Client {
                             let open = !app.menu_open();
                             app.set_menu_open(open);
                         }
-                        self.grabbed = if app.menu_open() {
-                            !grab(window, false)
-                        } else {
-                            grab(window, true)
-                        };
+                        let wanted = wants_cursor(app.menu_open(), app.chat_open(), false);
+                        self.grabbed = grab(window, wanted);
                     }
                     // The floating-origin check from Task 08's criteria: out
                     // and home. The world travels with the camera, so a working
@@ -868,7 +862,8 @@ impl Client {
             // Order matters: leave the server before stopping it, or the last
             // thing in the log is a connection dropping rather than a clean
             // goodbye.
-            let (renderer, bindings) = app.leave();
+            let (renderer, bindings, config) = app.leave();
+            self.config = config;
             self.parked = Some(Parked {
                 renderer,
                 present_mode: self.present_mode,
@@ -879,7 +874,7 @@ impl Client {
             handle.stop();
         }
         // The cursor comes back, or the menu cannot be clicked.
-        self.grabbed = !grab(&surface.window, false);
+        self.grabbed = grab(&surface.window, false);
         self.released_for_dialog = false;
         self.digging = false;
         self.held = Held::default();
@@ -1037,6 +1032,12 @@ impl Client {
         let app = self.start_app(connection);
         if let Some(surface) = self.window.as_mut() {
             surface.stage = Stage::Playing(Box::new(app));
+            // **Taken on the way in.** A world opened from the menu used to
+            // start with the pointer sitting in the middle of it: the client
+            // only ever grabbed on the first click, which was the right rule
+            // when it opened already in a world and there was nothing to click.
+            self.grabbed = grab(&surface.window, true);
+            self.released_for_dialog = false;
         }
         Ok(())
     }
@@ -1092,16 +1093,14 @@ impl Client {
         }
 
         let dialog_open = !app.dialogs().is_empty();
-        if dialog_open && !self.released_for_dialog {
-            self.grabbed = !grab(&surface.window, false);
-            self.released_for_dialog = true;
-        } else if !dialog_open && self.released_for_dialog {
-            self.released_for_dialog = false;
-            // Only if nothing else still wants it. Taking the cursor back into
-            // the settings screen would be the same bug from the other side.
-            if !app.menu_open() && !app.chat_open() {
-                self.grabbed = grab(&surface.window, true);
-            }
+        if dialog_open != self.released_for_dialog {
+            self.released_for_dialog = dialog_open;
+            // Asked on the transition rather than every frame, so a player who
+            // took the cursor back with Escape while a dialog is up keeps it —
+            // and answered by the one rule, so a dialog closing over an open
+            // menu does not snatch it away again.
+            let wanted = wants_cursor(app.menu_open(), app.chat_open(), dialog_open);
+            self.grabbed = grab(&surface.window, wanted);
         }
 
         let now = std::time::Instant::now();
@@ -1606,28 +1605,12 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
     let mut hud = app.hud_visible();
     let mut overlay = app.debug_overlay();
 
-    // **The same sheet every other panel gets**: centred, four by three, three
-    // quarters of the window. See `client::panel` for why one shape rather than
-    // four — a player reads these as one system or as four, and they were four.
-    let screen = ctx.content_rect();
-    let area = (screen.width(), screen.height());
-    let (width, height) = client::panel::size(area);
-    let (x, y) = client::panel::origin(area);
-    egui::Window::new("Menu")
-        .collapsible(false)
-        .resizable(false)
-        .title_bar(false)
-        .movable(false)
-        .fixed_pos(egui::pos2(screen.left() + x, screen.top() + y))
-        .fixed_size(egui::vec2(width, height))
-        .show(ctx, |ui| {
+    // **The same sheet every other screen gets**, and it decides the shape so
+    // this cannot. See `client::panel::sheet`.
+    resume |= client::panel::sheet(ctx, "Paused", Some("Resume"), |ui| {
+        {
             ui.vertical_centered_justified(|ui| {
                 ui.add_space(6.0);
-                ui.heading("Paused");
-                ui.add_space(10.0);
-                if ui.button("Resume").clicked() {
-                    resume = true;
-                }
                 if ui.button("Settings").clicked() {
                     controls = true;
                 }
@@ -1651,12 +1634,14 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
                     &mut scale,
                     *client::config::UI_SCALE_RANGE.start()..=*client::config::UI_SCALE_RANGE.end(),
                 )
+                .step_by(client::config::UI_SCALE_STEP)
                 .text("interface scale"),
             );
             ui.checkbox(&mut hud, "Show HUD");
             ui.checkbox(&mut overlay, "Debug overlay");
             ui.add_space(6.0);
-        });
+        }
+    });
 
     app.set_ui_scale(scale);
     app.set_hud_visible(hud);
@@ -1717,24 +1702,13 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
     let mut close = false;
     let mut volumes_changed = false;
 
-    // **The same sheet the menu gets.** It was a bare egui window wherever egui
-    // felt like putting it, which is what "janky" meant: it opened off to one
-    // side, it could be dragged half off the screen, and it had no relationship
-    // to anything else the game draws.
-    let screen = ctx.content_rect();
-    let area = (screen.width(), screen.height());
-    let (width, height) = client::panel::size(area);
-    let (x, y) = client::panel::origin(area);
-    egui::Window::new("Controls")
-        .collapsible(false)
-        .resizable(false)
-        .title_bar(false)
-        .movable(false)
-        .fixed_pos(egui::pos2(screen.left() + x, screen.top() + y))
-        .fixed_size(egui::vec2(width, height))
-        .show(ctx, |ui| {
-            ui.heading("Controls and audio");
-            ui.separator();
+    // **The same sheet every other screen gets**, which now decides the shape
+    // rather than being asked for one. This page is a scrolling list of
+    // bindings with volume sliders under it, and a `fixed_size` egui grows past
+    // is how it ended up running off the top and the bottom of the screen with
+    // no way to reach either end.
+    close |= client::panel::sheet(ctx, "Controls and audio", Some("Back"), |ui| {
+        {
             if let Some(id) = &waiting {
                 ui.label(
                     egui::RichText::new(format!("Press a key for {id} — Escape to cancel"))
@@ -1751,43 +1725,41 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
                 }
                 ui.separator();
             }
-            egui::ScrollArea::vertical()
-                .max_height(420.0)
-                .show(ui, |ui| {
-                    for (source, rows) in &groups {
-                        // **The attribution.** A player can see which mod wants
-                        // every binding they are being offered.
-                        ui.heading(source);
-                        for row in rows {
-                            ui.horizontal(|ui| {
-                                let label = if row.description.is_empty() {
-                                    row.id.clone()
-                                } else {
-                                    row.description.clone()
-                                };
-                                ui.add_sized([300.0, 18.0], egui::Label::new(label).truncate());
-                                let text = egui::RichText::new(&row.binding);
-                                let text = if row.conflicted {
-                                    text.color(egui::Color32::LIGHT_RED)
-                                } else {
-                                    text
-                                };
-                                if ui
-                                    .add_sized([120.0, 18.0], egui::Button::new(text))
-                                    .clicked()
-                                {
-                                    rebind = Some(row.id.clone());
-                                }
-                                // Only where there is something to undo, so the row
-                                // says at a glance which bindings are the player's.
-                                if row.custom && ui.small_button("reset").clicked() {
-                                    reset = Some(row.id.clone());
-                                }
-                            });
-                        }
-                        ui.separator();
+            {
+                for (source, rows) in &groups {
+                    // **The attribution.** A player can see which mod wants
+                    // every binding they are being offered.
+                    ui.heading(source);
+                    for row in rows {
+                        ui.horizontal(|ui| {
+                            let label = if row.description.is_empty() {
+                                row.id.clone()
+                            } else {
+                                row.description.clone()
+                            };
+                            ui.add_sized([300.0, 18.0], egui::Label::new(label).truncate());
+                            let text = egui::RichText::new(&row.binding);
+                            let text = if row.conflicted {
+                                text.color(egui::Color32::LIGHT_RED)
+                            } else {
+                                text
+                            };
+                            if ui
+                                .add_sized([120.0, 18.0], egui::Button::new(text))
+                                .clicked()
+                            {
+                                rebind = Some(row.id.clone());
+                            }
+                            // Only where there is something to undo, so the row
+                            // says at a glance which bindings are the player's.
+                            if row.custom && ui.small_button("reset").clicked() {
+                                reset = Some(row.id.clone());
+                            }
+                        });
                     }
-                });
+                    ui.separator();
+                }
+            }
             ui.separator();
             ui.heading("volume");
             // **Live, not on close.** A slider you cannot hear while dragging
@@ -1836,15 +1808,13 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
             }
 
             ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Reset all").clicked() {
-                    reset_all = true;
-                }
-                if ui.button("Close").clicked() {
-                    close = true;
-                }
-            });
-        });
+            // No "Close" here: the top bar's Back is the way out of every
+            // screen, and a second one further down is a second thing to learn.
+            if ui.button("Reset all").clicked() {
+                reset_all = true;
+            }
+        }
+    });
 
     if let Some(id) = rebind {
         app.begin_rebind(&id);
@@ -1904,14 +1874,19 @@ fn draw_front(
     config: &mut Config,
     view: &wgpu::TextureView,
 ) -> client::front::Action {
+    // **Before the input is taken, not inside the frame.** `egui_winit` turns
+    // a click into points using the zoom factor as it stands when the input is
+    // read, and `paint_egui` turns points back into pixels using it as it
+    // stands after — so setting it in between makes a frame whose clicks and
+    // whose pixels disagree, on every frame the scale changes. Set here, all
+    // three agree.
+    surface.egui.set_zoom_factor(config.ui_scale);
     let raw = surface.egui_state.take_egui_input(&surface.window);
     let mut action = client::front::Action::None;
-    let scale = config.ui_scale;
     let mut dirty = false;
     let output = surface.egui.run_ui(raw, |root| {
-        let context = root.ctx().clone();
-        context.set_zoom_factor(scale);
         if let Stage::Front(front) = &mut surface.stage {
+            let context = root.ctx().clone();
             action = front.draw(&context, config);
             dirty = front.take_settings_dirty();
         }
@@ -1936,6 +1911,10 @@ fn draw_front(
 /// the world instead of replacing it.
 fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     register_atlas(surface);
+    // Before the input, for the reason spelled out in `draw_front`.
+    if let Stage::Playing(app) = &surface.stage {
+        surface.egui.set_zoom_factor(app.ui_scale());
+    }
     let raw = surface.egui_state.take_egui_input(&surface.window);
     let Stage::Playing(app) = &mut surface.stage else {
         return;
@@ -1968,12 +1947,11 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         (content.width(), content.height())
     };
     let output = surface.egui.run_ui(raw, |root| {
+        // **One scale for the whole interface**, set above rather than by every
+        // panel: egui works in points, and the zoom factor is what a point is
+        // worth. A mod's HUD scales with it — see `draw_hud_scripts`, which
+        // measures its canvas in the same points.
         let context = root.ctx().clone();
-        // **One scale for the whole interface**, applied here rather than by
-        // every panel: egui works in points, and the zoom factor is what a
-        // point is worth. A mod's HUD scales with it — see `draw_hud_scripts`,
-        // which measures its canvas in the same points.
-        context.set_zoom_factor(app.ui_scale());
         if menu_open {
             draw_menu(app, &context);
         }
@@ -2214,7 +2192,27 @@ fn hotbar_slot(id: &str) -> Option<usize> {
     slot.checked_sub(1)
 }
 
+/// Whether the camera should have the mouse right now.
+///
+/// **One rule, in one place.** Four things can want the cursor back — the pause
+/// menu, the settings page, the chat line, a mod's dialog — and the decision
+/// used to be written out at each of the places that could open one. Four
+/// copies of a condition is four chances to get it wrong, and it WAS wrong: see
+/// [`grab`] for the negation that kept mouse-look running under every one of
+/// them.
+const fn wants_cursor(menu: bool, chat: bool, dialog: bool) -> bool {
+    !menu && !chat && !dialog
+}
+
 /// Grabs or releases the cursor, reporting whether it is now grabbed.
+///
+/// **The return is the STATE, not whether the call worked**, which is the whole
+/// of a bug worth naming. Every release site wrote `grabbed = !grab(w, false)`
+/// — reading the result as "did it succeed" — so releasing the cursor set
+/// `grabbed` to true. The cursor came back and mouse-look never stopped, so the
+/// pause screen, the chat line and every mod dialog were all opened with the
+/// camera still swinging under them. Reported from the window as "I hit escape
+/// and I am still looking around".
 ///
 /// Confined first, locked second: Wayland supports one and X11 the other, and
 /// a client that insisted on either would refuse to grab on half of Linux.
@@ -2283,6 +2281,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn only_a_world_with_nothing_over_it_gets_the_mouse() {
+        use super::wants_cursor;
+
+        // The camera has the mouse when nothing is asking for it, and not
+        // otherwise. **The bug this replaced was worse than a wrong condition:**
+        // `grab` returns whether the cursor is NOW grabbed, and every release
+        // site wrote `grabbed = !grab(w, false)` — reading it as "did that
+        // work" — so releasing the cursor set the flag to true and mouse-look
+        // carried on under the pause screen, the chat line and every dialog.
+        assert!(wants_cursor(false, false, false), "nothing is in the way");
+        assert!(!wants_cursor(true, false, false), "the pause menu is open");
+        assert!(!wants_cursor(false, true, false), "chat is open");
+        assert!(!wants_cursor(false, false, true), "a mod's dialog is open");
+        // And more than one at once is still no.
+        assert!(!wants_cursor(true, true, true));
+        // The case the old scattered version got wrong from the other side: a
+        // dialog closing must not take the cursor back into an open menu.
+        assert!(!wants_cursor(true, false, false));
+    }
+
+    #[test]
+    fn the_interface_scale_moves_in_steps_a_player_can_land_on() {
+        // Reported from the window as "waaay too sensitive". A continuous
+        // slider over the old 0.5..=3.0 moved the whole interface on a pixel of
+        // travel — and the interface includes the slider, so it slid out from
+        // under the pointer.
+        let range = client::config::UI_SCALE_RANGE;
+        let span = f64::from(*range.end() - *range.start());
+        let steps = span / client::config::UI_SCALE_STEP;
+        assert!(
+            (20.0..=40.0).contains(&steps),
+            "{steps} positions across the slider is not a scale anybody can aim at"
+        );
+        assert!(
+            *range.start() >= 0.75 && *range.end() <= 2.0,
+            "a range this wide is what made a small drag a big change"
+        );
+        // 1.0 has to be reachable exactly, or a player cannot get back to it.
+        // Counted rather than rounded: `round` is on the determinism ban list
+        // and a step count is integer arithmetic anyway.
+        let mut at = f64::from(*range.start());
+        let mut lands_on_one = false;
+        for _ in 0..64 {
+            if (at - 1.0).abs() < 1e-9 {
+                lands_on_one = true;
+            }
+            at += client::config::UI_SCALE_STEP;
+        }
+        assert!(
+            lands_on_one,
+            "the steps do not land on 1.0, so there is no way back to no scaling"
+        );
     }
 
     #[test]

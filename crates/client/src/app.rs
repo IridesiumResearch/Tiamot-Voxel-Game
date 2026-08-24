@@ -3080,15 +3080,23 @@ impl App {
     /// it per world would be a visible stall — so it goes back to the window,
     /// along with the bindings, which are the player's and not this world's.
     #[must_use]
-    pub fn leave(self) -> (Renderer, crate::input::Bindings) {
+    pub fn leave(self) -> (Renderer, crate::input::Bindings, crate::config::Config) {
         let Self {
             connection,
             renderer,
             bindings,
+            config,
             ..
         } = self;
         connection.shutdown();
-        (renderer, bindings)
+        // **The config comes back too.** A world holds its own copy so that a
+        // setting changed in it takes effect immediately, and the window kept
+        // the copy it started with — so a scale or a volume set in game was
+        // forgotten the moment the player left, and only reappeared on the next
+        // launch once `client.toml` had been read again. Reported from the
+        // window as the interface scale "only changing once the game is
+        // restarted".
+        (renderer, bindings, config)
     }
 
     /// Which fluid the camera is inside, if any.

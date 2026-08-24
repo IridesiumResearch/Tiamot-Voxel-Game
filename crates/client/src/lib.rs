@@ -101,6 +101,65 @@ pub mod panel {
         ((area.0 - width) / 2.0, (area.1 - height) / 2.0)
     }
 
+    /// What a screen the player pressed a button to open looks like.
+    ///
+    /// # Why every one of these goes through here
+    ///
+    /// **A `fixed_size` on an `egui::Window` is a request, not a bound.** Put
+    /// more in one than fits and egui grows it — so the settings page, which
+    /// has a scrolling list of bindings and then volume sliders below it, ran
+    /// off the top and the bottom of the screen with no way to reach either end.
+    /// Reported from the window, and it is the sort of thing every screen would
+    /// have got wrong separately.
+    ///
+    /// So the shape is decided here and the content is handed a `Ui` that is
+    /// already inside it: a title bar with an optional Back, then whatever is
+    /// left, scrolling. A screen cannot escape its own sheet because it never
+    /// gets to say how big it is.
+    ///
+    /// Returns whether Back was pressed.
+    pub fn sheet(
+        ctx: &egui::Context,
+        title: &str,
+        back: Option<&str>,
+        contents: impl FnOnce(&mut egui::Ui),
+    ) -> bool {
+        let screen = ctx.content_rect();
+        let (width, height) = size((screen.width(), screen.height()));
+        let (x, y) = origin((screen.width(), screen.height()));
+        let mut went_back = false;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .movable(false)
+            .fixed_pos(egui::pos2(screen.left() + x, screen.top() + y))
+            .fixed_size(egui::vec2(width, height))
+            // Belt as well as braces: `fixed_size` is what egui aims for and
+            // this is what it may not exceed, so a screen that asks for more
+            // scrolls instead of growing.
+            .max_height(height)
+            .show(ctx, |ui| {
+                ui.set_min_size(egui::vec2(width, height));
+                // **The bar is the same on every screen**, which is the point:
+                // a player who has learned where Back is has learned it once.
+                ui.horizontal(|ui| {
+                    if let Some(label) = back {
+                        went_back |= ui.button(format!("← {label}")).clicked();
+                        ui.separator();
+                    }
+                    ui.heading(title);
+                });
+                ui.separator();
+                // Everything below scrolls. The header stays put, so the way
+                // out is always on screen however long the page is.
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, contents);
+            });
+        went_back
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;

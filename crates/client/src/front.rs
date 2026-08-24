@@ -94,50 +94,40 @@ impl Front {
     /// the window saves when [`Front::settings_dirty`] says so.
     pub fn draw(&mut self, ctx: &egui::Context, config: &mut crate::config::Config) -> Action {
         let mut action = Action::None;
-        let screen = ctx.content_rect();
-        let area = (screen.width(), screen.height());
-        let (width, height) = crate::panel::size(area);
-        let (x, y) = crate::panel::origin(area);
-
-        egui::Window::new("Tiamot")
-            .collapsible(false)
-            .resizable(false)
-            .title_bar(false)
-            .movable(false)
-            .fixed_pos(egui::pos2(screen.left() + x, screen.top() + y))
-            .fixed_size(egui::vec2(width, height))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Tiamot");
-                    ui.add_space(16.0);
-                    for (tab, label) in [
-                        (Tab::Play, "Play"),
-                        (Tab::Mods, "Mods"),
-                        (Tab::Settings, "Settings"),
-                    ] {
-                        if ui.selectable_label(self.tab == tab, label).clicked() {
-                            self.tab = tab;
-                        }
+        // **The same sheet as every in-game screen**, so a page cannot decide
+        // its own size and run off the edges — see `crate::panel::sheet`. The
+        // tabs are this screen's own row under the shared bar, because it is
+        // the one screen with nowhere to go Back to.
+        crate::panel::sheet(ctx, "Tiamot", None, |ui| {
+            ui.horizontal(|ui| {
+                for (tab, label) in [
+                    (Tab::Play, "Play"),
+                    (Tab::Mods, "Mods"),
+                    (Tab::Settings, "Settings"),
+                ] {
+                    if ui.selectable_label(self.tab == tab, label).clicked() {
+                        self.tab = tab;
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Quit").clicked() {
-                            action = Action::Quit;
-                        }
-                    });
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Quit").clicked() {
+                        action = Action::Quit;
+                    }
                 });
-                ui.separator();
-
-                if let Some(notice) = &self.notice {
-                    ui.colored_label(egui::Color32::from_rgb(230, 170, 90), notice);
-                    ui.separator();
-                }
-
-                match self.tab {
-                    Tab::Play => action = self.play_tab(ui),
-                    Tab::Mods => self.mods_tab(ui),
-                    Tab::Settings => self.settings_tab(ui, config),
-                }
             });
+            ui.separator();
+
+            if let Some(notice) = &self.notice {
+                ui.colored_label(egui::Color32::from_rgb(230, 170, 90), notice);
+                ui.separator();
+            }
+
+            match self.tab {
+                Tab::Play => action = self.play_tab(ui),
+                Tab::Mods => self.mods_tab(ui),
+                Tab::Settings => self.settings_tab(ui, config),
+            }
+        });
 
         if let Some(confirmed) = self.confirmation(ctx) {
             action = confirmed;
@@ -148,10 +138,8 @@ impl Front {
     /// The world list, and the two buttons.
     fn play_tab(&mut self, ui: &mut egui::Ui) -> Action {
         let mut action = Action::None;
-        let list_height = (ui.available_height() - 96.0).max(80.0);
-        egui::ScrollArea::vertical()
-            .max_height(list_height)
-            .show(ui, |ui| {
+        {
+            {
                 if self.library.entries.is_empty() {
                     ui.label("No worlds yet. Name one below and press New World.");
                 }
@@ -171,7 +159,8 @@ impl Front {
                         self.selected = Some(index);
                     }
                 }
-            });
+            }
+        }
 
         ui.separator();
         ui.horizontal(|ui| {
@@ -235,7 +224,7 @@ impl Front {
             self.catalogue.set_all(all);
         }
         ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        {
             if self.catalogue.mods.is_empty() {
                 ui.label("No mods installed. A client with none can still join servers.");
             }
@@ -248,7 +237,7 @@ impl Front {
                     ui.indent(&listing.id, |ui| ui.weak(&listing.description));
                 }
             }
-        });
+        }
     }
 
     /// The mod-set warning, when one is waiting.
@@ -321,7 +310,7 @@ impl Front {
         use crate::config::{LightingMode, RenderMode, ShadowQuality};
 
         let mut changed = false;
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        {
             ui.heading("Player");
             ui.horizontal(|ui| {
                 ui.label("Display name");
@@ -394,6 +383,7 @@ impl Front {
                         *crate::config::UI_SCALE_RANGE.start()
                             ..=*crate::config::UI_SCALE_RANGE.end(),
                     )
+                    .step_by(crate::config::UI_SCALE_STEP)
                     .text("scale"),
                 )
                 .changed();
@@ -406,7 +396,7 @@ impl Front {
             ui.add_space(8.0);
             ui.weak("Keys and volume are on the in-game screen — press Escape in a world.");
             ui.weak("A mod's controls only exist once a server has told the client about them.");
-        });
+        }
         self.settings_dirty |= changed;
     }
 

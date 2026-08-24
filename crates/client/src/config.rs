@@ -311,7 +311,16 @@ impl ShadowQuality {
 /// and an enormous one is a single button filling the screen. Both are
 /// unrecoverable from inside the game, which is why this is a refusal at load
 /// rather than a clamp.
-pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
+pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.75..=2.0;
+
+/// The smallest change the interface-scale slider makes.
+///
+/// **Reported from the window as "waaay too sensitive".** A continuous slider
+/// over a range this wide moves the whole interface on a pixel of mouse travel,
+/// and the one setting whose effect is the control itself is the worst place
+/// for that — the slider slides out from under the pointer as it is dragged.
+/// Twenty-five steps across the range is a scale a player can land on.
+pub const UI_SCALE_STEP: f64 = 0.05;
 
 /// Client configuration.
 ///
