@@ -617,6 +617,14 @@ pub struct Renderer {
     /// The atlas geometry the shader needs, mirroring what was uploaded.
     atlas_grid: u32,
     atlas_side: u32,
+    /// The atlas texture itself, kept so the interface can draw from it.
+    ///
+    /// **Kept only because egui needs a view to register.** The world pass
+    /// reaches the atlas through `bind_group` and never touches this; a slot in
+    /// an inventory has to draw the same pixels, and the alternative — a second
+    /// upload of the same image for the UI — would double the atlas's memory
+    /// just to show a player what they are carrying.
+    atlas_view: wgpu::TextureView,
     chunks: BTreeMap<ChunkPos, ChunkMesh>,
     /// Retired chunk buffers, kept for reuse. See [`BufferPool`].
     pool: BufferPool,
@@ -830,6 +838,7 @@ impl Renderer {
             sampler,
             atlas_grid: grid,
             atlas_side: side,
+            atlas_view: view,
             chunks: BTreeMap::new(),
             pool: BufferPool::default(),
             selection_pipeline,
@@ -1031,6 +1040,17 @@ impl Renderer {
             &view,
             &self.sampler,
         );
+        self.atlas_view = view;
+    }
+
+    /// The atlas texture, for an interface that wants to draw a material.
+    ///
+    /// **The same texture the world is drawn from**, which is the point: a slot
+    /// showing stone and a wall made of it cannot disagree about what stone
+    /// looks like, because there is one image.
+    #[must_use]
+    pub const fn atlas_view(&self) -> &wgpu::TextureView {
+        &self.atlas_view
     }
 
     /// Uploads a chunk's mesh, replacing any previous one.

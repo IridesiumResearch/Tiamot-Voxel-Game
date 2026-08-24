@@ -42,6 +42,7 @@ pub mod camera;
 pub mod config;
 pub mod dialog;
 pub mod entities;
+pub mod icons;
 pub mod input;
 pub mod mesher;
 pub mod net;

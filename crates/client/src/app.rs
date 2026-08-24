@@ -776,6 +776,15 @@ pub struct App {
     settings_open: bool,
     /// Whether the player asked to quit from the menu.
     quit_requested: bool,
+    /// Where each material sits in the atlas, for whatever draws a slot.
+    ///
+    /// Kept beside the renderer's copy rather than read back out of it: the
+    /// interface needs the layout, the renderer needs the pixels, and the
+    /// atlas itself — several megabytes for a large mod set — is dropped once
+    /// it is on the GPU.
+    tiles: crate::texture::TileMap,
+    /// Whether the atlas texture changed and egui has not been told.
+    atlas_changed: bool,
     /// Whether the pause menu is on the screen.
     ///
     /// **Escape opens a menu rather than only releasing the cursor.** Releasing
@@ -1031,6 +1040,8 @@ impl App {
             settings_open: false,
             menu_open: false,
             quit_requested: false,
+            tiles: crate::texture::TileMap::default(),
+            atlas_changed: false,
             rebinding: None,
             bindings_dirty: false,
             connection,
@@ -2536,6 +2547,43 @@ impl App {
         self.quit_requested = true;
     }
 
+    /// Packs the server's textures and hands them to everything that draws.
+    ///
+    /// The renderer gets the pixels, the interface gets the layout, and the
+    /// packed image is dropped at the end of this call — one copy of an atlas
+    /// that is several megabytes for a large mod set.
+    fn adopt_atlas(
+        &mut self,
+        table: &[tiamot_core::proto::MaterialDef],
+        images: &BTreeMap<u16, Image>,
+    ) {
+        self.adopt_materials(table);
+        let atlas = build_atlas(table, images);
+        self.tiles = atlas.tiles_only();
+        self.atlas_changed = true;
+        self.renderer.set_atlas(&atlas);
+        // Every mesh drawn before this sampled the placeholder atlas. In
+        // practice the table arrives before any chunk, but "in practice" is not
+        // a guarantee the renderer should rely on.
+        self.store.mark_all_dirty();
+    }
+
+    /// Where each material sits in the atlas.
+    #[must_use]
+    pub const fn tiles(&self) -> &crate::texture::TileMap {
+        &self.tiles
+    }
+
+    /// Whether the atlas texture is new and needs registering with egui.
+    ///
+    /// True exactly once per atlas. The material table arrives mid-session,
+    /// after the window and its egui renderer already exist, so the bridge
+    /// cannot be built at startup — and re-registering every frame would leak
+    /// a texture per frame.
+    pub const fn take_atlas_change(&mut self) -> bool {
+        std::mem::replace(&mut self.atlas_changed, false)
+    }
+
     /// Takes the quit request, if one was made.
     pub const fn take_quit_request(&mut self) -> bool {
         std::mem::replace(&mut self.quit_requested, false)
@@ -3055,15 +3103,7 @@ impl App {
                     }
                 }
 
-                Event::Materials { table, images } => {
-                    self.adopt_materials(&table);
-                    self.renderer.set_atlas(&build_atlas(&table, &images));
-                    // Every mesh drawn before this sampled the placeholder
-                    // atlas. In practice the table arrives before any chunk,
-                    // but "in practice" is not a guarantee the renderer should
-                    // rely on.
-                    self.store.mark_all_dirty();
-                }
+                Event::Materials { table, images } => self.adopt_atlas(&table, &images),
 
                 Event::Joined { spawn, tick, .. } => {
                     let position = Position::from_world(

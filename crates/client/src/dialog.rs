@@ -27,6 +27,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::icons::Icons;
+
 use tiamot_core::proto::{Click, DialogEvent};
 use tiamot_core::ui::{Laid, Measure, Node, Rect, Style, Tree, Widget, layout};
 
@@ -166,13 +168,14 @@ impl Dialogs {
         ctx: &egui::Context,
         open: &BTreeMap<String, Tree>,
         views: &BTreeMap<String, ViewContents>,
+        icons: Icons<'_>,
         area: (f32, f32),
     ) -> Vec<Raised> {
         self.retain_open(open);
         let mut raised = Vec::new();
         for (form, tree) in open {
             let local = self.forms.entry(form.clone()).or_default();
-            raised.extend(draw_form(ctx, form, tree, local, views, area));
+            raised.extend(draw_form(ctx, form, tree, local, views, icons, area));
         }
         raised
     }
@@ -185,6 +188,7 @@ fn draw_form(
     tree: &Tree,
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
+    icons: Icons<'_>,
     area: (f32, f32),
 ) -> Vec<Raised> {
     let mut raised = Vec::new();
@@ -227,7 +231,18 @@ fn draw_form(
             // The tree and its rectangles are walked TOGETHER, by index, so a
             // renderer cannot pair a widget with somebody else's rectangle —
             // which a flat list plus a separate traversal invites.
-            paint(ui, origin, tree, 0, &laid, form, local, views, &mut raised);
+            paint(
+                ui,
+                origin,
+                tree,
+                0,
+                &laid,
+                form,
+                local,
+                views,
+                icons,
+                &mut raised,
+            );
             ui.allocate_space(egui::vec2(laid.rect.w as f32, laid.rect.h as f32));
             if ui.button("Close").clicked() {
                 close = true;
@@ -256,6 +271,7 @@ fn paint(
     form: &str,
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
+    icons: Icons<'_>,
     raised: &mut Vec<Raised>,
 ) {
     let Some(node) = tree.nodes.get(index) else {
@@ -266,11 +282,11 @@ fn paint(
         egui::vec2(laid.rect.w as f32, laid.rect.h as f32),
     );
     paint_background(ui, rect, &node.style);
-    paint_widget(ui, rect, node, form, local, views, raised);
+    paint_widget(ui, rect, node, form, local, views, icons, raised);
 
     for (child, child_laid) in tree.children_of(index).zip(&laid.children) {
         paint(
-            ui, origin, tree, child, child_laid, form, local, views, raised,
+            ui, origin, tree, child, child_laid, form, local, views, icons, raised,
         );
     }
 }
@@ -301,6 +317,11 @@ fn paint_background(ui: &egui::Ui, rect: egui::Rect, style: &Style) {
 struct Paint<'a> {
     /// Which dialog, for the events raised.
     form: &'a str,
+    /// The atlas, for whatever draws a material.
+    ///
+    /// Carried here rather than as a sixth parameter through four painters:
+    /// it is what a slot needs and nothing above a slot looks at it.
+    icons: Icons<'a>,
     /// Text colour, resolved from the node's style.
     colour: egui::Color32,
     /// Text font, resolved from the node's style.
@@ -321,6 +342,10 @@ impl Paint<'_> {
 ///
 /// A dispatcher: each interactive widget has its own painter, because they are
 /// where the interaction rules live and one 200-line match hid them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatcher carries what every widget painter might need"
+)]
 fn paint_widget(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -328,10 +353,12 @@ fn paint_widget(
     form: &str,
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
+    icons: Icons<'_>,
     raised: &mut Vec<Raised>,
 ) {
     let paint = Paint {
         form,
+        icons,
         colour: node.style.text_colour.map_or(egui::Color32::WHITE, |c| {
             egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
         }),
@@ -395,16 +422,20 @@ fn paint_widget(
     }
 }
 
-/// The colour that stands in for a material until the atlas is bridged in.
+/// The colour that stands in for a material when there is no atlas.
 ///
-/// **Shared with the tier-2 HUD's `Icon` command**, so a mod's hotbar and the
-/// engine's inventory slots show the same material as the same colour. Two
-/// independent hashes of the same id would be the sort of difference a player
-/// notices and nobody can explain.
+/// **The fallback, not the normal path** — see [`crate::icons::Icons`], which
+/// draws the real tile once the server's material table has arrived. This is
+/// what a slot shows on the frames before that, and for a client that never
+/// receives one.
+///
+/// Shared with the tier-2 HUD's `Icon` command, so a mod's hotbar and the
+/// engine's inventory slots fall back the same way. Two independent hashes of
+/// the same id would be the sort of difference a player notices and nobody can
+/// explain.
 #[must_use]
 pub fn material_tint(material: u16) -> egui::Color32 {
-    // Keyed off the id so two materials look different. Textured slots want the
-    // atlas, which is the world renderer's texture and a later change.
+    // Keyed off the id so two materials look different.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "a deliberate hash into a byte"
@@ -717,8 +748,7 @@ fn paint_slot(
         .and_then(|contents| contents.slots.get(usize::from(index)).copied().flatten())
     {
         let (material, units) = (stack.material, stack.units);
-        ui.painter()
-            .rect_filled(inner.shrink(6.0), 2.0, material_tint(material));
+        paint.icons.paint(ui.painter(), inner.shrink(6.0), material);
         // **Charter rule 5's display rule, and the only place the 27 shows.**
         // Blocks and spare nodes, never a raw unit count: a player thinks in
         // blocks, and `1+13` is what forty units actually is.

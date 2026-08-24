@@ -148,6 +148,13 @@ struct Surface {
     /// Local state for the server's dialogs — what is half-typed into a field,
     /// which is the client's business and not the server's.
     dialogs: client::dialog::Dialogs,
+    /// The world's texture atlas, as egui knows it.
+    ///
+    /// `None` until the server sends its material table, which is after the
+    /// window exists — so this cannot be built at startup, and every slot
+    /// drawn before it arrives falls back to a tint. Registered once per
+    /// atlas: see [`App::take_atlas_change`].
+    atlas_texture: Option<egui::TextureId>,
     size: (u32, u32),
 }
 
@@ -611,6 +618,7 @@ impl Client {
             egui_state,
             egui_renderer,
             dialogs: client::dialog::Dialogs::default(),
+            atlas_texture: None,
             size,
         })
     }
@@ -867,7 +875,7 @@ fn draw_sound_attribution(app: &App, ui: &mut egui::Ui) {
 /// alone, so a HUD is the same apparent size on every monitor and anchors take
 /// care of the width. Points rather than physical pixels, because egui works in
 /// points and DPI is its problem, not the script's.
-fn draw_hud_scripts(app: &mut App, ctx: &egui::Context) {
+fn draw_hud_scripts(app: &mut App, ctx: &egui::Context, icons: client::icons::Icons<'_>) {
     app.run_hud_scripts();
 
     // **Off means off, crosshair included** — but never chat, which is drawn
@@ -894,7 +902,7 @@ fn draw_hud_scripts(app: &mut App, ctx: &egui::Context) {
     let hides_crosshair = app
         .hud_frame(|frame| {
             for command in frame.commands() {
-                paint_hud_command(&painter, command, virtual_width, scale);
+                paint_hud_command(&painter, command, virtual_width, scale, icons);
             }
             frame.hides(tiamot_core::hud::Builtin::Crosshair)
         })
@@ -952,6 +960,7 @@ fn paint_hud_command(
     command: &tiamot_core::hud::Command,
     virtual_width: f32,
     scale: f32,
+    icons: client::icons::Icons<'_>,
 ) {
     use tiamot_core::hud::Command;
 
@@ -1018,7 +1027,7 @@ fn paint_hud_command(
             let min = place(*anchor, *x, *y);
             let extent = egui::vec2(f32::from(*size) * scale, f32::from(*size) * scale);
             let rect = egui::Rect::from_min_size(min, extent);
-            painter.rect_filled(rect, 2.0, client::dialog::material_tint(material.0));
+            icons.paint(painter, rect, material.0);
             painter.rect_stroke(
                 rect,
                 2.0,
@@ -1408,11 +1417,37 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+/// Hands egui a view of the world's texture atlas, once per atlas.
+///
+/// **Not a second copy.** The atlas is uploaded by the renderer and this
+/// registers a view of that same texture, so an inventory slot and the wall
+/// built from it cannot disagree about what a material looks like.
+///
+/// Nearest filtering: a 16-pixel tile blown up to a 48-point slot should look
+/// like the blocks do, not like a smear.
+fn register_atlas(surface: &mut Surface) {
+    if !surface.app.take_atlas_change() {
+        return;
+    }
+    // Freed before the replacement is registered: a session that reloads its
+    // material table would otherwise leak a bind group per reload.
+    if let Some(old) = surface.atlas_texture.take() {
+        surface.egui_renderer.free_texture(&old);
+    }
+    let device = surface.app.renderer().gpu().device.clone();
+    surface.atlas_texture = Some(surface.egui_renderer.register_native_texture(
+        &device,
+        surface.app.renderer().atlas_view(),
+        wgpu::FilterMode::Nearest,
+    ));
+}
+
 /// Draws the HUD over the frame that has just been rendered.
 ///
 /// A second render pass that loads rather than clears, so it composites onto
 /// the world instead of replacing it.
 fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
+    register_atlas(surface);
     let raw = surface.egui_state.take_egui_input(&surface.window);
     // Empty when the overlay is off. The warnings and the joining notice below
     // are NOT part of it — those tell a player something is wrong, and a player
@@ -1427,6 +1462,10 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
 
     let settings_open = surface.app.settings_open();
     let menu_open = surface.app.menu_open();
+    // Cloned out because the closure below borrows `surface.app` mutably, and
+    // the interface needs to read the atlas layout while it does.
+    let tiles = surface.app.tiles().clone();
+    let atlas_texture = surface.atlas_texture;
     let size = (
         surface.window.inner_size().width as f32,
         surface.window.inner_size().height as f32,
@@ -1448,10 +1487,13 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // server sent: `client::dialog` walks the tree and the rectangles
         // `core::ui` computed for it. See that module for why the layout is
         // not egui's.
-        let raised =
-            surface
-                .dialogs
-                .draw(&context, surface.app.dialogs(), surface.app.views(), size);
+        let raised = surface.dialogs.draw(
+            &context,
+            surface.app.dialogs(),
+            surface.app.views(),
+            client::icons::Icons::new(atlas_texture, Some(&tiles)),
+            size,
+        );
         // **The interface makes its own noise, locally.** A click that waited
         // for the server to agree it had happened would arrive after the button
         // had already visibly moved. `engine:ui_click` is bound like any other
@@ -1466,7 +1508,11 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // **Last, so a script's HUD sits over the world and under a dialog.**
         // A dialog is a thing a player is interacting with; a HUD is a thing
         // they are reading past.
-        draw_hud_scripts(&mut surface.app, &context);
+        draw_hud_scripts(
+            &mut surface.app,
+            &context,
+            client::icons::Icons::new(atlas_texture, Some(&tiles)),
+        );
         if lines.is_empty() && warnings.is_empty() && joined {
             return;
         }

@@ -470,7 +470,53 @@ impl Atlas {
     /// Returned as `(u0, v0, u1, v1)` in `0.0..=1.0`.
     #[must_use]
     pub fn tile_uv(&self, slot: u32) -> (f32, f32, f32, f32) {
-        let side = self.side() as f32;
+        self.tiles_only().uv_of_slot(slot)
+    }
+
+    /// Where each material sits, without carrying the pixels along.
+    ///
+    /// The interface needs to point at a tile — the inventory draws the same
+    /// stone the wall is drawn from — but it has no use for the packed image,
+    /// which for a large mod set is several megabytes the GPU already holds.
+    /// Handing the interface a [`TileMap`] keeps one copy of the atlas.
+    #[must_use]
+    pub fn tiles_only(&self) -> TileMap {
+        TileMap {
+            grid: self.grid,
+            slots: self.slots.clone(),
+        }
+    }
+}
+
+/// Where each material sits in the atlas: the layout, minus the image.
+///
+/// Produced by [`Atlas::tiles_only`] and held by whatever draws materials
+/// outside the world pass. It answers the one question the interface asks —
+/// "which rectangle of the atlas is this material?" — and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TileMap {
+    grid: u32,
+    slots: Vec<u32>,
+}
+
+impl TileMap {
+    /// The UV rectangle of one material's tile, excluding its padding.
+    ///
+    /// Returns `None` for an empty map — before the material table has
+    /// arrived there is no atlas to point into, and a caller that gets a
+    /// rectangle anyway would sample the placeholder and show every material
+    /// as the same colour.
+    #[must_use]
+    pub fn uv_of(&self, material: u16) -> Option<(f32, f32, f32, f32)> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        Some(self.uv_of_slot(self.slots.get(material as usize).copied().unwrap_or(0)))
+    }
+
+    /// The UV rectangle of one slot, excluding its padding.
+    fn uv_of_slot(&self, slot: u32) -> (f32, f32, f32, f32) {
+        let side = (self.grid * TILE_PITCH) as f32;
         let column = (slot % self.grid) as f32;
         let row = (slot / self.grid) as f32;
         let origin_x = column * TILE_PITCH as f32 + PADDING as f32;

@@ -2005,3 +2005,61 @@ fn a_held_dig_finishes_its_block_before_looking_through_the_hole() {
     app.shutdown();
     assert!(server.stop());
 }
+
+/// The atlas reaches the interface, and is handed to egui exactly once.
+///
+/// # Why the count matters
+///
+/// `register_native_texture` allocates a bind group per call and `main.rs` has
+/// no way to know when a new one is warranted other than being told. Asking
+/// every frame would leak one per frame; asking once at startup would never
+/// happen, because the material table arrives from the server long after the
+/// window does. So the flag has to be true exactly once per atlas, and this
+/// counts it across a whole session rather than trusting the shape of the code.
+#[test]
+fn the_atlas_reaches_the_interface_and_is_handed_over_exactly_once() {
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let server = embedded("atlas-bridge");
+    let mut app = client("atlas-bridge", &server, gpu);
+
+    let mut changes = 0;
+    let mut arrived: Option<Instant> = None;
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        if app.take_atlas_change() {
+            changes += 1;
+            arrived.get_or_insert_with(Instant::now);
+        }
+        // A second of frames AFTER the atlas lands, because what is being
+        // tested is an absence: a flag left set would be counted again in
+        // every one of them. Wall-clock rather than a frame count — the
+        // window is how long the client is watched, not how much it did.
+        if arrived.is_some_and(|at| at.elapsed() > Duration::from_secs(1)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    assert_eq!(
+        changes, 1,
+        "the atlas is handed to egui once per atlas, not once per frame"
+    );
+
+    // And the layout that went with it actually distinguishes materials — a
+    // bridge that mapped everything to tile zero would draw one block for all.
+    let tiles = app.tiles();
+    let first = tiles.uv_of(1).expect("the material table has arrived");
+    let second = tiles.uv_of(2).expect("the material table has arrived");
+    assert_ne!(
+        first, second,
+        "two materials sharing a tile would draw as the same block"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}
