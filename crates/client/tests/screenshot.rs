@@ -3021,3 +3021,62 @@ fn a_wall_off_the_side_of_the_screen_still_casts_into_it() {
          leaves the frustum stops casting, which is the shadow going out as you turn away"
     );
 }
+
+#[test]
+fn a_hand_is_on_screen_in_first_person_and_holds_what_is_selected() {
+    // **The viewmodel, from the one angle that can go wrong invisibly.** It is
+    // drawn in VIEW space with no view matrix and no depth test, so the two
+    // failures are "it is somewhere else entirely" and "the world is in front
+    // of it". Both look the same from the outside: no hand.
+    let Some(gpu) = gpu() else { return };
+    let chunks = wall_scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Pressed up against the wall, which is where a depth-tested hand would
+    // vanish. The camera looks along +z from inside the world.
+    let mut camera = Camera {
+        position: Position::from_world(17.5, 10.0, 24.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, 0.0);
+
+    renderer.set_hands(Vec::new());
+    let empty = target.capture(&mut renderer, &camera).expect("capture");
+
+    renderer.set_hands(client::render::viewmodel::pieces(
+        client::render::viewmodel::Hand::Main,
+        client::render::viewmodel::Held {
+            tile: Some([0.0, 0.0, 0.25, 0.25]),
+            swing: 0.0,
+        },
+    ));
+    let handed = target.capture(&mut renderer, &camera).expect("capture");
+
+    // The hand sits low and to the right. Counted rather than hashed, for the
+    // reason the body test gives: a hash averages a frame into a 16x16 grid
+    // precisely so that something this size cannot move it.
+    let differing = ((HEIGHT / 2)..HEIGHT)
+        .step_by(2)
+        .flat_map(|y| ((WIDTH / 2)..WIDTH).step_by(2).map(move |x| (x, y)))
+        .filter(|(x, y)| empty.pixel(*x, *y) != handed.pixel(*x, *y))
+        .count();
+    assert!(
+        differing > 20,
+        "only {differing} pixels changed in the bottom-right when a hand was put there, so \
+         either it is drawn somewhere else or the wall is in front of it"
+    );
+
+    // And the left half is untouched, which says it is a HAND rather than
+    // something drawn over the whole frame.
+    let left = ((HEIGHT / 2)..HEIGHT)
+        .step_by(2)
+        .flat_map(|y| (0..(WIDTH / 4)).step_by(2).map(move |x| (x, y)))
+        .filter(|(x, y)| empty.pixel(*x, *y) != handed.pixel(*x, *y))
+        .count();
+    assert!(
+        left < differing / 4,
+        "{left} pixels changed on the far side of the screen against {differing} where the \
+         hand is, so this is not a hand"
+    );
+}

@@ -33,6 +33,7 @@ pub mod graph;
 pub mod offscreen;
 pub mod shadow;
 pub mod skinned;
+pub mod viewmodel;
 
 use std::collections::BTreeMap;
 
@@ -597,6 +598,14 @@ pub struct Renderer {
     cast: usize,
     /// Skinned figures — every entity, every other player, and now this one.
     skinned: skinned::Skinned,
+    /// The hands, drawn last and in view space. See [`viewmodel`].
+    hands: viewmodel::Viewmodel,
+    /// What they are made of this frame.
+    ///
+    /// Uploaded in `render` rather than when they are set, because the
+    /// projection they are drawn with depends on the frame's aspect ratio and
+    /// the caller has no reason to know it.
+    hands_at: Vec<viewmodel::Piece>,
     /// The figure pipeline for the swapchain format. Mode 3 keeps its own,
     /// compiled against the float target, in `post`.
     skinned_pipeline: wgpu::RenderPipeline,
@@ -728,7 +737,9 @@ impl Renderer {
             skinned::colour_pipeline(&gpu, &skinned, &bind_layout, mode, COLOUR_FORMAT);
 
         Ok(Self {
+            hands: viewmodel::Viewmodel::new(&gpu, &view, &sampler, COLOUR_FORMAT),
             gpu,
+            hands_at: Vec::new(),
             skinned,
             skinned_pipeline,
             skinned_shadow: None,
@@ -967,7 +978,17 @@ impl Renderer {
             &view,
             &self.sampler,
         );
+        self.hands.set_atlas(&self.gpu, &view, &self.sampler);
         self.atlas_view = view;
+    }
+
+    /// What the hands are holding and how far through a swing they are.
+    ///
+    /// Given as pieces rather than as state, because deciding what a hand looks
+    /// like is `viewmodel`'s and deciding what is in one is the `App`'s — and
+    /// the renderer is neither.
+    pub fn set_hands(&mut self, pieces: Vec<viewmodel::Piece>) {
+        self.hands_at = pieces;
     }
 
     /// The atlas texture, for an interface that wants to draw a material.
@@ -1675,6 +1696,37 @@ impl Renderer {
         });
     }
 
+    /// Draws the hands, after the post chain and onto the target itself.
+    ///
+    /// **Not inside the world pass**, for two reasons. Mode 3's world pass
+    /// writes a float scene texture, and every pipeline that draws into it
+    /// needs a second variant for that format — a hand is not worth two
+    /// pipelines. And a viewmodel put through bloom and a filmic tonemap would
+    /// change brightness with whatever the player happened to be looking at,
+    /// which is exactly what a fixed piece of the interface must not do. So it
+    /// lands where the HUD lands: mode-independent, on a finished frame.
+    fn draw_hands(&self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("viewmodel"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // LOAD: the world is already here.
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        self.hands.draw(&mut pass);
+        self.hands.draw(&mut pass);
+    }
+
     /// Renders one frame into `target`.
     ///
     /// `size` is the target's dimensions; the depth buffer is rebuilt when they
@@ -1711,6 +1763,13 @@ impl Renderer {
             0,
             bytemuck::bytes_of(&self.globals_for(view_projection)),
         );
+
+        // Their own projection, and no view matrix at all — a hand is at a
+        // place on the screen rather than a place in the world.
+        let hands = std::mem::take(&mut self.hands_at);
+        self.hands
+            .prepare(&self.gpu, camera.projection(aspect), &hands);
+        self.hands_at = hands;
 
         let culled = self.cull_and_upload(camera, view_projection);
         self.upload_chunk_borders(camera, &culled.visible);
@@ -1825,6 +1884,8 @@ impl Renderer {
         // pass above just wrote and lands on `target`, so from outside the
         // renderer a frame looks the same in every mode.
         self.run_post(&mut encoder, target, view_projection);
+
+        self.draw_hands(&mut encoder, target);
 
         self.gpu.queue.submit(Some(encoder.finish()));
     }

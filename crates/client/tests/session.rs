@@ -227,6 +227,11 @@ fn singleplayer_joins_its_own_server_and_draws_the_world() {
     // negative one aims at the sky.
     app.look_down_by(-1.5);
     let upward = *app.camera();
+    // **And with no hand in it.** The viewmodel is always on screen in first
+    // person, so a frame of nothing but sky is not a frame of nothing any more
+    // — and the counter-example is about whether the WORLD drew. Caught by this
+    // very assertion the day the hand landed, which is what it is for.
+    app.renderer().set_hands(Vec::new());
     let sky_only = target.capture(app.renderer(), &upward).expect("capture");
     assert!(
         !shows_a_world(&sky_only),

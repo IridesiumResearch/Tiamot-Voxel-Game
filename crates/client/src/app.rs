@@ -672,6 +672,13 @@ impl Pacing {
 /// at a hundred frames a second would be a hundred of them.
 const PUNCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// How long one swing of a hand takes.
+///
+/// Short enough that a held dig reads as repeated swings rather than one long
+/// wave, and long enough to see. Not tied to the dig's own timing: a block that
+/// takes four seconds is not one slow swing.
+const SWING_TIME: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Where a ray enters a box, in the ray's own units, or `None` if it misses.
 ///
 /// The slab test. Division by a zero direction component gives an infinity
@@ -804,6 +811,12 @@ pub struct App {
     tiles: crate::texture::TileMap,
     /// Whether the atlas texture changed and egui has not been told.
     atlas_changed: bool,
+    /// When the hands last started a swing.
+    ///
+    /// One clock for both, because they swing for the same reasons and never at
+    /// the same time — a dig or a placement is one action, whichever hand it
+    /// came from.
+    swung_at: Option<std::time::Duration>,
     /// Whether the pause menu is on the screen.
     ///
     /// **Escape opens a menu rather than only releasing the cursor.** Releasing
@@ -1066,6 +1079,7 @@ impl App {
             quit_requested: false,
             tiles: crate::texture::TileMap::default(),
             atlas_changed: false,
+            swung_at: None,
             rebinding: None,
             bindings_dirty: false,
             connection,
@@ -1810,6 +1824,7 @@ impl App {
     /// and a held button at a hundred frames a second would be a hundred of
     /// them a second. One per swing is what a swing is.
     pub fn dig(&mut self) {
+        self.swing();
         if let Some(entity) = self.punch_target() {
             let now = self.since_start.elapsed();
             if now.saturating_sub(self.last_punch) >= PUNCH_INTERVAL {
@@ -1906,6 +1921,7 @@ impl App {
         // must spend the stairs they crafted rather than the loose rubble
         // beside them, so the cut goes with the request and the server matches
         // the pair.
+        self.swing();
         let Some(stack) = self.hotbar.get(self.selected).copied().flatten() else {
             self.warn("nothing selected to build with".to_owned());
             return;
@@ -2137,6 +2153,70 @@ impl App {
         if hotbar {
             self.adopt_hotbar();
         }
+    }
+
+    /// Starts a swing, if one is not already running.
+    ///
+    /// **Not restarted mid-swing.** Digging re-aims every frame the button is
+    /// held, so a swing that restarted on every one of those would be a hand
+    /// vibrating rather than swinging.
+    fn swing(&mut self) {
+        let now = self.since_start.elapsed();
+        let running = self
+            .swung_at
+            .is_some_and(|at| now.saturating_sub(at) < SWING_TIME);
+        if !running {
+            self.swung_at = Some(now);
+        }
+    }
+
+    /// How far through a swing the hands are, `0.0..=1.0`.
+    fn swing_phase(&self) -> f32 {
+        let Some(at) = self.swung_at else {
+            return 0.0;
+        };
+        let elapsed = self.since_start.elapsed().saturating_sub(at);
+        (elapsed.as_secs_f32() / SWING_TIME.as_secs_f32()).clamp(0.0, 1.0)
+    }
+
+    /// Hands the renderer this frame's hands.
+    ///
+    /// **What is in them comes from the inventory and the atlas**, which is why
+    /// this is here rather than in the renderer: the renderer knows what a hand
+    /// looks like and nothing about what a player owns.
+    fn place_hands(&mut self) {
+        // Third person shows the body instead; a hand hanging in the corner of
+        // a view the player is not looking out of would be nobody's.
+        let pieces = if self.third_person {
+            Vec::new()
+        } else {
+            let swing = self.swing_phase();
+            let tile = |stack: Option<tiamot_core::proto::StackDef>| {
+                stack.map(|stack| {
+                    let (u0, v0, u1, v1) = self
+                        .tiles
+                        .uv_of(stack.material)
+                        .unwrap_or((0.0, 0.0, 1.0, 1.0));
+                    [u0, v0, u1, v1]
+                })
+            };
+            let main = crate::render::viewmodel::pieces(
+                crate::render::viewmodel::Hand::Main,
+                crate::render::viewmodel::Held {
+                    tile: tile(self.hotbar.get(self.selected).copied().flatten()),
+                    swing,
+                },
+            );
+            let off = crate::render::viewmodel::pieces(
+                crate::render::viewmodel::Hand::Off,
+                crate::render::viewmodel::Held {
+                    tile: tile(self.offhand()),
+                    swing,
+                },
+            );
+            [main, off].concat()
+        };
+        self.renderer.set_hands(pieces);
     }
 
     /// Rebuilds the hotbar from the player's own slots.
@@ -3714,6 +3794,7 @@ impl App {
         // After the camera has settled, because every offset is relative to it.
         self.place_entities();
         self.place_blobs();
+        self.place_hands();
     }
 
     /// Places every entity in view for this frame.
