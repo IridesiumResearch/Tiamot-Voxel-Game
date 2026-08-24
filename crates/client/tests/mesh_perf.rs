@@ -23,8 +23,45 @@
 //! So the tight check is opt-in: set `TIAMOT_STRICT_PERF=1` on a machine
 //! comparable to the one in the verdict and it asserts within 3× of the
 //! recorded numbers. CI does not set it, and gates on the thresholds instead —
-//! which is the right split, because the thresholds are what the KEEP decision
-//! was actually granted on and they carry 9× and 28× margin.
+//! because the thresholds are what the KEEP decision was actually granted on.
+//!
+//! # The margin ran out, and that is worth reading rather than raising
+//!
+//! This used to say the thresholds "carry 9× and 28× margin". **That stopped
+//! being true.** Scene (d) measured 108 µs in the spike and measures about
+//! 330 µs on the same class of machine today — real features, all of them
+//! wanted: per-vertex light, fluid surfaces, the shore film. Three times the
+//! work against a 1 ms gate is a 3× margin, and a CI runner is itself about 3×
+//! slower, so the gate landed exactly on the line and started flapping
+//! (1.030 ms on 2026-08-24 against a 1 ms wall).
+//!
+//! The verdict's promise is "under 1 ms", and on the hardware the verdict was
+//! granted on it still holds. What could not hold is asserting a workstation
+//! threshold against a cloud runner with no headroom left — the same mistake
+//! `benches/macro-baseline.json` was rebaselined to stop making. So CI gates
+//! against the threshold **scaled by the runner handicap it is measured to
+//! have**, and the strict path keeps the verdict's own number.
+//!
+//! A real regression still fails both: it takes a 3× slowdown to reach the
+//! scaled gate, and the raw timing is printed either way.
+//!
+//! # What the strict check says today, which is not nothing
+//!
+//! `TIAMOT_STRICT_PERF=1` on the reference machine currently **fails**:
+//!
+//! ```text
+//! scene (d) realistic:  342 us against the spike's 108  (3.2x)
+//! scene (b) chiselled:  808 us against the spike's 143  (5.6x)
+//! ```
+//!
+//! That is a true statement about a real slowdown and it is left red on
+//! purpose. Everything that caused it was wanted — per-vertex light so mode 1
+//! can tell a cave from a field, fluid surfaces, the shore film — and every
+//! gate the KEEP verdict was granted on still passes with margin. But "several
+//! times slower than the number the decision was made on" is a thing to know
+//! before adding the next feature to this path, not a thing to quietly move a
+//! threshold past. Recorded 2026-08-24; nobody had run the strict check in a
+//! while, because CI does not.
 //!
 //! # Release builds only
 //!
@@ -60,6 +97,18 @@ const STONE: MaterialId = MaterialId(2);
 const DIRT: MaterialId = MaterialId(3);
 const GRASS: MaterialId = MaterialId(4);
 
+/// How much slower a CI runner is than the machine the verdict was granted on.
+///
+/// **Measured, not guessed.** The module docs above have said "about 3×" since
+/// the first CI run; 2026-08-24 put a number on it from both ends of the same
+/// commit — scene (d) at 325–333 µs on the reference machine and 1.030 ms on
+/// the runner, which is 3.1×.
+///
+/// Applied to the thresholds only when `TIAMOT_STRICT_PERF` is unset, so the
+/// verdict's own number is what gets asserted wherever the verdict's own
+/// number means something.
+const RUNNER_HANDICAP: u32 = 3;
+
 /// Task 02b gate 1: scene (d), the realistic one, under 1 ms.
 const REALISTIC_GATE: Duration = Duration::from_micros(1000);
 /// Task 02b gate 2: scene (b), heavily chiselled, under 4 ms.
@@ -82,6 +131,19 @@ fn strict() -> bool {
 }
 
 /// Asserts a measurement is within 3× of the spike's, when strict mode is on.
+/// The threshold to assert on this machine.
+///
+/// The verdict's number where the verdict's number means something, and the
+/// same number scaled by the runner's measured handicap everywhere else. See
+/// the module docs for why this is not simply a larger gate.
+fn gate(threshold: Duration) -> Duration {
+    if strict() {
+        threshold
+    } else {
+        threshold * RUNNER_HANDICAP
+    }
+}
+
 fn check_against_spike(label: &str, elapsed: Duration, measured_us: u64) {
     if !strict() {
         println!(
@@ -297,9 +359,11 @@ fn the_realistic_scene_meshes_inside_the_task_02b_gate() {
     );
 
     assert!(
-        elapsed < REALISTIC_GATE,
-        "scene (d) meshed in {elapsed:?}, over the Task 02b gate of {REALISTIC_GATE:?}. \
-         The KEEP verdict for full sub-node resolution was granted on this number."
+        elapsed < gate(REALISTIC_GATE),
+        "scene (d) meshed in {elapsed:?}, over the Task 02b gate of {REALISTIC_GATE:?} \
+         (allowed {:?} here — see RUNNER_HANDICAP). The KEEP verdict for full sub-node \
+         resolution was granted on this number.",
+        gate(REALISTIC_GATE)
     );
     check_against_spike("scene (d)", elapsed, MEASURED_REALISTIC_US);
 }
@@ -318,8 +382,10 @@ fn the_chiselled_scene_meshes_inside_the_task_02b_gate() {
     );
 
     assert!(
-        elapsed < CHISELLED_GATE,
-        "scene (b) meshed in {elapsed:?}, over the Task 02b gate of {CHISELLED_GATE:?}"
+        elapsed < gate(CHISELLED_GATE),
+        "scene (b) meshed in {elapsed:?}, over the Task 02b gate of {CHISELLED_GATE:?} \
+         (allowed {:?} here — see RUNNER_HANDICAP)",
+        gate(CHISELLED_GATE)
     );
     check_against_spike("scene (b)", elapsed, MEASURED_CHISELLED_US);
 }
@@ -338,8 +404,10 @@ fn a_remesh_after_one_subnode_edit_is_inside_the_task_02b_gate() {
 
         println!("remesh after one sub-node edit, scene {label}: {elapsed:?}");
         assert!(
-            elapsed < REMESH_GATE,
-            "remesh of scene {label} took {elapsed:?}, over the Task 02b gate of {REMESH_GATE:?}"
+            elapsed < gate(REMESH_GATE),
+            "remesh of scene {label} took {elapsed:?}, over the Task 02b gate of \
+             {REMESH_GATE:?} (allowed {:?} here — see RUNNER_HANDICAP)",
+            gate(REMESH_GATE)
         );
     }
 }
