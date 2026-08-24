@@ -76,14 +76,42 @@ fn a_paused_world_does_not_tick_and_does_not_catch_up_afterwards() {
     // Six hundred milliseconds is twelve ticks at 20 Hz; a banked accumulator
     // would run them all in the first instant after resuming.
     server.set_paused(false);
-    std::thread::sleep(Duration::from_millis(150));
-    let after = server.control().tick();
+    // **Polled to a condition, not slept for a fixed span.** A hundred and
+    // fifty milliseconds is three ticks on a quiet machine and can be none at
+    // all on a loaded runner, which is how this failed on macOS alone while
+    // ubuntu and windows passed. The anti-banking check below is unaffected:
+    // it reads the FIRST tick after the world restarts, and a banked
+    // accumulator would already have fired all twelve by then.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut after = held;
+    while std::time::Instant::now() < deadline {
+        after = server.control().tick();
+        if after > held {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(after > held, "the world did not restart after unpausing");
+    // **Bounded by the accumulator's own cap, and that is the honest bound.**
+    //
+    // This used to allow ten and claim it caught a banked accumulator. It could
+    // not: `MAX_CATCH_UP_TICKS` is five, so twelve ticks of pause can never all
+    // arrive however the pause is implemented, and removing the clock drain
+    // from the paused loop leaves this test green. Checked by doing exactly
+    // that.
+    //
+    // So the claim is right-sized. Two mechanisms enforce it — the paused loop
+    // throws the clock reading away so there is nothing to catch up, and the
+    // accumulator would cap and DISCARD the excess anyway — and this fails only
+    // if both go. That is still worth pinning: it is the property a player
+    // notices, and the bound moves with the constant rather than being a
+    // number somebody chose.
     assert!(
-        after < held + 10,
-        "resuming fired {} ticks at once, so the pause was banked rather than \
-         discarded",
-        after - held
+        after - held <= u64::from(tiamot_core::tick::MAX_CATCH_UP_TICKS),
+        "resuming fired {} ticks at once, over the {} the accumulator caps at, so the pause \
+         was banked AND the cap is gone",
+        after - held,
+        tiamot_core::tick::MAX_CATCH_UP_TICKS
     );
 
     assert!(server.stop());
