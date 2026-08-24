@@ -308,3 +308,161 @@ fn core_uis_inventory_screen_opens_and_closes_on_the_action_it_registered() {
     });
     assert!(server.stop());
 }
+
+/// Reads the tree of `core_ui`'s screen, waiting for one that satisfies `ready`.
+async fn screen(
+    bot: &mut Bot,
+    ready: impl Fn(&tiamot_core::ui::Tree) -> bool,
+) -> tiamot_core::ui::Tree {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        // **The LAST tree, not the first.** `Bot::dialogs` is a log of what
+        // arrived, so a screen the mod has redrawn appears twice — and taking
+        // the first hands back the version from before the button was pressed.
+        if let Some((_, tree)) = bot
+            .dialogs()
+            .into_iter()
+            .rfind(|(form, _)| form == "core_ui:inventory")
+            && ready(&tree)
+        {
+            return tree;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the screen never reached the state this was waiting for; open: {:?}",
+            bot.dialogs()
+                .into_iter()
+                .map(|(form, tree)| (
+                    form,
+                    tree.nodes
+                        .iter()
+                        .map(|node| format!("{:?}/{}", node.widget, node.name))
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>()
+        );
+        bot.recv().await.expect("recv");
+    }
+}
+
+/// The name of every button in a tree.
+fn buttons(tree: &tiamot_core::ui::Tree) -> Vec<String> {
+    tree.nodes
+        .iter()
+        .filter(|node| matches!(node.widget, tiamot_core::ui::Widget::Button { .. }))
+        .map(|node| node.name.clone())
+        .collect()
+}
+
+#[test]
+fn core_uis_shape_tab_cuts_a_block_and_the_cut_comes_back() {
+    // **The reference implementation of crafting, end to end.** The engine
+    // draws twenty-seven cells and reports a mask; that one item of a cut costs
+    // one unit per cell is written in `game/core_ui/init.lua` and nowhere else
+    // (charter rule 1). This drives the shipped mod rather than a fixture, so
+    // it is the recipe a player actually gets.
+    const CARVED: u32 = 0b1000_1111;
+
+    let server = start("shapes");
+    block_on(async {
+        let mut bot = join(&server, "mason").await;
+
+        // Something loose to cut. One block is 27 units and a five-cell stair
+        // costs five, so one dig is more than enough.
+        bot.dig_block(tiamot_core::BlockPos::new(0, -1, 0))
+            .await
+            .expect("dig");
+        bot.until_view("player:main", |slots| {
+            slots.first().is_some_and(Option::is_some)
+        })
+        .await
+        .expect("the dug block never reached a slot");
+        let before: u32 = bot.inventory().iter().map(|stack| stack.units).sum();
+
+        bot.action("core_ui:inventory", true).await.expect("press");
+        let tree = screen(&mut bot, |tree| !buttons(tree).is_empty()).await;
+        assert!(
+            buttons(&tree).iter().any(|name| name == "tab_shapes"),
+            "the shape tab is not on the screen: {:?}",
+            buttons(&tree)
+        );
+
+        // Switch to it, and the editor appears with a whole block in it.
+        bot.dialog_event(
+            "core_ui:inventory",
+            tiamot_core::proto::DialogEvent::Pressed {
+                name: "tab_shapes".to_owned(),
+            },
+        )
+        .await
+        .expect("send");
+        let tree = screen(&mut bot, |tree| {
+            tree.nodes
+                .iter()
+                .any(|node| matches!(node.widget, tiamot_core::ui::Widget::ShapeEditor { .. }))
+        })
+        .await;
+        let opened = tree
+            .nodes
+            .iter()
+            .find_map(|node| match node.widget {
+                tiamot_core::ui::Widget::ShapeEditor { shape, .. } => Some(shape),
+                _ => None,
+            })
+            .expect("checked above");
+        assert_eq!(
+            opened,
+            tiamot_core::inventory::Shape::ALL,
+            "chiselling is subtraction, so it starts from a whole block"
+        );
+
+        // Carve, then make one.
+        bot.dialog_event(
+            "core_ui:inventory",
+            tiamot_core::proto::DialogEvent::Chiselled {
+                name: "cut".to_owned(),
+                shape: CARVED,
+            },
+        )
+        .await
+        .expect("send");
+        bot.dialog_event(
+            "core_ui:inventory",
+            tiamot_core::proto::DialogEvent::Pressed {
+                name: "make".to_owned(),
+            },
+        )
+        .await
+        .expect("send");
+
+        // Driven to a CONDITION with a deadline: how many updates arrive before
+        // the one carrying the cut is the machine's business.
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let made = loop {
+            let stacks = bot.inventory();
+            if stacks.iter().any(|stack| stack.shape == CARVED) {
+                break stacks;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cut never came back: {:?}",
+                bot.inventory()
+            );
+            bot.recv().await.expect("recv");
+        };
+        let cut = made
+            .iter()
+            .find(|stack| stack.shape == CARVED)
+            .expect("checked above");
+        assert_eq!(
+            cut.units,
+            CARVED.count_ones(),
+            "one item of a cut costs one unit per cell"
+        );
+        let after: u32 = made.iter().map(|stack| stack.units).sum();
+        assert_eq!(after, before, "crafting invented or destroyed units");
+
+        bot.disconnect().await;
+    });
+    assert!(server.stop());
+}

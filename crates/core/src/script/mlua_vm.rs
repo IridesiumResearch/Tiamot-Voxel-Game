@@ -4283,11 +4283,18 @@ fn widget_of(kind: &str, spec: &Table) -> mlua::Result<crate::ui::Widget> {
             max: spec.get::<Option<i32>>("max")?.unwrap_or(100),
             value: spec.get::<Option<i32>>("value")?.unwrap_or(0),
         },
+        // **One-based on the way in, because it is one-based on the way out.**
+        // `DialogEvent::Chose` reports `index + 1` and the stubs document the
+        // field as one-based, and this read it raw — so a mod that wrote back
+        // the index it was just given selected the option after the one the
+        // player picked, and a one-option dropdown set to `1` was refused
+        // outright for selecting option 1 of 1. Exactly the asymmetry that bit
+        // `item_slot` in Task 14, in the one place that escaped the fix.
         "dropdown" => Widget::Dropdown {
             options: spec
                 .get::<Option<Vec<String>>>("options")?
                 .unwrap_or_default(),
-            selected: spec.get::<Option<u16>>("selected")?.unwrap_or(0),
+            selected: one_based(spec.get::<Option<u16>>("selected")?),
         },
         // **One-based on the way in, because they are one-based on the way
         // out.** A click event reports its slot as `index + 1`, and until Task
@@ -4461,6 +4468,39 @@ mod tests {
             panic!("expected a grid");
         };
         assert_eq!(first, 0, "a mod's first slot is the wire's slot zero");
+    }
+
+    #[test]
+    fn a_dropdown_selection_is_one_based_the_way_the_event_reports_it() {
+        // **The round trip a mod actually writes.** `DialogEvent::Chose` hands
+        // back `index + 1`; storing that and putting it back as `selected` must
+        // select the same option. Read raw, it selected the next one — and a
+        // one-option list set to `1` was refused for selecting option 1 of 1,
+        // which is how `core_ui`'s shape tab failed to open at all.
+        let lua = Lua::new();
+        let spec = lua.create_table().expect("table");
+        spec.set("type", "dropdown").expect("set");
+        spec.set("options", vec!["stone", "dirt"]).expect("set");
+        spec.set("selected", 1).expect("set");
+
+        let crate::ui::Widget::Dropdown { selected, options } =
+            widget_of("dropdown", &spec).expect("build")
+        else {
+            panic!("expected a dropdown");
+        };
+        assert_eq!(selected, 0, "the mod's first option is the wire's zero");
+        // And the tree it produces is one the limits accept, which the raw read
+        // did not manage for a single-option list.
+        let one = lua.create_table().expect("table");
+        one.set("type", "dropdown").expect("set");
+        one.set("options", vec!["stone"]).expect("set");
+        one.set("selected", 1).expect("set");
+        let tree = crate::ui::Build::leaf(widget_of("dropdown", &one).expect("build")).flatten();
+        assert!(
+            crate::ui::check(&tree, crate::ui::Limits::default()).is_ok(),
+            "a mod selecting its only option was refused"
+        );
+        assert_eq!(options.len(), 2);
     }
 
     #[test]
