@@ -933,7 +933,7 @@ impl Client {
         // world — and with no world there is nothing in it, so the menu would
         // be drawn over whatever the last frame left behind.
         clear(&surface.gpu, &view);
-        let action = draw_front(surface, self.config.ui_scale, &view);
+        let action = draw_front(surface, &mut self.config, &view);
         frame.present();
 
         match action {
@@ -1901,18 +1901,28 @@ fn register_atlas(surface: &mut Surface) {
 /// nothing to save when it is over.
 fn draw_front(
     surface: &mut Surface,
-    scale: f32,
+    config: &mut Config,
     view: &wgpu::TextureView,
 ) -> client::front::Action {
     let raw = surface.egui_state.take_egui_input(&surface.window);
     let mut action = client::front::Action::None;
+    let scale = config.ui_scale;
+    let mut dirty = false;
     let output = surface.egui.run_ui(raw, |root| {
         let context = root.ctx().clone();
         context.set_zoom_factor(scale);
         if let Stage::Front(front) = &mut surface.stage {
-            action = front.draw(&context);
+            action = front.draw(&context, config);
+            dirty = front.take_settings_dirty();
         }
     });
+    // **Written when it changes, not when the screen closes.** There is no
+    // "close" on a front screen — a player presses Play, and a setting that
+    // only reached the file on the way out would be lost by the one route
+    // everybody takes.
+    if dirty && let Err(err) = config.save(std::path::Path::new(CONFIG_FILE)) {
+        tracing::warn!(%err, "could not save the settings");
+    }
     surface
         .egui_state
         .handle_platform_output(&surface.window, output.platform_output);

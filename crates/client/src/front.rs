@@ -66,6 +66,8 @@ pub struct Front {
     confirming: Option<(usize, Mismatch)>,
     /// Something that went wrong, for the player to read.
     pub notice: Option<String>,
+    /// Whether a setting changed and `client.toml` wants writing.
+    settings_dirty: bool,
 }
 
 impl Front {
@@ -82,11 +84,15 @@ impl Front {
             name,
             address: String::new(),
             confirming: None,
+            settings_dirty: false,
         }
     }
 
     /// Draws a frame and returns what the player asked for.
-    pub fn draw(&mut self, ctx: &egui::Context) -> Action {
+    ///
+    /// `config` is edited in place — the settings tab writes straight to it and
+    /// the window saves when [`Front::settings_dirty`] says so.
+    pub fn draw(&mut self, ctx: &egui::Context, config: &mut crate::config::Config) -> Action {
         let mut action = Action::None;
         let screen = ctx.content_rect();
         let area = (screen.width(), screen.height());
@@ -129,7 +135,7 @@ impl Front {
                 match self.tab {
                     Tab::Play => action = self.play_tab(ui),
                     Tab::Mods => self.mods_tab(ui),
-                    Tab::Settings => settings_note(ui),
+                    Tab::Settings => self.settings_tab(ui, config),
                 }
             });
 
@@ -290,6 +296,120 @@ impl Front {
         decided
     }
 
+    /// Whether the settings changed and want writing out.
+    ///
+    /// One-shot, so the file is written once per change rather than once per
+    /// frame a slider is held.
+    pub const fn take_settings_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.settings_dirty, false)
+    }
+
+    /// The settings that need no world.
+    ///
+    /// # Why the keys are not here
+    ///
+    /// **There is nothing to bind yet.** Actions come from the server's
+    /// `ActionTable` — a mod registers a name and the engine owns the key
+    /// (charter rule 11) — so before joining, the list of things a key could
+    /// do is not merely unknown, it does not exist. Volume is the same: the
+    /// mixer belongs to a running world. Both are on the in-game screen, which
+    /// is the only place they can be.
+    ///
+    /// Everything below is a field of `client.toml` and nothing else, which is
+    /// why it can be set from here.
+    fn settings_tab(&mut self, ui: &mut egui::Ui, config: &mut crate::config::Config) {
+        use crate::config::{LightingMode, RenderMode, ShadowQuality};
+
+        let mut changed = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Player");
+            ui.horizontal(|ui| {
+                ui.label("Display name");
+                // A display string only. Identity is the key and the UUID
+                // derived from it (charter rule 13); nothing keys on this.
+                changed |= ui.text_edit_singleline(&mut config.display_name).changed();
+            });
+            ui.separator();
+
+            ui.heading("Graphics");
+            changed |= choice(
+                ui,
+                "Lighting",
+                &mut config.lighting_mode,
+                &[
+                    (LightingMode::Simple, "Simple"),
+                    (LightingMode::Classic, "Classic"),
+                    (LightingMode::Beautiful, "Beautiful"),
+                ],
+            );
+            changed |= choice(
+                ui,
+                "Shadows",
+                &mut config.shadow_quality,
+                &[
+                    (ShadowQuality::Off, "Off"),
+                    (ShadowQuality::Low, "Low"),
+                    (ShadowQuality::Medium, "Medium"),
+                    (ShadowQuality::High, "High"),
+                ],
+            );
+            changed |= choice(
+                ui,
+                "Draw",
+                &mut config.render_mode,
+                &[
+                    (RenderMode::Textured, "Textured"),
+                    (RenderMode::Flat, "Flat"),
+                    (RenderMode::Wireframe, "Wireframe"),
+                ],
+            );
+            changed |= ui
+                .checkbox(&mut config.vsync, "Wait for the display")
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut config.fov_degrees, 60.0..=110.0).text("field of view"))
+                .changed();
+            ui.separator();
+
+            ui.heading("World");
+            // **What the client ASKS for.** The server caps it — the interest
+            // volume is its cost, not this machine's — so a number here is a
+            // request and the HUD reports what was granted.
+            changed |= ui
+                .add(egui::Slider::new(&mut config.view_distance, 2..=24).text("view distance"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut config.vertical_view_distance, 1..=12)
+                        .text("vertical view distance"),
+                )
+                .changed();
+            ui.separator();
+
+            ui.heading("Interface");
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut config.ui_scale,
+                        *crate::config::UI_SCALE_RANGE.start()
+                            ..=*crate::config::UI_SCALE_RANGE.end(),
+                    )
+                    .text("scale"),
+                )
+                .changed();
+            changed |= ui
+                .checkbox(&mut config.hud_visible, "Show the HUD")
+                .changed();
+            changed |= ui
+                .checkbox(&mut config.debug_overlay, "Debug readouts")
+                .changed();
+            ui.add_space(8.0);
+            ui.weak("Keys and volume are on the in-game screen — press Escape in a world.");
+            ui.weak("A mod's controls only exist once a server has told the client about them.");
+        });
+        self.settings_dirty |= changed;
+    }
+
     /// Which mods are ticked, for a world about to start.
     #[must_use]
     pub fn enabled_mods(&self) -> Vec<String> {
@@ -306,16 +426,28 @@ impl Front {
     }
 }
 
-/// The settings tab, until the in-game settings screen is shared with it.
+/// One setting with a fixed set of answers, as a row of buttons.
 ///
-/// **Deliberately a pointer rather than a copy.** Every setting already has a
-/// control on the in-game screen, and two screens that both write `client.toml`
-/// is two places for a default to drift. Sharing that screen is the change to
-/// make; a second implementation of it is not.
-fn settings_note(ui: &mut egui::Ui) {
-    ui.label("Settings are on the in-game screen — press Escape once you are in a world.");
-    ui.add_space(6.0);
-    ui.weak("Graphics, shaders, controls and the debug readouts all live there.");
+/// Buttons rather than a dropdown: there are three or four of each, a player
+/// wants to see what the choices ARE, and a menu that has to be opened to find
+/// out is a menu that gets left on its default.
+fn choice<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut T,
+    options: &[(T, &str)],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.add_sized([120.0, 18.0], egui::Label::new(label));
+        for (option, text) in options {
+            if ui.selectable_label(*value == *option, *text).clicked() && *value != *option {
+                *value = *option;
+                changed = true;
+            }
+        }
+    });
+    changed
 }
 
 #[cfg(test)]
@@ -361,6 +493,22 @@ mod tests {
         assert!(
             screen.notice.is_some(),
             "a mod directory that would not scan must not look like no mods installed"
+        );
+    }
+
+    #[test]
+    fn a_setting_changed_asks_to_be_saved_exactly_once() {
+        // **Written when it changes, not when the screen closes**, because a
+        // front screen has no close: a player presses Play. The flag is
+        // one-shot so a held slider writes the file once per change rather than
+        // once per frame.
+        let mut screen = front(Vec::new());
+        assert!(!screen.take_settings_dirty(), "nothing has changed yet");
+        screen.settings_dirty = true;
+        assert!(screen.take_settings_dirty());
+        assert!(
+            !screen.take_settings_dirty(),
+            "the same change asked to be saved twice"
         );
     }
 
