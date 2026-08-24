@@ -229,14 +229,20 @@ impl Slots {
         // Matching stacks first, so shift-clicking twenty units into a view
         // that already holds some tops that up instead of taking a new slot.
         for slot in self.views[to].slots.iter_mut().flatten() {
-            if slot.material != moving.material {
+            // Shape as well as material — see `Slots::insert` for what the
+            // material-only test destroyed.
+            if slot.material != moving.material || slot.shape != moving.shape {
                 continue;
             }
             let giving = moving.units.min(u32::MAX - slot.units);
             if giving > 0
                 && let Ok(part) = moving.split(giving)
+                && slot.merge(part).is_err()
             {
-                let _ = slot.merge(part);
+                // Refused after the units were already out: put them back
+                // rather than drop them. Belt and braces behind the guard
+                // above, because this is a conservation law.
+                let _ = moving.merge(part);
             }
             if moving.is_empty() {
                 break;
@@ -271,14 +277,21 @@ impl Slots {
             return false;
         };
         for slot in self.views[at].slots.iter_mut().flatten() {
-            if slot.material != stack.material {
+            // **The shape is half of what makes two stacks the same stack.**
+            // Material alone was the test until shaped stacks existed, and the
+            // failure was silent and total: `split` takes the units out of the
+            // incoming stack, `merge` refuses the mismatch, and the part it
+            // refused is dropped on the floor. A player putting stairs into a
+            // bag holding loose stone of the same material lost the stairs.
+            if slot.material != stack.material || slot.shape != stack.shape {
                 continue;
             }
             let giving = stack.units.min(u32::MAX - slot.units);
             if giving > 0
                 && let Ok(part) = stack.split(giving)
+                && slot.merge(part).is_err()
             {
-                let _ = slot.merge(part);
+                let _ = stack.merge(part);
             }
             if stack.is_empty() {
                 return true;
@@ -363,7 +376,12 @@ impl Slots {
 ///
 /// Returns `(what goes in the slot, what stays in the hand)`.
 fn merge_or_swap(held: Stack, there: Stack) -> (Option<Stack>, Option<Stack>) {
-    if held.material != there.material {
+    // **Two things that cannot merge swap instead.** Material alone was the
+    // test, so a held stair left-clicked onto loose stone of the same material
+    // fell through to the merge, was refused, and NOTHING HAPPENED — which
+    // from the window is a slot that ignores clicks. A different cut is a
+    // different item, and a different item swaps.
+    if held.material != there.material || held.shape != there.shape {
         // Swap. The hand takes what was there.
         return (Some(held), Some(there));
     }
@@ -384,12 +402,20 @@ fn place_one(mut held: Stack, there: Option<Stack>) -> (Option<Stack>, Option<St
     };
     let slot = match there {
         None => Some(one),
-        Some(mut there) if there.material == one.material => {
-            let _ = there.merge(one);
+        // **Same shape as well as same material.** With material alone, a held
+        // stair placed one unit at a time onto loose rubble of the same stone
+        // vanished a unit per click: `merge` refused the shape and the unit
+        // that had already been split out of the hand went nowhere. Found by
+        // `no_run_of_clicks_changes_how_many_units_exist` the moment its
+        // generator started producing shaped stacks.
+        Some(mut there) if there.material == one.material && there.shape == one.shape => {
+            if there.merge(one).is_err() {
+                let _ = held.merge(one);
+            }
             Some(there)
         }
-        // A different material is not somewhere to put one unit; nothing
-        // happens and the hand keeps everything it had.
+        // Nowhere to put one unit; nothing happens and the hand keeps
+        // everything it had.
         Some(there) => {
             let _ = held.merge(one);
             Some(there)
@@ -400,6 +426,58 @@ fn place_one(mut held: Stack, there: Option<Stack>) -> (Option<Stack>, Option<St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cut_and_loose_material_of_one_stone_swap_rather_than_stall() {
+        use super::super::Shape;
+
+        let shape = Shape::new(0b101).expect("two cells");
+        let mut inv = Slots {
+            views: vec![View {
+                name: PLAYER_MAIN.to_owned(),
+                slots: vec![Some(Stack::new(STONE, 50).expect("loose"))],
+            }],
+            grab: Grab {
+                held: Some(Stack::shaped(STONE, shape, 3).expect("cut")),
+            },
+        };
+
+        assert!(inv.left_click(PLAYER_MAIN, 0));
+        assert_eq!(
+            inv.view(PLAYER_MAIN).expect("view").slots[0]
+                .expect("the slot took what was held")
+                .shape,
+            Some(shape),
+            "the cut went into the slot"
+        );
+        assert_eq!(
+            inv.grab.held.expect("the hand took what was there").shape,
+            None,
+            "the loose material came back to the hand"
+        );
+    }
+
+    #[test]
+    fn placing_one_cut_onto_loose_material_of_the_same_stone_loses_nothing() {
+        use super::super::Shape;
+
+        // The unit that used to disappear: `place_one` split one out of the
+        // hand, `merge` refused the shape, and nobody was holding it.
+        let shape = Shape::new(0b101).expect("two cells");
+        let mut inv = Slots {
+            views: vec![View {
+                name: PLAYER_MAIN.to_owned(),
+                slots: vec![Some(Stack::new(STONE, 50).expect("loose"))],
+            }],
+            grab: Grab {
+                held: Some(Stack::shaped(STONE, shape, 3).expect("cut")),
+            },
+        };
+        let before = inv.total_units();
+
+        assert!(inv.right_click(PLAYER_MAIN, 0));
+        assert_eq!(before, inv.total_units(), "a unit went missing");
+    }
+
     #[test]
     fn spending_a_cut_does_not_drain_the_loose_material_beside_it() {
         use super::super::Shape;
@@ -481,11 +559,19 @@ mod tests {
         use proptest::prelude::*;
 
         use super::*;
+        use crate::inventory::Shape;
 
         fn any_stack() -> impl Strategy<Value = Option<Stack>> {
             prop_oneof![
                 1 => Just(None),
                 4 => (2u16..6, 1u32..200).prop_map(|(m, units)| Stack::new(MaterialId(m), units)),
+                // **Shaped stacks of the SAME materials as the loose ones**,
+                // so the generator actually produces the collision that
+                // matters: a stair and loose rubble of one stone, which merge
+                // has to refuse and everything around it has to survive.
+                2 => (2u16..6, 1u32..0x07ff_ffff, 1u32..8).prop_map(|(m, mask, count)| {
+                    Shape::new(mask).and_then(|shape| Stack::shaped(MaterialId(m), shape, count))
+                }),
             ]
         }
 
@@ -536,6 +622,40 @@ mod tests {
                     before,
                     "a run of clicks changed the total"
                 );
+            }
+
+            /// **What a mod does to an inventory conserves units too.**
+            ///
+            /// Clicks are the player's route in; `insert` and `take` are the
+            /// mod API's, and they are the ones that carry a shape. This
+            /// caught `insert` destroying material outright: it split the
+            /// units out of the incoming stack, `merge` refused the shape
+            /// mismatch, and the part it refused was dropped.
+            #[test]
+            fn inserting_and_taking_conserves_units(
+                mut slots in any_slots(),
+                incoming in prop::collection::vec(any_stack(), 0..8),
+                takes in prop::collection::vec((2u16..6, 1u32..300), 0..8),
+            ) {
+                let mut expected = slots.total_units();
+                for stack in incoming.into_iter().flatten() {
+                    expected += u64::from(stack.units);
+                    slots.insert("player:main", stack);
+                    prop_assert_eq!(
+                        slots.total_units(),
+                        expected,
+                        "inserting a stack lost or invented units"
+                    );
+                }
+                for (material, units) in takes {
+                    let took = slots.take("player:main", MaterialId(material), None, units);
+                    expected -= u64::from(took);
+                    prop_assert_eq!(
+                        slots.total_units(),
+                        expected,
+                        "taking reported a different amount than it removed"
+                    );
+                }
             }
 
             /// And no slot ever holds a zero-unit stack, which would render as

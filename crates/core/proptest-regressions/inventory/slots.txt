@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2641f951074e5e4ce2e7ec221f47663fba1d47714d0996c5d568a439bf46674b # shrinks to mut slots = Slots { views: [View { name: "player:main", slots: [None] }, View { name: "player:hotbar", slots: [Some(Stack { material: MaterialId(5), units: 1, shape: Some(Shape(1)) }), None, None, None, Some(Stack { material: MaterialId(2), units: 1, shape: None })] }], grab: Grab { held: Some(Stack { material: MaterialId(2), units: 1, shape: Some(Shape(1)) }) } }, clicks = [(false, 4, 1)]
