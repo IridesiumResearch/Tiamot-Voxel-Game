@@ -581,6 +581,8 @@ dependencies = [
  "quinn",
  "rustls",
  "rustls-pki-types",
+ "serde",
+ "serde_json",
  "server",
  "thiserror 2.0.19",
  "tiamot-core",

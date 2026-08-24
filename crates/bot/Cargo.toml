@@ -26,6 +26,10 @@ mlua.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+serde.workspace = true
+# The connector's line protocol. Already in the tree (`crates/core` parses glTF
+# with it), so this adds a dependency edge rather than a dependency.
+serde_json = "1.0.151"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -39,3 +43,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "bot"
 path = "src/main.rs"
+
+# The connector: a headless client that reports what it sees as JSON lines and
+# takes instructions the same way. See `src/bin/watcher.rs` for why it speaks to
+# a pipe rather than to a model.
+[[bin]]
+name = "watcher"
+path = "src/bin/watcher.rs"
