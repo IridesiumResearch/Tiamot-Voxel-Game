@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -82,6 +82,10 @@ pub const PROTOCOL_VERSION: u32 = 25;
 // stream. They are also PER PLAYER rather than broadcast — which entities
 // somebody can see is their own interest set, and sending everyone every mob
 // would make a populated world cost the square of the people watching it.
+// v26 (post-14): appended `ClientMessage::SwapOffhand`, and `player:main` grew
+// a twenty-eighth slot for the off-hand to live in. The slot count is not on
+// the wire — a view's contents are sent as a list and the client reads its
+// length — so the growth needs no variant of its own; the message does.
 // v25 (post-14): appended `Widget::ShapeEditor` and `DialogEvent::Chiselled`.
 // Both APPENDED at the end of their enums, which this format makes safe — but
 // the version still moves, because a v24 client handed a tree holding a variant
@@ -783,6 +787,19 @@ pub enum ClientMessage {
         form: String,
         /// What happened.
         event: DialogEvent,
+    },
+
+    /// Put what is in this hand into the off-hand, and take back what was there.
+    ///
+    /// **Appended at the end** (protocol v26).
+    ///
+    /// A request like every other inventory gesture: the client says which
+    /// hotbar slot the player was holding and the server does the swap against
+    /// its own copy. A slot number nobody has is ignored rather than clamped —
+    /// clamping would swap a slot the player did not name.
+    SwapOffhand {
+        /// Which slot to swap with the off-hand, zero-based.
+        slot: u16,
     },
 }
 
@@ -1718,6 +1735,10 @@ pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolEr
         // Two bytes, and `ViewDistance::clamped` bounds them on the way in —
         // there is no value a peer can put here that costs anything to hold.
         | ClientMessage::ViewDistance { .. }
+        // Two bytes naming a slot. A number nobody has is ignored by the
+        // server rather than clamped — clamping would swap a slot the player
+        // did not name.
+        | ClientMessage::SwapOffhand { .. }
         // Eight bytes naming an entity. Every value is decodable and almost
         // all of them resolve to nothing, which the server treats as a punch
         // at thin air — there is nothing to bound here that the entity store
@@ -2420,6 +2441,30 @@ mod tests {
                 "{message:?} should be ordinal {expected}; a variant was inserted or reordered"
             );
         }
+    }
+
+    /// Ordinals 16 onwards. Its own function for the same reason
+    /// `pin_the_later_variants` is: the one above is at clippy's line ceiling,
+    /// and an ordinal that cannot be pinned because the test is too long is an
+    /// ordinal that goes unpinned.
+    #[test]
+    fn later_client_variant_ordinals_are_pinned() {
+        // Protocol v16 and v20, which went unpinned for six protocol versions.
+        let action = encode(&ClientMessage::Action {
+            id: String::new(),
+            pressed: false,
+        })
+        .expect("encode");
+        assert_eq!(action[0], 16);
+        let dialog = encode(&ClientMessage::DialogEvent {
+            form: String::new(),
+            event: DialogEvent::Closed,
+        })
+        .expect("encode");
+        assert_eq!(dialog[0], 17);
+        // Protocol v26.
+        let swap = encode(&ClientMessage::SwapOffhand { slot: 0 }).expect("encode");
+        assert_eq!(swap[0], 18);
     }
 
     #[test]

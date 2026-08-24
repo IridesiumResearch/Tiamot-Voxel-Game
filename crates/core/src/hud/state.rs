@@ -95,6 +95,12 @@ pub struct State {
     /// inventory, one entry per material, and a player who dug a second thing
     /// watched their hotbar rearrange itself under their hands.
     pub carried: Vec<Option<Carried>>,
+    /// What is in the off-hand, if anything.
+    ///
+    /// A slot of `player:main` like any other — the twenty-eighth — reached
+    /// with a key rather than by dragging, and handed to a script separately
+    /// because a HUD draws it somewhere else entirely.
+    pub offhand: Option<Carried>,
     /// What the crosshair is on, if anything is in reach.
     pub looking_at: Option<Look>,
     /// How far along a dig is, if one is happening.

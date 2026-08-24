@@ -868,6 +868,16 @@ function game.stop_loop(id) end
 ---day, what you carry, what you are looking at, the dig in progress, the tool in
 ---hand. It is not a way to read terrain the player cannot see.
 ---
+---`state.carried` is the HOTBAR — the first `state.slots` slots of
+---`player:main`, in slot order, **with holes**. An empty slot is `nil` rather
+---than a missing entry, so slot four is slot four whether or not there is
+---anything in it: iterate `1, state.slots` and test each, because `ipairs`
+---stops at the first hole and `#` cannot measure past one.
+---
+---`state.offhand` is the twenty-eighth slot of the same view, or nil. It is
+---handed over separately because a HUD draws it somewhere else entirely; the
+---engine's `engine:offhand` key swaps it with whatever is selected.
+---
 ---Chat and the settings screen are not in `hud.hide_builtin` and never will be —
 ---moderation and rebinding have to work whatever a server pushes.
 ---@param file string Path to the Lua file inside your mod directory.

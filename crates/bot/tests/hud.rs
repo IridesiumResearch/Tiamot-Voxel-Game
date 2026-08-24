@@ -466,3 +466,74 @@ fn core_uis_shape_tab_cuts_a_block_and_the_cut_comes_back() {
     });
     assert!(server.stop());
 }
+
+#[test]
+fn the_offhand_key_swaps_and_swapping_twice_puts_it_back() {
+    // **A place in the player's own inventory, not a second one.** The off-hand
+    // is slot 28 of `player:main` — so `game.inventory` sees it, conservation
+    // counts it, and there is no separate grid to shuffle between. The swap is
+    // the server's: the client says which slot it was holding and nothing else.
+    let server = start("offhand");
+    block_on(async {
+        let mut bot = join(&server, "swapper").await;
+
+        bot.dig_block(tiamot_core::BlockPos::new(0, -1, 0))
+            .await
+            .expect("dig");
+        let slots = bot
+            .until_view("player:main", |slots| {
+                slots.first().is_some_and(Option::is_some)
+            })
+            .await
+            .expect("the dug block never reached a slot");
+        let held = slots[0].expect("a stack in the first slot");
+        assert!(
+            slots.len() > tiamot_core::inventory::PLAYER_OFFHAND_SLOT,
+            "there is nowhere for the off-hand to be: {} slots",
+            slots.len()
+        );
+        assert!(
+            slots[tiamot_core::inventory::PLAYER_OFFHAND_SLOT].is_none(),
+            "the off-hand starts empty"
+        );
+        let before: u32 = bot.inventory().iter().map(|stack| stack.units).sum();
+
+        bot.send(&tiamot_core::proto::ClientMessage::SwapOffhand { slot: 0 })
+            .await
+            .expect("send");
+        let swapped = bot
+            .until_view("player:main", |slots| {
+                slots
+                    .get(tiamot_core::inventory::PLAYER_OFFHAND_SLOT)
+                    .is_some_and(Option::is_some)
+            })
+            .await
+            .expect("nothing ever reached the off-hand");
+        assert_eq!(
+            swapped[tiamot_core::inventory::PLAYER_OFFHAND_SLOT],
+            Some(held),
+            "what was in the hand is not what is in the off-hand"
+        );
+        assert!(swapped[0].is_none(), "the hand should be empty now");
+
+        // And back, because a gesture you cannot undo without looking is one
+        // nobody presses.
+        bot.send(&tiamot_core::proto::ClientMessage::SwapOffhand { slot: 0 })
+            .await
+            .expect("send");
+        let back = bot
+            .until_view("player:main", |slots| {
+                slots.first().is_some_and(Option::is_some)
+            })
+            .await
+            .expect("it never came back");
+        assert_eq!(back[0], Some(held), "two presses did not put it back");
+        assert!(back[tiamot_core::inventory::PLAYER_OFFHAND_SLOT].is_none());
+
+        let after: u32 = bot.inventory().iter().map(|stack| stack.units).sum();
+        assert_eq!(after, before, "swapping invented or destroyed units");
+
+        bot.disconnect().await;
+    });
+    assert!(server.stop());
+}

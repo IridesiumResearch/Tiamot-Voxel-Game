@@ -3048,6 +3048,33 @@ impl App {
         }
     }
 
+    /// Asks the server to swap the selected slot with the off-hand.
+    ///
+    /// **A request, like every other inventory gesture.** The client says which
+    /// slot the player was holding; the server does the swap against its own
+    /// copy and sends back what the inventory now is. Nothing is moved here,
+    /// so a client that lied about it still sees the truth a moment later.
+    pub fn swap_offhand(&mut self) {
+        let Ok(slot) = u16::try_from(self.selected) else {
+            return;
+        };
+        self.connection.send(Command::SwapOffhand { slot });
+    }
+
+    /// What is in the off-hand, if anything.
+    #[must_use]
+    pub fn offhand(&self) -> Option<tiamot_core::proto::StackDef> {
+        self.views
+            .get(tiamot_core::inventory::PLAYER_MAIN)
+            .and_then(|contents| {
+                contents
+                    .slots
+                    .get(tiamot_core::inventory::PLAYER_OFFHAND_SLOT)
+                    .copied()
+                    .flatten()
+            })
+    }
+
     /// The hotbar's slots, holes included.
     #[must_use]
     pub fn hotbar(&self) -> &[Option<tiamot_core::proto::StackDef>] {
@@ -4211,6 +4238,16 @@ impl App {
                 })
             })
             .collect();
+        let offhand = self.offhand().map(|stack| tiamot_core::hud::Carried {
+            material: tiamot_core::MaterialId(stack.material),
+            name: self
+                .materials
+                .get(&stack.material)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", stack.material)),
+            units: stack.units,
+            shape: stack.shape,
+        });
         let voxels = phys::Voxels::new(&self.store, predictor.origin());
         let looking_at = self.looking_at().map(|hit| {
             let material = voxels
@@ -4233,6 +4270,7 @@ impl App {
             time_of_day: self.sky_time(),
             selected: self.selected,
             carried,
+            offhand,
             looking_at,
             // Per-mille, and the cast saturates on a non-finite progress the
             // way `Fill` expects — a dig progress is a server number and this

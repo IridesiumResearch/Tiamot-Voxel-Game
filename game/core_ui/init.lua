@@ -101,6 +101,17 @@ local function items_tab()
         children = {
             { type = "label", text = "Inventory — the top row is your hotbar" },
             { type = "item_grid", view = "player:main", columns = 9, first = 1, count = 27 },
+            { type = "spacer", size = 6 },
+            -- Slot 28: the off-hand, which the engine's `engine:offhand` key
+            -- swaps into. Shown so a player can see what is in it and drag
+            -- something else there; the key is for doing it without looking.
+            {
+                type = "container", direction = "row", gap = 6,
+                children = {
+                    { type = "label", text = "Off-hand" },
+                    { type = "item_slot", view = "player:main", index = 28 },
+                },
+            },
         },
     }
 end

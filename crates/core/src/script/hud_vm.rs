@@ -721,6 +721,23 @@ impl HudVm {
         table.set("slots", state.carried.len())?;
         table.set("carried", carried)?;
 
+        // The off-hand, separately, because a HUD draws it somewhere else.
+        let offhand = match &state.offhand {
+            Some(entry) => {
+                let slot = self.lua.create_table()?;
+                slot.set("material", entry.material.0)?;
+                slot.set("name", entry.name.as_str())?;
+                slot.set("units", entry.units)?;
+                let (blocks, nodes) = entry.display();
+                slot.set("blocks", blocks)?;
+                slot.set("nodes", nodes)?;
+                slot.set("shape", (entry.shape != 0).then_some(entry.shape))?;
+                Some(slot)
+            }
+            None => None,
+        };
+        table.set("offhand", offhand)?;
+
         if let Some(look) = &state.looking_at {
             let hit = self.lua.create_table()?;
             hit.set("x", look.cell[0])?;

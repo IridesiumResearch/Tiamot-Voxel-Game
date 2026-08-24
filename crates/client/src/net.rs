@@ -434,6 +434,11 @@ pub enum Command {
         /// The entity, as the server named it when it spawned.
         entity: u64,
     },
+    /// Swap a hotbar slot with the off-hand.
+    SwapOffhand {
+        /// Which slot, zero-based.
+        slot: u16,
+    },
     /// Ask the server for a streaming radius.
     ///
     /// A request. The server clamps it to its own configured maximum and
@@ -1515,6 +1520,7 @@ fn to_wire(command: Command) -> ClientMessage {
         } => ClientMessage::StartDig { target },
         Command::Dig { target: None } => ClientMessage::CancelDig,
         Command::Punch { entity } => ClientMessage::Punch { entity },
+        Command::SwapOffhand { slot } => ClientMessage::SwapOffhand { slot },
         Command::SelectTool { tool } => ClientMessage::SelectTool { tool },
         Command::ViewDistance {
             horizontal,

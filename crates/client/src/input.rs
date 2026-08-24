@@ -487,6 +487,11 @@ const ENGINE_ACTIONS: &[(&str, &str, Option<Input>)] = &[
         Some(Input::Key(KeyCode::KeyR)),
     ),
     (
+        "engine:offhand",
+        "Swap what you are holding with the off-hand",
+        Some(Input::Key(KeyCode::KeyF)),
+    ),
+    (
         "engine:hotbar_1",
         "Hotbar slot 1",
         Some(Input::Key(KeyCode::Digit1)),

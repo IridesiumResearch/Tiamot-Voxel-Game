@@ -116,6 +116,45 @@ local function hotbar(state)
     end
 end
 
+--- The off-hand: one slot, mirrored to the left of the hotbar.
+---
+--- **A place in the same inventory, not a second one.** It is slot 28 of
+--- `player:main`, reached with a key rather than by dragging, and the engine
+--- hands it over separately because a HUD draws it somewhere else entirely.
+local function offhand(state)
+    if not state.offhand then
+        return
+    end
+    local left = -((SLOTS * PITCH) - GAP) / 2
+
+    hud.rect{
+        anchor = "bottom", x = left - PITCH - 6, y = SLOT + 12,
+        w = SLOT + 12, h = SLOT + 12, colour = PANEL,
+    }
+    hud.rect{
+        anchor = "bottom", x = left - PITCH, y = SLOT + 6,
+        w = SLOT, h = SLOT, colour = EMPTY,
+    }
+    hud.icon{
+        anchor = "bottom", x = left - PITCH, y = SLOT + 6, size = SLOT,
+        material = state.offhand.material,
+    }
+
+    local slot = state.offhand
+    local label
+    if slot.nodes == 0 then
+        label = tostring(slot.blocks)
+    elseif slot.blocks == 0 then
+        label = "+" .. slot.nodes
+    else
+        label = slot.blocks .. "+" .. slot.nodes
+    end
+    hud.text{
+        anchor = "bottom", x = left - PITCH + 2, y = 20,
+        text = label, size = 17, colour = WHITE,
+    }
+end
+
 --- A bar that fills while a block is being broken.
 ---
 --- **Deliberately not drawn any more.** A block now comes apart as you dig it —
@@ -141,6 +180,7 @@ end
 
 hud.on_draw(function(state)
     hotbar(state)
+    offhand(state)
     digging(state)
     target(state)
 end)

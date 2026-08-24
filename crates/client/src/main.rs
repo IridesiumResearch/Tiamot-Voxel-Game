@@ -649,6 +649,7 @@ impl Client {
                     // does not know how many there are — charter rule 1 puts
                     // that in the mods and a server could register twenty.
                     "engine:next_tool" if pressed => app.next_tool(),
+                    "engine:offhand" if pressed => app.swap_offhand(),
                     "engine:lighting_mode" | "engine:lighting_mode_alt" if pressed => {
                         app.cycle_lighting_mode();
                     }

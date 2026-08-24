@@ -117,7 +117,17 @@ pub const PLAYER_HOTBAR_SLOTS: usize = 9;
 ///
 /// So a player starts with room, and `insert` still grows past it. This caps
 /// nothing; it only means the room exists before something is in it.
-pub const PLAYER_MAIN_SLOTS: usize = 27;
+pub const PLAYER_MAIN_SLOTS: usize = 28;
+
+/// Which of `player:main`'s slots is the off-hand.
+///
+/// **A slot, not a second view.** The hotbar is already a band of this one view
+/// (see [`PLAYER_HOTBAR_SLOTS`]) and the off-hand is one more place in it — so
+/// `game.inventory` sees it like anything else, conservation counts it like
+/// anything else, and there is no second grid for a player to shuffle things
+/// between. It sits past the twenty-seven a screen shows, which is why it is
+/// reached with a key rather than by dragging.
+pub const PLAYER_OFFHAND_SLOT: usize = 27;
 
 impl Slots {
     /// The views every player has.
@@ -262,6 +272,31 @@ impl Slots {
         // Whatever would not fit goes back where it came from, rather than
         // being quietly eaten.
         self.views[from].slots[index] = (!moving.is_empty()).then_some(moving);
+        true
+    }
+
+    /// Swaps a hotbar slot with the off-hand.
+    ///
+    /// **A swap, not a move.** Whatever is in the off-hand comes back to the
+    /// slot the player was holding, so the gesture is its own undo — pressing
+    /// the key twice leaves the inventory exactly as it was, which is what
+    /// makes it safe to press without looking.
+    ///
+    /// Returns whether anything moved. `false` for a slot that does not exist,
+    /// or for a swap of two empty hands.
+    pub fn swap_offhand(&mut self, view: &str, slot: usize) -> bool {
+        let Some(at) = self.locate(view, slot) else {
+            return false;
+        };
+        if slot == PLAYER_OFFHAND_SLOT || self.views[at].slots.len() <= PLAYER_OFFHAND_SLOT {
+            return false;
+        }
+        if self.views[at].slots[slot].is_none()
+            && self.views[at].slots[PLAYER_OFFHAND_SLOT].is_none()
+        {
+            return false;
+        }
+        self.views[at].slots.swap(slot, PLAYER_OFFHAND_SLOT);
         true
     }
 
@@ -491,6 +526,37 @@ fn place_one(mut held: Stack, there: Option<Stack>) -> (Option<Stack>, Option<St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_offhand_swap_is_its_own_undo() {
+        // Pressing the key twice must leave the inventory exactly as it was, or
+        // it is not a gesture anybody can use without looking.
+        let mut inv = Slots::for_player();
+        inv.views[0].slots[0] = Some(Stack::new(STONE, 20).expect("stack"));
+        inv.views[0].slots[PLAYER_OFFHAND_SLOT] = Some(Stack::new(STONE, 7).expect("stack"));
+        let before = inv.clone();
+
+        assert!(inv.swap_offhand(PLAYER_MAIN, 0));
+        assert_eq!(
+            at(&inv, PLAYER_MAIN, 0).expect("swapped").units,
+            7,
+            "the off-hand's stack did not come to the hand"
+        );
+        assert!(inv.swap_offhand(PLAYER_MAIN, 0));
+        assert_eq!(inv, before, "two presses did not put it back");
+    }
+
+    #[test]
+    fn swapping_an_empty_hand_with_an_empty_offhand_does_nothing() {
+        // So a key pressed by accident does not mark the inventory dirty and
+        // send an update saying nothing changed.
+        let mut inv = Slots::for_player();
+        assert!(!inv.swap_offhand(PLAYER_MAIN, 3));
+        // And the off-hand cannot be swapped with itself.
+        inv.views[0].slots[PLAYER_OFFHAND_SLOT] = Some(Stack::new(STONE, 5).expect("stack"));
+        assert!(!inv.swap_offhand(PLAYER_MAIN, PLAYER_OFFHAND_SLOT));
+        assert_eq!(inv.total_units(), 5, "a refused swap changed something");
+    }
+
     #[test]
     fn shift_clicking_moves_a_stack_between_the_hotbar_band_and_the_rest() {
         // The gesture, with one view: out of the band, and back into it. What

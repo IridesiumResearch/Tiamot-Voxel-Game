@@ -147,6 +147,16 @@ pub enum Action {
         event: crate::proto::DialogEvent,
     },
 
+    /// Swap a hotbar slot with the off-hand.
+    ///
+    /// The session checks the phase and nothing else: whether the player has a
+    /// slot of that number is a question about their inventory, which the
+    /// server's handler answers by refusing rather than clamping.
+    SwapOffhand {
+        /// Which slot, zero-based.
+        slot: u16,
+    },
+
     /// Record a movement/look input for the next tick.
     Input {
         /// The tick the client believes it is on.
@@ -378,6 +388,9 @@ impl Session {
             }),
             ClientMessage::CancelDig => Response::act(Action::Dig { target: None }),
             ClientMessage::Punch { entity } => Response::act(Action::Punch { entity: *entity }),
+            ClientMessage::SwapOffhand { slot } => {
+                Response::act(Action::SwapOffhand { slot: *slot })
+            }
             ClientMessage::Action { id, pressed } => Response::act(Action::pressed(id, *pressed)),
             ClientMessage::DialogEvent { form, event } => Response::act(Action::Dialog {
                 form: form.clone(),
@@ -898,6 +911,7 @@ impl Session {
             ClientMessage::Place { .. } => "Place",
             ClientMessage::ViewDistance { .. } => "ViewDistance",
             ClientMessage::Punch { .. } => "Punch",
+            ClientMessage::SwapOffhand { .. } => "SwapOffhand",
         };
         self.close_with(DisconnectReason::ProtocolError {
             detail: format!("{what} is not valid in phase {:?}", self.phase),

@@ -292,6 +292,11 @@ fn client_messages() -> Vec<Vec<u8>> {
         // Protocol v15.
         ClientMessage::Punch { entity: 0 },
         ClientMessage::Punch { entity: u64::MAX },
+        // Protocol v26. The out-of-range slot is the interesting one: the
+        // server refuses it rather than clamping, and a clamp is exactly the
+        // bug a fuzzer would find by asking for slot 65,535.
+        ClientMessage::SwapOffhand { slot: 0 },
+        ClientMessage::SwapOffhand { slot: u16::MAX },
         // **Every dialog event**, which had NO seeds at all until protocol
         // v25 — the whole family of messages a client sends back from a
         // server's own interface, every string of which the server echoed to

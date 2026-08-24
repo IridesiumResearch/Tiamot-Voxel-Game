@@ -1180,6 +1180,23 @@ impl Shared {
         took
     }
 
+    /// Swaps a hotbar slot with the off-hand, for a player who pressed the key.
+    ///
+    /// Refused rather than clamped for a slot nobody has: clamping would swap
+    /// a slot the player did not name, which is worse than doing nothing.
+    pub fn swap_offhand(&self, uuid: &PlayerUuid, slot: usize) {
+        let swapped =
+            self.inventories
+                .lock()
+                .is_ok_and(|mut inventories| match inventories.get_mut(uuid) {
+                    Some(slots) => slots.swap_offhand(PLAYER_MAIN, slot),
+                    None => false,
+                });
+        if swapped && let Ok(mut dirty) = self.inventory_dirty.lock() {
+            dirty.insert(*uuid);
+        }
+    }
+
     /// Takes up to `units` of one material and cut out of a view, for a mod.
     ///
     /// Returns how many it got, which may be fewer than asked.
@@ -1921,6 +1938,11 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
             Action::Punch { entity } => {
                 if let Some(uuid) = session.uuid() {
                     shared.queue_punch(uuid, *entity);
+                }
+            }
+            Action::SwapOffhand { slot } => {
+                if let Some(uuid) = session.uuid() {
+                    shared.swap_offhand(&uuid, usize::from(*slot));
                 }
             }
             Action::Action { id, pressed } => {
