@@ -320,8 +320,21 @@ pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=3.0;
 /// an intention.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a settings file is a list of settings, and several of them are on-or-off"
+)]
 pub struct Config {
-    /// Which server to play on.
+    /// Whether to open on the front screen.
+    ///
+    /// **True is the default and the way a person runs this.** With it off the
+    /// client dials [`Config::server`] before the window exists and opens
+    /// already in a world — which is what a test rig, a benchmark or a kiosk
+    /// wants, and which is all the client could do before there was a menu.
+    #[serde(default = "Config::default_menu")]
+    pub menu: bool,
+
+    /// Which server to play on when [`Config::menu`] is off.
     #[serde(default)]
     pub server: ServerChoice,
 
@@ -439,6 +452,10 @@ pub struct Config {
 impl Config {
     fn default_display_name() -> String {
         "player".to_owned()
+    }
+
+    const fn default_menu() -> bool {
+        true
     }
 
     fn default_world_path() -> PathBuf {
@@ -621,6 +638,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             volumes: crate::audio::Volumes::default(),
+            menu: Self::default_menu(),
             server: ServerChoice::default(),
             display_name: Self::default_display_name(),
             world_path: Self::default_world_path(),

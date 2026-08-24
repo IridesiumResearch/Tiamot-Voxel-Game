@@ -513,6 +513,12 @@ impl BufferPool {
 /// Separate from [`Renderer`] because the window needs an adapter before it can
 /// choose a surface configuration, and a renderer that created its own device
 /// would have to be built after the window rather than beside it.
+///
+/// **Cloning is cheap and does not make a second device.** `wgpu::Device` and
+/// `wgpu::Queue` are handles to one thing; a clone is a second handle. The
+/// window keeps one so it can configure its surface and draw a menu before
+/// there is a renderer to ask.
+#[derive(Clone)]
 pub struct Gpu {
     /// The logical device.
     pub device: wgpu::Device,

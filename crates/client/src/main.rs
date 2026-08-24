@@ -35,6 +35,12 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 /// The config file, relative to the working directory.
 const CONFIG_FILE: &str = "client.toml";
 
+/// Where mods are installed, beside the executable.
+///
+/// The same directory a dedicated server is pointed at, so a world a player
+/// makes here and a world they host run the same content.
+const MODS_DIR: &str = "game";
+
 /// Where key bindings live, beside the config.
 ///
 /// Its own file rather than a section of `client.toml`: the settings screen
@@ -81,38 +87,69 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let identity = Identity::load_or_create(&data.join("identity.key"))?;
     tracing::info!(uuid = %identity.uuid_as_root().short(), "identity ready");
 
-    // An embedded server is started BEFORE the window, so a world that fails to
-    // open is a clear error on the terminal rather than a window that appears
-    // and then vanishes.
-    let (address, embedded) = match config.server {
-        ServerChoice::Remote(address) => (address, None),
-        ServerChoice::Embedded => {
-            let handle = tiamot_server::ServerHandle::start(&tiamot_server::Settings {
-                // Loopback only. An embedded server is this player's world, and
-                // binding it to every interface would silently publish it.
-                bind_addr: "127.0.0.1:0".parse()?,
-                world_path: config.world_path.clone(),
-                max_players: 1,
-                allowlist: tiamot_core::identity::Allowlist::open(),
-                view_distance: config.view(),
-                mods_path: Some(std::path::PathBuf::from("game")),
-                enabled_mods: None,
-                seed: None,
-                rcon: None,
-                materials: Vec::new(),
-            })?;
-            tracing::info!(addr = %handle.local_addr(), "embedded server listening");
-            (handle.local_addr(), Some(handle))
-        }
-    };
+    let library =
+        client::launcher::Library::load(&data.join("worlds.toml")).unwrap_or_else(|err| {
+            // A world list that will not parse is reported and then left alone:
+            // starting with an empty one would save over it the next time
+            // anything was added.
+            tracing::warn!("{err}");
+            client::launcher::Library::default()
+        });
+    let catalogue =
+        client::launcher::Catalogue::scan(std::path::Path::new(MODS_DIR), &data.join("mods.toml"));
 
-    let connection = Connection::open(
-        address,
-        identity,
-        config.display_name.clone(),
-        ContentCache::open(&data.join("content"))?,
-        &data.join("known-hosts"),
-    )?;
+    // **The world somebody already had, before there was a list to put it in.**
+    // Without this the first run after the front screen landed would show an
+    // empty list beside a `singleplayer/` directory full of a player's
+    // building, and the only way forward would be to make a second world.
+    let mut library = library;
+    if library.entries.is_empty() && config.world_path.is_dir() {
+        library.add(client::launcher::Entry {
+            name: config.world_path.file_name().map_or_else(
+                || "Singleplayer".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            ),
+            kind: client::launcher::Kind::Local {
+                path: config.world_path.clone(),
+            },
+            // Whatever it was played with was not recorded, so it is recorded
+            // as what is on now: inventing a set would invent a warning.
+            mods: catalogue.enabled(),
+        });
+        if let Err(err) = library.save(&data.join("worlds.toml")) {
+            tracing::warn!("{err}");
+        }
+    }
+
+    // **The front screen is the default, and `menu = false` is the way past
+    // it.** A client that dialled a server before opening a window could only
+    // ever have one world in it, because there was nowhere to name a second.
+    // The old behaviour is still exactly one line of config away, because that
+    // is what the bot harness and a dedicated test rig want.
+    let (connection, embedded) = if config.menu {
+        (None, None)
+    } else {
+        // An embedded server is started BEFORE the window, so a world that
+        // fails to open is a clear error on the terminal rather than a window
+        // that appears and then vanishes.
+        let (address, embedded) = match config.server {
+            ServerChoice::Remote(address) => (address, None),
+            ServerChoice::Embedded => {
+                let handle =
+                    start_local_world(&config.world_path, config.view(), catalogue.enabled())?;
+                tracing::info!(addr = %handle.local_addr(), "embedded server listening");
+                (handle.local_addr(), Some(handle))
+            }
+        };
+        let connection = Connection::open(
+            address,
+            identity,
+            config.display_name.clone(),
+            ContentCache::open(&data.join("content"))?,
+            &data.join("known-hosts"),
+        )?;
+        (Some(connection), embedded)
+    };
 
     let event_loop = EventLoop::new()?;
     // Poll rather than Wait: this is a game, and a frame is due whether or not
@@ -121,7 +158,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut client = Client {
         config,
-        connection: Some(connection),
+        library,
+        catalogue,
+        identity_path: data.join("identity.key"),
+        data,
+        parked: None,
+        connection,
         embedded,
         window: None,
         held: Held::default(),
@@ -138,11 +180,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     client.error.map_or(Ok(()), Err)
 }
 
+/// What the window is showing.
+///
+/// **A window before a world.** The client used to read `client.toml`, dial a
+/// server and open a window already in it — fine for one world and impossible
+/// for two, because there was nowhere to name a second one and no way to see
+/// which servers had been visited. So the window opens on the front screen and
+/// the world is built when the player presses Play.
+enum Stage {
+    /// The front screen: worlds, mods, and Play.
+    Front(Box<client::front::Front>),
+    /// In a world.
+    Playing(Box<App>),
+}
+
 /// The window, the surface, and everything drawn into it.
 struct Surface {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
-    app: App,
+    /// **Kept here rather than reached through the renderer**, because the
+    /// surface has to be configured and the front screen drawn before there is
+    /// a renderer to ask. A clone is a second handle, not a second device.
+    gpu: client::render::Gpu,
+    stage: Stage,
     egui: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
@@ -198,8 +258,115 @@ impl Held {
     }
 }
 
+/// A directory name a world's title can safely become.
+///
+/// **Not the title itself.** A player may call a world anything, including
+/// something with a `/` or a `..` in it, and that string must never reach a
+/// path. Anything but letters, digits, dash and underscore becomes a dash, and
+/// an empty result becomes `world` — a directory named for nothing is still a
+/// directory that opens.
+fn world_directory(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').to_owned();
+    if trimmed.is_empty() {
+        "world".to_owned()
+    } else {
+        trimmed
+    }
+}
+
+/// Paints the whole frame one colour.
+///
+/// The front screen has no world behind it, and the interface pass loads rather
+/// than clears — so without this a menu is drawn over whatever the driver left
+/// in the buffer.
+fn clear(gpu: &Gpu, view: &wgpu::TextureView) {
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("front"),
+        });
+    drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("front"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.05,
+                    g: 0.06,
+                    b: 0.08,
+                    a: 1.0,
+                }),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    }));
+    gpu.queue.submit(Some(encoder.finish()));
+}
+
+/// Starts an embedded server for one of this player's own worlds.
+///
+/// **Loopback only.** An embedded server is this player's world, and binding it
+/// to every interface would silently publish it.
+fn start_local_world(
+    world_path: &std::path::Path,
+    view: tiamot_core::interest::ViewDistance,
+    enabled_mods: Vec<String>,
+) -> Result<tiamot_server::ServerHandle, Box<dyn std::error::Error>> {
+    Ok(tiamot_server::ServerHandle::start(
+        &tiamot_server::Settings {
+            bind_addr: "127.0.0.1:0".parse()?,
+            world_path: world_path.to_path_buf(),
+            max_players: 1,
+            allowlist: tiamot_core::identity::Allowlist::open(),
+            view_distance: view,
+            mods_path: Some(std::path::PathBuf::from(MODS_DIR)),
+            enabled_mods: Some(enabled_mods),
+            seed: None,
+            rcon: None,
+            materials: Vec::new(),
+        },
+    )?)
+}
+
+/// The renderer, built with the window and waiting for a world.
+struct Parked {
+    renderer: Renderer,
+    present_mode: &'static str,
+}
+
 struct Client {
     config: Config,
+    /// The player's worlds and servers, as the front screen shows them.
+    library: client::launcher::Library,
+    /// Every installed mod, and which are ticked.
+    catalogue: client::launcher::Catalogue,
+    /// Where the identity and the content cache live.
+    data: std::path::PathBuf,
+    /// Where this machine's identity is kept.
+    ///
+    /// **The path rather than the key.** A player who leaves one world and
+    /// opens another is the same player (charter rule 13), so each connection
+    /// loads the same file — and a key that had been copied around the process
+    /// is a secret in more places than it needs to be.
+    identity_path: std::path::PathBuf,
+    /// The renderer, from window creation until a world takes it.
+    parked: Option<Parked>,
     /// Taken when the window is created.
     connection: Option<Connection>,
     /// Kept alive for as long as the client runs. Dropping it stops the world.
@@ -278,12 +445,54 @@ impl ApplicationHandler for Client {
                 surface.size = (size.width.max(1), size.height.max(1));
                 configure_surface(
                     &surface.surface,
-                    surface.app.renderer().gpu(),
+                    &surface.gpu,
                     surface.size,
                     self.config.vsync,
                 );
             }
 
+            WindowEvent::RedrawRequested if !self.frame() => event_loop.exit(),
+
+            // **Everything else is about a world**, and on the front screen
+            // there is not one: no camera to swing, no action table to look a
+            // key up in, and no cursor to grab. egui has already had its
+            // refusal above, so the menu is fully usable and this is silent.
+            event => self.world_event(event),
+        }
+    }
+
+    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+        if let Some(surface) = &self.window {
+            surface.window.request_redraw();
+        }
+    }
+
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        // Order matters: leave the server before stopping it, or the last thing
+        // in the log is a connection dropping rather than a clean goodbye.
+        if let Some(surface) = self.window.take()
+            && let Stage::Playing(app) = surface.stage
+        {
+            app.shutdown();
+        }
+        if let Some(handle) = self.embedded.take() {
+            handle.stop();
+        }
+    }
+}
+
+impl Client {
+    /// Window events that only mean something once a world is running.
+    fn world_event(&mut self, event: WindowEvent) {
+        let Some(surface) = self.window.as_mut() else {
+            return;
+        };
+        let Stage::Playing(app) = &mut surface.stage else {
+            return;
+        };
+        let window = &surface.window;
+
+        match event {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 // **Click to look FIRST, and before any action lookup.** Until
@@ -292,17 +501,17 @@ impl ApplicationHandler for Client {
                 // crosshair — and that is a property of the window rather than
                 // of whatever `engine:dig` happens to be bound to.
                 if button == MouseButton::Left && pressed && !self.grabbed {
-                    self.grabbed = grab(&surface.window, true);
+                    self.grabbed = grab(window, true);
                     return;
                 }
                 // The same rule for the mouse: a capture owns the button.
-                if surface.app.rebinding().is_some() {
+                if app.rebinding().is_some() {
                     if pressed {
-                        surface.app.capture(Control::Mouse(button));
+                        app.capture(Control::Mouse(button));
                     }
                     return;
                 }
-                let Some(action) = surface.app.action_for(Control::Mouse(button)) else {
+                let Some(action) = app.action_for(Control::Mouse(button)) else {
                     return;
                 };
                 match action.as_str() {
@@ -312,12 +521,12 @@ impl ApplicationHandler for Client {
                     "engine:dig" => {
                         self.digging = pressed;
                         if !pressed {
-                            surface.app.stop_digging();
+                            app.stop_digging();
                         }
                     }
                     // A single action, unlike digging. Repeating while held
                     // would build a wall out of one click.
-                    "engine:place" if pressed && self.grabbed => surface.app.place(),
+                    "engine:place" if pressed && self.grabbed => app.place(),
                     _ => {}
                 }
             }
@@ -328,7 +537,7 @@ impl ApplicationHandler for Client {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y < 0.0,
                     winit::event::MouseScrollDelta::PixelDelta(position) => position.y < 0.0,
                 };
-                surface.app.select_next(forward);
+                app.select_next(forward);
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -341,7 +550,7 @@ impl ApplicationHandler for Client {
                 // that — charter rule 11, and the reason a mod can add a
                 // control without the client learning a new key.
                 // **While a capture is waiting, the key belongs to it.**
-                if surface.app.rebinding().is_some() {
+                if app.rebinding().is_some() {
                     if !pressed {
                         // The release of the key that was just bound, or of the
                         // one that opened the prompt. Neither is a binding.
@@ -352,23 +561,23 @@ impl ApplicationHandler for Client {
                     // out that is not "bind something", and it is checked
                     // BEFORE the capture or it would bind Escape.
                     if code == winit::keyboard::KeyCode::Escape {
-                        surface.app.cancel_rebind();
+                        app.cancel_rebind();
                         return;
                     }
                     // Otherwise this key is the answer. Taken here rather than
                     // acted on, or rebinding would also fire whatever the key
                     // currently does — at best a jump, at worst the very thing
                     // being rebound away from.
-                    surface.app.capture(Control::Key(code));
+                    app.capture(Control::Key(code));
                     return;
                 }
-                let Some(action) = surface.app.action_for(Control::Key(code)) else {
+                let Some(action) = app.action_for(Control::Key(code)) else {
                     return;
                 };
                 // **Typing is not walking.** Every action but the ones that
                 // close chat is swallowed while the input line is open, so a
                 // player writing "sssh" does not sneak-strafe across the map.
-                if surface.app.chat_open() && !matches!(action.as_str(), "engine:menu") {
+                if app.chat_open() && !matches!(action.as_str(), "engine:menu") {
                     return;
                 }
                 match action.as_str() {
@@ -385,16 +594,16 @@ impl ApplicationHandler for Client {
                     // them always leaves a player somewhere they can act — and
                     // Escape always gets them out, whichever key let them in.
                     "engine:settings" if pressed => {
-                        let showing = surface.app.settings_open();
-                        surface.app.set_menu_open(!showing);
+                        let showing = app.settings_open();
+                        app.set_menu_open(!showing);
                         if !showing {
-                            surface.app.open_settings();
+                            app.open_settings();
                         }
                         // The cursor has to come back to click anything.
-                        self.grabbed = if surface.app.menu_open() {
-                            !grab(&surface.window, false)
+                        self.grabbed = if app.menu_open() {
+                            !grab(window, false)
                         } else {
-                            grab(&surface.window, true)
+                            grab(window, true)
                         };
                     }
                     // Chat takes the cursor and the keyboard: a player typing
@@ -402,13 +611,13 @@ impl ApplicationHandler for Client {
                     // stops feeding movement to `held` while it is open — see
                     // where this is checked before the match.
                     "engine:chat" if pressed => {
-                        surface.app.set_chat_open(true);
+                        app.set_chat_open(true);
                         self.held = Held::default();
-                        self.grabbed = !grab(&surface.window, false);
+                        self.grabbed = !grab(window, false);
                     }
                     "engine:debug_overlay" if pressed => {
-                        let on = !surface.app.debug_overlay();
-                        surface.app.set_debug_overlay(on);
+                        let on = !app.debug_overlay();
+                        app.set_debug_overlay(on);
                     }
                     // **Escape is the front door.** It used to only release the
                     // cursor, which left the settings screen reachable by one
@@ -416,16 +625,16 @@ impl ApplicationHandler for Client {
                     // in. Now it opens a menu — and closes chat, a dialog's
                     // grab, or the menu itself, whichever is in the way.
                     "engine:menu" if pressed => {
-                        if surface.app.chat_open() {
-                            surface.app.set_chat_open(false);
+                        if app.chat_open() {
+                            app.set_chat_open(false);
                         } else {
-                            let open = !surface.app.menu_open();
-                            surface.app.set_menu_open(open);
+                            let open = !app.menu_open();
+                            app.set_menu_open(open);
                         }
-                        self.grabbed = if surface.app.menu_open() {
-                            !grab(&surface.window, false)
+                        self.grabbed = if app.menu_open() {
+                            !grab(window, false)
                         } else {
-                            grab(&surface.window, true)
+                            grab(window, true)
                         };
                     }
                     // The floating-origin check from Task 08's criteria: out
@@ -442,83 +651,64 @@ impl ApplicationHandler for Client {
                     // A cycle rather than a key per tool, because the engine
                     // does not know how many there are — charter rule 1 puts
                     // that in the mods and a server could register twenty.
-                    "engine:next_tool" if pressed => surface.app.next_tool(),
+                    "engine:next_tool" if pressed => app.next_tool(),
                     "engine:lighting_mode" | "engine:lighting_mode_alt" if pressed => {
-                        surface.app.cycle_lighting_mode();
+                        app.cycle_lighting_mode();
                     }
                     // Its own control rather than part of the lighting mode:
                     // the cascades are the largest thing the client allocates
                     // and the right setting depends entirely on the card.
-                    "engine:shadow_quality" if pressed => surface.app.cycle_shadow_quality(),
+                    "engine:shadow_quality" if pressed => app.cycle_shadow_quality(),
                     "engine:third_person" | "engine:third_person_alt" if pressed => {
-                        surface.app.toggle_third_person();
+                        app.toggle_third_person();
                     }
                     "engine:chunk_borders" if pressed => {
-                        let on = surface.app.toggle_chunk_borders();
+                        let on = app.toggle_chunk_borders();
                         tracing::info!(on, "chunk borders");
                     }
                     // Temporary, for tracking sources: a source and a full flow
                     // block look identical, so from inside a pond there is no
                     // telling which block is feeding it.
                     "engine:fluid_sources" if pressed => {
-                        let on = surface.app.toggle_fluid_sources();
+                        let on = app.toggle_fluid_sources();
                         tracing::info!(on, "fluid source outlines");
                     }
                     // A twentieth of a day a press, so a full circuit is twenty
                     // presses and dawn is findable.
                     "engine:time_back" | "engine:time_back_alt" if pressed => {
-                        surface.app.nudge_time(-0.05);
+                        app.nudge_time(-0.05);
                     }
                     "engine:time_forward" | "engine:time_forward_alt" if pressed => {
-                        surface.app.nudge_time(0.05);
+                        app.nudge_time(0.05);
                     }
                     "engine:time_resync" | "engine:time_resync_alt" if pressed => {
-                        surface.app.resync_time();
+                        app.resync_time();
                     }
                     // Singleplayer only, and through the embedded server's own
                     // handle rather than over the wire — a client cannot edit a
                     // world it is a guest in, and this does not make it one.
                     "engine:material_row" if pressed => {
                         if let Some(server) = self.embedded.as_ref() {
-                            for (pos, material) in surface.app.debug_material_row() {
+                            for (pos, material) in app.debug_material_row() {
                                 server.seed_block(pos, material);
                             }
                         }
                     }
                     id => {
                         if let Some(slot) = hotbar_slot(id).filter(|_| pressed) {
-                            surface.app.select_slot(slot);
+                            app.select_slot(slot);
                         } else {
                             // Anything else is a mod's, and the mod is told
                             // BOTH edges so it can implement a held control.
                             // `send_action` drops engine ids, so an unhandled
                             // arm above cannot leak onto the wire.
-                            surface.app.send_action(id, pressed);
+                            app.send_action(id, pressed);
                         }
                     }
                 }
             }
 
-            WindowEvent::RedrawRequested if !self.frame() => event_loop.exit(),
-
             _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
-        if let Some(surface) = &self.window {
-            surface.window.request_redraw();
-        }
-    }
-
-    fn exiting(&mut self, _: &ActiveEventLoop) {
-        // Order matters: leave the server before stopping it, or the last thing
-        // in the log is a connection dropping rather than a clean goodbye.
-        if let Some(surface) = self.window.take() {
-            surface.app.shutdown();
-        }
-        if let Some(handle) = self.embedded.take() {
-            handle.stop();
         }
     }
 }
@@ -558,7 +748,7 @@ impl Client {
                 ..Default::default()
             },
         );
-        let mut renderer = Renderer::new(gpu, self.config.render_mode, size.0, size.1)?;
+        let mut renderer = Renderer::new(gpu.clone(), self.config.render_mode, size.0, size.1)?;
         renderer.set_lighting_mode(self.config.lighting_mode);
         renderer.set_shadow_quality(self.config.shadow_quality);
 
@@ -575,46 +765,30 @@ impl Client {
             None,
         );
 
-        let connection = self
-            .connection
-            .take()
-            .ok_or("the connection was already taken; the window was created twice")?;
+        // **The renderer is built here and parked until there is a world.**
+        // It owns the depth buffer, the pipelines and the shadow cascades, and
+        // building it takes long enough that doing it on the Play button would
+        // be a visible stall between pressing it and anything happening.
+        self.parked = Some(Parked {
+            renderer,
+            present_mode,
+        });
+
+        let stage = match self.connection.take() {
+            // `menu = false` in `client.toml`, or a `--connect` run: the world
+            // was dialled before the window and there is nothing to choose.
+            Some(connection) => Stage::Playing(Box::new(self.start_app(connection))),
+            None => Stage::Front(Box::new(client::front::Front::new(
+                self.library.clone(),
+                self.catalogue.clone(),
+            ))),
+        };
 
         Ok(Surface {
             window,
             surface,
-            app: {
-                let mut app = App::with_bindings(
-                    self.config.clone(),
-                    connection,
-                    renderer,
-                    self.bindings.take().unwrap_or_default(),
-                );
-                // So the HUD reports the mode in force rather than the flag that
-                // asked for one. See `configure_surface`.
-                app.set_present_mode(present_mode);
-                // The environment belongs to the binary, not to `App`: a library
-                // reading it would be process-global state a caller cannot
-                // control, which is a poor thing for tests and a worse one for an
-                // embedded server.
-                if let Some(path) = std::env::var_os("TIAMOT_TRACE_FRAMES") {
-                    let path = std::path::PathBuf::from(path);
-                    if app.log_frames_to(&path) {
-                        tracing::info!(path = %path.display(), "logging every frame");
-                    } else {
-                        tracing::warn!(path = %path.display(), "could not open the frame log");
-                    }
-                }
-                if let Some(path) = std::env::var_os("TIAMOT_TRACE_PHYSICS") {
-                    let path = std::path::PathBuf::from(path);
-                    if app.trace_physics_to(&path) {
-                        tracing::info!(path = %path.display(), "tracing physics per tick");
-                    } else {
-                        tracing::warn!(path = %path.display(), "could not open the physics trace");
-                    }
-                }
-                app
-            },
+            gpu,
+            stage,
             egui,
             egui_state,
             egui_renderer,
@@ -624,9 +798,221 @@ impl Client {
         })
     }
 
+    /// Builds the running world around a connection.
+    ///
+    /// Its own function because it happens twice — once at startup when the
+    /// world was chosen before the window, and once when the player presses
+    /// Play — and the two must set the same things up.
+    fn start_app(&mut self, connection: Connection) -> App {
+        let Parked {
+            renderer,
+            present_mode,
+        } = self
+            .parked
+            .take()
+            .expect("the renderer is parked when the window is created");
+        let mut app = App::with_bindings(
+            self.config.clone(),
+            connection,
+            renderer,
+            self.bindings.take().unwrap_or_default(),
+        );
+        // So the HUD reports the mode in force rather than the flag that asked
+        // for one. See `configure_surface`.
+        app.set_present_mode(present_mode);
+        // The environment belongs to the binary, not to `App`: a library
+        // reading it would be process-global state a caller cannot control,
+        // which is a poor thing for tests and a worse one for an embedded
+        // server.
+        if let Some(path) = std::env::var_os("TIAMOT_TRACE_FRAMES") {
+            let path = std::path::PathBuf::from(path);
+            if app.log_frames_to(&path) {
+                tracing::info!(path = %path.display(), "logging every frame");
+            } else {
+                tracing::warn!(path = %path.display(), "could not open the frame log");
+            }
+        }
+        if let Some(path) = std::env::var_os("TIAMOT_TRACE_PHYSICS") {
+            let path = std::path::PathBuf::from(path);
+            if app.trace_physics_to(&path) {
+                tracing::info!(path = %path.display(), "tracing physics per tick");
+            } else {
+                tracing::warn!(path = %path.display(), "could not open the physics trace");
+            }
+        }
+        app
+    }
+
+    /// Draws one frame of the front screen. Returns whether to keep going.
+    ///
+    /// **Its own loop, not a branch inside the world's.** A menu has no camera
+    /// to advance, no network to pump and no chunks to mesh, and threading
+    /// "unless there is no world" through every one of those would put the
+    /// menu's existence into code that has nothing to do with it.
+    fn front_frame(&mut self) -> bool {
+        let Some(surface) = self.window.as_mut() else {
+            return false;
+        };
+        let frame = match surface.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                configure_surface(
+                    &surface.surface,
+                    &surface.gpu,
+                    surface.size,
+                    self.config.vsync,
+                );
+                return true;
+            }
+            // A window nobody can see. Nothing to draw and nothing to say
+            // about it — the menu is not paced by anything, so the next frame
+            // simply tries again.
+            wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
+                return true;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.error = Some("the surface rejected a frame request".into());
+                return false;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // **Cleared here rather than by the interface pass.** `draw_front`
+        // loads what is already in the buffer, exactly as the HUD does over the
+        // world — and with no world there is nothing in it, so the menu would
+        // be drawn over whatever the last frame left behind.
+        clear(&surface.gpu, &view);
+        let action = draw_front(surface, self.config.ui_scale, &view);
+        frame.present();
+
+        match action {
+            client::front::Action::None => true,
+            client::front::Action::Quit => false,
+            client::front::Action::Open(entry) => self.open(&entry),
+            client::front::Action::Create(name) => self.create(&name),
+        }
+    }
+
+    /// Opens a world or dials a server, and hands the window the running world.
+    ///
+    /// A failure is reported ON the front screen rather than to the terminal: a
+    /// player who typed an address wrong is looking at the menu, and a log line
+    /// they never see is the same as no message at all.
+    fn open(&mut self, entry: &client::launcher::Entry) -> bool {
+        match self.connect(entry) {
+            Ok(()) => {
+                self.library.add(client::launcher::Entry {
+                    // The mods it is being played with NOW, so the next visit
+                    // compares against the truth rather than against whatever
+                    // it was made with.
+                    mods: if entry.is_local() {
+                        self.catalogue.enabled()
+                    } else {
+                        Vec::new()
+                    },
+                    ..entry.clone()
+                });
+                self.save_library();
+                true
+            }
+            Err(err) => {
+                if let Some(surface) = self.window.as_mut()
+                    && let Stage::Front(front) = &mut surface.stage
+                {
+                    front.notice = Some(format!("could not open `{}`: {err}", entry.name));
+                }
+                true
+            }
+        }
+    }
+
+    /// Makes a world and opens it.
+    fn create(&mut self, name: &str) -> bool {
+        let entry = client::launcher::Entry {
+            name: name.to_owned(),
+            kind: client::launcher::Kind::Local {
+                path: std::path::PathBuf::from("worlds").join(world_directory(name)),
+            },
+            mods: self.catalogue.enabled(),
+        };
+        self.open(&entry)
+    }
+
+    /// Starts whatever `entry` names and swaps the window into it.
+    fn connect(&mut self, entry: &client::launcher::Entry) -> Result<(), String> {
+        let identity = Identity::load_or_create(&self.identity_path)
+            .map_err(|err| format!("this machine's identity could not be read: {err}"))?;
+        let address = match &entry.kind {
+            client::launcher::Kind::Local { path } => {
+                let handle = start_local_world(
+                    &self.data.join(path),
+                    self.config.view(),
+                    self.catalogue.enabled(),
+                )
+                .map_err(|err| err.to_string())?;
+                let address = handle.local_addr();
+                // Held on `Client`, because dropping it stops the world.
+                self.embedded = Some(handle);
+                address
+            }
+            client::launcher::Kind::Remote { address } => {
+                use std::net::ToSocketAddrs;
+                address
+                    .to_socket_addrs()
+                    .map_err(|err| format!("`{address}` is not an address: {err}"))?
+                    .next()
+                    .ok_or_else(|| format!("`{address}` resolved to nothing"))?
+            }
+        };
+
+        let cache = ContentCache::open(&self.data.join("content"))
+            .map_err(|err| format!("the content cache could not be opened: {err}"))?;
+        let connection = Connection::open(
+            address,
+            identity,
+            self.config.display_name.clone(),
+            cache,
+            &self.data.join("known-hosts"),
+        )
+        .map_err(|err| {
+            // The server this failed to reach is stopped again, or a second
+            // attempt would find the world already locked by the first.
+            if let Some(handle) = self.embedded.take() {
+                handle.stop();
+            }
+            err.to_string()
+        })?;
+
+        let app = self.start_app(connection);
+        if let Some(surface) = self.window.as_mut() {
+            surface.stage = Stage::Playing(Box::new(app));
+        }
+        Ok(())
+    }
+
+    /// Writes the world list, complaining to the log if it cannot.
+    fn save_library(&self) {
+        if let Err(err) = self.library.save(&self.data.join("worlds.toml")) {
+            tracing::warn!("{err}");
+        }
+    }
+
     /// Draws one frame. Returns whether to keep going.
     fn frame(&mut self) -> bool {
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|surface| matches!(surface.stage, Stage::Front(_)))
+        {
+            return self.front_frame();
+        }
         let Some(surface) = self.window.as_mut() else {
+            return false;
+        };
+        let Stage::Playing(app) = &mut surface.stage else {
             return false;
         };
 
@@ -644,7 +1030,7 @@ impl Client {
         // somebody else's server there are other people in it, and one of them
         // opening a menu must not stop the world for everybody.
         if let Some(server) = self.embedded.as_ref() {
-            let wanted = surface.app.menu_open();
+            let wanted = app.menu_open();
             if server.paused() != wanted {
                 server.set_paused(wanted);
             }
@@ -653,11 +1039,11 @@ impl Client {
         // Quitting from the menu ends the loop, and `exiting` does the rest:
         // leave the server, then stop it. Order matters there and it is already
         // written down once.
-        if surface.app.take_quit_request() {
+        if app.take_quit_request() {
             return false;
         }
 
-        let dialog_open = !surface.app.dialogs().is_empty();
+        let dialog_open = !app.dialogs().is_empty();
         if dialog_open && !self.released_for_dialog {
             self.grabbed = !grab(&surface.window, false);
             self.released_for_dialog = true;
@@ -665,7 +1051,7 @@ impl Client {
             self.released_for_dialog = false;
             // Only if nothing else still wants it. Taking the cursor back into
             // the settings screen would be the same bug from the other side.
-            if !surface.app.menu_open() && !surface.app.chat_open() {
+            if !app.menu_open() && !app.chat_open() {
                 self.grabbed = grab(&surface.window, true);
             }
         }
@@ -715,12 +1101,12 @@ impl Client {
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 configure_surface(
                     &surface.surface,
-                    surface.app.renderer().gpu(),
+                    &surface.gpu,
                     surface.size,
                     self.config.vsync,
                 );
                 phases.acquire = elapsed_ms(phase);
-                surface.app.log_frame(&phases, false);
+                app.log_frame(&phases, false);
                 return true;
             }
 
@@ -730,7 +1116,7 @@ impl Client {
             // picture is exactly what the log exists to count.
             wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Timeout => {
                 phases.acquire = elapsed_ms(phase);
-                surface.app.log_frame(&phases, false);
+                app.log_frame(&phases, false);
                 return true;
             }
 
@@ -742,7 +1128,7 @@ impl Client {
         phases.acquire = elapsed_ms(phase);
 
         let phase = std::time::Instant::now();
-        if !surface.app.pump_network() {
+        if !app.pump_network() {
             return false;
         }
         phases.network = elapsed_ms(phase);
@@ -754,17 +1140,17 @@ impl Client {
         //
         // Not timed as its own phase: starting a sound is handing a buffer to
         // kira's thread, which is the point of kira having one.
-        surface.app.play_heard();
-        let _ = surface.app.play_footsteps();
+        app.play_heard();
+        let _ = app.play_footsteps();
         // Jumping and landing, watched from the body rather than from the key:
         // a jump pressed against a ceiling makes no noise and a fall off a
         // ledge lands without anybody pressing anything.
-        surface.app.play_movement_cues();
+        app.play_movement_cues();
         // After the HUD raised them last frame; before the next draw does.
-        surface.app.flush_dialog_events();
+        app.flush_dialog_events();
 
         let phase = std::time::Instant::now();
-        surface.app.remesh();
+        app.remesh();
         phases.remesh = elapsed_ms(phase);
 
         // `advance` reports the input itself, once per simulation tick rather
@@ -773,7 +1159,7 @@ impl Client {
         // server's input queue is keyed by tick.
         let phase = std::time::Instant::now();
         let input = self.held.as_input(self.pending_teleport.take());
-        surface.app.advance(input, dt);
+        app.advance(input, dt);
 
         // After `advance`, so the dig aims at where the player ended up this
         // frame rather than where they started. Re-sent every frame the button
@@ -781,17 +1167,17 @@ impl Client {
         // free, and it means a dig follows the crosshair rather than sticking
         // to whatever was under it when the button went down.
         if self.digging {
-            surface.app.dig();
+            app.dig();
         }
         phases.advance = elapsed_ms(phase);
 
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let camera = *surface.app.camera();
+        let camera = *app.camera();
 
         let phase = std::time::Instant::now();
-        surface.app.renderer().render(&view, &camera, surface.size);
+        app.renderer().render(&view, &camera, surface.size);
         phases.world = elapsed_ms(phase);
 
         let phase = std::time::Instant::now();
@@ -801,16 +1187,23 @@ impl Client {
         let phase = std::time::Instant::now();
         frame.present();
         phases.present = elapsed_ms(phase);
+
+        // Taken again because `draw_hud` needs the whole window and the world
+        // is one of its fields. Cheap, and the alternative is threading the
+        // interface's needs through a borrow it does not want.
+        let Stage::Playing(app) = &mut surface.stage else {
+            return false;
+        };
         // Only here, at the one place a frame becomes a picture. Now that the
         // image is acquired first, the count should track the frame rate closely
         // — a gap means frames are still being built and dropped, which is the
         // thing this was added to catch.
-        surface.app.note_presented();
-        surface.app.log_frame(&phases, true);
+        app.note_presented();
+        app.log_frame(&phases, true);
 
         // Paired with the `dt` measured at the top of the NEXT frame, which is
         // what actually measures this one.
-        surface.app.record_phases(phases);
+        app.record_phases(phases);
         true
     }
 }
@@ -1427,7 +1820,10 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
 /// Nearest filtering: a 16-pixel tile blown up to a 48-point slot should look
 /// like the blocks do, not like a smear.
 fn register_atlas(surface: &mut Surface) {
-    if !surface.app.take_atlas_change() {
+    let Stage::Playing(app) = &mut surface.stage else {
+        return;
+    };
+    if !app.take_atlas_change() {
         return;
     }
     // Freed before the replacement is registered: a session that reloads its
@@ -1435,12 +1831,41 @@ fn register_atlas(surface: &mut Surface) {
     if let Some(old) = surface.atlas_texture.take() {
         surface.egui_renderer.free_texture(&old);
     }
-    let device = surface.app.renderer().gpu().device.clone();
+    let device = surface.gpu.device.clone();
+    let Stage::Playing(app) = &mut surface.stage else {
+        return;
+    };
     surface.atlas_texture = Some(surface.egui_renderer.register_native_texture(
         &device,
-        surface.app.renderer().atlas_view(),
+        app.renderer().atlas_view(),
         wgpu::FilterMode::Nearest,
     ));
+}
+
+/// Draws the front screen, and reports what the player asked for.
+///
+/// The same egui plumbing the HUD uses, minus everything about a world: no
+/// atlas to register, no scale to apply from an `App` that does not exist, and
+/// nothing to save when it is over.
+fn draw_front(
+    surface: &mut Surface,
+    scale: f32,
+    view: &wgpu::TextureView,
+) -> client::front::Action {
+    let raw = surface.egui_state.take_egui_input(&surface.window);
+    let mut action = client::front::Action::None;
+    let output = surface.egui.run_ui(raw, |root| {
+        let context = root.ctx().clone();
+        context.set_zoom_factor(scale);
+        if let Stage::Front(front) = &mut surface.stage {
+            action = front.draw(&context);
+        }
+    });
+    surface
+        .egui_state
+        .handle_platform_output(&surface.window, output.platform_output);
+    paint_egui(surface, output.shapes, output.textures_delta, view);
+    action
 }
 
 /// Draws the HUD over the frame that has just been rendered.
@@ -1450,22 +1875,25 @@ fn register_atlas(surface: &mut Surface) {
 fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     register_atlas(surface);
     let raw = surface.egui_state.take_egui_input(&surface.window);
+    let Stage::Playing(app) = &mut surface.stage else {
+        return;
+    };
     // Empty when the overlay is off. The warnings and the joining notice below
     // are NOT part of it — those tell a player something is wrong, and a player
     // who turned off a frame-timing readout did not ask to stop being told.
-    let lines = if surface.app.debug_overlay() {
-        surface.app.hud()
+    let lines = if app.debug_overlay() {
+        app.hud()
     } else {
         Vec::new()
     };
-    let warnings: Vec<String> = surface.app.warnings().to_vec();
-    let joined = surface.app.joined();
+    let warnings: Vec<String> = app.warnings().to_vec();
+    let joined = app.joined();
 
-    let settings_open = surface.app.settings_open();
-    let menu_open = surface.app.menu_open();
-    // Cloned out because the closure below borrows `surface.app` mutably, and
+    let settings_open = app.settings_open();
+    let menu_open = app.menu_open();
+    // Cloned out because the closure below borrows `app` mutably, and
     // the interface needs to read the atlas layout while it does.
-    let tiles = surface.app.tiles().clone();
+    let tiles = app.tiles().clone();
     let atlas_texture = surface.atlas_texture;
     let size = (
         surface.window.inner_size().width as f32,
@@ -1477,12 +1905,12 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // every panel: egui works in points, and the zoom factor is what a
         // point is worth. A mod's HUD scales with it — see `draw_hud_scripts`,
         // which measures its canvas in the same points.
-        context.set_zoom_factor(surface.app.ui_scale());
+        context.set_zoom_factor(app.ui_scale());
         if menu_open {
-            draw_menu(&mut surface.app, &context);
+            draw_menu(app, &context);
         }
         if settings_open {
-            draw_settings(&mut surface.app, &context);
+            draw_settings(app, &context);
         }
         // **Server dialogs, drawn from data.** Nothing here executes anything a
         // server sent: `client::dialog` walks the tree and the rectangles
@@ -1490,8 +1918,8 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // not egui's.
         let raised = surface.dialogs.draw(
             &context,
-            surface.app.dialogs(),
-            surface.app.views(),
+            app.dialogs(),
+            app.views(),
             client::icons::Icons::new(atlas_texture, Some(&tiles)),
             size,
         );
@@ -1500,17 +1928,15 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // had already visibly moved. `engine:ui_click` is bound like any other
         // cue, so a mod set that binds nothing is silent here and that is fine.
         if !raised.is_empty() {
-            surface
-                .app
-                .play_cue("engine:ui_click", client::audio::Bus::Ui);
+            app.play_cue("engine:ui_click", client::audio::Bus::Ui);
         }
-        surface.app.raise_dialog_events(raised);
-        draw_chat(&mut surface.app, &context);
+        app.raise_dialog_events(raised);
+        draw_chat(app, &context);
         // **Last, so a script's HUD sits over the world and under a dialog.**
         // A dialog is a thing a player is interacting with; a HUD is a thing
         // they are reading past.
         draw_hud_scripts(
-            &mut surface.app,
+            app,
             &context,
             client::icons::Icons::new(atlas_texture, Some(&tiles)),
         );
@@ -1552,9 +1978,9 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     // other settings. Saved on the same "the App raises a flag, the window
     // knows the path" split as the bindings below. One flag for both: they are
     // the same file, and a second flag would be a second chance to forget one.
-    if surface.app.take_volumes_dirty() {
-        let mut config = surface.app.config().clone();
-        config.volumes = surface.app.mixer_mut().volumes().clone();
+    if app.take_volumes_dirty() {
+        let mut config = app.config().clone();
+        config.volumes = app.mixer_mut().volumes().clone();
         if let Err(err) = config.save(std::path::Path::new(CONFIG_FILE)) {
             tracing::warn!(%err, "could not save the volume settings");
         }
@@ -1565,20 +1991,31 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     // once a frame — a rebind is a click, so there is nothing to batch, and a
     // failed write is reported rather than retried because the likeliest cause
     // is a read-only directory that will not fix itself.
-    if surface.app.take_bindings_dirty()
-        && let Err(err) = surface
-            .app
-            .bindings()
-            .save(std::path::Path::new(BINDINGS_FILE))
+    if app.take_bindings_dirty()
+        && let Err(err) = app.bindings().save(std::path::Path::new(BINDINGS_FILE))
     {
         tracing::warn!(%err, "could not save the key bindings");
     }
 
-    let gpu = surface.app.renderer().gpu();
-    let pixels_per_point = surface.window.scale_factor() as f32;
-    let triangles = surface.egui.tessellate(output.shapes, pixels_per_point);
+    paint_egui(surface, output.shapes, output.textures_delta, view);
+}
 
-    for (id, delta) in &output.textures_delta.set {
+/// Uploads and draws whatever egui produced, over what is already there.
+///
+/// Shared by the front screen and the HUD: the two decide different things and
+/// then hand the result to the same three calls, and a second copy of this is a
+/// second place for a screen descriptor to go stale.
+fn paint_egui(
+    surface: &mut Surface,
+    shapes: Vec<egui::epaint::ClippedShape>,
+    textures: egui::TexturesDelta,
+    view: &wgpu::TextureView,
+) {
+    let gpu = surface.gpu.clone();
+    let pixels_per_point = surface.window.scale_factor() as f32;
+    let triangles = surface.egui.tessellate(shapes, pixels_per_point);
+
+    for (id, delta) in &textures.set {
         surface
             .egui_renderer
             .update_texture(&gpu.device, &gpu.queue, *id, delta);
@@ -1627,7 +2064,7 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
 
     gpu.queue.submit(Some(encoder.finish()));
 
-    for id in &output.textures_delta.free {
+    for id in &textures.free {
         surface.egui_renderer.free_texture(id);
     }
 }
@@ -1710,7 +2147,25 @@ fn grab(window: &Window, grab: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::hotbar_slot;
+    use super::{hotbar_slot, world_directory};
+
+    #[test]
+    fn a_world_name_never_becomes_a_path_that_leaves_the_worlds_directory() {
+        // **A player may call a world anything.** That string is a title, not a
+        // path, and a title with a `..` or a `/` in it must not be able to say
+        // where the files go.
+        assert_eq!(world_directory("My World"), "my-world");
+        assert!(!world_directory("../../etc").contains('/'));
+        assert!(!world_directory("../../etc").contains(".."));
+        assert_eq!(
+            world_directory("../.."),
+            "world",
+            "a name of nothing still opens"
+        );
+        assert_eq!(world_directory(""), "world");
+        // Ordinary names survive intact, dashes and underscores included.
+        assert_eq!(world_directory("test_world-2"), "test_world-2");
+    }
 
     #[test]
     fn a_hotbar_action_names_the_slot_it_selects() {
