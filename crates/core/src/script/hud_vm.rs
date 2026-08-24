@@ -698,7 +698,12 @@ impl HudVm {
         table.set("selected", state.selected + 1)?;
 
         let carried = self.lua.create_table()?;
+        // **An empty slot is a hole, not a missing entry.** A hotbar is a row
+        // of places, so slot four has to be readable as slot four whether or
+        // not anything is in it — a script that compacted the list would draw
+        // a player's fourth stack under their third key.
         for (index, entry) in state.carried.iter().enumerate() {
+            let Some(entry) = entry else { continue };
             let slot = self.lua.create_table()?;
             slot.set("material", entry.material.0)?;
             slot.set("name", entry.name.as_str())?;
@@ -708,8 +713,12 @@ impl HudVm {
             let (blocks, nodes) = entry.display();
             slot.set("blocks", blocks)?;
             slot.set("nodes", nodes)?;
+            slot.set("shape", (entry.shape != 0).then_some(entry.shape))?;
             carried.set(index + 1, slot)?;
         }
+        // How many places there are, which `#carried` cannot answer once there
+        // are holes in it.
+        table.set("slots", state.carried.len())?;
         table.set("carried", carried)?;
 
         if let Some(look) = &state.looking_at {
@@ -781,14 +790,14 @@ mod tests {
         State {
             position: [1.0, 2.0, 3.0],
             selected: 0,
-            carried: vec![Carried {
+            carried: vec![Some(Carried {
                 material: MaterialId(7),
                 name: "core_blocks:white".to_owned(),
                 // Charter rule 5's example, exactly: forty units is one block
                 // and thirteen spare nodes.
                 units: 40,
                 shape: 0,
-            }],
+            })],
             ..State::default()
         }
     }

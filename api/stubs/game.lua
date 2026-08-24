@@ -1199,6 +1199,21 @@ function game.register_action(spec) end
 ---@return integer
 function game.get_block_id(id) end
 
+---The block id a numeric material belongs to: the inverse of `game.get_block_id`.
+---
+---Everything that reports a material reports a NUMBER — an inventory listing, a
+---dig event, a HUD state — because numeric ids are what the world is stored
+---with. They are per-session and mean nothing across runs (charter rule 8), so
+---this is how one gets back to the canonical string a person can read and a mod
+---can compare.
+---
+---Returns nil for a material no mod registered, which is a world written by a
+---different mod set arriving with ids yours has never heard of. Listing it as
+---unknown is the right thing to do about that; erroring is not.
+---@param material integer
+---@return string? id The qualified block id, e.g. "core_blocks:stone".
+function game.block_of(material) end
+
 ---Generates a heightmap for a chunk from fractal noise.
 ---
 ---One call fills all 256 columns natively. There is no per-sample entry point,

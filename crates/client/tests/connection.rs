@@ -637,21 +637,31 @@ fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
 
     let state = tiamot_core::hud::State {
         selected: 1,
+        // **A hole in the middle**, because that is what a hotbar has: these
+        // are the player's own slots and the third one is empty. A HUD that
+        // compacted them would draw the fourth stack under the third key.
         carried: vec![
-            tiamot_core::hud::Carried {
+            Some(tiamot_core::hud::Carried {
                 material: tiamot_core::MaterialId(3),
                 name: "core_blocks:white".to_owned(),
                 units: 27,
                 shape: 0,
-            },
-            tiamot_core::hud::Carried {
+            }),
+            Some(tiamot_core::hud::Carried {
                 material: tiamot_core::MaterialId(4),
                 name: "core_blocks:black".to_owned(),
                 // Charter rule 5's example: forty units is one block and
                 // thirteen spare nodes, and the HUD must say so.
                 units: 40,
                 shape: 0,
-            },
+            }),
+            None,
+            Some(tiamot_core::hud::Carried {
+                material: tiamot_core::MaterialId(5),
+                name: "core_blocks:grey".to_owned(),
+                units: 9,
+                shape: 0,
+            }),
         ],
         ..tiamot_core::hud::State::default()
     };
@@ -677,7 +687,13 @@ fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
         })
         .expect("a frame");
 
-    assert_eq!(icons, 2, "one icon per carried stack");
+    // Four slots, one of them a hole: three icons. **The hole is the
+    // assertion** — a HUD that compacted the row would draw four in a row and
+    // put the fourth stack under the third key.
+    assert_eq!(
+        icons, 3,
+        "one icon per filled hotbar slot, and none for a hole"
+    );
     assert!(
         labels.iter().any(|label| label == "1+13"),
         "the 27-unit display should reach the hotbar, got {labels:?}"

@@ -86,8 +86,15 @@ pub struct State {
     pub time_of_day: f32,
     /// Which entry of [`State::carried`] is selected, zero-based.
     pub selected: usize,
-    /// What the player is carrying, in slot order.
-    pub carried: Vec<Carried>,
+    /// The hotbar: the player's own slots, in slot order, holes included.
+    ///
+    /// **A place, not a list.** These are the first slots of `player:main`,
+    /// which is what the number keys select between — so slot four is slot four
+    /// whether or not there is anything in it, and picking something up does
+    /// not shuffle what the other keys reach. It used to be the CONSOLIDATED
+    /// inventory, one entry per material, and a player who dug a second thing
+    /// watched their hotbar rearrange itself under their hands.
+    pub carried: Vec<Option<Carried>>,
     /// What the crosshair is on, if anything is in reach.
     pub looking_at: Option<Look>,
     /// How far along a dig is, if one is happening.

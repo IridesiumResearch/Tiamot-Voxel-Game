@@ -2063,3 +2063,71 @@ fn the_atlas_reaches_the_interface_and_is_handed_over_exactly_once() {
     app.shutdown();
     assert!(server.stop());
 }
+
+/// The hotbar is the player's own slots, in position.
+///
+/// # What this replaced
+///
+/// It used to be the CONSOLIDATED inventory — one entry per material, sorted by
+/// id — so a player who dug a second thing watched the row rearrange itself
+/// under their hands and the key that had been placing stone was suddenly
+/// placing dirt. A hotbar is a place. This asserts the row IS the first slots
+/// of `player:main`, which is the same grid the inventory screen's top row
+/// draws, so the two can never disagree about what key three reaches.
+#[test]
+fn the_hotbar_is_the_first_slots_of_the_players_own_inventory() {
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let server = embedded("hotbar-slots");
+    let mut app = client("hotbar-slots", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+    app.look_down_by(std::f32::consts::FRAC_PI_4);
+    assert!(
+        run_frames(&mut app, |app| app.looking_at().is_some()),
+        "the crosshair found nothing within reach"
+    );
+
+    // Dig, so there is anything at all to be in a slot.
+    let mut filled = false;
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline && !filled {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        app.dig();
+        filled = app
+            .views()
+            .get("player:main")
+            .is_some_and(|view| view.slots.iter().flatten().count() > 0);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    app.stop_digging();
+    assert!(filled, "nothing ever reached a slot: {:?}", app.warnings());
+
+    let slots = app
+        .views()
+        .get("player:main")
+        .expect("checked above")
+        .slots
+        .clone();
+    let hotbar = app.hotbar().to_vec();
+    assert_eq!(hotbar.len(), 9, "the number keys reach nine places");
+    for (index, slot) in hotbar.iter().enumerate() {
+        assert_eq!(
+            *slot,
+            slots.get(index).copied().flatten(),
+            "hotbar slot {index} is not the inventory's slot {index}"
+        );
+    }
+    assert!(
+        hotbar.iter().any(Option::is_some),
+        "the dug material never appeared in the hotbar"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}

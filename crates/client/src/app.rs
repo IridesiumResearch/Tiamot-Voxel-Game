@@ -135,6 +135,15 @@ const THIRD_PERSON_DISTANCE: f64 = 4.0;
 /// as long as it ran. Enough to scroll back through a conversation.
 const MAX_CHAT_LINES: usize = 200;
 
+/// How many of the player's slots the number keys reach.
+///
+/// **The engine's number, not a mod's.** Charter rule 11 puts key bindings
+/// here, and the engine registers `engine:hotbar_1` through `_9` — so nine is
+/// how many places there are to select. What a HUD DRAWS is still the mod's
+/// (`core_ui/hud.lua` has its own `SLOTS`), and one that drew five would show
+/// five of these nine.
+const HOTBAR_SLOTS: usize = 9;
+
 /// Most dialog events held while waiting to send them.
 ///
 /// A player mashing buttons on a stalled connection must not grow this without
@@ -952,6 +961,11 @@ pub struct App {
     /// Server-authoritative and never edited here: the client is told what it
     /// has. An inventory a client could change is not an inventory.
     carried: Vec<tiamot_core::proto::StackDef>,
+    /// The hotbar: the first [`HOTBAR_SLOTS`] slots of `player:main`.
+    ///
+    /// Derived from the view rather than sent separately, so what the number
+    /// keys reach and what the inventory screen's top row shows cannot drift.
+    hotbar: Vec<Option<tiamot_core::proto::StackDef>>,
     /// Every tool the server's mods registered, in ascending id order.
     ///
     /// Empty until the server says. Charter rule 1: the engine has no tools of
@@ -1088,6 +1102,7 @@ impl App {
             previous_intent: Intent::default(),
             previous_input: Input::default(),
             carried: Vec::new(),
+            hotbar: vec![None; HOTBAR_SLOTS],
             selected: 0,
             tools: Vec::new(),
             held_tool: 0,
@@ -1881,7 +1896,7 @@ impl App {
         // must spend the stairs they crafted rather than the loose rubble
         // beside them, so the cut goes with the request and the server matches
         // the pair.
-        let Some(stack) = self.carried.get(self.selected).copied() else {
+        let Some(stack) = self.hotbar.get(self.selected).copied().flatten() else {
             self.warn("nothing selected to build with".to_owned());
             return;
         };
@@ -2106,8 +2121,31 @@ impl App {
         slots: Vec<Option<tiamot_core::proto::StackDef>>,
         held: Option<tiamot_core::proto::StackDef>,
     ) {
+        let hotbar = view == tiamot_core::inventory::PLAYER_MAIN;
         self.views
             .insert(view, crate::dialog::ViewContents { slots, held });
+        if hotbar {
+            self.adopt_hotbar();
+        }
+    }
+
+    /// Rebuilds the hotbar from the player's own slots.
+    ///
+    /// **The first nine slots of `player:main`, holes and all.** The hotbar
+    /// used to be the CONSOLIDATED inventory — one entry per material, in id
+    /// order — so a player who dug a second thing watched the row rearrange
+    /// itself under their hands, and the key that had been placing stone was
+    /// suddenly placing dirt. A hotbar is a place. These are the same slots the
+    /// inventory screen's top row shows, because they are the same slots.
+    fn adopt_hotbar(&mut self) {
+        let slots = self
+            .views
+            .get(tiamot_core::inventory::PLAYER_MAIN)
+            .map(|contents| contents.slots.as_slice())
+            .unwrap_or_default();
+        self.hotbar = (0..HOTBAR_SLOTS)
+            .map(|index| slots.get(index).copied().flatten())
+            .collect();
     }
 
     /// Records a chat line, keeping the most recent [`MAX_CHAT_LINES`].
@@ -2307,7 +2345,6 @@ impl App {
     /// as "it placed the wrong thing" and nobody can reproduce.
     fn adopt_inventory(&mut self, stacks: Vec<tiamot_core::proto::StackDef>) {
         self.carried = stacks;
-        self.selected = self.selected.min(self.carried.len().saturating_sub(1));
     }
 
     /// Folds the cue table the server sent.
@@ -2969,21 +3006,24 @@ impl App {
         self.tools.get(self.held_tool)
     }
 
-    /// The material the hotbar is on, if the player is carrying anything.
+    /// The material the hotbar is on, if that slot has anything in it.
     #[must_use]
     pub fn selected_material(&self) -> Option<u16> {
-        self.carried.get(self.selected).map(|stack| stack.material)
+        self.hotbar
+            .get(self.selected)
+            .copied()
+            .flatten()
+            .map(|stack| stack.material)
     }
 
     /// Moves the hotbar selection, wrapping.
     ///
-    /// Wrapping rather than clamping because the input is a mouse wheel, and a
-    /// wheel that stops at the end feels broken.
+    /// **Over the slots, not over what is in them.** Wrapping because the input
+    /// is a mouse wheel and a wheel that stops at the end feels broken; over
+    /// the fixed nine because scrolling past an empty slot and having the
+    /// selection skip it would make the row's positions unlearnable.
     pub fn select_next(&mut self, forward: bool) {
-        if self.carried.is_empty() {
-            return;
-        }
-        let count = self.carried.len();
+        let count = self.hotbar.len().max(1);
         self.selected = if forward {
             (self.selected + 1) % count
         } else {
@@ -2993,9 +3033,15 @@ impl App {
 
     /// Selects a slot directly, as the number keys do.
     pub fn select_slot(&mut self, slot: usize) {
-        if slot < self.carried.len() {
+        if slot < self.hotbar.len() {
             self.selected = slot;
         }
+    }
+
+    /// The hotbar's slots, holes included.
+    #[must_use]
+    pub fn hotbar(&self) -> &[Option<tiamot_core::proto::StackDef>] {
+        &self.hotbar
     }
 
     /// What the player is carrying, as `(material, units)` in id order.
@@ -4076,20 +4122,22 @@ impl App {
         let predictor = self.predictor.as_ref()?;
         let (x, y, z) = self.camera.position.to_world();
         let carried = self
-            .carried
+            .hotbar
             .iter()
-            .map(|stack| tiamot_core::hud::Carried {
-                material: tiamot_core::MaterialId(stack.material),
-                // The string id, because that is what is canonical (charter
-                // rule 8) and the number is per-session. A script showing a
-                // name shows this one.
-                name: self
-                    .materials
-                    .get(&stack.material)
-                    .cloned()
-                    .unwrap_or_else(|| format!("#{}", stack.material)),
-                units: stack.units,
-                shape: stack.shape,
+            .map(|slot| {
+                slot.map(|stack| tiamot_core::hud::Carried {
+                    material: tiamot_core::MaterialId(stack.material),
+                    // The string id, because that is what is canonical (charter
+                    // rule 8) and the number is per-session. A script showing a
+                    // name shows this one.
+                    name: self
+                        .materials
+                        .get(&stack.material)
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{}", stack.material)),
+                    units: stack.units,
+                    shape: stack.shape,
+                })
             })
             .collect();
         let voxels = phys::Voxels::new(&self.store, predictor.origin());

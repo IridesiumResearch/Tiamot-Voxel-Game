@@ -218,9 +218,15 @@ fn what_a_player_digs_shows_up_in_the_slots_core_uis_screen_draws() {
             grids.contains(&("player:main", 0, 27)),
             "the main grid should start at the first slot a player owns, got {grids:?}"
         );
-        assert!(
-            grids.iter().any(|(view, _, _)| *view == "player:hotbar"),
-            "and the hotbar is its OWN view, not the tail of the main one: {grids:?}"
+        // **One grid, because there is one inventory.** The hotbar used to be
+        // `player:hotbar`, a second view of nine slots beside the twenty-seven,
+        // and a player had to shuffle stacks between two grids to put anything
+        // where a number key could reach it. It is now a BAND: the first nine
+        // slots of this grid, which is what its label says.
+        assert_eq!(
+            grids.len(),
+            1,
+            "a second grid is a second place a player has to move things to: {grids:?}"
         );
     });
     assert!(server.stop());

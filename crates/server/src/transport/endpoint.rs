@@ -514,7 +514,7 @@ pub const CHUNKS_PER_TICK: usize = 16;
 pub const CHUNKS_IN_FLIGHT_PER_CLIENT: usize = 4;
 
 /// Most chunk requests that may be queued before new ones are refused.
-use tiamot_core::inventory::{PLAYER_HOTBAR, PLAYER_MAIN};
+use tiamot_core::inventory::{PLAYER_HOTBAR_SLOTS, PLAYER_MAIN};
 
 pub const MAX_QUEUED_CHUNK_REQUESTS: usize = 512;
 
@@ -1278,14 +1278,12 @@ impl Shared {
             tiamot_core::proto::Click::Left => slots.left_click(view, index),
             tiamot_core::proto::Click::Right => slots.right_click(view, index),
             tiamot_core::proto::Click::ShiftLeft => {
-                // Only between a player's own views for now. A mod's container
-                // becomes a destination when views can be mod-owned.
-                let other = if view == PLAYER_MAIN {
-                    PLAYER_HOTBAR
-                } else {
-                    PLAYER_MAIN
-                };
-                slots.shift_click(view, index, other)
+                // **Within the player's own view**, between the hotbar band and
+                // the rest of it — which is what the gesture means now that the
+                // hotbar is the first nine slots of one inventory rather than a
+                // second view to shuffle things into. A mod's container becomes
+                // a destination when views can be mod-owned.
+                slots.stow(view, index, PLAYER_HOTBAR_SLOTS)
             }
         };
         if changed && let Ok(mut dirty) = self.inventory_dirty.lock() {

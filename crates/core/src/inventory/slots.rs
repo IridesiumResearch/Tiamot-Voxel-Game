@@ -96,8 +96,15 @@ pub struct Slots {
 /// Namespaced `player:` because charter rule 8 applies to these as much as to a
 /// mod's, and because a mod naming its container `main` must not collide.
 pub const PLAYER_MAIN: &str = "player:main";
-/// The nine slots a player selects between with the number keys.
-pub const PLAYER_HOTBAR: &str = "player:hotbar";
+/// How many of `player:main`'s slots the number keys reach.
+///
+/// **The hotbar is a place in the player's own inventory, not a second view.**
+/// It used to be `player:hotbar`, nine slots beside the twenty-seven — so a
+/// player had to shuffle things between two grids to put them where a key
+/// could reach them, and the HUD, which drew what was CARRIED rather than what
+/// was in those slots, agreed with neither. One view, and the first nine slots
+/// of it are the ones the keys select between.
+pub const PLAYER_HOTBAR_SLOTS: usize = 9;
 
 /// How many slots `player:main` starts with.
 ///
@@ -115,17 +122,14 @@ pub const PLAYER_MAIN_SLOTS: usize = 27;
 impl Slots {
     /// The views every player has.
     ///
+    /// **One**, and its first [`PLAYER_HOTBAR_SLOTS`] are the hotbar.
+    ///
     /// `player:main` starts at [`PLAYER_MAIN_SLOTS`] and GROWS beyond it as
-    /// material arrives — see [`Slots::insert`]. The hotbar is nine, because
-    /// that is what the engine's `engine:hotbar_1`..`_9` actions select
-    /// between.
+    /// material arrives — see [`Slots::insert`].
     #[must_use]
     pub fn for_player() -> Self {
         Self {
-            views: vec![
-                View::empty(PLAYER_MAIN, PLAYER_MAIN_SLOTS),
-                View::empty(PLAYER_HOTBAR, 9),
-            ],
+            views: vec![View::empty(PLAYER_MAIN, PLAYER_MAIN_SLOTS)],
             grab: Grab::default(),
         }
     }
@@ -258,6 +262,67 @@ impl Slots {
         // Whatever would not fit goes back where it came from, rather than
         // being quietly eaten.
         self.views[from].slots[index] = (!moving.is_empty()).then_some(moving);
+        true
+    }
+
+    /// Shift-clicks within one view: between the hotbar band and the rest.
+    ///
+    /// **The gesture still means something with one view.** It used to move a
+    /// stack from `player:main` to `player:hotbar` and back, which is what two
+    /// views made it mean; with the hotbar a BAND of the player's own slots,
+    /// the same gesture sends a stack out of the band or into it. That is what
+    /// a player is asking for either way — "put this where the number keys can
+    /// reach it", or "get it out of my way".
+    ///
+    /// `band` is how many slots at the front are the hotbar. Anything that will
+    /// not fit stays where it was, which is what makes the gesture safe rather
+    /// than lossy.
+    pub fn stow(&mut self, view: &str, index: usize, band: usize) -> bool {
+        let Some(at) = self.locate(view, index) else {
+            return false;
+        };
+        let Some(mut moving) = self.views[at].slots[index].take() else {
+            return false;
+        };
+        let slots = self.views[at].slots.len();
+        let target: Vec<usize> = if index < band {
+            (band..slots).collect()
+        } else {
+            (0..band.min(slots)).collect()
+        };
+
+        // Matching stacks first, so stowing twenty units onto a slot that
+        // already holds some tops it up instead of taking a new slot.
+        for slot in target.iter().copied() {
+            let Some(stack) = &mut self.views[at].slots[slot] else {
+                continue;
+            };
+            if stack.material != moving.material || stack.shape != moving.shape {
+                continue;
+            }
+            let giving = moving.units.min(u32::MAX - stack.units);
+            if giving > 0
+                && let Ok(part) = moving.split(giving)
+                && stack.merge(part).is_err()
+            {
+                let _ = moving.merge(part);
+            }
+            if moving.is_empty() {
+                break;
+            }
+        }
+        if !moving.is_empty()
+            && let Some(empty) = target
+                .iter()
+                .copied()
+                .find(|slot| self.views[at].slots[*slot].is_none())
+        {
+            self.views[at].slots[empty] = Some(moving);
+            moving.units = 0;
+        }
+
+        // Whatever would not fit goes back where it came from.
+        self.views[at].slots[index] = (!moving.is_empty()).then_some(moving);
         true
     }
 
@@ -426,6 +491,48 @@ fn place_one(mut held: Stack, there: Option<Stack>) -> (Option<Stack>, Option<St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shift_clicking_moves_a_stack_between_the_hotbar_band_and_the_rest() {
+        // The gesture, with one view: out of the band, and back into it. What
+        // a player means either way is "put this where the keys can reach it"
+        // or "get it out of my way", and both are the same click.
+        let mut inv = Slots::for_player();
+        assert!(inv.insert(PLAYER_MAIN, Stack::new(STONE, 50).expect("stack")));
+
+        assert!(inv.stow(PLAYER_MAIN, 0, PLAYER_HOTBAR_SLOTS));
+        assert!(
+            at(&inv, PLAYER_MAIN, 0).is_none(),
+            "the stack did not leave the hotbar"
+        );
+        let landed = (PLAYER_HOTBAR_SLOTS..PLAYER_MAIN_SLOTS)
+            .find(|slot| at(&inv, PLAYER_MAIN, *slot).is_some())
+            .expect("it went somewhere outside the band");
+        assert_eq!(inv.total_units(), 50, "stowing changed how much there was");
+
+        assert!(inv.stow(PLAYER_MAIN, landed, PLAYER_HOTBAR_SLOTS));
+        assert!(
+            at(&inv, PLAYER_MAIN, 0).is_some(),
+            "it did not come back into the band"
+        );
+        assert_eq!(inv.total_units(), 50);
+    }
+
+    #[test]
+    fn stowing_tops_up_a_matching_stack_before_taking_a_new_slot() {
+        let mut inv = Slots::for_player();
+        // Slot 0 is in the band; slot 9 is the first outside it.
+        inv.views[0].slots[0] = Some(Stack::new(STONE, 20).expect("stack"));
+        inv.views[0].slots[9] = Some(Stack::new(STONE, 5).expect("stack"));
+
+        assert!(inv.stow(PLAYER_MAIN, 0, PLAYER_HOTBAR_SLOTS));
+        assert_eq!(
+            at(&inv, PLAYER_MAIN, 9).expect("topped up").units,
+            25,
+            "the matching stack outside the band should have taken it"
+        );
+        assert_eq!(inv.total_units(), 25);
+    }
+
     #[test]
     fn a_cut_and_loose_material_of_one_stone_swap_rather_than_stall() {
         use super::super::Shape;
@@ -698,9 +805,11 @@ mod tests {
             inv.view(PLAYER_MAIN).map(|view| view.slots.len()),
             Some(PLAYER_MAIN_SLOTS)
         );
+        // One view, not two: the hotbar is a band inside this one.
         assert_eq!(
-            inv.view(PLAYER_HOTBAR).map(|view| view.slots.len()),
-            Some(9)
+            inv.views.len(),
+            1,
+            "a second view is one a player has to shuffle things into"
         );
         assert_eq!(inv.total_units(), 0, "room is not contents");
     }

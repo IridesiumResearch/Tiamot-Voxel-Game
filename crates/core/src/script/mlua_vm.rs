@@ -2936,9 +2936,11 @@ impl MluaVm {
         Ok(())
     }
 
-    /// Everything callable after freeze: lookups, bulk noise, streams, constants.
-    fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
-        // -- frozen-phase API ---------------------------------------------
+    /// `game.get_block_id` and `game.block_of`: a material's two names.
+    ///
+    /// Charter rule 8 in one place — the string id is canonical and the numeric
+    /// one is per-session, so every mod needs to get from either to the other.
+    fn install_material_lookups(&self, game: &Table) -> Result<(), ScriptError> {
         let get_block_id = self
             .lua
             .create_function(|lua, id: String| {
@@ -2950,6 +2952,39 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         game.set("get_block_id", get_block_id)
             .map_err(|err| self.vm_error(&err))?;
+
+        // The other direction, which every listing needs: an inventory, a dig
+        // event and a HUD state all name a material by NUMBER, and a mod that
+        // wants to say what the player is holding has nothing to say it with.
+        // Charter rule 8 makes the string canonical, so this is how a numeric
+        // id gets back to something a person can read.
+        let block_of = self
+            .lua
+            .create_function(|lua, material: u16| {
+                let registry: Table = lua.named_registry_value("tiamot.blocks")?;
+                for pair in registry.pairs::<String, u16>() {
+                    let (id, numeric) = pair?;
+                    if numeric == material {
+                        return Ok(Some(id));
+                    }
+                }
+                // **`nil` rather than an error.** A material a mod has never
+                // heard of is the `engine:unknown` placeholder of charter rule
+                // 8 arriving from a world written by a different mod set, and
+                // listing it as unknown is what a mod should do about it.
+                Ok(None)
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("block_of", block_of)
+            .map_err(|err| self.vm_error(&err))?;
+
+        Ok(())
+    }
+
+    /// Everything callable after freeze: lookups, bulk noise, streams, constants.
+    fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        // -- frozen-phase API ---------------------------------------------
+        self.install_material_lookups(game)?;
 
         let set_block = self.block_writer()?;
         game.set("set_block", set_block)

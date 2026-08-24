@@ -48,7 +48,17 @@ local function hotbar(state)
 
     -- Above the target line rather than beside it: two hints on one row read
     -- as one sentence that does not parse.
-    if #state.carried == 0 then
+    --
+    -- Counted rather than `#state.carried`: the hotbar is the player's own
+    -- slots and an empty one is a HOLE, which is exactly the shape `#` cannot
+    -- measure.
+    local anything = false
+    for index = 1, SLOTS do
+        if state.carried[index] then
+            anything = true
+        end
+    end
+    if not anything then
         hud.text{
             anchor = "bottom", x = -110, y = SLOT + 64,
             text = "carrying nothing — dig something", size = 20, colour = DIM,

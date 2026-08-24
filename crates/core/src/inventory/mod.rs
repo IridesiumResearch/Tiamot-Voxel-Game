@@ -16,7 +16,7 @@
 
 pub mod slots;
 
-pub use slots::{Grab, PLAYER_HOTBAR, PLAYER_MAIN, PLAYER_MAIN_SLOTS, Slots, View};
+pub use slots::{Grab, PLAYER_HOTBAR_SLOTS, PLAYER_MAIN, PLAYER_MAIN_SLOTS, Slots, View};
 
 use crate::UNITS_PER_BLOCK;
 use crate::block::{BlockView, SUBNODES_PER_BLOCK};
