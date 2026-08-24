@@ -3071,6 +3071,26 @@ impl App {
         self.connection.shutdown();
     }
 
+    /// Leaves the server and hands back what the window lent this world.
+    ///
+    /// **Because leaving a world is not leaving the game.** Quit used to end
+    /// the process, which was the only thing it could mean before there was a
+    /// front screen to go back to. The renderer owns the device, the pipelines
+    /// and the shadow cascades and takes long enough to build that rebuilding
+    /// it per world would be a visible stall — so it goes back to the window,
+    /// along with the bindings, which are the player's and not this world's.
+    #[must_use]
+    pub fn leave(self) -> (Renderer, crate::input::Bindings) {
+        let Self {
+            connection,
+            renderer,
+            bindings,
+            ..
+        } = self;
+        connection.shutdown();
+        (renderer, bindings)
+    }
+
     /// Which fluid the camera is inside, if any.
     ///
     /// The EYE rather than the body: a swimmer floating with their head out is

@@ -163,6 +163,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         identity_path: data.join("identity.key"),
         data,
         parked: None,
+        present_mode: "",
         connection,
         embedded,
         window: None,
@@ -367,6 +368,8 @@ struct Client {
     identity_path: std::path::PathBuf,
     /// The renderer, from window creation until a world takes it.
     parked: Option<Parked>,
+    /// The present mode the surface actually got, for the next world's HUD.
+    present_mode: &'static str,
     /// Taken when the window is created.
     connection: Option<Connection>,
     /// Kept alive for as long as the client runs. Dropping it stops the world.
@@ -769,6 +772,7 @@ impl Client {
         // It owns the depth buffer, the pipelines and the shadow cascades, and
         // building it takes long enough that doing it on the Play button would
         // be a visible stall between pressing it and anything happening.
+        self.present_mode = present_mode;
         self.parked = Some(Parked {
             renderer,
             present_mode,
@@ -841,6 +845,50 @@ impl Client {
             }
         }
         app
+    }
+
+    /// Leaves the running world and goes back to the front screen.
+    ///
+    /// Returns whether to keep going, which is always yes — the window stays,
+    /// and only the world ends.
+    fn leave_world(&mut self) -> bool {
+        let Some(surface) = self.window.as_mut() else {
+            return false;
+        };
+        // Replaced rather than taken, because a `Surface` without a stage is
+        // not a thing this can hold even for a statement.
+        let stage = std::mem::replace(
+            &mut surface.stage,
+            Stage::Front(Box::new(client::front::Front::new(
+                self.library.clone(),
+                self.catalogue.clone(),
+            ))),
+        );
+        if let Stage::Playing(app) = stage {
+            // Order matters: leave the server before stopping it, or the last
+            // thing in the log is a connection dropping rather than a clean
+            // goodbye.
+            let (renderer, bindings) = app.leave();
+            self.parked = Some(Parked {
+                renderer,
+                present_mode: self.present_mode,
+            });
+            self.bindings = Some(bindings);
+        }
+        if let Some(handle) = self.embedded.take() {
+            handle.stop();
+        }
+        // The cursor comes back, or the menu cannot be clicked.
+        self.grabbed = !grab(&surface.window, false);
+        self.released_for_dialog = false;
+        self.digging = false;
+        self.held = Held::default();
+        // The atlas belonged to the world that just ended; the next one
+        // registers its own.
+        if let Some(texture) = surface.atlas_texture.take() {
+            surface.egui_renderer.free_texture(&texture);
+        }
+        true
     }
 
     /// Draws one frame of the front screen. Returns whether to keep going.
@@ -1036,11 +1084,11 @@ impl Client {
             }
         }
 
-        // Quitting from the menu ends the loop, and `exiting` does the rest:
-        // leave the server, then stop it. Order matters there and it is already
-        // written down once.
+        // **Quitting a world is not quitting the game.** It was, because
+        // there was nowhere else to go; now it goes back to the front screen,
+        // where the player can open another world or press Quit again.
         if app.take_quit_request() {
-            return false;
+            return self.leave_world();
         }
 
         let dialog_open = !app.dialogs().is_empty();
@@ -1583,7 +1631,11 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
                 if ui.button("Settings").clicked() {
                     controls = true;
                 }
-                if ui.button("Quit").clicked() {
+                // **"Leave", not "Quit".** It goes back to the front screen,
+                // where the game is still running and another world is one
+                // click away — calling that quitting would make a player who
+                // wanted to switch worlds close the game instead.
+                if ui.button("Leave world").clicked() {
                     quit = true;
                 }
                 ui.add_space(10.0);
