@@ -226,6 +226,22 @@ pub struct Comparison {
 /// Fails a run whose p99 is more than this multiple of the baseline's.
 pub const REGRESSION_FACTOR: u64 = 2;
 
+/// How far a run's tick count may drift from the baseline's before the two are
+/// different benchmarks.
+///
+/// **This is the guard that was missing, and it cost six red nights across two
+/// incidents.** The workload check below compares bots and rounds, which is
+/// what a person changes on purpose — but what actually moved, twice, was how
+/// long a ROUND takes. `04652ca` made chiselling cheaper and a 622-tick session
+/// became 379; `09becc7` made a block come apart sub-node by sub-node and a
+/// 626-tick session became 8,700. Both times the parameters matched, both times
+/// p99 was suddenly measuring a different part of a different distribution, and
+/// both times it was read as a regression for several nights running.
+///
+/// A quarter either way is loose enough for ordinary variation in how far four
+/// bots get, and far tighter than any change that has ever moved this.
+pub const TICK_DRIFT: f64 = 0.25;
+
 /// A p99 at or below this is never a regression, whatever the ratio says.
 ///
 /// 5% of the 50 ms tick — charter rule 18's unit, deliberately, because the
@@ -277,6 +293,27 @@ pub fn compare(baseline: &TickReport, run: &TickReport) -> Comparison {
                 baseline.rounds
             ),
         };
+    }
+
+    // **And the session must be the same LENGTH**, which the parameters do not
+    // guarantee: a change to how long a dig takes alters how many ticks the
+    // same script occupies without touching bots or rounds. See `TICK_DRIFT`
+    // for the two incidents this is here to name on sight.
+    if baseline.ticks != 0 {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "tick counts are thousands, exact in f64"
+        )]
+        let drift = (run.ticks as f64 - baseline.ticks as f64).abs() / baseline.ticks as f64;
+        if drift > TICK_DRIFT {
+            return Comparison {
+                within_tolerance: false,
+                message: format!(
+                    "workload moved: the baseline ran {} ticks and this run ran {}. The                      parameters match, so something changed how long the script TAKES — a p99                      from these two is measuring different parts of different distributions,                      not the server. Find what changed the session length, then record a new                      baseline.",
+                    baseline.ticks, run.ticks
+                ),
+            };
+        }
     }
 
     // A baseline of 0 would make any run infinitely worse. Treat it as
@@ -514,6 +551,48 @@ mod tests {
             max_us: p99 * 2,
             over_budget: 0,
             dropped: 0,
+        }
+    }
+
+    #[test]
+    fn a_session_that_got_longer_is_named_as_such_and_not_as_a_regression() {
+        // **The failure this exists to stop.** Twice a change to how long an
+        // action takes altered the session length at identical parameters, and
+        // twice the gate reported a p99 regression that nobody could find,
+        // because p99 was measuring a different part of a different
+        // distribution. The parameters match here; only the tick count moved.
+        let mut baseline = report(500);
+        baseline.ticks = 626;
+        let mut run = report(3338);
+        run.ticks = 8854;
+
+        let verdict = compare(&baseline, &run);
+        assert!(!verdict.within_tolerance);
+        assert!(
+            verdict.message.contains("workload moved"),
+            "a moved workload must be named, not reported as a regression: {}",
+            verdict.message
+        );
+        assert!(
+            verdict.message.contains("626") && verdict.message.contains("8854"),
+            "the message must carry both tick counts, or it says nothing actionable: {}",
+            verdict.message
+        );
+    }
+
+    #[test]
+    fn ordinary_variation_in_session_length_is_not_a_moved_workload() {
+        // Four bots do not get exactly as far every run. A guard that fired on
+        // that would be a guard everybody turns off.
+        let mut baseline = report(500);
+        baseline.ticks = 8700;
+        for ticks in [8700, 7000, 10_000] {
+            let mut run = report(600);
+            run.ticks = ticks;
+            assert!(
+                compare(&baseline, &run).within_tolerance,
+                "{ticks} ticks against 8700 should be the same benchmark"
+            );
         }
     }
 
