@@ -3780,6 +3780,11 @@ impl App {
         let at = self.camera.position.offset_to(feet);
         self.renderer.set_body(Some(at));
         self.renderer.set_body_visible(self.third_person);
+
+        // After the camera has settled, because every offset is relative to it.
+        self.place_entities();
+        // And after the entities, because the player's figure goes on the end
+        // of theirs — see `Renderer::set_player`.
         self.renderer
             .set_player(Some(crate::render::skinned::Figure {
                 offset: at,
@@ -3790,9 +3795,6 @@ impl App {
                 anim: self.gait(),
                 phase: self.since_start.elapsed().as_secs_f32(),
             }));
-
-        // After the camera has settled, because every offset is relative to it.
-        self.place_entities();
         self.place_blobs();
         self.place_hands();
     }

@@ -624,7 +624,9 @@ pub struct Renderer {
     /// prediction rate rather than at the entity stream's twenty hertz and that
     /// local path never learned the rig. The box was always marked as debug —
     /// "should not grow into one; when Task 12 brings real entities this goes".
-    player: Option<skinned::Figure>,
+    player: bool,
+    /// How many of `entities_at` are entities, as opposed to the player.
+    entity_figures: usize,
     /// Whether the world pass draws the body, as opposed to only the cascades.
     ///
     /// **Position and visibility are separate on purpose.** In first person the
@@ -684,14 +686,8 @@ impl Renderer {
 
         let (blob_pipeline, blob_pipeline_hdr, blobs) = build_blobs(&gpu, &bind_layout);
 
-        let selection_shader = gpu
-            .device
-            .create_shader_module(wgpu::include_wgsl!("selection.wgsl"));
-        let selection_pipeline =
-            build_selection_pipeline(&gpu, &selection_shader, &bind_layout, COLOUR_FORMAT);
-
-        let selection_buffer = line_buffer(&gpu, "selection", SELECTION_CAPACITY);
-        let border_buffer = line_buffer(&gpu, "chunk-borders", CHUNK_BORDER_CAPACITY);
+        let (selection_shader, selection_pipeline, selection_buffer, border_buffer) =
+            build_lines(&gpu, &bind_layout);
 
         let globals = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
@@ -732,14 +728,14 @@ impl Renderer {
 
         // The engine's own rig, built in Rust and uploaded once. A mod-supplied
         // model goes through the same constructor — see `core::model`.
+        let hands = viewmodel::Viewmodel::new(&gpu, &view, &sampler, COLOUR_FORMAT);
         let skinned = skinned::Skinned::new(&gpu, tiamot_core::model::humanoid());
         let skinned_pipeline =
             skinned::colour_pipeline(&gpu, &skinned, &bind_layout, mode, COLOUR_FORMAT);
 
         Ok(Self {
-            hands: viewmodel::Viewmodel::new(&gpu, &view, &sampler, COLOUR_FORMAT),
+            hands,
             gpu,
-            hands_at: Vec::new(),
             skinned,
             skinned_pipeline,
             skinned_shadow: None,
@@ -797,8 +793,11 @@ impl Renderer {
             drawn: 0,
             cast: 0,
             entities_at: Vec::new(),
+            hands_at: Vec::new(),
+            // First person, no player figure, nothing behind it.
             body_at: None,
-            player: None,
+            player: false,
+            entity_figures: 0,
             body_visible: false,
         })
     }
@@ -870,20 +869,21 @@ impl Renderer {
     /// **Placed last of all the figures**, which is what lets the world pass
     /// leave it out in first person while the cascades keep it — see
     /// [`skinned::Skinned::draw_first`].
+    ///
+    /// **Must be called after [`Renderer::set_entities`]** for the frame, which
+    /// is why it appends rather than being stored beside them: keeping it in
+    /// its own field meant cloning the whole entity list once a frame purely to
+    /// put one figure on the end, in the frame path, for every frame the client
+    /// has ever drawn.
     pub fn set_player(&mut self, figure: Option<skinned::Figure>) {
-        self.player = figure;
-    }
-
-    /// Where every figure this frame is, the player's own last.
-    fn figures(&self) -> Vec<skinned::Figure> {
-        let mut all = self.entities_at.clone();
-        all.extend(self.player);
-        all
+        self.entities_at.truncate(self.entity_figures);
+        self.entities_at.extend(figure);
+        self.player = figure.is_some();
     }
 
     /// How many figures the world pass draws, as opposed to the cascades.
     const fn visible_figures(&self, total: usize) -> usize {
-        if self.player.is_some() && !self.body_visible {
+        if self.player && !self.body_visible {
             total.saturating_sub(1)
         } else {
             total
@@ -891,7 +891,11 @@ impl Renderer {
     }
 
     /// Where every entity in view is this frame, camera-relative, in blocks.
+    ///
+    /// Call before [`Renderer::set_player`], which appends to this.
     pub fn set_entities(&mut self, figures: Vec<skinned::Figure>) {
+        self.entity_figures = figures.len();
+        self.player = false;
         self.entities_at = figures;
     }
 
@@ -1778,8 +1782,9 @@ impl Renderer {
         // instances and the same palette, which is what makes a figure appear
         // in the same place in the world and in its own shadow — posing per
         // pass would let the two disagree by a frame.
-        let figures = self.figures();
+        let figures = std::mem::take(&mut self.entities_at);
         self.skinned.prepare(&self.gpu, &figures);
+        self.entities_at = figures;
 
         let mut encoder = self
             .gpu
@@ -2121,6 +2126,33 @@ fn build_blob_pipeline(
             multiview_mask: None,
             cache: None,
         })
+}
+
+/// The line overlay: one pipeline, and the two buffers that feed it.
+///
+/// The selection cage and the chunk cage are the same shader with different
+/// vertices, so they are built together — and `Renderer::new` is at clippy's
+/// line ceiling, which is what makes this a function rather than eight lines
+/// inline.
+fn build_lines(
+    gpu: &Gpu,
+    bind_layout: &wgpu::BindGroupLayout,
+) -> (
+    wgpu::ShaderModule,
+    wgpu::RenderPipeline,
+    wgpu::Buffer,
+    wgpu::Buffer,
+) {
+    let shader = gpu
+        .device
+        .create_shader_module(wgpu::include_wgsl!("selection.wgsl"));
+    let pipeline = build_selection_pipeline(gpu, &shader, bind_layout, COLOUR_FORMAT);
+    (
+        shader,
+        pipeline,
+        line_buffer(gpu, "selection", SELECTION_CAPACITY),
+        line_buffer(gpu, "chunk-borders", CHUNK_BORDER_CAPACITY),
+    )
 }
 
 /// The one bind group every pipeline here shares: globals, atlas, sampler.
