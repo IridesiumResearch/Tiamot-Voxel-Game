@@ -457,6 +457,64 @@ function game.get_tool(player) end
 ---@return boolean took
 function game.set_tool(player, tool) end
 
+---What a player is carrying in one of their views.
+---
+---Consolidated: one entry per material AND cut, so ten stairs in three slots
+---are one entry of thirty items. The default view is `"player:main"`, the
+---player's own bag; `"player:hotbar"` is the other one every player has.
+---
+---Each entry is `{ material = <numeric id>, units = , blocks = , nodes = ,
+---count = , shape = }`. `units` is charter rule 5's own quantity, `blocks` and
+---`nodes` are that split for display, `count` is how many ITEMS — whole blocks
+---of loose material, or items of the cut. `shape` is the 27-bit occupancy mask
+---of a cut and is nil for loose material, so `if entry.shape then` is the test
+---for "is this a shaped stack".
+---
+---Answers an empty list during worldgen, when nobody is carrying anything yet.
+---@param player string A player UUID in hex, as a hook event reports one.
+---@param view string? Which view. Defaults to "player:main".
+---@return table[] stacks
+function game.inventory(player, view) end
+
+---Puts material into a player's inventory.
+---
+---**This and `game.take` are what make crafting expressible.** The engine holds
+---no recipes: turning twenty-seven units of stone into three stairs is a mod
+---taking the stone and giving back the stairs, and the engine's only job is to
+---make both halves possible and to conserve units across them (charter rule 5).
+---
+---The spec is `{ material = , units = | count = , shape = , view = }`.
+---`material` is a block id like `"core:stone"` or a numeric material id.
+---Quantity is either `units` — raw units — or `count`, which is items and is
+---multiplied by what one costs: 27 units for loose material, or the number of
+---cells in `shape` for a cut. `shape` is a 27-bit occupancy mask over the
+---block's sub-nodes, indexed `x + 3*y + 9*z`; leave it out for loose material.
+---
+---Two stacks stack only if they are the same material AND the same shape, so
+---giving somebody a cut never merges it into the rubble they were carrying.
+---
+---Returns false for a player who is not connected, or for a quantity of zero.
+---An inventory never refuses for lack of room — it grows.
+---@param player string A player UUID in hex.
+---@param spec table
+---@return boolean gave
+function game.give(player, spec) end
+
+---Takes material out of a player's inventory.
+---
+---The same spec as `game.give`, and the same defaults. **Returns how many
+---UNITS it actually got**, which may be fewer than asked for — a mod that
+---cannot complete a recipe can give back exactly what it took rather than
+---having to ask twice how much that was.
+---
+---The cut is part of what is being spent: taking loose stone will not empty the
+---stairs the player crafted out of it, and taking stairs will not drain their
+---rubble.
+---@param player string A player UUID in hex.
+---@param spec table
+---@return integer units How many units were removed.
+function game.take(player, spec) end
+
 ---Called when a player says something in chat.
 ---
 ---**A veto.** Returning `false` stops the line reaching anybody, and returning

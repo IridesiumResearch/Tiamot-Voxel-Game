@@ -910,6 +910,14 @@ pub trait ScriptVm: Sized {
     /// anything yet.
     fn set_tools_access(&mut self, access: std::sync::Arc<dyn crate::dig::Tools>);
 
+    /// Points `game.inventory`, `game.give` and `game.take` at the players.
+    ///
+    /// The same seam as [`Self::set_tools_access`], for the same reason: the
+    /// frozen API is installed before there is anybody carrying anything, and
+    /// crafting is a mod's job (charter rule 1) so a mod has to be able to
+    /// spend material and hand something back.
+    fn set_inventory_access(&mut self, access: std::sync::Arc<dyn crate::inventory::Access>);
+
     /// Points `game.play_sound` at the connected players.
     ///
     /// Called once, after the server exists. Until then a request is dropped —

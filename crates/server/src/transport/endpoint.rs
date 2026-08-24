@@ -1129,6 +1129,84 @@ impl Shared {
         }
     }
 
+    /// What a player is carrying in one named view.
+    ///
+    /// Consolidated, so a mod asking "how much stone" gets one number rather
+    /// than a slot layout it did not ask about.
+    #[must_use]
+    pub fn contents_of(&self, uuid: &PlayerUuid, view: &str) -> Vec<tiamot_core::inventory::Stack> {
+        self.inventories
+            .lock()
+            .map(|inventories| {
+                inventories
+                    .get(uuid)
+                    .map(|slots| slots.consolidated(view))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Puts a stack into one of a player's views, for a mod.
+    ///
+    /// **Refuses a player who is not connected**, rather than creating slots
+    /// for them: an inventory made here would belong to nobody and would be
+    /// gone the moment they joined properly.
+    pub fn give(
+        &self,
+        uuid: &PlayerUuid,
+        view: &str,
+        stack: tiamot_core::inventory::Stack,
+    ) -> bool {
+        // **Connected is the test, not "has dug something".** An inventory
+        // record is created the first time a player is credited, so somebody
+        // who has just joined has none — and a mod handing them a starting kit
+        // in `on_player_join` would have been refused for it.
+        let connected = self
+            .bodies
+            .lock()
+            .is_ok_and(|bodies| bodies.contains_key(uuid));
+        if !connected {
+            return false;
+        }
+        let took = self.inventories.lock().is_ok_and(|mut inventories| {
+            inventories
+                .entry(*uuid)
+                .or_insert_with(tiamot_core::inventory::Slots::for_player)
+                .insert(view, stack)
+        });
+        if took && let Ok(mut dirty) = self.inventory_dirty.lock() {
+            dirty.insert(*uuid);
+        }
+        took
+    }
+
+    /// Takes up to `units` of one material and cut out of a view, for a mod.
+    ///
+    /// Returns how many it got, which may be fewer than asked.
+    pub fn take(
+        &self,
+        uuid: &PlayerUuid,
+        view: &str,
+        material: tiamot_core::material::MaterialId,
+        shape: Option<tiamot_core::inventory::Shape>,
+        units: u32,
+    ) -> u32 {
+        let took = self
+            .inventories
+            .lock()
+            .map(|mut inventories| match inventories.get_mut(uuid) {
+                Some(slots) => slots.take(view, material, shape, units),
+                None => 0,
+            })
+            .unwrap_or(0);
+        if took > 0
+            && let Ok(mut dirty) = self.inventory_dirty.lock()
+        {
+            dirty.insert(*uuid);
+        }
+        took
+    }
+
     /// What a player is carrying.
     #[must_use]
     pub fn inventory_of(&self, uuid: &PlayerUuid) -> Vec<tiamot_core::inventory::Stack> {

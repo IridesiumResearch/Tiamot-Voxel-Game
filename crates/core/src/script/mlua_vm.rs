@@ -244,6 +244,13 @@ pub struct MluaVm {
     fluid: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::fluid::Access>>>>,
     /// Where `game.get_tool` and `game.set_tool` reach, once there are players.
     tools: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::dig::Tools>>>>,
+
+    /// Where `game.inventory`, `game.give` and `game.take` reach.
+    ///
+    /// Empty until the server fills it, exactly like [`Self::tools`]: a mod
+    /// crafting during worldgen has nobody to craft for.
+    inventories:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::inventory::Access>>>>,
     /// Where `game.play_sound` reaches, once there are players to hear it.
     sounds: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::sound::Access>>>>,
     /// The server's dialog API, installed once the world is running.
@@ -421,6 +428,101 @@ fn one_based(value: Option<u16>) -> u16 {
     value.unwrap_or(1).saturating_sub(1)
 }
 
+/// The view a mod means when it does not say: the player's own bag.
+const DEFAULT_VIEW: &str = "player:main";
+
+/// Turns a Lua material — a string id or a numeric one — into a [`MaterialId`].
+///
+/// **Both spellings, because a mod has both to hand.** Charter rule 8 makes the
+/// string id canonical and that is what a mod author writes; a numeric id is
+/// what every hook event and inventory listing hands back, and asking them to
+/// convert it before giving it straight back would be a papercut with no
+/// purpose. A string that no mod registered is an error naming the id, not a
+/// silent fall back to air.
+fn material_of(lua: &mlua::Lua, value: &mlua::Value) -> mlua::Result<crate::material::MaterialId> {
+    match value {
+        mlua::Value::Integer(id) => u16::try_from(*id)
+            .map(crate::material::MaterialId)
+            .map_err(|_| mlua::Error::external(format!("material id {id} is out of range"))),
+        mlua::Value::String(id) => {
+            let id = id.to_str()?.to_owned();
+            let registry: Table = lua.named_registry_value("tiamot.blocks")?;
+            registry
+                .get::<Option<u16>>(id.clone())?
+                .map(crate::material::MaterialId)
+                .ok_or_else(|| mlua::Error::external(format!("no block registered with id `{id}`")))
+        }
+        other => Err(mlua::Error::external(format!(
+            "material must be a block id or a numeric material, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// The player a mod named, as raw UUID bytes.
+fn player_of(uuid: &str, what: &str) -> mlua::Result<[u8; 32]> {
+    crate::identity::PlayerUuid::from_hex(uuid)
+        .map(|player| *player.as_bytes())
+        .map_err(|_| {
+            mlua::Error::external(format!(
+                "{what} takes a player UUID in hex, as a hook event reports one"
+            ))
+        })
+}
+
+/// The cut a spec asked for, and whether it was spelled at all.
+///
+/// A mask of every cell means a whole block, which is loose material and no
+/// shape — see [`crate::inventory::Shape::new`], which refuses it for the same
+/// reason. A mask a mod cannot mean at all (zero) is an error rather than a
+/// silent whole block, because "give them nothing" is not what anyone wrote.
+fn shape_of(spec: &Table) -> mlua::Result<Option<crate::inventory::Shape>> {
+    let Some(mask) = spec.get::<Option<u32>>("shape")? else {
+        return Ok(None);
+    };
+    if mask & crate::inventory::Shape::ALL == 0 {
+        return Err(mlua::Error::external(
+            "shape is an occupancy mask over a block's 27 sub-nodes and cannot be empty",
+        ));
+    }
+    Ok(crate::inventory::Shape::new(mask))
+}
+
+/// How many units a `{units = }` or `{count = }` spec asks for.
+///
+/// `count` is items — blocks of loose material, or items of the cut — and is
+/// what a crafting recipe is written in. `units` is charter rule 5's own
+/// quantity and is what conservation is asserted on. Both, because a mod
+/// writing "three stairs" and a mod writing "eighty-one units" are both right.
+fn units_of(spec: &Table, shape: Option<crate::inventory::Shape>) -> mlua::Result<u32> {
+    if let Some(units) = spec.get::<Option<u32>>("units")? {
+        return Ok(units);
+    }
+    let count = spec.get::<Option<u32>>("count")?.unwrap_or(1);
+    let per = shape.map_or(crate::UNITS_PER_BLOCK, crate::inventory::Shape::cells);
+    count.checked_mul(per).ok_or_else(|| {
+        mlua::Error::external(format!(
+            "{count} items of {per} units each does not fit in a stack"
+        ))
+    })
+}
+
+/// One stack, as a mod reads it.
+fn stack_table(lua: &mlua::Lua, stack: crate::inventory::Stack) -> mlua::Result<Table> {
+    let (blocks, nodes) = stack.display();
+    let entry = lua.create_table()?;
+    entry.set("material", stack.material.0)?;
+    entry.set("units", stack.units)?;
+    entry.set("blocks", blocks)?;
+    entry.set("nodes", nodes)?;
+    entry.set("count", stack.count())?;
+    // Absent rather than zero for loose material, so `if slot.shape then` is
+    // the test for "is this a cut" and a mask of zero never has to mean two
+    // different things.
+    entry.set("shape", stack.shape.map(crate::inventory::Shape::occupancy))?;
+    Ok(entry)
+}
+
 /// Resolves a `require` name against a mod's directory, refusing to escape it.
 ///
 /// Returns `None` for anything that leaves the directory — checked after
@@ -477,6 +579,7 @@ impl ScriptVm for MluaVm {
             light: std::sync::Arc::new(std::sync::Mutex::new(None)),
             fluid: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tools: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            inventories: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
             dialogs: std::sync::Arc::new(std::sync::Mutex::new(None)),
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -537,6 +640,12 @@ impl ScriptVm for MluaVm {
 
     fn set_tools_access(&mut self, access: std::sync::Arc<dyn crate::dig::Tools>) {
         if let Ok(mut slot) = self.tools.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_inventory_access(&mut self, access: std::sync::Arc<dyn crate::inventory::Access>) {
+        if let Ok(mut slot) = self.inventories.lock() {
             *slot = Some(access);
         }
     }
@@ -1755,6 +1864,96 @@ impl MluaVm {
         }
     }
 
+    /// The `game.inventory`, `game.give` and `game.take` functions.
+    ///
+    /// **Crafting is a mod's job, and this is what makes that possible.**
+    /// Charter rule 1: the engine holds mechanisms, and "twenty-seven units of
+    /// stone becomes three stairs" is content. Until these existed nothing but
+    /// digging could put anything into an inventory and nothing but placing
+    /// could take it out, so a shaped stack — which only crafting produces —
+    /// had no way to come into being at all.
+    ///
+    /// All three take a player UUID in hex, the way every hook event names a
+    /// player (charter rule 13). Before the seam is installed — during worldgen
+    /// — `inventory` answers empty, `give` is dropped and `take` takes nothing,
+    /// because there is nobody carrying anything yet. Same rule as
+    /// `game.set_tool`.
+    fn install_inventory(&self, game: &Table) -> Result<(), ScriptError> {
+        let slot = std::sync::Arc::clone(&self.inventories);
+        let read = self
+            .lua
+            .create_function(move |lua, (uuid, view): (String, Option<String>)| {
+                let player = player_of(&uuid, "inventory")?;
+                let view = view.unwrap_or_else(|| DEFAULT_VIEW.to_owned());
+                let stacks = slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|access| access.contents(player, &view)))
+                    .unwrap_or_default();
+                let list = lua.create_table()?;
+                for stack in stacks {
+                    list.push(stack_table(lua, stack)?)?;
+                }
+                Ok(list)
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("inventory", read)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.inventories);
+        let give = self
+            .lua
+            .create_function(move |lua, (uuid, spec): (String, Table)| {
+                let player = player_of(&uuid, "give")?;
+                let material = material_of(lua, &spec.get::<mlua::Value>("material")?)?;
+                let shape = shape_of(&spec)?;
+                let units = units_of(&spec, shape)?;
+                let view = spec
+                    .get::<Option<String>>("view")?
+                    .unwrap_or_else(|| DEFAULT_VIEW.to_owned());
+                // Nothing to give is not an error and not a change: a recipe
+                // that yields zero of something is a recipe with a condition
+                // in it, and the mod already knows what it asked for.
+                let Some(stack) = crate::inventory::Stack::new(material, units)
+                    .map(|stack| crate::inventory::Stack { shape, ..stack })
+                else {
+                    return Ok(false);
+                };
+                let accepted = slot.lock().ok().and_then(|slot| {
+                    slot.as_ref()
+                        .map(|access| access.give(player, &view, stack))
+                });
+                Ok(accepted.unwrap_or(false))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("give", give).map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.inventories);
+        let take = self
+            .lua
+            .create_function(move |lua, (uuid, spec): (String, Table)| {
+                let player = player_of(&uuid, "take")?;
+                let material = material_of(lua, &spec.get::<mlua::Value>("material")?)?;
+                let shape = shape_of(&spec)?;
+                let units = units_of(&spec, shape)?;
+                let view = spec
+                    .get::<Option<String>>("view")?
+                    .unwrap_or_else(|| DEFAULT_VIEW.to_owned());
+                // **How many it actually got, not whether it got them all.**
+                // A mod that asked for more than the player has can put back
+                // what it took; one told only `false` would have to ask twice
+                // to find out how much that was.
+                let took = slot.lock().ok().and_then(|slot| {
+                    slot.as_ref()
+                        .map(|access| access.take(player, &view, material, shape, units))
+                });
+                Ok(took.unwrap_or(0))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("take", take).map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// The `game.get_tool` and `game.set_tool` functions.
     ///
     /// Both take a player UUID in hex, the way `game.entity` reports one and
@@ -1938,6 +2137,7 @@ impl MluaVm {
 
         self.install_entity_step_hook(mod_id, game)?;
         self.install_tools(game)?;
+        self.install_inventory(game)?;
         self.install_sound(mod_id, game)?;
         self.install_dialogs(mod_id, game)?;
 

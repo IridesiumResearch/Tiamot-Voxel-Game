@@ -480,6 +480,57 @@ pub fn debit(stacks: &mut Vec<Stack>, material: MaterialId, units: u32) -> u32 {
     units - remaining
 }
 
+/// Where a mod reaches a player's inventory.
+///
+/// # Why this is a seam and not a field
+///
+/// Charter rule 1: the mod API is the only API, and crafting belongs in a mod.
+/// A mod that turns twenty-seven units of stone into three stairs has to be
+/// able to spend one and hand back the other — and inventories live on the
+/// server's connection state, which `crates/core`'s script host has no business
+/// reaching into. So the host holds a `dyn Access` the server fills in, the
+/// same way [`crate::dig::Tools`] and [`crate::storage::Access`] work.
+///
+/// Every method takes the player's raw UUID bytes, because charter rule 13 is
+/// that mod state keys on the UUID and never on the display name.
+///
+/// # It is the server's copy that changes
+///
+/// Nothing here goes near a client. A mod gives, the server's slots change, and
+/// the player is told what they now have — the same direction digging and
+/// placing already run in. An inventory a client could assert into is not an
+/// inventory.
+pub trait Access: Send + Sync {
+    /// What a player holds in one view, consolidated: one stack per
+    /// material-and-shape.
+    ///
+    /// Empty for a player who is not connected or a view that does not exist,
+    /// which are the same answer to "what is in it" and neither is an error.
+    fn contents(&self, player: [u8; 32], view: &str) -> Vec<Stack>;
+
+    /// Puts a stack into a player's view.
+    ///
+    /// Returns whether it took. `false` means the player is not connected or
+    /// the view does not exist — never that it did not fit, because
+    /// [`crate::inventory::Slots::insert`] grows rather than refusing.
+    fn give(&self, player: [u8; 32], view: &str, stack: Stack) -> bool;
+
+    /// Takes up to `units` of one material and cut, returning how many it got.
+    ///
+    /// **Partial by design.** A crafting mod asking for more than the player
+    /// has gets what there was and can decide whether to give it back; the
+    /// alternative — all or nothing — hides the amount and makes the mod ask
+    /// twice.
+    fn take(
+        &self,
+        player: [u8; 32],
+        view: &str,
+        material: MaterialId,
+        shape: Option<Shape>,
+        units: u32,
+    ) -> u32;
+}
+
 #[cfg(test)]
 mod tests {
     /// A stair-ish shape: the lower half plus one step. Five cells.

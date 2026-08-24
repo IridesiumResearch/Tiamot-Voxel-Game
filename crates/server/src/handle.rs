@@ -1161,6 +1161,11 @@ impl ServerHandle {
                                 .set_tools_access(std::sync::Arc::new(HeldTools {
                                     shared: std::sync::Arc::clone(&shared),
                                 }));
+                            // And where a mod's crafting puts what it made.
+                            host.vm_mut()
+                                .set_inventory_access(std::sync::Arc::new(Carried {
+                                    shared: std::sync::Arc::clone(&shared),
+                                }));
                             // And who is close enough to hear a mod's sounds.
                             host.vm_mut()
                                 .set_sound_access(std::sync::Arc::new(Earshot {
@@ -2771,6 +2776,45 @@ impl Drop for ServerHandle {
 ///
 /// The seam from [`tiamot_core::dig::Tools`]. Which tool a player holds lives
 /// with their body, above `core`, and the VM lives inside it (charter rule 3).
+/// The seam `game.inventory`, `game.give` and `game.take` reach through.
+///
+/// **The mod API's route into an inventory, and the only one.** Charter rule 1
+/// puts crafting in a mod, and until this existed only digging could credit an
+/// inventory and only placing could debit one — so a shaped stack, which only
+/// crafting produces, could not be brought into being at all.
+///
+/// Everything it does happens to the SERVER's copy and is followed by an
+/// update to the player, the same direction digging already runs in. Installed
+/// here rather than only in the VM's tests, because `game.set_block` was dead
+/// on every real server for three tasks for exactly that reason.
+struct Carried {
+    shared: std::sync::Arc<crate::transport::endpoint::Shared>,
+}
+
+impl tiamot_core::inventory::Access for Carried {
+    fn contents(&self, player: [u8; 32], view: &str) -> Vec<tiamot_core::inventory::Stack> {
+        let uuid = tiamot_core::identity::PlayerUuid::from_bytes(player);
+        self.shared.contents_of(&uuid, view)
+    }
+
+    fn give(&self, player: [u8; 32], view: &str, stack: tiamot_core::inventory::Stack) -> bool {
+        let uuid = tiamot_core::identity::PlayerUuid::from_bytes(player);
+        self.shared.give(&uuid, view, stack)
+    }
+
+    fn take(
+        &self,
+        player: [u8; 32],
+        view: &str,
+        material: tiamot_core::material::MaterialId,
+        shape: Option<tiamot_core::inventory::Shape>,
+        units: u32,
+    ) -> u32 {
+        let uuid = tiamot_core::identity::PlayerUuid::from_bytes(player);
+        self.shared.take(&uuid, view, material, shape, units)
+    }
+}
+
 struct HeldTools {
     shared: std::sync::Arc<crate::transport::endpoint::Shared>,
 }
