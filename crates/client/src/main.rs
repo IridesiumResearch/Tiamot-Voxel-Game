@@ -1957,10 +1957,16 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     // the interface needs to read the atlas layout while it does.
     let tiles = app.tiles().clone();
     let atlas_texture = surface.atlas_texture;
-    let size = (
-        surface.window.inner_size().width as f32,
-        surface.window.inner_size().height as f32,
-    );
+    // **Points, not physical pixels.** `client::panel` sizes a sheet and egui
+    // lays it out, and both work in points — measuring the window instead made
+    // a mod's dialog a quarter larger than the engine's own screens at the
+    // default interface scale, which is the same units mistake as the click
+    // offset above and was hiding behind the fact that a dialog has no edge to
+    // line up with.
+    let size = {
+        let content = surface.egui.content_rect();
+        (content.width(), content.height())
+    };
     let output = surface.egui.run_ui(raw, |root| {
         let context = root.ctx().clone();
         // **One scale for the whole interface**, applied here rather than by
@@ -2062,6 +2068,26 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     paint_egui(surface, output.shapes, output.textures_delta, view);
 }
 
+/// How many physical pixels one interface point is worth.
+///
+/// # The bug this is
+///
+/// **`egui_winit` divides a click by `zoom × window scale`; this used to
+/// multiply a widget back up by the window scale alone.** With the default
+/// interface scale of 1.25 that put every widget a quarter of its distance from
+/// the top-left corner away from where egui thought it was — so a button had to
+/// be clicked below and to the right of itself, by more the further down the
+/// screen it sat. Reported from the front screen, where the buttons are far
+/// enough down to make it obvious; it was just as wrong in every dialog and on
+/// the settings screen, where the targets are bigger and the miss was survivable.
+///
+/// There is exactly one right answer and it is the one egui itself computes:
+/// the zoom factor times the window's own scale. Anything that converts between
+/// points and pixels must use THIS, and nothing may use `scale_factor` alone.
+fn interface_scale(ctx: &egui::Context, window: &Window) -> f32 {
+    egui_winit::pixels_per_point(ctx, window)
+}
+
 /// Uploads and draws whatever egui produced, over what is already there.
 ///
 /// Shared by the front screen and the HUD: the two decide different things and
@@ -2074,7 +2100,7 @@ fn paint_egui(
     view: &wgpu::TextureView,
 ) {
     let gpu = surface.gpu.clone();
-    let pixels_per_point = surface.window.scale_factor() as f32;
+    let pixels_per_point = interface_scale(&surface.egui, &surface.window);
     let triangles = surface.egui.tessellate(shapes, pixels_per_point);
 
     for (id, delta) in &textures.set {
@@ -2210,6 +2236,54 @@ fn grab(window: &Window, grab: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{hotbar_slot, world_directory};
+
+    /// A click lands where the widget is drawn, whatever the interface scale.
+    ///
+    /// # What this pins
+    ///
+    /// `egui_winit` turns a physical click into points by dividing by
+    /// `zoom × window scale`, and the renderer turns points back into pixels by
+    /// multiplying by whatever it is handed. **Those two numbers have to be the
+    /// same one**, and for a long time the renderer used the window scale alone:
+    /// at the default interface scale of 1.25 every widget had to be clicked a
+    /// quarter of its distance from the top-left corner below and to the right
+    /// of itself.
+    ///
+    /// The number egui itself computes is `Context::pixels_per_point`, and this
+    /// asserts it is the product — so a future change that reaches for
+    /// `scale_factor` again has something to fail against. A window cannot be
+    /// opened in a test, so this drives the context directly with the same
+    /// `native_pixels_per_point` a window would report.
+    #[test]
+    fn a_click_lands_where_the_widget_is_drawn() {
+        for (native, zoom) in [(1.0, 1.25), (1.0, 1.0), (2.0, 1.25), (1.5, 0.75)] {
+            let ctx = egui::Context::default();
+            ctx.set_zoom_factor(zoom);
+            let mut input = egui::RawInput::default();
+            input
+                .viewports
+                .entry(input.viewport_id)
+                .or_default()
+                .native_pixels_per_point = Some(native);
+            let _ = ctx.run_ui(input, |_| {});
+
+            let expected = native * zoom;
+            assert!(
+                (ctx.pixels_per_point() - expected).abs() < 1e-5,
+                "at native {native} and zoom {zoom}, egui works in {} pixels per point and the \
+                 renderer would have used {expected}",
+                ctx.pixels_per_point()
+            );
+            // And the thing the bug actually did: the window scale on its own
+            // is NOT the answer whenever the player has scaled the interface.
+            if (zoom - 1.0).abs() > 1e-5 {
+                assert!(
+                    (ctx.pixels_per_point() - native).abs() > 1e-5,
+                    "the window scale alone happened to be right, so this proves nothing"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_world_name_never_becomes_a_path_that_leaves_the_worlds_directory() {

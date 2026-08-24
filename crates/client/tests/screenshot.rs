@@ -2954,3 +2954,51 @@ fn a_figure_in_the_frame_does_not_move_the_milk() {
          camera — a figure's draw is disturbing state a later pass depends on"
     );
 }
+
+#[test]
+fn a_wall_off_the_side_of_the_screen_still_casts_into_it() {
+    // **Reported from the window: "when turning away from the thing that casts
+    // the shadow the shadow very abruptly disappears".**
+    //
+    // The diagnosis was in the report. The cascades were filled from the
+    // CAMERA-visible chunk list, so a wall that left the frustum stopped being
+    // drawn into the light's map — and its shadow went out mid-stride, on the
+    // ground the player was still looking at. `shadow::CASTER_MARGIN` was
+    // written for this exact failure and could never fix it: widening the
+    // light's box behind the camera is no help when the geometry never reaches
+    // the pass.
+    //
+    // This measures the fix at its source rather than through a frame. A frame
+    // test would have to arrange a shadow long enough to survive the caster
+    // leaving view, which is a scene about sun angles; the claim is simply that
+    // the cascades are fed more than the eye can see.
+    let Some(gpu) = gpu() else { return };
+    let chunks = wall_scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    renderer.set_sun(1.0, [1.0, 1.0, 1.0], [-0.80, -0.45, 0.0]);
+
+    // Low over the floor, looking along the wall rather than at it, so a good
+    // part of the world is behind the camera.
+    let mut camera = Camera {
+        position: Position::from_world(40.0, 12.0, 24.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -0.2);
+    let _ = target.capture(&mut renderer, &camera).expect("capture");
+
+    let seen = renderer.drawn();
+    let casting = renderer.casting();
+    assert!(
+        seen < chunks.len(),
+        "the camera can see the whole world ({seen} of {}), so this proves nothing about \
+         what is off screen",
+        chunks.len()
+    );
+    assert!(
+        casting > seen,
+        "the cascades were fed {casting} chunks and the eye can see {seen}: a caster that \
+         leaves the frustum stops casting, which is the shadow going out as you turn away"
+    );
+}

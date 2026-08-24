@@ -696,6 +696,8 @@ pub struct Renderer {
     fog_end: f32,
     /// How many chunks the last frame actually drew.
     drawn: usize,
+    /// How many chunks the last frame drew into the cascades.
+    cast: usize,
     /// The debug body's mesh, built once, and where it is this frame.
     ///
     /// `None` in first person, which is every frame until somebody asks for
@@ -887,6 +889,7 @@ impl Renderer {
             fog_start: f32::MAX,
             fog_end: f32::MAX,
             drawn: 0,
+            cast: 0,
             body: body_buffers,
             entities_at: Vec::new(),
             body_at: None,
@@ -1023,6 +1026,17 @@ impl Renderer {
     #[must_use]
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// How many chunks the last frame drew into the shadow cascades.
+    ///
+    /// **Larger than [`Renderer::drawn`] whenever something off-screen casts
+    /// into view**, which is the whole point of the second list — see
+    /// [`Culled`]. Equal to it in the modes with no cascades, where there is
+    /// nothing to fill.
+    #[must_use]
+    pub const fn casting(&self) -> usize {
+        self.cast
     }
 
     /// How many chunks the last frame drew, after culling.
@@ -1241,7 +1255,7 @@ impl Renderer {
     /// than `CHUNK_BLOCKS`. Getting that wrong draws a cage a third of the size
     /// of the thing it is supposed to be outlining, which looks like a bug in the
     /// culler rather than in a constant.
-    fn upload_chunk_borders(&mut self, camera: &Camera, visible: &[ChunkPos]) {
+    fn upload_chunk_borders(&mut self, camera: &Camera, visible: &[(ChunkPos, u32)]) {
         if !self.show_borders && self.sources.is_empty() {
             self.border_vertices = 0;
             return;
@@ -1283,7 +1297,7 @@ impl Renderer {
             }
             return;
         }
-        for pos in visible {
+        for (pos, _) in visible {
             let offset = camera.position.chunk_offset(*pos);
             push_box_edges(
                 &mut vertices,
@@ -1432,33 +1446,95 @@ impl Renderer {
             self.elapsed = (self.elapsed + dt) % FLUID_CLOCK_WRAP;
         }
     }
+}
 
-    /// Frustum-culls the resident chunks and uploads their offsets.
+/// What one frame's culling decided.
+///
+/// # Two lists, because a shadow's caster need not be on screen
+///
+/// **The cascades used to be filled from the camera-visible list**, so a wall
+/// stopped shadowing the ground the moment it left the frustum — turn away from
+/// a tower and its shadow vanished mid-stride. Reported from the window as a
+/// shadow disappearing abruptly when you look away from what casts it, and the
+/// diagnosis was right there in the report: it is not the chunk being unloaded,
+/// it is the chunk not being drawn into the light's map.
+///
+/// `shadow::CASTER_MARGIN` was written for exactly this and could never fix it:
+/// it widens the light's box behind the camera, which is no help when the
+/// geometry never reaches the pass at all.
+#[derive(Debug, Default)]
+struct Culled {
+    /// Chunks the world pass draws, with their instance index.
+    visible: Vec<(ChunkPos, u32)>,
+    /// Chunks the cascades draw, with their instance index.
     ///
-    /// Returns the meshes to draw, in the order their instances were written —
-    /// the draw loop indexes the instance array by position in this list, so
-    /// the two must not be built separately.
-    fn cull_and_upload(&mut self, camera: &Camera, view_projection: glam::Mat4) -> Vec<ChunkPos> {
+    /// Tested against each cascade's own matrix — the same `Frustum` the camera
+    /// uses, against the light's box rather than the eye's — so anything that
+    /// can cast into the shadow map is in it whether or not it is on screen.
+    casters: Vec<(ChunkPos, u32)>,
+    /// Where the player's own body sits in the instance array.
+    body: u32,
+}
+
+impl Renderer {
+    /// Culls the resident chunks against the camera AND the light, and uploads
+    /// their offsets.
+    ///
+    /// Both lists index one instance array, which is why this is one function:
+    /// a draw loop indexes that array by the number recorded here, so the list
+    /// and the array must not be built separately.
+    fn cull_and_upload(&mut self, camera: &Camera, view_projection: glam::Mat4) -> Culled {
         // Cull, then build the instance array. Both in one pass so a chunk's
         // offset is computed exactly once per frame.
         let frustum = Frustum::from_view_projection(view_projection);
-        let mut visible = Vec::with_capacity(self.chunks.len());
+        // **The light's frusta as well as the camera's**, because a shadow's
+        // caster does not have to be on screen. See `Culled::casters`.
+        let cascades: Vec<Frustum> = self
+            .post
+            .as_ref()
+            .and_then(graph::Post::shadows)
+            .map(|shadows| {
+                shadows
+                    .matrices()
+                    .iter()
+                    .map(|matrix| Frustum::from_view_projection(*matrix))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut culled = Culled::default();
         let mut instances = Vec::with_capacity(self.chunks.len());
         for pos in self.chunks.keys() {
             let offset = camera.position.chunk_offset(*pos);
-            if !frustum.contains_chunk(offset) {
+            let seen = frustum.contains_chunk(offset);
+            let casts = cascades
+                .iter()
+                .any(|cascade| cascade.contains_chunk(offset));
+            if !seen && !casts {
                 continue;
             }
+            // **One instance array, two index lists.** Both passes read the
+            // same offsets, so a chunk that is both seen and casting is
+            // uploaded once — and a chunk that is only casting still has an
+            // instance for the cascade pass to point at.
+            //
             // Positions rather than the meshes themselves: this method takes
             // `&mut self` to grow the instance buffer, and a borrow of a mesh
             // would keep that borrow alive across the draw loop. The lookup it
             // costs is one `BTreeMap` probe per drawn chunk per frame.
-            visible.push(*pos);
+            let instance = instances.len() as u32;
+            if seen {
+                culled.visible.push((*pos, instance));
+            }
+            if casts {
+                culled.casters.push((*pos, instance));
+            }
             instances.push(Instance {
                 offset: [offset.x, offset.y, offset.z, 0.0],
             });
         }
-        self.drawn = visible.len();
+        self.drawn = culled.visible.len();
+        self.cast = culled.casters.len();
 
         // The body rides at the end of the same array, so drawing it is one
         // more instance index rather than a second buffer and a second binding.
@@ -1485,8 +1561,9 @@ impl Renderer {
                 .queue
                 .write_buffer(&self.instances, 0, bytemuck::cast_slice(&instances));
         }
+        culled.body = instances.len().saturating_sub(1) as u32;
 
-        visible
+        culled
     }
 
     /// Builds or drops mode 3's targets to match the mode and the frame size.
@@ -1616,10 +1693,10 @@ impl Renderer {
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         pipeline: &wgpu::RenderPipeline,
-        visible: &[ChunkPos],
+        visible: &[(ChunkPos, u32)],
     ) {
         let mut wet = false;
-        for (index, pos) in visible.iter().enumerate() {
+        for (pos, instance) in visible {
             let Some(fluid) = self.chunks.get(pos).and_then(|mesh| mesh.fluid.as_ref()) else {
                 continue;
             };
@@ -1631,8 +1708,7 @@ impl Renderer {
             }
             pass.set_vertex_buffer(0, fluid.vertices.slice(..));
             pass.set_index_buffer(fluid.indices.slice(..), wgpu::IndexFormat::Uint32);
-            let instance = index as u32;
-            pass.draw_indexed(0..fluid.index_count, 0, instance..instance + 1);
+            pass.draw_indexed(0..fluid.index_count, 0, *instance..*instance + 1);
         }
     }
 
@@ -1651,23 +1727,25 @@ impl Renderer {
     /// float positions and a skeleton, which the packed voxel vertex cannot
     /// express — see `render::skinned`. This is the client's own debug body and
     /// nothing else.
-    fn draw_bodies(&self, pass: &mut wgpu::RenderPass<'_>, chunks: usize, in_world: bool) {
+    fn draw_bodies(&self, pass: &mut wgpu::RenderPass<'_>, instance: u32, in_world: bool) {
         if self.body_at.is_none() || (in_world && !self.body_visible) {
             return;
         }
-        let instance = chunks as u32;
         pass.set_vertex_buffer(0, self.body.vertices.slice(..));
         pass.set_index_buffer(self.body.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.body.index_count, 0, instance..instance + 1);
     }
 
-    /// Draws the visible chunks into every shadow cascade.
+    /// Draws every shadow CASTER into every cascade.
     ///
     /// The same meshes and the same instance buffer as the world pass, drawn
     /// from the sun instead of from the eye — which is why the shadow pipeline
     /// shares this module's vertex layout rather than having one of its own.
     /// Nothing happens in the modes with no cascades to fill.
-    fn fill_cascades(&self, encoder: &mut wgpu::CommandEncoder, visible: &[ChunkPos]) {
+    ///
+    /// **Casters, not the visible list**, which is what [`Culled`] is about: a
+    /// wall that leaves the screen still shadows the ground in front of you.
+    fn fill_cascades(&self, encoder: &mut wgpu::CommandEncoder, culled: &Culled) {
         let Some(shadows) = self.post.as_ref().and_then(graph::Post::shadows) else {
             return;
         };
@@ -1692,20 +1770,19 @@ impl Renderer {
         // there is no second `render` call to get the load op wrong in.
         shadows.render(encoder, |pass, cascade| {
             pass.set_vertex_buffer(1, self.instances.slice(..));
-            for (index, pos) in visible.iter().enumerate() {
+            for (pos, instance) in &culled.casters {
                 let Some(mesh) = self.chunks.get(pos) else {
                     continue;
                 };
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                let instance = index as u32;
-                pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
+                pass.draw_indexed(0..mesh.index_count, 0, *instance..*instance + 1);
             }
             // And the client's own debug body.
             // `false`: the cascades take the body whether or not the world
             // pass draws it, which is what gives a first-person player a
             // shadow.
-            self.draw_bodies(pass, visible.len(), false);
+            self.draw_bodies(pass, culled.body, false);
 
             // Figures, in their own pipeline. **A mob with no shadow floats**,
             // which is the one thing about a drawn body that everybody notices
@@ -1758,8 +1835,8 @@ impl Renderer {
             bytemuck::bytes_of(&self.globals_for(view_projection)),
         );
 
-        let visible = self.cull_and_upload(camera, view_projection);
-        self.upload_chunk_borders(camera, &visible);
+        let culled = self.cull_and_upload(camera, view_projection);
+        self.upload_chunk_borders(camera, &culled.visible);
 
         // **Once per frame, before any pass.** All three read the same
         // instances and the same palette, which is what makes a figure appear
@@ -1776,7 +1853,7 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        self.fill_cascades(&mut encoder, &visible);
+        self.fill_cascades(&mut encoder, &culled);
 
         let (colour, depth, world_pipeline, fluid_pipeline, selection_pipeline, skinned_pipeline) =
             self.world_pass_target(target);
@@ -1813,7 +1890,7 @@ impl Renderer {
             }
             pass.set_vertex_buffer(1, self.instances.slice(..));
 
-            for (index, pos) in visible.iter().enumerate() {
+            for (pos, instance) in &culled.visible {
                 let Some(mesh) = self.chunks.get(pos) else {
                     continue;
                 };
@@ -1822,11 +1899,10 @@ impl Renderer {
                 // The instance range picks this chunk's offset out of the
                 // shared array — one buffer write per frame instead of one per
                 // chunk.
-                let instance = index as u32;
-                pass.draw_indexed(0..mesh.index_count, 0, instance..instance + 1);
+                pass.draw_indexed(0..mesh.index_count, 0, *instance..*instance + 1);
             }
 
-            self.draw_bodies(&mut pass, visible.len(), true);
+            self.draw_bodies(&mut pass, culled.body, true);
 
             // **After the terrain, before the fluid.** A blob is a mark on the
             // ground, so it goes over what it is marking; milk is above the
@@ -1851,7 +1927,7 @@ impl Renderer {
                 pass.set_vertex_buffer(1, self.instances.slice(..));
             }
 
-            self.draw_fluid(&mut pass, fluid_pipeline, &visible);
+            self.draw_fluid(&mut pass, fluid_pipeline, &culled.visible);
 
             // Last, so it draws over the world it outlines. Its pipeline does
             // not write depth, so the order within the pass is what decides
