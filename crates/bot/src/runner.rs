@@ -204,9 +204,9 @@ async fn carrying(bot: &mut Bot) -> Option<u16> {
     let stacks = bot.await_inventory(Duration::from_millis(200)).await.ok()?;
     stacks
         .into_iter()
-        .filter(|(_, units)| *units > 0)
-        .max_by_key(|(id, units)| (*units, std::cmp::Reverse(*id)))
-        .map(|(id, _)| id)
+        .filter(|stack| stack.units > 0)
+        .max_by_key(|stack| (stack.units, std::cmp::Reverse(stack.material)))
+        .map(|stack| stack.material)
 }
 
 /// Runs one wandering bot for `duration`, editing as it goes.

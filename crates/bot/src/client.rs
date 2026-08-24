@@ -1480,7 +1480,9 @@ impl Bot {
     /// The LAST word per view, not every update: a test wants the current
     /// state, and the history is only noise.
     #[must_use]
-    pub fn views(&self) -> std::collections::BTreeMap<String, Vec<Option<(u16, u32)>>> {
+    pub fn views(
+        &self,
+    ) -> std::collections::BTreeMap<String, Vec<Option<tiamot_core::proto::StackDef>>> {
         let mut latest = std::collections::BTreeMap::new();
         for message in self.received() {
             if let ServerMessage::ViewUpdate { view, slots, .. } = message {
@@ -1492,7 +1494,7 @@ impl Bot {
 
     /// What the server last said is on this player's cursor.
     #[must_use]
-    pub fn held(&self) -> Option<(u16, u32)> {
+    pub fn held(&self) -> Option<tiamot_core::proto::StackDef> {
         self.received()
             .into_iter()
             .filter_map(|message| match message {
@@ -1511,8 +1513,8 @@ impl Bot {
     pub async fn until_view(
         &mut self,
         view: &str,
-        want: impl Fn(&[Option<(u16, u32)>]) -> bool,
-    ) -> Result<Vec<Option<(u16, u32)>>, BotError> {
+        want: impl Fn(&[Option<tiamot_core::proto::StackDef>]) -> bool,
+    ) -> Result<Vec<Option<tiamot_core::proto::StackDef>>, BotError> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if let Some(slots) = self.views().get(view)
@@ -1560,8 +1562,14 @@ impl Bot {
         target: tiamot_core::SubNodePos,
         material: u16,
     ) -> Result<(), BotError> {
-        self.send(&tiamot_core::proto::ClientMessage::Place { target, material })
-            .await
+        self.send(&tiamot_core::proto::ClientMessage::Place {
+            target,
+            material,
+            // Loose material. A bot that wants to place a cut stack builds the
+            // message itself; this helper is the ordinary case.
+            shape: 0,
+        })
+        .await
     }
 
     /// Waits until the server confirms a partially-filled block at `pos`.
@@ -1696,7 +1704,7 @@ impl Bot {
     /// so 27 is one block — use [`tiamot_core::inventory::display`] to split
     /// them into blocks and spare nodes.
     #[must_use]
-    pub fn inventory(&self) -> Vec<(u16, u32)> {
+    pub fn inventory(&self) -> Vec<tiamot_core::proto::StackDef> {
         self.received()
             .iter()
             .rev()
@@ -1715,7 +1723,7 @@ impl Bot {
     pub async fn await_inventory(
         &mut self,
         timeout: std::time::Duration,
-    ) -> Result<Vec<(u16, u32)>, BotError> {
+    ) -> Result<Vec<tiamot_core::proto::StackDef>, BotError> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1736,8 +1744,8 @@ impl Bot {
     pub fn units_of(&self, material: u16) -> u32 {
         self.inventory()
             .iter()
-            .filter(|(id, _)| *id == material)
-            .map(|(_, units)| *units)
+            .filter(|stack| stack.material == material)
+            .map(|stack| stack.units)
             .sum()
     }
 

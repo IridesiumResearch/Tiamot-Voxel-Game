@@ -296,7 +296,13 @@ impl Slots {
     ///
     /// Walks slots in order, so a player spending material empties the stack
     /// they can see first rather than one chosen by a hash.
-    pub fn take(&mut self, view: &str, material: MaterialId, units: u32) -> u32 {
+    pub fn take(
+        &mut self,
+        view: &str,
+        material: MaterialId,
+        shape: Option<super::Shape>,
+        units: u32,
+    ) -> u32 {
         let Some(at) = self.index_of(view) else {
             return 0;
         };
@@ -306,7 +312,11 @@ impl Slots {
                 break;
             }
             let Some(stack) = slot else { continue };
-            if stack.material != material {
+            // **The cut is part of what is being spent.** A player placing a
+            // stair must not have it paid for out of their loose rubble, or the
+            // stairs they crafted would sit in the inventory while the material
+            // quietly drained away.
+            if stack.material != material || stack.shape != shape {
                 continue;
             }
             let taking = stack.units.min(left);
@@ -390,6 +400,48 @@ fn place_one(mut held: Stack, there: Option<Stack>) -> (Option<Stack>, Option<St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spending_a_cut_does_not_drain_the_loose_material_beside_it() {
+        use super::super::Shape;
+
+        // **The conservation hole shapes could have opened.** A player placing
+        // a stair must spend the stairs they crafted; paying for it out of the
+        // rubble in the next slot would leave the stairs sitting there while
+        // the material quietly went away.
+        let shape = Shape::new(0b101).expect("two cells");
+        let mut inv = Slots {
+            views: vec![View {
+                name: PLAYER_MAIN.to_owned(),
+                slots: vec![
+                    Some(Stack::new(STONE, 50).expect("loose")),
+                    Some(Stack::shaped(STONE, shape, 3).expect("cut")),
+                ],
+            }],
+            grab: Grab::default(),
+        };
+
+        // Taking the cut takes it from the cut slot only.
+        assert_eq!(
+            inv.take(PLAYER_MAIN, STONE, Some(shape), shape.cells()),
+            shape.cells()
+        );
+        assert_eq!(
+            inv.views[0].slots[0].expect("loose survives").units,
+            50,
+            "the loose material was spent on a shaped placement"
+        );
+        assert_eq!(inv.views[0].slots[1].expect("cut survives").count(), 2);
+
+        // And loose takes from loose, not from the cut.
+        assert_eq!(inv.take(PLAYER_MAIN, STONE, None, 50), 50);
+        assert!(inv.views[0].slots[0].is_none());
+        assert_eq!(inv.views[0].slots[1].expect("cut survives").count(), 2);
+
+        // Asking for a cut nobody holds takes nothing rather than falling back.
+        let other = Shape::new(0b11).expect("another cut");
+        assert_eq!(inv.take(PLAYER_MAIN, STONE, Some(other), 2), 0);
+    }
+
     use super::*;
     use crate::UNITS_PER_BLOCK;
     use crate::material::MaterialId;
@@ -610,7 +662,7 @@ mod tests {
             grab: Grab::default(),
         };
         // Spanning two slots, first one emptied.
-        assert_eq!(inv.take("player:main", STONE, 7), 7);
+        assert_eq!(inv.take("player:main", STONE, None, 7), 7);
         assert!(
             at(&inv, "player:main", 0).is_none(),
             "an emptied slot must be None"
@@ -619,11 +671,11 @@ mod tests {
         assert_eq!(inv.total_units(), 11);
 
         // Asking for more than there is takes what there is and says so.
-        assert_eq!(inv.take("player:main", STONE, 99), 2);
-        assert_eq!(inv.take("player:main", STONE, 1), 0);
+        assert_eq!(inv.take("player:main", STONE, None, 99), 2);
+        assert_eq!(inv.take("player:main", STONE, None, 1), 0);
         // A material nobody has, and a view nobody has.
-        assert_eq!(inv.take("player:main", MaterialId(77), 5), 0);
-        assert_eq!(inv.take("nosuch:view", DIRT, 5), 0);
+        assert_eq!(inv.take("player:main", MaterialId(77), None, 5), 0);
+        assert_eq!(inv.take("nosuch:view", DIRT, None, 5), 0);
         assert_eq!(inv.total_units(), 9, "only the dirt should be left");
     }
 

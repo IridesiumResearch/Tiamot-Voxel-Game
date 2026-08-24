@@ -105,6 +105,8 @@ pub enum Action {
         target: crate::coords::SubNodePos,
         /// The material to place, as a world material id.
         material: u16,
+        /// The occupancy to place it in, or `0` for loose material.
+        shape: u32,
     },
 
     /// Hit an entity.
@@ -384,9 +386,14 @@ impl Session {
             ClientMessage::SelectTool { tool } => {
                 Response::act(Action::SelectTool { tool: tool.clone() })
             }
-            ClientMessage::Place { target, material } => Response::act(Action::Place {
+            ClientMessage::Place {
+                target,
+                material,
+                shape,
+            } => Response::act(Action::Place {
                 target: *target,
                 material: *material,
+                shape: *shape,
             }),
             _ => return None,
         })

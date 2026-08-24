@@ -787,6 +787,7 @@ mod tests {
                 // Charter rule 5's example, exactly: forty units is one block
                 // and thirteen spare nodes.
                 units: 40,
+                shape: 0,
             }],
             ..State::default()
         }

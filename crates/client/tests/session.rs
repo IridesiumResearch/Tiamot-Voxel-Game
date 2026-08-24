@@ -453,7 +453,7 @@ fn a_player_can_dig_and_then_build_with_what_they_dug() {
         dug = app
             .carried()
             .first()
-            .is_some_and(|(_, units)| *units >= tiamot_core::UNITS_PER_BLOCK);
+            .is_some_and(|stack| stack.units >= tiamot_core::UNITS_PER_BLOCK);
         std::thread::sleep(Duration::from_millis(16));
     }
     assert!(
@@ -465,7 +465,7 @@ fn a_player_can_dig_and_then_build_with_what_they_dug() {
 
     let carried = app.carried()[0];
     assert!(
-        carried.1 >= tiamot_core::UNITS_PER_BLOCK,
+        carried.units >= tiamot_core::UNITS_PER_BLOCK,
         "short: {carried:?}"
     );
 

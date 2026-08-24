@@ -15,6 +15,11 @@ pub struct Carried {
     pub name: String,
     /// How much, in units.
     pub units: u32,
+    /// The 27-bit occupancy each item is cut to, or `0` for loose material.
+    ///
+    /// A HUD showing a hotbar wants to draw a stair differently from a block of
+    /// the same stone, and this is the only thing that tells them apart.
+    pub shape: u32,
 }
 
 impl Carried {

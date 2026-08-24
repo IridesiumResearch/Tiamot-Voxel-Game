@@ -211,9 +211,9 @@ fn a_staircase_survives_a_hundred_and_fifty_millisecond_round_trip_and_five_perc
             // — but the server re-sends on the next change, and the dig below
             // is what forces one.
             let funded = until(&mut bot, Duration::from_secs(20), |bot| {
-                bot.inventory()
-                    .iter()
-                    .any(|(id, units)| *id == stone && *units >= tiamot_core::UNITS_PER_BLOCK)
+                bot.inventory().iter().any(|stack| {
+                    stack.material == stone && stack.units >= tiamot_core::UNITS_PER_BLOCK
+                })
             })
             .await;
             assert!(funded, "step {step}: the dig never credited a full block");

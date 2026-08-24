@@ -93,7 +93,7 @@ pub enum Reply {
     /// The command succeeded and carried no data.
     Done,
     /// The current inventory, as `(material id, units)`.
-    Inventory(Vec<(u16, u32)>),
+    Inventory(Vec<tiamot_core::proto::StackDef>),
     /// The command failed; the script should stop.
     Failed(String),
 }
@@ -299,8 +299,13 @@ pub fn run_script(source: &str, name: &str, channel: Channel) -> Result<ScriptOu
                     _ => Vec::new(),
                 };
                 let out = lua.create_table()?;
-                for (material, units) in stacks {
-                    out.set(material, units)?;
+                // Keyed by material, summed across cuts. A bot script asking
+                // "how much stone have I got" means the material, not one
+                // particular shape of it — and a script that cares about a cut
+                // is not a thing that exists yet.
+                for stack in stacks {
+                    let held: u32 = out.get(stack.material).unwrap_or(0);
+                    out.set(stack.material, held.saturating_add(stack.units))?;
                 }
                 Ok(out)
             })
@@ -515,7 +520,11 @@ mod tests {
              bot.assert(inv[2] == 243, 'expected 243 units, got ' .. tostring(inv[2]))\n\
              bot.assert(inv[2] / bot.UNITS_PER_BLOCK == 9, 'expected 9 blocks')",
             |command| match command {
-                Command::Inventory => Reply::Inventory(vec![(2, 243)]),
+                Command::Inventory => Reply::Inventory(vec![tiamot_core::proto::StackDef {
+                    material: 2,
+                    units: 243,
+                    shape: 0,
+                }]),
                 _ => Reply::Done,
             },
         );

@@ -453,7 +453,7 @@ fn digging_air_yields_nothing() {
         assert!(
             bot.inventory()
                 .iter()
-                .all(|(id, _)| *id != MaterialId::AIR.0),
+                .all(|stack| stack.material != MaterialId::AIR.0),
             "air must never appear in an inventory: {:?}",
             bot.inventory()
         );
@@ -564,7 +564,7 @@ fn a_dig_takes_time_and_yields_the_block_it_broke() {
         assert!(
             carried
                 .iter()
-                .any(|(id, units)| *id == stone && *units == 27),
+                .any(|stack| stack.material == stone && stack.units == 27),
             "expected 27 units of stone, got {carried:?}"
         );
     });
@@ -694,7 +694,7 @@ fn the_chisel_takes_one_cell_where_a_hand_takes_the_block() {
         assert!(
             carried
                 .iter()
-                .any(|(id, units)| *id == stone && *units == 1),
+                .any(|stack| stack.material == stone && stack.units == 1),
             "a chiselled cell should yield exactly 1 unit, got {carried:?}"
         );
         // Sharper than reading the block back: the broadcast says which KIND

@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -82,6 +82,11 @@ pub const PROTOCOL_VERSION: u32 = 23;
 // stream. They are also PER PLAYER rather than broadcast — which entities
 // somebody can see is their own interest set, and sending everyone every mob
 // would make a populated world cost the square of the people watching it.
+// v24 (post-14): `InventoryUpdate`, `ViewUpdate` and `ClientMessage::Place`
+// carry a SHAPE. `(u16, u32)` became `StackDef`, which is a FIELD CHANGE on
+// existing messages rather than an appended variant — the one shape of change
+// this format does not make safe, exactly as v10 and v13 were. The version
+// check is what keeps a v23 peer from reading these bytes as the old pair.
 // v13 (Task 11): `FluidDef` grew a `color`, for the tint over a submerged
 // camera. **A field on an existing struct, not an appended variant** — the one
 // shape of change this format does not make safe, exactly as v10 was, so the
@@ -406,6 +411,30 @@ pub struct SoundDef {
     pub pitch_variance: f32,
 }
 
+/// A quantity of one material, as the wire carries it.
+///
+/// # Why this is a struct and not a tuple any more
+///
+/// It was `(u16, u32)` — material and units — in two messages. A stack can now
+/// be cut to a SHAPE, and a pair of numbers with a third meaning bolted on is
+/// how a wire format becomes unreadable. Named fields also make the zero case
+/// say what it means: `shape: 0` is loose material, because an empty occupancy
+/// mask is not a shape a player can hold.
+///
+/// **A field change on an existing message, not an appended variant** — the one
+/// shape of change postcard does not make safe, exactly as v10 and v13 were. The
+/// version check is what keeps a v23 client from reading these bytes as the old
+/// pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StackDef {
+    /// World material id.
+    pub material: u16,
+    /// How much, in units. 27 units is one whole block.
+    pub units: u32,
+    /// The 27-bit occupancy each item is cut to, or `0` for loose material.
+    pub shape: u32,
+}
+
 /// A sound bound to a named event.
 ///
 /// **The client needs this, not just the server.** Most cues are resolved
@@ -656,6 +685,13 @@ pub enum ClientMessage {
         target: SubNodePos,
         /// Which material to place, as a world material id.
         material: u16,
+        /// The occupancy to place it in, or `0` for loose material.
+        ///
+        /// **Which STACK is being spent, not merely which material.** A player
+        /// placing a stair must not have it paid for out of their loose rubble:
+        /// the server matches the pair, so the stairs they crafted stay in the
+        /// inventory rather than the material draining out from under them.
+        shape: u32,
     },
 
     /// Ask for how far the server should stream chunks to this player.
@@ -920,8 +956,11 @@ pub enum ServerMessage {
     /// are in **units**, and the client displays `units / 27` blocks plus
     /// `units % 27` nodes.
     InventoryUpdate {
-        /// Material id and unit count, in ascending material order.
-        stacks: Vec<(u16, u32)>,
+        /// What the player holds, in ascending material order.
+        ///
+        /// Two stacks of one material are two entries when they are cut
+        /// differently — see [`StackDef`].
+        stacks: Vec<StackDef>,
     },
 
     /// The world's material table for this session.
@@ -1249,13 +1288,13 @@ pub enum ServerMessage {
     ViewUpdate {
         /// Which view, e.g. `"player:main"`.
         view: String,
-        /// Each slot's material and units, or `None` for an empty slot.
-        slots: Vec<Option<(u16, u32)>>,
+        /// What each slot holds, or `None` for an empty slot.
+        slots: Vec<Option<StackDef>>,
         /// What is on the player's cursor, if anything.
         ///
         /// Server-held: a move is two half-gestures, and a client that owned
         /// the middle of one could invent items by lying about what it took.
-        held: Option<(u16, u32)>,
+        held: Option<StackDef>,
     },
 
     /// The HUD scripts a server's mods want the client to run.
@@ -1806,7 +1845,7 @@ fn check_play(message: &ServerMessage) -> Result<(), ProtocolError> {
 ///
 /// Its own function because `validate_server_message` sits at clippy's line
 /// limit — a real constraint here rather than a lint being obeyed.
-fn check_view(view: &str, slots: &[Option<(u16, u32)>]) -> Result<(), ProtocolError> {
+fn check_view(view: &str, slots: &[Option<StackDef>]) -> Result<(), ProtocolError> {
     check_len("view", view.len(), MAX_ID_BYTES)?;
     // A server claiming a million slots is a server making the client allocate
     // a million slots (charter rule 14). The cap is the dialog schema's, so a
@@ -2328,6 +2367,7 @@ mod tests {
                 ClientMessage::Place {
                     target: SubNodePos::new(0, 0, 0),
                     material: 0,
+                    shape: 0,
                 },
                 13,
             ),

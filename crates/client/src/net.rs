@@ -230,9 +230,9 @@ pub enum Event {
         /// Which view.
         view: String,
         /// Each slot, or `None` where it is empty.
-        slots: Vec<Option<(u16, u32)>>,
+        slots: Vec<Option<tiamot_core::proto::StackDef>>,
         /// What is on the cursor.
-        held: Option<(u16, u32)>,
+        held: Option<tiamot_core::proto::StackDef>,
     },
 
     /// Something happened near enough to hear.
@@ -268,8 +268,8 @@ pub enum Event {
     /// stream that ever dropped a message would leave the client permanently
     /// wrong with no way to notice.
     Inventory {
-        /// Material id and unit count, in ascending material order.
-        stacks: Vec<(u16, u32)>,
+        /// What the player holds, in ascending material order.
+        stacks: Vec<tiamot_core::proto::StackDef>,
     },
 
     /// The player is in the world.
@@ -459,6 +459,8 @@ pub enum Command {
         target: tiamot_core::SubNodePos,
         /// Which material, as a world material id.
         material: u16,
+        /// The cut being placed, or `0` for loose material.
+        shape: u32,
     },
 
     /// Report that a mod-registered action was pressed or released.
@@ -1521,7 +1523,15 @@ fn to_wire(command: Command) -> ClientMessage {
             horizontal,
             vertical,
         },
-        Command::Place { target, material } => ClientMessage::Place { target, material },
+        Command::Place {
+            target,
+            material,
+            shape,
+        } => ClientMessage::Place {
+            target,
+            material,
+            shape,
+        },
         Command::Action { id, pressed } => ClientMessage::Action { id, pressed },
         Command::Dialog { form, event } => ClientMessage::DialogEvent { form, event },
         Command::Disconnect => ClientMessage::Disconnect,

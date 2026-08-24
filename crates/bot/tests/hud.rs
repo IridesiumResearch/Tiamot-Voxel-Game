@@ -178,7 +178,7 @@ fn what_a_player_digs_shows_up_in_the_slots_core_uis_screen_draws() {
             })
             .await
             .expect("the dug block never reached a slot");
-        let (_, units) = slots[0].expect("a stack in the first slot");
+        let units = slots[0].expect("a stack in the first slot").units;
         assert!(units > 0);
         assert!(
             slots.len() >= 27,

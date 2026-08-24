@@ -642,6 +642,7 @@ fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
                 material: tiamot_core::MaterialId(3),
                 name: "core_blocks:white".to_owned(),
                 units: 27,
+                shape: 0,
             },
             tiamot_core::hud::Carried {
                 material: tiamot_core::MaterialId(4),
@@ -649,6 +650,7 @@ fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
                 // Charter rule 5's example: forty units is one block and
                 // thirteen spare nodes, and the HUD must say so.
                 units: 40,
+                shape: 0,
             },
         ],
         ..tiamot_core::hud::State::default()

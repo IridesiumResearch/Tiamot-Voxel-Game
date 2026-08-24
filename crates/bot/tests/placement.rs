@@ -106,8 +106,8 @@ fn centre_of(pos: BlockPos) -> SubNodePos {
 fn held(bot: &Bot, material: u16) -> u32 {
     bot.inventory()
         .iter()
-        .find(|(id, _)| *id == material)
-        .map_or(0, |(_, units)| *units)
+        .find(|stack| stack.material == material)
+        .map_or(0, |stack| stack.units)
 }
 
 /// Digs a whole block with the default tool and waits for the units to land.

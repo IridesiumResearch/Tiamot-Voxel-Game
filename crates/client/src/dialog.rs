@@ -46,10 +46,10 @@ pub struct Raised {
 /// inventory cannot be desynced by a client that lies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ViewContents {
-    /// Each slot's material and units, or `None` where it is empty.
-    pub slots: Vec<Option<(u16, u32)>>,
+    /// What each slot holds, or `None` where it is empty.
+    pub slots: Vec<Option<tiamot_core::proto::StackDef>>,
     /// What is on the cursor.
-    pub held: Option<(u16, u32)>,
+    pub held: Option<tiamot_core::proto::StackDef>,
 }
 
 /// Per-widget state the tree itself cannot carry.
@@ -712,10 +712,11 @@ fn paint_slot(
     );
 
     // What the server last said is in it.
-    if let Some((material, units)) = views
+    if let Some(stack) = views
         .get(view)
         .and_then(|contents| contents.slots.get(usize::from(index)).copied().flatten())
     {
+        let (material, units) = (stack.material, stack.units);
         ui.painter()
             .rect_filled(inner.shrink(6.0), 2.0, material_tint(material));
         // **Charter rule 5's display rule, and the only place the 27 shows.**

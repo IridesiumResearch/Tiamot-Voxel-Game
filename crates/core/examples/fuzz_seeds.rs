@@ -248,10 +248,20 @@ fn client_messages() -> Vec<Vec<u8>> {
         ClientMessage::Place {
             target: SubNodePos::new(6, 7, 8),
             material: 3,
+            shape: 0,
         },
         ClientMessage::Place {
             target: SubNodePos::new(i32::MAX, i32::MIN, 0),
             material: u16::MAX,
+            // Protocol v24: a cut being placed, and a mask with bits past the
+            // block's twenty-seven — which the server must read as loose rather
+            // than as a shape nobody can hold.
+            shape: u32::MAX,
+        },
+        ClientMessage::Place {
+            target: SubNodePos::new(0, 0, 0),
+            material: 3,
+            shape: 0b101,
         },
         // Protocol v12. Missing until v15 — the checklist's re-seed step is the
         // one people skip, and a corpus that stops at an older variant means
@@ -623,8 +633,26 @@ fn server_messages() -> Vec<Vec<u8>> {
         },
         ServerMessage::ViewUpdate {
             view: "player:main".to_owned(),
-            slots: vec![Some((3, 40)), None, Some((4, 27))],
-            held: Some((3, 13)),
+            slots: vec![
+                Some(tiamot_core::proto::StackDef {
+                    material: 3,
+                    units: 40,
+                    shape: 0,
+                }),
+                None,
+                // Protocol v24: a shaped stack, which is the shape a decoder
+                // has never seen before this version.
+                Some(tiamot_core::proto::StackDef {
+                    material: 4,
+                    units: 27,
+                    shape: 0b1_0101,
+                }),
+            ],
+            held: Some(tiamot_core::proto::StackDef {
+                material: 3,
+                units: 13,
+                shape: 0,
+            }),
         },
         // Protocol v23: the cue table and the loops.
         ServerMessage::SoundBindings {

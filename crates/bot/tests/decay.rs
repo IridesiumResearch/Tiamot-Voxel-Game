@@ -116,7 +116,7 @@ fn carried(bot: &Bot) -> u32 {
         .into_iter()
         .filter_map(|message| match message {
             ServerMessage::InventoryUpdate { stacks } => {
-                Some(stacks.iter().map(|(_, units)| *units).sum())
+                Some(stacks.iter().map(|stack| stack.units).sum())
             }
             _ => None,
         })

@@ -942,7 +942,7 @@ pub struct App {
     ///
     /// Server-authoritative and never edited here: the client is told what it
     /// has. An inventory a client could change is not an inventory.
-    carried: Vec<(u16, u32)>,
+    carried: Vec<tiamot_core::proto::StackDef>,
     /// Every tool the server's mods registered, in ascending id order.
     ///
     /// Empty until the server says. Charter rule 1: the engine has no tools of
@@ -1866,14 +1866,22 @@ impl App {
     /// else the server may still refuse — it owns that decision — and says why,
     /// which arrives as a warning.
     pub fn place(&mut self) {
-        let Some(material) = self.selected_material() else {
+        // **Which STACK, not merely which material.** A player placing a stair
+        // must spend the stairs they crafted rather than the loose rubble
+        // beside them, so the cut goes with the request and the server matches
+        // the pair.
+        let Some(stack) = self.carried.get(self.selected).copied() else {
             self.warn("nothing selected to build with".to_owned());
             return;
         };
         let Some(target) = self.place_target() else {
             return;
         };
-        self.connection.send(Command::Place { target, material });
+        self.connection.send(Command::Place {
+            target,
+            material: stack.material,
+            shape: stack.shape,
+        });
     }
 
     /// The cells the next dig would remove, as world positions.
@@ -2084,8 +2092,8 @@ impl App {
     fn adopt_view(
         &mut self,
         view: String,
-        slots: Vec<Option<(u16, u32)>>,
-        held: Option<(u16, u32)>,
+        slots: Vec<Option<tiamot_core::proto::StackDef>>,
+        held: Option<tiamot_core::proto::StackDef>,
     ) {
         self.views
             .insert(view, crate::dialog::ViewContents { slots, held });
@@ -2286,7 +2294,7 @@ impl App {
     /// stack is spent, and a selection left pointing past the end would build
     /// with whatever slid into that position — the sort of bug a player reports
     /// as "it placed the wrong thing" and nobody can reproduce.
-    fn adopt_inventory(&mut self, stacks: Vec<(u16, u32)>) {
+    fn adopt_inventory(&mut self, stacks: Vec<tiamot_core::proto::StackDef>) {
         self.carried = stacks;
         self.selected = self.selected.min(self.carried.len().saturating_sub(1));
     }
@@ -2916,7 +2924,7 @@ impl App {
     /// The material the hotbar is on, if the player is carrying anything.
     #[must_use]
     pub fn selected_material(&self) -> Option<u16> {
-        self.carried.get(self.selected).map(|(id, _)| *id)
+        self.carried.get(self.selected).map(|stack| stack.material)
     }
 
     /// Moves the hotbar selection, wrapping.
@@ -2944,7 +2952,7 @@ impl App {
 
     /// What the player is carrying, as `(material, units)` in id order.
     #[must_use]
-    pub fn carried(&self) -> &[(u16, u32)] {
+    pub fn carried(&self) -> &[tiamot_core::proto::StackDef] {
         &self.carried
     }
 
@@ -3914,7 +3922,8 @@ impl App {
                 self.carried
                     .iter()
                     .enumerate()
-                    .map(|(slot, (id, units))| {
+                    .map(|(slot, stack)| {
+                        let (id, units) = (&stack.material, &stack.units);
                         let name = self
                             .materials
                             .get(id)
@@ -4029,17 +4038,18 @@ impl App {
         let carried = self
             .carried
             .iter()
-            .map(|(id, units)| tiamot_core::hud::Carried {
-                material: tiamot_core::MaterialId(*id),
+            .map(|stack| tiamot_core::hud::Carried {
+                material: tiamot_core::MaterialId(stack.material),
                 // The string id, because that is what is canonical (charter
                 // rule 8) and the number is per-session. A script showing a
                 // name shows this one.
                 name: self
                     .materials
-                    .get(id)
+                    .get(&stack.material)
                     .cloned()
-                    .unwrap_or_else(|| format!("#{id}")),
-                units: *units,
+                    .unwrap_or_else(|| format!("#{}", stack.material)),
+                units: stack.units,
+                shape: stack.shape,
             })
             .collect();
         let voxels = phys::Voxels::new(&self.store, predictor.origin());

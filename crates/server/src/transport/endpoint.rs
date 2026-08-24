@@ -492,6 +492,11 @@ pub struct PlacementRequest {
     pub target: tiamot_core::SubNodePos,
     /// The material they claim to be holding.
     pub material: u16,
+    /// The cut they claim to be holding, or `0` for loose material.
+    ///
+    /// A CLAIM, like the material: the server matches it against what the
+    /// player actually has and places nothing if they have no such stack.
+    pub shape: u32,
 }
 
 /// How many chunk requests the simulation serves per tick, across all players.
@@ -555,6 +560,7 @@ impl Shared {
         actor: PlayerUuid,
         target: tiamot_core::SubNodePos,
         material: u16,
+        shape: u32,
     ) -> bool {
         let Ok(mut queue) = self.placements.lock() else {
             return false;
@@ -566,6 +572,7 @@ impl Shared {
             actor,
             target,
             material,
+            shape,
         });
         true
     }
@@ -635,14 +642,20 @@ impl Shared {
     ///
     /// Marks the inventory dirty only when something was actually taken, so a
     /// refused placement does not cost a sync message.
-    pub fn debit(&self, uuid: &PlayerUuid, material: tiamot_core::MaterialId, units: u32) -> u32 {
+    pub fn debit(
+        &self,
+        uuid: &PlayerUuid,
+        material: tiamot_core::MaterialId,
+        shape: Option<tiamot_core::inventory::Shape>,
+        units: u32,
+    ) -> u32 {
         let Ok(mut inventories) = self.inventories.lock() else {
             return 0;
         };
         let Some(held) = inventories.get_mut(uuid) else {
             return 0;
         };
-        let taken = held.take(PLAYER_MAIN, material, units);
+        let taken = held.take(PLAYER_MAIN, material, shape, units);
         if taken > 0
             && let Ok(mut dirty) = self.inventory_dirty.lock()
         {
@@ -1139,17 +1152,20 @@ impl Shared {
         let Some(slots) = self.slots_of(uuid) else {
             return Vec::new();
         };
-        let held = slots.grab.held.map(|stack| (stack.material.0, stack.units));
+        let wire = |stack: tiamot_core::inventory::Stack| tiamot_core::proto::StackDef {
+            material: stack.material.0,
+            units: stack.units,
+            shape: stack
+                .shape
+                .map_or(0, tiamot_core::inventory::Shape::occupancy),
+        };
+        let held = slots.grab.held.map(wire);
         slots
             .views
             .iter()
             .map(|view| ServerMessage::ViewUpdate {
                 view: view.name.clone(),
-                slots: view
-                    .slots
-                    .iter()
-                    .map(|slot| slot.map(|stack| (stack.material.0, stack.units)))
-                    .collect(),
+                slots: view.slots.iter().map(|slot| slot.map(wire)).collect(),
                 held,
             })
             .collect()
@@ -1526,7 +1542,11 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     let stacks = shared
                         .inventory_of(&uuid)
                         .into_iter()
-                        .map(|stack| (stack.material.0, stack.units))
+                        .map(|stack| tiamot_core::proto::StackDef {
+                            material: stack.material.0,
+                            units: stack.units,
+                            shape: stack.shape.map_or(0, tiamot_core::inventory::Shape::occupancy),
+                        })
                         .collect();
                     frame::write(&mut send, &ServerMessage::InventoryUpdate { stacks }).await?;
                     // **And where it all is**, on the same flag. The two are
@@ -1847,9 +1867,13 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
             // same reason digging and movement are queued rather than applied
             // here. Two connection tasks placing at once would otherwise
             // resolve in whichever order the OS woke them.
-            Action::Place { target, material } => {
+            Action::Place {
+                target,
+                material,
+                shape,
+            } => {
                 if let Some(uuid) = session.uuid()
-                    && !shared.queue_placement(uuid, *target, *material)
+                    && !shared.queue_placement(uuid, *target, *material, *shape)
                 {
                     warn!("placement queue is full; dropping a placement");
                 }

@@ -1737,7 +1737,14 @@ impl ServerHandle {
                             // brush fills the block bottom-up.
                             let brush = shared.place_brush(&request.actor);
 
-                            let outcome = tiamot_core::place::plan(request.target, held, brush)
+                            // The cut the player claims to be holding. A shape
+                            // the engine does not consider a shape — empty, or
+                            // a full block — is loose material, which is what a
+                            // client that knows nothing about shapes sends.
+                            let shape = tiamot_core::inventory::Shape::new(request.shape);
+
+                            let outcome =
+                                tiamot_core::place::plan(request.target, held, shape, brush)
                                 .and_then(|plan| {
                                     // Air only, judged cell by cell. Placing
                                     // into occupied space would have to decide
@@ -1830,7 +1837,7 @@ impl ServerHandle {
                             // on any path where the debit came up short —
                             // another connection of theirs spending it between
                             // the check and here is enough.
-                            let paid = shared.debit(&request.actor, material, plan.units);
+                            let paid = shared.debit(&request.actor, material, shape, plan.units);
                             if paid == 0 {
                                 shared.tell(
                                     &request.actor,

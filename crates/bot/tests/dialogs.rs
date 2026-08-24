@@ -403,7 +403,8 @@ fn splitting_a_stack_in_a_dialog_respects_the_twenty_seven_unit_arithmetic() {
             })
             .await
             .expect("the dug block never reached a slot");
-        let (material, units) = before[0].expect("a stack in slot 0");
+        let first = before[0].expect("a stack in slot 0");
+        let (material, units) = (first.material, first.units);
         assert!(units > 1, "need more than one unit to halve, got {units}");
 
         // Right-click it: half into the hand, half left behind.
@@ -423,13 +424,13 @@ fn splitting_a_stack_in_a_dialog_respects_the_twenty_seven_unit_arithmetic() {
                 slots
                     .first()
                     .and_then(|slot| *slot)
-                    .is_none_or(|(_, u)| u < units)
+                    .is_none_or(|stack| stack.units < units)
             })
             .await
             .expect("the split never happened");
 
-        let behind = after[0].map_or(0, |(_, u)| u);
-        let held = bot.held().map_or(0, |(_, u)| u);
+        let behind = after[0].map_or(0, |stack| stack.units);
+        let held = bot.held().map_or(0, |stack| stack.units);
         assert_eq!(
             behind + held,
             units,
@@ -441,7 +442,7 @@ fn splitting_a_stack_in_a_dialog_respects_the_twenty_seven_unit_arithmetic() {
             "the larger half should be in the hand: {held} held against {behind} behind"
         );
         assert_eq!(
-            bot.held().map(|(m, _)| m),
+            bot.held().map(|stack| stack.material),
             Some(material),
             "the material changed"
         );
@@ -463,11 +464,14 @@ fn splitting_a_stack_in_a_dialog_respects_the_twenty_seven_unit_arithmetic() {
                 slots
                     .first()
                     .and_then(|slot| *slot)
-                    .is_some_and(|(_, u)| u == units)
+                    .is_some_and(|stack| stack.units == units)
             })
             .await
             .expect("the halves never merged back");
-        assert_eq!(merged[0], Some((material, units)));
+        assert_eq!(
+            merged[0].map(|stack| (stack.material, stack.units)),
+            Some((material, units))
+        );
         assert_eq!(bot.held(), None, "the hand should be empty after placing");
 
         bot.disconnect().await;
@@ -496,7 +500,11 @@ fn a_forged_slot_move_cannot_invent_items() {
             })
             .await
             .expect("the dug block never reached a slot");
-        let total: u64 = before.iter().flatten().map(|(_, u)| u64::from(*u)).sum();
+        let total: u64 = before
+            .iter()
+            .flatten()
+            .map(|stack| u64::from(stack.units))
+            .sum();
 
         for (view, index) in [
             ("player:main", 9999u16),
@@ -541,9 +549,9 @@ fn a_forged_slot_move_cannot_invent_items() {
         let now: u64 = after
             .iter()
             .flatten()
-            .map(|(_, u)| u64::from(*u))
+            .map(|stack| u64::from(stack.units))
             .sum::<u64>()
-            + bot.held().map_or(0, |(_, u)| u64::from(u));
+            + bot.held().map_or(0, |stack| u64::from(stack.units));
         assert_eq!(
             now, total,
             "a forged slot move changed how many units exist"

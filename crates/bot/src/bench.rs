@@ -371,9 +371,9 @@ pub async fn probe_material(addr: std::net::SocketAddr) -> Result<u16, String> {
         .await
         .map_err(|err| err.to_string())?
         .into_iter()
-        .filter(|(_, units)| *units > 0)
-        .max_by_key(|(id, units)| (*units, std::cmp::Reverse(*id)))
-        .map(|(id, _)| id)
+        .filter(|stack| stack.units > 0)
+        .max_by_key(|stack| (stack.units, std::cmp::Reverse(stack.material)))
+        .map(|stack| stack.material)
         .ok_or_else(|| {
             "the probe dig credited nothing; the mod set defines no drops, so there is \
              nothing to build with"
