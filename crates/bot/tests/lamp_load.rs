@@ -92,6 +92,7 @@ fn twenty_bots_churning_lamps_keep_the_tick_inside_its_budget() {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(reference_mods()),
+        enabled_mods: None,
         seed: Some(31),
         rcon: None,
         materials: Vec::new(),

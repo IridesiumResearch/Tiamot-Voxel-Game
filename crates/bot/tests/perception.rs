@@ -133,6 +133,7 @@ fn start(name: &str, mods: PathBuf) -> ServerHandle {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(mods),
+        enabled_mods: None,
         seed: Some(7),
         rcon: None,
         materials: Vec::new(),

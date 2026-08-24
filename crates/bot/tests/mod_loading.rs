@@ -48,6 +48,7 @@ fn start(world: &Path, mods: Option<PathBuf>) -> ServerHandle {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: mods,
+        enabled_mods: None,
         seed: Some(1),
         rcon: None,
         materials: Vec::new(),
@@ -243,6 +244,7 @@ fn an_unresolvable_mod_set_refuses_to_start() {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(mods),
+        enabled_mods: None,
         seed: Some(1),
         rcon: None,
         materials: Vec::new(),
@@ -328,4 +330,81 @@ fn mod_blocks_get_the_ids_the_vm_promised_them() {
     });
 
     server.stop();
+}
+
+#[test]
+fn a_mod_left_out_of_the_selection_does_not_load() {
+    // **The launcher's tick-boxes, from the server's side.** A world is started
+    // with a list of mod ids and only those load — which is what makes turning
+    // a mod off in the front screen mean anything at all.
+    let world = scratch("selected-world");
+    let mods = scratch("selected-mods");
+    write_mod(&mods, "wanted", "", "game.register_block{ id = \"kept\" }");
+    write_mod(
+        &mods,
+        "unwanted",
+        "",
+        "game.register_block{ id = \"dropped\" }",
+    );
+
+    let server = ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: world,
+        max_players: 8,
+        allowlist: Allowlist::open(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(mods),
+        enabled_mods: Some(vec!["wanted".to_owned()]),
+        seed: Some(1),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("start");
+
+    block_on(async {
+        let bot = join(&server, "picky").await;
+        let table = bot
+            .material_table()
+            .expect("the material table arrives on join");
+        let ids: Vec<&str> = table.iter().map(|def| def.name.as_str()).collect();
+        assert!(
+            ids.contains(&"wanted:kept"),
+            "the mod that was ticked did not load: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"unwanted:dropped"),
+            "a mod left out of the selection registered anyway: {ids:?}"
+        );
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn a_selection_that_breaks_a_dependency_refuses_to_start() {
+    // Half a mod set is not a smaller mod set. Turning off something another
+    // ticked mod depends on is the same failure as never installing it, and it
+    // has to be the same answer — otherwise a player generates a world with a
+    // mod silently absent and finds out later.
+    let world = scratch("broken-selection-world");
+    let mods = scratch("broken-selection-mods");
+    write_mod(&mods, "base", "", "");
+    write_mod(&mods, "needy", "depends = [\"base >=0.1\"]", "");
+
+    let result = ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: world,
+        max_players: 8,
+        allowlist: Allowlist::open(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(mods),
+        enabled_mods: Some(vec!["needy".to_owned()]),
+        seed: Some(1),
+        rcon: None,
+        materials: Vec::new(),
+    });
+    assert!(
+        result.is_err(),
+        "a selection missing a dependency started anyway"
+    );
 }

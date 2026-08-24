@@ -81,6 +81,7 @@ fn two_hundred_ticks_under_four_bots_stays_within_budget() {
         rcon: None,
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         mods_path: None,
+        enabled_mods: None,
         seed: Some(1),
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     })
@@ -243,6 +244,7 @@ fn worldgen_under_a_joining_player_stays_inside_the_tick_budget() {
         allowlist: Allowlist::open(),
         view_distance: view,
         mods_path: Some(repo_mods),
+        enabled_mods: None,
         seed: Some(7),
         rcon: None,
         materials: Vec::new(),
@@ -322,6 +324,7 @@ fn four_bots_all_see_a_fourth_bots_edit() {
         rcon: None,
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         mods_path: None,
+        enabled_mods: None,
         seed: Some(1),
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     })

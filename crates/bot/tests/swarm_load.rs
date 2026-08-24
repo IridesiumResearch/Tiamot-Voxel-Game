@@ -83,6 +83,7 @@ fn twenty_bots_for_sixty_seconds_leave_the_server_healthy() {
         // caught it; nothing in the fast CI loop could, because nothing else
         // runs this workload.
         mods_path: Some(reference_mods()),
+        enabled_mods: None,
         seed: Some(21),
         rcon: None,
         materials: vec!["load:stone".to_owned()],

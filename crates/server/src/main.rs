@@ -131,6 +131,7 @@ fn run(cli: &Cli) -> Result<(), ServerError> {
         allowlist: Allowlist::open(),
         seed: config.seed,
         mods_path: config.mods_path.clone(),
+        enabled_mods: config.enabled_mods.clone(),
         view_distance: tiamot_core::interest::ViewDistance::clamped(
             config.view_distance,
             config.vertical_view_distance,

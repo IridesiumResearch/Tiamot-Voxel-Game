@@ -39,6 +39,7 @@ fn settings(dir: &std::path::Path) -> Settings {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: None,
+        enabled_mods: None,
         seed: Some(11),
         rcon: None,
         materials: Vec::new(),

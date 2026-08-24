@@ -55,6 +55,7 @@ fn start(name: &str) -> ServerHandle {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::DEFAULT,
         mods_path: Some(reference_mods()),
+        enabled_mods: None,
         seed: Some(4),
         rcon: None,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),

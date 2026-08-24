@@ -32,6 +32,7 @@ fn start(name: &str) -> (ServerHandle, std::net::SocketAddr) {
         rcon: Some((rcon_addr, TOKEN.to_owned())),
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         mods_path: None,
+        enabled_mods: None,
         seed: Some(1),
         materials: vec!["test:stone".to_owned()],
     })

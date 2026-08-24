@@ -417,6 +417,16 @@ pub struct Settings {
     /// broken.
     pub mods_path: Option<PathBuf>,
 
+    /// Which mods to load, by id. `None` loads every mod in
+    /// [`mods_path`](Self::mods_path).
+    ///
+    /// **The server owner's decision, and that includes a player running one
+    /// on their own machine.** The launcher's mod tick-boxes arrive here. A
+    /// selection that leaves out something an enabled mod depends on fails to
+    /// resolve and the world does not start, which is right: half a mod set is
+    /// not a smaller mod set.
+    pub enabled_mods: Option<Vec<String>>,
+
     /// Extra material ids to register, on top of whatever mods register.
     ///
     /// Charter rule 9's lifecycle is register → FREEZE → world load, so these
@@ -468,7 +478,11 @@ impl ServerHandle {
         let mut mods: Vec<ModEntry> = Vec::new();
 
         if let Some(mods_path) = &settings.mods_path {
-            match ModHost::<MluaVm>::load_from(mods_path, VmLimits::default()) {
+            match ModHost::<MluaVm>::load_selected(
+                mods_path,
+                VmLimits::default(),
+                settings.enabled_mods.as_deref(),
+            ) {
                 Ok(mut loaded) => {
                     // FREEZE. After this `register_*` is a hard error.
                     if let Err(err) = loaded.freeze() {
@@ -2638,6 +2652,7 @@ impl ServerHandle {
             view_distance: tiamot_core::interest::ViewDistance::DEFAULT,
             seed: None,
             mods_path: None,
+            enabled_mods: None,
             // Singleplayer has no admin port. The player already has full
             // control of the process.
             rcon: None,

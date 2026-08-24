@@ -64,6 +64,7 @@ fn start(name: &str) -> ServerHandle {
         // so a modless server is one where every script would fail at the first
         // dig — and `core_worldgen` is what puts terrain under them to dig.
         mods_path: Some(reference_mods()),
+        enabled_mods: None,
         seed: Some(9),
         rcon: None,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),

@@ -36,6 +36,7 @@ fn settings(dir: &std::path::Path) -> Settings {
         rcon: None,
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         mods_path: None,
+        enabled_mods: None,
         seed: Some(1),
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
     }
@@ -56,6 +57,7 @@ fn reference_mods() -> PathBuf {
 fn settings_with_mods(dir: &std::path::Path) -> Settings {
     Settings {
         mods_path: Some(reference_mods()),
+        enabled_mods: None,
         ..settings(dir)
     }
 }

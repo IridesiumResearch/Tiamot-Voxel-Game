@@ -41,6 +41,7 @@ fn start(name: &str) -> ServerHandle {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(repo().join("game")),
+        enabled_mods: None,
         seed: Some(5),
         rcon: None,
         materials: Vec::new(),

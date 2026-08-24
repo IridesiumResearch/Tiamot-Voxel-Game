@@ -123,6 +123,7 @@ fn start(name: &str, mods: PathBuf) -> ServerHandle {
         // replication is a third of the cost.
         view_distance: ViewDistance::default(),
         mods_path: Some(mods),
+        enabled_mods: None,
         seed: Some(12),
         rcon: None,
         materials: Vec::new(),

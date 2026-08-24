@@ -44,6 +44,7 @@ pub mod dialog;
 pub mod entities;
 pub mod icons;
 pub mod input;
+pub mod launcher;
 pub mod mesher;
 pub mod net;
 pub mod predict;

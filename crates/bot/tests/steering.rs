@@ -102,6 +102,7 @@ fn start(name: &str) -> ServerHandle {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(write_mod(name)),
+        enabled_mods: None,
         seed: Some(31),
         rcon: None,
         materials: Vec::new(),

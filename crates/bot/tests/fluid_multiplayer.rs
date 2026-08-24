@@ -117,6 +117,7 @@ fn start(name: &str) -> (ServerHandle, PathBuf) {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(mods),
+        enabled_mods: None,
         seed: Some(11),
         rcon: None,
         materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),

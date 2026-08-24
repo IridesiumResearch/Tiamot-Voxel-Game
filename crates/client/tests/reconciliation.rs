@@ -80,6 +80,7 @@ fn embedded(name: &str) -> ServerHandle {
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(reference_mods()),
+        enabled_mods: None,
         seed: Some(7),
         rcon: None,
         materials: Vec::new(),

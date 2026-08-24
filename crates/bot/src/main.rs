@@ -398,6 +398,7 @@ fn bench_mode(
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: mods.canonicalize().ok(),
+        enabled_mods: None,
         seed: Some(0x7149_7231),
         rcon: None,
         materials: vec!["bench:stone".to_owned()],

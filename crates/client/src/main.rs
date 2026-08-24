@@ -96,6 +96,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 allowlist: tiamot_core::identity::Allowlist::open(),
                 view_distance: config.view(),
                 mods_path: Some(std::path::PathBuf::from("game")),
+                enabled_mods: None,
                 seed: None,
                 rcon: None,
                 materials: Vec::new(),

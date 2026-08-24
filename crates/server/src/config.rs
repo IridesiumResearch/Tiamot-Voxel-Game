@@ -82,6 +82,16 @@ pub struct Config {
     #[serde(default)]
     pub mods_path: Option<PathBuf>,
 
+    /// Which mods to load, by id. Absent loads every mod in `mods_path`.
+    ///
+    /// **The mod set is the server owner's decision**, whether that owner is a
+    /// company or somebody running a world for two friends. A selection that
+    /// leaves out something an enabled mod depends on fails to resolve and the
+    /// server does not start: half a mod set is not a smaller mod set, and
+    /// there is no correct subset to fall back to.
+    #[serde(default)]
+    pub enabled_mods: Option<Vec<String>>,
+
     /// How far players can see, in chunks (horizontal radius).
     ///
     /// Clamped into the supported range rather than obeyed literally —
@@ -217,6 +227,7 @@ impl Default for Config {
             max_players: Self::default_max_players(),
             seed: None,
             mods_path: None,
+            enabled_mods: None,
             view_distance: Self::default_view_distance(),
             vertical_view_distance: Self::default_vertical_view_distance(),
             rcon: None,
