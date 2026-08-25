@@ -1456,8 +1456,8 @@ impl Bot {
         self.received()
             .into_iter()
             .filter_map(|message| match message {
-                ServerMessage::ShowDialog { form, tree }
-                | ServerMessage::UpdateDialog { form, tree } => Some((form, tree)),
+                ServerMessage::ShowDialog { form, tree, .. }
+                | ServerMessage::UpdateDialog { form, tree, .. } => Some((form, tree)),
                 _ => None,
             })
             .collect()

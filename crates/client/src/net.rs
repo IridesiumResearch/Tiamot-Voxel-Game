@@ -217,6 +217,9 @@ pub enum Event {
         form: String,
         /// What to draw.
         tree: Box<tiamot_core::ui::Tree>,
+        /// Whether the mod built a prompt rather than a screen — see
+        /// [`tiamot_core::proto::ServerMessage::ShowDialog::compact`].
+        compact: bool,
     },
 
     /// A server closed a dialog.
@@ -943,12 +946,21 @@ async fn session(
         };
 
         match message {
-            ServerMessage::ShowDialog { form, tree }
-            | ServerMessage::UpdateDialog { form, tree } => {
+            ServerMessage::ShowDialog {
+                form,
+                tree,
+                compact,
+            }
+            | ServerMessage::UpdateDialog {
+                form,
+                tree,
+                compact,
+            } => {
                 // Validated at decode, so this is a tree that passed `check`.
                 let _ = events.send(Event::Dialog {
                     form,
                     tree: Box::new(tree),
+                    compact,
                 });
             }
             ServerMessage::CloseDialog { form } => {

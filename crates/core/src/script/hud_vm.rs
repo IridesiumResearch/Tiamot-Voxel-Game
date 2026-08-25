@@ -598,6 +598,13 @@ impl HudVm {
             })?,
         )?;
 
+        self.install_icon(hud)?;
+        Ok(())
+    }
+
+    /// The `hud.icon` command, on its own because the draw table is at
+    /// clippy's line ceiling and appending to it is what put it there.
+    fn install_icon(&self, hud: &Table) -> mlua::Result<()> {
         hud.set(
             "icon",
             self.lua.create_function(|lua, spec: Table| {
@@ -607,6 +614,22 @@ impl HudVm {
                     reason = "clamped to u16 range by `whole`"
                 )]
                 let material = MaterialId(whole(raw, 0, 0, i64::from(u16::MAX)) as u16);
+                // Masked to the twenty-seven bits a shape has. A script that
+                // passed a larger number gets the cells that exist rather than
+                // an error: the same saturating rule every other field here
+                // follows, so a value out of range cannot depend on HOW it got
+                // out of range.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "clamped to the 27-bit mask by `whole`"
+                )]
+                let shape = whole(
+                    spec.get::<Option<f64>>("shape")?,
+                    0,
+                    0,
+                    i64::from(crate::inventory::Shape::ALL),
+                ) as u32;
                 emit(
                     lua,
                     Command::Icon {
@@ -615,6 +638,7 @@ impl HudVm {
                         y: offset(&spec, "y")?,
                         size: extent(&spec, "size", 48)?,
                         material,
+                        shape,
                     },
                 )
             })?,
@@ -714,6 +738,9 @@ impl HudVm {
             slot.set("blocks", blocks)?;
             slot.set("nodes", nodes)?;
             slot.set("shape", (entry.shape != 0).then_some(entry.shape))?;
+            // Items, for a cut. `nil` for loose material, where blocks and
+            // spare nodes is the display and a count means nothing.
+            slot.set("count", entry.count())?;
             carried.set(index + 1, slot)?;
         }
         // How many places there are, which `#carried` cannot answer once there
@@ -732,6 +759,9 @@ impl HudVm {
                 slot.set("blocks", blocks)?;
                 slot.set("nodes", nodes)?;
                 slot.set("shape", (entry.shape != 0).then_some(entry.shape))?;
+                // Items, for a cut. `nil` for loose material, where blocks and
+                // spare nodes is the display and a count means nothing.
+                slot.set("count", entry.count())?;
                 Some(slot)
             }
             None => None,
@@ -850,6 +880,83 @@ end)
         };
         assert_eq!(text, "slot 1", "indices handed to Lua are 1-based");
         assert_eq!(*anchor, Anchor::Bottom);
+    }
+
+    #[test]
+    fn the_reference_hud_counts_a_cut_and_measures_loose_material() {
+        // **The real `game/core_ui/hud.lua`, not a fixture.** What a hotbar
+        // says a stack is was reported wrong from the window twice over: a cut
+        // was labelled with its UNITS, so one thirteen-cell stair read `+13`,
+        // and it was drawn with the material's flat tile, so stairs looked like
+        // stone. Both are decisions in that file, and a fixture that repeated
+        // them would prove nothing about the mod that ships.
+        // One item of a thirteen-cell shape, which is thirteen units.
+        const CUT: u32 = 0b1_1010_1010_1010;
+
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../game/core_ui/hud.lua"
+        ))
+        .expect("the reference HUD script");
+
+        let mut vm = vm();
+        vm.load("core_ui", &source).expect("load");
+
+        let mut cut_state = state();
+        cut_state.carried = vec![Some(Carried {
+            material: MaterialId(7),
+            name: "core_blocks:white".to_owned(),
+            units: CUT.count_ones(),
+            shape: CUT,
+        })];
+        assert!(vm.draw(&cut_state).is_empty(), "the reference HUD faulted");
+        let drawn = commands(&vm);
+
+        let labels: Vec<&str> = drawn
+            .iter()
+            .filter_map(|command| match command {
+                Command::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.contains(&"1"),
+            "one stair should be labelled `1`, and the labels were {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|label| label.contains("13")),
+            "the cut was labelled with its units: {labels:?}"
+        );
+        assert!(
+            drawn.iter().any(|command| matches!(
+                command,
+                Command::Icon { shape, .. } if *shape == CUT
+            )),
+            "the hotbar drew the material rather than the cut"
+        );
+
+        // And loose material is unchanged: charter rule 5's blocks and spare
+        // nodes, with no shape for the icon to draw.
+        assert!(vm.draw(&state()).is_empty());
+        let drawn = commands(&vm);
+        let labels: Vec<&str> = drawn
+            .iter()
+            .filter_map(|command| match command {
+                Command::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.contains(&"1+13"),
+            "forty loose units should still read `1+13`, and the labels were {labels:?}"
+        );
+        assert!(
+            drawn.iter().any(|command| matches!(
+                command,
+                Command::Icon { shape, .. } if *shape == 0
+            )),
+            "loose material asked for a shape"
+        );
     }
 
     #[test]

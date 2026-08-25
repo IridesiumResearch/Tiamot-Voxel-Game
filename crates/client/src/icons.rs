@@ -70,6 +70,57 @@ impl<'a> Icons<'a> {
             painter.rect_filled(rect, 2.0, crate::dialog::material_tint(material));
         }
     }
+
+    /// Draws what a stack looks like: a cut as its cells, loose material as its
+    /// tile.
+    ///
+    /// # Why a cut cannot be drawn as a tile
+    ///
+    /// **A shape is the only thing that tells two stacks of one material
+    /// apart.** They stack separately, they cost different amounts and they
+    /// place differently, and an interface that drew the material's tile for
+    /// both showed a player a block of stone where their stairs were. Reported
+    /// from the window, of a cut that had just been made.
+    ///
+    /// The cells are the same projection the shape editor uses — see
+    /// [`crate::shape_view`] — so a cut looks the same wherever it is shown:
+    /// in the editor that made it, in a slot, and on the hotbar.
+    pub fn paint_stack(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        material: u16,
+        shape: u32,
+    ) {
+        if shape == 0 || shape == tiamot_core::inventory::Shape::ALL {
+            self.paint(painter, rect, material);
+            return;
+        }
+        self.paint_cells(painter, rect, material, shape);
+    }
+
+    /// Draws a mask's cells, whatever the mask is.
+    ///
+    /// Separate from [`Icons::paint_stack`] because the shape EDITOR starts
+    /// from a whole block and has to draw it as twenty-seven cells — that is
+    /// the thing being chiselled. A whole block in a SLOT is loose material and
+    /// draws as its tile.
+    pub fn paint_cells(&self, painter: &egui::Painter, rect: egui::Rect, material: u16, mask: u32) {
+        // Square and centred: the projection fits a six-by-six box, and
+        // stretching it would put the cells' faces out of true with each other.
+        let side = rect.width().min(rect.height());
+        let area = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+        for (x, y, z) in crate::shape_view::draw_order(mask) {
+            for face in [
+                crate::shape_view::Face::Front,
+                crate::shape_view::Face::Right,
+                crate::shape_view::Face::Top,
+            ] {
+                let corners = crate::shape_view::face_corners(area, x, y, z, face);
+                crate::dialog::paint_cell_face(painter, corners, *self, material, face);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

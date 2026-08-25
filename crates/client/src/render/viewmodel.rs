@@ -107,6 +107,14 @@ const SKIN: [f32; 4] = [0.85, 0.66, 0.52, 1.0];
 pub struct Held {
     /// The atlas rectangle of what it holds, if it holds anything.
     pub tile: Option<[f32; 4]>,
+    /// The 27-bit occupancy it is cut to, or `0` for a whole block.
+    ///
+    /// **A cut is held as the thing it is.** A hand that drew a cube for both
+    /// showed a player a block of stone where their stairs were, and the shape
+    /// is the only thing that tells the two apart — the same reason a slot
+    /// draws its cells (`crate::icons::Icons::paint_stack`). Reported from the
+    /// window.
+    pub shape: u32,
     /// How far through a swing, `0.0..=1.0`.
     pub swing: f32,
 }
@@ -144,19 +152,96 @@ pub fn pieces(hand: Hand, held: Held) -> Vec<Piece> {
         // the arm's own direction so it follows the swing rather than hanging
         // off it.
         let along = shape::ARM[1] * shape::GRIP + shape::BLOCK * 0.5;
-        pieces.push(Piece {
-            placement: [
-                side * shape::SIDE + roll.sin() * along * side.signum(),
-                drop + roll.cos() * along,
-                depth,
-                roll * 0.4,
-            ],
-            size: [shape::BLOCK, shape::BLOCK, shape::BLOCK, 0.0],
-            uv: tile,
-            tint: [1.0, 1.0, 1.0, 1.0],
-        });
+        let centre = [
+            side * shape::SIDE + roll.sin() * along * side.signum(),
+            drop + roll.cos() * along,
+            depth,
+        ];
+        // Less than the arm's roll, so a held block leans with the swing
+        // without spinning in the hand.
+        let lean = roll * 0.4;
+        for cell in cells(held.shape) {
+            pieces.push(cell.piece(centre, lean, tile));
+        }
     }
     pieces
+}
+
+/// One box of a held thing, before it is placed in the hand.
+///
+/// Offsets are in the BLOCK's own axes — `x` right, `y` up, `z` back, the same
+/// axes the view has — and are turned into view space by [`Cell::piece`].
+#[derive(Debug, Clone, Copy)]
+struct Cell {
+    /// Offset from the centre of the block, in blocks.
+    offset: [f32; 3],
+    /// Half-extent, in blocks.
+    half: f32,
+}
+
+impl Cell {
+    /// Where this box goes, once the hand's lean is applied.
+    ///
+    /// **The offset is rolled by the same angle the corners are.** The shader
+    /// rolls every piece's own corners about the view's forward axis, so a cell
+    /// placed at an unrolled offset would rotate about ITSELF while the
+    /// assembly stayed put — twenty-seven cubes each spinning in place instead
+    /// of one shape leaning. Rolling the offset here is what makes the pile
+    /// rigid.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "charter rule 4 exempts rendering; this is where a hand is on the screen"
+    )]
+    fn piece(self, centre: [f32; 3], lean: f32, tile: [f32; 4]) -> Piece {
+        let (sin, cos) = (lean.sin(), lean.cos());
+        let [dx, dy, dz] = self.offset;
+        Piece {
+            placement: [
+                centre[0] + dx * cos - dy * sin,
+                centre[1] + dx * sin + dy * cos,
+                centre[2] + dz,
+                lean,
+            ],
+            size: [self.half, self.half, self.half, 0.0],
+            uv: tile,
+            tint: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
+
+/// The boxes one held item is made of.
+///
+/// A whole block — loose material, or a mask with every cell — is ONE box, not
+/// twenty-seven: it is the common case by far, it looks identical, and a cut is
+/// the only thing that needs the cells drawn separately.
+fn cells(mask: u32) -> Vec<Cell> {
+    if mask == 0 || mask == tiamot_core::inventory::Shape::ALL {
+        return vec![Cell {
+            offset: [0.0; 3],
+            half: shape::BLOCK,
+        }];
+    }
+    let half = shape::BLOCK / 3.0;
+    let mut cells = Vec::new();
+    for z in 0..3 {
+        for y in 0..3 {
+            for x in 0..3 {
+                let bit = x + y * 3 + z * 9;
+                if mask & (1 << bit) == 0 {
+                    continue;
+                }
+                // `(index - 1) * 2 * half` puts the middle cell at the centre
+                // and the outer two a full cell either side, so three of them
+                // fill exactly the block the single box would have.
+                let along = |index: i32| (index - 1) as f32 * 2.0 * half;
+                cells.push(Cell {
+                    offset: [along(x), along(y), along(z)],
+                    half,
+                });
+            }
+        }
+    }
+    cells
 }
 
 /// The viewmodel's pipeline, its uniform, and the pieces for this frame.
@@ -411,6 +496,7 @@ mod tests {
     fn a_held_block_is_a_second_box_at_the_end_of_the_arm() {
         let held = Held {
             tile: Some([0.1, 0.1, 0.2, 0.2]),
+            shape: 0,
             swing: 0.0,
         };
         let main = pieces(Hand::Main, held);
@@ -445,9 +531,116 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_is_held_as_its_cells_and_fills_the_same_space_a_block_would() {
+        // **The reported bug.** A chiselled stack was drawn as a whole block,
+        // so a player who had just made stairs was shown stone.
+        let tile = Some([0.1, 0.1, 0.2, 0.2]);
+        let whole = pieces(
+            Hand::Main,
+            Held {
+                tile,
+                shape: 0,
+                swing: 0.0,
+            },
+        );
+        // The middle row along x — cells `(0,1,1)`, `(1,1,1)`, `(2,1,1)`.
+        // Deliberately the row through the centre: its cells have no offset in
+        // y or z, so the hand's lean cannot mix them into x and the envelope is
+        // comparable to the whole block's without unrolling anything.
+        let mask = 0b111 << 12;
+        let cut = pieces(
+            Hand::Main,
+            Held {
+                tile,
+                shape: mask,
+                swing: 0.0,
+            },
+        );
+        assert_eq!(whole.len(), 2, "an arm and one box");
+        assert_eq!(
+            cut.len(),
+            2 + mask.count_ones() as usize - 1,
+            "an arm and one box per cell"
+        );
+
+        // The cells occupy the same envelope the single box does: three across
+        // is exactly one block, so a cut does not grow in the hand.
+        //
+        // Measured on the boxes rather than on the placed pieces, because a
+        // placed piece has been rolled into the hand's lean and its extent
+        // along a view axis is no longer the extent along the block's own.
+        let envelope = |mask: u32| {
+            let mut low = f32::MAX;
+            let mut high = f32::MIN;
+            for cell in cells(mask) {
+                low = low.min(cell.offset[0] - cell.half);
+                high = high.max(cell.offset[0] + cell.half);
+            }
+            (low, high)
+        };
+        assert_eq!(
+            envelope(mask),
+            envelope(0),
+            "a full row is not a block wide"
+        );
+
+        // A mask with every cell is the block again — one box, not twenty-seven
+        // that look like one.
+        let all = pieces(
+            Hand::Main,
+            Held {
+                tile,
+                shape: tiamot_core::inventory::Shape::ALL,
+                swing: 0.0,
+            },
+        );
+        assert_eq!(all.len(), 2, "a whole mask is still one box");
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "charter rule 4 exempts rendering; this measures an angle on the screen"
+    )]
+    #[test]
+    fn a_held_cut_leans_as_one_thing_rather_than_cell_by_cell() {
+        // **The trap under drawing a shape at all.** The shader rolls each
+        // piece's own corners about the view's forward axis, so a cell placed
+        // at an UNROLLED offset spins about itself while the pile stays put —
+        // twenty-seven cubes each turning in place instead of one shape
+        // leaning. The offsets have to turn with the corners.
+        //
+        // Measured as the ANGLE between two cells, not the distance between
+        // them: a distance is preserved by any translation, so the first
+        // version of this test passed with the rotation deleted.
+        let held = Held {
+            tile: Some([0.0, 0.0, 1.0, 1.0]),
+            // Two cells apart along the block's own x, through the centre so
+            // nothing else contributes.
+            shape: (1 << 12) | (1 << 14),
+            swing: 0.0,
+        };
+        for swing in [0.0_f32, 0.25, 0.5, 1.0] {
+            let drawn = pieces(Hand::Main, Held { swing, ..held });
+            assert_eq!(drawn.len(), 3, "an arm and two cells");
+            let (first, last) = (drawn[1].placement, drawn[2].placement);
+            let lean = drawn[1].placement[3];
+            let angle = (last[1] - first[1]).atan2(last[0] - first[0]);
+            assert!(
+                (angle - lean).abs() < 1e-5,
+                "at swing {swing} the cells lie at {angle} and the block is rolled to {lean}"
+            );
+            assert!(
+                lean.abs() > 1e-3,
+                "the hand is not leaning at all, so this proves nothing"
+            );
+        }
+    }
+
+    #[test]
     fn a_swing_moves_the_hand_and_comes_back() {
         let held = Held {
             tile: None,
+            shape: 0,
             swing: 0.0,
         };
         let rest = pieces(Hand::Main, held)[0].placement;
@@ -478,6 +671,7 @@ mod tests {
             Hand::Main,
             Held {
                 tile: None,
+                shape: 0,
                 swing: 7.5,
             },
         )[0]
@@ -486,6 +680,7 @@ mod tests {
             Hand::Main,
             Held {
                 tile: None,
+                shape: 0,
                 swing: 1.0,
             },
         )[0]

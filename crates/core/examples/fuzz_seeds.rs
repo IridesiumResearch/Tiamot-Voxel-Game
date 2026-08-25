@@ -709,10 +709,12 @@ fn server_messages() -> Vec<Vec<u8>> {
         ServerMessage::ShowDialog {
             form: "core_ui:inventory".to_owned(),
             tree: sample_tree(),
+            compact: false,
         },
         ServerMessage::UpdateDialog {
             form: "core_ui:inventory".to_owned(),
             tree: sample_tree(),
+            compact: true,
         },
         ServerMessage::CloseDialog {
             form: "core_ui:inventory".to_owned(),

@@ -2914,11 +2914,13 @@ impl tiamot_core::ui::host::Access for Screens {
             tiamot_core::proto::ServerMessage::UpdateDialog {
                 form: request.form.clone(),
                 tree: request.tree.clone(),
+                compact: request.compact,
             }
         } else {
             tiamot_core::proto::ServerMessage::ShowDialog {
                 form: request.form.clone(),
                 tree: request.tree.clone(),
+                compact: request.compact,
             }
         };
         // A mod names a player by their canonical UUID hex (charter rule 13).

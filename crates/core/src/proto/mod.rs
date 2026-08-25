@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 26;
+pub const PROTOCOL_VERSION: u32 = 27;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -82,6 +82,15 @@ pub const PROTOCOL_VERSION: u32 = 26;
 // stream. They are also PER PLAYER rather than broadcast — which entities
 // somebody can see is their own interest set, and sending everyone every mob
 // would make a populated world cost the square of the people watching it.
+// v27 (post-14): `ShowDialog` and `UpdateDialog` carry `compact`. A FIELD
+// change on two messages, the same shape of change v24 made, and it moves the
+// version for the same reason: a v26 client decoding a v27 dialog would read
+// the bool as part of the next field and get a tree that is not one.
+// **Why the flag exists at all.** A dialog is drawn in the same centred four by
+// three sheet as every other screen, because a player reads them as one system
+// and a screen that resized as they switched tabs read as the window moving
+// under them. A yes/no prompt does not want a whole sheet, and the engine
+// cannot tell a prompt from an inventory by looking at it — so the mod says.
 // v26 (post-14): appended `ClientMessage::SwapOffhand`, and `player:main` grew
 // a twenty-eighth slot for the off-hand to live in. The slot count is not on
 // the wire — a view's contents are sent as a list and the client reads its
@@ -1292,6 +1301,14 @@ pub enum ServerMessage {
         form: String,
         /// What to draw.
         tree: crate::ui::Tree,
+        /// Whether to draw it as a small prompt sized to its contents rather
+        /// than as the full sheet every other screen takes.
+        ///
+        /// The engine cannot tell a two-button prompt from an inventory by
+        /// looking at the tree — both are containers of widgets — so the mod
+        /// says which it built. Default is the sheet: a mod that says nothing
+        /// gets the shape the rest of the interface has.
+        compact: bool,
     },
 
     /// Replace the contents of a dialog already open.
@@ -1307,6 +1324,12 @@ pub enum ServerMessage {
         form: String,
         /// Its new contents.
         tree: crate::ui::Tree,
+        /// As [`ServerMessage::ShowDialog::compact`].
+        ///
+        /// Carried on the update as well as the open, so a redraw cannot change
+        /// the shape of the window it lands in — which is exactly what a
+        /// remembered flag would eventually do.
+        compact: bool,
     },
 
     /// Close a dialog.
@@ -2052,7 +2075,8 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         // client's own copy of the world.
         ServerMessage::BlockDelta { edit, .. } => check_occupancy(edit)?,
 
-        ServerMessage::ShowDialog { form, tree } | ServerMessage::UpdateDialog { form, tree } => {
+        ServerMessage::ShowDialog { form, tree, .. }
+        | ServerMessage::UpdateDialog { form, tree, .. } => {
             check_dialog(form, Some(tree))?;
         }
         ServerMessage::CloseDialog { form } => check_dialog(form, None)?,
@@ -2936,12 +2960,14 @@ mod tests {
         let show = encode(&ServerMessage::ShowDialog {
             form: String::new(),
             tree: crate::ui::Tree { nodes: Vec::new() },
+            compact: false,
         })
         .expect("encode");
         assert_eq!(show[0], 28);
         let update = encode(&ServerMessage::UpdateDialog {
             form: String::new(),
             tree: crate::ui::Tree { nodes: Vec::new() },
+            compact: false,
         })
         .expect("encode");
         assert_eq!(update[0], 29);

@@ -18,6 +18,13 @@ pub struct ShowRequest {
     pub tree: super::Tree,
     /// Whether this replaces a dialog already open, rather than opening one.
     pub update: bool,
+    /// Whether the client should draw it as a small prompt sized to its
+    /// contents rather than as the full sheet every other screen takes.
+    ///
+    /// See [`crate::proto::ServerMessage::ShowDialog::compact`]: the engine
+    /// cannot tell a prompt from an inventory by looking at the tree, so the
+    /// mod says, and saying nothing means the sheet.
+    pub compact: bool,
 }
 
 /// The server's side of the dialog API.

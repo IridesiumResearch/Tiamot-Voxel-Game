@@ -25,6 +25,26 @@ local PANEL = { 0, 0, 0, 130 }
 local SELECTED = { 255, 255, 255, 220 }
 local EMPTY = { 0, 0, 0, 90 }
 
+--- What a slot says it holds.
+---
+--- **Two questions with two answers, and the engine has decided which.** Loose
+--- material is blocks and spare nodes, worked out by the engine (charter rule
+--- 5) — `1+13` is what forty units actually is. A CUT is counted instead:
+--- `state.carried[n].count` is how many of that shape it is, and is nil for
+--- loose material, which is what says which display to use. Labelling a
+--- thirteen-cell stair `+13` told a player they had thirteen of something.
+local function label_of(slot)
+    if slot.count then
+        return tostring(slot.count)
+    end
+    if slot.nodes == 0 then
+        return tostring(slot.blocks)
+    elseif slot.blocks == 0 then
+        return "+" .. slot.nodes
+    end
+    return slot.blocks .. "+" .. slot.nodes
+end
+
 --- Draws the hotbar: a fixed row of slots, filled from what you carry.
 ---
 --- **A fixed row, not one box per stack.** It used to draw one slot per carried
@@ -93,24 +113,16 @@ local function hotbar(state)
         end
 
         if slot then
+            -- **The shape as well as the material.** A cut is drawn as its
+            -- cells rather than as the block it came from, because the shape is
+            -- the only thing that tells two stacks of one stone apart.
             hud.icon{
                 anchor = "bottom", x = x, y = SLOT + 6, size = SLOT,
-                material = slot.material,
+                material = slot.material, shape = slot.shape,
             }
-
-            -- Charter rule 5's display, as the engine worked it out. `1+13` is
-            -- what forty units actually is; a raw `40` would be a number about
-            -- nothing a player can hold.
-            local label
-            if slot.nodes == 0 then
-                label = tostring(slot.blocks)
-            elseif slot.blocks == 0 then
-                label = "+" .. slot.nodes
-            else
-                label = slot.blocks .. "+" .. slot.nodes
-            end
             hud.text{
-                anchor = "bottom", x = x + 2, y = 20, text = label, size = 17, colour = WHITE,
+                anchor = "bottom", x = x + 2, y = 20, text = label_of(slot), size = 17,
+                colour = WHITE,
             }
         end
     end
@@ -137,21 +149,11 @@ local function offhand(state)
     }
     hud.icon{
         anchor = "bottom", x = left - PITCH, y = SLOT + 6, size = SLOT,
-        material = state.offhand.material,
+        material = state.offhand.material, shape = state.offhand.shape,
     }
-
-    local slot = state.offhand
-    local label
-    if slot.nodes == 0 then
-        label = tostring(slot.blocks)
-    elseif slot.blocks == 0 then
-        label = "+" .. slot.nodes
-    else
-        label = slot.blocks .. "+" .. slot.nodes
-    end
     hud.text{
         anchor = "bottom", x = left - PITCH + 2, y = 20,
-        text = label, size = 17, colour = WHITE,
+        text = label_of(state.offhand), size = 17, colour = WHITE,
     }
 end
 

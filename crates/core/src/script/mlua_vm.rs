@@ -1848,11 +1848,16 @@ impl MluaVm {
                     // name what it did.
                     crate::ui::check(&tree, crate::ui::Limits::default())
                         .map_err(mlua::Error::external)?;
+                    // **Absent means the sheet.** A mod that says nothing gets
+                    // the same shape every other screen has; `compact = true`
+                    // is a mod saying it built a prompt rather than a screen.
+                    let compact: bool = spec.get::<Option<bool>>("compact")?.unwrap_or(false);
                     let request = crate::ui::host::ShowRequest {
                         player,
                         form,
                         tree,
                         update,
+                        compact,
                     };
                     let shown = slot
                         .lock()
@@ -4605,6 +4610,40 @@ mod tests {
                 panic!("`{hook}` could not be registered: {detail}");
             }
         }
+    }
+
+    #[test]
+    fn a_dialog_is_a_screen_unless_the_mod_says_it_is_a_prompt() {
+        // **The default is the shape the rest of the interface has.** A mod
+        // that says nothing gets the full sheet, because a player reads every
+        // screen the game shows them as one interface — and the engine cannot
+        // tell a two-button prompt from an inventory by looking at the tree.
+        let tree = r#"tree = { type = "label", text = "hello" }"#;
+        let silent = show(&format!(
+            r#"game.show_dialog{{ player = "abc", form = "s", {tree} }}"#
+        ))
+        .expect("load");
+        assert!(
+            !silent[0].compact,
+            "a mod that said nothing got a prompt rather than a screen"
+        );
+
+        let asked = show(&format!(
+            r#"game.show_dialog{{ player = "abc", form = "s", compact = true, {tree} }}"#
+        ))
+        .expect("load");
+        assert!(
+            asked[0].compact,
+            "`compact = true` did not reach the server"
+        );
+
+        // And on an update, because the flag travels with the tree: a redraw
+        // that dropped it would change the window a player is reading.
+        let updated = show(&format!(
+            r#"game.update_dialog{{ player = "abc", form = "s", compact = true, {tree} }}"#
+        ))
+        .expect("load");
+        assert!(updated[0].update && updated[0].compact);
     }
 
     #[test]

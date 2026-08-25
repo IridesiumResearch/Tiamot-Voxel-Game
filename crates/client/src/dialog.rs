@@ -176,7 +176,7 @@ impl Dialogs {
     /// A player who closes a shop and opens it again gets an empty text field,
     /// which is what they expect — and it stops a mod's dialog accumulating
     /// state for a session's worth of forms it never uses again.
-    pub fn retain_open(&mut self, open: &BTreeMap<String, Tree>) {
+    pub fn retain_open(&mut self, open: &BTreeMap<String, Screen>) {
         self.forms.retain(|form, _| open.contains_key(form));
     }
 
@@ -184,18 +184,89 @@ impl Dialogs {
     pub fn draw(
         &mut self,
         ctx: &egui::Context,
-        open: &BTreeMap<String, Tree>,
+        open: &BTreeMap<String, Screen>,
         views: &BTreeMap<String, ViewContents>,
         icons: Icons<'_>,
         area: (f32, f32),
     ) -> Vec<Raised> {
         self.retain_open(open);
         let mut raised = Vec::new();
-        for (form, tree) in open {
+        for (form, screen) in open {
             let local = self.forms.entry(form.clone()).or_default();
-            raised.extend(draw_form(ctx, form, tree, local, views, icons, area));
+            raised.extend(draw_form(ctx, form, screen, local, views, icons, area));
         }
         raised
+    }
+}
+
+/// One dialog a server has open on this screen.
+///
+/// The flag travels WITH the tree rather than being remembered per form: a
+/// redraw carries it too, so a mod cannot change the shape of the window its
+/// screen lives in halfway through — which is exactly what a remembered flag
+/// eventually does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Screen {
+    /// What to draw.
+    pub tree: Tree,
+    /// Whether the mod built a prompt rather than a screen.
+    pub compact: bool,
+}
+
+impl Screen {
+    /// One dialog, as the server described it.
+    #[must_use]
+    pub const fn new(tree: Tree, compact: bool) -> Self {
+        Self { tree, compact }
+    }
+}
+
+/// The rectangle one dialog is drawn in, in points.
+///
+/// # Why a screen is the whole sheet whatever is in it
+///
+/// **A player reads every screen the game puts in front of them as one thing.**
+/// Sizing each one to its contents made the inventory a different size from the
+/// crafting tab of the same dialog, so switching tabs grew and shrank the
+/// window under the pointer, and no two screens agreed with each other.
+/// Reported from the window.
+///
+/// The engine cannot tell a two-button prompt from an inventory by looking at
+/// the tree — both are containers of widgets — so the mod says which it built,
+/// and a `compact` one is measured and capped the way every dialog used to be.
+/// Saying nothing gets the sheet, because the sheet is what the rest of the
+/// interface looks like.
+#[must_use]
+pub fn window_size(compact: bool, wanted: (i32, i32), area: (f32, f32)) -> (i32, i32) {
+    let sheet = crate::panel::size(area);
+    let cap = (sheet.0 as i32, sheet.1 as i32);
+    if compact {
+        (wanted.0.clamp(160, cap.0), wanted.1.clamp(120, cap.1))
+    } else {
+        cap
+    }
+}
+
+/// What a slot says it holds.
+///
+/// **Two different questions, and they have two different answers.** Loose
+/// material is charter rule 5's blocks and spare nodes, because a player thinks
+/// in blocks and `1+13` is what forty units actually is. A CUT is counted:
+/// thirteen units cut to a thirteen-cell shape is one stair, and labelling it
+/// `+13` told a player they had thirteen of something. Reported from the
+/// window. See [`tiamot_core::inventory::items`], which decides which it is.
+#[must_use]
+pub fn stack_label(units: u32, shape: u32) -> String {
+    if let Some(count) = tiamot_core::inventory::items(units, shape) {
+        return count.to_string();
+    }
+    let (blocks, nodes) = tiamot_core::inventory::display(units);
+    if nodes == 0 {
+        blocks.to_string()
+    } else if blocks == 0 {
+        format!("+{nodes}")
+    } else {
+        format!("{blocks}+{nodes}")
     }
 }
 
@@ -203,69 +274,70 @@ impl Dialogs {
 fn draw_form(
     ctx: &egui::Context,
     form: &str,
-    tree: &Tree,
+    screen: &Screen,
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
     area: (f32, f32),
 ) -> Vec<Raised> {
+    let tree = &screen.tree;
     let mut raised = Vec::new();
     let ruler = EguiRuler { ctx };
-    // **Sized to its contents, capped at three quarters of the window.**
-    //
-    // Reported from the window: the inventory "does not quite fill up the whole
-    // screen" is what a player wants, and what they got was a panel three
-    // quarters the size of the window whatever was in it. Laying out into the
-    // cap and then allocating that much space gives every dialog the same size
-    // — a two-button prompt as large as an inventory screen.
-    //
-    // So measure the tree first and lay it out into whichever is smaller. A
-    // tree that genuinely wants the room still gets it, and a small one is a
-    // small window.
-    // The same sheet the engine's own panels take — see `client::panel`. A
-    // mod's dialog is one of the screens a player reads as part of one system,
-    // so it may be smaller than this and never larger.
-    let sheet = crate::panel::size(area);
-    let cap = (sheet.0 as i32, sheet.1 as i32);
-    let wanted = tiamot_core::ui::natural(tree, &ruler);
-    let width = wanted.0.clamp(160, cap.0);
-    let height = wanted.1.clamp(120, cap.1);
+    // The same sheet the engine's own panels take — see `client::panel` and
+    // `window_size`, which is where the reasoning lives. A screen is the sheet;
+    // a prompt is measured and capped by it.
+    // Measured only when the answer can depend on it: a screen is the sheet
+    // whatever is in it, and walking the tree to find a size nothing reads is a
+    // layout pass per dialog per frame.
+    let wanted = if screen.compact {
+        tiamot_core::ui::natural(tree, &ruler)
+    } else {
+        (0, 0)
+    };
+    let (width, height) = window_size(screen.compact, wanted, area);
 
     let mut close = false;
-    egui::Window::new(form)
-        .collapsible(false)
-        .resizable(false)
-        // Centred, and only as a DEFAULT: a player who drags it somewhere gets
-        // to keep it there, which is what `default_pos` means and `fixed_pos`
-        // would not.
-        .default_pos(egui::pos2(
-            (area.0 - width as f32) / 2.0,
-            (area.1 - height as f32) / 2.0,
-        ))
-        .default_width(width as f32)
-        .show(ctx, |ui| {
-            let origin = ui.cursor().min;
-            let laid = layout(tree, Rect::new(0, 0, width, height), &ruler);
-            // The tree and its rectangles are walked TOGETHER, by index, so a
-            // renderer cannot pair a widget with somebody else's rectangle —
-            // which a flat list plus a separate traversal invites.
-            paint(
-                ui,
-                origin,
-                tree,
-                0,
-                &laid,
-                form,
-                local,
-                views,
-                icons,
-                &mut raised,
-            );
-            ui.allocate_space(egui::vec2(laid.rect.w as f32, laid.rect.h as f32));
-            if ui.button("Close").clicked() {
-                close = true;
-            }
-        });
+    let centred = egui::pos2(
+        (area.0 - width as f32) / 2.0,
+        (area.1 - height as f32) / 2.0,
+    );
+    let window = egui::Window::new(form).collapsible(false).resizable(false);
+    // **A screen does not move and a prompt does.** Centred is only a DEFAULT
+    // for a prompt, so a player who drags one somewhere keeps it there; a
+    // screen is the sheet, in the place every other sheet is, and a sheet that
+    // could be dragged half off the window would be a screen with no way back.
+    let window = if screen.compact {
+        window.default_pos(centred).default_width(width as f32)
+    } else {
+        window
+            .movable(false)
+            .fixed_pos(centred)
+            .fixed_size(egui::vec2(width as f32, height as f32))
+            .max_height(height as f32)
+    };
+    window.show(ctx, |ui| {
+        let origin = ui.cursor().min;
+        let laid = layout(tree, Rect::new(0, 0, width, height), &ruler);
+        // The tree and its rectangles are walked TOGETHER, by index, so a
+        // renderer cannot pair a widget with somebody else's rectangle —
+        // which a flat list plus a separate traversal invites.
+        paint(
+            ui,
+            origin,
+            tree,
+            0,
+            &laid,
+            form,
+            local,
+            views,
+            icons,
+            &mut raised,
+        );
+        ui.allocate_space(egui::vec2(laid.rect.w as f32, laid.rect.h as f32));
+        if ui.button("Close").clicked() {
+            close = true;
+        }
+    });
     if close {
         raised.push(Raised {
             form: form.to_owned(),
@@ -484,16 +556,9 @@ fn paint_shape_editor(
     let area = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
     let response = ui.allocate_rect(rect, egui::Sense::click());
 
-    for (x, y, z) in crate::shape_view::draw_order(mask) {
-        for face in [
-            crate::shape_view::Face::Front,
-            crate::shape_view::Face::Right,
-            crate::shape_view::Face::Top,
-        ] {
-            let corners = crate::shape_view::face_corners(area, x, y, z, face);
-            paint_cell_face(ui.painter(), corners, paint.icons, material, face);
-        }
-    }
+    // Cells, not a stack: the editor's whole block is twenty-seven cells to
+    // chisel at, where a whole block in a slot is loose material.
+    paint.icons.paint_cells(ui.painter(), area, material, mask);
 
     let clicked = if response.clicked() {
         Some(false)
@@ -536,7 +601,10 @@ fn paint_shape_editor(
 ///
 /// Falls back to the flat tint when there is no atlas — the frames before the
 /// material table arrives, exactly as a slot does.
-fn paint_cell_face(
+/// # Panics
+///
+/// Never: the `expect` reads back the vertex pushed on the line above it.
+pub fn paint_cell_face(
     painter: &egui::Painter,
     corners: [egui::Pos2; 4],
     icons: crate::icons::Icons<'_>,
@@ -923,18 +991,10 @@ fn paint_slot(
         .and_then(|contents| contents.slots.get(usize::from(index)).copied().flatten())
     {
         let (material, units) = (stack.material, stack.units);
-        paint.icons.paint(ui.painter(), inner.shrink(6.0), material);
-        // **Charter rule 5's display rule, and the only place the 27 shows.**
-        // Blocks and spare nodes, never a raw unit count: a player thinks in
-        // blocks, and `1+13` is what forty units actually is.
-        let (blocks, nodes) = tiamot_core::inventory::display(units);
-        let label = if nodes == 0 {
-            blocks.to_string()
-        } else if blocks == 0 {
-            format!("+{nodes}")
-        } else {
-            format!("{blocks}+{nodes}")
-        };
+        paint
+            .icons
+            .paint_stack(ui.painter(), inner.shrink(6.0), material, stack.shape);
+        let label = stack_label(units, stack.shape);
         ui.painter().text(
             inner.right_bottom() - egui::vec2(2.0, 2.0),
             egui::Align2::RIGHT_BOTTOM,
@@ -971,6 +1031,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_screen_is_the_sheet_and_only_a_prompt_is_its_own_size() {
+        // **The reported bug, as a property.** Switching from the inventory to
+        // the crafting tab of the same dialog changed how much the tree wanted,
+        // and the window grew and shrank under the pointer. A screen is the
+        // sheet whatever is in it, so two different trees cannot disagree about
+        // where the window is.
+        let area = (1920.0, 1080.0);
+        let sheet = crate::panel::size(area);
+        let sheet = (sheet.0 as i32, sheet.1 as i32);
+
+        let small = window_size(false, (200, 150), area);
+        let large = window_size(false, (4000, 4000), area);
+        assert_eq!(
+            small, sheet,
+            "a screen is the sheet however little is in it"
+        );
+        assert_eq!(large, sheet, "a screen is the sheet however much is in it");
+        assert_eq!(small, large, "two tabs of one dialog are the same window");
+
+        // A prompt is measured, and still may not exceed the sheet: a mod that
+        // asks for a window larger than the screen does not get one.
+        assert_eq!(window_size(true, (200, 150), area), (200, 150));
+        assert_eq!(window_size(true, (4000, 4000), area), sheet);
+        // And has a floor, so a tree that measures to nothing is still clickable.
+        assert_eq!(window_size(true, (0, 0), area), (160, 120));
+    }
+
+    #[test]
     fn state_for_a_closed_dialog_is_forgotten() {
         // A player who closes a shop and opens it again gets an empty field,
         // and a session does not accumulate state for forms it never sees
@@ -980,7 +1068,13 @@ mod tests {
         dialogs.forms.insert("a:two".to_owned(), Local::default());
 
         let mut open = BTreeMap::new();
-        open.insert("a:two".to_owned(), Tree { nodes: Vec::new() });
+        open.insert(
+            "a:two".to_owned(),
+            Screen {
+                tree: Tree { nodes: Vec::new() },
+                compact: false,
+            },
+        );
         dialogs.retain_open(&open);
 
         assert!(

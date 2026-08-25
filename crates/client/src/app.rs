@@ -770,7 +770,7 @@ pub struct App {
     ///
     /// A `BTreeMap` so the draw order is the same every frame: two dialogs
     /// open at once should not swap places because a hash changed.
-    dialogs: std::collections::BTreeMap<String, tiamot_core::ui::Tree>,
+    dialogs: std::collections::BTreeMap<String, crate::dialog::Screen>,
     /// The audio backend, or a silent stand-in where there is no device.
     mixer: crate::audio::Mixer,
     /// Which sound each named event plays, as the server last said.
@@ -2109,10 +2109,10 @@ impl App {
     /// A whole tree replaces the old one rather than patching it: a dialog is
     /// small, and a patch stream that dropped a message would leave a player
     /// looking at something the server does not believe is there.
-    fn adopt_dialog(&mut self, form: String, tree: Option<tiamot_core::ui::Tree>) {
-        match tree {
-            Some(tree) => {
-                self.dialogs.insert(form, tree);
+    fn adopt_dialog(&mut self, form: String, screen: Option<crate::dialog::Screen>) {
+        match screen {
+            Some(screen) => {
+                self.dialogs.insert(form, screen);
             }
             None => {
                 self.dialogs.remove(&form);
@@ -2240,28 +2240,33 @@ impl App {
             Vec::new()
         } else {
             let swing = self.swing_phase();
-            let tile = |stack: Option<tiamot_core::proto::StackDef>| {
-                stack.map(|stack| {
-                    let (u0, v0, u1, v1) = self
-                        .tiles
-                        .uv_of(stack.material)
-                        .unwrap_or((0.0, 0.0, 1.0, 1.0));
-                    [u0, v0, u1, v1]
-                })
+            // The tile AND the cut: what the hand holds is a stack, and two
+            // stacks of one stone differ only by their shape.
+            let held = |stack: Option<tiamot_core::proto::StackDef>| {
+                let Some(stack) = stack else {
+                    return crate::render::viewmodel::Held {
+                        tile: None,
+                        shape: 0,
+                        swing,
+                    };
+                };
+                let (u0, v0, u1, v1) = self
+                    .tiles
+                    .uv_of(stack.material)
+                    .unwrap_or((0.0, 0.0, 1.0, 1.0));
+                crate::render::viewmodel::Held {
+                    tile: Some([u0, v0, u1, v1]),
+                    shape: stack.shape,
+                    swing,
+                }
             };
             let main = crate::render::viewmodel::pieces(
                 crate::render::viewmodel::Hand::Main,
-                crate::render::viewmodel::Held {
-                    tile: tile(self.hotbar.get(self.selected).copied().flatten()),
-                    swing,
-                },
+                held(self.hotbar.get(self.selected).copied().flatten()),
             );
             let off = crate::render::viewmodel::pieces(
                 crate::render::viewmodel::Hand::Off,
-                crate::render::viewmodel::Held {
-                    tile: tile(self.offhand()),
-                    swing,
-                },
+                held(self.offhand()),
             );
             [main, off].concat()
         };
@@ -2369,7 +2374,7 @@ impl App {
 
     /// The dialogs a server has open on this screen, in a stable order.
     #[must_use]
-    pub const fn dialogs(&self) -> &std::collections::BTreeMap<String, tiamot_core::ui::Tree> {
+    pub const fn dialogs(&self) -> &std::collections::BTreeMap<String, crate::dialog::Screen> {
         &self.dialogs
     }
 
@@ -3463,7 +3468,11 @@ impl App {
                 Event::SoundBindings { bindings } => self.adopt_bindings(bindings),
 
                 Event::View { view, slots, held } => self.adopt_view(view, slots, held),
-                Event::Dialog { form, tree } => self.adopt_dialog(form, Some(*tree)),
+                Event::Dialog {
+                    form,
+                    tree,
+                    compact,
+                } => self.adopt_dialog(form, Some(crate::dialog::Screen::new(*tree, compact))),
                 Event::DialogClosed { form } => self.adopt_dialog(form, None),
 
                 // Held for the frame loop, which is the only place a sound can

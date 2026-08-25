@@ -275,6 +275,29 @@ impl Stack {
 
 /// Splits a unit count into whole blocks and spare nodes.
 ///
+/// How many items `units` of a material cut to `shape` is, or `None` for loose
+/// material, where `shape` is the 27-bit mask the wire carries and `0` is loose.
+///
+/// **What a player counts is items, not units.** Charter rule 5's blocks and
+/// spare nodes is the right answer for loose rubble and the wrong one for a
+/// stack of stairs: thirteen units cut to a thirteen-cell shape is ONE stair,
+/// and an interface that labelled it `+13` was telling a player they had
+/// thirteen of something. Reported from the window, after making a cut and
+/// finding nodes in the hotbar.
+///
+/// `None` rather than a count of one is the honest answer for loose material:
+/// there is no item to count, which is exactly why the display differs.
+#[must_use]
+pub const fn items(units: u32, shape: u32) -> Option<u32> {
+    if shape == 0 {
+        return None;
+    }
+    // A shape with no cells cannot exist — `Shape::new` refuses an empty mask —
+    // so the division is guarded against a value that never arrives rather than
+    // a case anything reaches.
+    units.checked_div(shape.count_ones())
+}
+
 /// `(units / 27, units % 27)` — charter rule 5's display rule, in one place so
 /// no caller open-codes the division.
 #[must_use]

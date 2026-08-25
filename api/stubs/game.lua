@@ -600,6 +600,7 @@ function game.register_on_chat(callback) end
 ---@field player string Required. The player's UUID — never their display name (charter rule 13).
 ---@field form string Required. Your name for this dialog, namespaced with your mod id automatically.
 ---@field tree Tiamot.Widget Required. The root widget.
+---@field compact boolean? Draw it as a small prompt sized to its contents rather than as a full screen. Default `false`.
 
 ---Shows a dialog on a player's screen.
 ---
@@ -611,6 +612,14 @@ function game.register_on_chat(callback) end
 ---other mod can watch what a player types into your text field or act on your
 ---buttons. That is also why `form` is namespaced — two mods may both use
 ---"inventory" without colliding.
+---
+---**Your dialog is drawn as a full screen unless you say otherwise.** Every
+---screen the game puts in front of a player is the same centred shape, because
+---a player reads them as one interface rather than as one per mod. The engine
+---cannot tell a two-button prompt from an inventory by looking at the tree, so
+---set `compact = true` when you built a prompt, and it is measured and drawn
+---small. Pass it on `update_dialog` too: it travels with the tree, so a redraw
+---cannot change the shape of the window a player is already reading.
 ---
 ---Returns whether the player was there to show it to, which is NOT a promise it
 ---rendered.
@@ -851,9 +860,9 @@ function game.stop_loop(id) end
 ---    hud.hide_builtin("crosshair")
 ---    for index, slot in ipairs(state.carried) do
 ---        hud.icon{ anchor = "bottom", x = (index - 1) * 56 - 224, y = 72, size = 48,
----                  material = slot.material }
+---                  material = slot.material, shape = slot.shape }
 ---        hud.text{ anchor = "bottom", x = (index - 1) * 56 - 224, y = 26,
----                  text = slot.blocks .. "+" .. slot.nodes, size = 18 }
+---                  text = slot.count or (slot.blocks .. "+" .. slot.nodes), size = 18 }
 ---    end
 ---end)
 ---```
@@ -873,6 +882,14 @@ function game.stop_loop(id) end
 ---than a missing entry, so slot four is slot four whether or not there is
 ---anything in it: iterate `1, state.slots` and test each, because `ipairs`
 ---stops at the first hole and `#` cannot measure past one.
+---
+---**A stack carries a `shape` and a `count`, and a cut is not loose material.**
+---`slot.shape` is the 27-bit occupancy each item is cut to, or nil for loose
+---material; passing it to `hud.icon` draws the cells rather than the block's
+---tile, which is the only thing that tells two stacks of one stone apart.
+---`slot.count` is how many of that cut it is, and is nil for loose material —
+---where `slot.blocks` and `slot.nodes` are the display instead. Labelling a
+---thirteen-cell stair `+13` tells a player they have thirteen of something.
 ---
 ---`state.offhand` is the twenty-eighth slot of the same view, or nil. It is
 ---handed over separately because a HUD draws it somewhere else entirely; the

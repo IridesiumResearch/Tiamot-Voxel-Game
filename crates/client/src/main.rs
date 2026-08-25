@@ -1523,11 +1523,12 @@ fn paint_hud_command(
             y,
             size,
             material,
+            shape,
         } => {
             let min = place(*anchor, *x, *y);
             let extent = egui::vec2(f32::from(*size) * scale, f32::from(*size) * scale);
             let rect = egui::Rect::from_min_size(min, extent);
-            icons.paint(painter, rect, material.0);
+            icons.paint_stack(painter, rect, material.0, *shape);
             painter.rect_stroke(
                 rect,
                 2.0,

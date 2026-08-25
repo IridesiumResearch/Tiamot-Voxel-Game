@@ -199,6 +199,13 @@ pub enum Command {
         size: u16,
         /// What to draw.
         material: MaterialId,
+        /// The 27-bit occupancy each item is cut to, or `0` for a whole block.
+        ///
+        /// **A cut does not look like the block it came from**, and a hotbar
+        /// that drew the material's tile for both told a player their stairs
+        /// were stone. `0` draws the flat tile, which is what loose material
+        /// is; anything else draws the cells.
+        shape: u32,
     },
 }
 

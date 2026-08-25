@@ -33,6 +33,16 @@ impl Carried {
     pub const fn display(&self) -> (u32, u32) {
         crate::inventory::display(self.units)
     }
+
+    /// How many items this is, or `None` for loose material.
+    ///
+    /// See [`crate::inventory::items`]: a cut is counted, loose rubble is
+    /// measured, and which of the two a script should show is not a decision
+    /// every script should be making separately.
+    #[must_use]
+    pub const fn count(&self) -> Option<u32> {
+        crate::inventory::items(self.units, self.shape)
+    }
 }
 
 /// What the crosshair is on.
