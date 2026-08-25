@@ -3023,6 +3023,75 @@ fn a_wall_off_the_side_of_the_screen_still_casts_into_it() {
 }
 
 #[test]
+fn a_prop_is_drawn_in_the_world_and_hides_behind_what_is_in_front_of_it() {
+    // **The half of a held item the viewmodel cannot do.** In third person the
+    // block is at a place in the WORLD, not on the screen: it goes behind the
+    // wall you walk past, and the arm holding it passes in front of it. So the
+    // two things worth checking are that it draws at all and that it is
+    // depth-tested — a pass that ignored depth would look right from every
+    // angle except the one where something is in the way.
+    let Some(gpu) = gpu() else { return };
+    let chunks = wall_scene();
+    let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Straight down over the floor, whose top is at y = 8. Down rather than
+    // along, so "in front" and "behind" are a height rather than a heading and
+    // the wall's own edges cannot come into it.
+    let mut camera = Camera {
+        position: Position::from_world(20.0, 14.0, 24.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -1.5);
+    let bare = target.capture(&mut renderer, &camera).expect("capture");
+
+    // One box hanging in the air between the camera and the floor.
+    let near = client::render::Prop {
+        model: glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::splat(0.25),
+            glam::Quat::IDENTITY,
+            glam::vec3(0.0, -2.0, 0.0),
+        )
+        .to_cols_array(),
+        uv: [0.0, 0.0, 0.25, 0.25],
+    };
+    renderer.set_props(std::slice::from_ref(&near));
+    let held = target.capture(&mut renderer, &camera).expect("capture");
+
+    let changed = |other: &client::texture::Image| {
+        (0..HEIGHT)
+            .step_by(2)
+            .flat_map(|y| (0..WIDTH).step_by(2).map(move |x| (x, y)))
+            .filter(|(x, y)| bare.pixel(*x, *y) != other.pixel(*x, *y))
+            .count()
+    };
+    let drawn = changed(&held);
+    assert!(
+        drawn > 20,
+        "only {drawn} pixels changed when a prop was put in front of the camera"
+    );
+
+    // The same box, now buried in the floor. Depth-tested, so none of it
+    // should reach the frame.
+    let behind = client::render::Prop {
+        model: glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::splat(0.25),
+            glam::Quat::IDENTITY,
+            glam::vec3(0.0, -7.0, 0.0),
+        )
+        .to_cols_array(),
+        uv: [0.0, 0.0, 0.25, 0.25],
+    };
+    renderer.set_props(std::slice::from_ref(&behind));
+    let hidden = target.capture(&mut renderer, &camera).expect("capture");
+    let leaked = changed(&hidden);
+    assert_eq!(
+        leaked, 0,
+        "{leaked} pixels of a prop behind the wall reached the frame, so it is not depth-tested"
+    );
+}
+
+#[test]
 fn a_hand_is_on_screen_in_first_person_and_holds_what_is_selected() {
     // **The viewmodel, from the one angle that can go wrong invisibly.** It is
     // drawn in VIEW space with no view matrix and no depth test, so the two

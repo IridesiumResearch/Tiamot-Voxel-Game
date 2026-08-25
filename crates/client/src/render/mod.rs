@@ -565,6 +565,14 @@ pub struct Renderer {
     blobs: wgpu::Buffer,
     blob_count: u32,
     blob_capacity: usize,
+    /// The prop pipeline — what a figure is holding — and this frame's boxes.
+    ///
+    /// Two pipelines for the two colour targets, exactly as the blob has: mode
+    /// 3 draws into an HDR offscreen and the other modes into the surface.
+    prop_pipeline: wgpu::RenderPipeline,
+    prop_pipeline_hdr: wgpu::RenderPipeline,
+    props: wgpu::Buffer,
+    prop_count: u32,
     /// Mode 3's targets and post chain, built when that mode is showing and
     /// dropped when it is not.
     ///
@@ -685,6 +693,7 @@ impl Renderer {
             build_fluid_pipeline(&gpu, &shader, &[Some(&bind_layout)], COLOUR_FORMAT);
 
         let (blob_pipeline, blob_pipeline_hdr, blobs) = build_blobs(&gpu, &bind_layout);
+        let (prop_pipeline, prop_pipeline_hdr, props) = build_props(&gpu, &bind_layout);
 
         let (selection_shader, selection_pipeline, selection_buffer, border_buffer) =
             build_lines(&gpu, &bind_layout);
@@ -696,22 +705,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("atlas"),
-            // Repeat, because the shader's `fract` already wraps — this only
-            // matters for the derivative-driven mip levels at grazing angles.
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            // NEAREST magnification: voxel textures are pixel art, and
-            // smoothing them is what turns a 16-pixel tile into a smear.
-            // Linear minification and mip interpolation, because the
-            // alternative is aliasing that shimmers as the camera moves.
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
+        let sampler = build_atlas_sampler(&gpu);
 
         let placeholder = Atlas::build(&[None]);
         let (view, grid, side) = upload_atlas(&gpu, &placeholder);
@@ -775,6 +769,10 @@ impl Renderer {
             blobs,
             blob_count: 0,
             blob_capacity: BLOB_CAPACITY,
+            prop_pipeline,
+            prop_pipeline_hdr,
+            props,
+            prop_count: 0,
             post: None,
             // Full daylight until a sky says otherwise, which is what Task
             // 08's scenes assumed and what a world with no sky mod gets.
@@ -879,6 +877,16 @@ impl Renderer {
         self.entities_at.truncate(self.entity_figures);
         self.entities_at.extend(figure);
         self.player = figure.is_some();
+    }
+
+    /// Where a named joint of `figure` is, in the figure's own space.
+    ///
+    /// See [`skinned::Skinned::attachment`]: the caller composes the heading
+    /// and the camera-relative offset around it, because those are the
+    /// caller's and the joint is the rig's.
+    #[must_use]
+    pub fn attachment(&self, figure: &skinned::Figure, joint: &str) -> Option<[f32; 16]> {
+        self.skinned.attachment(figure, joint)
     }
 
     /// How many figures the world pass draws, as opposed to the cascades.
@@ -1110,6 +1118,46 @@ impl Renderer {
                 .queue
                 .write_buffer(&self.blobs, 0, bytemuck::cast_slice(&instances));
         }
+    }
+
+    /// Sets what figures are holding this frame.
+    ///
+    /// **Every frame, like the entity list and the blobs.** A prop hangs off an
+    /// animated joint, so where it is is a function of the clip's phase and
+    /// changes on every one of them; there is nothing to keep between frames.
+    ///
+    /// Silently truncated at [`PROP_CAPACITY`], which is the same bargain the
+    /// blobs make: a frame that drew a few boxes fewer is better than one that
+    /// reallocated a buffer to draw them all.
+    pub fn set_props(&mut self, props: &[Prop]) {
+        let count = props.len().min(PROP_CAPACITY);
+        self.prop_count = u32::try_from(count).unwrap_or(0);
+        if count > 0 {
+            self.gpu
+                .queue
+                .write_buffer(&self.props, 0, bytemuck::cast_slice(&props[..count]));
+        }
+    }
+
+    /// Draws what figures are holding, if anything.
+    fn draw_props(&self, pass: &mut wgpu::RenderPass<'_>) {
+        if self.prop_count == 0 {
+            return;
+        }
+        let pipeline = if self.post.is_some() {
+            &self.prop_pipeline_hdr
+        } else {
+            &self.prop_pipeline
+        };
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.set_vertex_buffer(0, self.props.slice(..));
+        pass.draw(0..36, 0..self.prop_count);
+        // **Put the chunks' instance array back**, for exactly the reason the
+        // figures put it back: the fluid pass sets slot 0 and the indices and
+        // inherits slot 1 from the chunk loop, so leaving anything else there
+        // feeds a pond somebody's hand as its chunk offset.
+        pass.set_vertex_buffer(1, self.instances.slice(..));
     }
 
     /// Draws the blob shadows, if there are any.
@@ -1866,6 +1914,10 @@ impl Renderer {
                 pass.set_vertex_buffer(1, self.instances.slice(..));
             }
 
+            // What those figures are holding, in the same company: opaque,
+            // depth-tested, after the terrain and before the blended fluid.
+            self.draw_props(&mut pass);
+
             self.draw_fluid(&mut pass, fluid_pipeline, &culled.visible);
 
             // Last, so it draws over the world it outlines. Its pipeline does
@@ -2013,6 +2065,102 @@ fn build_selection_pipeline(
 /// controls the length of.
 const BLOB_CAPACITY: usize = 512;
 
+/// Most prop boxes one frame will draw.
+///
+/// A held item is at most twenty-seven cells and there are two hands, so this
+/// is a couple of dozen figures' worth. The local player is the only one whose
+/// hands the client knows about today; the cap is what stops a future one that
+/// knows about everybody from being unbounded.
+const PROP_CAPACITY: usize = 512;
+
+/// One prop box, as the shader reads it.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Prop {
+    /// The model matrix, camera-relative, by column.
+    pub model: [f32; 16],
+    /// The atlas rectangle: `u0, v0, u1, v1`.
+    pub uv: [f32; 4],
+}
+
+/// How big a held block is, as a half-extent in cells.
+///
+/// **Smaller than a real block.** A full one at true scale is nearly a third of
+/// the figure's height and reads as somebody carrying a wardrobe; this is about
+/// half a block across, which is what a voxel game holds. Tuned by eye, like
+/// the viewmodel's own constants and for the same reason: a held object is a
+/// composition, and the only test of the number is whether it looks held.
+const HELD_HALF: f32 = 0.7;
+
+/// Where the block sits in the hand joint's own frame, in cells.
+///
+/// The rig hangs each limb downward from its joint — a hand's box runs from the
+/// joint origin to about a cell below it — so this drops the block to the fist
+/// and pushes it a little forward of the palm. It deliberately overlaps the
+/// hand rather than floating clear of it, which is the same call the viewmodel
+/// made and was reported as looking better than a gap.
+const HELD_GRIP: [f32; 3] = [0.0, -0.55, 0.35];
+
+/// The boxes one hand is holding, as instances the prop pass can draw.
+///
+/// `joint` is the hand's transform in the figure's own space — cells, model
+/// space, straight from [`Renderer::attachment`] — and the figure's heading and
+/// camera-relative offset are composed around it here, in the same order the
+/// skinned vertex stage composes them: cells to blocks, then the heading, then
+/// the offset. Getting that order wrong puts a held block somewhere in the
+/// world that has nothing to do with the hand.
+///
+/// A cut is one box per occupied cell, exactly as the viewmodel draws it, so a
+/// stair looks like a stair in both views.
+#[must_use]
+pub fn held_boxes(
+    figure: &skinned::Figure,
+    joint: &[f32; 16],
+    shape: u32,
+    uv: [f32; 4],
+) -> Vec<Prop> {
+    use glam::Mat4;
+
+    let placed = Mat4::from_translation(glam::Vec3::from(figure.offset))
+        * Mat4::from_rotation_y(figure.yaw)
+        // The rig is built in cells and the world is in blocks — the division
+        // `place()` does in the shader, done here for the same geometry.
+        * Mat4::from_scale(glam::Vec3::splat(1.0 / 3.0))
+        * Mat4::from_cols_array(joint)
+        * Mat4::from_translation(glam::Vec3::from(HELD_GRIP));
+
+    let whole = shape == 0 || shape == tiamot_core::inventory::Shape::ALL;
+    if whole {
+        return vec![Prop {
+            model: (placed * Mat4::from_scale(glam::Vec3::splat(HELD_HALF))).to_cols_array(),
+            uv,
+        }];
+    }
+
+    let half = HELD_HALF / 3.0;
+    let mut boxes = Vec::new();
+    for z in 0..3 {
+        for y in 0..3 {
+            for x in 0..3 {
+                if shape & (1 << (x + y * 3 + z * 9)) == 0 {
+                    continue;
+                }
+                // The middle cell at the centre and the outer two a full cell
+                // either side, so three of them fill exactly the block one box
+                // would have.
+                let along = |index: i32| (index - 1) as f32 * 2.0 * half;
+                let cell = Mat4::from_translation(glam::vec3(along(x), along(y), along(z)))
+                    * Mat4::from_scale(glam::Vec3::splat(half));
+                boxes.push(Prop {
+                    model: (placed * cell).to_cols_array(),
+                    uv,
+                });
+            }
+        }
+    }
+    boxes
+}
+
 /// One blob shadow, as the shader reads it.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -2048,6 +2196,125 @@ fn build_blobs(
         build_blob_pipeline(gpu, &shader, bind_layout, graph::HDR_FORMAT),
         buffer,
     )
+}
+
+/// How the atlas is sampled.
+///
+/// Its own function because `Renderer::new` sits at clippy's line ceiling and
+/// this is a block of settings with one reason to change — the same argument
+/// `build_lines` and `build_blobs` make.
+fn build_atlas_sampler(gpu: &Gpu) -> wgpu::Sampler {
+    gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("atlas"),
+        // Repeat, because the shader's `fract` already wraps — this only
+        // matters for the derivative-driven mip levels at grazing angles.
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        // NEAREST magnification: voxel textures are pixel art, and smoothing
+        // them is what turns a 16-pixel tile into a smear. Linear minification
+        // and mip interpolation, because the alternative is aliasing that
+        // shimmers as the camera moves.
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    })
+}
+
+/// The prop pass: two pipelines and the buffer they read.
+///
+/// Built together for the reason `build_blobs` gives — `Renderer::new` sits at
+/// clippy's line ceiling, and this is three statements that belong to one
+/// thing.
+fn build_props(
+    gpu: &Gpu,
+    bind_layout: &wgpu::BindGroupLayout,
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::Buffer) {
+    let shader = gpu
+        .device
+        .create_shader_module(wgpu::include_wgsl!("prop.wgsl"));
+    let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("props"),
+        size: (PROP_CAPACITY * size_of::<Prop>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (
+        build_prop_pipeline(gpu, &shader, bind_layout, COLOUR_FORMAT),
+        build_prop_pipeline(gpu, &shader, bind_layout, graph::HDR_FORMAT),
+        buffer,
+    )
+}
+
+/// The prop pipeline: one instanced cube per box, opaque.
+///
+/// **Depth-writing, unlike the blob.** A held block is a solid object standing
+/// in the world: the arm holding it goes in front of it from some angles and
+/// behind it from others, and only the depth buffer knows which.
+fn build_prop_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    bind_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let layout = gpu
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("prop-pipeline-layout"),
+            bind_group_layouts: &[Some(bind_layout)],
+            immediate_size: 0,
+        });
+    let columns: [wgpu::VertexAttribute; 5] = std::array::from_fn(|index| wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x4,
+        offset: (index * size_of::<[f32; 4]>()) as u64,
+        shader_location: index as u32,
+    });
+
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("prop"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vertex_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: size_of::<Prop>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &columns,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fragment_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
 }
 
 /// The blob-shadow pipeline: one instanced quad per body, blended dark.
@@ -2622,4 +2889,133 @@ fn make_depth_with(
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A joint sitting three cells to the figure's own right, at rest.
+    fn joint(at: [f32; 3]) -> [f32; 16] {
+        let mut matrix = tiamot_core::model::Matrix::from([
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0_f32,
+        ]);
+        matrix[12] = at[0];
+        matrix[13] = at[1];
+        matrix[14] = at[2];
+        matrix
+    }
+
+    fn placement(prop: &Prop) -> glam::Vec3 {
+        glam::vec3(prop.model[12], prop.model[13], prop.model[14])
+    }
+
+    #[test]
+    fn a_held_box_lands_where_the_hand_is_and_not_where_the_figure_started() {
+        // **The composition order, which is the whole of what can go wrong
+        // here.** The rig is in cells and the world is in blocks, and the
+        // figure's own offset is ALREADY in blocks — so scaling the wrong side
+        // of the multiply divides a player's position by three and puts their
+        // hands a third of the way back to the origin. Nothing about the
+        // picture says which of the two happened; the block is simply somewhere
+        // else.
+        let figure = skinned::Figure {
+            offset: [12.0, -3.0, 40.0],
+            yaw: 0.0,
+            anim: 0,
+            phase: 0.0,
+        };
+        let boxes = held_boxes(&figure, &joint([3.0, 0.0, 0.0]), 0, [0.0; 4]);
+        assert_eq!(boxes.len(), 1, "a whole block is one box");
+
+        // At yaw zero the figure's axes are the world's, so the hand is its
+        // three cells — one block — along x, plus the grip, and the offset is
+        // untouched.
+        let grip = glam::Vec3::from(HELD_GRIP) / 3.0;
+        let wanted = glam::Vec3::from(figure.offset) + glam::vec3(1.0, 0.0, 0.0) + grip;
+        let at = placement(&boxes[0]);
+        assert!(
+            (at - wanted).length() < 1e-5,
+            "the hand is at {at} and should be at {wanted}"
+        );
+    }
+
+    #[test]
+    fn a_held_box_turns_with_the_figure_and_the_offset_does_not() {
+        // Turned a quarter, so the hand swings from +x to −z while the body
+        // stays exactly where it was. A rotation applied to the wrong side —
+        // to the whole thing rather than to the rig — would move the body too,
+        // which is a player teleporting as they turn.
+        let figure = skinned::Figure {
+            offset: [12.0, -3.0, 40.0],
+            yaw: std::f32::consts::FRAC_PI_2,
+            anim: 0,
+            phase: 0.0,
+        };
+        let boxes = held_boxes(&figure, &joint([3.0, 0.0, 0.0]), 0, [0.0; 4]);
+        let at = placement(&boxes[0]);
+
+        // The hand's own displacement from the body, which is what turned.
+        let arm = at - glam::Vec3::from(figure.offset);
+        assert!(
+            arm.z < -0.5 && arm.x.abs() < 0.5,
+            "a quarter turn should carry the hand from +x to −z, and it is at {arm}"
+        );
+        // One block out, plus the grip: the arm did not stretch or collapse.
+        assert!(
+            (arm.length() - 1.0).abs() < 0.5,
+            "the hand is {} blocks from the body: {arm}",
+            arm.length()
+        );
+    }
+
+    #[test]
+    fn a_held_cut_is_one_box_per_cell_and_fills_the_block_it_came_from() {
+        let figure = skinned::Figure {
+            offset: [0.0; 3],
+            yaw: 0.0,
+            anim: 0,
+            phase: 0.0,
+        };
+        let mask = 0b111 << 12;
+        let cut = held_boxes(&figure, &joint([0.0; 3]), mask, [0.0; 4]);
+        assert_eq!(cut.len(), mask.count_ones() as usize);
+
+        // Three cells across is exactly the block one box would have been, in
+        // the figure's own frame — measured on x, which at yaw zero is the
+        // world's x and the row's own axis.
+        let extent = |boxes: &[Prop]| {
+            let mut low = f32::MAX;
+            let mut high = f32::MIN;
+            for prop in boxes {
+                // The scale is on the diagonal and is already in blocks —
+                // the cells-to-blocks division is inside the matrix.
+                let half = prop.model[0].abs();
+                low = low.min(placement(prop).x - half);
+                high = high.max(placement(prop).x + half);
+            }
+            (low, high)
+        };
+        let whole = held_boxes(&figure, &joint([0.0; 3]), 0, [0.0; 4]);
+        let (cut_low, cut_high) = extent(&cut);
+        let (whole_low, whole_high) = extent(&whole);
+        assert!(
+            (cut_low - whole_low).abs() < 1e-5 && (cut_high - whole_high).abs() < 1e-5,
+            "a full row of cells spans {cut_low}..{cut_high} and the block spans \
+             {whole_low}..{whole_high}"
+        );
+
+        // A mask with every cell is the block again — one box, not
+        // twenty-seven that look like one.
+        let all = held_boxes(
+            &figure,
+            &joint([0.0; 3]),
+            tiamot_core::inventory::Shape::ALL,
+            [0.0; 4],
+        );
+        assert_eq!(all.len(), 1);
+    }
 }

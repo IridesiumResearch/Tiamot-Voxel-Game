@@ -46,6 +46,28 @@ pub const IDENTITY: Matrix = [
 #[must_use]
 pub fn skinning_matrices(model: &Model, clip: Option<&Clip>, time: f32) -> Vec<Matrix> {
     let joints = &model.skin.joints;
+    joint_matrices(model, clip, time)
+        .iter()
+        .zip(joints)
+        .map(|(matrix, joint)| multiply(matrix, &joint.inverse_bind))
+        .collect()
+}
+
+/// Where each joint IS, for a clip at a time — model space, no inverse bind.
+///
+/// # Why this is not [`skinning_matrices`]
+///
+/// A skinning matrix moves a VERTEX from its bind pose to where the joint has
+/// carried it, which is the joint's transform composed with the inverse of
+/// where it started. Ask one of those where the hand is and the answer is
+/// wrong by exactly the bind pose.
+///
+/// What hangs a held block off a hand is this: the joint's own place in the
+/// figure, which is what an attachment point means. Same walk, same order, one
+/// multiply short.
+#[must_use]
+pub fn joint_matrices(model: &Model, clip: Option<&Clip>, time: f32) -> Vec<Matrix> {
+    let joints = &model.skin.joints;
     if joints.is_empty() {
         return Vec::new();
     }
@@ -82,10 +104,6 @@ pub fn skinning_matrices(model: &Model, clip: Option<&Clip>, time: f32) -> Vec<M
     }
 
     world
-        .iter()
-        .zip(joints)
-        .map(|(matrix, joint)| multiply(matrix, &joint.inverse_bind))
-        .collect()
 }
 
 /// The rest pose, for a model with no clip to play.

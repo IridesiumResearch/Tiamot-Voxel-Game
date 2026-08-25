@@ -2273,6 +2273,48 @@ impl App {
         self.renderer.set_hands(pieces);
     }
 
+    /// Puts what the player is carrying into the hands of their own figure.
+    ///
+    /// **First person has a viewmodel and third person has a body**, and until
+    /// now only one of the two held anything: turning around showed a figure
+    /// with empty hands holding the block it had just placed. Reported from the
+    /// window.
+    ///
+    /// # What this does not do yet
+    ///
+    /// **Only the local player's.** Nothing on the wire says what somebody ELSE
+    /// is holding — an entity carries a position, a heading and an animation
+    /// tag, and nothing about an inventory — so every other figure in the world
+    /// still has empty hands. Closing that is a field on the entity stream and
+    /// a protocol version, not a change here.
+    fn place_props(&mut self, figure: Option<&crate::render::skinned::Figure>) {
+        let Some(figure) = figure.filter(|_| self.third_person) else {
+            self.renderer.set_props(&[]);
+            return;
+        };
+        let mut props = Vec::new();
+        for (joint, stack) in [
+            ("hand.r", self.hotbar.get(self.selected).copied().flatten()),
+            ("hand.l", self.offhand()),
+        ] {
+            let Some(stack) = stack else { continue };
+            let Some(joint) = self.renderer.attachment(figure, joint) else {
+                continue;
+            };
+            let (u0, v0, u1, v1) = self
+                .tiles
+                .uv_of(stack.material)
+                .unwrap_or((0.0, 0.0, 1.0, 1.0));
+            props.extend(crate::render::held_boxes(
+                figure,
+                &joint,
+                stack.shape,
+                [u0, v0, u1, v1],
+            ));
+        }
+        self.renderer.set_props(&props);
+    }
+
     /// Rebuilds the hotbar from the player's own slots.
     ///
     /// **The first nine slots of `player:main`, holes and all.** The hotbar
@@ -3855,19 +3897,23 @@ impl App {
         self.place_entities();
         // And after the entities, because the player's figure goes on the end
         // of theirs — see `Renderer::set_player`.
-        self.renderer
-            .set_player(Some(crate::render::skinned::Figure {
-                offset: at,
-                // The camera's yaw, not the server's: the body turns with the
-                // look, at prediction rate, which is the whole reason the local
-                // player is not simply read back off the entity stream —
-                // converted, because the two count from different directions.
-                yaw: figure_yaw(self.camera.yaw),
-                anim: self.gait(),
-                phase: self.since_start.elapsed().as_secs_f32(),
-            }));
+        let figure = crate::render::skinned::Figure {
+            offset: at,
+            // The camera's yaw, not the server's: the body turns with the look,
+            // at prediction rate, which is the whole reason the local player is
+            // not simply read back off the entity stream — converted, because
+            // the two count from different directions.
+            yaw: figure_yaw(self.camera.yaw),
+            anim: self.gait(),
+            phase: self.since_start.elapsed().as_secs_f32(),
+        };
+        self.renderer.set_player(Some(figure));
         self.place_blobs();
         self.place_hands();
+        // The same figure, not another one built from the same fields: what the
+        // hands hold hangs off the clip's phase and the heading, and two copies
+        // of those would be two things to keep in step.
+        self.place_props(Some(&figure));
     }
 
     /// Places every entity in view for this frame.

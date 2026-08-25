@@ -165,6 +165,31 @@ impl Skinned {
         &self.shader
     }
 
+    /// Where a named joint IS, in the figure's own space, for hanging
+    /// something off it.
+    ///
+    /// **In CELLS and in model space**, like every coordinate the rig is built
+    /// in: the caller composes the figure's heading and its camera-relative
+    /// offset around this, exactly as the vertex stage does — see `place` in
+    /// `skinned.wgsl`. Doing that here would mean this function knowing about
+    /// the floating origin, which is the one thing a joint does not care about.
+    ///
+    /// `None` for a model that has no such joint, so a mod-supplied rig with
+    /// its own naming loses its held item rather than putting it at the origin.
+    #[must_use]
+    pub fn attachment(&self, figure: &Figure, joint: &str) -> Option<[f32; 16]> {
+        let index = self.model.skin.index_of(joint)?;
+        let clip = self
+            .model
+            .clip(model::clip_for(tiamot_core::ent::AnimTag(figure.anim)));
+        // The joint's own transform, not a skinning matrix: one of those is
+        // composed with the inverse bind pose and answers where a VERTEX went,
+        // which is wrong by exactly the bind pose. See `model::joint_matrices`.
+        model::joint_matrices(&self.model, clip, figure.phase)
+            .get(usize::from(index))
+            .copied()
+    }
+
     /// How many joints one figure's palette takes.
     #[must_use]
     pub fn joints(&self) -> usize {
