@@ -58,19 +58,6 @@ impl<'a> Icons<'a> {
         ))
     }
 
-    /// Draws a material into `rect`, textured if it can be and tinted if not.
-    ///
-    /// The single place the fallback is decided, so every material shown
-    /// anywhere in the interface degrades the same way on the frames before
-    /// the atlas exists.
-    pub fn paint(&self, painter: &egui::Painter, rect: egui::Rect, material: u16) {
-        if let Some((texture, uv)) = self.of(material) {
-            painter.image(texture, rect, uv, egui::Color32::WHITE);
-        } else {
-            painter.rect_filled(rect, 2.0, crate::dialog::material_tint(material));
-        }
-    }
-
     /// Draws what a stack looks like: a cut as its cells, loose material as its
     /// tile.
     ///
@@ -93,10 +80,36 @@ impl<'a> Icons<'a> {
         shape: u32,
     ) {
         if shape == 0 || shape == tiamot_core::inventory::Shape::ALL {
-            self.paint(painter, rect, material);
+            self.paint_block(painter, rect, material);
             return;
         }
         self.paint_cells(painter, rect, material, shape);
+    }
+
+    /// Draws a whole block as a cube seen from a corner.
+    ///
+    /// # Why a slot is not a flat square
+    ///
+    /// **A flat tile is one face of a block, and a player reads it as a
+    /// sticker.** Reported from the window: the inventory and the hotbar
+    /// "display as a square for the most part", and an angled block is what
+    /// they should be. Three faces at three brightnesses is what says the thing
+    /// in the slot is a solid object, and it is the same projection a cut is
+    /// drawn in — so a block and a stair cut from it look like the same
+    /// material seen the same way.
+    ///
+    /// Three quads rather than the twenty-seven cells of a full mask: the cube
+    /// is identical and the seams between cell edges are not.
+    pub fn paint_block(&self, painter: &egui::Painter, rect: egui::Rect, material: u16) {
+        let area = square(rect);
+        for face in [
+            crate::shape_view::Face::Front,
+            crate::shape_view::Face::Right,
+            crate::shape_view::Face::Top,
+        ] {
+            let corners = crate::shape_view::block_corners(area, face);
+            crate::dialog::paint_cell_face(painter, corners, *self, material, face);
+        }
     }
 
     /// Draws a mask's cells, whatever the mask is.
@@ -106,10 +119,7 @@ impl<'a> Icons<'a> {
     /// the thing being chiselled. A whole block in a SLOT is loose material and
     /// draws as its tile.
     pub fn paint_cells(&self, painter: &egui::Painter, rect: egui::Rect, material: u16, mask: u32) {
-        // Square and centred: the projection fits a six-by-six box, and
-        // stretching it would put the cells' faces out of true with each other.
-        let side = rect.width().min(rect.height());
-        let area = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+        let area = square(rect);
         for (x, y, z) in crate::shape_view::draw_order(mask) {
             for face in [
                 crate::shape_view::Face::Front,
@@ -121,6 +131,15 @@ impl<'a> Icons<'a> {
             }
         }
     }
+}
+
+/// The largest centred square inside `rect`.
+///
+/// The projection fits a square box, and stretching it would put the cube's
+/// faces out of true with each other.
+fn square(rect: egui::Rect) -> egui::Rect {
+    let side = rect.width().min(rect.height());
+    egui::Rect::from_center_size(rect.center(), egui::vec2(side, side))
 }
 
 #[cfg(test)]
@@ -179,15 +198,16 @@ mod tests {
         );
     }
 
-    /// Everything one call to [`Icons::paint`] actually put on the screen.
-    fn painted(icons: Icons<'_>) -> Vec<egui::epaint::Primitive> {
+    /// Everything one call to [`Icons::paint_stack`] put on the screen.
+    fn painted_stack(icons: Icons<'_>, shape: u32) -> Vec<egui::epaint::Primitive> {
         let ctx = egui::Context::default();
         let output = ctx.run_ui(egui::RawInput::default(), |root| {
             let painter = root.ctx().layer_painter(egui::LayerId::background());
-            icons.paint(
+            icons.paint_stack(
                 &painter,
                 egui::Rect::from_min_size(egui::pos2(4.0, 4.0), egui::vec2(32.0, 32.0)),
                 1,
+                shape,
             );
         });
         ctx.tessellate(output.shapes, 1.0)
@@ -197,10 +217,44 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_block_in_a_slot_is_a_cube_and_not_a_square() {
+        // **Reported from the window**: a slot drew one face of the atlas tile,
+        // which reads as a sticker rather than as a solid thing. Three faces at
+        // three brightnesses is what says it is a block.
+        //
+        // Counted in VERTICES rather than by eye: a flat tile is one quad and a
+        // cube seen from a corner is three, and no arrangement of one quad
+        // makes twelve corners.
+        let tiles = atlas().tiles_only();
+        let icons = Icons::new(Some(egui::TextureId::User(3)), Some(&tiles));
+        let corners = |drawn: Vec<egui::epaint::Primitive>| {
+            drawn
+                .iter()
+                .map(|primitive| match primitive {
+                    egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                    egui::epaint::Primitive::Callback(_) => 0,
+                })
+                .sum::<usize>()
+        };
+        let block = corners(painted_stack(icons, 0));
+        assert!(
+            block >= 12,
+            "a whole block drew {block} vertices, which is not three faces"
+        );
+
+        // And a cut is still its own cells, which is more of them again.
+        let cut = corners(painted_stack(icons, 0b111 << 12));
+        assert!(
+            cut > block,
+            "a three-cell cut drew {cut} vertices and a whole block drew {block}"
+        );
+    }
+
+    #[test]
     fn a_material_with_an_atlas_is_drawn_from_the_atlas() {
         let tiles = atlas().tiles_only();
         let id = egui::TextureId::User(11);
-        let textured = painted(Icons::new(Some(id), Some(&tiles)));
+        let textured = painted_stack(Icons::new(Some(id), Some(&tiles)), 0);
         assert!(
             textured.iter().any(|primitive| matches!(
                 primitive,
@@ -212,7 +266,7 @@ mod tests {
         // The counter-example, so the assertion above is visibly not vacuous:
         // with no atlas the same call draws with egui's own font texture,
         // which is what a flat rectangle uses.
-        let tinted = painted(Icons::default());
+        let tinted = painted_stack(Icons::default(), 0);
         assert!(
             tinted.iter().all(|primitive| !matches!(
                 primitive,

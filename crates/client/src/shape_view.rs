@@ -115,24 +115,42 @@ pub fn face_corners(area: egui::Rect, x: i32, y: i32, z: i32, face: Face) -> [eg
         reason = "grid coordinates are 0..=3 and exact in f32"
     )]
     let (x, y, z) = (x as f32, y as f32, z as f32);
+    corners_of(area, (x, y, z), 1.0, face)
+}
+
+/// The four screen corners of one face of the WHOLE block.
+///
+/// **Not twenty-seven cells that happen to be full.** A block drawn cell by
+/// cell is eighty-one quads with visible seams where their edges meet; this is
+/// three, and it is the same cube in the same projection. Loose material in a
+/// slot is a block, so this is what a slot draws.
+#[must_use]
+pub fn block_corners(area: egui::Rect, face: Face) -> [egui::Pos2; 4] {
+    corners_of(area, (0.0, 0.0, 0.0), SIDE as f32, face)
+}
+
+/// One face of a cube `size` cells across, with its low corner at `at`.
+fn corners_of(area: egui::Rect, at: (f32, f32, f32), size: f32, face: Face) -> [egui::Pos2; 4] {
+    let (x, y, z) = at;
+    let step = size;
     match face {
         Face::Top => [
-            project(area, x, y + 1.0, z),
-            project(area, x + 1.0, y + 1.0, z),
-            project(area, x + 1.0, y + 1.0, z + 1.0),
-            project(area, x, y + 1.0, z + 1.0),
+            project(area, x, y + step, z),
+            project(area, x + step, y + step, z),
+            project(area, x + step, y + step, z + step),
+            project(area, x, y + step, z + step),
         ],
         Face::Right => [
-            project(area, x + 1.0, y, z),
-            project(area, x + 1.0, y + 1.0, z),
-            project(area, x + 1.0, y + 1.0, z + 1.0),
-            project(area, x + 1.0, y, z + 1.0),
+            project(area, x + step, y, z),
+            project(area, x + step, y + step, z),
+            project(area, x + step, y + step, z + step),
+            project(area, x + step, y, z + step),
         ],
         Face::Front => [
-            project(area, x, y, z + 1.0),
-            project(area, x + 1.0, y, z + 1.0),
-            project(area, x + 1.0, y + 1.0, z + 1.0),
-            project(area, x, y + 1.0, z + 1.0),
+            project(area, x, y, z + step),
+            project(area, x + step, y, z + step),
+            project(area, x + step, y + step, z + step),
+            project(area, x, y + step, z + step),
         ],
     }
 }

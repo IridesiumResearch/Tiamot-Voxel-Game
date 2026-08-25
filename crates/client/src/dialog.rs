@@ -672,8 +672,18 @@ pub fn paint_cell_face(
             uv.left_bottom(),
         ];
         for (corner, uv) in corners.iter().zip(uvs) {
-            mesh.colored_vertex(*corner, tint);
-            mesh.vertices.last_mut().expect("just pushed").uv = uv;
+            // **Pushed rather than `colored_vertex`.** That helper is for an
+            // UNTEXTURED mesh and debug-asserts as much, so this panicked in
+            // any build with debug assertions on — which `cargo run -p client`
+            // is — the moment a slot or the shape editor had an atlas to draw
+            // from. It has been latent since the atlas was bridged into egui:
+            // every test that reached this line did so without an atlas, and
+            // took the flat-tint branch below instead.
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: *corner,
+                uv,
+                color: tint,
+            });
         }
         mesh.add_triangle(0, 1, 2);
         mesh.add_triangle(0, 2, 3);
