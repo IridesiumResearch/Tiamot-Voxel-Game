@@ -436,8 +436,22 @@ impl ApplicationHandler for Client {
         // egui gets first refusal. When it wants an event — a click on a
         // widget, a keystroke in a text field — the world must not also act on
         // it, or clicking a button also swings the camera.
+        //
+        // **But only while there is a pointer to point with.** A grabbed cursor
+        // is invisible and locked to the middle of the window, so winit stops
+        // reporting where it is and egui goes on believing it is wherever it
+        // was last seen — which, now that a world is entered from a menu, is
+        // over the Play button that started it. egui then claims every mouse
+        // event for a widget nobody can see or reach, and the one that goes
+        // missing is the button RELEASE: the client never learns the dig
+        // stopped and keeps digging for as long as the world is open.
+        //
+        // Reported from the window as being stuck digging. The rule is the
+        // honest one: with the cursor grabbed the interface is not being
+        // pointed at, so it gets no say. Chat, dialogs and the menus all
+        // release the cursor first, which is exactly when egui should have it.
         let response = surface.egui_state.on_window_event(&surface.window, &event);
-        if response.consumed {
+        if response.consumed && !self.grabbed {
             return;
         }
 
@@ -452,6 +466,20 @@ impl ApplicationHandler for Client {
                     surface.size,
                     self.config.vsync,
                 );
+            }
+
+            // **Nothing is held down when the window is not being looked at.**
+            // A player who alt-tabs mid-dig gets no release event at all, and
+            // the same stuck dig as the bug above. Cheap to be sure about.
+            WindowEvent::Focused(false) => {
+                self.held = Held::default();
+                if self.digging {
+                    self.digging = false;
+                    if let Stage::Playing(app) = &mut surface.stage {
+                        app.stop_digging();
+                    }
+                }
+                self.grabbed = grab(&surface.window, false);
             }
 
             WindowEvent::RedrawRequested if !self.frame() => event_loop.exit(),
@@ -2315,12 +2343,13 @@ mod tests {
         let span = f64::from(*range.end() - *range.start());
         let steps = span / client::config::UI_SCALE_STEP;
         assert!(
-            (20.0..=40.0).contains(&steps),
+            (8.0..=40.0).contains(&steps),
             "{steps} positions across the slider is not a scale anybody can aim at"
         );
         assert!(
-            *range.start() >= 0.75 && *range.end() <= 2.0,
-            "a range this wide is what made a small drag a big change"
+            *range.start() >= 0.75 && *range.end() <= 1.25,
+            "a range this wide is what made a small drag a big change; past about a quarter \
+             either way the interface stops fitting the screen rather than getting clearer"
         );
         // 1.0 has to be reachable exactly, or a player cannot get back to it.
         // Counted rather than rounded: `round` is on the determinism ban list

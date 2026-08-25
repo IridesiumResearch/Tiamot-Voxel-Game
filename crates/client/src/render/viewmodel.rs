@@ -67,9 +67,13 @@ mod shape {
     /// How far from the eye the hand sits.
     pub const DEPTH: f32 = -0.55;
     /// How far to the side.
-    pub const SIDE: f32 = 0.30;
+    ///
+    /// **Further out than it was.** Reported from the window: the hand wanted
+    /// to be more out of the way, and a viewmodel's job is to say what you are
+    /// holding without standing in front of what you are aiming at.
+    pub const SIDE: f32 = 0.36;
     /// How far below the middle of the screen.
-    pub const DROP: f32 = -0.28;
+    pub const DROP: f32 = -0.33;
     /// Half-extents of the forearm.
     pub const ARM: [f32; 3] = [0.055, 0.13, 0.055];
     /// Half-extent of a held block, which is smaller than a real one — a block
@@ -77,6 +81,13 @@ mod shape {
     pub const BLOCK: f32 = 0.085;
     /// How far the arm tilts inward, in radians, so it points at the middle.
     pub const TILT: f32 = 0.45;
+    /// How far up the arm the held thing sits, as a share of the arm's length.
+    ///
+    /// **Less than one, so it overlaps the hand rather than balancing on it.**
+    /// At the arm's full length the block floated off the end of the fingers;
+    /// reported from the window, along with the observation that clipping into
+    /// the hand is fine and looks better than a gap.
+    pub const GRIP: f32 = 0.55;
     /// How far a swing carries the hand, in radians.
     pub const SWING: f32 = 0.9;
     /// How far a swing pulls it back toward the eye, in blocks.
@@ -132,7 +143,7 @@ pub fn pieces(hand: Hand, held: Held) -> Vec<Piece> {
         // Sitting at the end of the arm, which is where a hand is. Offset along
         // the arm's own direction so it follows the swing rather than hanging
         // off it.
-        let along = shape::ARM[1] + shape::BLOCK;
+        let along = shape::ARM[1] * shape::GRIP + shape::BLOCK * 0.5;
         pieces.push(Piece {
             placement: [
                 side * shape::SIDE + roll.sin() * along * side.signum(),

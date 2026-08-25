@@ -25,33 +25,33 @@
 //! recorded numbers. CI does not set it, and gates on the thresholds instead —
 //! because the thresholds are what the KEEP decision was actually granted on.
 //!
-//! # The margin ran out, and that is worth reading rather than raising
+//! # The margin ran out once, and was won back rather than legislated away
 //!
-//! This used to say the thresholds "carry 9× and 28× margin". **That stopped
-//! being true.** Scene (d) measured 108 µs in the spike and measures about
-//! 330 µs on the same class of machine today — real features, all of them
-//! wanted: per-vertex light, fluid surfaces, the shore film. Three times the
-//! work against a 1 ms gate is a 3× margin, and a CI runner is itself about 3×
-//! slower, so the gate landed exactly on the line and started flapping
-//! (1.030 ms on 2026-08-24 against a 1 ms wall).
+//! This used to say the thresholds "carry 9× and 28× margin". That stopped
+//! being true: scene (d) measured 108 µs in the spike and had drifted to about
+//! 330 µs — real features, all of them wanted, per-vertex light and fluid
+//! surfaces and the shore film. Three times the work against a 1 ms gate is a
+//! 3× margin, and a runner measured at 3.1× this machine landed exactly on the
+//! line and flapped (1.030 ms on 2026-08-24).
 //!
-//! The verdict's promise is "under 1 ms", and on the hardware the verdict was
-//! granted on it still holds. What could not hold is asserting a workstation
-//! threshold against a cloud runner with no headroom left — the same mistake
-//! `benches/macro-baseline.json` was rebaselined to stop making. So CI gates
-//! against the threshold **scaled by the runner handicap it is measured to
-//! have**, and the strict path keeps the verdict's own number.
+//! The first answer was to scale the gate by the runner's handicap. The better
+//! one was to go and find the time: a `Uniform` block — which is nearly every
+//! solid block in a real chunk — was being read a sub-node at a time, twenty-
+//! seven matches and twenty-seven scattered stores for twenty-seven copies of
+//! one answer. Filled whole, scene (d) is about 270 µs and a runner about 840,
+//! back under the wall the KEEP verdict was granted on.
 //!
-//! A real regression still fails both: it takes a 3× slowdown to reach the
-//! scaled gate, and the raw timing is printed either way.
+//! So the threshold is the verdict's own number again, plus
+//! `RUNNER_SLACK_PERCENT` for a shared machine's day-to-day variance, and the
+//! strict path asserts it exactly.
 //!
 //! # What the strict check says today, which is not nothing
 //!
 //! `TIAMOT_STRICT_PERF=1` on the reference machine currently **fails**:
 //!
 //! ```text
-//! scene (d) realistic:  342 us against the spike's 108  (3.2x)
-//! scene (b) chiselled:  808 us against the spike's 143  (5.6x)
+//! scene (d) realistic:  270 us against the spike's 108  (2.5x)
+//! scene (b) chiselled:  750 us against the spike's 143  (5.2x)
 //! ```
 //!
 //! That is a true statement about a real slowdown and it is left red on
@@ -97,17 +97,20 @@ const STONE: MaterialId = MaterialId(2);
 const DIRT: MaterialId = MaterialId(3);
 const GRASS: MaterialId = MaterialId(4);
 
-/// How much slower a CI runner is than the machine the verdict was granted on.
+/// How much a shared runner may exceed the verdict's threshold, as a percent.
 ///
-/// **Measured, not guessed.** The module docs above have said "about 3×" since
-/// the first CI run; 2026-08-24 put a number on it from both ends of the same
-/// commit — scene (d) at 325–333 µs on the reference machine and 1.030 ms on
-/// the runner, which is 3.1×.
+/// **Ten, not three hundred.** For one day this was a 3× scaling, because
+/// scene (d) had drifted to 330 µs on the reference machine and 1.030 ms on a
+/// runner measured at 3.1× — exactly on a 1 ms wall, and flapping. The block
+/// fill has since been given back the twenty percent it lost (a uniform block
+/// is filled whole rather than a sub-node at a time), so the reference machine
+/// reads about 270 µs and the runner about 840: back under the wall the KEEP
+/// verdict was granted on, which is where this should be.
 ///
-/// Applied to the thresholds only when `TIAMOT_STRICT_PERF` is unset, so the
-/// verdict's own number is what gets asserted wherever the verdict's own
-/// number means something.
-const RUNNER_HANDICAP: u32 = 3;
+/// So the threshold is the verdict's again and this is only the runner's
+/// day-to-day variance on top. Applied when `TIAMOT_STRICT_PERF` is unset, so
+/// the verdict's own number is asserted exactly wherever it means something.
+const RUNNER_SLACK_PERCENT: u32 = 10;
 
 /// Task 02b gate 1: scene (d), the realistic one, under 1 ms.
 const REALISTIC_GATE: Duration = Duration::from_micros(1000);
@@ -140,7 +143,7 @@ fn gate(threshold: Duration) -> Duration {
     if strict() {
         threshold
     } else {
-        threshold * RUNNER_HANDICAP
+        threshold + threshold * RUNNER_SLACK_PERCENT / 100
     }
 }
 
@@ -361,7 +364,7 @@ fn the_realistic_scene_meshes_inside_the_task_02b_gate() {
     assert!(
         elapsed < gate(REALISTIC_GATE),
         "scene (d) meshed in {elapsed:?}, over the Task 02b gate of {REALISTIC_GATE:?} \
-         (allowed {:?} here — see RUNNER_HANDICAP). The KEEP verdict for full sub-node \
+         (allowed {:?} here — see RUNNER_SLACK_PERCENT). The KEEP verdict for full sub-node \
          resolution was granted on this number.",
         gate(REALISTIC_GATE)
     );
@@ -384,7 +387,7 @@ fn the_chiselled_scene_meshes_inside_the_task_02b_gate() {
     assert!(
         elapsed < gate(CHISELLED_GATE),
         "scene (b) meshed in {elapsed:?}, over the Task 02b gate of {CHISELLED_GATE:?} \
-         (allowed {:?} here — see RUNNER_HANDICAP)",
+         (allowed {:?} here — see RUNNER_SLACK_PERCENT)",
         gate(CHISELLED_GATE)
     );
     check_against_spike("scene (b)", elapsed, MEASURED_CHISELLED_US);
@@ -406,7 +409,7 @@ fn a_remesh_after_one_subnode_edit_is_inside_the_task_02b_gate() {
         assert!(
             elapsed < gate(REMESH_GATE),
             "remesh of scene {label} took {elapsed:?}, over the Task 02b gate of \
-             {REMESH_GATE:?} (allowed {:?} here — see RUNNER_HANDICAP)",
+             {REMESH_GATE:?} (allowed {:?} here — see RUNNER_SLACK_PERCENT)",
             gate(REMESH_GATE)
         );
     }

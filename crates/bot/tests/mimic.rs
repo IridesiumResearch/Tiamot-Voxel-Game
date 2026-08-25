@@ -283,11 +283,48 @@ fn the_mimic_flees_when_it_is_punched() {
             .await
             .expect("a mimic should appear");
 
-        // Let it settle beside her first, so the distance below is the one it
-        // chose rather than the one it spawned at.
+        // Let it settle first, so the distance below is the one it chose rather
+        // than the one it spawned at.
         for _ in 0..20 {
             ada.walk([0.0; 3], 0, 4).await.expect("stand");
         }
+
+        // **Then walk up to it**, because it keeps its distance now and a punch
+        // is reach-limited on the server. It stops closing at `KEEP_BLOCKS` and
+        // does not retreat, so approaching works — which is the whole reason it
+        // does not back away, and this is the test that says so.
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let here = ada.walk([0.0; 3], 0, 1).await.expect("stand");
+            let me = [
+                (f64::from(here.chunk.x) * 48.0 + f64::from(here.local[0])) / 3.0,
+                (f64::from(here.chunk.y) * 48.0 + f64::from(here.local[1])) / 3.0,
+                (f64::from(here.chunk.z) * 48.0 + f64::from(here.local[2])) / 3.0,
+            ];
+            let seen = ada.entities();
+            let Some(entity) = seen.get(&mimic.id) else {
+                break;
+            };
+            let it = world_of(entity);
+            let gap = flat_distance(it, me);
+            if gap < 2.0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "could not get within arm's reach of the mimic: {gap:.1} blocks away"
+            );
+            // The server reads `movement` as world x and z directly for a
+            // client that never looks, so this is simply "that way".
+            #[expect(clippy::cast_possible_truncation, reason = "a walk direction")]
+            let toward = [
+                ((it[0] - me[0]) / gap) as f32,
+                0.0,
+                ((it[2] - me[2]) / gap) as f32,
+            ];
+            ada.walk(toward, 0, 4).await.expect("walk");
+        }
+
         let here = ada.walk([0.0; 3], 0, 1).await.expect("stand");
         let ada_at = [
             (f64::from(here.chunk.x) * 48.0 + f64::from(here.local[0])) / 3.0,

@@ -24,7 +24,15 @@
 -- Twenty ticks a second (the engine's fixed rate), so these are seconds.
 local DELAY_TICKS = 40 -- how far behind it walks: two seconds
 local NOTICE_BLOCKS = 32 -- how far it can notice you, per the task
-local KEEP_BLOCKS = 2.5 -- how close it will get before it stops
+-- **How far back it hangs.** It used to close to two and a half blocks, which
+-- is standing on your heels; a thing that follows you is eerier a few paces
+-- back, where you have to turn round to check it is still there.
+--
+-- It STOPS CLOSING at this distance and does not retreat past it. Backing away
+-- was the first version and it was wrong: a mimic that gives ground whenever
+-- you approach can never be reached, and `register_on_punch` becomes a hook
+-- nothing can ever fire. Walk at it and it stands there.
+local KEEP_BLOCKS = 7 -- how close it will get before it stops closing
 local FLEE_TICKS = 60 -- three seconds of running away after a punch
 local WANDER_TICKS = 50 -- how often it picks a new idle direction
 local WANDER_BLOCKS = 6 -- how far from home it will drift
@@ -284,7 +292,7 @@ game.register_on_entity_step(function(id)
             local past = trail[now - DELAY_TICKS]
             if past ~= nil then
                 if distance(self.pos, player.pos) < KEEP_BLOCKS then
-                    -- Close enough. It stops and copies what you were doing,
+                    -- Near enough. It stops and copies what you were doing,
                     -- which is the part that reads as wrong.
                     game.set_entity(id, { drive = { walk = { x = 0, z = 0 } }, anim = past.anim })
                 else

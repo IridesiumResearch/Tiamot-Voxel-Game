@@ -42,7 +42,7 @@
 // `face_shade` here is the mode 1 directional constant below; the light
 // sampler comes in under a name that says which one it is.
 use crate::shade::{BlockLight, Shade, face_shade as sample_corner_light};
-use tiamot_core::block::subnode_index;
+use tiamot_core::block::{BlockView, subnode_index};
 use tiamot_core::chunk::Chunk;
 use tiamot_core::coords::LocalBlock;
 use tiamot_core::{BLOCKS_PER_CHUNK, CHUNK_SUBNODES, SUBNODES_PER_AXIS};
@@ -55,6 +55,12 @@ pub const CELLS: usize = N * N * N;
 
 /// Bit offset of the chunk's first cell within a column word.
 const FIRST: u32 = 1;
+
+/// The three column bits one whole block occupies along an axis.
+///
+/// A uniform block fills three adjacent cells, which is three adjacent bits —
+/// so it goes in as one OR rather than three.
+const FULL_BLOCK_BITS: u64 = (1 << SUBNODES_PER_AXIS) - 1;
 
 /// The six face directions, as (axis, positive).
 const FACES: [(usize, bool); 6] = [
@@ -289,25 +295,7 @@ impl SubNodeGrid {
             let base_y = local.y as usize * SUBNODES_PER_AXIS as usize;
             let base_z = local.z as usize * SUBNODES_PER_AXIS as usize;
 
-            for cz in 0..SUBNODES_PER_AXIS {
-                for cy in 0..SUBNODES_PER_AXIS {
-                    for cx in 0..SUBNODES_PER_AXIS {
-                        let material = view.subnode(subnode_index(cx, cy, cz));
-                        if material.is_air() {
-                            continue;
-                        }
-                        let x = base_x + cx as usize;
-                        let y = base_y + cy as usize;
-                        let z = base_z + cz as usize;
-
-                        materials[x + N * y + N * N * z] = material.get();
-                        columns[0][y * N + z] |= 1 << (x as u32 + FIRST);
-                        columns[1][x * N + z] |= 1 << (y as u32 + FIRST);
-                        columns[2][x * N + y] |= 1 << (z as u32 + FIRST);
-                    }
-                }
-            }
-
+            fill_terrain(&mut materials, &mut columns, view, [base_x, base_y, base_z]);
             if let Some((material, depth)) = flooded {
                 fill_fluid(
                     &mut materials,
@@ -1625,6 +1613,69 @@ pub fn mesh_chunk(
         &SubNodeGrid::from_chunk_with_fluid(chunk, neighbours, absent, fluid),
         light,
     )
+}
+
+/// Lays one block's terrain into the grid.
+///
+/// Split out of `SubNodeGrid::from_chunk_with_fluid` because that function is
+/// at clippy's line ceiling, and because the uniform case below deserves to be
+/// read on its own.
+fn fill_terrain(
+    materials: &mut [u16],
+    columns: &mut [Vec<u64>; 3],
+    view: BlockView<'_>,
+    base: [usize; 3],
+) {
+    let [base_x, base_y, base_z] = base;
+    // **A whole block, whole.** `Uniform` is what almost every solid
+    // block in a real chunk is, and asking `subnode` twenty-seven times
+    // for twenty-seven copies of one answer is twenty-seven matches, a
+    // branch each, and a scattered store each. Filled a row at a time
+    // instead — `x` is the contiguous axis of `materials`, so each row
+    // of three is one `fill` — and the column bits go in three at a
+    // time, because three adjacent cells are three adjacent bits.
+    if let BlockView::Uniform(material) = view {
+        let bits = FULL_BLOCK_BITS;
+        let value = material.get();
+        for cz in 0..SUBNODES_PER_AXIS as usize {
+            let z = base_z + cz;
+            for cy in 0..SUBNODES_PER_AXIS as usize {
+                let y = base_y + cy;
+                let row = base_x + N * y + N * N * z;
+                materials[row..row + SUBNODES_PER_AXIS as usize].fill(value);
+                columns[0][y * N + z] |= bits << (base_x as u32 + FIRST);
+            }
+        }
+        for cy in 0..SUBNODES_PER_AXIS as usize {
+            for cx in 0..SUBNODES_PER_AXIS as usize {
+                columns[2][(base_x + cx) * N + base_y + cy] |= bits << (base_z as u32 + FIRST);
+            }
+        }
+        for cz in 0..SUBNODES_PER_AXIS as usize {
+            for cx in 0..SUBNODES_PER_AXIS as usize {
+                columns[1][(base_x + cx) * N + base_z + cz] |= bits << (base_y as u32 + FIRST);
+            }
+        }
+    } else {
+        for cz in 0..SUBNODES_PER_AXIS {
+            for cy in 0..SUBNODES_PER_AXIS {
+                for cx in 0..SUBNODES_PER_AXIS {
+                    let material = view.subnode(subnode_index(cx, cy, cz));
+                    if material.is_air() {
+                        continue;
+                    }
+                    let x = base_x + cx as usize;
+                    let y = base_y + cy as usize;
+                    let z = base_z + cz as usize;
+
+                    materials[x + N * y + N * N * z] = material.get();
+                    columns[0][y * N + z] |= 1 << (x as u32 + FIRST);
+                    columns[1][x * N + z] |= 1 << (y as u32 + FIRST);
+                    columns[2][x * N + y] |= 1 << (z as u32 + FIRST);
+                }
+            }
+        }
+    }
 }
 
 impl crate::shade::CellOccupancy for SubNodeGrid {

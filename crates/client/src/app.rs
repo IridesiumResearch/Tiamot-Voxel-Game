@@ -144,6 +144,23 @@ const MAX_CHAT_LINES: usize = 200;
 /// five of these nine.
 const HOTBAR_SLOTS: usize = 9;
 
+/// The heading a figure needs to face the way a camera is looking.
+///
+/// # Two conventions, and they are mirror images
+///
+/// A figure's heading is the one a mod writes: `atan2(dx, dz)`, so facing is
+/// `(sin θ, cos θ)` — that is what a mod computes for an entity and what the
+/// rig's vertex shader turns by. The camera's yaw counts the other way, because
+/// the world is right-handed with `+z` north and east is `−x`, so its forward
+/// is `(−sin θ, cos θ)`.
+///
+/// Negating is the whole conversion, and getting it wrong is invisible until
+/// you turn: at yaw zero both point north and agree exactly. Reported from the
+/// window as not facing the way you are walking.
+const fn figure_yaw(camera_yaw: f32) -> f32 {
+    -camera_yaw
+}
+
 /// Below this the player's figure stands still, in cells per tick.
 ///
 /// Not zero: a body resting against geometry keeps a hair of velocity from the
@@ -3790,8 +3807,9 @@ impl App {
                 offset: at,
                 // The camera's yaw, not the server's: the body turns with the
                 // look, at prediction rate, which is the whole reason the local
-                // player is not simply read back off the entity stream.
-                yaw: self.camera.yaw,
+                // player is not simply read back off the entity stream —
+                // converted, because the two count from different directions.
+                yaw: figure_yaw(self.camera.yaw),
                 anim: self.gait(),
                 phase: self.since_start.elapsed().as_secs_f32(),
             }));
@@ -4500,6 +4518,56 @@ pub fn build_atlas(
 mod tests {
     use super::*;
     use tiamot_core::proto::MaterialDef;
+
+    #[test]
+    fn a_figure_faces_the_way_the_camera_looks() {
+        // **The two conventions, checked against each other rather than
+        // asserted.** A mod writes a heading as `atan2(dx, dz)`, so a figure
+        // faces `(sin θ, cos θ)`; the camera's forward is `(−sin θ, cos θ)`
+        // because east is `−x`. Reported from the window as a body that did not
+        // face the way it was walking.
+        //
+        // Zero is deliberately not the only case: at yaw zero both point north
+        // and a missing conversion is invisible.
+        for degrees in [0.0_f32, 45.0, 90.0, 180.0, 270.0, -30.0] {
+            let camera = crate::camera::Camera {
+                yaw: degrees.to_radians(),
+                pitch: 0.0,
+                ..crate::camera::Camera::default()
+            };
+            let looking = camera.forward();
+            let heading = figure_yaw(camera.yaw);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "charter rule 4 exempts presentation; this is a camera heading"
+            )]
+            let (facing_x, facing_z) = (heading.sin(), heading.cos());
+            assert!(
+                (facing_x - looking.x).abs() < 1e-5 && (facing_z - looking.z).abs() < 1e-5,
+                "at {degrees}° the camera looks ({}, {}) and the figure faces ({facing_x}, \
+                 {facing_z})",
+                looking.x,
+                looking.z
+            );
+        }
+
+        // And the counter-example: passing the camera's yaw straight through —
+        // which is what it did — disagrees the moment you turn.
+        let camera = crate::camera::Camera {
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            ..crate::camera::Camera::default()
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "charter rule 4 exempts presentation; this is a camera heading"
+        )]
+        let unconverted = camera.yaw.sin();
+        assert!(
+            (unconverted - camera.forward().x).abs() > 1.0,
+            "the unconverted heading happens to agree, so this proves nothing"
+        );
+    }
 
     /// An `Input` holding one direction, everything else neutral.
     fn pressing(forward: f32, right: f32) -> Input {
