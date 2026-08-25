@@ -53,8 +53,14 @@ fn material_table(
     content: &tiamot_core::content::ContentIndex,
     textures: &[tiamot_core::script::BlockTexture],
     block_rules: &[tiamot_core::script::BlockRules],
+    items: &[String],
 ) -> Vec<tiamot_core::proto::MaterialDef> {
     use std::collections::BTreeMap;
+
+    // Everything a player can carry is in one table; an ITEM is one that may
+    // not be put in the world. See `register_item` for why it is one flag and
+    // not a second id space.
+    let items: std::collections::BTreeSet<&str> = items.iter().map(String::as_str).collect();
 
     let rules: BTreeMap<&str, &tiamot_core::script::BlockRules> = block_rules
         .iter()
@@ -94,6 +100,7 @@ fn material_table(
                 step_sound: rules.get(name).and_then(|rules| rules.step_sound.clone()),
                 name: name.to_owned(),
                 texture,
+                placeable: !items.contains(name),
             })
         })
         .collect();
@@ -606,12 +613,17 @@ impl ServerHandle {
             .as_ref()
             .map(|loaded| loaded.vm().registered_block_rules())
             .unwrap_or_default();
+        let items = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_items())
+            .unwrap_or_default();
         let materials = material_table(
             &registry,
             world.materials(),
             &content_index,
             &block_textures,
             &block_rules,
+            &items,
         );
         // Charter rule 1: the engine has no tools of its own, so this list is
         // whatever the mods registered and nothing else. A client is told it
@@ -969,6 +981,13 @@ impl ServerHandle {
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             hardness,
+            held_slot: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            // The runtime ids of everything a mod registered as an item. Looked
+            // up here, where the registry is, so the tick loop compares numbers.
+            items: items
+                .iter()
+                .filter_map(|name| tiamot_core::material::MaterialRegistry::id_of(&registry, name))
+                .collect(),
             tools,
             default_tool,
         });
@@ -1753,6 +1772,22 @@ impl ServerHandle {
                                 &shared.inventory_of(&request.actor),
                                 material,
                             );
+
+                            // **An item is not a block.** Everything a player
+                            // can carry shares one id space (see
+                            // `register_item`), and the world palette must
+                            // never contain one that cannot be placed — a
+                            // sword written into a chunk is a chunk that
+                            // meshes a sword. Refused here rather than
+                            // filtered later, because a refusal a player can
+                            // read is the whole point of this loop.
+                            if shared.items.contains(&material) {
+                                shared.tell(
+                                    &request.actor,
+                                    "that is not something you can build with".to_owned(),
+                                );
+                                continue;
+                            }
 
                             // The same bound as digging. A placement is a
                             // request and this is one more reason to refuse it.
@@ -2831,6 +2866,26 @@ impl tiamot_core::inventory::Access for Carried {
     fn give(&self, player: [u8; 32], view: &str, stack: tiamot_core::inventory::Stack) -> bool {
         let uuid = tiamot_core::identity::PlayerUuid::from_bytes(player);
         self.shared.give(&uuid, view, stack)
+    }
+
+    fn held(&self, player: [u8; 32]) -> Option<tiamot_core::inventory::Stack> {
+        let uuid = tiamot_core::identity::PlayerUuid::from_bytes(player);
+        // Absent means slot zero, which is where a client starts and stays
+        // until somebody presses a hotbar key.
+        let slot = self
+            .shared
+            .held_slot
+            .lock()
+            .ok()
+            .and_then(|held| held.get(&uuid).copied())
+            .unwrap_or(0);
+        self.shared
+            .slots_of(&uuid)?
+            .view(tiamot_core::inventory::PLAYER_MAIN)?
+            .slots
+            .get(slot)
+            .copied()
+            .flatten()
     }
 
     fn take(

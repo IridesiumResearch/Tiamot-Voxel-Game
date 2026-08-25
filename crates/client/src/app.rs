@@ -824,6 +824,12 @@ pub struct App {
     settings_open: bool,
     /// Whether the player asked to quit from the menu.
     quit_requested: bool,
+    /// Materials that may not be put in the world: the items.
+    ///
+    /// See [`tiamot_core::proto::MaterialDef::placeable`]. Empty until a server
+    /// sends its table, which is correct: a client with no table has nothing to
+    /// place either.
+    items: std::collections::BTreeSet<u16>,
     /// Where each material sits in the atlas, for whatever draws a slot.
     ///
     /// Kept beside the renderer's copy rather than read back out of it: the
@@ -1093,6 +1099,7 @@ impl App {
             mixer,
             heard: Vec::new(),
             step_sounds: std::collections::BTreeMap::new(),
+            items: std::collections::BTreeSet::new(),
             stride: 0.0,
             last_step_at: [0.0; 3],
             volumes_dirty: false,
@@ -1949,6 +1956,14 @@ impl App {
             self.warn("nothing selected to build with".to_owned());
             return;
         };
+        // **Told here rather than after a round trip.** The server refuses this
+        // too and owns the decision, but a client that asked would leave the
+        // player watching nothing happen for the length of a round trip. See
+        // `App::items`.
+        if self.items.contains(&stack.material) {
+            self.warn("that is not something you can build with".to_owned());
+            return;
+        }
         let Some(target) = self.place_target() else {
             return;
         };
@@ -2055,6 +2070,15 @@ impl App {
         self.step_sounds = table
             .iter()
             .filter_map(|entry| entry.step_sound.clone().map(|sound| (entry.id, sound)))
+            .collect();
+        // **What may not be built with.** The server refuses a placement of one
+        // anyway — it owns that decision (charter rule 2) — but a client that
+        // sent the request would spend a round trip to be told no, and the
+        // player would watch their sword not become a block with no idea why.
+        self.items = table
+            .iter()
+            .filter(|entry| !entry.placeable)
+            .map(|entry| entry.id)
             .collect();
     }
 
@@ -3254,18 +3278,36 @@ impl App {
     /// selection skip it would make the row's positions unlearnable.
     pub fn select_next(&mut self, forward: bool) {
         let count = self.hotbar.len().max(1);
-        self.selected = if forward {
+        let slot = if forward {
             (self.selected + 1) % count
         } else {
             (self.selected + count - 1) % count
         };
+        self.hold(slot);
     }
 
     /// Selects a slot directly, as the number keys do.
     pub fn select_slot(&mut self, slot: usize) {
         if slot < self.hotbar.len() {
-            self.selected = slot;
+            self.hold(slot);
         }
+    }
+
+    /// Holds a slot, and tells the server which one.
+    ///
+    /// **Told on the CHANGE, not every tick.** The hotbar is the client's own
+    /// UI and nothing about the world moves when a player looks at a different
+    /// slot — but a mod cannot act on what somebody is holding unless the
+    /// server knows what that is, which is the whole reason an item that is
+    /// not a block is worth registering.
+    fn hold(&mut self, slot: usize) {
+        if self.selected == slot {
+            return;
+        }
+        self.selected = slot;
+        self.connection.send(crate::net::Command::SelectSlot {
+            slot: u16::try_from(slot).unwrap_or(0),
+        });
     }
 
     /// Asks the server to swap the selected slot with the off-hand.
@@ -4879,12 +4921,14 @@ mod tests {
                 id: 0,
                 name: "engine:air".to_owned(),
                 texture: None,
+                placeable: true,
                 step_sound: None,
             },
             MaterialDef {
                 id: 5,
                 name: "core:white".to_owned(),
                 texture: Some([0u8; 32]),
+                placeable: true,
                 step_sound: None,
             },
         ];
@@ -4915,6 +4959,7 @@ mod tests {
             id: 2,
             name: "mod:untextured".to_owned(),
             texture: None,
+            placeable: true,
             step_sound: None,
         }];
         let atlas = build_atlas(&table, &BTreeMap::new());

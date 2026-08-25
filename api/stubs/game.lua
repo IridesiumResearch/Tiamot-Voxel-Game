@@ -304,6 +304,39 @@ function game.register_tool(spec) end
 ---@param spec { id: string, slots: integer }
 function game.register_view(spec) end
 
+---Registers an ITEM: something a player can carry and cannot build with.
+---Registration window only. Returns its numeric material id.
+---
+---**An item IS a material.** Everything a player can carry is one id in one
+---table — a stack is a material, a quantity in units and a cut (charter rule 5)
+---— and that is what inventories, the wire, the icons and the world's own
+---string↔numeric table are built on. A sword takes an id from the same counter
+---a stone does, sits in the same slots, draws from the same atlas, and stacks by
+---the same rule.
+---
+---The one thing that differs is that it may **not be placed in the world**. Try
+---and the server refuses it and says so; the client does not even ask.
+---
+---An item therefore has no `hardness`, no `drops`, no `dominance` and no
+---`light_emit`, and passing one is an error rather than being ignored — it is
+---never in the world, so there is nothing for any of them to mean.
+---
+---What it DOES is yours. The engine has no idea what a sword is: use
+---`game.held(player)` to see what somebody is pointing with, `game.register_on_punch`
+---to act when they hit something, `game.register_view` for somewhere to wear it,
+---and `game.storage` for anything it should remember.
+---
+---```lua
+---local sword = game.register_item{
+---    id = "sword",
+---    name = "Iron Sword",
+---    texture = "items/sword.png",
+---}
+---```
+---@param spec { id: string, name?: string, texture?: string, description?: string }
+---@return integer material_id
+function game.register_item(spec) end
+
 ---Registers a world generation callback.
 ---
 ---**Registration window only.**
@@ -523,6 +556,22 @@ function game.inventory(player, view) end
 ---@param spec table
 ---@return boolean gave
 function game.give(player, spec) end
+
+---What a player is holding: the stack in the hotbar slot they have selected.
+---
+---Returns nil for a player who is not connected or an empty slot, which are the
+---same answer to "what is in your hand".
+---
+---**This is what makes an item worth registering.** `game.inventory` says what
+---somebody OWNS; this says what they are pointing with, which is the difference
+---between a rucksack and a weapon. The slot is the client's own UI state and
+---reaches the server when it changes.
+---
+---The table is the same shape `game.inventory` reports a stack in:
+---`{ material, units, blocks, nodes, count, shape }`.
+---@param player string A player UUID in hex.
+---@return table|nil held
+function game.held(player) end
 
 ---Takes material out of a player's inventory.
 ---

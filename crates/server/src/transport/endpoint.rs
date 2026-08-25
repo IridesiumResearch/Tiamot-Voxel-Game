@@ -313,6 +313,23 @@ pub struct Shared {
     /// unbreakable — see `BlockRules::DEFAULT_HARDNESS`.
     pub hardness: std::collections::BTreeMap<tiamot_core::MaterialId, tiamot_core::dig::Resistance>,
 
+    /// Which hotbar slot each player is holding.
+    ///
+    /// **The client's own UI state, kept here so a mod can ask.** The hotbar
+    /// keys and the wheel never reached the server before — nothing but a
+    /// `Place` said what was in hand — which is enough for building and not
+    /// enough for anything a mod wants to do with an item that is not a block.
+    /// Absent means slot zero, which is where a client starts.
+    pub held_slot: std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, usize>>,
+
+    /// Materials that may NOT be put in the world: the items.
+    ///
+    /// **The world palette must never contain one.** Everything a player can
+    /// carry shares one id space — see `register_item` — and this is the set
+    /// that is a sword rather than a stone. Built once from the frozen
+    /// registries, like the hardness beside it.
+    pub items: std::collections::BTreeSet<tiamot_core::MaterialId>,
+
     /// Named `bodies` rather than `players` because `players` is already the
     /// connected *count* on this struct, and two fields whose names differ only
     /// by what they happen to hold is how the wrong one gets locked.
@@ -1953,6 +1970,13 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     shared.swap_offhand(&uuid, usize::from(*slot));
                 }
             }
+            Action::SelectSlot { slot } => {
+                if let Some(uuid) = session.uuid()
+                    && let Ok(mut held) = shared.held_slot.lock()
+                {
+                    held.insert(uuid, usize::from(*slot));
+                }
+            }
             Action::Action { id, pressed } => {
                 if let Some(uuid) = session.uuid() {
                     shared.queue_action(uuid, id.clone(), *pressed);
@@ -2136,6 +2160,8 @@ mod tests {
             materials: Vec::new(),
             tool_table: Vec::new(),
             views: Vec::new(),
+            items: std::collections::BTreeSet::new(),
+            held_slot: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             action_table: Vec::new(),
             sound_table: Vec::new(),
             hud_scripts: Vec::new(),

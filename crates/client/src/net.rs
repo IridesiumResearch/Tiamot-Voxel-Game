@@ -453,6 +453,14 @@ pub enum Command {
         /// Chunks of vertical radius.
         vertical: u8,
     },
+    /// Say which hotbar slot is being held.
+    ///
+    /// Not a request: the hotbar keys are the client's and nothing about the
+    /// world changes. The server keeps it so a mod can ask what is in hand.
+    SelectSlot {
+        /// Zero-based.
+        slot: u16,
+    },
     /// Choose the held tool.
     SelectTool {
         /// Qualified tool id, or `None` for a bare hand.
@@ -1534,6 +1542,7 @@ fn to_wire(command: Command) -> ClientMessage {
         Command::Punch { entity } => ClientMessage::Punch { entity },
         Command::SwapOffhand { slot } => ClientMessage::SwapOffhand { slot },
         Command::SelectTool { tool } => ClientMessage::SelectTool { tool },
+        Command::SelectSlot { slot } => ClientMessage::SelectSlot { slot },
         Command::ViewDistance {
             horizontal,
             vertical,
@@ -1689,6 +1698,7 @@ mod tests {
                 name: (*name).to_owned(),
                 texture: *texture,
                 step_sound: None,
+                placeable: true,
             })
             .collect()
     }

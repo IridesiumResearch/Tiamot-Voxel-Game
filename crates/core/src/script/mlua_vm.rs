@@ -1249,6 +1249,19 @@ impl ScriptVm for MluaVm {
         tools
     }
 
+    fn registered_items(&self) -> Vec<String> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.items") else {
+            return Vec::new();
+        };
+        let mut items: Vec<String> = registry
+            .pairs::<String, bool>()
+            .filter_map(Result::ok)
+            .map(|(id, _)| id)
+            .collect();
+        items.sort();
+        items
+    }
+
     fn registered_views(&self) -> Vec<crate::inventory::ViewDef> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.views") else {
             return Vec::new();
@@ -1963,6 +1976,21 @@ impl MluaVm {
         game.set("give", give).map_err(|err| self.vm_error(&err))?;
 
         let slot = std::sync::Arc::clone(&self.inventories);
+        let held = self
+            .lua
+            .create_function(move |lua, uuid: String| {
+                let player = player_of(&uuid, "held")?;
+                let stack = slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|access| access.held(player)))
+                    .flatten();
+                stack.map(|stack| stack_table(lua, stack)).transpose()
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("held", held).map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.inventories);
         let take = self
             .lua
             .create_function(move |lua, (uuid, spec): (String, Table)| {
@@ -2128,6 +2156,14 @@ impl MluaVm {
             .create_function(move |lua, spec: Table| register_tool(lua, &owner, &spec))
             .map_err(|err| self.vm_error(&err))?;
         game.set("register_tool", register_tool)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
+        let register_item = self
+            .lua
+            .create_function(move |lua, spec: Table| register_item(lua, &owner, &spec))
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_item", register_item)
             .map_err(|err| self.vm_error(&err))?;
 
         let owner = mod_id.to_owned();
@@ -3171,6 +3207,10 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.block_rules", block_rules)
             .map_err(|err| self.vm_error(&err))?;
+        let items = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.items", items)
+            .map_err(|err| self.vm_error(&err))?;
         let views = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.views", views)
@@ -3460,6 +3500,97 @@ fn step_sound_of(owner: &str, spec: &Table, entry: &Table) -> mlua::Result<()> {
         entry.set("step_sound", step)?;
     }
     Ok(())
+}
+
+/// `game.register_item{ id, name, texture }`.
+///
+/// # Why an item is a material
+///
+/// **Everything a player can carry is one id in one table.** A stack is a
+/// material, a quantity in units and a cut (charter rule 5), and that is what
+/// the inventory, the wire, the icons and the world's own string↔numeric table
+/// are all built on. Giving items a second id space would mean a `kind` byte on
+/// every stack and a `match` at every one of those places, for a distinction
+/// that matters in exactly one of them.
+///
+/// So an item is registered into the same space and marked NOT PLACEABLE, which
+/// is the only thing that actually differs: a sword is a thing you can hold and
+/// not a thing you can put in the world. Everything else — the atlas tile, the
+/// slot it sits in, the units it counts in, the id the world file remembers —
+/// works because it already worked for blocks.
+///
+/// The consequence to keep in mind: a material id names something carryable,
+/// and only some of those are blocks. `placeable` is what tells them apart, and
+/// the world palette must never contain a `false` one.
+fn register_item(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
+    let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+    if frozen {
+        return Err(mlua::Error::external(format!(
+            "mod `{owner}`: registration is closed"
+        )));
+    }
+
+    let id: String = spec
+        .get("id")
+        .map_err(|_| mlua::Error::external("register_item: missing required field `id`"))?;
+    for pair in spec.pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !ITEM_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "register_item(\"{id}\"): unknown field `{name}`. An item is not a block: it \
+                     has no hardness, no drops and no light, because it is never in the world."
+                )));
+            }
+        }
+    }
+
+    let qualified = qualify_id(owner, &id).map_err(mlua::Error::external)?;
+    let texture = match spec.get::<Option<String>>("texture")? {
+        Some(path) => {
+            Some(validate_texture_path(&qualified, &path).map_err(mlua::Error::external)?)
+        }
+        None => None,
+    };
+
+    let registry: Table = lua.named_registry_value("tiamot.blocks")?;
+    if registry.contains_key(qualified.clone())? {
+        return Err(mlua::Error::external(format!(
+            "`{qualified}` is already registered"
+        )));
+    }
+    let next: u16 = lua.named_registry_value("tiamot.next_material")?;
+    registry.set(qualified.clone(), next)?;
+    lua.set_named_registry_value("tiamot.next_material", next + 1)?;
+
+    // The one thing that makes it an item rather than a block.
+    let items: Table = lua.named_registry_value("tiamot.items")?;
+    items.set(qualified.clone(), true)?;
+
+    if let Some(path) = texture {
+        let textures: Table = lua.named_registry_value("tiamot.block_textures")?;
+        let entry = lua.create_table()?;
+        entry.set("mod", owner)?;
+        entry.set("path", path)?;
+        textures.set(qualified.clone(), entry)?;
+    }
+
+    // A display name, on the same table blocks use, so an interface asking what
+    // to call something asks one question.
+    if let Some(name) = spec.get::<Option<String>>("name")? {
+        let rules: Table = lua.named_registry_value("tiamot.block_rules")?;
+        let entry = if let Some(entry) = rules.get::<Option<Table>>(qualified.clone())? {
+            entry
+        } else {
+            let entry = lua.create_table()?;
+            rules.set(qualified.clone(), entry.clone())?;
+            entry
+        };
+        entry.set("name", name)?;
+    }
+
+    Ok(next)
 }
 
 fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
@@ -4112,6 +4243,13 @@ const FLUID_FIELDS: [&str; 7] = [
 ];
 
 /// Fields `register_block` accepts. Anything else is an error naming the field.
+/// Keys `register_item` accepts.
+///
+/// **Deliberately short.** An item has no hardness, no drops, no dominance and
+/// no light, because it is never in the world — and a field list that quietly
+/// accepted them would be an API promising behaviour nothing implements.
+const ITEM_FIELDS: [&str; 4] = ["id", "name", "texture", "description"];
+
 const BLOCK_FIELDS: [&str; 10] = [
     "id",
     "name",
@@ -6668,6 +6806,86 @@ mod dig_rules_tests {
                 "the error for `{spec}` should name `{field}`: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_item_is_a_material_that_cannot_be_placed() {
+        // **Everything a player can carry is one id in one table.** A stack is
+        // a material, a quantity in units and a cut (charter rule 5), and that
+        // is what the inventory, the wire, the icons and the world's own
+        // string↔numeric table are all built on. A sword gets an id from the
+        // same counter a stone does; the only thing that differs is that it may
+        // not go in the world.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core_gear",
+            r#"
+            game.register_block{ id = "stone", hardness = 1.0 }
+            game.register_item{ id = "sword", name = "Sword", texture = "sword.png" }
+            "#,
+        )
+        .expect("load");
+
+        let blocks = vm.registered_blocks();
+        let ids: std::collections::BTreeMap<&str, MaterialId> = blocks
+            .iter()
+            .map(|(name, id)| (name.as_str(), *id))
+            .collect();
+        assert!(
+            ids.contains_key("core_gear:sword"),
+            "an item is in the material table: {ids:?}"
+        );
+        assert_ne!(
+            ids["core_gear:sword"], ids["core_gear:stone"],
+            "an item and a block share a counter and must not share an id"
+        );
+
+        // And it is marked, which is the whole of what makes it an item.
+        assert_eq!(vm.registered_items(), vec!["core_gear:sword".to_owned()]);
+
+        // Its texture reaches the atlas by the same road a block's does, which
+        // is what makes a slot able to draw it with no new code at all.
+        assert!(
+            vm.registered_block_textures()
+                .iter()
+                .any(|texture| texture.block == "core_gear:sword" && texture.path == "sword.png"),
+            "an item's texture did not reach the atlas"
+        );
+    }
+
+    #[test]
+    fn an_item_is_not_a_block_and_the_error_says_so() {
+        let mut refuser = vm();
+        // The fields a block has and an item does not. Refused rather than
+        // ignored: an API that accepted `hardness` on a sword would be
+        // promising behaviour nothing implements.
+        for field in ["hardness = 1.0", "light_emit = { r = 5 }", "drops = {}"] {
+            let source = format!("game.register_item{{ id = \"sword\", {field} }}");
+            let err =
+                load(&mut refuser, "core_gear", &source).expect_err(&format!("{field} accepted"));
+            let (ScriptError::Load { detail, .. } | ScriptError::Runtime { detail, .. }) = &err
+            else {
+                panic!("{err:?}");
+            };
+            assert!(
+                detail.contains("unknown field"),
+                "the error for `{field}` should name it: {detail}"
+            );
+        }
+
+        // And a name already taken is refused whichever way round it is.
+        let mut fresh = vm();
+        assert!(
+            load(
+                &mut fresh,
+                "core_gear",
+                r#"game.register_block{ id = "thing" }
+                   game.register_item{ id = "thing" }"#,
+            )
+            .is_err(),
+            "an item took a block's id"
+        );
     }
 
     #[test]

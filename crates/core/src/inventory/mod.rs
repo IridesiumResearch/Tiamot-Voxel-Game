@@ -549,6 +549,17 @@ pub trait Access: Send + Sync {
     /// [`crate::inventory::Slots::insert`] grows rather than refusing.
     fn give(&self, player: [u8; 32], view: &str, stack: Stack) -> bool;
 
+    /// What a player is holding: the stack in the hotbar slot they selected.
+    ///
+    /// `None` for a player who is not connected, or an empty slot — which are
+    /// the same answer to "what is in your hand" and neither is an error.
+    ///
+    /// **The slot is the client's own UI state**, sent when it changes (see
+    /// `ClientMessage::SelectSlot`). Without it a mod could see what somebody
+    /// OWNS and never what they are pointing with, which is the difference
+    /// between an inventory and a weapon.
+    fn held(&self, player: [u8; 32]) -> Option<Stack>;
+
     /// Takes up to `units` of one material and cut, returning how many it got.
     ///
     /// **Partial by design.** A crafting mod asking for more than the player

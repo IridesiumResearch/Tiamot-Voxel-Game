@@ -157,6 +157,16 @@ pub enum Action {
         slot: u16,
     },
 
+    /// The player is now holding this hotbar slot.
+    ///
+    /// Not a request: nothing about the world changes when somebody looks at a
+    /// different slot. The server keeps it so a mod can ask what is in a
+    /// player's hand — see `game.held`.
+    SelectSlot {
+        /// Which slot, zero-based.
+        slot: u16,
+    },
+
     /// Record a movement/look input for the next tick.
     Input {
         /// The tick the client believes it is on.
@@ -391,6 +401,7 @@ impl Session {
             ClientMessage::SwapOffhand { slot } => {
                 Response::act(Action::SwapOffhand { slot: *slot })
             }
+            ClientMessage::SelectSlot { slot } => Response::act(Action::SelectSlot { slot: *slot }),
             ClientMessage::Action { id, pressed } => Response::act(Action::pressed(id, *pressed)),
             ClientMessage::DialogEvent { form, event } => Response::act(Action::Dialog {
                 form: form.clone(),
@@ -908,6 +919,7 @@ impl Session {
             ClientMessage::DialogEvent { .. } => "DialogEvent",
             ClientMessage::Action { .. } => "Action",
             ClientMessage::SelectTool { .. } => "SelectTool",
+            ClientMessage::SelectSlot { .. } => "SelectSlot",
             ClientMessage::Place { .. } => "Place",
             ClientMessage::ViewDistance { .. } => "ViewDistance",
             ClientMessage::Punch { .. } => "Punch",

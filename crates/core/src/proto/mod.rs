@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 30;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -82,6 +82,18 @@ pub const PROTOCOL_VERSION: u32 = 28;
 // stream. They are also PER PLAYER rather than broadcast — which entities
 // somebody can see is their own interest set, and sending everyone every mob
 // would make a populated world cost the square of the people watching it.
+// v30 (post-14): appended `ClientMessage::SelectSlot`. Which slot a player is
+// holding was known only to the client — the hotbar keys are handled locally
+// and nothing but a `Place` ever told the server what was in hand. That is
+// enough for building and not enough for anything a mod wants to do with an
+// ITEM: a sword that swings, a torch that lights, a tool that digs faster. The
+// server has to know what is held before a mod can ask.
+// v29 (post-14): `MaterialDef` carries `placeable`. Everything a player can
+// carry is one id in one table — a stack is a material, a quantity and a cut —
+// and an ITEM is a material that may not be put in the world. One flag rather
+// than a second id space, because the distinction matters in exactly one place
+// and a `kind` byte would put a `match` in all the others. The client needs it
+// to stop offering a placement that the server would only refuse.
 // v28 (post-14): `EntityDef` carries `item`. An entity can BE a stack — one
 // lying on the ground — and the client draws it as the same cells a hand holds
 // and a slot shows. On the SPAWN and not in the delta: what an item is never
@@ -532,6 +544,18 @@ pub struct MaterialDef {
     pub id: u16,
     /// The canonical string id, e.g. `"core:white"`.
     pub name: String,
+    /// Whether this can be put in the world.
+    ///
+    /// **False makes it an item**: a sword, a helmet, a thing you can hold and
+    /// carry and not a thing you can build with. Everything else about it is a
+    /// material — the atlas tile, the slot it sits in, the units it counts in —
+    /// because that is what a stack is made of (charter rule 5), and only this
+    /// differs.
+    ///
+    /// The world palette must never contain a `false` one, which is the
+    /// server's job: a placement of an item is refused before it becomes an
+    /// edit.
+    pub placeable: bool,
     /// Content hash of this material's texture, if it registered one.
     ///
     /// A hash rather than a path: the client fetches it through the same
@@ -813,6 +837,24 @@ pub enum ClientMessage {
     /// clamping would swap a slot the player did not name.
     SwapOffhand {
         /// Which slot to swap with the off-hand, zero-based.
+        slot: u16,
+    },
+
+    /// Which hotbar slot the player is holding.
+    ///
+    /// **Appended at the end** (protocol v30).
+    ///
+    /// A statement of local UI state, not a request: the hotbar keys and the
+    /// wheel are the client's, and nothing about the world changes when a
+    /// player looks at a different slot. The server keeps it so a MOD can ask
+    /// what somebody is holding — which is what makes an item that is not a
+    /// block worth registering at all.
+    ///
+    /// Sent when it changes, not every tick. A slot out of range is clamped
+    /// rather than refused: it is a display detail, and disconnecting somebody
+    /// over one would be a very expensive way to say nothing.
+    SelectSlot {
+        /// Zero-based, into `player:main`.
         slot: u16,
     },
 }
@@ -1776,6 +1818,11 @@ pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolEr
         // server rather than clamped — clamping would swap a slot the player
         // did not name.
         | ClientMessage::SwapOffhand { .. }
+        // Two bytes naming a slot, and nothing about the world changes when a
+        // player looks at a different one. Clamped by the server rather than
+        // refused: disconnecting somebody over a display detail would be a very
+        // expensive way to say nothing.
+        | ClientMessage::SelectSlot { .. }
         // Eight bytes naming an entity. Every value is decodable and almost
         // all of them resolve to nothing, which the server treats as a punch
         // at thin air — there is nothing to bound here that the entity store
@@ -2516,6 +2563,9 @@ mod tests {
         // Protocol v26.
         let swap = encode(&ClientMessage::SwapOffhand { slot: 0 }).expect("encode");
         assert_eq!(swap[0], 18);
+        // Protocol v30.
+        let select = encode(&ClientMessage::SelectSlot { slot: 0 }).expect("encode");
+        assert_eq!(select[0], 19);
     }
 
     #[test]
@@ -3132,12 +3182,14 @@ mod tests {
                     id: 0,
                     name: "engine:air".to_owned(),
                     texture: None,
+                    placeable: true,
                     step_sound: None,
                 },
                 MaterialDef {
                     id: 2,
                     name: "core:white".to_owned(),
                     texture: Some([9u8; 32]),
+                    placeable: true,
                     step_sound: None,
                 },
             ],

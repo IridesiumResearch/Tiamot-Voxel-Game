@@ -1126,6 +1126,13 @@ pub trait ScriptVm: Sized {
     /// Tools registered during the loading window, ordered by id.
     fn registered_tools(&self) -> Vec<Tool>;
 
+    /// Ids registered as ITEMS rather than blocks, sorted.
+    ///
+    /// **The only thing that makes an item an item.** Everything a player can
+    /// carry shares one id space (see `register_item` for why), and this is the
+    /// list of the ones that may not be placed in the world.
+    fn registered_items(&self) -> Vec<String>;
+
     /// Inventory views mods asked for, ordered by id.
     ///
     /// **Not `player:main`**, which every player has and no mod may resize —
