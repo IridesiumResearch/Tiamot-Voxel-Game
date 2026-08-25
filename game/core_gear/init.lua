@@ -37,9 +37,15 @@ game.register_item{
 game.register_view{ id = "worn", slots = 4 }
 
 -- The key that opens the worn slots.
+--
+-- **Checked against what the engine already binds**, which a mod cannot ask
+-- about: `default_key` is a SUGGESTION and the engine owns bindings (charter
+-- rule 11), so a mod suggesting one already taken produces two actions on one
+-- key and a player wondering why their tool cycles when they open a screen.
+-- The first draft of this suggested `KeyR`, which is `engine:next_tool`.
 game.register_action{
     id = "gear",
-    default_key = "KeyR",
+    default_key = "KeyZ",
     description = "Open the worn slots",
 }
 

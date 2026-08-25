@@ -2117,6 +2117,33 @@ impl App {
                 tracing::warn!(%err, "a server's action was refused");
             }
         }
+        self.warn_about_shared_defaults();
+    }
+
+    /// Warns about two actions whose default key is the same.
+    ///
+    /// # Why this is worth a line on the player's screen
+    ///
+    /// **A mod cannot ask what is already bound**, and it should not be able
+    /// to: the engine owns bindings and mods never read keys (charter rule 11).
+    /// So a mod suggesting a key the engine already uses is a mistake nobody is
+    /// positioned to catch — and the failure is SILENT, because
+    /// [`crate::input::Bindings::action_for`] takes the FIRST action whose
+    /// binding matches and the other one simply never fires.
+    ///
+    /// The player is the one who can fix it, on the controls screen, so the
+    /// player is who is told — and told which mod, for the same reason a
+    /// mod-attributed warning exists at all.
+    ///
+    /// Only DEFAULTS: a player who has deliberately put two actions on one key
+    /// has said what they meant.
+    fn warn_about_shared_defaults(&mut self) {
+        for (first, second) in shared_defaults(&self.actions) {
+            self.warn(format!(
+                "`{second}` and `{first}` are both on the same key by default; only one of them \
+                 will work until you rebind it"
+            ));
+        }
     }
 
     /// Every sound the server's mods registered.
@@ -4696,10 +4723,100 @@ pub fn build_atlas(
     Atlas::build(&slots)
 }
 
+/// Pairs of actions whose DEFAULT key is the same, as `(held, clashing)`.
+///
+/// Defaults only: a player who has deliberately put two actions on one key has
+/// said what they meant. See [`App::warn_about_shared_defaults`], which is the
+/// only caller and does nothing but phrase this.
+fn shared_defaults(actions: &crate::input::Actions) -> Vec<(String, String)> {
+    let mut seen: std::collections::BTreeMap<crate::input::Input, String> =
+        std::collections::BTreeMap::new();
+    let mut clashes = Vec::new();
+    for action in actions.iter() {
+        let Some(default) = action.default else {
+            continue;
+        };
+        match seen.entry(default) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(action.id.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(held) => {
+                clashes.push((held.get().clone(), action.id.clone()));
+            }
+        }
+    }
+    clashes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tiamot_core::proto::MaterialDef;
+
+    #[test]
+    fn two_actions_on_one_default_key_are_reported_to_the_player() {
+        // **A mod cannot ask what is already bound**, and should not be able to
+        // — the engine owns bindings and mods never read keys (charter rule
+        // 11). So a mod suggesting a key the engine already uses is a mistake
+        // nobody is positioned to catch, and the failure is SILENT:
+        // `Bindings::action_for` takes the first match and the other action
+        // never fires again.
+        //
+        // Found writing `game/core_gear`, whose first draft put its screen on
+        // `KeyR` — which is `engine:next_tool`.
+        let mut actions = crate::input::Actions::engine();
+        let taken = actions
+            .iter()
+            .find_map(|action| action.default.map(|input| (action.id.clone(), input)));
+        let (engine_action, key) = taken.expect("the engine binds something by default");
+
+        actions
+            .register(crate::input::Action {
+                id: "a_mod:thing".to_owned(),
+                description: "does a thing".to_owned(),
+                source: crate::input::Source::Mod("a_mod".to_owned()),
+                default: Some(key),
+            })
+            .expect("register");
+
+        // The clash-finder on its own, without a whole App: it is a pure walk
+        // over the action list, which is the part that can be wrong.
+        let mut seen: std::collections::BTreeMap<crate::input::Input, String> =
+            std::collections::BTreeMap::new();
+        let mut clashes = Vec::new();
+        for action in actions.iter() {
+            let Some(default) = action.default else {
+                continue;
+            };
+            match seen.entry(default) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(action.id.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(held) => {
+                    clashes.push((held.get().clone(), action.id.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            clashes,
+            vec![(engine_action, "a_mod:thing".to_owned())],
+            "a mod landing on a key the engine already uses went unreported"
+        );
+
+        // The counter-example: the engine's own defaults do not clash with each
+        // other, so this reports a real thing rather than always reporting.
+        let clean = crate::input::Actions::engine();
+        let mut seen: std::collections::BTreeSet<crate::input::Input> =
+            std::collections::BTreeSet::new();
+        for action in clean.iter() {
+            if let Some(default) = action.default {
+                assert!(
+                    seen.insert(default),
+                    "two ENGINE actions share `{default:?}` by default"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_figure_faces_the_way_the_camera_looks() {
