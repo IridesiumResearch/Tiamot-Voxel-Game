@@ -3906,6 +3906,10 @@ impl App {
             yaw: figure_yaw(self.camera.yaw),
             anim: self.gait(),
             phase: self.since_start.elapsed().as_secs_f32(),
+            carrying: [
+                self.hotbar.get(self.selected).copied().flatten().is_some(),
+                self.offhand().is_some(),
+            ],
         };
         self.renderer.set_player(Some(figure));
         self.place_blobs();
@@ -4095,6 +4099,11 @@ impl App {
                 // stable across frames or the phase jitters, which is why it
                 // comes from the id rather than from anything about the frame.
                 phase: now.as_secs_f32() + (id % 977) as f32 * 0.037,
+                // **Nobody else's hands are known.** Nothing on the wire says
+                // what another entity is holding, so an arm held out for a
+                // block that is never drawn would be a pose with no reason.
+                // See `App::place_props`.
+                carrying: [false; 2],
             });
         }
         self.renderer.set_entities(placed);

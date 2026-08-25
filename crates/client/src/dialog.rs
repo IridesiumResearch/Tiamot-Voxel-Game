@@ -221,30 +221,32 @@ impl Screen {
     }
 }
 
-/// The rectangle one dialog is drawn in, in points.
+/// The rectangle a `compact` dialog is drawn in, in points.
 ///
-/// # Why a screen is the whole sheet whatever is in it
+/// # Why only a compact one is measured
 ///
 /// **A player reads every screen the game puts in front of them as one thing.**
 /// Sizing each one to its contents made the inventory a different size from the
 /// crafting tab of the same dialog, so switching tabs grew and shrank the
 /// window under the pointer, and no two screens agreed with each other.
-/// Reported from the window.
+/// Reported from the window. A screen is therefore the sheet — see
+/// [`crate::panel::sheet_with`], which decides that and hands over a `Ui`
+/// already inside it.
 ///
 /// The engine cannot tell a two-button prompt from an inventory by looking at
 /// the tree — both are containers of widgets — so the mod says which it built,
-/// and a `compact` one is measured and capped the way every dialog used to be.
-/// Saying nothing gets the sheet, because the sheet is what the rest of the
-/// interface looks like.
+/// and a `compact` one is measured the way every dialog used to be. It is still
+/// capped by the sheet: a mod that asks for a window bigger than the screen
+/// does not get one.
 #[must_use]
-pub fn window_size(compact: bool, wanted: (i32, i32), area: (f32, f32)) -> (i32, i32) {
+pub fn prompt_size(wanted: (i32, i32), area: (f32, f32)) -> (i32, i32) {
     let sheet = crate::panel::size(area);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a window's size in points, which is small and positive"
+    )]
     let cap = (sheet.0 as i32, sheet.1 as i32);
-    if compact {
-        (wanted.0.clamp(160, cap.0), wanted.1.clamp(120, cap.1))
-    } else {
-        cap
-    }
+    (wanted.0.clamp(160, cap.0), wanted.1.clamp(120, cap.1))
 }
 
 /// What a slot says it holds.
@@ -270,6 +272,36 @@ pub fn stack_label(units: u32, shape: u32) -> String {
     }
 }
 
+/// Lays a tree out into `size` and paints it at the cursor.
+///
+/// Shared by both shapes of dialog, because what differs between a screen and a
+/// prompt is the window around the tree and nothing about the tree itself.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a paint walk carries its context; grouping it would hide the recursion"
+)]
+fn paint_tree(
+    ui: &mut egui::Ui,
+    size: (i32, i32),
+    tree: &Tree,
+    ruler: &EguiRuler<'_>,
+    form: &str,
+    local: &mut Local,
+    views: &BTreeMap<String, ViewContents>,
+    icons: Icons<'_>,
+    raised: &mut Vec<Raised>,
+) {
+    let origin = ui.cursor().min;
+    let laid = layout(tree, Rect::new(0, 0, size.0, size.1), ruler);
+    // The tree and its rectangles are walked TOGETHER, by index, so a renderer
+    // cannot pair a widget with somebody else's rectangle — which a flat list
+    // plus a separate traversal invites.
+    paint(
+        ui, origin, tree, 0, &laid, form, local, views, icons, raised,
+    );
+    ui.allocate_space(egui::vec2(laid.rect.w as f32, laid.rect.h as f32));
+}
+
 /// Draws one dialog in its own window.
 fn draw_form(
     ctx: &egui::Context,
@@ -283,61 +315,75 @@ fn draw_form(
     let tree = &screen.tree;
     let mut raised = Vec::new();
     let ruler = EguiRuler { ctx };
-    // The same sheet the engine's own panels take — see `client::panel` and
-    // `window_size`, which is where the reasoning lives. A screen is the sheet;
-    // a prompt is measured and capped by it.
-    // Measured only when the answer can depend on it: a screen is the sheet
-    // whatever is in it, and walking the tree to find a size nothing reads is a
-    // layout pass per dialog per frame.
-    let wanted = if screen.compact {
-        tiamot_core::ui::natural(tree, &ruler)
-    } else {
-        (0, 0)
-    };
-    let (width, height) = window_size(screen.compact, wanted, area);
-
     let mut close = false;
-    let centred = egui::pos2(
-        (area.0 - width as f32) / 2.0,
-        (area.1 - height as f32) / 2.0,
-    );
-    let window = egui::Window::new(form).collapsible(false).resizable(false);
-    // **A screen does not move and a prompt does.** Centred is only a DEFAULT
-    // for a prompt, so a player who drags one somewhere keeps it there; a
-    // screen is the sheet, in the place every other sheet is, and a sheet that
-    // could be dragged half off the window would be a screen with no way back.
-    let window = if screen.compact {
-        window.default_pos(centred).default_width(width as f32)
+
+    if screen.compact {
+        // A prompt: measured, capped by the sheet, and draggable. Centred is
+        // only a DEFAULT, so a player who moves one keeps it where they put it.
+        let (width, height) = prompt_size(tiamot_core::ui::natural(tree, &ruler), area);
+        egui::Window::new(form)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(egui::pos2(
+                (area.0 - width as f32) / 2.0,
+                (area.1 - height as f32) / 2.0,
+            ))
+            .default_width(width as f32)
+            .show(ctx, |ui| {
+                paint_tree(
+                    ui,
+                    (width, height),
+                    tree,
+                    &ruler,
+                    form,
+                    local,
+                    views,
+                    icons,
+                    &mut raised,
+                );
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
     } else {
-        window
-            .movable(false)
-            .fixed_pos(centred)
-            .fixed_size(egui::vec2(width as f32, height as f32))
-            .max_height(height as f32)
-    };
-    window.show(ctx, |ui| {
-        let origin = ui.cursor().min;
-        let laid = layout(tree, Rect::new(0, 0, width, height), &ruler);
-        // The tree and its rectangles are walked TOGETHER, by index, so a
-        // renderer cannot pair a widget with somebody else's rectangle —
-        // which a flat list plus a separate traversal invites.
-        paint(
-            ui,
-            origin,
-            tree,
-            0,
-            &laid,
-            form,
-            local,
-            views,
-            icons,
-            &mut raised,
-        );
-        ui.allocate_space(egui::vec2(laid.rect.w as f32, laid.rect.h as f32));
-        if ui.button("Close").clicked() {
-            close = true;
-        }
-    });
+        // **A screen goes through the engine's own sheet**, which is the only
+        // way it can be the same shape as the engine's own screens.
+        //
+        // It used to build its own window at the sheet's size and lay the tree
+        // into the whole of it, then add a Close button underneath — and
+        // `fixed_size` on an `egui::Window` is a REQUEST, so the window grew by
+        // however much did not fit. Reported from the window: the inventory
+        // still reached the top and the bottom of the screen. `panel::sheet`
+        // hands over a `Ui` that is already inside the sheet, so a screen
+        // cannot escape one because it never gets to say how big it is.
+        //
+        // No heading: a dialog's own title is inside its tree, where the mod
+        // put it, and the `id` here is the namespaced form the server named.
+        close |= crate::panel::sheet_with(ctx, form, None, Some("Close"), |ui| {
+            // The room the sheet handed over, which inside its scrolling body
+            // is the viewport rather than the endless height a scroll area can
+            // hold. Measured rather than assumed: the clip rectangle, which is
+            // the other candidate, is a few points WIDER than the room.
+            let room = ui.available_size();
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a window's size in points, which is small and positive"
+            )]
+            let size = (room.x.max(1.0) as i32, room.y.max(1.0) as i32);
+            paint_tree(
+                ui,
+                size,
+                tree,
+                &ruler,
+                form,
+                local,
+                views,
+                icons,
+                &mut raised,
+            );
+        });
+    }
+
     if close {
         raised.push(Raised {
             form: form.to_owned(),
@@ -1031,31 +1077,132 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_screen_is_the_sheet_and_only_a_prompt_is_its_own_size() {
-        // **The reported bug, as a property.** Switching from the inventory to
-        // the crafting tab of the same dialog changed how much the tree wanted,
-        // and the window grew and shrank under the pointer. A screen is the
-        // sheet whatever is in it, so two different trees cannot disagree about
-        // where the window is.
+    fn a_prompt_is_its_own_size_and_never_larger_than_the_sheet() {
         let area = (1920.0, 1080.0);
         let sheet = crate::panel::size(area);
+        #[expect(clippy::cast_possible_truncation, reason = "a size in points")]
         let sheet = (sheet.0 as i32, sheet.1 as i32);
 
-        let small = window_size(false, (200, 150), area);
-        let large = window_size(false, (4000, 4000), area);
-        assert_eq!(
-            small, sheet,
-            "a screen is the sheet however little is in it"
-        );
-        assert_eq!(large, sheet, "a screen is the sheet however much is in it");
-        assert_eq!(small, large, "two tabs of one dialog are the same window");
+        assert_eq!(prompt_size((200, 150), area), (200, 150));
+        // A mod that asks for a window bigger than the screen does not get one.
+        assert_eq!(prompt_size((4000, 4000), area), sheet);
+        // And a floor, so a tree that measures to nothing is still clickable.
+        assert_eq!(prompt_size((0, 0), area), (160, 120));
+    }
 
-        // A prompt is measured, and still may not exceed the sheet: a mod that
-        // asks for a window larger than the screen does not get one.
-        assert_eq!(window_size(true, (200, 150), area), (200, 150));
-        assert_eq!(window_size(true, (4000, 4000), area), sheet);
-        // And has a floor, so a tree that measures to nothing is still clickable.
-        assert_eq!(window_size(true, (0, 0), area), (160, 120));
+    /// Draws `tree` as a screen into a headless egui and returns what it
+    /// covered, in points.
+    fn drawn_extent(tree: Tree, area: (f32, f32)) -> egui::Rect {
+        let ctx = egui::Context::default();
+        crate::app::install_fonts(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(area.0, area.1),
+            )),
+            ..Default::default()
+        };
+        let mut dialogs = Dialogs::default();
+        let mut open = BTreeMap::new();
+        open.insert("mod:screen".to_owned(), Screen::new(tree, false));
+        let views = BTreeMap::new();
+
+        // Twice: the first pass has no fonts laid out yet, so what it measures
+        // is not what a player sees. The second is a steady frame.
+        let mut covered = egui::Rect::NOTHING;
+        for _ in 0..2 {
+            let output = ctx.run_ui(raw.clone(), |root| {
+                let ctx = root.ctx().clone();
+                dialogs.draw(&ctx, &open, &views, Icons::default(), area);
+            });
+            covered = egui::Rect::NOTHING;
+            for clipped in &output.shapes {
+                // **Intersected with its clip rectangle.** A shape scrolled out
+                // of view still reports its own bounds, so the union of those
+                // measures the CONTENT rather than the window. A window that
+                // really did grow grows its clip rectangle with it, so this
+                // still catches the thing the test is about.
+                let visible = clipped
+                    .shape
+                    .visual_bounding_rect()
+                    .intersect(clipped.clip_rect);
+                if visible.is_positive() {
+                    covered = covered.union(visible);
+                }
+            }
+        }
+        covered
+    }
+
+    #[test]
+    fn a_screen_stays_inside_the_sheet_however_much_is_in_it() {
+        /// egui's window frame: `panel::size` is the room the CONTENTS get, and
+        /// the window drawn around it is that plus its own margin and stroke.
+        /// Every screen in the game carries the same one.
+        const FRAME: f32 = 64.0;
+
+        // **The reported bug, twice over.** A screen used to build its own
+        // window at the sheet's size, lay the tree into the whole of it, and
+        // then add a Close button underneath — and `fixed_size` on an
+        // `egui::Window` is a request rather than a bound, so the window grew
+        // by however much did not fit and the inventory reached the top and the
+        // bottom of the screen.
+        //
+        // Measured on what was actually PAINTED rather than on a number the
+        // sizing function returned, because the number was already right: it
+        // was the window that ignored it.
+        let area = (1920.0, 1080.0);
+        let sheet = crate::panel::size(area);
+
+        let full = |labels: usize| {
+            let children: Vec<_> = (0..labels)
+                .map(|index| {
+                    tiamot_core::ui::Build::leaf(Widget::Label {
+                        text: format!("line {index} of a screen with a great deal in it"),
+                    })
+                })
+                .collect();
+            tiamot_core::ui::Build::of(
+                Node::new(Widget::Container {
+                    direction: Direction::Column,
+                    gap: 4,
+                    padding: 8,
+                    align: Align::Start,
+                }),
+                children,
+            )
+            .flatten()
+        };
+
+        let little = drawn_extent(full(1), area);
+        let lots = drawn_extent(full(200), area);
+
+        // **It does not reach the top and the bottom**, which is the words the
+        // report used. A sixteenth of the screen clear at each end — the bound
+        // is loose because it is guarding against a window with NO margin,
+        // which is what was reported, and because the sheet is centred by the
+        // room its contents get rather than by the frame drawn around them.
+        let margin = area.1 / 16.0;
+        assert!(
+            lots.min.y > margin && lots.max.y < area.1 - margin,
+            "a screen with a lot in it covered {lots:?} of a {area:?} window, so it runs off \
+             the top and the bottom"
+        );
+        assert!(
+            (lots.height() - little.height()).abs() < 1.0
+                && (lots.width() - little.width()).abs() < 1.0,
+            "two screens are different sizes ({little:?} against {lots:?}), so switching tabs \
+             moves the window"
+        );
+        // And it is the SHEET rather than some other stable size — a window
+        // pinned to the whole screen would pass the two checks above.
+        //
+        assert!(
+            lots.height() - sheet.1 < FRAME && lots.height() > sheet.1 - FRAME,
+            "a screen covered {} points and the sheet is {}",
+            lots.height(),
+            sheet.1
+        );
     }
 
     #[test]

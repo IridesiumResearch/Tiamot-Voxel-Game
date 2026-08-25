@@ -216,6 +216,24 @@ pub mod panel {
         back: Option<&str>,
         contents: impl FnOnce(&mut egui::Ui),
     ) -> bool {
+        sheet_with(ctx, title, Some(title), back, contents)
+    }
+
+    /// The same sheet, for a screen whose heading is not its identity.
+    ///
+    /// **A mod's dialog is one of these**, and the two differ: `id` is the
+    /// namespaced form the server named — `core_ui:inventory` — which egui
+    /// needs to tell one window from another and which no player should ever
+    /// be shown. A dialog's own heading is inside its tree, where the mod put
+    /// it, so it passes `None` and gets the bar with just the way out on it.
+    pub fn sheet_with(
+        ctx: &egui::Context,
+        id: &str,
+        heading: Option<&str>,
+        back: Option<&str>,
+        contents: impl FnOnce(&mut egui::Ui),
+    ) -> bool {
+        let title = id;
         let screen = ctx.content_rect();
         let (width, height) = size((screen.width(), screen.height()));
         let (x, y) = origin((screen.width(), screen.height()));
@@ -238,9 +256,13 @@ pub mod panel {
                 ui.horizontal(|ui| {
                     if let Some(label) = back {
                         went_back |= ui.button(format!("← {label}")).clicked();
-                        ui.separator();
+                        if heading.is_some() {
+                            ui.separator();
+                        }
                     }
-                    ui.heading(title);
+                    if let Some(heading) = heading {
+                        ui.heading(heading);
+                    }
                 });
                 ui.separator();
                 // Everything below scrolls. The header stays put, so the way

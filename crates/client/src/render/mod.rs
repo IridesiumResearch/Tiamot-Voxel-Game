@@ -2085,12 +2085,13 @@ pub struct Prop {
 
 /// How big a held block is, as a half-extent in cells.
 ///
-/// **Smaller than a real block.** A full one at true scale is nearly a third of
-/// the figure's height and reads as somebody carrying a wardrobe; this is about
-/// half a block across, which is what a voxel game holds. Tuned by eye, like
-/// the viewmodel's own constants and for the same reason: a held object is a
+/// **Much smaller than a real block.** A full one at true scale is nearly a
+/// third of the figure's height and reads as somebody carrying a wardrobe.
+/// This is about a fifth of a block across — halved from the first attempt,
+/// which was reported from the window as still too big. Tuned by eye, like the
+/// viewmodel's own constants and for the same reason: a held object is a
 /// composition, and the only test of the number is whether it looks held.
-const HELD_HALF: f32 = 0.7;
+const HELD_HALF: f32 = 0.35;
 
 /// Where the block sits in the hand joint's own frame, in cells.
 ///
@@ -2927,6 +2928,7 @@ mod tests {
             yaw: 0.0,
             anim: 0,
             phase: 0.0,
+            carrying: [false; 2],
         };
         let boxes = held_boxes(&figure, &joint([3.0, 0.0, 0.0]), 0, [0.0; 4]);
         assert_eq!(boxes.len(), 1, "a whole block is one box");
@@ -2954,6 +2956,7 @@ mod tests {
             yaw: std::f32::consts::FRAC_PI_2,
             anim: 0,
             phase: 0.0,
+            carrying: [false; 2],
         };
         let boxes = held_boxes(&figure, &joint([3.0, 0.0, 0.0]), 0, [0.0; 4]);
         let at = placement(&boxes[0]);
@@ -2979,6 +2982,7 @@ mod tests {
             yaw: 0.0,
             anim: 0,
             phase: 0.0,
+            carrying: [false; 2],
         };
         let mask = 0b111 << 12;
         let cut = held_boxes(&figure, &joint([0.0; 3]), mask, [0.0; 4]);

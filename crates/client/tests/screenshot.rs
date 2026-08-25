@@ -1502,6 +1502,7 @@ fn a_figure_on_screen_does_not_take_the_terrains_shadows_with_it() {
         yaw: 0.0,
         anim: 0,
         phase: 0.0,
+        carrying: [false; 2],
     }]);
     let peopled = ratio(&mut renderer);
     renderer.set_entities(Vec::new());
@@ -1983,6 +1984,7 @@ fn player_at(offset: [f32; 3]) -> client::render::skinned::Figure {
         yaw: 0.0,
         anim: 0,
         phase: 0.0,
+        carrying: [false; 2],
     }
 }
 
@@ -2763,6 +2765,7 @@ fn an_entity_is_drawn_where_the_server_put_it() {
         yaw: 0.0,
         anim: 0,
         phase: 0.0,
+        carrying: [false; 2],
     }]);
     let peopled = target.capture(&mut renderer, &camera).expect("capture");
     let after = average(
@@ -2826,6 +2829,7 @@ fn a_hundred_entities_all_reach_the_instance_buffer() {
                 // Every clip the rig ships, so a crowd exercises all of them.
                 anim: (index % 6) as u8,
                 phase: index as f32 * 0.05,
+                carrying: [false; 2],
             }
         })
         .collect();
@@ -2871,6 +2875,7 @@ fn a_figure_is_posed_by_its_clip_rather_than_drawn_at_rest() {
             yaw: 0.0,
             anim,
             phase,
+            carrying: [false; 2],
         }]);
         target.capture(&mut renderer, &camera).expect("capture")
     };
@@ -2958,6 +2963,7 @@ fn a_figure_in_the_frame_does_not_move_the_milk() {
         yaw: 0.0,
         anim: 1,
         phase: 0.25,
+        carrying: [false; 2],
     }]);
     let peopled = target.capture(&mut renderer, &camera).expect("capture");
 

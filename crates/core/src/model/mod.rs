@@ -37,7 +37,10 @@ pub mod build;
 pub mod humanoid;
 pub mod ingest;
 
-pub use animate::{Matrix, joint_matrices, rest_matrices, skinning_matrices};
+pub use animate::{
+    Matrix, joint_matrices, joint_matrices_with, rest_matrices, skinning_matrices,
+    skinning_matrices_with,
+};
 pub use humanoid::{clip_for, humanoid};
 pub use ingest::{ModelError, load, load_isolated};
 

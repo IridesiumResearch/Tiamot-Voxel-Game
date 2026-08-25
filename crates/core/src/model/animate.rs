@@ -45,8 +45,37 @@ pub const IDENTITY: Matrix = [
 /// figure standing still rather than a figure collapsed into the origin.
 #[must_use]
 pub fn skinning_matrices(model: &Model, clip: Option<&Clip>, time: f32) -> Vec<Matrix> {
+    skinning_matrices_with(model, clip, time, &[])
+}
+
+/// The same, with extra rotations applied to named joints.
+///
+/// # What `extra` is for
+///
+/// **Posing a rig for something the clip does not know about.** A figure
+/// carrying a block holds the arm out rather than letting it hang, and which
+/// arm depends on which hand has something in it — a fact about an inventory,
+/// which no animation clip has any business knowing. A clip per combination is
+/// the alternative, and there are four of them for two hands.
+///
+/// Each entry is a joint index and a matrix multiplied into that joint's LOCAL
+/// transform, so it turns the joint about its own origin and carries every
+/// child with it. Applied before the chain is composed, which is what makes an
+/// arm's rotation move the hand on the end of it.
+///
+/// The matrix is the caller's because building a rotation needs `sin` and
+/// `cos`, and those are off the deterministic subset this crate is held to
+/// (charter rule 4). Posing a figure is presentation, so the client builds it
+/// where that is allowed and hands it over already built.
+#[must_use]
+pub fn skinning_matrices_with(
+    model: &Model,
+    clip: Option<&Clip>,
+    time: f32,
+    extra: &[(u8, Matrix)],
+) -> Vec<Matrix> {
     let joints = &model.skin.joints;
-    joint_matrices(model, clip, time)
+    joint_matrices_with(model, clip, time, extra)
         .iter()
         .zip(joints)
         .map(|(matrix, joint)| multiply(matrix, &joint.inverse_bind))
@@ -67,6 +96,21 @@ pub fn skinning_matrices(model: &Model, clip: Option<&Clip>, time: f32) -> Vec<M
 /// multiply short.
 #[must_use]
 pub fn joint_matrices(model: &Model, clip: Option<&Clip>, time: f32) -> Vec<Matrix> {
+    joint_matrices_with(model, clip, time, &[])
+}
+
+/// The same, with extra rotations applied to named joints.
+///
+/// See [`skinning_matrices_with`], which is this plus the inverse bind pose.
+/// **Anything hung off a joint must be placed with the SAME `extra`** the
+/// figure was drawn with, or a held block stays where the arm would have been.
+#[must_use]
+pub fn joint_matrices_with(
+    model: &Model,
+    clip: Option<&Clip>,
+    time: f32,
+    extra: &[(u8, Matrix)],
+) -> Vec<Matrix> {
     let joints = &model.skin.joints;
     if joints.is_empty() {
         return Vec::new();
@@ -95,7 +139,15 @@ pub fn joint_matrices(model: &Model, clip: Option<&Clip>, time: f32) -> Vec<Matr
     // reach here.
     let mut world: Vec<Matrix> = Vec::with_capacity(joints.len());
     for (index, joint) in joints.iter().enumerate() {
-        let own = matrix_of(&local[index]);
+        let mut own = matrix_of(&local[index]);
+        // **After the pose, before the parent.** The rotation is in the joint's
+        // own frame, so it turns the joint about its origin and every child
+        // follows — an arm lifting carries its hand, which is the whole point.
+        for (posed, matrix) in extra {
+            if usize::from(*posed) == index {
+                own = multiply(&own, matrix);
+            }
+        }
         let composed = match joint.parent {
             None => own,
             Some(parent) => multiply(&world[usize::from(parent)], &own),
@@ -254,6 +306,71 @@ mod tests {
     /// space is the fourth column of the composed world matrix.
     fn moved(matrix: &Matrix) -> [f32; 3] {
         [matrix[12], matrix[13], matrix[14]]
+    }
+
+    #[test]
+    fn a_pose_on_an_arm_carries_the_hand_on_the_end_of_it() {
+        // **What makes a carried block follow a lifted arm.** The client poses
+        // the SHOULDER, because lifting at the wrist bends a hand off the end
+        // of an arm that has not moved — and a pose on a parent is only worth
+        // anything if the chain below it comes too.
+        //
+        // A quarter turn about x, written out exactly so this test needs no
+        // trigonometry: `cos` is zero and `sin` is one, and both are off this
+        // crate's allowed subset (charter rule 4).
+        let quarter: Matrix = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, -1.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let model = humanoid();
+        let arm = model
+            .skin
+            .index_of("arm.r")
+            .expect("the rig has a right arm");
+        let hand = model
+            .skin
+            .index_of("hand.r")
+            .expect("the rig has a right hand");
+        let hips = model.skin.index_of("hips").expect("the rig has hips");
+
+        let origin = |matrices: &[Matrix], joint: u8| {
+            let matrix = matrices[usize::from(joint)];
+            [matrix[12], matrix[13], matrix[14]]
+        };
+        let rest = joint_matrices(&model, None, 0.0);
+        let posed = joint_matrices_with(&model, None, 0.0, &[(arm, quarter)]);
+
+        // The shoulder itself does not move: a rotation about a joint's own
+        // origin leaves that origin where it was.
+        let (was, now) = (origin(&rest, arm), origin(&posed, arm));
+        for axis in 0..3 {
+            assert!(
+                (was[axis] - now[axis]).abs() < 1e-4,
+                "the shoulder moved when the arm turned: {was:?} to {now:?}"
+            );
+        }
+
+        // The hand does, and by the length of the arm rather than a little.
+        let (was, now) = (origin(&rest, hand), origin(&posed, hand));
+        let moved = (0..3)
+            .map(|axis| (was[axis] - now[axis]) * (was[axis] - now[axis]))
+            .sum::<f32>();
+        assert!(
+            moved > 0.25,
+            "the hand barely moved when the arm turned a quarter: {was:?} to {now:?}"
+        );
+
+        // And nothing else in the rig did. A pose that reached the hips would
+        // be a figure that leant over every time it picked something up.
+        let (was, now) = (origin(&rest, hips), origin(&posed, hips));
+        for axis in 0..3 {
+            assert!(
+                (was[axis] - now[axis]).abs() < 1e-6,
+                "posing an arm moved the body: {was:?} to {now:?}"
+            );
+        }
     }
 
     #[test]

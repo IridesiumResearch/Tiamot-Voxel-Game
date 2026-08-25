@@ -52,6 +52,15 @@ pub struct Figure {
     /// sharing a clock march in step, which reads as a chorus line rather than
     /// as a crowd.
     pub phase: f32,
+    /// Whether each hand has something in it — right first, then left.
+    ///
+    /// **A carrying arm is held out rather than left to hang.** Reported from
+    /// the window: a figure holding a block at rest looks like a figure that
+    /// has put it down. Which arm is lifted depends on which hand is full,
+    /// which is a fact about an inventory and not something a clip can know —
+    /// so it is a pose applied over the clip rather than four more clips. See
+    /// [`Skinned::carry_pose`].
+    pub carrying: [bool; 2],
 }
 
 /// One instance, as the shader reads it.
@@ -165,6 +174,47 @@ impl Skinned {
         &self.shader
     }
 
+    /// How far a carrying arm is held out of rest, in radians.
+    ///
+    /// **Negative swings it forward.** The rig hangs each arm down its own
+    /// `−y`, and a rotation about `x` takes `−y` toward `−z`; the world's
+    /// forward is `+z`, so the sign is the one that looks wrong written down
+    /// and right on the screen. Tuned by eye, like the grip it carries: the ask
+    /// was "not quite in resting pose", not a raised arm.
+    const CARRY_LIFT: f32 = -0.35;
+
+    /// The joint rotations that pose a figure's arms for what it is carrying.
+    ///
+    /// **Anything hung off a hand must be placed with the SAME list** — see
+    /// [`tiamot_core::model::joint_matrices_with`]. That is why this is one
+    /// function rather than a rotation written out at each of the two places
+    /// that need it: a block placed against an unposed arm hangs in the air
+    /// beside a hand that has moved.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "charter rule 4 exempts rendering; this is a figure's pose, not the world"
+    )]
+    fn carry_pose(&self, figure: &Figure) -> Vec<(u8, tiamot_core::model::Matrix)> {
+        let (sin, cos) = (Self::CARRY_LIFT.sin(), Self::CARRY_LIFT.cos());
+        // A rotation about the joint's own x, column-major, as `Matrix` is.
+        let lift = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, cos, sin, 0.0, //
+            0.0, -sin, cos, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        // The ARM rather than the hand: lifting at the shoulder carries the
+        // forearm and the hand with it, and lifting at the wrist bends a hand
+        // off the end of an arm that has not moved.
+        ["arm.r", "arm.l"]
+            .into_iter()
+            .zip(figure.carrying)
+            .filter(|(_, carrying)| *carrying)
+            .filter_map(|(joint, _)| self.model.skin.index_of(joint))
+            .map(|index| (index, lift))
+            .collect()
+    }
+
     /// Where a named joint IS, in the figure's own space, for hanging
     /// something off it.
     ///
@@ -185,7 +235,9 @@ impl Skinned {
         // The joint's own transform, not a skinning matrix: one of those is
         // composed with the inverse bind pose and answers where a VERTEX went,
         // which is wrong by exactly the bind pose. See `model::joint_matrices`.
-        model::joint_matrices(&self.model, clip, figure.phase)
+        // The same pose the figure is DRAWN with, or the block hangs in the air
+        // beside an arm that has moved.
+        model::joint_matrices_with(&self.model, clip, figure.phase, &self.carry_pose(figure))
             .get(usize::from(index))
             .copied()
     }
@@ -220,7 +272,8 @@ impl Skinned {
             let clip = self
                 .model
                 .clip(model::clip_for(tiamot_core::ent::AnimTag(figure.anim)));
-            for matrix in model::skinning_matrices(&self.model, clip, figure.phase) {
+            let posed = self.carry_pose(figure);
+            for matrix in model::skinning_matrices_with(&self.model, clip, figure.phase, &posed) {
                 matrices.extend_from_slice(&matrix);
             }
             instances.push(Instance {
