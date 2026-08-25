@@ -815,6 +815,11 @@ pub struct App {
     last_step_at: [f32; 3],
     /// Whether the volumes have changed since they were written out.
     volumes_dirty: bool,
+    /// Where the interface-scale slider has been dragged to and not let go of.
+    ///
+    /// Held rather than applied, because applying it moves the slider — see
+    /// [`crate::widget::settle`].
+    ui_scale_draft: Option<f32>,
     /// Whether the settings screen is showing.
     settings_open: bool,
     /// Whether the player asked to quit from the menu.
@@ -1091,6 +1096,7 @@ impl App {
             stride: 0.0,
             last_step_at: [0.0; 3],
             volumes_dirty: false,
+            ui_scale_draft: None,
             settings_open: false,
             menu_open: false,
             quit_requested: false,
@@ -2133,6 +2139,32 @@ impl App {
         }
     }
 
+    /// Closes the topmost dialog, if one is open, reporting whether it did.
+    ///
+    /// **Escape closes what is in front of you before it opens what is not.**
+    /// A dialog is a screen the player asked for, and the key that gets out of
+    /// every other screen used to walk straight past it and open the pause menu
+    /// on top — so the inventory needed two Escapes and the first one paused
+    /// the game. Reported from the window.
+    ///
+    /// Topmost is the LAST of the map, which is the one drawn last and so the
+    /// one on top of the pile. The event goes to the server rather than closing
+    /// it here, because the dialog is the mod's: the mod hears `Closed`, drops
+    /// whatever it was tracking, and the close comes back as
+    /// [`Event::DialogClosed`] — the same path the dialog's own Close button
+    /// takes. A client that shut its own copy would leave a mod believing a
+    /// screen it can still write to is on somebody's display.
+    pub fn close_top_dialog(&mut self) -> bool {
+        let Some(form) = self.dialogs.keys().next_back().cloned() else {
+            return false;
+        };
+        self.raise_dialog_events(vec![crate::dialog::Raised {
+            form,
+            event: tiamot_core::proto::DialogEvent::Closed,
+        }]);
+        true
+    }
+
     /// Takes the dialog events raised since the last call, to send them.
     ///
     /// Drained rather than read: each one is a request the server acts on once,
@@ -2750,6 +2782,18 @@ impl App {
     #[must_use]
     pub const fn ui_scale(&self) -> f32 {
         self.config.ui_scale
+    }
+
+    /// The scale the slider should be showing: the draft if one is being
+    /// dragged, and what is in force otherwise.
+    #[must_use]
+    pub fn shown_ui_scale(&self) -> f32 {
+        self.ui_scale_draft.unwrap_or(self.config.ui_scale)
+    }
+
+    /// The half-dragged scale, for the slider to update in place.
+    pub const fn ui_scale_draft(&mut self) -> &mut Option<f32> {
+        &mut self.ui_scale_draft
     }
 
     /// Sets the interface scale, clamped to what a player can recover from.

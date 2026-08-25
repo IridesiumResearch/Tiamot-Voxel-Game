@@ -56,6 +56,98 @@ pub mod sky;
 pub mod texture;
 pub mod trust;
 
+/// Interface controls whose behaviour is shared between screens.
+pub mod widget {
+    /// What a settled slider should do with the value it is showing.
+    ///
+    /// Returns the draft to keep for the next frame, and the value to apply, in
+    /// that order. Exactly one of them is `Some` — a value is either still
+    /// being chosen or it has been chosen.
+    ///
+    /// # Why a value is not applied while the drag is running
+    ///
+    /// **Because the interface scale rescales the slider.** Applying it live
+    /// changes egui's zoom factor mid-drag, which moves the slider under the
+    /// pointer, which changes the value the pointer is now over. Reported from
+    /// the window as jumping and jerking around, and it is a feedback loop
+    /// rather than a jitter: the control is an input to its own position.
+    ///
+    /// The previous rule was that a scale you cannot see while dragging is a
+    /// scale you have to guess at. That is true and it is the lesser problem.
+    ///
+    /// A change that is not a drag — an arrow key, a click on the track —
+    /// applies at once, because there is no drag to wait for the end of.
+    #[must_use]
+    pub const fn settle(
+        dragging: bool,
+        changed: bool,
+        draft: Option<f32>,
+        shown: f32,
+    ) -> (Option<f32>, Option<f32>) {
+        if dragging {
+            return (Some(shown), None);
+        }
+        match draft {
+            // The frame the pointer came up: what was being dragged is now the
+            // answer, whether or not egui calls this frame a change.
+            Some(value) => (None, Some(value)),
+            None if changed => (None, Some(shown)),
+            None => (None, None),
+        }
+    }
+
+    /// A slider that applies its value only once the player lets go.
+    ///
+    /// `live` is what is in force now and `draft` is where the pointer has
+    /// dragged to and not yet let go of. Returns a value the moment it is
+    /// settled, and nothing on the frames in between — see [`settle`].
+    pub fn on_release(
+        ui: &mut egui::Ui,
+        label: &str,
+        range: std::ops::RangeInclusive<f32>,
+        step: f64,
+        live: f32,
+        draft: &mut Option<f32>,
+    ) -> Option<f32> {
+        let mut shown = draft.unwrap_or(live);
+        let response = ui.add(
+            egui::Slider::new(&mut shown, range)
+                .step_by(step)
+                .text(label),
+        );
+        // **Held, not merely moved.** A pointer pressed on the handle and not
+        // yet moved is a drag that has started, and treating it as settled
+        // would apply a value on the way past.
+        let holding = response.dragged() || response.is_pointer_button_down_on();
+        let (kept, settled) = settle(holding, response.changed(), *draft, shown);
+        *draft = kept;
+        settled
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_drag_is_kept_and_a_release_is_applied() {
+            // Nothing happening: no draft, no value.
+            assert_eq!(settle(false, false, None, 1.0), (None, None));
+
+            // The drag: remembered, and nothing applied yet — this is the whole
+            // of the fix, because applying here is what moved the slider.
+            assert_eq!(settle(true, true, None, 0.9), (Some(0.9), None));
+            assert_eq!(settle(true, true, Some(0.9), 0.85), (Some(0.85), None));
+
+            // The pointer comes up. egui reports no change on that frame, and
+            // the answer is the draft rather than nothing.
+            assert_eq!(settle(false, false, Some(0.85), 0.85), (None, Some(0.85)));
+
+            // An arrow key or a click on the track: no drag to wait for.
+            assert_eq!(settle(false, true, None, 1.1), (None, Some(1.1)));
+        }
+    }
+}
+
 /// The shape every full-screen panel takes: centred, four by three, most of the
 /// window.
 ///

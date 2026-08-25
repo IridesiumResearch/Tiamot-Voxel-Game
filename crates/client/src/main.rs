@@ -472,14 +472,19 @@ impl ApplicationHandler for Client {
             // A player who alt-tabs mid-dig gets no release event at all, and
             // the same stuck dig as the bug above. Cheap to be sure about.
             WindowEvent::Focused(false) => {
-                self.held = Held::default();
-                if self.digging {
+                if let Stage::Playing(app) = &mut surface.stage {
+                    self.grabbed = hand_over(
+                        &surface.window,
+                        false,
+                        app,
+                        &mut self.held,
+                        &mut self.digging,
+                    );
+                } else {
+                    self.held = Held::default();
                     self.digging = false;
-                    if let Stage::Playing(app) = &mut surface.stage {
-                        app.stop_digging();
-                    }
+                    self.grabbed = grab(&surface.window, false);
                 }
-                self.grabbed = grab(&surface.window, false);
             }
 
             WindowEvent::RedrawRequested if !self.frame() => event_loop.exit(),
@@ -632,7 +637,8 @@ impl Client {
                         }
                         // The cursor has to come back to click anything.
                         let wanted = wants_cursor(app.menu_open(), app.chat_open(), false);
-                        self.grabbed = grab(window, wanted);
+                        self.grabbed =
+                            hand_over(window, wanted, app, &mut self.held, &mut self.digging);
                     }
                     // Chat takes the cursor and the keyboard: a player typing
                     // "west" must not walk west while they do it. The window
@@ -640,8 +646,13 @@ impl Client {
                     // where this is checked before the match.
                     "engine:chat" if pressed => {
                         app.set_chat_open(true);
-                        self.held = Held::default();
-                        self.grabbed = grab(window, wants_cursor(false, true, false));
+                        self.grabbed = hand_over(
+                            window,
+                            wants_cursor(false, true, false),
+                            app,
+                            &mut self.held,
+                            &mut self.digging,
+                        );
                     }
                     "engine:debug_overlay" if pressed => {
                         let on = !app.debug_overlay();
@@ -650,17 +661,30 @@ impl Client {
                     // **Escape is the front door.** It used to only release the
                     // cursor, which left the settings screen reachable by one
                     // undocumented function key and the interface with no way
-                    // in. Now it opens a menu — and closes chat, a dialog's
-                    // grab, or the menu itself, whichever is in the way.
+                    // in. Now it opens a menu — and closes chat, a dialog, or
+                    // the menu itself, whichever is in the way.
+                    //
+                    // **Front to back, and one thing per press.** A dialog is
+                    // in front of the menu, so Escape closes the inventory
+                    // rather than pausing the game behind it — which is what it
+                    // did, and it took two presses to get back to the world.
+                    // Reported from the window.
                     "engine:menu" if pressed => {
                         if app.chat_open() {
                             app.set_chat_open(false);
+                        } else if app.close_top_dialog() {
+                            // Nothing else to do here. The dialog belongs to a
+                            // mod and closes when the server agrees it has, and
+                            // the cursor goes back to the camera on that
+                            // transition — the same one that released it.
+                            return;
                         } else {
                             let open = !app.menu_open();
                             app.set_menu_open(open);
                         }
                         let wanted = wants_cursor(app.menu_open(), app.chat_open(), false);
-                        self.grabbed = grab(window, wanted);
+                        self.grabbed =
+                            hand_over(window, wanted, app, &mut self.held, &mut self.digging);
                     }
                     // The floating-origin check from Task 08's criteria: out
                     // and home. The world travels with the camera, so a working
@@ -1129,7 +1153,13 @@ impl Client {
             // and answered by the one rule, so a dialog closing over an open
             // menu does not snatch it away again.
             let wanted = wants_cursor(app.menu_open(), app.chat_open(), dialog_open);
-            self.grabbed = grab(&surface.window, wanted);
+            self.grabbed = hand_over(
+                &surface.window,
+                wanted,
+                app,
+                &mut self.held,
+                &mut self.digging,
+            );
         }
 
         let now = std::time::Instant::now();
@@ -1630,9 +1660,11 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
     let mut resume = false;
     let mut controls = false;
     let mut quit = false;
-    let mut scale = app.ui_scale();
     let mut hud = app.hud_visible();
     let mut overlay = app.debug_overlay();
+    let live = app.ui_scale();
+    let mut settled = None;
+    let draft = app.ui_scale_draft();
 
     // **The same sheet every other screen gets**, and it decides the shape so
     // this cannot. See `client::panel::sheet`.
@@ -1655,16 +1687,19 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(6.0);
             });
 
-            // **Interface scale, live.** A scale you cannot see while dragging
-            // is a scale you have to guess at, and this is the one setting
-            // whose effect is the slider itself.
-            ui.add(
-                egui::Slider::new(
-                    &mut scale,
-                    *client::config::UI_SCALE_RANGE.start()..=*client::config::UI_SCALE_RANGE.end(),
-                )
-                .step_by(client::config::UI_SCALE_STEP)
-                .text("interface scale"),
+            // **Interface scale, on release rather than live.** It used to
+            // apply while the drag was running, on the grounds that a scale you
+            // cannot see is a scale you have to guess at. That is true and it
+            // is the lesser problem: the scale rescales the slider, so the
+            // control moved under the pointer and the value chased it. Reported
+            // from the window as jumping around. See `client::widget::settle`.
+            settled = client::widget::on_release(
+                ui,
+                "interface scale",
+                client::config::UI_SCALE_RANGE,
+                client::config::UI_SCALE_STEP,
+                live,
+                draft,
             );
             ui.checkbox(&mut hud, "Show HUD");
             ui.checkbox(&mut overlay, "Debug overlay");
@@ -1672,7 +1707,9 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
         }
     });
 
-    app.set_ui_scale(scale);
+    if let Some(scale) = settled {
+        app.set_ui_scale(scale);
+    }
     app.set_hud_visible(hud);
     app.set_debug_overlay(overlay);
     if controls {
@@ -2231,6 +2268,37 @@ fn hotbar_slot(id: &str) -> Option<usize> {
 /// them.
 const fn wants_cursor(menu: bool, chat: bool, dialog: bool) -> bool {
     !menu && !chat && !dialog
+}
+
+/// Hands the mouse to the interface, or takes it back for the camera.
+///
+/// **Releasing the cursor stops what the player was doing with it.** Every
+/// screen that wants the pointer — chat, a mod's dialog, the pause menu, the
+/// settings page — is a screen the player is no longer digging through, and
+/// each of them used to release the cursor and leave the dig running. Reported
+/// from the window: opening chat mid-dig took the next sub-node out of the next
+/// block before it stopped, because the only things that ever called
+/// [`App::stop_digging`] were the mouse release and losing focus.
+///
+/// So it hangs off the same transition [`wants_cursor`] already decides, in one
+/// place, rather than being remembered at each of the four sites that open a
+/// screen. Taking the cursor BACK does nothing: a player returning to the world
+/// is not holding anything down, because the interface had the button.
+fn hand_over(
+    window: &Window,
+    wanted: bool,
+    app: &mut App,
+    held: &mut Held,
+    digging: &mut bool,
+) -> bool {
+    if !wanted {
+        *held = Held::default();
+        if *digging {
+            *digging = false;
+            app.stop_digging();
+        }
+    }
+    grab(window, wanted)
 }
 
 /// Grabs or releases the cursor, reporting whether it is now grabbed.

@@ -68,6 +68,9 @@ pub struct Front {
     pub notice: Option<String>,
     /// Whether a setting changed and `client.toml` wants writing.
     settings_dirty: bool,
+    /// Where the interface-scale slider has been dragged to and not let go of.
+    /// See [`crate::widget::settle`].
+    scale_draft: Option<f32>,
 }
 
 impl Front {
@@ -85,6 +88,7 @@ impl Front {
             address: String::new(),
             confirming: None,
             settings_dirty: false,
+            scale_draft: None,
         }
     }
 
@@ -376,17 +380,20 @@ impl Front {
             ui.separator();
 
             ui.heading("Interface");
-            changed |= ui
-                .add(
-                    egui::Slider::new(
-                        &mut config.ui_scale,
-                        *crate::config::UI_SCALE_RANGE.start()
-                            ..=*crate::config::UI_SCALE_RANGE.end(),
-                    )
-                    .step_by(crate::config::UI_SCALE_STEP)
-                    .text("scale"),
-                )
-                .changed();
+            // On release, not live: the scale rescales the slider, so applying
+            // it mid-drag moves the control out from under the pointer. See
+            // [`crate::widget::settle`].
+            if let Some(scale) = crate::widget::on_release(
+                ui,
+                "scale",
+                crate::config::UI_SCALE_RANGE,
+                crate::config::UI_SCALE_STEP,
+                config.ui_scale,
+                &mut self.scale_draft,
+            ) {
+                changed |= (config.ui_scale - scale).abs() > f32::EPSILON;
+                config.ui_scale = scale;
+            }
             changed |= ui
                 .checkbox(&mut config.hud_visible, "Show the HUD")
                 .changed();

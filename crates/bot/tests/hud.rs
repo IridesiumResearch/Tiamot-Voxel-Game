@@ -309,6 +309,88 @@ fn core_uis_inventory_screen_opens_and_closes_on_the_action_it_registered() {
     assert!(server.stop());
 }
 
+#[test]
+fn a_screen_closed_from_the_client_can_be_opened_again() {
+    // **What Escape now does, and the trap under it.** The client raises
+    // `Closed` for the topmost dialog rather than opening the pause menu behind
+    // it, and that event goes to the mod as well as to the engine: the engine
+    // closes the form whatever the mod does, but the MOD is the thing holding
+    // "this player has the screen open". A mod that never heard the close would
+    // still believe it was open, so the next press of the key would toggle it
+    // shut and the inventory would look dead.
+    //
+    // The keystroke itself is the window's and is not tested here — this is the
+    // half that crosses the wire.
+    let server = start("closed");
+    block_on(async {
+        let mut bot = join(&server, "closer").await;
+
+        bot.action("core_ui:inventory", true).await.expect("press");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            if bot
+                .dialogs()
+                .into_iter()
+                .any(|(form, _)| form == "core_ui:inventory")
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the inventory never opened"
+            );
+            bot.recv().await.expect("recv");
+        }
+
+        // What Escape sends.
+        bot.dialog_event("core_ui:inventory", tiamot_core::proto::DialogEvent::Closed)
+            .await
+            .expect("send");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            if bot
+                .closed_dialogs()
+                .iter()
+                .any(|form| form == "core_ui:inventory")
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "closing it from the client did not close it"
+            );
+            bot.recv().await.expect("recv");
+        }
+
+        // And it opens again on the same key, which is what says the mod heard.
+        let before = bot
+            .dialogs()
+            .into_iter()
+            .filter(|(form, _)| form == "core_ui:inventory")
+            .count();
+        bot.action("core_ui:inventory", true).await.expect("press");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let now = bot
+                .dialogs()
+                .into_iter()
+                .filter(|(form, _)| form == "core_ui:inventory")
+                .count();
+            if now > before {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the key that used to open the inventory stopped working after a close"
+            );
+            bot.recv().await.expect("recv");
+        }
+
+        bot.disconnect().await;
+    });
+    assert!(server.stop());
+}
+
 /// Reads the tree of `core_ui`'s screen, waiting for one that satisfies `ready`.
 async fn screen(
     bot: &mut Bot,
