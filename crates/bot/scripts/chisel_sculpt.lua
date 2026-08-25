@@ -35,8 +35,15 @@ local TX, TY, TZ = -2, 0, 0
 
 bot.join("sculptor")
 
+-- **Per material, not just a total.** What was dug is the id whose units GREW,
+-- and picking "any id with units in it" was only ever right while a player
+-- arrived carrying nothing. A mod that hands something out on join — which is
+-- a thing mods do — made that pick the wrong stack, at random, because a Lua
+-- table's pair order is unspecified.
+local held = {}
 local before = 0
-for _, units in pairs(bot.inventory()) do
+for id, units in pairs(bot.inventory()) do
+    held[id] = units
     before = before + units
 end
 
@@ -61,7 +68,7 @@ local gained = 0
 local material = nil
 for id, units in pairs(bot.inventory()) do
     gained = gained + units
-    if units > 0 then
+    if units > (held[id] or 0) then
         material = id
     end
 end

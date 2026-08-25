@@ -1492,6 +1492,26 @@ impl Bot {
         latest
     }
 
+    /// One view's slots, if the server has sent it.
+    ///
+    /// A convenience over [`Bot::views`], because a test asking about one view
+    /// asks about one view.
+    #[must_use]
+    pub fn view(&self, name: &str) -> Option<Vec<Option<tiamot_core::proto::StackDef>>> {
+        self.views().remove(name)
+    }
+
+    /// Says which hotbar slot is held, as a client does when a number key is
+    /// pressed.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError`] if the connection has gone.
+    pub async fn select_slot(&mut self, slot: u16) -> Result<(), BotError> {
+        self.send(&tiamot_core::proto::ClientMessage::SelectSlot { slot })
+            .await
+    }
+
     /// What the server last said is on this player's cursor.
     #[must_use]
     pub fn held(&self) -> Option<tiamot_core::proto::StackDef> {

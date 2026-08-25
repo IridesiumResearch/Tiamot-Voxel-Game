@@ -2870,6 +2870,37 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         game.set("entities_in_radius", entities.within)
             .map_err(|err| self.vm_error(&err))?;
+        self.install_player_lookup(game)?;
+        Ok(())
+    }
+
+    /// `game.player_entity(uuid)`.
+    ///
+    /// **Charter rule 13's other half.** Every hook hands a mod a UUID — who
+    /// dug, who spoke, who pressed a key — and every entity call takes an id,
+    /// so without this a mod that knows WHO cannot find out WHERE. The
+    /// alternative is scanning the world for a body whose owner matches, which
+    /// is a scan of everything to answer a question the server has a map for.
+    fn install_player_lookup(&self, game: &Table) -> Result<(), ScriptError> {
+        let slot = std::sync::Arc::clone(&self.entities);
+        let lookup = self
+            .lua
+            .create_function(move |_, uuid: String| {
+                let player = player_of(&uuid, "player_entity")?;
+                let found = slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|store| store.player(player)))
+                    .flatten();
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "an entity id is handed to Lua as an integer, as every other one is"
+                )]
+                Ok(found.map(|id| id.0 as i64))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("player_entity", lookup)
+            .map_err(|err| self.vm_error(&err))?;
         Ok(())
     }
 
@@ -7081,6 +7112,15 @@ mod entity_tests {
                 .ok()
                 .and_then(|mut e| e.get_mut(id).map(|entity| patch.apply(entity)))
                 .unwrap_or(false)
+        }
+
+        fn player(&self, uuid: [u8; 32]) -> Option<crate::ent::EntityId> {
+            // The test double has no roster, so it does what the real one does
+            // by another road: find the body whose owner matches.
+            let entities = self.entities.lock().ok()?;
+            entities.iter().find_map(|(id, entity)| {
+                (entity.owner.map(|owner| *owner.0.as_bytes()) == Some(uuid)).then_some(id)
+            })
         }
 
         fn within(

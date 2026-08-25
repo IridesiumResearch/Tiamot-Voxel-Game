@@ -12,6 +12,7 @@ implementations and test fixtures, not shipped content.
 | `core_worldgen` | A mod can generate terrain through the native heightmap fills. |
 | `core_tools` | Digging rules live in Lua — delete it and nothing can be broken, because the engine has no bare hand (Task 09). |
 | `core_sky` | Sky content lives in Lua — delete it and the world loses its day and keeps everything else (Task 10). |
+| `core_gear` | Items that are not blocks, dropping and picking up, and a worn-slot view all live in Lua — the engine draws a dropped stack and decides nothing else about it. |
 | `core_ui` | The HUD and the inventory screen live in Lua — delete it and a client keeps a crosshair, chat and settings, and loses everything else on the screen (Task 14). |
 
 Each of those is checked by a test that removes the directory and asserts what

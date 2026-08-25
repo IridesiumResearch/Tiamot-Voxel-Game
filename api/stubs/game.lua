@@ -1461,6 +1461,27 @@ function game.set_entity(id, spec) end
 ---@return integer[]
 function game.entities_in_radius(position, radius, source) end
 
+---The entity mirroring a connected player, by their UUID. Nil if they are not here.
+---
+---**The other half of charter rule 13.** Every hook hands you a UUID — who dug,
+---who spoke, who pressed a key — and every entity call takes an id, so without
+---this a mod that knows WHO cannot find out WHERE. Feed the id straight to
+---`game.entity` for their position, or to `set_entity` and the rest.
+---
+---Ids are per-session and a player's changes every time they join, so look it
+---up when you need it rather than remembering it.
+---
+---```lua
+---game.register_on_action(function(event)
+---    local body = game.player_entity(event.player)
+---    local where = body and game.entity(body)
+---    if where then game.log("they are at " .. where.pos.x) end
+---end)
+---```
+---@param player string A player UUID in hex.
+---@return integer|nil id
+function game.player_entity(player) end
+
 --- MOD STORAGE -------------------------------------------------------------
 
 ---Your mod's own persistent key/value store, saved with the world.

@@ -1,0 +1,9 @@
+# Reference item, drop and equipment registrations.
+#
+# The mod id is `core_gear`, not `core`: a mod owns only its own id as a
+# registration namespace, and `core` belongs to `core_blocks`.
+id = "core_gear"
+name = "Core Gear"
+version = "0.1.0"
+description = "Reference items, dropping and worn slots. A test fixture, not a game."
+license = "GPL-3.0-only"

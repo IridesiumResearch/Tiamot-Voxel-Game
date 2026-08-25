@@ -159,6 +159,15 @@ impl Population {
         id
     }
 
+    /// The entity mirroring a connected player, or `None` if they are not here.
+    ///
+    /// The index the mirror already keeps, not a scan: a body goes in the
+    /// moment a player connects and comes out when they go.
+    #[must_use]
+    pub fn player_body(&self, uuid: &tiamot_core::PlayerUuid) -> Option<EntityId> {
+        self.players.get(uuid).copied()
+    }
+
     /// Removes the mirrors of players who are no longer connected.
     ///
     /// Takes the set that IS here rather than the one that left, because a
@@ -445,6 +454,13 @@ impl tiamot_core::ent::Access for Shared {
         population
             .get_mut(id)
             .is_some_and(|entity| patch.apply(entity))
+    }
+
+    fn player(&self, uuid: [u8; 32]) -> Option<EntityId> {
+        let uuid = tiamot_core::PlayerUuid::from_bytes(uuid);
+        // The mirror index the tick already keeps, not a scan: a body is put
+        // there the moment a player connects and taken out when they go.
+        self.population.read().ok()?.player_body(&uuid)
     }
 
     fn within(&self, centre: [f64; 3], radius: f64, source: Option<&str>) -> Vec<EntityId> {

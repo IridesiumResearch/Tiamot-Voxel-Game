@@ -60,6 +60,7 @@ fn the_reference_mods_load_in_dependency_order() {
         host.resolved().ids(),
         vec![
             "core",
+            "core_gear",
             "core_milk",
             "core_mimic",
             "core_sky",

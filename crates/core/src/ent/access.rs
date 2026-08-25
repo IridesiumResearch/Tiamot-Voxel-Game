@@ -122,6 +122,20 @@ pub trait Access: Send + Sync {
     /// Changes an entity. Returns whether anything changed.
     fn patch(&self, id: EntityId, patch: &Patch) -> bool;
 
+    /// The entity mirroring a connected player, by their UUID.
+    ///
+    /// **Charter rule 13's other half.** Every hook hands a mod a UUID — who
+    /// dug, who spoke, who pressed a key — and every entity call takes an id,
+    /// so without this a mod that knows WHO cannot find out WHERE. Scanning the
+    /// world for a body whose owner matches is the alternative, and it is a
+    /// scan of everything to answer a question the server already has a map
+    /// for.
+    ///
+    /// `None` for a player who is not connected, and for a UUID that has never
+    /// been seen. Ids are per-session and a player's changes every time they
+    /// join, so this is a lookup rather than something to remember.
+    fn player(&self, uuid: [u8; 32]) -> Option<EntityId>;
+
     /// Every entity within `radius` blocks of a world position, nearest first.
     ///
     /// `source` filters by which mod spawned it, since that is the only label
