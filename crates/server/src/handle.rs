@@ -190,6 +190,13 @@ fn entity_messages(
                 anim: spawn.anim.0,
                 model: spawn.model,
                 collider: spawn.collider.map(|box_| [box_.width, box_.height]),
+                item: spawn.item.map(|stack| tiamot_core::proto::StackDef {
+                    material: stack.material.0,
+                    units: stack.units,
+                    shape: stack
+                        .shape
+                        .map_or(0, tiamot_core::inventory::Shape::occupancy),
+                }),
                 // Resolved here, where the roster is. Charter rule 13: a
                 // display name is a per-server claim bound to a UUID, so the
                 // engine stores the UUID and looks the name up at send time —

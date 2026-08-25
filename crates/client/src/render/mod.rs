@@ -2130,15 +2130,24 @@ pub fn held_boxes(
         * Mat4::from_cols_array(joint)
         * Mat4::from_translation(glam::Vec3::from(HELD_GRIP));
 
-    let whole = shape == 0 || shape == tiamot_core::inventory::Shape::ALL;
-    if whole {
+    boxes_of(&placed, HELD_HALF, shape, uv)
+}
+
+/// A stack's boxes, inside a frame something else has placed.
+///
+/// `half` is the half-extent of the WHOLE block; a cut's cells are a third of
+/// that each, so three of them fill exactly the block one box would have.
+fn boxes_of(placed: &glam::Mat4, half: f32, shape: u32, uv: [f32; 4]) -> Vec<Prop> {
+    use glam::Mat4;
+
+    if shape == 0 || shape == tiamot_core::inventory::Shape::ALL {
         return vec![Prop {
-            model: (placed * Mat4::from_scale(glam::Vec3::splat(HELD_HALF))).to_cols_array(),
+            model: (*placed * Mat4::from_scale(glam::Vec3::splat(half))).to_cols_array(),
             uv,
         }];
     }
 
-    let half = HELD_HALF / 3.0;
+    let cell = half / 3.0;
     let mut boxes = Vec::new();
     for z in 0..3 {
         for y in 0..3 {
@@ -2146,20 +2155,65 @@ pub fn held_boxes(
                 if shape & (1 << (x + y * 3 + z * 9)) == 0 {
                     continue;
                 }
-                // The middle cell at the centre and the outer two a full cell
-                // either side, so three of them fill exactly the block one box
-                // would have.
-                let along = |index: i32| (index - 1) as f32 * 2.0 * half;
-                let cell = Mat4::from_translation(glam::vec3(along(x), along(y), along(z)))
-                    * Mat4::from_scale(glam::Vec3::splat(half));
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a cell index is 0..=2 and exact in f32"
+                )]
+                let along = |index: i32| (index - 1) as f32 * 2.0 * cell;
+                let placement = Mat4::from_translation(glam::vec3(along(x), along(y), along(z)))
+                    * Mat4::from_scale(glam::Vec3::splat(cell));
                 boxes.push(Prop {
-                    model: (placed * cell).to_cols_array(),
+                    model: (*placed * placement).to_cols_array(),
                     uv,
                 });
             }
         }
     }
     boxes
+}
+
+/// How far off the ground a dropped item floats, in blocks.
+///
+/// Clear of the surface rather than sitting on it: an entity's position is
+/// between its feet, so a box centred there would be half sunk in the floor.
+const DROP_LIFT: f32 = 0.22;
+
+/// How big a dropped item is, as a half-extent in blocks.
+///
+/// Larger than what a hand holds, because a thing lying on the ground has to be
+/// SEEN from across a room, where a held one is already next to the eye.
+const DROP_HALF: f32 = 0.16;
+
+/// How fast a dropped item turns, in radians per second.
+const DROP_SPIN: f32 = 1.1;
+
+/// Which way a dropped item is facing this frame.
+///
+/// **Each one keeps its own clock, offset by its id**, exactly as a figure's
+/// animation phase does: a floor covered in items all facing the same way reads
+/// as a display case rather than as things somebody dropped. The offset comes
+/// from the id rather than from anything about the frame, or it would jitter.
+#[must_use]
+pub fn spin(seconds: f32, id: u64) -> f32 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an id modulo 977 is exact in f32; this is a phase offset, not a coordinate"
+    )]
+    let offset = (id % 977) as f32 * 0.0643;
+    seconds * DROP_SPIN + offset
+}
+
+/// The boxes one dropped item is made of, camera-relative.
+///
+/// Same geometry as a held one — a cut is its cells, a whole block is one box —
+/// so an item looks the same in a hand, in a slot and on the floor.
+#[must_use]
+pub fn dropped_boxes(at: [f32; 3], yaw: f32, shape: u32, uv: [f32; 4]) -> Vec<Prop> {
+    use glam::Mat4;
+
+    let placed = Mat4::from_translation(glam::vec3(at[0], at[1] + DROP_LIFT, at[2]))
+        * Mat4::from_rotation_y(yaw);
+    boxes_of(&placed, DROP_HALF, shape, uv)
 }
 
 /// One blob shadow, as the shader reads it.

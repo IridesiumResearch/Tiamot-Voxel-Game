@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -82,6 +82,11 @@ pub const PROTOCOL_VERSION: u32 = 27;
 // stream. They are also PER PLAYER rather than broadcast — which entities
 // somebody can see is their own interest set, and sending everyone every mob
 // would make a populated world cost the square of the people watching it.
+// v28 (post-14): `EntityDef` carries `item`. An entity can BE a stack — one
+// lying on the ground — and the client draws it as the same cells a hand holds
+// and a slot shows. On the SPAWN and not in the delta: what an item is never
+// changes while it lies there, so putting it in the twenty-times-a-second
+// message would be paying for it on every one of them.
 // v27 (post-14): `ShowDialog` and `UpdateDialog` carry `compact`. A FIELD
 // change on two messages, the same shape of change v24 made, and it moves the
 // version for the same reason: a v26 client decoding a v27 dialog would read
@@ -1459,6 +1464,15 @@ pub struct EntityDef {
     pub model: Option<String>,
     /// Footprint and height, in cells, or `None` for something with no box.
     pub collider: Option<[f32; 2]>,
+    /// The stack it looks like, for an item lying on the ground.
+    ///
+    /// **A mod cannot draw anything** (charter rule 1 puts what an item is
+    /// worth in a mod and the picture in the engine), so an entity says what
+    /// stack it represents and the client draws that. `None` for anything that
+    /// is not an item, which is every entity unless a mod says otherwise; an
+    /// entity with a stack and no [`EntityDef::model`] is an item, and one with
+    /// a model is a rig.
+    pub item: Option<StackDef>,
     /// The label above it, already resolved to the current display name.
     ///
     /// Resolved by the server because the name bound to a UUID is a fact only
@@ -2042,6 +2056,19 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
                 }
                 if let Some(nametag) = &entity.nametag {
                     check_len("entity_nametag", nametag.len(), MAX_NAME_BYTES)?;
+                }
+                // **A shape is twenty-seven bits and a server is not trusted**
+                // (charter rule 14). A mask with bits above the block would
+                // index past the cells a renderer walks, which is the one thing
+                // in a stack that is not simply a number.
+                if let Some(item) = &entity.item
+                    && item.shape & !crate::inventory::Shape::ALL != 0
+                {
+                    return Err(ProtocolError::FieldTooLarge {
+                        field: "entity_item_shape",
+                        len: item.shape as usize,
+                        limit: crate::inventory::Shape::ALL as usize,
+                    });
                 }
             }
         }
@@ -3068,6 +3095,7 @@ mod tests {
                 model: None,
                 collider: None,
                 nametag: None,
+                item: None,
             }],
         };
         assert!(validate_server_message(&infinite).is_err());
@@ -3087,6 +3115,7 @@ mod tests {
                 model: None,
                 collider: Some([f32::NAN, 1.0]),
                 nametag: None,
+                item: None,
             }],
         };
         assert!(validate_server_message(&bad_box).is_err());

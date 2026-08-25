@@ -72,10 +72,20 @@ pub mod meta_keys {
 /// bytes, and a shared number would force a migration on every world for a
 /// change that touched nothing it holds.
 ///
-/// **`postcard` variants are position-encoded** (see [`codec`]), so appending an
-/// enum variant or a struct field is safe and inserting or reordering one is
-/// not. Anything that is not an append bumps this and adds a migration.
-pub const ENTITY_FORMAT_VERSION: u8 = 1;
+/// **Appending a struct FIELD is not safe, whatever this used to say.**
+/// `postcard` is not self-describing: a decoder reads fields in order and stops
+/// where the struct ends, so a blob written before a field existed runs out of
+/// bytes and fails with "hit the end of buffer". Measured, not assumed — the
+/// claim that an append was safe stood here from Task 03 until an entity grew
+/// its first new field, which is exactly when a wrong rule about migrations
+/// costs somebody their world.
+///
+/// Appending an enum VARIANT is safe, because a variant nothing has written
+/// yet appears in no existing blob.
+///
+/// So: any change to [`crate::ent::Entity`]'s persisted fields bumps this and
+/// adds a step to [`migrate::migrate_entity`].
+pub const ENTITY_FORMAT_VERSION: u8 = 2;
 
 /// Anything that can go wrong talking to a world database.
 #[derive(Debug, thiserror::Error)]
@@ -776,23 +786,37 @@ impl WorldDb {
         let mut entities = Vec::new();
         for row in rows {
             let (version, blob) = row?;
-            if version != i64::from(ENTITY_FORMAT_VERSION) {
-                return Err(WorldError::Entity {
-                    pos,
-                    domain: domain.to_owned(),
-                    reason: format!(
-                        "stored in format version {version}, this build writes \
-                         {ENTITY_FORMAT_VERSION}"
-                    ),
-                });
-            }
-            entities.push(
-                postcard::from_bytes(&blob).map_err(|source| WorldError::Entity {
-                    pos,
-                    domain: domain.to_owned(),
-                    reason: source.to_string(),
-                })?,
-            );
+            // **Migrated on load and rewritten at the next save**, exactly as a
+            // chunk is: a world nobody visits pays nothing, and an entity in a
+            // corner of the map still decodes years later because its step is
+            // still in the chain.
+            let entity = match u8::try_from(version) {
+                Ok(ENTITY_FORMAT_VERSION) => {
+                    postcard::from_bytes(&blob).map_err(|source| WorldError::Entity {
+                        pos,
+                        domain: domain.to_owned(),
+                        reason: source.to_string(),
+                    })?
+                }
+                Ok(older) => {
+                    migrate::migrate_entity(older, &blob).map_err(|source| WorldError::Entity {
+                        pos,
+                        domain: domain.to_owned(),
+                        reason: source.to_string(),
+                    })?
+                }
+                Err(_) => {
+                    return Err(WorldError::Entity {
+                        pos,
+                        domain: domain.to_owned(),
+                        reason: format!(
+                            "stored in format version {version}, this build writes \
+                             {ENTITY_FORMAT_VERSION}"
+                        ),
+                    });
+                }
+            };
+            entities.push(entity);
         }
         Ok(entities)
     }

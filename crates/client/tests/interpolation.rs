@@ -69,6 +69,7 @@ fn def(local: [f32; 3]) -> EntityDef {
         model: Some("engine:humanoid".to_owned()),
         collider: Some([1.8, 5.4]),
         nametag: None,
+        item: None,
     }
 }
 

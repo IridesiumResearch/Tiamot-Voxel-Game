@@ -507,6 +507,19 @@ fn units_of(spec: &Table, shape: Option<crate::inventory::Shape>) -> mlua::Resul
     })
 }
 
+/// One stack, as a mod writes it.
+///
+/// The same three fields `game.give` takes, so a mod that can hand a player a
+/// stack can drop the same stack on the ground without learning a second
+/// spelling.
+fn stack_of(lua: &mlua::Lua, spec: &Table) -> mlua::Result<Option<crate::inventory::Stack>> {
+    let material = material_of(lua, &spec.get::<mlua::Value>("material")?)?;
+    let shape = shape_of(spec)?;
+    let units = units_of(spec, shape)?;
+    Ok(crate::inventory::Stack::new(material, units)
+        .map(|stack| crate::inventory::Stack { shape, ..stack }))
+}
+
 /// One stack, as a mod reads it.
 fn stack_table(lua: &mlua::Lua, stack: crate::inventory::Stack) -> mlua::Result<Table> {
     let (blocks, nodes) = stack.display();
@@ -2604,7 +2617,7 @@ impl MluaVm {
         let source = owner.to_owned();
         let spawn = self
             .lua
-            .create_function(move |_, spec: Table| {
+            .create_function(move |lua, spec: Table| {
                 let store = store!(store, None::<i64>);
                 let position: Table = spec.get("pos")?;
                 let transform = crate::ent::Transform::from_world(
@@ -2614,6 +2627,13 @@ impl MluaVm {
                 );
                 let mut entity = crate::ent::Entity::at(transform, source.clone());
                 entity.model = spec.get::<Option<String>>("model")?;
+                // **What it looks like, when what it is is a stack.** An item
+                // on the ground is a mod's idea — what it is worth, how long it
+                // lasts, who may pick it up — and the picture is the engine's,
+                // because a mod cannot put geometry in the world at all.
+                if let Some(item) = spec.get::<Option<Table>>("item")? {
+                    entity.item = stack_of(lua, &item)?;
+                }
                 if let Some(points) = spec.get::<Option<u32>>("health")? {
                     entity.health = Some(crate::ent::Health::full(points));
                 }
@@ -2701,6 +2721,16 @@ impl MluaVm {
                 out.set("on_ground", entity.on_ground)?;
                 out.set("source", entity.source)?;
                 out.set("model", entity.model)?;
+                // The same shape `game.inventory` reports a stack in, so a mod
+                // reading an item off the ground and giving it to a player
+                // moves one table between two calls.
+                out.set(
+                    "item",
+                    entity
+                        .item
+                        .map(|stack| stack_table(lua, stack))
+                        .transpose()?,
+                )?;
                 out.set("anim", entity.anim.0)?;
                 // Charter rule 13: the UUID, as hex, and never the name. A mod
                 // that stores "whose is this" must store something a rename
@@ -6720,6 +6750,68 @@ mod entity_tests {
             std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::ent::Access>
         );
         (vm, store)
+    }
+
+    #[test]
+    fn an_entity_can_be_a_stack_lying_on_the_ground() {
+        // **What a dropped item is.** The engine has no opinion about dropping
+        // — what an item is worth, how long it lasts and who may pick it up are
+        // a mod's (charter rule 1) — but a mod cannot draw anything, so the
+        // mechanism is that an entity says what stack it IS and the client
+        // draws that. The round trip is the test: a mod puts a cut on the
+        // ground and reads back the same cut, in the same shape `game.inventory`
+        // hands it over in.
+        const CARVED: u32 = 0b1010_0101;
+        let (mut vm, store) = vm_with_entities();
+        load(
+            &mut vm,
+            "dropper",
+            &format!(
+                "turn = 0\n\
+                 seen = nil\n\
+                 game.register_on_tick(function()\n\
+                   turn = turn + 1\n\
+                   if turn == 1 then\n\
+                     id = game.spawn_entity{{ pos = {{x=1,y=2,z=3}},\n\
+                       item = {{ material = 7, shape = {CARVED}, count = 2 }} }}\n\
+                   else\n\
+                     seen = game.entity(id)\n\
+                   end\n\
+                 end)"
+            ),
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        assert!(vm.tick(1).expect("tick").is_empty());
+        {
+            let entities = store.entities.lock().expect("lock");
+            let (_, entity) = entities.iter().next().expect("one entity");
+            let item = entity.item.expect("the entity is an item");
+            assert_eq!(item.material.0, 7);
+            assert_eq!(
+                item.shape.map(crate::inventory::Shape::occupancy),
+                Some(CARVED),
+                "the cut did not survive the spawn"
+            );
+            assert_eq!(
+                item.units,
+                2 * CARVED.count_ones(),
+                "two of a cut is two lots of its cells"
+            );
+        }
+
+        assert!(vm.tick(1).expect("tick").is_empty());
+        vm.eval_in(
+            "dropper",
+            &format!(
+                "assert(seen.item ~= nil, 'the item did not come back')\n\
+                 assert(seen.item.shape == {CARVED}, 'shape came back as ' .. \
+                 tostring(seen.item.shape))\n\
+                 assert(seen.item.count == 2, 'count came back as ' .. tostring(seen.item.count))"
+            ),
+        )
+        .expect("the mod read its own item back");
     }
 
     #[test]

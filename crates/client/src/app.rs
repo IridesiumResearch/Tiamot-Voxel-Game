@@ -2288,31 +2288,63 @@ impl App {
     /// still has empty hands. Closing that is a field on the entity stream and
     /// a protocol version, not a change here.
     fn place_props(&mut self, figure: Option<&crate::render::skinned::Figure>) {
-        let Some(figure) = figure.filter(|_| self.third_person) else {
-            self.renderer.set_props(&[]);
-            return;
-        };
-        let mut props = Vec::new();
-        for (joint, stack) in [
-            ("hand.r", self.hotbar.get(self.selected).copied().flatten()),
-            ("hand.l", self.offhand()),
-        ] {
-            let Some(stack) = stack else { continue };
-            let Some(joint) = self.renderer.attachment(figure, joint) else {
-                continue;
-            };
-            let (u0, v0, u1, v1) = self
-                .tiles
-                .uv_of(stack.material)
-                .unwrap_or((0.0, 0.0, 1.0, 1.0));
-            props.extend(crate::render::held_boxes(
-                figure,
-                &joint,
-                stack.shape,
-                [u0, v0, u1, v1],
-            ));
+        let mut props = self.dropped_props();
+        if let Some(figure) = figure.filter(|_| self.third_person) {
+            for (joint, stack) in [
+                ("hand.r", self.hotbar.get(self.selected).copied().flatten()),
+                ("hand.l", self.offhand()),
+            ] {
+                let Some(stack) = stack else { continue };
+                let Some(joint) = self.renderer.attachment(figure, joint) else {
+                    continue;
+                };
+                props.extend(crate::render::held_boxes(
+                    figure,
+                    &joint,
+                    stack.shape,
+                    self.tile_of(stack.material),
+                ));
+            }
         }
         self.renderer.set_props(&props);
+    }
+
+    /// Where a material is in the atlas, or the whole sheet if it is not there.
+    fn tile_of(&self, material: u16) -> [f32; 4] {
+        let (u0, v0, u1, v1) = self.tiles.uv_of(material).unwrap_or((0.0, 0.0, 1.0, 1.0));
+        [u0, v0, u1, v1]
+    }
+
+    /// Every item lying in view, as boxes.
+    ///
+    /// **An entity that IS a stack**, which is what a dropped item is. The
+    /// engine has no opinion about dropping — what an item is worth, how long
+    /// it lasts and who may pick it up are a mod's (charter rule 1) — but a mod
+    /// cannot draw anything, so an entity says what stack it represents and
+    /// this is where that becomes a picture.
+    fn dropped_props(&self) -> Vec<crate::render::Prop> {
+        let now = self.since_start.elapsed();
+        let cells = f64::from(tiamot_core::SUBNODES_PER_AXIS);
+        let mut props = Vec::new();
+        for (id, entity) in self.entities.iter() {
+            let Some(stack) = entity.item else { continue };
+            let Some(pose) = entity.pose(now) else {
+                continue;
+            };
+            let corner = tiamot_core::BlockPos::from_chunk_corner(pose.chunk);
+            let at = self.camera.position.offset_to([
+                f64::from(corner.x) + f64::from(pose.local[0]) / cells,
+                f64::from(corner.y) + f64::from(pose.local[1]) / cells,
+                f64::from(corner.z) + f64::from(pose.local[2]) / cells,
+            ]);
+            props.extend(crate::render::dropped_boxes(
+                at,
+                crate::render::spin(now.as_secs_f32(), id),
+                stack.shape,
+                self.tile_of(stack.material),
+            ));
+        }
+        props
     }
 
     /// Rebuilds the hotbar from the player's own slots.

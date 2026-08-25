@@ -18,6 +18,11 @@
 //! **Steps are append-only and permanent.** Deleting the v0→v1 step orphans
 //! every world that still has a v0 chunk in it.
 //!
+//! Entity blobs migrate through the same shape, in [`migrate_entity`], and
+//! keep their own version — the two formats change for entirely different
+//! reasons and a shared number would migrate every world for a change that
+//! touched nothing it holds.
+//!
 //! # The v0 step is deliberately synthetic
 //!
 //! `v0` is not a format that ever shipped — Task 03 is the first persistence
@@ -35,17 +40,20 @@ use crate::block::{BlockContent, Cells};
 use crate::persist::codec::ChunkPayload;
 
 /// A migration step could not be applied.
+///
+/// Shared by chunks and entities: the two chains are separate and their
+/// failures are the same two.
 #[derive(Debug, thiserror::Error)]
 pub enum MigrationError {
     /// No step exists for this version.
-    #[error("no migration step from chunk format version {from}")]
+    #[error("no migration step from format version {from}")]
     NoStep {
         /// Version with no step.
         from: u8,
     },
 
     /// A blob failed to decode at the version it claimed.
-    #[error("chunk blob does not decode as format version {version}")]
+    #[error("a blob does not decode as format version {version}")]
     Decode {
         /// Version attempted.
         version: u8,
@@ -84,6 +92,68 @@ pub fn migrate_chunk(version: u8, serialised: &[u8]) -> Result<ChunkPayload, Mig
         // When v2 arrives: decode as v1, apply v1_to_v2, and make the v0 arm
         // chain through it rather than returning directly.
         other => Err(MigrationError::NoStep { from: other }),
+    }
+}
+
+/// The v1 entity: v2 without the stack an item on the ground is made of.
+///
+/// **A copy of the struct as it was**, not the live one with a field removed.
+/// The live struct will keep growing, and a step that referred to it would
+/// silently start decoding a shape that never existed on disk.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct EntityV1 {
+    transform: crate::ent::Transform,
+    velocity: crate::ent::Velocity,
+    collider: Option<crate::ent::Collider>,
+    model: Option<String>,
+    health: Option<crate::ent::Health>,
+    nametag: Option<crate::ent::Nametag>,
+    owner: Option<crate::ent::Owner>,
+    source: String,
+    script: Option<Vec<u8>>,
+}
+
+/// Brings one entity blob forward to [`crate::persist::ENTITY_FORMAT_VERSION`].
+///
+/// # Errors
+///
+/// [`MigrationError::NoStep`] for a version with no step, and
+/// [`MigrationError::Decode`] for a blob that does not decode at the version it
+/// claims to be.
+pub fn migrate_entity(
+    version: u8,
+    serialised: &[u8],
+) -> Result<crate::ent::Entity, MigrationError> {
+    match version {
+        1 => {
+            let v1: EntityV1 = postcard::from_bytes(serialised)
+                .map_err(|source| MigrationError::Decode { version: 1, source })?;
+            Ok(v1_to_v2(v1))
+        }
+        other => Err(MigrationError::NoStep { from: other }),
+    }
+}
+
+/// v1 → v2: an entity can be a stack lying on the ground.
+///
+/// Nothing written before v2 was an item, because there was no way to be one.
+/// `None` is therefore the correct value rather than a default that happens to
+/// be convenient.
+fn v1_to_v2(v1: EntityV1) -> crate::ent::Entity {
+    crate::ent::Entity {
+        transform: v1.transform,
+        velocity: v1.velocity,
+        on_ground: false,
+        drive: crate::phys::Intent::default(),
+        collider: v1.collider,
+        model: v1.model,
+        item: None,
+        anim: crate::ent::AnimTag::default(),
+        health: v1.health,
+        nametag: v1.nametag,
+        owner: v1.owner,
+        source: v1.source,
+        script: v1.script,
     }
 }
 
@@ -200,6 +270,70 @@ mod tests {
         assert_eq!(v1.index_words, v0.index_words);
         assert_eq!(v1.mixed_cells, v0.mixed_cells);
         assert!(v1.mixed_free.is_empty(), "v0 never reclaimed a slot");
+    }
+
+    #[test]
+    fn a_v1_entity_reads_back_as_a_v2_one_carrying_no_item() {
+        // **The step that a wrong comment nearly skipped.** `postcard` is not
+        // self-describing, so a blob written before `item` existed simply runs
+        // out of bytes — the counter-example below is the whole reason this
+        // needed a migration rather than an appended field.
+        #[derive(serde::Serialize)]
+        struct WriteV1 {
+            transform: crate::ent::Transform,
+            velocity: crate::ent::Velocity,
+            collider: Option<crate::ent::Collider>,
+            model: Option<String>,
+            health: Option<crate::ent::Health>,
+            nametag: Option<crate::ent::Nametag>,
+            owner: Option<crate::ent::Owner>,
+            source: String,
+            script: Option<Vec<u8>>,
+        }
+        let written = WriteV1 {
+            transform: crate::ent::Transform::from_world(4.0, 5.0, 6.0),
+            velocity: crate::ent::Velocity([1.0, 0.0, -1.0]),
+            collider: Some(crate::ent::Collider {
+                width: 1.8,
+                height: 5.4,
+            }),
+            model: Some("engine:humanoid".to_owned()),
+            health: Some(crate::ent::Health::full(20)),
+            nametag: None,
+            owner: None,
+            source: "core_mimic".to_owned(),
+            script: Some(vec![1, 2, 3]),
+        };
+        let blob = postcard::to_allocvec(&written).expect("encode");
+
+        // The counter-example first: the CURRENT struct cannot read it.
+        assert!(
+            postcard::from_bytes::<crate::ent::Entity>(&blob).is_err(),
+            "a v1 blob decoded as v2, so this migration is not needed and the \
+             comment that said an append was safe was right after all"
+        );
+
+        let entity = migrate_entity(1, &blob).expect("the step exists");
+        assert_eq!(entity.model.as_deref(), Some("engine:humanoid"));
+        assert_eq!(entity.source, "core_mimic");
+        assert_eq!(entity.script, Some(vec![1, 2, 3]));
+        assert_eq!(entity.health, Some(crate::ent::Health::full(20)));
+        assert!(
+            entity.item.is_none(),
+            "nothing written before v2 could be an item"
+        );
+    }
+
+    #[test]
+    fn an_entity_version_with_no_step_is_refused() {
+        assert!(matches!(
+            migrate_entity(200, &[]),
+            Err(MigrationError::NoStep { from: 200 })
+        ));
+        assert!(
+            migrate_entity(1, &[0xFF; 4]).is_err(),
+            "a blob that is not v1-shaped is an error, not a panic"
+        );
     }
 
     #[test]

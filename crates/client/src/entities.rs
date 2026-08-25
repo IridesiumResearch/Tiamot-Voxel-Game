@@ -69,6 +69,8 @@ pub struct Entity {
     pub collider: Option<[f32; 2]>,
     /// The label above it, already the current display name.
     pub nametag: Option<String>,
+    /// The stack it looks like, for an item lying on the ground.
+    pub item: Option<tiamot_core::proto::StackDef>,
     /// Recent positions, oldest first.
     samples: Vec<Sample>,
 }
@@ -106,6 +108,7 @@ impl Entity {
     fn from_def(def: &EntityDef, at: Duration) -> Self {
         Self {
             model: def.model.clone(),
+            item: def.item,
             collider: def.collider,
             nametag: def.nametag.clone(),
             samples: vec![Sample {
@@ -361,6 +364,7 @@ mod tests {
             anim: 0,
             model: Some("engine:humanoid".into()),
             collider: Some([1.8, 5.4]),
+            item: None,
             nametag: None,
         }
     }

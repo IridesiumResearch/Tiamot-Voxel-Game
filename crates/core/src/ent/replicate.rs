@@ -67,6 +67,13 @@ pub struct Spawn {
     pub model: Option<String>,
     /// How big it is, for the client's own culling.
     pub collider: Option<Collider>,
+    /// The stack it looks like, for an item on the ground.
+    ///
+    /// **On the spawn and not in the delta.** What an item IS never changes
+    /// while it lies there — a stack that changed would be a different item —
+    /// so putting it in the twenty-times-a-second message would be paying for
+    /// it on every one of them. See [`Entity::item`].
+    pub item: Option<crate::inventory::Stack>,
     /// What it is doing.
     pub anim: AnimTag,
     /// The label above it, unresolved.
@@ -288,6 +295,7 @@ fn spawn_of(id: EntityId, entity: &Entity) -> Spawn {
         velocity: entity.velocity,
         model: entity.model.clone(),
         collider: entity.collider,
+        item: entity.item,
         anim: entity.anim,
         nametag: entity.nametag.clone(),
     }

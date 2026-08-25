@@ -140,6 +140,22 @@ pub struct Entity {
     /// Deliberately NOT persisted — see [`AnimTag`].
     #[serde(skip)]
     pub anim: AnimTag,
+    /// The stack this entity IS, for something lying on the ground.
+    ///
+    /// # Why an entity carries a stack rather than a mod drawing one
+    ///
+    /// **A mod cannot draw anything.** Charter rule 1 puts an item on the
+    /// ground in a mod — what it is worth, how long it lasts, who may pick it
+    /// up — but the picture is the engine's, because there is no way for a mod
+    /// to put geometry in the world at all. So the mechanism is a field: an
+    /// entity says what stack it represents and the client draws that stack,
+    /// the same cells a hand holds and a slot shows.
+    ///
+    /// `None` for anything that is not an item, which is every entity a mod
+    /// spawns unless it says otherwise. An entity with a stack and no
+    /// [`Entity::model`] is an item; one with a model is a rig, and the stack
+    /// is ignored.
+    pub item: Option<crate::inventory::Stack>,
     /// Hit points, or `None` for something that cannot be hurt.
     pub health: Option<Health>,
     /// The label above it, or `None` for no label.
@@ -172,6 +188,7 @@ impl Entity {
             drive: crate::phys::Intent::default(),
             collider: None,
             model: None,
+            item: None,
             anim: AnimTag::default(),
             health: None,
             nametag: None,

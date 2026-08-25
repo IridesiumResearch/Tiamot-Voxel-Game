@@ -29,7 +29,13 @@ use crate::material::MaterialId;
 /// Never holds air and never holds zero units: both are the absence of a stack
 /// rather than a stack, and allowing them would mean every consumer had to
 /// filter. [`Stack::new`] enforces this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// **Serialisable because an entity can BE a stack** — an item lying on the
+/// ground persists with the chunk it is in. That path is the world's own
+/// database and not a peer, so it is not hostile input (charter rule 14): what
+/// comes off the wire is [`crate::proto::StackDef`], which the decoder checks.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Stack {
     /// What this is made of.
     pub material: MaterialId,
@@ -67,7 +73,9 @@ pub struct Stack {
 /// Two stacks merge only if they are the same material AND the same shape.
 /// That is the whole of "blocks crafted into the same shape stack": identical
 /// things stack, and a stair and a slab of the same stone are not identical.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct Shape(u32);
 
 impl Shape {

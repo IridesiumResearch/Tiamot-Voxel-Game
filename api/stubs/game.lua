@@ -1290,6 +1290,13 @@ function game.rng_stream(pos, name) end
 ---`entities_in_radius` filters on and what tells the engine whose entity a
 ---leftover is when a mod is removed from a world.
 ---
+---**`item` makes it a thing lying on the ground.** An entity can BE a stack:
+---give it the same `{ material, count/units, shape }` table `game.give` takes
+---and the client draws that stack — the same cells a hand holds and a slot
+---shows — instead of a model. Give it a collider and gravity puts it on the
+---floor; the engine has no further opinion, so how long it lasts, who may pick
+---it up and what that costs are yours to write (charter rule 1).
+---
 ---```lua
 ---local id = game.spawn_entity{
 ---    pos = { x = 10.5, y = 64, z = -3 },
@@ -1298,8 +1305,15 @@ function game.rng_stream(pos, name) end
 ---    nametag = "Something",
 ---    collider = { width = 1.8, height = 5.4 },  -- cells
 ---}
+---
+----- A dropped stack: no model, an item, and a small box so it falls.
+---local dropped = game.spawn_entity{
+---    pos = { x = 10.5, y = 64, z = -3 },
+---    item = { material = stone, count = 4 },
+---    collider = { width = 0.6, height = 0.6 },
+---}
 ---```
----@param spec { pos: { x: number, y: number, z: number }, model?: string, health?: integer, nametag?: string, collider?: { width: number, height: number } }
+---@param spec { pos: { x: number, y: number, z: number }, model?: string, item?: table, health?: integer, nametag?: string, collider?: { width: number, height: number } }
 ---@return integer|nil id
 function game.spawn_entity(spec) end
 
@@ -1326,7 +1340,11 @@ function game.despawn_entity(id) end
 ---CURRENT display name the engine resolves when it draws the tag — a player's
 ---own body has the second, never the first.
 ---@param id integer
----@return { pos: { x: number, y: number, z: number }, yaw: number, pitch: number, velocity: { x: number, y: number, z: number }, on_ground: boolean, source: string, model: string|nil, anim: integer, health: integer|nil, max_health: integer|nil, owner: string|nil, nametag: string|nil, nametag_player: string|nil }|nil
+---`item` is the stack an entity IS, for something lying on the ground, in the
+---same shape `game.inventory` reports one — `{ material, units, blocks, nodes,
+---count, shape }` — so reading an item off the floor and handing it to a player
+---moves one table between two calls.
+---@return { pos: { x: number, y: number, z: number }, yaw: number, pitch: number, velocity: { x: number, y: number, z: number }, on_ground: boolean, source: string, model: string|nil, item: table|nil, anim: integer, health: integer|nil, max_health: integer|nil, owner: string|nil, nametag: string|nil, nametag_player: string|nil }|nil
 function game.entity(id) end
 
 ---Changes an entity. Returns whether anything changed.

@@ -662,6 +662,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                 model: Some("core_mimic:chest".to_owned()),
                 collider: Some([0.6, 1.8]),
                 nametag: Some("a mimic".to_owned()),
+                item: None,
             }],
         },
         ServerMessage::EntityDespawn {
