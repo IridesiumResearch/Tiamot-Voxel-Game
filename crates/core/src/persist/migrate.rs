@@ -301,7 +301,12 @@ mod tests {
             health: Some(crate::ent::Health::full(20)),
             nametag: None,
             owner: None,
-            source: "core_mimic".to_owned(),
+            // Deliberately not the name of a real reference mod. A bot test
+            // greps engine SOURCE for those to prove no content was
+            // special-cased, and a fixture string is exactly the false positive
+            // that check should not have to argue with — including in a
+            // comment, which is where this landed the first time.
+            source: "a_mod".to_owned(),
             script: Some(vec![1, 2, 3]),
         };
         let blob = postcard::to_allocvec(&written).expect("encode");
@@ -315,7 +320,7 @@ mod tests {
 
         let entity = migrate_entity(1, &blob).expect("the step exists");
         assert_eq!(entity.model.as_deref(), Some("engine:humanoid"));
-        assert_eq!(entity.source, "core_mimic");
+        assert_eq!(entity.source, "a_mod");
         assert_eq!(entity.script, Some(vec![1, 2, 3]));
         assert_eq!(entity.health, Some(crate::ent::Health::full(20)));
         assert!(
