@@ -128,7 +128,10 @@ fn a_player_arrives_holding_an_item_and_cannot_place_it() {
         let mut bot = join(&server, "Carrier").await;
         let sword = material_of(&bot, "core_gear:sword");
 
-        // The mod hands one out on join, so there is something to try with.
+        // Asked for, not handed out on join: a fixture that changed every
+        // player's starting inventory is a fixture other tests have to know
+        // about, and three of them broke when it did.
+        bot.chat("gear").await.expect("ask");
         let deadline = tokio::time::Instant::now() + PATIENCE;
         loop {
             if bot.inventory().iter().any(|stack| stack.material == sword) {
@@ -175,6 +178,7 @@ fn what_a_player_drops_lands_as_an_entity_and_comes_back() {
         let mut bot = join(&server, "Dropper").await;
         let sword = material_of(&bot, "core_gear:sword");
 
+        bot.chat("gear").await.expect("ask");
         let deadline = tokio::time::Instant::now() + PATIENCE;
         loop {
             if bot.inventory().iter().any(|stack| stack.material == sword) {

@@ -203,11 +203,21 @@ game.register_on_tick(function()
     end
 end)
 
--- Everybody starts with one, so the mechanism is visible without a recipe.
+-- Say `gear` in chat and one appears.
 --
--- **A fixture, not a design.** A real game gives a sword out for a reason; this
--- exists so that opening the inventory shows a thing that is not a block, and
--- pressing the drop key puts it on the floor.
-game.register_on_player_join(function(event)
+-- **Asked for rather than handed out on join, and that is fixture hygiene.**
+-- The first version gave everybody a sword when they arrived, which quietly
+-- changed the starting inventory for every player on the server — and three
+-- unrelated tests broke, each of them reasonably assuming a player begins
+-- carrying what they dug and nothing else. A fixture that perturbs global
+-- state is a fixture that other tests have to know about.
+--
+-- It is also the chat veto doing its job: returning `false` stops the line
+-- being broadcast, so a command is not also a message everybody reads.
+game.register_on_chat(function(event)
+    if event.text ~= "gear" then
+        return
+    end
     game.give(event.player, { material = "core_gear:sword", count = 1 })
+    return false
 end)

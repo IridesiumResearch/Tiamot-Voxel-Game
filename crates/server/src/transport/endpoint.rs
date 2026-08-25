@@ -1291,6 +1291,24 @@ impl Shared {
             .collect()
     }
 
+    /// Makes sure a player HAS an inventory, with every registered view in it.
+    ///
+    /// **A player's slots used to spring into existence the first time they
+    /// dug**, because every path that touched them created them on the way.
+    /// That is invisible while the only question anybody asks is "what have you
+    /// got" — the answer is nothing either way — and wrong the moment a mod
+    /// registers a view and draws a screen over it, because a view that does
+    /// not exist yet is never sent and the screen is over nothing.
+    ///
+    /// Empty is a fact about a place, not the absence of one.
+    pub fn ensure_inventory(&self, uuid: PlayerUuid) {
+        if let Ok(mut inventories) = self.inventories.lock() {
+            inventories
+                .entry(uuid)
+                .or_insert_with(|| tiamot_core::inventory::Slots::for_player_with(&self.views));
+        }
+    }
+
     /// A player's slots, for a dialog to click on.
     #[must_use]
     pub fn slots_of(&self, uuid: &PlayerUuid) -> Option<tiamot_core::inventory::Slots> {
@@ -1857,6 +1875,19 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 },
             )
             .await?;
+
+            // **Every view once, even the empty ones.** They are otherwise sent
+            // only when something changes, so a view that has never held
+            // anything is a view the client has never been told exists — and a
+            // mod that registered one and drew a screen over it before anybody
+            // put anything in it showed a screen over nothing. Empty is a fact
+            // about a place, not the absence of one.
+            if let Some(uuid) = session.uuid() {
+                shared.ensure_inventory(uuid);
+                for message in shared.view_updates(&uuid) {
+                    frame::write(&mut send, &message).await?;
+                }
+            }
         }
 
         // **The client's say in how far it sees, clamped by the server's.**
