@@ -280,6 +280,30 @@ function game.register_sky(spec) end
 ---@param spec Tiamot.ToolSpec
 function game.register_tool(spec) end
 
+---Registers an inventory view: a place stacks may sit, given to every player.
+---Registration window only.
+---
+---**What a slot MEANS is yours; where it is is the engine's.** An armour rack,
+---a tool belt, a bandolier — the engine has no idea what any of those are, and
+---it does not need one. It gives the view a name and a fixed number of slots,
+---moves stacks between them, sends them to the client, and asks no questions
+---about which slot is a helmet.
+---
+---`id` is namespaced with your mod id, like every other id. The size is FIXED,
+---unlike `player:main`, which grows: four slots is the point of an armour rack,
+---and a fifth appearing because something was shoved in would be a rack that is
+---no longer four. Between 1 and 256 — every slot of every view is sent to a
+---client whenever any of them changes.
+---
+---Draw it with an `item_grid` widget naming the view, and read or write it with
+---`game.inventory(player, view)`, `game.give` and `game.take`.
+---
+---```lua
+---game.register_view{ id = "worn", slots = 4 }   --> "core_armour:worn"
+---```
+---@param spec { id: string, slots: integer }
+function game.register_view(spec) end
+
 ---Registers a world generation callback.
 ---
 ---**Registration window only.**

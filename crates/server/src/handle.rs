@@ -882,6 +882,14 @@ impl ServerHandle {
             .into_iter()
             .map(|tool| (tool.id.clone(), tool))
             .collect::<std::collections::BTreeMap<_, _>>();
+        // The extra places a mod wants stacks to be able to sit. Read here for
+        // the same reason the tools are: the registries are frozen (charter
+        // rule 9), so this is settled once and cannot change under a player.
+        let views = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_views())
+            .unwrap_or_default();
+        info!(views = views.len(), "inventory views registered");
         // Lowest id among those marked default, so the answer does not depend
         // on which mod loaded first.
         let default_tool = tools
@@ -919,6 +927,7 @@ impl ServerHandle {
             mods,
             materials,
             tool_table,
+            views,
             action_table,
             sound_table,
             sound_bindings,

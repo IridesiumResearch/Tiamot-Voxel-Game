@@ -17,7 +17,8 @@
 pub mod slots;
 
 pub use slots::{
-    Grab, PLAYER_HOTBAR_SLOTS, PLAYER_MAIN, PLAYER_MAIN_SLOTS, PLAYER_OFFHAND_SLOT, Slots, View,
+    Grab, MAX_VIEW_SLOTS, PLAYER_HOTBAR_SLOTS, PLAYER_MAIN, PLAYER_MAIN_SLOTS, PLAYER_OFFHAND_SLOT,
+    Slots, View, ViewDef,
 };
 
 use crate::UNITS_PER_BLOCK;

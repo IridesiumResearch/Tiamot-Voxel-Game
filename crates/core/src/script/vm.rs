@@ -1126,6 +1126,14 @@ pub trait ScriptVm: Sized {
     /// Tools registered during the loading window, ordered by id.
     fn registered_tools(&self) -> Vec<Tool>;
 
+    /// Inventory views mods asked for, ordered by id.
+    ///
+    /// **Not `player:main`**, which every player has and no mod may resize —
+    /// these are the extra places a mod wants stacks to be able to sit, like an
+    /// armour rack or a tool belt. What the slots MEAN is the mod's; the engine
+    /// gives them a name and a size and moves stacks between them.
+    fn registered_views(&self) -> Vec<crate::inventory::ViewDef>;
+
     /// Every sound the loaded mods registered, in load order.
     fn registered_sounds(&self) -> Vec<crate::sound::Sound>;
 

@@ -291,6 +291,14 @@ pub struct Shared {
     /// there is nothing that could change it while the server runs.
     pub tools: std::collections::BTreeMap<String, tiamot_core::script::Tool>,
 
+    /// The extra inventory views mods asked for, in id order.
+    ///
+    /// Built once at startup from the frozen registries (charter rule 9), like
+    /// the tools beside it — every player gets the same set, and a view
+    /// appearing halfway through a session would be a place a client had never
+    /// been told about.
+    pub views: Vec<tiamot_core::inventory::ViewDef>,
+
     /// The tool a player digs with when they have selected nothing.
     ///
     /// `None` when the loaded mods registered no default — and then nobody can
@@ -1119,7 +1127,7 @@ impl Shared {
         if let Ok(mut inventories) = self.inventories.lock() {
             let held = inventories
                 .entry(uuid)
-                .or_insert_with(tiamot_core::inventory::Slots::for_player);
+                .or_insert_with(|| tiamot_core::inventory::Slots::for_player_with(&self.views));
             for stack in stacks {
                 held.insert(PLAYER_MAIN, stack);
             }
@@ -1171,7 +1179,7 @@ impl Shared {
         let took = self.inventories.lock().is_ok_and(|mut inventories| {
             inventories
                 .entry(*uuid)
-                .or_insert_with(tiamot_core::inventory::Slots::for_player)
+                .or_insert_with(|| tiamot_core::inventory::Slots::for_player_with(&self.views))
                 .insert(view, stack)
         });
         if took && let Ok(mut dirty) = self.inventory_dirty.lock() {
@@ -2127,6 +2135,7 @@ mod tests {
             mod_set_fingerprint: 0,
             materials: Vec::new(),
             tool_table: Vec::new(),
+            views: Vec::new(),
             action_table: Vec::new(),
             sound_table: Vec::new(),
             hud_scripts: Vec::new(),

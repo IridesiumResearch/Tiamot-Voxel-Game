@@ -46,6 +46,25 @@ pub struct View {
     pub slots: Vec<Option<Stack>>,
 }
 
+/// A view a mod asked the engine to give every player.
+///
+/// See [`Slots::for_player_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewDef {
+    /// The qualified id, e.g. `"core_armour:worn"`.
+    pub id: String,
+    /// How many slots it has. Fixed: an armour rack does not grow.
+    pub slots: usize,
+}
+
+/// The most slots one registered view may have.
+///
+/// **A bound rather than a taste.** Every slot of every view is sent to the
+/// client on any change, so a mod asking for a million would be a mod that
+/// stops the server for everybody. Large enough for any rack, chest page or
+/// bandolier somebody actually wants.
+pub const MAX_VIEW_SLOTS: usize = 256;
+
 impl View {
     /// An empty view of `count` slots.
     #[must_use]
@@ -138,8 +157,38 @@ impl Slots {
     /// material arrives — see [`Slots::insert`].
     #[must_use]
     pub fn for_player() -> Self {
+        Self::for_player_with(&[])
+    }
+
+    /// The same, plus the views mods asked for.
+    ///
+    /// # Why a mod cannot just start using a name
+    ///
+    /// **A view is a place, and a place has a size.** `player:main` grows on
+    /// insert because a player may own more than fits (see [`Slots::insert`]),
+    /// but an armour rack does not: four slots is the point of it, and a fifth
+    /// appearing because something was shoved in would be a rack that is no
+    /// longer four. So the engine has to be told how many there are, and the
+    /// only moment that can be settled for every player at once is the
+    /// registration window (charter rule 9).
+    ///
+    /// What the slots MEAN — that this one is a helmet and that one is not — is
+    /// entirely the mod's. The engine moves stacks between slots and has no
+    /// opinion about which ones are boots.
+    #[must_use]
+    pub fn for_player_with(extra: &[ViewDef]) -> Self {
+        let mut views = vec![View::empty(PLAYER_MAIN, PLAYER_MAIN_SLOTS)];
+        for def in extra {
+            // A mod that names `player:main` gets ignored rather than obeyed:
+            // resizing the view the engine itself credits digging into is not
+            // something a mod may do by picking a string.
+            if def.id == PLAYER_MAIN {
+                continue;
+            }
+            views.push(View::empty(def.id.clone(), def.slots));
+        }
         Self {
-            views: vec![View::empty(PLAYER_MAIN, PLAYER_MAIN_SLOTS)],
+            views,
             grab: Grab::default(),
         }
     }

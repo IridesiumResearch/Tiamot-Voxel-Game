@@ -1249,6 +1249,22 @@ impl ScriptVm for MluaVm {
         tools
     }
 
+    fn registered_views(&self) -> Vec<crate::inventory::ViewDef> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.views") else {
+            return Vec::new();
+        };
+        let mut views: Vec<crate::inventory::ViewDef> = registry
+            .pairs::<String, usize>()
+            .filter_map(Result::ok)
+            .map(|(id, slots)| crate::inventory::ViewDef { id, slots })
+            .collect();
+        // Lua table order is unspecified, and this list decides the ORDER views
+        // are created in for every player on the server. Two servers disagreeing
+        // about it would be two servers whose `ViewUpdate` streams differ.
+        views.sort_by(|a, b| a.id.cmp(&b.id));
+        views
+    }
+
     fn registered_actions(&self) -> Vec<super::vm::Action> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.actions") else {
             return Vec::new();
@@ -2112,6 +2128,14 @@ impl MluaVm {
             .create_function(move |lua, spec: Table| register_tool(lua, &owner, &spec))
             .map_err(|err| self.vm_error(&err))?;
         game.set("register_tool", register_tool)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let owner = mod_id.to_owned();
+        let register_view = self
+            .lua
+            .create_function(move |lua, spec: Table| register_view(lua, &owner, &spec))
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_view", register_view)
             .map_err(|err| self.vm_error(&err))?;
 
         let owner = mod_id.to_owned();
@@ -3147,6 +3171,10 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.block_rules", block_rules)
             .map_err(|err| self.vm_error(&err))?;
+        let views = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.views", views)
+            .map_err(|err| self.vm_error(&err))?;
         let tools = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.tools", tools)
@@ -3756,6 +3784,46 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     entry.set("color_g", color[1])?;
     entry.set("color_b", color[2])?;
     registry.set(qualified, entry)?;
+    Ok(())
+}
+
+/// `game.register_view{ id, slots }`.
+///
+/// **A place a mod wants stacks to be able to sit**, given to every player.
+/// What the slots MEAN — an armour rack, a tool belt, a bandolier — is the
+/// mod's; the engine gives them a name and a size and moves stacks between
+/// them. See [`crate::inventory::Slots::for_player_with`].
+fn register_view(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
+    let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+    if frozen {
+        return Err(mlua::Error::external(format!(
+            "mod `{owner}`: registration is closed"
+        )));
+    }
+
+    let id: String = spec
+        .get("id")
+        .map_err(|_| mlua::Error::external("register_view: missing required field `id`"))?;
+    let qualified = qualify_id(owner, &id).map_err(mlua::Error::external)?;
+
+    let slots: usize = spec
+        .get("slots")
+        .map_err(|_| mlua::Error::external("register_view: missing required field `slots`"))?;
+    if slots == 0 || slots > crate::inventory::MAX_VIEW_SLOTS {
+        return Err(mlua::Error::external(format!(
+            "register_view(\"{qualified}\"): {slots} slots, which is outside 1..={}. Every slot \
+             of every view is sent to a client on any change.",
+            crate::inventory::MAX_VIEW_SLOTS
+        )));
+    }
+
+    let views: Table = lua.named_registry_value("tiamot.views")?;
+    if views.contains_key(qualified.clone())? {
+        return Err(mlua::Error::external(format!(
+            "register_view(\"{qualified}\"): already registered"
+        )));
+    }
+    views.set(qualified, slots)?;
     Ok(())
 }
 
@@ -6600,6 +6668,84 @@ mod dig_rules_tests {
                 "the error for `{spec}` should name `{field}`: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_mod_registers_a_place_for_stacks_to_sit() {
+        // **Armour, tool belts and bandoliers are a mod's** — what a slot MEANS
+        // is content (charter rule 1) — but where a stack may sit is the
+        // engine's, because the engine is what moves them. Before this a mod
+        // could name any view it liked and find nothing there: `player:main`
+        // was the only one that existed and it was written in Rust.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "core_armour",
+            r#"
+            game.register_view{ id = "worn", slots = 4 }
+            game.register_view{ id = "belt", slots = 9 }
+            "#,
+        )
+        .expect("load");
+
+        let views = vm.registered_views();
+        assert_eq!(views.len(), 2);
+        // Namespaced with the mod's own id, like every other id (rule 8), and
+        // sorted, because this list decides the order of a wire message.
+        assert_eq!(views[0].id, "core_armour:belt");
+        assert_eq!(views[0].slots, 9);
+        assert_eq!(views[1].id, "core_armour:worn");
+
+        // And a player actually gets them, at the size that was asked for.
+        let slots = crate::inventory::Slots::for_player_with(&views);
+        let worn = slots
+            .view("core_armour:worn")
+            .expect("the registered view is on the player");
+        assert_eq!(worn.slots.len(), 4);
+        assert!(
+            slots.view(crate::inventory::PLAYER_MAIN).is_some(),
+            "registering a view must not cost a player the one they had"
+        );
+    }
+
+    #[test]
+    fn a_view_may_not_be_nothing_or_everything_or_the_players_own() {
+        let mut vm = vm();
+        for (spec, why) in [
+            (
+                r#"game.register_view{ id = "empty", slots = 0 }"#,
+                "0 slots",
+            ),
+            (
+                r#"game.register_view{ id = "huge", slots = 100000 }"#,
+                "a view bigger than the cap",
+            ),
+            (
+                r#"game.register_view{ id = "dup", slots = 1 }
+                   game.register_view{ id = "dup", slots = 2 }"#,
+                "the same view twice",
+            ),
+        ] {
+            assert!(load(&mut vm, "greedy", spec).is_err(), "{why} was accepted");
+        }
+
+        // **And `player:main` cannot be redefined by naming it.** A mod's ids
+        // are namespaced, so the string it would have to produce is not one
+        // `qualify_id` will make — but the view builder refuses it anyway,
+        // because the view digging credits into is not something a mod resizes
+        // by picking a string.
+        let mine = crate::inventory::Slots::for_player_with(&[crate::inventory::ViewDef {
+            id: crate::inventory::PLAYER_MAIN.to_owned(),
+            slots: 1,
+        }]);
+        assert_eq!(
+            mine.view(crate::inventory::PLAYER_MAIN)
+                .expect("still there")
+                .slots
+                .len(),
+            crate::inventory::PLAYER_MAIN_SLOTS,
+            "a mod resized the player's own inventory"
+        );
     }
 
     #[test]
