@@ -30,6 +30,7 @@
 pub mod buffer;
 pub mod noise;
 pub mod rng;
+pub mod trig;
 
 pub use buffer::{BufferError, ChunkBuffer};
 pub use noise::{

@@ -142,6 +142,14 @@ local function steer(id, self_pos, target, gait, anim)
     -- SIMULATION. This is not simulation: a heading changes nothing about where
     -- anything is, and the engine sends it quantised to a byte.
     game.set_entity(id, {
+        -- **`math.atan` is the platform's libm, and this is a tick.** Charter
+        -- rule 4: two servers running this mod can compute slightly different
+        -- yaws, and a yaw is persisted entity state. The engine has a committed
+        -- table for `sin` and `cos` (`game.entity` reports `facing` from it)
+        -- and none yet for the inverse, so this is a KNOWN hazard rather than
+        -- an accident — recorded in `docs/float-determinism.md`. The fix is a
+        -- committed `atan2` table beside the others, not something to work
+        -- around here.
         yaw = math.atan(dx, dz),
         anim = anim or ANIM_WALK,
     })

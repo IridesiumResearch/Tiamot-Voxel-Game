@@ -102,6 +102,29 @@ no transcendental. If simulation ever genuinely needs a trig value, use a
 committed lookup table with linear interpolation: deterministic by construction,
 and faster besides.
 
+**That table now exists: `core::detgen::trig`.** It arrived when a mod wanted to
+throw a dropped item in the direction a player is facing — a trig value the
+simulation genuinely needs, because the result becomes an entity position and
+then persisted world state. Its samples are committed as `f32` bit patterns, so
+no machine ever computes them; everything done to them is `+ - *` and
+comparison. A table *computed at startup* would be a table two platforms could
+disagree about, which is this whole problem restated, and is the mistake to
+watch for if anyone ever "optimises" it.
+
+Its accuracy is bounded by linear interpolation's own `|f''| h² / 8`, which is
+under five parts in a million — and, far more importantly, it is the SAME error
+on every machine.
+
+A mod must not compute one itself: Lua's `math.sin` is the platform's libm like
+any other, and a mod runs inside the tick. `game.entity` therefore reports
+`facing` as a vector, so a mod never has to.
+
+**The inverse direction is still open.** Turning a direction back into an angle
+needs `atan2`, there is no committed table for it, and at least one reference
+mod in `game/` calls Lua's. That is the same hazard and it is not yet fixed;
+whoever needs it next should add the table beside `sin` rather than reach for
+libm.
+
 ### 2. `mul_add`
 
 **Why:** it uses a hardware FMA where one exists and a software fallback where

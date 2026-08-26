@@ -2773,6 +2773,20 @@ impl MluaVm {
                 out.set("pos", position)?;
                 out.set("yaw", entity.transform.yaw)?;
                 out.set("pitch", entity.transform.pitch)?;
+                // **The direction, worked out by the engine.** A mod turning
+                // the yaw into a vector itself would call `math.sin`, and that
+                // is the platform's libm — two servers would put the same
+                // thrown item in different places, and that difference becomes
+                // persisted world state. Charter rule 4 names the answer and
+                // `detgen::trig` is it, so the answer is the same everywhere
+                // and a mod never has to know why.
+                //
+                // The same convention a figure's heading uses: facing is
+                // `(sin yaw, cos yaw)`, so yaw zero is north.
+                let facing = lua.create_table()?;
+                facing.set("x", crate::detgen::trig::sin(entity.transform.yaw))?;
+                facing.set("z", crate::detgen::trig::cos(entity.transform.yaw))?;
+                out.set("facing", facing)?;
                 let velocity = lua.create_table()?;
                 velocity.set("x", entity.velocity.0[0])?;
                 velocity.set("y", entity.velocity.0[1])?;
