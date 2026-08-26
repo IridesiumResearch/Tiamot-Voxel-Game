@@ -1174,6 +1174,23 @@ impl ScriptVm for MluaVm {
                         };
                         (channel("r"), channel("g"), channel("b"))
                     });
+                // `absorbs = { rate = n, becomes = "damp_dirt" }`. Read here
+                // rather than validated at registration for the same reason
+                // `light_emit` is: the registry table holds what the mod said
+                // and this turns it into what the simulation needs.
+                let absorbs = entry
+                    .as_ref()
+                    .and_then(|entry| entry.get::<Option<Table>>("absorbs").ok().flatten())
+                    .map_or((0, None), |absorbs| {
+                        let rate = absorbs
+                            .get::<Option<u32>>("rate")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0)
+                            .min(crate::fluid::MAX_VOLUME);
+                        let becomes = absorbs.get::<Option<String>>("becomes").ok().flatten();
+                        (rate, becomes)
+                    });
                 (
                     *id,
                     BlockRules {
@@ -1185,6 +1202,7 @@ impl ScriptVm for MluaVm {
                         dominance,
                         drops,
                         light_emit,
+                        absorbs,
                     },
                 )
             })
@@ -3743,6 +3761,9 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
             }
             entry.set("light_emit", stored)?;
         }
+        if let Some(absorbs) = spec.get::<Option<Table>>("absorbs")? {
+            entry.set("absorbs", block_absorbs(lua, owner, &id, &absorbs)?)?;
+        }
         if let Some(drops) = drops {
             let parsed = lua.create_table()?;
             for pair in drops.pairs::<String, u32>() {
@@ -4287,7 +4308,7 @@ const FLUID_FIELDS: [&str; 6] = [
 /// accepted them would be an API promising behaviour nothing implements.
 const ITEM_FIELDS: [&str; 4] = ["id", "name", "texture", "description"];
 
-const BLOCK_FIELDS: [&str; 10] = [
+const BLOCK_FIELDS: [&str; 11] = [
     "id",
     "name",
     "drops",
@@ -4298,6 +4319,7 @@ const BLOCK_FIELDS: [&str; 10] = [
     "textures",
     "light_emit",
     "sounds",
+    "absorbs",
 ];
 
 /// Keys the `textures` sub-table accepts.
@@ -4307,6 +4329,43 @@ const BLOCK_FIELDS: [&str; 10] = [
 /// additive, while shipping a six-key schema nothing renders yet would freeze a
 /// guess into the mod API.
 const TEXTURE_FIELDS: [&str; 1] = ["all"];
+
+/// Keys the `absorbs` sub-table accepts.
+const ABSORBS_FIELDS: [&str; 2] = ["rate", "becomes"];
+
+/// Reads and validates `absorbs = { rate = ..., becomes = ... }`.
+///
+/// Sub-Node Contract §4.3: the ENGINE knows a rate and a successor, and what
+/// saturation means is the mod's — which is why the chain is materials rather
+/// than state bits, and why the last link simply omits `becomes`.
+fn block_absorbs(lua: &Lua, owner: &str, id: &str, absorbs: &Table) -> mlua::Result<Table> {
+    for key in absorbs.clone().pairs::<String, Value>() {
+        let (key, _) = key?;
+        if !ABSORBS_FIELDS.contains(&key.as_str()) {
+            return Err(mlua::Error::external(format!(
+                "register_block(\"{id}\"): unknown absorbs field `{key}`"
+            )));
+        }
+    }
+    let rate: u32 = absorbs.get::<Option<u32>>("rate")?.unwrap_or(0);
+    if rate == 0 || rate > crate::fluid::MAX_VOLUME {
+        return Err(mlua::Error::external(format!(
+            "register_block(\"{id}\"): absorbs.rate must be 1..={}, got {rate}. It is how many \
+             of a block's 27 cells this drinks per fluid tick; zero is a block that does not \
+             absorb, which is what leaving `absorbs` out says.",
+            crate::fluid::MAX_VOLUME
+        )));
+    }
+    let stored = lua.create_table()?;
+    stored.set("rate", rate)?;
+    if let Some(becomes) = absorbs.get::<Option<String>>("becomes")? {
+        stored.set(
+            "becomes",
+            qualify_id(owner, &becomes).map_err(mlua::Error::external)?,
+        )?;
+    }
+    Ok(stored)
+}
 
 /// Reads and validates `textures = { all = "..." }`.
 fn block_texture_path(block: &str, textures: &Table) -> mlua::Result<String> {

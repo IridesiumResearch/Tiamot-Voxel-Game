@@ -128,6 +128,17 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
+/// The reference saturation chain: dry ground, damp, and soaked.
+///
+/// Named here rather than in the example so the drift test and the generator
+/// read from one list — a texture in one and not the other is a file nobody
+/// notices has stopped matching.
+pub const GROUND_CHAIN: &[(&str, [u8; 3])] = &[
+    ("ground", [150, 118, 84]),
+    ("damp", [112, 88, 62]),
+    ("soaked", [78, 61, 43]),
+];
+
 impl Image {
     /// A solid colour.
     #[must_use]
@@ -174,14 +185,36 @@ impl Image {
     /// meshing is working at all — which matters for the first visible build.
     #[must_use]
     pub fn white_with_border() -> Self {
+        Self::tinted_with_border([255, 255, 255])
+    }
+
+    /// The same tile in a colour, for a mod that wants more than one ground.
+    ///
+    /// **The border scales with the colour rather than being a fixed grey**, so
+    /// a dark tile gets a dark edge instead of a light one drawn on top of it.
+    /// White comes out at exactly 220 either way, which is what lets
+    /// [`Image::white_with_border`] delegate here without the shipped PNG
+    /// changing by a byte.
+    #[must_use]
+    pub fn tinted_with_border(colour: [u8; 3]) -> Self {
+        /// How much of the colour the edge pixels keep. 0.86, as an integer
+        /// ratio so no rounding creeps in between builds.
+        const EDGE: u32 = 220;
+
         let mut rgba = Vec::with_capacity((TILE as usize) * (TILE as usize) * 4);
         for y in 0..TILE {
             for x in 0..TILE {
                 let edge = x == 0 || y == 0 || x == TILE - 1 || y == TILE - 1;
-                // Faint: 0.86 grey against white. Visible as an edge, not as a
-                // drawn-on grid.
-                let value = if edge { 220 } else { 255 };
-                rgba.extend_from_slice(&[value, value, value, 255]);
+                for channel in colour {
+                    // Faint: visible as an edge, not as a drawn-on grid.
+                    let value = if edge {
+                        u8::try_from(u32::from(channel) * EDGE / 255).unwrap_or(channel)
+                    } else {
+                        channel
+                    };
+                    rgba.push(value);
+                }
+                rgba.push(255);
             }
         }
         Self {
@@ -655,6 +688,44 @@ mod tests {
              `cargo run -p client --example write_reference_textures -- game`",
             path.display()
         );
+    }
+
+    #[test]
+    fn every_shipped_ground_texture_matches_its_generator() {
+        // The same pinning `white.png` gets, for the saturation chain. A chain
+        // whose three steps looked identical would make the mechanism
+        // invisible, and a hand-edited PNG is how they would drift back
+        // together without a diff anyone can review.
+        for (name, colour) in GROUND_CHAIN {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../game/core_milk/textures/{name}.png"));
+            let bytes = std::fs::read(&path).expect("the reference mod ships this texture");
+            let decoded = decode_png(&bytes).expect("and it must be a decodable PNG");
+            assert_eq!(
+                decoded,
+                Image::tinted_with_border(*colour),
+                "{} has drifted from its generator; re-run \
+                 `cargo run -p client --example write_reference_textures -- game`",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_chain_gets_darker_at_every_step() {
+        // The mechanism has to be VISIBLE or the fixture proves nothing from
+        // the window. Three tiles nobody can tell apart is a saturation chain
+        // that looks broken.
+        let brightness =
+            |colour: [u8; 3]| u32::from(colour[0]) + u32::from(colour[1]) + u32::from(colour[2]);
+        for pair in GROUND_CHAIN.windows(2) {
+            assert!(
+                brightness(pair[1].1) < brightness(pair[0].1),
+                "`{}` is not darker than `{}`",
+                pair[1].0,
+                pair[0].0
+            );
+        }
     }
 
     #[test]

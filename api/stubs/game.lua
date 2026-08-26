@@ -127,6 +127,7 @@ function Stream:next_bool() end
 ---@field textures Tiamot.BlockTextures? Which images clients draw this block with.
 ---@field sounds { step: string }? What this block sounds like underfoot. The client plays its own footsteps from its own movement, so this is the only way it can know. Unqualified ids mean your own mod's.
 ---@field light_emit Tiamot.LightEmit? Light this block gives off. Omit for anything that is not a lamp.
+---@field absorbs { rate: integer, becomes: string? }? Ground that drinks. `rate` is how many of the block's 27 cells it takes out of fluid touching it, per fluid tick, 1..=27. `becomes` is the block it turns into once it has taken them, qualified against your own mod — omit it for ground that drinks for ever without changing, which is a drain rather than a sponge. **Saturation is a chain of materials, not engine state** (Sub-Node Contract §4.3): `dirt` → `damp_dirt` → `saturated_dirt`, and the chain ends where a block stops naming a successor. A block of two or more materials never absorbs, because there is no way to turn one material inside a mix into its successor without per-cell saturation state.
 
 ---How `dominance` decides a mixed block's hardness.
 ---

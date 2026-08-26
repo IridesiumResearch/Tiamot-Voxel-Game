@@ -277,6 +277,12 @@ pub struct BlockRules {
     ///
     /// Sunlight is not settable here. It comes from the sky, not from a block.
     pub light_emit: (u8, u8, u8),
+    /// How much fluid this block drinks per fluid tick, and what it becomes.
+    ///
+    /// `(0, None)` for anything that does not absorb, which is almost
+    /// everything. The second half is a block id and is resolved against the
+    /// registry by whoever holds one — charter rule 8 again.
+    pub absorbs: (u32, Option<String>),
 }
 
 impl BlockRules {

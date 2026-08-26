@@ -23,6 +23,17 @@ fn main() {
         &root.join("core_blocks/textures/white.png"),
         &client::texture::Image::white_with_border(),
     );
+
+    // The saturation chain `core_milk` demonstrates: the same ground, darker
+    // each time it drinks. Sub-Node Contract §4.3 makes saturation a chain of
+    // MATERIALS rather than state bits, and this is the half of that decision
+    // the mod owns — the engine has no opinion about what wet dirt looks like.
+    for (name, colour) in client::texture::GROUND_CHAIN {
+        write(
+            &root.join(format!("core_milk/textures/{name}.png")),
+            &client::texture::Image::tinted_with_border(*colour),
+        );
+    }
 }
 
 /// Encodes an image as RGBA8 PNG and writes it, creating parent directories.

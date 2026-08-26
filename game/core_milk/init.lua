@@ -28,6 +28,50 @@ game.register_block{
     light_emit = { 2, 2, 2 },
 }
 
+-- **The saturation chain: ground that drinks, in three steps.**
+--
+-- Sub-Node Contract §4.3. The engine's mechanism is "this block takes `rate`
+-- cells per fluid tick and then becomes `becomes`"; everything else is here.
+-- Saturation is registered MATERIALS rather than state bits on a block, which
+-- is what lets this mod own the darker texture and lets another mod give
+-- saturated sand different behaviour without the engine learning what porosity
+-- is.
+--
+-- The chain terminates by the last link simply not naming a successor. Soaked
+-- ground still drinks — a puddle standing on it keeps draining — but it has
+-- nothing left to turn into. A mod that wanted saturated ground to stop
+-- absorbing would leave `absorbs` off it entirely, and that is the difference
+-- between ground that is full and ground that is a drain.
+--
+-- Nine cells is a third of a block per fluid tick, chosen so the effect is
+-- visible in a few seconds rather than being something you have to wait out.
+-- **It is a mod's number**: pour one bucket into a hole in dry ground and most
+-- of it soaks away, which is realistic and can read as "the bucket did not
+-- work". Tune it here, not in the engine.
+game.register_block{
+    id = "ground",
+    name = "Ground",
+    description = "Dry. It drinks what is poured on it.",
+    textures = { all = "textures/ground.png" },
+    absorbs = { rate = 9, becomes = "damp" },
+}
+
+game.register_block{
+    id = "damp",
+    name = "Damp ground",
+    description = "It has had some, and it will take more.",
+    textures = { all = "textures/damp.png" },
+    absorbs = { rate = 9, becomes = "soaked" },
+}
+
+game.register_block{
+    id = "soaked",
+    name = "Soaked ground",
+    description = "As wet as it gets. Still a drain, but it turns into nothing.",
+    textures = { all = "textures/soaked.png" },
+    absorbs = { rate = 9 },
+}
+
 game.register_fluid{
     id = "milk",
     material = "milk",

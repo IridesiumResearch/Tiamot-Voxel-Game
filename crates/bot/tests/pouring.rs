@@ -271,6 +271,29 @@ fn a_pour_and_a_scoop_give_back_exactly_what_was_carried() {
     server.stop();
 }
 
+/// The material a mod registered, as the server numbered it this session.
+fn material_named(bot: &Bot, suffix: &str) -> u16 {
+    bot.material_table()
+        .expect("the server should have sent a material table")
+        .into_iter()
+        .find(|entry| entry.name.ends_with(suffix))
+        .map(|entry| entry.id)
+        .unwrap_or_else(|| panic!("the reference mods should register `{suffix}`"))
+}
+
+/// Whether the bot has been told `pos` became `material`.
+fn became(bot: &Bot, pos: BlockPos, material: u16) -> bool {
+    bot.received().iter().any(|message| {
+        matches!(
+            message,
+            tiamot_core::proto::ServerMessage::BlockDelta {
+                edit: tiamot_core::proto::Edit::Block { pos: got, material: got_material },
+                ..
+            } if *got == pos && *got_material == material
+        )
+    })
+}
+
 /// Walls a two-block trough, so one bucket settles as two half-full blocks.
 fn trough(server: &ServerHandle, floor: u16, left: BlockPos) {
     let right = BlockPos::new(left.x + 1, left.y, left.z);
@@ -349,6 +372,68 @@ fn scooping_a_shallow_puddle_gives_back_a_partial_bucket() {
             "a scoop of {there} cells credited {} units rather than {there} — a partial bucket \
              was either rounded up to a whole one or refused",
             bot.units_of(milk).saturating_sub(before)
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn ground_that_drinks_gets_darker_and_the_milk_it_took_is_accounted_for() {
+    // **Sub-Node Contract §4.3, end to end through the mod API.** The engine's
+    // whole part is "this block takes `rate` cells and becomes `becomes`";
+    // `core_milk` decides that ground drinks nine cells at a time and turns
+    // into damp ground, and it registers three materials rather than asking
+    // the engine for saturation state.
+    //
+    // Saturation as MATERIALS is what makes this testable from outside at all:
+    // a state bit would be invisible to a client, and the proof that it worked
+    // would have to be a server-side assertion about a number nobody can see.
+    let server = start("saturation");
+    block_on(async {
+        let mut bot = join(&server, "Pourer").await;
+        let milk = milk_id(&bot).await;
+        let ground = material_named(&bot, "core_milk:ground");
+        let damp = material_named(&bot, "core_milk:damp");
+        stock_up(&server, &mut bot, milk, 2).await;
+
+        let at = BlockPos::new(2, 4, 2);
+        let floor = floor_id(&bot).await;
+        carve_basin(&server, floor, at.y, 1..=4, at.z);
+        // Thirsty ground under the pour, walled so the milk cannot simply run
+        // away instead of soaking in.
+        assert!(
+            server.seed_block(BlockPos::new(at.x, at.y - 1, at.z), ground),
+            "the world should accept seeded ground"
+        );
+        wall_in(&server, floor, at);
+        bot.sleep_ticks(4).await;
+
+        bot.move_to(2.0, 0.0, 4.0).await.expect("walk to the pour");
+        pour_at(&mut bot, at, milk).await;
+
+        assert!(
+            until(&mut bot, Duration::from_secs(20), |bot| became(
+                bot,
+                BlockPos::new(at.x, at.y - 1, at.z),
+                damp
+            ))
+            .await,
+            "the ground never turned damp, so nothing absorbed — or it absorbed and the swap \
+             never reached a client, which looks identical from here and is why this waits for \
+             the BLOCK rather than for the milk to go"
+        );
+
+        // And the milk it took is gone from the world rather than still
+        // standing on top of ground that has drunk it.
+        assert!(
+            until(&mut bot, Duration::from_secs(20), |bot| {
+                bot.fluid_at(at).volume() < tiamot_core::UNITS_PER_BLOCK
+            })
+            .await,
+            "the ground turned damp without the puddle losing anything, so absorption \
+             created the saturation out of nothing"
         );
 
         bot.disconnect().await;

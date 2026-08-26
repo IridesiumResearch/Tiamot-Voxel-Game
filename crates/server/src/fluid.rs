@@ -43,7 +43,9 @@
 use std::collections::{BTreeSet, HashMap};
 
 use tiamot_core::coords::{BlockPos, ChunkPos};
-use tiamot_core::fluid::{Flow, Fluid, FluidLayer, Fluids, Neighbourhood, Solver, Tuning};
+use tiamot_core::fluid::{
+    Absorbency, Absorbs, Flow, Fluid, FluidLayer, Fluids, Neighbourhood, Sinks, Solver, Tuning,
+};
 
 use crate::world::World;
 
@@ -66,6 +68,38 @@ pub const TICKS_PER_FLUID_TICK: u64 = 2;
 /// carry means work is deferred and never dropped, and a fluid that takes a
 /// moment to find its level is what a fluid is supposed to look like.
 pub const VISITS_PER_TICK: usize = 512;
+
+/// Builds an absorbency table from what the mods registered.
+///
+/// Keyed by WORLD material id, like emissions and hardness: a world that has
+/// seen a different mod set numbers its materials differently, and a table of
+/// this session's runtime ids would name every block one number out (charter
+/// rule 8). The successor goes through the same lookup, so a saturation chain
+/// survives a world being opened by a client with other mods installed.
+///
+/// A `becomes` naming a block nobody registered is dropped to `None` rather
+/// than refused: the chain simply ends there, which is what a mod that removed
+/// the last link of its own chain should get.
+#[must_use]
+pub fn absorbency_from_rules(
+    rules: &[tiamot_core::script::BlockRules],
+    id_of: impl Fn(&str) -> Option<tiamot_core::MaterialId>,
+) -> Absorbency {
+    Absorbency::new(rules.iter().filter_map(|rule| {
+        let (rate, becomes) = &rule.absorbs;
+        if *rate == 0 {
+            return None;
+        }
+        let becomes = becomes.as_deref().and_then(&id_of);
+        Some((
+            id_of(&rule.block)?,
+            Absorbs {
+                rate: *rate,
+                becomes,
+            },
+        ))
+    }))
+}
 
 /// A handle on the fluid store, for the mod API.
 ///
@@ -173,6 +207,7 @@ pub struct Fluidics {
     /// without the distinction.
     loaded: std::collections::BTreeSet<ChunkPos>,
     fluids: Fluids,
+    absorbency: Absorbency,
     solver: Solver,
     /// Writes a MOD made, waiting to go out with the next tick's changes.
     ///
@@ -194,6 +229,7 @@ impl Fluidics {
             dirty: std::collections::BTreeSet::new(),
             loaded: std::collections::BTreeSet::new(),
             fluids,
+            absorbency: Absorbency::default(),
             solver: Solver::new(),
             written: Vec::new(),
         }
@@ -227,6 +263,37 @@ impl Fluidics {
     /// next unload without anything going wrong visibly.
     pub fn mark_dirty(&mut self, pos: ChunkPos) {
         self.dirty.insert(pos);
+    }
+
+    /// Records which materials drink, and what they turn into.
+    ///
+    /// Set after the registries freeze, because the successor material has to
+    /// be resolvable — `becomes = "damp_dirt"` is a string until there is a
+    /// registry to look it up in (charter rule 8).
+    pub fn set_absorbency(&mut self, absorbency: Absorbency) {
+        self.absorbency = absorbency;
+    }
+
+    /// What one material does to fluid touching it.
+    #[must_use]
+    pub fn absorbs(&self, material: tiamot_core::MaterialId) -> Option<Absorbs> {
+        self.absorbency.get(material)
+    }
+
+    /// The same for a whole block, which is what the tick actually holds.
+    #[must_use]
+    pub fn absorbs_block(&self, block: &tiamot_core::block::BlockView<'_>) -> Option<Absorbs> {
+        self.absorbency.block(block)
+    }
+
+    /// Takes what the solver destroyed since this was last called.
+    ///
+    /// The caller applies the material swaps [`Sinks::absorbed`] describes: this
+    /// module knows a rate and a successor, and turning "three cells went into
+    /// this block" into a terrain edit needs the world, which is the tick
+    /// thread's rather than this lock's.
+    pub fn take_sinks(&mut self) -> Sinks {
+        self.solver.take_sinks()
     }
 
     /// What the mods registered.
@@ -381,6 +448,7 @@ impl Fluidics {
         let mut view = Wet {
             world,
             layers: &mut self.layers,
+            absorbency: &self.absorbency,
         };
         changes.extend(solver.tick(&mut view, tuning, VISITS_PER_TICK, seed, fluid_tick));
         self.solver = solver;
@@ -482,6 +550,7 @@ impl tiamot_core::phys::FluidLookup for Fluidics {
 struct Wet<'a> {
     world: &'a World,
     layers: &'a mut HashMap<ChunkPos, FluidLayer>,
+    absorbency: &'a Absorbency,
 }
 
 impl Neighbourhood for Wet<'_> {
@@ -498,6 +567,23 @@ impl Neighbourhood for Wet<'_> {
     fn occupancy(&self, pos: BlockPos) -> Option<u32> {
         let chunk = self.world.resident(pos.chunk())?;
         Some(chunk.get_block_local(pos.local()).filled_cells())
+    }
+
+    /// Sub-Node Contract §4.3: how many cells this block drinks per tick.
+    ///
+    /// The material's own rate, and nothing about what it becomes — the solver
+    /// has no registry, so it reports that a block absorbed and whoever holds
+    /// one decides that dirt is now damp dirt.
+    fn absorbency(&self, pos: BlockPos) -> u32 {
+        if self.absorbency.is_empty() {
+            return 0;
+        }
+        let Some(chunk) = self.world.resident(pos.chunk()) else {
+            return 0;
+        };
+        self.absorbency
+            .block(&chunk.get_block_local(pos.local()))
+            .map_or(0, |absorbs| absorbs.rate)
     }
 
     fn fluid(&self, pos: BlockPos) -> Fluid {

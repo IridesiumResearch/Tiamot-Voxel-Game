@@ -809,6 +809,22 @@ impl ServerHandle {
             },
         );
 
+        // Which materials drink, keyed by world id for the same reason
+        // emissions are — and with the SUCCESSOR resolved through the same
+        // table, so `becomes = "damp_dirt"` names the same block on a world
+        // that has seen a different mod set.
+        let absorbency = crate::fluid::absorbency_from_rules(&block_rules, |block| {
+            let runtime = registry
+                .iter()
+                .find(|(_, name)| *name == block)
+                .map(|(id, _)| id)?;
+            world
+                .materials()
+                .to_world(runtime)
+                .ok()
+                .map(tiamot_core::MaterialId)
+        });
+
         // **Stable ids for the fluids, and adoption of any the world already
         // knew.** Charter rule 8: a fluid byte on disk carries a number, and
         // `Fluids::register` numbers positionally in registration order — so
@@ -1111,7 +1127,11 @@ impl ServerHandle {
                     // Never contended — both sides are this thread — and never
                     // held across a callback, which is what would deadlock.
                     let fluidics = std::sync::Arc::new(std::sync::RwLock::new(
-                        crate::fluid::Fluidics::new(fluids),
+                        {
+                            let mut fluidics = crate::fluid::Fluidics::new(fluids);
+                            fluidics.set_absorbency(absorbency);
+                            fluidics
+                        },
                     ));
                     // And the entities, behind the same kind of lock for the
                     // same reason: `game.spawn_entity` runs on this thread
@@ -2529,8 +2549,60 @@ impl ServerHandle {
                             // A mod's `game.set_fluid` takes the same lock, and
                             // holding it across a callback is the one
                             // arrangement that deadlocks.
+                            // **Saturation, applied where the registry is.**
+                            // Sub-Node Contract §4.3: the solver knows a rate
+                            // and reports that a block drank; turning that into
+                            // "dirt is damp dirt now" needs the world and the
+                            // material table, neither of which the solver has.
+                            //
+                            // Collected under the lock and applied after it is
+                            // dropped, because a terrain edit relights and
+                            // broadcasts, and both of those want the tick
+                            // thread rather than the fluid lock.
+                            let sinks = fluid.take_sinks();
+                            let soaked: Vec<(tiamot_core::BlockPos, tiamot_core::MaterialId)> =
+                                sinks
+                                    .absorbed
+                                    .iter()
+                                    .filter_map(|taken| {
+                                        let block = world.resident(taken.pos.chunk())?;
+                                        let becomes = fluid
+                                            .absorbs_block(&block.get_block_local(taken.pos.local()))?
+                                            .becomes?;
+                                        Some((taken.pos, becomes))
+                                    })
+                                    .collect();
                             let blocked = fluid.take_blocked();
                             drop(fluid);
+
+                            for (pos, becomes) in soaked {
+                                // Whatever shape the block had, kept: a
+                                // chiselled step that soaks is still a step.
+                                let edit = tiamot_core::proto::Edit::Block {
+                                    pos,
+                                    material: becomes.0,
+                                };
+                                match world.apply(&edit, &mut source) {
+                                    Ok(_) => {
+                                        relight.push(pos);
+                                        // The pond has to hear about it too: a
+                                        // block that soaked may have crossed
+                                        // its own `waterlogs_at` and stopped
+                                        // being somewhere fluid can go.
+                                        fluidics
+                                            .write()
+                                            .expect("fluid lock")
+                                            .touch(pos);
+                                        shared.broadcast(ServerMessage::BlockDelta {
+                                            edit,
+                                            actor: None,
+                                        });
+                                    }
+                                    Err(err) => {
+                                        warn!("a soaked block could not be written: {err}");
+                                    }
+                                }
+                            }
                             for event in blocked {
                                 let Some(name) = fluidics
                                     .read()

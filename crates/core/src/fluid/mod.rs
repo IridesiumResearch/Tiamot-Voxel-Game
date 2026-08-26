@@ -49,7 +49,7 @@ mod solver;
 pub mod codec;
 
 pub use layer::FluidLayer;
-pub use solver::{Blocked, Flow, Neighbourhood, Solver, Tuning};
+pub use solver::{Absorbed, Blocked, Flow, Neighbourhood, Sinks, Solver, Tuning};
 
 /// The fullest a block with nothing else in it can be, in cells of 27.
 ///
@@ -179,6 +179,95 @@ impl Fluid {
     #[must_use]
     pub const fn with_volume(self, volume: u32) -> Self {
         Self::new(self.fluid(), volume)
+    }
+}
+
+/// What one material does to fluid that touches it.
+///
+/// **A fact about a block, not a policy.** Sub-Node Contract §4.3: the engine's
+/// mechanism is "this block takes `rate` cells per fluid tick and then becomes
+/// `becomes`"; which materials are absorbent, how thirsty they are and what
+/// saturation looks like are the mod's (charter rule 1).
+///
+/// Saturation is expressed as **registered materials** rather than as state
+/// bits on a block — `dirt` → `damp_dirt` → `saturated_dirt`. Chunks are
+/// palette-compressed so three materials are very nearly free, the mod owns the
+/// darker texture, and a mod may give saturated sand different behaviour from
+/// saturated dirt without the engine ever learning what porosity is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Absorbs {
+    /// How many cells of 27 it takes per fluid tick.
+    pub rate: u32,
+    /// What it turns into once it has taken them, if anything.
+    ///
+    /// `None` is ground that drinks for ever — a drain rather than a sponge.
+    /// The last step of a saturation chain is the material that says nothing,
+    /// which is how a chain terminates without the engine counting steps.
+    pub becomes: Option<MaterialId>,
+}
+
+/// Which materials drink, and what they become.
+///
+/// A flat `Vec` indexed by material id for the same reason
+/// [`crate::light::Emissions`] is one: the solver asks per block visited, and
+/// most materials answer "nothing".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Absorbency {
+    by_id: Vec<Option<Absorbs>>,
+}
+
+impl Absorbency {
+    /// Builds a table from what the mods registered.
+    #[must_use]
+    pub fn new(entries: impl IntoIterator<Item = (MaterialId, Absorbs)>) -> Self {
+        let mut by_id: Vec<Option<Absorbs>> = Vec::new();
+        for (id, absorbs) in entries {
+            let index = id.0 as usize;
+            if by_id.len() <= index {
+                by_id.resize(index + 1, None);
+            }
+            by_id[index] = Some(absorbs);
+        }
+        Self { by_id }
+    }
+
+    /// What `material` does to fluid, or `None` for anything that does nothing.
+    #[must_use]
+    pub fn get(&self, material: MaterialId) -> Option<Absorbs> {
+        self.by_id.get(material.0 as usize).copied().flatten()
+    }
+
+    /// How many cells `material` takes per fluid tick, or zero.
+    #[must_use]
+    pub fn rate(&self, material: MaterialId) -> u32 {
+        self.get(material).map_or(0, |absorbs| absorbs.rate)
+    }
+
+    /// What a whole block does to fluid touching it.
+    ///
+    /// **A block of two or more materials does not absorb**, and that is a
+    /// stated limit rather than an oversight. Saturation is expressed as the
+    /// block BECOMING another material (§4.3), and there is no way to turn one
+    /// material inside a mixed block into its successor without per-cell
+    /// saturation state — which is sub-node fluid state through the back door,
+    /// and the thing §4 exists to keep out.
+    ///
+    /// Occupancy plays no part for the other two forms: dirt chiselled to a
+    /// sliver is still dirt, exactly as a chiselled lamp is still a lamp
+    /// ([`crate::light::Emissions::block`]).
+    #[must_use]
+    pub fn block(&self, block: &crate::block::BlockView<'_>) -> Option<Absorbs> {
+        match block {
+            crate::block::BlockView::Uniform(material)
+            | crate::block::BlockView::Partial { material, .. } => self.get(*material),
+            crate::block::BlockView::Mixed(_) => None,
+        }
+    }
+
+    /// Whether nothing at all drinks, so the solver can skip asking.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.by_id.iter().all(Option::is_none)
     }
 }
 
