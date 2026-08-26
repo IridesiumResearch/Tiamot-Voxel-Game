@@ -77,6 +77,11 @@ local AHEAD = 0.8
 --- three cells is one block. A toss rather than a throw — far enough to clear
 --- your own feet, close enough to pick up again without a walk.
 local THROW = 0.5
+--- The arc on top of the aim, in cells per tick.
+---
+--- A stack thrown dead level still wants to rise a little, or it reads as slid
+--- rather than thrown.
+local LOFT = 0.25
 --- How close a player has to be to pick something up, in blocks.
 local REACH = 1.5
 --- How long a dropped stack ignores the player who dropped it, in ticks.
@@ -115,7 +120,10 @@ local function throw(body, stack)
     local id = game.spawn_entity{
         pos = {
             x = body.pos.x + body.facing.x * AHEAD,
-            y = body.pos.y + LIFT,
+            -- From the head rather than from the feet, and moved with the aim:
+            -- a stack thrown while looking up should leave from above the eye,
+            -- not from the ground.
+            y = body.pos.y + LIFT + body.facing.y * AHEAD,
             z = body.pos.z + body.facing.z * AHEAD,
         },
         item = stack,
@@ -124,12 +132,17 @@ local function throw(body, stack)
         collider = { width = 0.5, height = 0.5 },
     }
     if id ~= nil then
-        -- A toss, so it arcs away rather than appearing at arm's length. Up a
-        -- little as well as out, which is what makes it look thrown.
+        -- **Along the whole of `facing`, pitch included.** Look up and it goes
+        -- further; look at your feet and it lands on them. Reported from the
+        -- window as wanting it spat out rather than dropped, and the vertical
+        -- part is what makes that read as a throw rather than a nudge.
+        --
+        -- `LOFT` is on top of the aim: a stack thrown dead level still wants to
+        -- rise a little, or it reads as slid.
         game.set_entity(id, {
             velocity = {
                 x = body.facing.x * THROW,
-                y = THROW * 0.5,
+                y = body.facing.y * THROW + LOFT,
                 z = body.facing.z * THROW,
             },
         })

@@ -1413,7 +1413,9 @@ function game.despawn_entity(id) end
 ---CURRENT display name the engine resolves when it draws the tag — a player's
 ---own body has the second, never the first.
 ---@param id integer
----`facing` is the direction the entity is looking, as a unit `{ x, z }`.
+---`facing` is the direction the entity is looking, as a unit `{ x, y, z }` —
+---pitch included, so a throw along it goes further when the head is raised and
+---lands at the feet when it is lowered.
 ---**Use it rather than computing one from `yaw`.** `math.sin(yaw)` is the
 ---platform's libm, so two servers running your mod would put the same thrown
 ---item in slightly different places — and that difference becomes persisted
@@ -1424,7 +1426,7 @@ function game.despawn_entity(id) end
 ---same shape `game.inventory` reports one — `{ material, units, blocks, nodes,
 ---count, shape }` — so reading an item off the floor and handing it to a player
 ---moves one table between two calls.
----@return { pos: { x: number, y: number, z: number }, yaw: number, pitch: number, facing: { x: number, z: number }, velocity: { x: number, y: number, z: number }, on_ground: boolean, source: string, model: string|nil, item: table|nil, anim: integer, health: integer|nil, max_health: integer|nil, owner: string|nil, nametag: string|nil, nametag_player: string|nil }|nil
+---@return { pos: { x: number, y: number, z: number }, yaw: number, pitch: number, facing: { x: number, y: number, z: number }, velocity: { x: number, y: number, z: number }, on_ground: boolean, source: string, model: string|nil, item: table|nil, anim: integer, health: integer|nil, max_health: integer|nil, owner: string|nil, nametag: string|nil, nametag_player: string|nil }|nil
 function game.entity(id) end
 
 ---Changes an entity. Returns whether anything changed.

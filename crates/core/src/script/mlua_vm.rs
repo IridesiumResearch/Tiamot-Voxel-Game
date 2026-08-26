@@ -2782,10 +2782,20 @@ impl MluaVm {
                 // and a mod never has to know why.
                 //
                 // The same convention a figure's heading uses: facing is
-                // `(sin yaw, cos yaw)`, so yaw zero is north.
+                // `(sin yaw, cos yaw)` in the horizontal, so yaw zero is north.
+                //
+                // **Pitch is in it too**, because "which way is this pointing"
+                // includes up and down: a mod throwing something along it
+                // throws further when the head is raised and at its own feet
+                // when it is lowered, which is what a player expects and what
+                // was asked for. A unit vector, so a caller multiplying by a
+                // speed gets that speed whichever way they are looking.
+                let pitch = entity.transform.pitch;
+                let flat = crate::detgen::trig::cos(pitch);
                 let facing = lua.create_table()?;
-                facing.set("x", crate::detgen::trig::sin(entity.transform.yaw))?;
-                facing.set("z", crate::detgen::trig::cos(entity.transform.yaw))?;
+                facing.set("x", crate::detgen::trig::sin(entity.transform.yaw) * flat)?;
+                facing.set("y", crate::detgen::trig::sin(pitch))?;
+                facing.set("z", crate::detgen::trig::cos(entity.transform.yaw) * flat)?;
                 out.set("facing", facing)?;
                 let velocity = lua.create_table()?;
                 velocity.set("x", entity.velocity.0[0])?;
