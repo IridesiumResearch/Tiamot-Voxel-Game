@@ -1480,7 +1480,22 @@ impl ServerHandle {
                                             // a heading needs no trigonometry;
                                             // radians here because that is what
                                             // a transform holds. One multiply.
-                                            yaw: player.look[0] * turn,
+                                            //
+                                            // **Converted, because a camera and
+                                            // a body count yaw in opposite
+                                            // directions.** This stored the
+                                            // camera's angle unconverted, so
+                                            // every OTHER player saw a body
+                                            // facing the mirror image of where
+                                            // its owner was looking — the same
+                                            // mistake `figure_yaw` was written
+                                            // for after third person showed it
+                                            // on the local player's own figure.
+                                            // Invisible at yaw zero, where the
+                                            // two agree.
+                                            yaw: tiamot_core::ent::figure_yaw(
+                                                player.look[0] * turn,
+                                            ),
                                             pitch: player.look[1] * turn,
                                         },
                                         tiamot_core::ent::Velocity(player.body.velocity),

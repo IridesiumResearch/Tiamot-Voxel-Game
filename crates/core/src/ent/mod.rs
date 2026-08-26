@@ -46,7 +46,7 @@ use std::collections::BTreeMap;
 
 pub use access::{Access, Patch};
 pub use component::{
-    AnimTag, Collider, HUMANOID_MODEL, Health, Nametag, Owner, Transform, Velocity,
+    AnimTag, Collider, HUMANOID_MODEL, Health, Nametag, Owner, Transform, Velocity, figure_yaw,
 };
 pub use replicate::{Delta, Spawn, Tracker, Update};
 

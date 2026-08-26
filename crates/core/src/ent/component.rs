@@ -172,6 +172,29 @@ pub type Collider = crate::phys::Shape;
 /// `engine:humanoid`.
 pub const HUMANOID_MODEL: &str = "engine:humanoid";
 
+/// A camera's yaw, as the yaw of the BODY looking through it.
+///
+/// # Two conventions, and they are not the same one
+///
+/// A figure faces `(sin yaw, cos yaw)` — that is what the skinned vertex stage
+/// does with a heading, and what a mob writing `atan2(dx, dz)` produces. A
+/// CAMERA looks along `(−sin yaw, cos yaw)`, because the world is right-handed
+/// with `+z` north, which makes east `−x`. The two therefore count in opposite
+/// directions, and the conversion is the negation.
+///
+/// **Getting it wrong is invisible until you turn**: at yaw zero both point
+/// north and agree exactly. It has now been got wrong twice — once for the
+/// local player's own figure in third person, and once for the mirrored body
+/// every OTHER player sees, which stored the camera's yaw unconverted and so
+/// faced the mirror image of where its owner was looking.
+///
+/// It lives in `core` rather than in the client so that both ends convert the
+/// same way, once. It is not rendering: it is which way round an angle counts.
+#[must_use]
+pub const fn figure_yaw(camera_yaw: f32) -> f32 {
+    -camera_yaw
+}
+
 /// What an entity is doing, as a tag.
 ///
 /// **The server never touches animation maths.** It says "walking" and the
@@ -277,6 +300,50 @@ pub enum Nametag {
 /// themselves, going offline, and rotating their key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Owner(pub PlayerUuid);
+
+#[cfg(test)]
+mod yaw_tests {
+    use super::*;
+
+    #[test]
+    fn a_body_faces_the_way_the_camera_looks() {
+        // **The conversion, checked against both conventions rather than
+        // asserted.** A figure faces `(sin yaw, cos yaw)` — what the skinned
+        // vertex stage does with a heading — and a camera looks along
+        // `(−sin yaw, cos yaw)`, because the world is right-handed with `+z`
+        // north and east is `−x`.
+        //
+        // Zero is deliberately not the only case: at yaw zero both point north
+        // and a missing conversion is invisible. That is how it shipped wrong
+        // twice — once on the local player's own figure, once on the mirrored
+        // body every other player sees.
+        for degrees in [0.0_f32, 45.0, 90.0, 180.0, 270.0, -30.0] {
+            let camera = degrees.to_radians();
+            let body = figure_yaw(camera);
+
+            let looking = (
+                -crate::detgen::trig::sin(camera),
+                crate::detgen::trig::cos(camera),
+            );
+            let facing = (
+                crate::detgen::trig::sin(body),
+                crate::detgen::trig::cos(body),
+            );
+            assert!(
+                (facing.0 - looking.0).abs() < 1e-5 && (facing.1 - looking.1).abs() < 1e-5,
+                "at {degrees}° the camera looks {looking:?} and the body faces {facing:?}"
+            );
+        }
+
+        // And the counter-example: passing the camera's yaw straight through —
+        // which is what the player mirror did — disagrees the moment you turn.
+        let camera = 90.0_f32.to_radians();
+        assert!(
+            (crate::detgen::trig::sin(camera) - -crate::detgen::trig::sin(camera)).abs() > 1.0,
+            "the unconverted value agrees, so this test proves nothing"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

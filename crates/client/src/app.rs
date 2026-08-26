@@ -158,7 +158,7 @@ const HOTBAR_SLOTS: usize = 9;
 /// you turn: at yaw zero both point north and agree exactly. Reported from the
 /// window as not facing the way you are walking.
 const fn figure_yaw(camera_yaw: f32) -> f32 {
-    -camera_yaw
+    tiamot_core::ent::figure_yaw(camera_yaw)
 }
 
 /// Below this the player's figure stands still, in cells per tick.
