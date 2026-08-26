@@ -310,10 +310,10 @@ mod tests {
     fn fluid(name: &str) -> Registered {
         Registered {
             name: name.to_owned(),
-            flow_range: 7,
+
             waterlogs_at: 14,
             tick_rate: 1,
-            renews_from: 0,
+            evaporates: 0,
             color: [255, 255, 255],
             material: MaterialId(4),
         }
@@ -405,7 +405,7 @@ mod tests {
 
         // And it is inert: it spreads nowhere and is not offered to clients.
         let entry = without.get(stood_in).expect("registered");
-        assert_eq!(entry.flow_range, 0);
+        assert_eq!(entry.waterlogs_at, 1);
         assert_eq!(entry.material, MaterialId::AIR);
         assert!(
             without

@@ -646,7 +646,6 @@ fn server_messages() -> Vec<Vec<u8>> {
                 id: 1,
                 name: "core_milk:milk".to_owned(),
                 material: 4,
-                depths: [1, 2, 3, 4, 5, 6, 7, 8],
                 color: [240, 240, 230],
             }],
         },

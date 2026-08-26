@@ -3,32 +3,43 @@
 
 //! Fluid: what is in a block, and which fluid it is.
 //!
-//! # The model, and what it deliberately is not
+//! # The model
 //!
-//! Classic Minecraft-style flow: source blocks that sustain themselves, a level
-//! that decays with distance, and no conservation. Milk poured from a source is
-//! created out of nothing and drained milk goes nowhere. That is a settled scope
-//! decision, not an oversight — a conserved, pressure-equalising sim is a
-//! different and much larger system, and the API here is shaped so one could
-//! replace the update rule later without touching storage, the wire, or the
-//! renderer.
+//! **Conserved.** A block holds a volume in cells of 27 — the unit charter rule
+//! 5 uses for everything else — and volume moves between blocks rather than
+//! being created. It leaves the world only through a declared sink, and the
+//! solver counts every cell it destroys so charter rule 15's conservation
+//! proptest can be written at all.
+//!
+//! There are no source blocks. An infinite spring is a conservation violation
+//! by definition, so the source flag, `flow_range` and `renews_from` all went
+//! with the model that needed them. Sub-Node Contract §4 is authoritative and
+//! §4.1 records what this replaced and why.
 //!
 //! # Block resolution, on purpose
 //!
-//! Everything else in this engine is sub-node. Fluid is not, and that keeps it
-//! off the sub-node risk surface entirely: there are no partially-flooded
-//! carved blocks, no fluid-versus-occupancy interactions in the mesher, and no
-//! new cases in collision. Sub-Node Contract §4 states the whole of it in one
-//! sentence — a block accepts fluid **iff its occupancy is empty**.
+//! Everything else in this engine is sub-node. Fluid is not: one volume per
+//! block, never a per-cell mask. The lattice is read for exactly two things —
+//! how much will fit (`capacity`) and whether a block is floor — and that keeps
+//! fluid off the sub-node risk surface entirely.
 //!
-//! # Why a byte and not a nibble
+//! **Volume in cells is not sub-node fluid.** The unit changed; the resolution
+//! did not. What it buys is that a block one third full of stone holds one
+//! third less fluid, which the old sevenths could not express and which
+//! conservation makes observable: a bucket is a measurement, so a player pouring
+//! into chiselled ground could otherwise get more back out than they put in.
 //!
-//! The level needs three bits and the source flag one. The remaining four hold
-//! the fluid's id, because the engine supports several registered fluids even
-//! though the reference mods ship one; without an id a chunk could not say
-//! whether a block held milk or something a mod added next to it. A byte per
-//! block is 4 KiB for a chunk that has any fluid at all and **nothing at all for
-//! a chunk that has none**, which is almost every chunk — see [`FluidLayer`].
+//! # Why two bytes and not one
+//!
+//! Volume needs five bits to reach 27 and the fluid id needs four. Nine bits do
+//! not fit in a byte, and the two ways to make them fit are both worse than
+//! paying for the second one: halving the fluid registry to seven trades a
+//! limit that lasts forever against a byte, and dropping to 15 volumes
+//! reintroduces the conversion this change exists to delete.
+//!
+//! Two bytes per block is 8 KiB for a chunk that has any fluid at all and
+//! **nothing at all for a chunk that has none**, which is almost every chunk —
+//! see [`FluidLayer`].
 
 use crate::material::MaterialId;
 
@@ -40,17 +51,39 @@ pub mod codec;
 pub use layer::FluidLayer;
 pub use solver::{Blocked, Flow, Neighbourhood, Solver, Tuning};
 
-/// The fullest a fluid block can be.
+/// The fullest a block with nothing else in it can be, in cells of 27.
 ///
-/// Levels run `1..=7`, with 0 meaning "no fluid". Seven is a source or a block
-/// directly fed by one; each block of lateral travel costs one.
-pub const MAX_LEVEL: u8 = 7;
+/// A block's actual ceiling is [`capacity`], which subtracts whatever terrain is
+/// in the way. This is the ceiling for an empty one.
+pub const MAX_VOLUME: u32 = 27;
+
+/// How much fluid a block will take, in cells of 27.
+///
+/// **Sub-Node Contract §4.** `occupancy` is how full of terrain the block is, in
+/// the same cells; `waterlogs_at` is the registering fluid's threshold for
+/// calling a block floor. At or above that threshold the block is fluid-solid —
+/// it neither holds nor passes fluid — and below it, what is left over is what
+/// will fit.
+///
+/// The world reports a fact and the fluid decides what it means, which is why
+/// the threshold is passed in rather than known here: two fluids in one world
+/// may disagree about what counts as floor.
+#[must_use]
+pub const fn capacity(occupancy: u32, waterlogs_at: u32) -> u32 {
+    if occupancy >= waterlogs_at {
+        return 0;
+    }
+    if occupancy >= MAX_VOLUME {
+        return 0;
+    }
+    MAX_VOLUME - occupancy
+}
 
 /// The most fluids that can be registered at once.
 ///
 /// Four bits of id, and zero means "none", so fifteen. Not a limit anybody is
 /// expected to reach — the reference mods register one — and raising it means
-/// widening the per-block byte, which is a storage and protocol change rather
+/// widening the per-block word, which is a storage and protocol change rather
 /// than a constant.
 pub const MAX_FLUIDS: usize = 15;
 
@@ -73,91 +106,79 @@ impl FluidId {
     }
 }
 
-/// What one block holds: which fluid, how much, and whether it is a source.
+/// What one block holds: which fluid, and how much.
 ///
 /// # Layout
 ///
 /// | bits | meaning |
 /// |---|---|
-/// | 4..8 | fluid id, 0 for none |
-/// | 3 | source flag |
-/// | 0..3 | level, 0..=7 |
+/// | 5..9 | fluid id, 0 for none |
+/// | 0..5 | volume in cells, `0..=27` |
 ///
-/// A source always reads at [`MAX_LEVEL`]; the flag says it sustains itself
-/// rather than draining. The two are stored separately rather than encoding a
-/// source as "level 8" so that a decayed source and a full flow block stay
-/// distinguishable, which is what makes draining terminate.
+/// The seven high bits are spare. There is no source flag: under a conserved
+/// model a block that sustains itself is matter from nothing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Fluid(pub u8);
+pub struct Fluid(pub u16);
+
+/// Where the fluid id sits.
+const ID_SHIFT: u16 = 5;
+
+/// The volume field, once the id is shifted off it.
+const VOLUME_MASK: u16 = 0b1_1111;
 
 impl Fluid {
     /// A block with nothing in it.
     pub const EMPTY: Self = Self(0);
 
-    /// A block of `fluid` at `level`, not a source.
+    /// A block of `fluid` holding `volume` cells.
     ///
-    /// A level of zero, or a fluid of [`FluidId::NONE`], is [`Self::EMPTY`]:
+    /// A volume of zero, or a fluid of [`FluidId::NONE`], is [`Self::EMPTY`]:
     /// "some milk, but none of it" is not a state worth being able to write.
+    /// Volume is clamped to [`MAX_VOLUME`] rather than wrapping, because a
+    /// value that does not fit the field would otherwise silently become a
+    /// different fluid.
     #[must_use]
-    pub const fn flowing(fluid: FluidId, level: u8) -> Self {
-        if fluid.is_none() || level == 0 {
+    pub const fn new(fluid: FluidId, volume: u32) -> Self {
+        if fluid.is_none() || volume == 0 {
             return Self::EMPTY;
         }
-        let level = if level > MAX_LEVEL { MAX_LEVEL } else { level };
-        Self((fluid.0 << 4) | level)
-    }
-
-    /// A source block of `fluid`, which sustains [`MAX_LEVEL`].
-    #[must_use]
-    pub const fn source(fluid: FluidId) -> Self {
-        if fluid.is_none() {
-            return Self::EMPTY;
-        }
-        Self((fluid.0 << 4) | 0b1000 | MAX_LEVEL)
+        let volume = if volume > MAX_VOLUME {
+            MAX_VOLUME
+        } else {
+            volume
+        };
+        Self(((fluid.0 as u16) << ID_SHIFT) | volume as u16)
     }
 
     /// Which fluid this is, or [`FluidId::NONE`].
     #[must_use]
     pub const fn fluid(self) -> FluidId {
-        FluidId(self.0 >> 4)
+        FluidId((self.0 >> ID_SHIFT) as u8)
     }
 
-    /// How full the block is, `0..=7`.
+    /// How much it holds, in cells of 27.
+    ///
+    /// **This is the number the mesher's surface height and the physics'
+    /// submerged fraction both want**, in the units they already speak
+    /// (charter rule 5). It used to need converting from sevenths; Sub-Node
+    /// Contract §4.1 records the conversion that deleted.
     #[must_use]
-    pub const fn level(self) -> u8 {
-        self.0 & 0b0111
-    }
-
-    /// Whether this block sustains itself.
-    #[must_use]
-    pub const fn is_source(self) -> bool {
-        self.0 & 0b1000 != 0
+    pub const fn volume(self) -> u32 {
+        (self.0 & VOLUME_MASK) as u32
     }
 
     /// Whether the block holds nothing.
     #[must_use]
     pub const fn is_empty(self) -> bool {
-        self.level() == 0 || self.fluid().is_none()
+        self.volume() == 0 || self.fluid().is_none()
     }
 
-    /// How much of the block's HEIGHT this fills, in twenty-sevenths.
+    /// The same fluid holding `volume` instead.
     ///
-    /// **In sub-node units even though fluid is block-resolution**, because the
-    /// only things that ask are the renderer's surface height and the physics'
-    /// submerged fraction, and both of those already speak in cells (charter
-    /// rule 5). A full block is 24 of 27 rather than 27: a brim-full block of
-    /// milk still has a visible surface below the block above it, which is what
-    /// makes a waterfall read as milk rather than as a solid column.
+    /// Empties the block rather than keeping an id with no volume behind it.
     #[must_use]
-    pub const fn depth_units(self) -> u32 {
-        if self.is_empty() {
-            return 0;
-        }
-        // Level 7 is 24/27, about 0.9 of a block; level 1 is 3/27, a ninth.
-        // A fraction rather than a cell count: a block is only three sub-nodes
-        // tall, and the whole point of this number is to express surface
-        // heights the lattice cannot.
-        (self.level() as u32) * 24 / (MAX_LEVEL as u32)
+    pub const fn with_volume(self, volume: u32) -> Self {
+        Self::new(self.fluid(), volume)
     }
 }
 
@@ -212,11 +233,6 @@ pub trait Access: Send + Sync {
 pub struct Registered {
     /// The canonical string id, `"core:milk"`.
     pub name: String,
-    /// How far a source spreads sideways on flat ground, in blocks.
-    ///
-    /// Seven for milk, which is [`MAX_LEVEL`]: each block of travel costs a
-    /// level, so a shorter range is a fluid that thins out faster.
-    pub flow_range: u8,
     /// How full a block must be before this fluid treats it as floor, in cells
     /// of 27. See [`Tuning::waterlogs_at`].
     pub waterlogs_at: u32,
@@ -225,11 +241,14 @@ pub struct Registered {
     /// One means every fluid tick. Larger is a slower, more viscous fluid, and
     /// it costs proportionally less to simulate.
     pub tick_rate: u8,
-    /// How many neighbouring sources make a block a source of its own.
+    /// One in how many fluid ticks an exposed block loses a cell, or zero.
     ///
-    /// Zero never renews. See [`Tuning::renews_from`] — it is what stops an
-    /// ocean collapsing when somebody takes a bucket out of the middle of it.
-    pub renews_from: u8,
+    /// **A declared sink** (Sub-Node Contract §4.3). Only a block with air
+    /// directly above it evaporates, so a wide shallow pool goes before a deep
+    /// narrow one — more of it is exposed. Zero never evaporates, which is the
+    /// engine default: a world that only ever gets wetter is a mod's decision
+    /// to make, not the engine's.
+    pub evaporates: u32,
     /// What being inside it looks like, sRGB `0..=255`.
     ///
     /// Separate from the material, because a texture is what the surface looks
@@ -313,13 +332,12 @@ impl Fluids {
     pub fn register_placeholder(&mut self, name: &str) -> Result<FluidId, RegisterError> {
         let id = self.register(Registered {
             name: name.to_owned(),
-            // Spreads nowhere and moves never: the fluid's own rules left with
-            // the mod that knew them, and guessing at them would rearrange a
-            // world the moment somebody disabled something.
-            flow_range: 0,
-            waterlogs_at: crate::UNITS_PER_BLOCK,
+            // Treats everything as floor and never evaporates: the fluid's own
+            // rules left with the mod that knew them, and guessing at them
+            // would rearrange a world the moment somebody disabled something.
+            waterlogs_at: 1,
             tick_rate: 1,
-            renews_from: 0,
+            evaporates: 0,
             // Never drawn and never submerged in, so the colour is arbitrary;
             // white is the one that cannot be mistaken for a deliberate choice.
             color: [255, 255, 255],
@@ -409,48 +427,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_source_and_a_full_flow_block_are_not_the_same_thing() {
-        // **The distinction draining depends on.** A source sustains itself; a
-        // flow block at the same level drains the moment its parent goes away.
-        // Encoding a source as "level 8" would make these one value and there
-        // would be nothing left to drain.
+    fn a_volume_of_nothing_is_empty_whichever_way_it_is_written() {
         let milk = FluidId(1);
-        let source = Fluid::source(milk);
-        let full = Fluid::flowing(milk, MAX_LEVEL);
-
-        assert_eq!(source.level(), full.level());
-        assert!(source.is_source());
-        assert!(!full.is_source());
-        assert_ne!(source, full);
-    }
-
-    #[test]
-    fn a_level_of_nothing_is_empty_whichever_way_it_is_written() {
-        let milk = FluidId(1);
-        assert_eq!(Fluid::flowing(milk, 0), Fluid::EMPTY);
-        assert_eq!(Fluid::flowing(FluidId::NONE, MAX_LEVEL), Fluid::EMPTY);
+        assert_eq!(Fluid::new(milk, 0), Fluid::EMPTY);
+        assert_eq!(Fluid::new(FluidId::NONE, MAX_VOLUME), Fluid::EMPTY);
         assert!(Fluid::EMPTY.is_empty());
-        assert_eq!(Fluid::EMPTY.depth_units(), 0);
+        assert_eq!(Fluid::EMPTY.volume(), 0);
     }
 
     #[test]
-    fn a_full_block_stops_short_of_the_block_above() {
-        // Contract §4 and the reason a waterfall reads as milk: a brim-full
-        // block still shows a surface.
-        let milk = FluidId(1);
-        assert_eq!(Fluid::flowing(milk, MAX_LEVEL).depth_units(), 24);
-        assert!(Fluid::flowing(milk, MAX_LEVEL).depth_units() < crate::UNITS_PER_BLOCK);
-        // Monotone, and never zero for a block that holds anything.
-        for level in 1..=MAX_LEVEL {
-            let shallower = Fluid::flowing(milk, level - 1).depth_units();
-            let here = Fluid::flowing(milk, level).depth_units();
-            assert!(here > 0);
-            assert!(
-                here > shallower,
-                "level {level} is no deeper than {}",
-                level - 1
-            );
+    fn volume_and_id_survive_each_other_across_the_whole_range() {
+        // **The bit-packing test that matters.** Volume needs five bits and the
+        // id four; getting the shift wrong makes a deep block of one fluid read
+        // as a shallow block of another, which looks like a flow bug rather
+        // than a storage one.
+        for id in 1..=MAX_FLUIDS as u8 {
+            for volume in 1..=MAX_VOLUME {
+                let value = Fluid::new(FluidId(id), volume);
+                assert_eq!(value.fluid(), FluidId(id), "id lost at volume {volume}");
+                assert_eq!(value.volume(), volume, "volume lost for id {id}");
+                assert!(!value.is_empty());
+            }
         }
+    }
+
+    #[test]
+    fn more_than_a_block_holds_is_clamped_rather_than_wrapped() {
+        // Wrapping would carry into the id field, so a block overfilled by one
+        // cell would silently become a different fluid.
+        let milk = FluidId(1);
+        let over = Fluid::new(milk, MAX_VOLUME + 5);
+        assert_eq!(over.volume(), MAX_VOLUME);
+        assert_eq!(over.fluid(), milk);
+    }
+
+    #[test]
+    fn terrain_in_a_block_takes_the_space_out_of_its_capacity() {
+        // **Sub-Node Contract §4.1, the volume lie retired.** A block a third
+        // full of stone holds a third less, and conservation is what made that
+        // observable: a bucket is a measurement.
+        let waterlogs_at = 14;
+        assert_eq!(capacity(0, waterlogs_at), MAX_VOLUME);
+        assert_eq!(capacity(9, waterlogs_at), MAX_VOLUME - 9);
+        assert_eq!(capacity(13, waterlogs_at), MAX_VOLUME - 13);
+        // At the threshold the block is floor, and floor holds nothing.
+        assert_eq!(capacity(waterlogs_at, waterlogs_at), 0);
+        assert_eq!(capacity(MAX_VOLUME, waterlogs_at), 0);
+    }
+
+    #[test]
+    fn a_fluid_that_calls_everything_floor_still_fills_empty_air() {
+        // `waterlogs_at = 1` is the old "any chiselled cell is waterproof"
+        // rule, and it must still let fluid into a block with nothing in it or
+        // the fluid could never move at all.
+        assert_eq!(capacity(0, 1), MAX_VOLUME);
+        assert_eq!(capacity(1, 1), 0);
     }
 
     #[test]
@@ -459,9 +490,8 @@ mod tests {
         let milk = fluids
             .register(Registered {
                 name: "core:milk".into(),
-                flow_range: 7,
                 waterlogs_at: 14,
-                renews_from: 0,
+                evaporates: 0,
                 color: [255, 255, 255],
                 tick_rate: 1,
                 material: MaterialId(4),
@@ -469,7 +499,7 @@ mod tests {
             .expect("first registration");
         assert_eq!(milk, FluidId(1), "zero is reserved for 'no fluid'");
         assert_eq!(fluids.id_of("core:milk"), Some(milk));
-        assert_eq!(fluids.get(milk).map(|f| f.flow_range), Some(7));
+        assert_eq!(fluids.get(milk).map(|f| f.waterlogs_at), Some(14));
         assert!(fluids.get(FluidId::NONE).is_none());
     }
 
@@ -478,9 +508,8 @@ mod tests {
         let mut fluids = Fluids::new();
         let entry = || Registered {
             name: "core:milk".into(),
-            flow_range: 7,
             waterlogs_at: 14,
-            renews_from: 0,
+            evaporates: 0,
             color: [255, 255, 255],
             tick_rate: 1,
             material: MaterialId(4),
@@ -499,9 +528,8 @@ mod tests {
             fluids
                 .register(Registered {
                     name: format!("test:fluid{index}"),
-                    flow_range: 7,
                     waterlogs_at: 14,
-                    renews_from: 0,
+                    evaporates: 0,
                     color: [255, 255, 255],
                     tick_rate: 1,
                     material: MaterialId(1),
@@ -511,30 +539,13 @@ mod tests {
         assert!(matches!(
             fluids.register(Registered {
                 name: "test:one-too-many".into(),
-                flow_range: 7,
                 waterlogs_at: 14,
-                renews_from: 0,
+                evaporates: 0,
                 color: [255, 255, 255],
                 tick_rate: 1,
                 material: MaterialId(1),
             }),
             Err(RegisterError::Full { .. })
         ));
-    }
-
-    #[test]
-    fn a_block_round_trips_through_its_byte() {
-        for id in 1..=MAX_FLUIDS as u8 {
-            for level in 1..=MAX_LEVEL {
-                let flowing = Fluid::flowing(FluidId(id), level);
-                assert_eq!(flowing.fluid(), FluidId(id));
-                assert_eq!(flowing.level(), level);
-                assert!(!flowing.is_source());
-            }
-            let source = Fluid::source(FluidId(id));
-            assert_eq!(source.fluid(), FluidId(id));
-            assert_eq!(source.level(), MAX_LEVEL);
-            assert!(source.is_source());
-        }
     }
 }

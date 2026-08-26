@@ -154,7 +154,7 @@ impl FluidLayer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{FluidId, MAX_LEVEL};
+    use super::super::{FluidId, MAX_VOLUME};
     use super::*;
 
     fn local(x: u32, y: u32, z: u32) -> LocalBlock {
@@ -184,8 +184,8 @@ mod tests {
         // **The settled-world assertion, at the storage level.**
         let milk = FluidId(1);
         let mut layer = FluidLayer::empty();
-        assert!(layer.set(local(1, 1, 1), Fluid::flowing(milk, 4)));
-        assert!(layer.set(local(2, 1, 1), Fluid::source(milk)));
+        assert!(layer.set(local(1, 1, 1), Fluid::new(milk, 4)));
+        assert!(layer.set(local(2, 1, 1), Fluid::new(milk, MAX_VOLUME)));
         assert!(!layer.is_empty());
         assert_eq!(layer.filled(), 2);
 
@@ -204,18 +204,18 @@ mod tests {
         // positive here is a packet per settled block per tick.
         let milk = FluidId(1);
         let mut layer = FluidLayer::empty();
-        assert!(layer.set(local(0, 0, 0), Fluid::flowing(milk, 3)));
-        assert!(!layer.set(local(0, 0, 0), Fluid::flowing(milk, 3)));
-        assert!(layer.set(local(0, 0, 0), Fluid::flowing(milk, 2)));
+        assert!(layer.set(local(0, 0, 0), Fluid::new(milk, 3)));
+        assert!(!layer.set(local(0, 0, 0), Fluid::new(milk, 3)));
+        assert!(layer.set(local(0, 0, 0), Fluid::new(milk, 2)));
     }
 
     #[test]
     fn a_layer_round_trips_through_its_blocks() {
         let milk = FluidId(1);
         let mut layer = FluidLayer::empty();
-        layer.set(local(0, 0, 0), Fluid::source(milk));
-        layer.set(local(15, 15, 15), Fluid::flowing(milk, MAX_LEVEL));
-        layer.set(local(7, 2, 9), Fluid::flowing(milk, 1));
+        layer.set(local(0, 0, 0), Fluid::new(milk, MAX_VOLUME));
+        layer.set(local(15, 15, 15), Fluid::new(milk, MAX_VOLUME));
+        layer.set(local(7, 2, 9), Fluid::new(milk, 1));
 
         let copy = FluidLayer::from_blocks(layer.blocks());
         assert_eq!(copy, layer);

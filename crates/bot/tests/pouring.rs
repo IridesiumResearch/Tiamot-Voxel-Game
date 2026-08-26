@@ -176,84 +176,94 @@ async fn pour_at(bot: &mut Bot, pos: BlockPos, milk: u16) {
         .expect("the pour should reach the server");
 }
 
+/// Walls the four sides of a block so conserved milk stays in it.
+///
+/// **Sub-Node Contract §4 is why this exists.** Milk is conserved and levels
+/// itself, so twenty-seven cells poured onto an open floor are gone from the
+/// block you poured into within a couple of fluid ticks — spread over its
+/// neighbours, which is correct and useless to a test about one block.
+fn wall_in(server: &ServerHandle, floor: u16, at: BlockPos) {
+    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+        assert!(
+            server.seed_block(BlockPos::new(at.x + dx, at.y, at.z + dz), floor),
+            "the world should accept a seeded wall"
+        );
+    }
+}
+
 #[test]
-fn a_pour_into_flowing_milk_makes_a_second_source_rather_than_scooping_it() {
-    // **Reported from a running game**: "I do not seem to be able to place a
-    // water source inside flowing water. I should be able to right click on the
-    // block behind the flowing water and place another source right inside the
-    // current puddle, next to the original water source."
+fn a_pour_and_a_scoop_give_back_exactly_what_was_carried() {
+    // **The conservation round trip, through the mod API and nothing else.**
+    // Charter rule 15 wants conservation asserted on simulation invariants; this
+    // is the same invariant seen from where a player stands, which is the only
+    // place it can go wrong in a way somebody notices.
     //
-    // The engine was never the obstacle — its placement check is on TERRAIN
-    // sub-nodes and fluid lives in its own layer, so the click reached the mod
-    // every time. `core_milk` was the obstacle: it scooped whenever the block
-    // held anything at all, so pouring into a spreading puddle emptied that one
-    // block, which then refilled from the original source. The click looked
-    // like it did nothing.
-    //
-    // Flow is milk that is only passing through. A bucket poured into it should
-    // leave a second spring, which is what widening a pool requires.
-    let server = start("pour-into-flow");
+    // Under the old model this test could not have been written: a bucket
+    // created a source out of nothing and scooping destroyed one, so units in
+    // and units out had no relationship at all.
+    let server = start("pour-and-scoop");
     block_on(async {
         let mut bot = join(&server, "Pourer").await;
         let milk = milk_id(&bot).await;
+        // **Two blocks' worth, and the second one is not slack.** `core_milk`
+        // pours the material a player is HOLDING, so somebody who pours their
+        // last drop has nothing left to click with and cannot scoop it back —
+        // see the note in `game/core_milk/init.lua`. A test that carried one
+        // bucket would be unable to exercise the second half of its own round
+        // trip.
         stock_up(&server, &mut bot, milk, 2).await;
         let floor = floor_id(&bot).await;
         let ground = BlockPos::new(2, 4, 2);
         carve_basin(&server, floor, ground.y, 1..=4, ground.z);
-        // Let the seeds land before pouring into them.
+        wall_in(&server, floor, ground);
         bot.sleep_ticks(4).await;
 
+        let carried = bot.units_of(milk);
+        assert_eq!(
+            carried,
+            2 * tiamot_core::UNITS_PER_BLOCK,
+            "the fixture should start with exactly two blocks' worth"
+        );
+
         bot.move_to(2.0, 0.0, 4.0).await.expect("walk to the pour");
+        pour_at(&mut bot, ground, milk).await;
+
+        assert!(
+            until(&mut bot, Duration::from_secs(15), |bot| {
+                bot.fluid_at(ground).volume() == tiamot_core::UNITS_PER_BLOCK
+            })
+            .await,
+            "a whole bucket poured into a walled block should hold all of it; it holds {}",
+            bot.fluid_at(ground).volume()
+        );
+        // **Waited for, not asserted straight away.** The fluid layer and the
+        // inventory are two messages, and the pour arriving says nothing about
+        // whether the debit has. Asserting here read the units the client had
+        // before it was told.
+        assert!(
+            until(&mut bot, Duration::from_secs(15), |bot| bot.units_of(milk)
+                == carried - tiamot_core::UNITS_PER_BLOCK)
+            .await,
+            "the pour was not charged a bucket: {} units left of {carried}",
+            bot.units_of(milk)
+        );
+
+        // And back out again.
         pour_at(&mut bot, ground, milk).await;
         assert!(
             until(&mut bot, Duration::from_secs(15), |bot| bot
                 .fluid_at(ground)
-                .is_source())
+                .is_empty())
             .await,
-            "the first pour did not leave a source"
+            "clicking a block that already holds milk should scoop it"
         );
-
-        // Wait for it to spread, and take whichever neighbour it actually
-        // reached rather than guessing one: the floor under a generated world
-        // is not flat, and a test that names a block the milk had no reason to
-        // enter measures the terrain instead of the mod.
-        let neighbours = [
-            BlockPos::new(ground.x + 1, ground.y, ground.z),
-            BlockPos::new(ground.x - 1, ground.y, ground.z),
-            BlockPos::new(ground.x, ground.y, ground.z + 1),
-            BlockPos::new(ground.x, ground.y, ground.z - 1),
-        ];
-        let flowing = |bot: &Bot| {
-            neighbours.into_iter().find(|at| {
-                let there = bot.fluid_at(*at);
-                !there.is_empty() && !there.is_source()
-            })
-        };
         assert!(
-            until(&mut bot, Duration::from_secs(20), |bot| flowing(bot)
-                .is_some())
+            until(&mut bot, Duration::from_secs(15), |bot| bot.units_of(milk)
+                == carried)
             .await,
-            "the milk never spread to any neighbour, so there is no flow to pour into"
-        );
-        let spread = flowing(&bot).expect("a flowing neighbour");
-
-        // **The reported click.** Pour into the flow.
-        pour_at(&mut bot, spread, milk).await;
-        assert!(
-            until(&mut bot, Duration::from_secs(15), |bot| bot
-                .fluid_at(spread)
-                .is_source())
-            .await,
-            "pouring into flowing milk did not leave a source — it was scooped \
-             instead, which is the reported bug: the puddle refills from the \
-             original source and the click appears to do nothing"
-        );
-
-        // And the original is untouched: a second spring beside the first, not
-        // one moved.
-        assert!(
-            bot.fluid_at(ground).is_source(),
-            "the second pour disturbed the first source"
+            "what came back out is not what went in: {} units against {carried} — milk was \
+             created or destroyed by a round trip that has no sink in it",
+            bot.units_of(milk)
         );
 
         bot.disconnect().await;
@@ -261,35 +271,84 @@ fn a_pour_into_flowing_milk_makes_a_second_source_rather_than_scooping_it() {
     server.stop();
 }
 
+/// Walls a two-block trough, so one bucket settles as two half-full blocks.
+fn trough(server: &ServerHandle, floor: u16, left: BlockPos) {
+    let right = BlockPos::new(left.x + 1, left.y, left.z);
+    for at in [left, right] {
+        for dz in [-1, 1] {
+            assert!(
+                server.seed_block(BlockPos::new(at.x, at.y, at.z + dz), floor),
+                "the world should accept a seeded wall"
+            );
+        }
+    }
+    for x in [left.x - 1, right.x + 1] {
+        assert!(
+            server.seed_block(BlockPos::new(x, left.y, left.z), floor),
+            "the world should accept a seeded end wall"
+        );
+    }
+}
+
 #[test]
-fn a_pour_onto_a_source_still_scoops_it() {
-    // The other half, which must keep working: a source is what a bucket takes
-    // back. Clearing it is what makes the rest drain, and being able to watch
-    // that happen is the point of the mechanism.
-    let server = start("scoop-a-source");
+fn scooping_a_shallow_puddle_gives_back_a_partial_bucket() {
+    // **The decision this protects**: a bucket is a MEASUREMENT, not a switch.
+    // Scooping half a puddle gives half a bucket back, and it costs no new
+    // concept to say so — milk in an inventory is units of a material like
+    // anything else (charter rule 5), so "half a bucket" is just fewer units.
+    //
+    // The rejected alternative was Minecraft's, where a bucket tops itself up
+    // out of neighbouring blocks until it is full. That makes scooping one
+    // block drain water the player never pointed at.
+    let server = start("partial-bucket");
     block_on(async {
-        let mut bot = join(&server, "Scooper").await;
+        let mut bot = join(&server, "Pourer").await;
         let milk = milk_id(&bot).await;
         stock_up(&server, &mut bot, milk, 2).await;
-        let at = BlockPos::new(2, 4, 2);
+        let floor = floor_id(&bot).await;
+        let ground = BlockPos::new(2, 4, 2);
+        carve_basin(&server, floor, ground.y, 1..=4, ground.z);
+        // **A sealed trough of exactly two blocks.** One bucket levels itself
+        // across them and then STOPS, which is what makes the amount readable:
+        // an open puddle is still moving when the test samples it, and the
+        // first version of this test scooped a block that had lost a cell
+        // between the reading and the click.
+        trough(&server, floor, ground);
+        bot.sleep_ticks(4).await;
 
         bot.move_to(2.0, 0.0, 4.0).await.expect("walk to the pour");
-        pour_at(&mut bot, at, milk).await;
+        pour_at(&mut bot, ground, milk).await;
+
+        // Levelled and settled: half a bucket each, give or take the odd cell
+        // that cannot be split.
+        let neighbour = BlockPos::new(ground.x + 1, ground.y, ground.z);
         assert!(
-            until(&mut bot, Duration::from_secs(15), |bot| bot
-                .fluid_at(at)
-                .is_source())
+            until(&mut bot, Duration::from_secs(20), |bot| {
+                let here = bot.fluid_at(ground).volume();
+                let there = bot.fluid_at(neighbour).volume();
+                here + there == tiamot_core::UNITS_PER_BLOCK && here.abs_diff(there) <= 1
+            })
             .await,
-            "the pour did not leave a source"
+            "the bucket never levelled across the trough: {} and {}",
+            bot.fluid_at(ground).volume(),
+            bot.fluid_at(neighbour).volume()
+        );
+        let there = bot.fluid_at(ground).volume();
+        assert!(
+            there > 0 && there < tiamot_core::UNITS_PER_BLOCK,
+            "the block holds {there} cells, which is not a partial bucket"
         );
 
-        pour_at(&mut bot, at, milk).await;
+        let before = bot.units_of(milk);
+        pour_at(&mut bot, ground, milk).await;
+
         assert!(
-            until(&mut bot, Duration::from_secs(15), |bot| bot
-                .fluid_at(at)
-                .is_empty())
+            until(&mut bot, Duration::from_secs(15), |bot| bot.units_of(milk)
+                == before + there)
             .await,
-            "pouring onto a source did not take it back"
+            "a scoop of {there} cells credited {} units rather than {there} — a partial bucket \
+             was either rounded up to a whole one or refused",
+            bot.units_of(milk).saturating_sub(before)
         );
 
         bot.disconnect().await;

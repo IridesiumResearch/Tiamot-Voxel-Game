@@ -665,7 +665,11 @@ fn detgen_contains_no_terrain_policy() {
 /// platforms. The solver's active set is a `BTreeSet` for precisely this
 /// reason, and a `HashSet` swapped in would fail here on every platform and for
 /// a different value on each run.
-const FLUID_GOLDEN: u64 = 5_527_249_282_102_538_918;
+/// Rebaselined 2026-08-26 when the model became conserved: level meant
+/// distance travelled from a source, volume means volume, and there are no
+/// sources (Sub-Node Contract §4.1). A deliberate rule change is exactly the
+/// case this constant's warning names.
+const FLUID_GOLDEN: u64 = 10_233_241_359_803_942_171;
 // Regenerated once, deliberately, when the hole preference was WIRED IN. It had
 // been written, table-driven tested and never consulted by the solver, so milk
 // spread evenly in all directions and reached a hole by covering the ground
@@ -695,7 +699,7 @@ const FLUID_GOLDEN: u64 = 5_527_249_282_102_538_918;
 fn fluid_fingerprint() -> u64 {
     use std::collections::{BTreeMap, BTreeSet};
     use tiamot_core::coords::BlockPos;
-    use tiamot_core::fluid::{Fluid, FluidId, Neighbourhood, Solver, Tuning};
+    use tiamot_core::fluid::{Fluid, FluidId, MAX_VOLUME, Neighbourhood, Solver, Tuning};
 
     const MILK: FluidId = FluidId(1);
 
@@ -735,11 +739,20 @@ fn fluid_fingerprint() -> u64 {
         }
     }
 
-    /// Milk that renews from three sides — an ocean rather than a spring.
-    const RENEWING: Tuning = Tuning {
-        renews_from: 3,
+    /// Milk that evaporates, which is the seeded half of the rule.
+    ///
+    /// **The new determinism risk.** Flow is integer arithmetic and could only
+    /// diverge through visit order; evaporation is randomness, and randomness
+    /// that came from anywhere but the world seed and the block's position
+    /// would differ between two servers running the same world. One in three,
+    /// so the hash actually depends on it.
+    const EVAPORATING: Tuning = Tuning {
+        evaporates: 3,
         ..Tuning::DEFAULT
     };
+
+    /// The world seed these scenes settle under.
+    const SEED: u64 = 0x51E5_D0C7_A311_9F42;
 
     /// Settles a scene and folds every block of it into the hash.
     fn run(hasher: &mut blake3::Hasher, scene: Scene, solver: Solver, ticks: usize) {
@@ -754,8 +767,8 @@ fn fluid_fingerprint() -> u64 {
         ticks: usize,
         tuning: Tuning,
     ) {
-        for _ in 0..ticks {
-            solver.tick(&mut scene, tuning, usize::MAX);
+        for tick in 0..ticks {
+            solver.tick(&mut scene, tuning, usize::MAX, SEED, tick as u64);
         }
         // Sorted by construction — a `BTreeMap` — so the hash does not depend
         // on the order the blocks happened to be written in.
@@ -763,7 +776,7 @@ fn fluid_fingerprint() -> u64 {
             hasher.update(&x.to_le_bytes());
             hasher.update(&y.to_le_bytes());
             hasher.update(&z.to_le_bytes());
-            hasher.update(&[value.0]);
+            hasher.update(&value.0.to_le_bytes());
         }
         // And how much work is outstanding, so a scenario that settles on one
         // platform and not on another is a difference this notices.
@@ -783,7 +796,7 @@ fn fluid_fingerprint() -> u64 {
         }
     }
     let mut solver = Solver::new();
-    scene.set_fluid(BlockPos::new(-6, 6, 0), Fluid::source(MILK));
+    scene.set_fluid(BlockPos::new(-6, 6, 0), Fluid::new(MILK, MAX_VOLUME));
     solver.touch(BlockPos::new(-6, 6, 0));
     run(&mut hasher, scene, solver, 120);
 
@@ -804,7 +817,7 @@ fn fluid_fingerprint() -> u64 {
         }
     }
     let mut solver = Solver::new();
-    scene.set_fluid(BlockPos::new(0, 6, 0), Fluid::source(MILK));
+    scene.set_fluid(BlockPos::new(0, 6, 0), Fluid::new(MILK, MAX_VOLUME));
     solver.touch(BlockPos::new(0, 6, 0));
     run(&mut hasher, scene, solver, 120);
 
@@ -819,10 +832,10 @@ fn fluid_fingerprint() -> u64 {
         scene.solid.insert((x, 1, 1));
     }
     let mut solver = Solver::new();
-    scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::source(MILK));
+    scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::new(MILK, MAX_VOLUME));
     solver.touch(BlockPos::new(0, 1, 0));
     for _ in 0..60 {
-        solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX);
+        solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX, SEED, 0);
     }
     scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::EMPTY);
     solver.touch(BlockPos::new(0, 1, 0));
@@ -844,16 +857,16 @@ fn fluid_fingerprint() -> u64 {
     let mut solver = Solver::new();
     for x in -2..=2 {
         for z in -2..=2 {
-            scene.set_fluid(BlockPos::new(x, 1, z), Fluid::source(MILK));
+            scene.set_fluid(BlockPos::new(x, 1, z), Fluid::new(MILK, MAX_VOLUME));
             solver.touch(BlockPos::new(x, 1, z));
         }
     }
-    for _ in 0..30 {
-        solver.tick(&mut scene, RENEWING, usize::MAX);
+    for tick in 0..30u64 {
+        solver.tick(&mut scene, EVAPORATING, usize::MAX, SEED, tick);
     }
     scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::EMPTY);
     solver.touch(BlockPos::new(0, 1, 0));
-    run_with(&mut hasher, scene, solver, 30, RENEWING);
+    run_with(&mut hasher, scene, solver, 30, EVAPORATING);
 
     u64::from_le_bytes(
         hasher.finalize().as_bytes()[..8]
@@ -891,7 +904,7 @@ fn the_fluid_scenarios_actually_hold_milk() {
     // and perfectly meaningless. This asserts the scenarios did something.
     use std::collections::{BTreeMap, BTreeSet};
     use tiamot_core::coords::BlockPos;
-    use tiamot_core::fluid::{Fluid, FluidId, Neighbourhood, Solver, Tuning};
+    use tiamot_core::fluid::{Fluid, FluidId, MAX_VOLUME, Neighbourhood, Solver, Tuning};
 
     #[derive(Default)]
     struct Basin {
@@ -930,11 +943,21 @@ fn the_fluid_scenarios_actually_hold_milk() {
             scene.solid.insert((x, 0, z));
         }
     }
+    // The seed only matters to evaporation, which `Tuning::DEFAULT` has off.
+    const SEED: u64 = 0x51E5_D0C7_A311_9F42;
+
     let mut solver = Solver::new();
-    scene.set_fluid(BlockPos::new(0, 3, 0), Fluid::source(FluidId(1)));
-    solver.touch(BlockPos::new(0, 3, 0));
-    for _ in 0..120 {
-        solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX);
+    // **Several blocks' worth, not one.** A single block of 27 cells spread
+    // over an 81-block basin is one cell everywhere, and a golden hashing a
+    // flat sheet of ones would not notice the flow rule changing.
+    let mut poured = 0;
+    for y in 1..=4 {
+        scene.set_fluid(BlockPos::new(0, y, 0), Fluid::new(FluidId(1), MAX_VOLUME));
+        solver.touch(BlockPos::new(0, y, 0));
+        poured += MAX_VOLUME;
+    }
+    for tick in 0..120u64 {
+        solver.tick(&mut scene, Tuning::DEFAULT, usize::MAX, SEED, tick);
     }
 
     assert!(
@@ -942,9 +965,18 @@ fn the_fluid_scenarios_actually_hold_milk() {
         "only {} blocks hold milk, so the golden is hashing almost nothing",
         scene.fluid.len()
     );
-    let levels: BTreeSet<u8> = scene.fluid.values().map(|value| value.level()).collect();
+    // **Conservation, in the test that guards the golden.** Nothing here
+    // absorbs and nothing evaporates, so every cell poured in is still
+    // somewhere — and a golden over a scene that quietly lost half its milk
+    // would be a stable hash of a broken rule.
+    let held: u32 = scene.fluid.values().map(|value| value.volume()).sum();
+    assert_eq!(
+        held, poured,
+        "milk went missing with no sink to account for it"
+    );
+    let volumes: BTreeSet<u32> = scene.fluid.values().map(|value| value.volume()).collect();
     assert!(
-        levels.len() > 1,
-        "every block is at the same level, so the gradient the golden should cover is absent"
+        volumes.len() > 1,
+        "every block holds the same amount, so the gradient the golden should cover is absent"
     );
 }

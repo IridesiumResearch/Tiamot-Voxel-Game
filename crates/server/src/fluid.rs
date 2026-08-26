@@ -174,6 +174,15 @@ pub struct Fluidics {
     loaded: std::collections::BTreeSet<ChunkPos>,
     fluids: Fluids,
     solver: Solver,
+    /// Writes a MOD made, waiting to go out with the next tick's changes.
+    ///
+    /// **A mod's `game.set_fluid` is a change nobody was told about**, and the
+    /// old model hid that: a source fed its neighbours or renewed itself, so
+    /// the solver always produced something on the next tick and the touched
+    /// chunk went out with it. A conserved pour into a sealed block moves
+    /// nothing at all, and the milk existed only on the server — visible to
+    /// `game.get_fluid` and to nobody looking at it.
+    written: Vec<Flow>,
 }
 
 impl Fluidics {
@@ -186,6 +195,7 @@ impl Fluidics {
             loaded: std::collections::BTreeSet::new(),
             fluids,
             solver: Solver::new(),
+            written: Vec::new(),
         }
     }
 
@@ -315,7 +325,17 @@ impl Fluidics {
     /// The one way fluid enters the world from outside the solver: a mod's
     /// `game.set_fluid`, a player pouring, a chunk being edited.
     pub fn set(&mut self, pos: BlockPos, value: Fluid) -> bool {
+        let was = self.at(pos);
         let changed = self.write(pos, value);
+        if changed {
+            // Reported like any other flow, so a pour that settles instantly
+            // still reaches the clients that have to draw it.
+            self.written.push(Flow {
+                pos,
+                was,
+                now: value,
+            });
+        }
         self.solver.touch(pos);
         changed
     }
@@ -332,9 +352,14 @@ impl Fluidics {
     ///
     /// Returns every change, for broadcasting and re-meshing. Empty for a
     /// settled world, and it does not even take a lock to find that out.
-    pub fn tick(&mut self, world: &World, fluid_tick: u64) -> Vec<Flow> {
+    pub fn tick(&mut self, world: &World, fluid_tick: u64, seed: u64) -> Vec<Flow> {
+        // **Taken on every path**, including the two that do no work. A write a
+        // mod made is a change whatever the solver decides afterwards, and
+        // dropping it on the viscosity check would lose it for good rather
+        // than delaying it.
+        let mut changes = std::mem::take(&mut self.written);
         if self.solver.is_settled() {
-            return Vec::new();
+            return changes;
         }
         // **A fluid's own rate, and until now it was registered and ignored.**
         // `register_fluid{ tick_rate }` was accepted, stored, carried all the
@@ -348,7 +373,7 @@ impl Fluidics {
         // slower. Ships one fluid; the shape is here for when that changes.
         let tuning = self.tuning();
         if !fluid_tick.is_multiple_of(u64::from(tuning.tick_rate.max(1))) {
-            return Vec::new();
+            return changes;
         }
         // Taken apart so the solver can borrow the store mutably while the world
         // is borrowed immutably, which is the same trick `Lit` plays for light.
@@ -357,7 +382,7 @@ impl Fluidics {
             world,
             layers: &mut self.layers,
         };
-        let changes = solver.tick(&mut view, tuning, VISITS_PER_TICK);
+        changes.extend(solver.tick(&mut view, tuning, VISITS_PER_TICK, seed, fluid_tick));
         self.solver = solver;
         changes
     }
@@ -412,11 +437,9 @@ impl Fluidics {
             .iter_registered()
             .next()
             .map_or(Tuning::DEFAULT, |(_, f)| Tuning {
-                flow_range: f.flow_range,
-                hole_search: Tuning::DEFAULT.hole_search,
                 waterlogs_at: f.waterlogs_at,
                 tick_rate: f.tick_rate,
-                renews_from: f.renews_from,
+                evaporates: f.evaporates,
             })
     }
 
@@ -528,10 +551,9 @@ pub fn fluids_from_rules(
         };
         if let Err(err) = fluids.register(tiamot_core::fluid::Registered {
             name: rule.fluid.clone(),
-            flow_range: rule.flow_range,
             waterlogs_at: rule.waterlogs_at,
             tick_rate: rule.tick_rate,
-            renews_from: rule.renews_from,
+            evaporates: rule.evaporates,
             color: rule.color,
             material,
         }) {
@@ -556,9 +578,61 @@ fn block_at(chunk: ChunkPos, index: usize) -> BlockPos {
 
 #[cfg(test)]
 mod tests {
-    use tiamot_core::fluid::FluidId;
+    use tiamot_core::fluid::{FluidId, MAX_VOLUME};
 
     use super::*;
+
+    #[test]
+    fn a_mod_write_that_settles_instantly_is_still_reported() {
+        // **The bug the conserved model exposed.** `game.set_fluid` writes and
+        // wakes the block, but only the SOLVER's changes were returned — so a
+        // pour into a block with nowhere to flow produced an empty change list
+        // and no `ChunkFluid` ever went out. The milk existed on the server,
+        // answered `game.get_fluid`, and was invisible to everybody.
+        //
+        // The old model hid it: a source fed its neighbours or renewed itself,
+        // so there was always something for the next tick to report.
+        let mut fluids = Fluids::new();
+        let milk = fluids
+            .register(tiamot_core::fluid::Registered {
+                name: "test:milk".into(),
+                waterlogs_at: 14,
+                tick_rate: 1,
+                evaporates: 0,
+                color: [255, 255, 255],
+                material: tiamot_core::MaterialId(4),
+            })
+            .expect("register");
+        let mut fluidics = Fluidics::new(fluids);
+
+        let block = BlockPos::new(1, 2, 3);
+        assert!(fluidics.set(block, Fluid::new(milk, MAX_VOLUME)));
+
+        let dir = std::env::temp_dir().join("tiamot-fluid-write-report");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("world.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let mut registry = tiamot_core::Registry::new();
+        let db = tiamot_core::persist::WorldDb::open(&path, &mut registry).expect("open");
+        let world = crate::world::World::open(db, 1).expect("world");
+        let changes = fluidics.tick(&world, 0, 0);
+
+        assert!(
+            changes.iter().any(|flow| flow.pos == block),
+            "a mod's own write was not reported, so no client is ever told about it"
+        );
+        // And exactly once: a write reported again on the next tick would
+        // re-broadcast a chunk for ever.
+        let again = fluidics.tick(&world, 1, 0);
+        assert!(
+            !again
+                .iter()
+                .any(|flow| flow.pos == block && flow.was.is_empty()),
+            "the same write was reported twice"
+        );
+    }
 
     #[test]
     fn the_bench_and_the_server_agree_on_the_cap() {
@@ -591,7 +665,7 @@ mod tests {
         let mut saved = FluidLayer::empty();
         saved.set(
             tiamot_core::coords::LocalBlock::new(0, 0, 0),
-            Fluid::source(milk),
+            Fluid::new(milk, MAX_VOLUME),
         );
         fluidics.chunk_loaded(pos, saved);
         assert_eq!(fluidics.dirty(), 0, "a load dirtied the chunk it loaded");
@@ -599,7 +673,7 @@ mod tests {
         // A pour is.
         fluidics.set(
             BlockPos::new(corner.x + 1, corner.y, corner.z),
-            Fluid::source(milk),
+            Fluid::new(milk, MAX_VOLUME),
         );
         assert_eq!(fluidics.dirty(), 1);
 
@@ -621,7 +695,7 @@ mod tests {
         let pos = ChunkPos::new(-2, 3, 1);
         let block = block_at(pos, 0);
 
-        fluidics.set(block, Fluid::source(milk));
+        fluidics.set(block, Fluid::new(milk, MAX_VOLUME));
         fluidics.take_dirty();
 
         fluidics.set(block, Fluid::EMPTY);
@@ -657,7 +731,7 @@ mod tests {
 
         // A player pours into it, and then it arrives again.
         let block = block_at(pos, 0);
-        fluidics.set(block, Fluid::source(milk));
+        fluidics.set(block, Fluid::new(milk, MAX_VOLUME));
         assert!(fluidics.knows(pos), "the pour lost the chunk's read mark");
 
         // Forgetting it — a real unload — puts it back to unread.
@@ -690,7 +764,7 @@ mod tests {
         for y in 0..4 {
             fluidics.set(
                 BlockPos::new(corner.x + 2, corner.y + y, corner.z + 2),
-                Fluid::source(milk),
+                Fluid::new(milk, MAX_VOLUME),
             );
         }
 
@@ -766,7 +840,7 @@ mod tests {
         let mut layer = FluidLayer::empty();
         layer.set(
             tiamot_core::coords::LocalBlock::new(1, 2, 3),
-            Fluid::flowing(milk, 4),
+            Fluid::new(milk, 4),
         );
 
         let mut fluidics = Fluidics::new(Fluids::new());
@@ -774,14 +848,14 @@ mod tests {
 
         assert!(!fluidics.is_empty());
         assert!(!fluidics.is_settled(), "a loaded pond was not queued");
-        assert_eq!(fluidics.at(BlockPos::new(1, 2, 3)).level(), 4);
+        assert_eq!(fluidics.at(BlockPos::new(1, 2, 3)).volume(), 4);
     }
 
     #[test]
     fn a_block_that_drains_gives_its_chunk_back() {
         let milk = FluidId(1);
         let mut fluidics = Fluidics::new(Fluids::new());
-        assert!(fluidics.set(BlockPos::new(0, 0, 0), Fluid::source(milk)));
+        assert!(fluidics.set(BlockPos::new(0, 0, 0), Fluid::new(milk, MAX_VOLUME)));
         assert!(!fluidics.is_empty());
 
         assert!(fluidics.set(BlockPos::new(0, 0, 0), Fluid::EMPTY));

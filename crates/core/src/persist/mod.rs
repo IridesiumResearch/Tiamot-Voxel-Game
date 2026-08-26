@@ -183,16 +183,12 @@ pub enum WorldError {
 
 /// The same block, under a different fluid id.
 ///
-/// Preserves the level and the source flag exactly — only the four id bits move
-/// between the session's numbering and the world's. A source that came back as a
-/// flow block would drain, and the pond would be gone a few ticks after the
-/// world loaded.
+/// Preserves the volume exactly — only the id bits move between the session's
+/// numbering and the world's. A pond that came back holding a different amount
+/// than it was saved with would be a conservation failure that survived a
+/// restart, which is the hardest kind to find.
 fn retag(value: crate::fluid::Fluid, fluid: crate::fluid::FluidId) -> crate::fluid::Fluid {
-    if value.is_source() {
-        crate::fluid::Fluid::source(fluid)
-    } else {
-        crate::fluid::Fluid::flowing(fluid, value.level())
-    }
+    crate::fluid::Fluid::new(fluid, value.volume())
 }
 
 /// An open world database.

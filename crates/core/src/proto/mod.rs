@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -1556,12 +1556,6 @@ pub struct FluidDef {
     pub name: String,
     /// The world material id a full block of it is drawn as.
     pub material: u16,
-    /// How full a block at each level is, in twenty-sevenths.
-    ///
-    /// Sent rather than recomputed so a client and a server cannot disagree
-    /// about where a surface sits — which would show as milk at one height on
-    /// screen and a different one under your feet.
-    pub depths: [u8; 8],
     /// What being inside it looks like, as sRGB `0..=255`.
     ///
     /// **Not the texture, and not derived from it.** A texture is what a surface

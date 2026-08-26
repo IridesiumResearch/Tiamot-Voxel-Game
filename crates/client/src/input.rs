@@ -567,11 +567,6 @@ const ENGINE_ACTIONS: &[(&str, &str, Option<Input>)] = &[
         Some(Input::Key(KeyCode::KeyB)),
     ),
     (
-        "engine:fluid_sources",
-        "Outline fluid sources",
-        Some(Input::Key(KeyCode::KeyN)),
-    ),
-    (
         "engine:time_back",
         "Wind the sky back",
         Some(Input::Key(KeyCode::BracketLeft)),

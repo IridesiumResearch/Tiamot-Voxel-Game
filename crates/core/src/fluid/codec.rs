@@ -27,7 +27,7 @@ use super::{Fluid, FluidLayer};
 /// A chunk with no fluid in it. No payload follows.
 const TAG_EMPTY: u8 = 0;
 
-/// Runs of `(count: u16, value: u8)`, little-endian.
+/// Runs of `(count: u16, value: u16)`, little-endian.
 const TAG_RUNS: u8 = 1;
 
 /// Why a fluid payload would not decode.
@@ -62,16 +62,17 @@ pub enum FluidDecodeError {
         expected: usize,
     },
 
-    /// A byte that is not a value this build can represent.
+    /// A word that is not a value this build can represent.
     ///
-    /// A level of zero paired with a fluid id, or an id paired with no level,
-    /// are both writable as bytes and mean nothing — [`Fluid::EMPTY`] is the
-    /// only encoding of "nothing". Refusing them keeps one value per state,
+    /// A volume of zero paired with a fluid id, an id paired with no volume, a
+    /// volume above [`super::MAX_VOLUME`], or anything set in the seven spare
+    /// high bits — all writable and all meaningless, where [`Fluid::EMPTY`] is
+    /// the only encoding of "nothing". Refusing them keeps one value per state,
     /// which is what makes a hash of the layer mean something.
-    #[error("fluid byte {value} is not a state a block can be in")]
+    #[error("fluid word {value} is not a state a block can be in")]
     NotAState {
-        /// The byte that was rejected.
-        value: u8,
+        /// The word that was rejected.
+        value: u16,
     },
 }
 
@@ -95,12 +96,12 @@ pub fn encode(layer: &FluidLayer) -> Vec<u8> {
             continue;
         }
         out.extend_from_slice(&run.to_le_bytes());
-        out.push(current.0);
+        out.extend_from_slice(&current.0.to_le_bytes());
         current = value;
         run = 1;
     }
     out.extend_from_slice(&run.to_le_bytes());
-    out.push(current.0);
+    out.extend_from_slice(&current.0.to_le_bytes());
     out
 }
 
@@ -131,8 +132,11 @@ pub fn decode(bytes: &[u8]) -> Result<FluidLayer, FluidDecodeError> {
                     .get(offset..offset + 2)
                     .map(|pair| u16::from_le_bytes([pair[0], pair[1]]) as usize)
                     .ok_or(FluidDecodeError::Truncated)?;
-                let value = *rest.get(offset + 2).ok_or(FluidDecodeError::Truncated)?;
-                offset += 3;
+                let value = rest
+                    .get(offset + 2..offset + 4)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .ok_or(FluidDecodeError::Truncated)?;
+                offset += 4;
 
                 if count == 0 {
                     return Err(FluidDecodeError::EmptyRun);
@@ -161,17 +165,29 @@ pub fn decode(bytes: &[u8]) -> Result<FluidLayer, FluidDecodeError> {
     }
 }
 
-/// Reads one byte as a block state, refusing the ones that mean nothing.
-fn state(value: u8) -> Result<Fluid, FluidDecodeError> {
+/// Reads one word as a block state, refusing the ones that mean nothing.
+///
+/// **Charter rule 14: this is hostile input.** The word is wider than the states
+/// that fit in it, so most bit patterns are not states at all — a volume above
+/// [`super::MAX_VOLUME`], an id with no volume, a volume with no id, or anything
+/// in the seven spare high bits. Each is refused rather than clamped: a decoder
+/// that silently repaired a payload would let two clients disagree about a
+/// chunk they were both told was the same.
+fn state(value: u16) -> Result<Fluid, FluidDecodeError> {
     let fluid = Fluid(value);
     if fluid == Fluid::EMPTY {
         return Ok(Fluid::EMPTY);
     }
-    // Exactly one encoding of nothing, and a source is always at full level.
-    if fluid.fluid().is_none() || fluid.level() == 0 {
+    // Exactly one encoding of nothing.
+    if fluid.fluid().is_none() || fluid.volume() == 0 {
         return Err(FluidDecodeError::NotAState { value });
     }
-    if fluid.is_source() && fluid.level() != super::MAX_LEVEL {
+    if fluid.volume() > super::MAX_VOLUME {
+        return Err(FluidDecodeError::NotAState { value });
+    }
+    // The spare bits are spare, not ignored. A payload that sets one is from a
+    // build that means something by it, and this one does not know what.
+    if value >> 9 != 0 {
         return Err(FluidDecodeError::NotAState { value });
     }
     Ok(fluid)
@@ -179,7 +195,7 @@ fn state(value: u8) -> Result<Fluid, FluidDecodeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{FluidId, MAX_LEVEL};
+    use super::super::{FluidId, MAX_VOLUME};
     use super::*;
     use crate::coords::LocalBlock;
 
@@ -199,10 +215,10 @@ mod tests {
     fn a_puddle_round_trips() {
         let milk = FluidId(1);
         let mut layer = FluidLayer::empty();
-        layer.set(local(0, 0, 0), Fluid::source(milk));
-        layer.set(local(1, 0, 0), Fluid::flowing(milk, 6));
-        layer.set(local(2, 0, 0), Fluid::flowing(milk, 5));
-        layer.set(local(15, 15, 15), Fluid::flowing(milk, 1));
+        layer.set(local(0, 0, 0), Fluid::new(milk, MAX_VOLUME));
+        layer.set(local(1, 0, 0), Fluid::new(milk, 6));
+        layer.set(local(2, 0, 0), Fluid::new(milk, 5));
+        layer.set(local(15, 15, 15), Fluid::new(milk, 1));
 
         let decoded = decode(&encode(&layer)).expect("round trip");
         assert_eq!(decoded, layer);
@@ -210,12 +226,13 @@ mod tests {
 
     #[test]
     fn a_puddle_costs_a_handful_of_bytes() {
-        // The claim the module docs make. Three runs plus a tag.
+        // The claim the module docs make. Three runs plus a tag, at four bytes
+        // a run now that a state is a word rather than a byte.
         let milk = FluidId(1);
         let mut layer = FluidLayer::empty();
-        layer.set(local(0, 0, 0), Fluid::source(milk));
+        layer.set(local(0, 0, 0), Fluid::new(milk, MAX_VOLUME));
         assert!(
-            encode(&layer).len() <= 1 + 3 * 3,
+            encode(&layer).len() <= 1 + 3 * 4,
             "one block of milk encoded to {} bytes",
             encode(&layer).len()
         );
@@ -224,10 +241,12 @@ mod tests {
     #[test]
     fn a_full_chunk_round_trips() {
         let milk = FluidId(1);
-        let layer =
-            FluidLayer::from_blocks(std::iter::repeat_n(Fluid::source(milk), BLOCKS_PER_CHUNK));
+        let layer = FluidLayer::from_blocks(std::iter::repeat_n(
+            Fluid::new(milk, MAX_VOLUME),
+            BLOCKS_PER_CHUNK,
+        ));
         let encoded = encode(&layer);
-        assert_eq!(encoded.len(), 1 + 3, "a uniform chunk is one run");
+        assert_eq!(encoded.len(), 1 + 4, "a uniform chunk is one run");
         assert_eq!(decode(&encoded), Ok(layer));
     }
 
@@ -235,10 +254,16 @@ mod tests {
     fn hostile_payloads_are_refused_rather_than_allocated_for() {
         assert_eq!(decode(&[]), Err(FluidDecodeError::Empty));
         assert_eq!(decode(&[9]), Err(FluidDecodeError::UnknownTag { tag: 9 }));
+        // A run is `(count: u16, value: u16)`, so every prefix short of four
+        // bytes is truncated rather than a state.
         assert_eq!(decode(&[TAG_RUNS, 1]), Err(FluidDecodeError::Truncated));
         assert_eq!(decode(&[TAG_RUNS, 1, 0]), Err(FluidDecodeError::Truncated));
         assert_eq!(
-            decode(&[TAG_RUNS, 0, 0, 0]),
+            decode(&[TAG_RUNS, 1, 0, 0]),
+            Err(FluidDecodeError::Truncated)
+        );
+        assert_eq!(
+            decode(&[TAG_RUNS, 0, 0, 0, 0]),
             Err(FluidDecodeError::EmptyRun)
         );
 
@@ -247,7 +272,7 @@ mod tests {
         let mut runaway = vec![TAG_RUNS];
         for _ in 0..2 {
             runaway.extend_from_slice(&u16::MAX.to_le_bytes());
-            runaway.push(0);
+            runaway.extend_from_slice(&0u16.to_le_bytes());
         }
         assert!(matches!(
             decode(&runaway),
@@ -282,8 +307,8 @@ mod tests {
             })
         );
         // And the reachable ones are accepted.
-        assert!(state(Fluid::source(FluidId(1)).0).is_ok());
-        assert!(state(Fluid::flowing(FluidId(1), MAX_LEVEL).0).is_ok());
+        assert!(state(Fluid::new(FluidId(1), MAX_VOLUME).0).is_ok());
+        assert!(state(Fluid::new(FluidId(1), MAX_VOLUME).0).is_ok());
         assert!(state(Fluid::EMPTY.0).is_ok());
     }
 
@@ -291,7 +316,7 @@ mod tests {
     fn a_short_payload_is_a_length_error_rather_than_a_short_layer() {
         let mut short = vec![TAG_RUNS];
         short.extend_from_slice(&1u16.to_le_bytes());
-        short.push(0);
+        short.extend_from_slice(&0u16.to_le_bytes());
         assert!(matches!(
             decode(&short),
             Err(FluidDecodeError::WrongLength { covered: 1, .. })

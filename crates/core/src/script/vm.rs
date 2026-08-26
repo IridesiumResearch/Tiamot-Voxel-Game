@@ -354,12 +354,6 @@ pub struct FluidRules {
     /// mod give its fluid a texture without the engine growing a second,
     /// nearly-identical texture path.
     pub material: String,
-    /// How far a source spreads sideways on flat ground, in blocks.
-    ///
-    /// Capped at [`crate::fluid::MAX_LEVEL`], because the level IS the distance
-    /// travelled and there are only seven of them. A shorter range is a fluid
-    /// that thins out faster.
-    pub flow_range: u8,
     /// How full a block must be before this fluid treats it as floor, in cells
     /// of 27.
     ///
@@ -374,29 +368,25 @@ pub struct FluidRules {
     /// proportionally less to simulate — which is a real lever for a mod adding
     /// a fluid it expects to cover a lot of world.
     pub tick_rate: u8,
-    /// How many neighbouring sources make a block a source of its own.
+    /// One in how many fluid ticks an exposed block loses a cell, or zero.
     ///
-    /// Zero — the default — never renews, and a source is a thing that exists
-    /// exactly once. Three is "sources on all but one side", which is what
-    /// stops an ocean collapsing when somebody takes a bucket out of the
-    /// middle of it. See `fluid::Tuning::renews_from`.
-    pub renews_from: u8,
+    /// A declared sink (Sub-Node Contract §4.3), and zero — the default —
+    /// never evaporates. Only a block open to the air above loses anything, so
+    /// a wide shallow pool goes before a deep narrow one.
+    pub evaporates: u32,
     /// What being inside it looks like, sRGB `0..=255`.
     pub color: [u8; 3],
 }
 
 impl FluidRules {
-    /// How far a fluid spreads if its mod said nothing.
-    pub const DEFAULT_FLOW_RANGE: u8 = crate::fluid::MAX_LEVEL;
-
     /// How often a fluid updates if its mod said nothing.
     pub const DEFAULT_TICK_RATE: u8 = 1;
 
     /// How full a block must be to be floor, if its mod said nothing.
     pub const DEFAULT_WATERLOGS_AT: u32 = 14;
 
-    /// Whether a fluid renews, if its mod said nothing. It does not.
-    pub const DEFAULT_RENEWS_FROM: u8 = 0;
+    /// Whether a fluid evaporates, if its mod said nothing. It does not.
+    pub const DEFAULT_EVAPORATES: u32 = 0;
 
     /// What a fluid looks like from inside, if its mod said nothing.
     ///
@@ -744,8 +734,8 @@ pub struct FluidFlowEvent {
     pub into: BlockPos,
     /// Which fluid, by its registered string id.
     pub fluid: String,
-    /// What level it is pressing at, `1..=7`.
-    pub level: u8,
+    /// How much it is pressing with, in cells of 27.
+    pub volume: u32,
     /// The material of the block in the way.
     ///
     /// A **runtime** id, resolved to its string before it reaches Lua — charter

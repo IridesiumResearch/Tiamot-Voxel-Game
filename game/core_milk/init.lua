@@ -31,30 +31,20 @@ game.register_block{
 game.register_fluid{
     id = "milk",
     material = "milk",
-    -- The full seven. Milk spreads as far as the engine can express, because a
-    -- reference implementation should exercise the ceiling rather than sit
-    -- comfortably below it — a flow_range of 3 would never catch an off-by-one
-    -- at the limit.
-    flow_range = 7,
     -- Every third fluid tick, so a spring runs at about 3 Hz rather than 10.
     -- Reported from the window as spreading "about 3x the speed I would hope
     -- for", which is a mod's opinion to hold and this is where it belongs —
     -- the engine's rate is 10 Hz and stays that way for anything that wants it.
     tick_rate = 3,
-    -- **Sources on all but one side make a source.** Without this a source is a
-    -- thing that exists exactly once: scoop one out of the middle of a lake and
-    -- the hole fills with flow, which drains the moment its parent goes, and
-    -- the lake is permanently one block of source poorer. Do that along a
-    -- shoreline and the whole body of water is flow hanging off a shrinking
-    -- core — an ocean that collapses because somebody filled a bucket.
+    -- **Milk does not evaporate.** A declared sink is the engine's mechanism
+    -- and whether to use it is this mod's opinion (charter rule 1): a puddle
+    -- that dries out is right for water in the sun and wrong for milk on a
+    -- floor, and a reference fixture that quietly destroyed what a test poured
+    -- would make every conservation assertion flaky rather than wrong.
     --
-    -- Three rather than the two Minecraft asks for, deliberately. At two, any
-    -- 2x2 pool is an infinite well and a bucket is a way to MAKE ocean; at
-    -- three the rule only heals water that was already there.
-    --
-    -- The engine defaults this to zero and does not have an opinion — creating
-    -- matter out of nothing is game design, and charter rule 1 puts that here.
-    renews_from = 3,
+    -- A mod that wants a drying world sets this to how many fluid ticks a cell
+    -- lasts on average, counted only for blocks open to the air.
+    evaporates = 0,
     -- What the world looks like from inside it. Milk, so a warm white rather
     -- than a pure one — pure white reads as fog or as a broken frame, and the
     -- point of being under milk is that you can tell.
@@ -126,9 +116,10 @@ game.register_on_fluid_flow(function(event)
         return
     end
 
-    -- A trickle does not soak a sponge. `level` is what the milk is pressing
-    -- at, 1 to 7, so this is the mod's own threshold and not the engine's.
-    if event.level < 3 then
+    -- A trickle does not soak a sponge. `volume` is what the milk is pressing
+    -- with, in cells of 27, so this is the mod's own threshold and not the
+    -- engine's — a third of a block.
+    if event.volume < 9 then
         return
     end
 
@@ -143,6 +134,26 @@ end)
 -- what a player is looking for when they are trying to find the source.
 game.register_sound{ id = "pour", file = "sounds/pour.wav", gain = 0.8, pitch_variance = 0.15 }
 
+-- **The known wart, and it is content rather than a mechanism.**
+--
+-- This mod has no bucket ITEM: the milk material is both the thing carried and
+-- the thing poured, so the hook only fires while the player is holding some. A
+-- player who pours their very last drop is left with an empty hand and no way
+-- to click the puddle back up.
+--
+-- A real game mod fixes this with a container — an item that persists whether
+-- it is full or empty, the way a bucket does — and that is a design decision
+-- about a game rather than a gap in the engine (charter rule 1). A reference
+-- fixture proving the mechanism does not need one, and inventing one here would
+-- be this file quietly becoming a game.
+--
+-- How much a bucket carries, in cells of 27 — one whole block's worth.
+--
+-- Charter rule 5's own unit, so a bucket is not a second quantity: it is
+-- twenty-seven units of the milk material, held in the inventory exactly like
+-- twenty-seven units of stone.
+local BUCKET = 27
+
 game.register_on_place(function(event)
     if event.material ~= MILK then
         -- Somebody placing an ordinary block. Nothing to do with us; returning
@@ -153,34 +164,43 @@ game.register_on_place(function(event)
 
     local at = { x = event.x, y = event.y, z = event.z }
     local there = game.get_fluid(at)
-    -- **A SOURCE is what a bucket takes back, not any milk at all.**
+
+    -- **Partial buckets, and they cost nothing to have.**
     --
-    -- Reported from a running game: "I do not seem to be able to place a water
-    -- source inside flowing water — I should be able to right click on the
-    -- block behind the flowing water and place another source right inside the
-    -- current puddle." Quite so, and the reason it did not work was here rather
-    -- than in the engine: this used to scoop whenever the block held anything,
-    -- so pouring into a spreading puddle emptied that one block instead of
-    -- feeding it — and the puddle immediately refilled from the original
-    -- source, so it read as the click doing nothing at all.
+    -- Under a conserved fluid a bucket is a MEASUREMENT rather than a switch,
+    -- so scooping half a puddle has to give back half a bucket. Charter rule 5
+    -- already makes that expressible without a new concept: milk in the
+    -- inventory is units of a material like anything else, so "a bucket" is
+    -- just 27 of them and "half a bucket" is 13.
     --
-    -- Flow is milk that is only passing through. Pouring into it leaves a
-    -- second spring in the middle of the pool, which is what a bucket should
-    -- do and what widening a pool requires.
-    if there.source then
-        -- Clearing the source is what makes the rest drain: every flow block
-        -- downstream loses its parent and empties a level per fluid tick, which
-        -- is the behaviour most worth being able to watch happen.
-        game.set_fluid(at, { level = 0 })
-        game.log("scooped milk at " .. at.x .. "," .. at.y .. "," .. at.z)
+    -- The alternative the design considered was Minecraft's — top the bucket up
+    -- out of neighbouring blocks until it is full — and it was rejected because
+    -- it makes scooping one block drain water the player never pointed at.
+    if there.volume > 0 then
+        -- Take exactly what is in THIS block. Nothing is pulled out of its
+        -- neighbours, so what the player scooped is what they were looking at.
+        game.give(event.player, { material = "core_milk:milk", units = there.volume })
+        game.set_fluid(at, { volume = 0 })
+        game.log("scooped " .. there.volume .. " cells at " .. at.x .. "," .. at.y .. "," .. at.z)
     else
-        game.set_fluid(at, { fluid = "core_milk:milk", source = true })
-        game.play_sound{
-            sound = "pour",
-            pos = { x = at.x + 0.5, y = at.y + 0.5, z = at.z + 0.5 },
-            radius = 28,
-        }
-        game.log("poured milk at " .. at.x .. "," .. at.y .. "," .. at.z)
+        -- **Charged here, by this mod, and that is not an oversight.** A hook
+        -- that cancels a placement is not charged by the engine — see the
+        -- `verdict.allowed` path in the server's placement loop — so the mod
+        -- that decided what the click meant is the one that pays for it.
+        --
+        -- `game.take` reports what it actually got, which is how a player
+        -- carrying thirteen units pours thirteen cells rather than being
+        -- refused for not having a full bucket.
+        local got = game.take(event.player, { material = "core_milk:milk", units = BUCKET })
+        if got > 0 then
+            game.set_fluid(at, { fluid = "core_milk:milk", volume = got })
+            game.play_sound{
+                sound = "pour",
+                pos = { x = at.x + 0.5, y = at.y + 0.5, z = at.z + 0.5 },
+                radius = 28,
+            }
+            game.log("poured " .. got .. " cells at " .. at.x .. "," .. at.y .. "," .. at.z)
+        end
     end
 
     -- Cancel the terrain write. The block was only ever a way of naming what to

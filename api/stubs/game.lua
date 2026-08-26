@@ -1041,10 +1041,10 @@ function game.find_path(from, to, options) end
 ---@class Tiamot.FluidSpec
 ---@field id string Unqualified id. `"milk"` from mod `core_milk` becomes `"core_milk:milk"`.
 ---@field material string The registered block a full block of it is drawn as. REQUIRED — a fluid with no material cannot be drawn, and the engine does not get to decide what your fluid looks like (charter rule 1). Qualified against your own mod, so a fluid can name its own block.
----@field flow_range? integer How far a source spreads sideways on flat ground, in blocks. 1..=7, default 7. The level a block holds IS how far the fluid has travelled, which is why seven is the ceiling — a shorter range is a fluid that thins out faster.
 ---@field tick_rate? integer Simulation ticks between updates. Default 1, which is every fluid tick (10 Hz). Larger is slower and more viscous, and costs proportionally less to simulate.
 ---@field color? { r: integer, g: integer, b: integer } What the world looks like from INSIDE the fluid — the tint and fog a submerged camera sees. Channels are 0..=255 and default to white. Deliberately not derived from `material`: a texture is what the surface looks like from outside, and clear water has a vivid surface with a faint tint. The engine has no opinion about either.
----@field renews_from? integer How many of the four lateral neighbours must be sources before a block becomes a source itself. 0..=4, default 0, which never renews. Set it to 3 for water that behaves like an ocean: without renewal a source exists exactly once, so scooping one out of the middle of a lake leaves flow that drains away, and a body of water collapses as people fill buckets from it. Three rather than Minecraft's two on purpose — at two, any 2x2 pool is an infinite well. **This creates matter out of nothing, which is why the engine defaults it off and leaves the decision to you.**
+---@field waterlogs_at? integer How full of terrain a block must be before this fluid treats it as floor, in cells of 27. Default 14 — over half. Below it the block is more air than anything and the fluid runs through; at or above it the block holds the fluid up and a mod can swap it for a waterlogged one from `register_on_fluid_flow`. Set it to 1 for the blocky rule where a single chiselled cell makes a block waterproof.
+---@field evaporates? integer One in how many fluid ticks a block open to the air loses a cell. Default 0, which never evaporates. **This destroys matter**, which is why the engine defaults it off and leaves the decision to you — a wide shallow pool goes before a deep narrow one, because more of it is exposed.
 
 ---Registers a fluid.
 ---
@@ -1053,23 +1053,30 @@ function game.find_path(from, to, options) end
 ---like hurting you or making a sound, is yours and needs no engine support
 ---beyond the hooks that already exist.
 ---
----Fluid is BLOCK resolution, not sub-node. A block holds fluid only if it is
----entirely empty — Sub-Node Contract §4 — so there is no such thing as a
----partially flooded chiselled block, and you do not have to think about one.
+Fluid is BLOCK resolution, not sub-node: one volume per block, never a
+---per-cell mask (Sub-Node Contract §4). What the lattice IS consulted for is how
+---much fits — a block one third full of stone holds one third less — so you
+---never have to think about a partially flooded chiselled block, only about how
+---much room one has left.
+---
+---**Fluid is conserved.** Volume moves between blocks and is never created;
+---there are no source blocks, because an infinite spring is a conservation
+---violation by definition. A bucket is a measurement.
 ---
 ---```lua
 ---game.register_block{ id = "milk", texture = "milk.png" }
----game.register_fluid{ id = "milk", material = "milk", flow_range = 7 }
+---game.register_fluid{ id = "milk", material = "milk" }
 ---```
 ---@param spec Tiamot.FluidSpec
 function game.register_fluid(spec) end
 
 ---What a block holds.
 ---
----`level` is 0..7, where 7 is a source or a block directly fed by one and each
----block of lateral travel costs one. `source` says the block sustains itself
----rather than draining — the two differ, and that difference is what makes a
----channel empty when you take its spring away.
+---`volume` is how much is in it, in CELLS of 27 — the same unit inventory
+---quantities use (charter rule 5), so a puddle and a bucketful are two numbers
+---you can compare directly. A whole block is 27.
+---
+---There is no `source`: fluid is conserved and nothing sustains itself.
 ---
 ---Coordinates are BLOCKS. A dig event gives you cells — divide by three.
 ---
@@ -1078,12 +1085,12 @@ function game.register_fluid(spec) end
 ---
 ---```lua
 ---local here = game.get_fluid{ x = 10, y = 64, z = -3 }
----if not here.empty and here.level > 4 then
----    -- deep enough to swim in
+---if not here.empty and here.volume > 18 then
+---    -- two thirds of a block; deep enough to swim in
 ---end
 ---```
 ---@param position { x: integer, y: integer, z: integer }
----@return { level: integer, source: boolean, empty: boolean }
+---@return { volume: integer, empty: boolean }
 function game.get_fluid(position) end
 
 ---Puts fluid in a block, or takes it away.
@@ -1092,16 +1099,20 @@ function game.get_fluid(position) end
 ---is not refused: the next fluid tick clears it, which is the same answer the
 ---engine gives when a player builds in a pond. One rule rather than two.
 ---
----`level = 0` clears the block whatever `fluid` names. `source = true` places a
----spring, which sustains itself until something removes it; anything else
----places flowing fluid that drains once nothing is feeding it.
+---`volume` is in cells of 27 and defaults to a whole block. `volume = 0` clears
+---the block whatever `fluid` names.
+---
+---**This writes rather than pours**, so it does not conserve anything on its
+---own: it is how a mod puts fluid into the world in the first place, and what a
+---mod takes out is its own to account for. `game.give` and `game.take` are how
+---a bucket balances the books.
 ---
 ---```lua
----game.set_fluid({ x = 10, y = 64, z = -3 }, { fluid = "core_milk:milk", source = true })
----game.set_fluid({ x = 10, y = 64, z = -3 }, { level = 0 })  -- scoop it up
+---game.set_fluid({ x = 10, y = 64, z = -3 }, { fluid = "core_milk:milk", volume = 27 })
+---game.set_fluid({ x = 10, y = 64, z = -3 }, { volume = 0 })  -- scoop it up
 ---```
 ---@param position { x: integer, y: integer, z: integer }
----@param spec { fluid: string, level?: integer, source?: boolean }
+---@param spec { fluid: string, volume?: integer }
 ---@return boolean changed
 function game.set_fluid(position, spec) end
 
@@ -1244,7 +1255,7 @@ function game.register_on_punch(callback) end
 ---@field from { x: integer, y: integer, z: integer } The block the fluid is in.
 ---@field into { x: integer, y: integer, z: integer } The block it could not enter.
 ---@field fluid string The fluid's registered id, e.g. `"core:milk"`.
----@field level integer What level it is pressing at, 1 to 7.
+---@field volume integer How much it is pressing with, in cells of 27.
 ---@field block string? The blocking block's id, or nil if nothing registered it.
 ---@field occupancy integer 27-bit mask of which of the blocking block's sub-nodes are filled.
 ---@field units integer How many of the 27 are filled — `occupancy`'s popcount.

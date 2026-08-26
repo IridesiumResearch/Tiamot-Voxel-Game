@@ -201,23 +201,22 @@ pub fn fluid_at(solid: &impl Solid, point: [f32; 3]) -> FluidId {
 ///
 /// # The rule that has to match the renderer exactly
 ///
-/// Contract §4 makes a brim-full block 24 of 27 units, so that a pond has a
-/// visible surface below the block above it. **A block with fluid above it has
-/// no surface**, and is full to all 27 — the client's mesher says so in
-/// `ChunkFluid::fill` ("a block with fluid above it is FULL, whatever its own
-/// level says"), and without the same rule here a body would float at a level
-/// the milk is not drawn at.
+/// Contract §4.4: a block's fluid stands at its volume, in cells of 27, and **a
+/// block with fluid above it has no surface** — it is full to all 27 whatever
+/// its own volume says. The client's mesher says the same thing in
+/// `ChunkFluid::fill`, and without the same rule here a body would float at a
+/// level the milk is not drawn at.
 ///
-/// The interior of a pond would otherwise be 11% air by volume: every block in a
-/// submerged column stopping a third of a cell short of the one above it, for a
-/// buoyancy weaker than the constants say and a body that sinks fractionally
-/// through each block boundary it passes. The renderer had this bug first and
-/// fixed it; the physics does not get to rediscover it.
+/// The interior of a pond would otherwise be air by the fraction each block was
+/// short: every block in a submerged column stopping below the one above it,
+/// for a buoyancy weaker than the constants say and a body that sinks
+/// fractionally through each block boundary it passes. The renderer had this
+/// bug first and fixed it; the physics does not get to rediscover it.
 fn surface_height(solid: &impl Solid, x: i32, y: i32, z: i32, fluid: crate::fluid::Fluid) -> f32 {
     if !solid.fluid(x, y + 1, z).is_empty() {
         return CELLS_PER_BLOCK;
     }
-    fluid.depth_units() as f32 / UNITS_PER_CELL
+    fluid.volume() as f32 / UNITS_PER_CELL
 }
 
 /// Whether the top of a box is out of the fluid.
@@ -370,7 +369,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::fluid::{Fluid, MAX_LEVEL};
+    use crate::fluid::{Fluid, MAX_VOLUME};
     use crate::phys::{Body, EYE_HEIGHT, Gait, Intent, PLAYER_HEIGHT, Tuning, step};
 
     const MILK: FluidId = FluidId(1);
@@ -391,7 +390,7 @@ mod tests {
         const fn new(depth: i32) -> Self {
             Self {
                 depth,
-                level: MAX_LEVEL,
+                level: MAX_VOLUME as u8,
                 fluid: MILK,
             }
         }
@@ -409,7 +408,7 @@ mod tests {
 
         fn fluid(&self, _x: i32, y: i32, _z: i32) -> Fluid {
             if y >= 0 && y < self.depth {
-                Fluid::flowing(self.fluid, self.level)
+                Fluid::new(self.fluid, u32::from(self.level))
             } else {
                 Fluid::EMPTY
             }
@@ -490,13 +489,17 @@ mod tests {
     }
 
     #[test]
-    fn a_submerged_block_is_full_to_the_brim_and_the_top_one_is_not() {
+    fn a_full_block_is_full_and_a_part_filled_one_stops_at_its_volume() {
         // **The rule that has to match the renderer**, asserted as the number
-        // rather than as a behaviour: Contract §4 makes a full block 24 of 27
-        // so a pond shows a surface, and `ChunkFluid::fill` overrides that to 27
-        // for a block with fluid above it. A physics that skipped the override
-        // would leave a third of a cell of air at every block boundary inside a
-        // pond — invisible, and worth 11% of the buoyancy.
+        // rather than as a behaviour: Contract §4.4 puts the surface at
+        // `volume / 27`, and a block with fluid above it is full whatever its
+        // own volume says.
+        //
+        // This used to assert the opposite of its first half — a brim-full
+        // block stopped at 24 of 27 so that a pond showed a surface under the
+        // block above it. That was a hack for a waterfall reading as a solid
+        // column, and conservation retired it: falling milk is thin because it
+        // genuinely holds few cells, not because the renderer was told to lie.
         let pool = Pool::new(3);
 
         // A one-cell-tall probe inside the lower block, entirely in the region
@@ -510,28 +513,41 @@ mod tests {
             "the top of a submerged block read dry, so the pond has gaps in it"
         );
 
-        // And the same probe under the top block's surface, which does stop
-        // short: block 2 spans cells 6..9 and level 7 fills 24/27 = 2.67 of it.
+        // And the same probe in the TOP block, which is also full: 27 cells is
+        // the whole block, so a brim-full pond reaches the top of it.
         let surface = Aabb {
             min: [24.0, 8.7, 24.0],
             max: [24.5, 8.95, 24.5],
         };
+        assert!(
+            submersion(&pool, &surface).fraction > 0.99,
+            "a brim-full top block read dry at the brim"
+        );
+
+        // A block holding a third of its volume stops a third of the way up.
+        // Block 0 spans cells 0..3, so nine cells of 27 is one cell deep and
+        // anything above that is out of the milk.
+        let shallow = Pool::new(1).at_level(9);
+        let dry = Aabb {
+            min: [24.0, 1.2, 24.0],
+            max: [24.5, 1.4, 24.5],
+        };
         assert_eq!(
-            submersion(&pool, &surface),
+            submersion(&shallow, &dry),
             Submersion::DRY,
-            "a brim-full top block flooded past the surface the mesher draws"
+            "a third-full block wet a probe above its surface"
         );
     }
 
     #[test]
     fn a_shallow_puddle_wets_only_the_part_of_the_box_inside_it() {
-        // Known answer. One block of milk at level 7 is 24/27 = 2.667 cells
-        // deep with nothing above it; a player box is 5.4 cells tall, so a body
-        // standing in it is 2.667/5.4 submerged and no more.
+        // Known answer. One full block of milk is 27/27 = 3 cells deep
+        // (Contract §4.4); a player box is 5.4 cells tall, so a body standing
+        // in it is 3/5.4 submerged and no more.
         let pool = Pool::new(1);
         let wet = submersion(&pool, &Body::at([24.0, 0.0, 24.0]).aabb());
 
-        let expected = (24.0 / 9.0) / PLAYER_HEIGHT;
+        let expected = (27.0 / 9.0) / PLAYER_HEIGHT;
         assert!(
             (wet.fraction - expected).abs() < 1e-4,
             "read {} rather than {expected}",
@@ -544,8 +560,8 @@ mod tests {
     fn a_lower_level_is_a_shallower_puddle() {
         // Monotone, which is what makes wading feel graded rather than stepped.
         let mut last = 0.0;
-        for level in 1..=MAX_LEVEL {
-            let pool = Pool::new(1).at_level(level);
+        for level in 1..=MAX_VOLUME {
+            let pool = Pool::new(1).at_level(level as u8);
             let wet = submersion(&pool, &Body::at([24.0, 0.0, 24.0]).aabb()).fraction;
             assert!(
                 wet > last,
@@ -657,7 +673,7 @@ mod tests {
                 // Blocks are three cells; the water occupies block y 0..4,
                 // which is cells 0..12, west of the bank.
                 if x < 0 && (0..4).contains(&y) {
-                    Fluid::flowing(MILK, MAX_LEVEL)
+                    Fluid::new(MILK, MAX_VOLUME)
                 } else {
                     Fluid::EMPTY
                 }
@@ -869,8 +885,8 @@ mod tests {
             fn fluid(&self, _x: i32, y: i32, _z: i32) -> Fluid {
                 match y {
                     // Oil in the bottom block, milk in the three above it.
-                    0 => Fluid::flowing(OIL, MAX_LEVEL),
-                    1..=3 => Fluid::flowing(MILK, MAX_LEVEL),
+                    0 => Fluid::new(OIL, MAX_VOLUME),
+                    1..=3 => Fluid::new(MILK, MAX_VOLUME),
                     _ => Fluid::EMPTY,
                 }
             }
@@ -903,12 +919,12 @@ mod tests {
         #[test]
         fn the_fraction_is_always_a_fraction_and_never_a_nan(
             depth in 0i32..6,
-            level in 1u8..=MAX_LEVEL,
+            level in 1u32..=MAX_VOLUME,
             height in -2.0f32..20.0,
         ) {
             // Whatever the scene, the answer is a fraction of a box: in `0..=1`,
             // finite, and zero exactly when nothing wet overlaps.
-            let pool = Pool::new(depth).at_level(level);
+            let pool = Pool::new(depth).at_level(level as u8);
             let wet = submersion(&pool, &Body::at([24.0, height, 24.0]).aabb());
 
             prop_assert!(wet.fraction.is_finite(), "not finite: {}", wet.fraction);

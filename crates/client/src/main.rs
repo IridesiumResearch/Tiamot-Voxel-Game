@@ -721,13 +721,6 @@ impl Client {
                         let on = app.toggle_chunk_borders();
                         tracing::info!(on, "chunk borders");
                     }
-                    // Temporary, for tracking sources: a source and a full flow
-                    // block look identical, so from inside a pond there is no
-                    // telling which block is feeding it.
-                    "engine:fluid_sources" if pressed => {
-                        let on = app.toggle_fluid_sources();
-                        tracing::info!(on, "fluid source outlines");
-                    }
                     // A twentieth of a day a press, so a full circuit is twenty
                     // presses and dawn is findable.
                     "engine:time_back" | "engine:time_back_alt" if pressed => {

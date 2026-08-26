@@ -858,7 +858,7 @@ mod tests {
         // one domain and a load that used another, say. Only running them
         // against each other catches that.
         use crate::fluid::Fluidics;
-        use tiamot_core::fluid::{Fluid, FluidId, Fluids};
+        use tiamot_core::fluid::{Fluid, FluidId, Fluids, MAX_VOLUME};
 
         let milk = FluidId(1);
         let pond = BlockPos::new(20, 5, -9);
@@ -867,7 +867,7 @@ mod tests {
         {
             let (mut world, _) = world("fluid-round-trip");
             let mut fluidics = Fluidics::new(Fluids::new());
-            fluidics.set(pond, Fluid::source(milk));
+            fluidics.set(pond, Fluid::new(milk, MAX_VOLUME));
 
             let dirty = fluidics.take_dirty();
             assert_eq!(dirty.len(), 1, "the pour did not mark its chunk");
@@ -894,7 +894,7 @@ mod tests {
 
         assert!(fluidics.knows(chunk));
         assert!(
-            fluidics.at(pond).is_source(),
+            fluidics.at(pond).volume() == MAX_VOLUME,
             "the pond came back as {:?} rather than a source, so it would drain \
              away a few ticks after the world loaded",
             fluidics.at(pond)
@@ -911,7 +911,7 @@ mod tests {
         // layer emptied is dropped from memory, so a dirty list that followed
         // the layer would never write the removal and the milk would come back.
         use crate::fluid::Fluidics;
-        use tiamot_core::fluid::{Fluid, FluidId, Fluids};
+        use tiamot_core::fluid::{Fluid, FluidId, Fluids, MAX_VOLUME};
 
         let pond = BlockPos::new(3, 3, 3);
         let chunk = pond.chunk();
@@ -920,7 +920,7 @@ mod tests {
             let (mut world, _) = world("fluid-drain-round-trip");
             let mut fluidics = Fluidics::new(Fluids::new());
 
-            fluidics.set(pond, Fluid::source(FluidId(1)));
+            fluidics.set(pond, Fluid::new(FluidId(1), MAX_VOLUME));
             let dirty = fluidics.take_dirty();
             world
                 .save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))

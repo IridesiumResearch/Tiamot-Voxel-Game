@@ -154,7 +154,7 @@ fn a_batch_save_writes_every_chunk() {
 
 #[test]
 fn a_pond_survives_a_round_trip_through_the_database() {
-    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer, MAX_LEVEL};
+    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer, MAX_VOLUME};
 
     let mut registry = registry_with(&[]);
     let db = WorldDb::open_in_memory(&mut registry).expect("open");
@@ -162,20 +162,21 @@ fn a_pond_survives_a_round_trip_through_the_database() {
     let milk = FluidId(1);
 
     let mut layer = FluidLayer::empty();
-    layer.set(LocalBlock::new(3, 0, 3), Fluid::source(milk));
-    layer.set(LocalBlock::new(4, 0, 3), Fluid::flowing(milk, MAX_LEVEL));
-    layer.set(LocalBlock::new(5, 0, 3), Fluid::flowing(milk, 2));
+    layer.set(LocalBlock::new(3, 0, 3), Fluid::new(milk, MAX_VOLUME));
+    layer.set(LocalBlock::new(4, 0, 3), Fluid::new(milk, 13));
+    layer.set(LocalBlock::new(5, 0, 3), Fluid::new(milk, 2));
 
     db.save_chunk_fluid(pos, &layer).expect("save");
     let loaded = db.load_chunk_fluid(pos).expect("load").expect("present");
 
     assert_eq!(loaded, layer);
-    // Every distinction the byte carries, not just "there is milk": a source
-    // that came back as a full flow block would drain, and the pond would be
-    // gone a few ticks after the world loaded.
-    assert!(loaded.get(LocalBlock::new(3, 0, 3)).is_source());
-    assert!(!loaded.get(LocalBlock::new(4, 0, 3)).is_source());
-    assert_eq!(loaded.get(LocalBlock::new(5, 0, 3)).level(), 2);
+    // Every distinction the word carries, not just "there is milk". Volume is
+    // conserved, so a block that came back holding a different amount than it
+    // was saved with is a conservation failure that survived a restart — the
+    // hardest kind to find, because nothing in the running world did it.
+    assert_eq!(loaded.get(LocalBlock::new(3, 0, 3)).volume(), MAX_VOLUME);
+    assert_eq!(loaded.get(LocalBlock::new(4, 0, 3)).volume(), 13);
+    assert_eq!(loaded.get(LocalBlock::new(5, 0, 3)).volume(), 2);
 }
 
 #[test]
@@ -197,14 +198,14 @@ fn a_pond_that_drains_does_not_come_back() {
     // the second save upserted an empty layer instead of deleting the row, or
     // skipped the write because there was nothing to write, the milk would
     // reappear the next time the chunk loaded.
-    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer};
+    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer, MAX_VOLUME};
 
     let mut registry = registry_with(&[]);
     let db = WorldDb::open_in_memory(&mut registry).expect("open");
     let pos = ChunkPos::new(1, 1, 1);
 
     let mut layer = FluidLayer::empty();
-    layer.set(LocalBlock::new(0, 0, 0), Fluid::source(FluidId(1)));
+    layer.set(LocalBlock::new(0, 0, 0), Fluid::new(FluidId(1), MAX_VOLUME));
     db.save_chunk_fluid(pos, &layer).expect("save the pond");
     assert!(db.load_chunk_fluid(pos).expect("load").is_some());
 
@@ -220,7 +221,7 @@ fn a_pond_that_drains_does_not_come_back() {
 
 #[test]
 fn a_fluid_batch_writes_the_ponds_and_removes_the_drains_together() {
-    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer};
+    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer, MAX_VOLUME};
 
     let mut registry = registry_with(&[]);
     let mut db = WorldDb::open_in_memory(&mut registry).expect("open");
@@ -228,7 +229,7 @@ fn a_fluid_batch_writes_the_ponds_and_removes_the_drains_together() {
 
     // Sixteen chunks with milk, saved first so there is something to remove.
     let mut wet = FluidLayer::empty();
-    wet.set(LocalBlock::new(2, 2, 2), Fluid::source(milk));
+    wet.set(LocalBlock::new(2, 2, 2), Fluid::new(milk, MAX_VOLUME));
     let positions: Vec<ChunkPos> = (0..16).map(|i| ChunkPos::new(i, 0, 0)).collect();
     let written = db
         .save_chunk_fluid_batch(positions.iter().map(|pos| (*pos, &wet)))
@@ -264,7 +265,7 @@ fn terrain_and_fluid_are_independent_rows() {
     // A chunk can hold milk with no terrain edits and terrain edits with no
     // milk, and neither save may disturb the other — which is the property that
     // makes them separate tables rather than one blob.
-    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer};
+    use tiamot_core::fluid::{Fluid, FluidId, FluidLayer, MAX_VOLUME};
 
     let mut registry = registry_with(&["core:stone"]);
     let db = WorldDb::open_in_memory(&mut registry).expect("open");
@@ -272,7 +273,7 @@ fn terrain_and_fluid_are_independent_rows() {
     let pos = ChunkPos::new(7, 7, 7);
 
     let mut layer = FluidLayer::empty();
-    layer.set(LocalBlock::new(1, 1, 1), Fluid::source(FluidId(1)));
+    layer.set(LocalBlock::new(1, 1, 1), Fluid::new(FluidId(1), MAX_VOLUME));
     db.save_chunk_fluid(pos, &layer).expect("fluid");
     db.save_chunk(pos, &Chunk::new(pos, stone))
         .expect("terrain");
@@ -302,10 +303,9 @@ fn terrain_and_fluid_are_independent_rows() {
 fn fluid_named(name: &str) -> tiamot_core::fluid::Registered {
     tiamot_core::fluid::Registered {
         name: name.to_owned(),
-        flow_range: 7,
         waterlogs_at: 14,
         tick_rate: 1,
-        renews_from: 0,
+        evaporates: 0,
         color: [255, 255, 255],
         material: MaterialId(4),
     }
@@ -321,7 +321,7 @@ fn a_pond_is_still_milk_after_another_mod_loads_ahead_of_it() {
     // after it — and the renumbering went straight to disk, so every stored pond
     // silently became a different fluid. The byte stays perfectly valid, which
     // is what makes it the kind of bug nobody finds by looking.
-    use tiamot_core::fluid::{Fluid, FluidLayer, Fluids};
+    use tiamot_core::fluid::{Fluid, FluidLayer, Fluids, MAX_VOLUME};
 
     let path = scratch("fluid-ids-reordered");
     let pos = ChunkPos::new(1, 0, 2);
@@ -337,7 +337,7 @@ fn a_pond_is_still_milk_after_another_mod_loads_ahead_of_it() {
 
         let milk = fluids.id_of("core_milk:milk").expect("registered");
         let mut layer = FluidLayer::empty();
-        layer.set(block, Fluid::source(milk));
+        layer.set(block, Fluid::new(milk, MAX_VOLUME));
         db.save_chunk_fluid(pos, &layer).expect("save");
     }
 
@@ -372,9 +372,10 @@ fn a_pond_is_still_milk_after_another_mod_loads_ahead_of_it() {
             .map(|entry| entry.name.as_str())
             .unwrap_or("nothing at all")
     );
-    assert!(
-        value.is_source(),
-        "the pond came back as a flow block, so it would drain away"
+    assert_eq!(
+        value.volume(),
+        MAX_VOLUME,
+        "the pond came back holding less than it was saved with"
     );
 }
 
@@ -399,7 +400,7 @@ fn a_pond_whose_mod_was_removed_survives_and_comes_back() {
 
         let acid = fluids.id_of("acid:acid").expect("registered");
         let mut layer = FluidLayer::empty();
-        layer.set(block, Fluid::flowing(acid, 5));
+        layer.set(block, Fluid::new(acid, 5));
         db.save_chunk_fluid(pos, &layer).expect("save");
     }
 
@@ -420,7 +421,7 @@ fn a_pond_whose_mod_was_removed_survives_and_comes_back() {
             fluids.is_placeholder(value.fluid()),
             "acid came back as something other than a stand-in"
         );
-        assert_eq!(value.level(), 5, "the stand-in lost the level");
+        assert_eq!(value.volume(), 5, "the stand-in lost the volume");
 
         // Saving it back must not lose it either — the common case is a chunk
         // that gets rewritten for an unrelated reason.
@@ -443,7 +444,7 @@ fn a_pond_whose_mod_was_removed_survives_and_comes_back() {
         fluids.id_of("acid:acid").expect("registered"),
         "the acid did not come back when its mod did"
     );
-    assert_eq!(value.level(), 5);
+    assert_eq!(value.volume(), 5);
 }
 
 #[test]

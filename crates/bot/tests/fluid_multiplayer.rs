@@ -72,7 +72,7 @@ fn write_pourer(root: &std::path::Path) -> PathBuf {
             r#"
 game.register_block{{ id = "milk", name = "Milk" }}
 game.register_block{{ id = "rock", name = "Rock" }}
-game.register_fluid{{ id = "milk", material = "milk", flow_range = 7 }}
+game.register_fluid{{ id = "milk", material = "milk" }}
 
 local elapsed = 0
 local floored = false
@@ -81,11 +81,21 @@ local poured = false
 game.register_on_tick(function(dt_ticks)
     elapsed = elapsed + dt_ticks
 
-    -- The floor first. `set_block` is queued on the seed queue rather than
-    -- applied inline, so the chunk is not resident the instant this returns.
+    -- **A WELL, not a floor slab.** Milk is conserved (Sub-Node Contract §4),
+    -- so a block of it on an open slab spreads into the four neighbours and
+    -- falls off the edges within a couple of fluid ticks — and this test is
+    -- about whether a client ever SEES the pond, not about how long it lasts.
+    -- Four walls keep the twenty-seven cells in the one block being watched.
+    --
+    -- `set_block` is queued on the seed queue rather than applied inline, so
+    -- the chunk is not resident the instant this returns.
     if not floored and elapsed >= 10 then
         floored = true
         game.set_block({{ x = {x}, y = {floor}, z = {z} }}, "pourer:rock")
+        game.set_block({{ x = {x} + 1, y = {y}, z = {z} }}, "pourer:rock")
+        game.set_block({{ x = {x} - 1, y = {y}, z = {z} }}, "pourer:rock")
+        game.set_block({{ x = {x}, y = {y}, z = {z} + 1 }}, "pourer:rock")
+        game.set_block({{ x = {x}, y = {y}, z = {z} - 1 }}, "pourer:rock")
         return
     end
 
@@ -93,7 +103,7 @@ game.register_on_tick(function(dt_ticks)
         return
     end
     poured = true
-    game.set_fluid({{ x = {x}, y = {y}, z = {z} }}, {{ fluid = "pourer:milk", source = true }})
+    game.set_fluid({{ x = {x}, y = {y}, z = {z} }}, {{ fluid = "pourer:milk", volume = 27 }})
     game.log("poured")
 end)
 "#,
@@ -166,7 +176,7 @@ async fn until(bot: &mut Bot, timeout: Duration, done: impl Fn(&Bot) -> bool) ->
 fn fingerprint(layer: &FluidLayer) -> u64 {
     let mut hasher = blake3::Hasher::new();
     for value in layer.blocks() {
-        hasher.update(&[value.0]);
+        hasher.update(&value.0.to_le_bytes());
     }
     u64::from_le_bytes(
         hasher.finalize().as_bytes()[..8]
@@ -215,7 +225,7 @@ fn a_second_client_recovers_the_pond_over_a_lossy_link() {
         let mut clean = join(&server, "Clean").await;
         assert!(
             until(&mut clean, Duration::from_secs(15), |bot| {
-                bot.fluid_at(POND).is_source()
+                !bot.fluid_at(POND).is_empty()
             })
             .await,
             "the pond never reached a client on a clean link, so there is nothing to recover"
@@ -242,7 +252,7 @@ fn a_second_client_recovers_the_pond_over_a_lossy_link() {
 
         assert!(
             until(&mut lossy, Duration::from_secs(20), |bot| {
-                bot.fluid_at(POND).is_source()
+                !bot.fluid_at(POND).is_empty()
             })
             .await,
             "a client on a lossy link never recovered the pond — the keyframe that \
@@ -290,7 +300,7 @@ fn a_client_that_joins_after_the_pour_is_told_about_it() {
         let mut first = join(&server, "First").await;
         assert!(
             until(&mut first, Duration::from_secs(15), |bot| {
-                bot.fluid_at(POND).is_source()
+                !bot.fluid_at(POND).is_empty()
             })
             .await,
             "the pond never poured"
@@ -302,7 +312,7 @@ fn a_client_that_joins_after_the_pour_is_told_about_it() {
         let mut late = join(&server, "Late").await;
         assert!(
             until(&mut late, Duration::from_secs(15), |bot| {
-                bot.fluid_at(POND).is_source()
+                !bot.fluid_at(POND).is_empty()
             })
             .await,
             "a client joining after the pour was never told about the pond"

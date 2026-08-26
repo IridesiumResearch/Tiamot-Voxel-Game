@@ -1051,7 +1051,7 @@ impl ScriptVm for MluaVm {
             table.set("into", into)?;
 
             table.set("fluid", event.fluid.as_str())?;
-            table.set("level", event.level)?;
+            table.set("volume", event.volume)?;
             table.set("occupancy", event.occupancy)?;
             table.set("units", event.occupancy.count_ones())?;
             // The blocking block by NAME. A runtime id would be a number that
@@ -1206,9 +1206,9 @@ impl ScriptVm for MluaVm {
                 Some(FluidRules {
                     fluid,
                     material: entry.get("material").ok()?,
-                    flow_range: entry.get("flow_range").ok()?,
+
                     waterlogs_at: entry.get("waterlogs_at").ok()?,
-                    renews_from: entry.get("renews_from").ok()?,
+                    evaporates: entry.get("evaporates").ok()?,
                     color: [
                         entry.get("color_r").ok()?,
                         entry.get("color_g").ok()?,
@@ -2550,11 +2550,16 @@ impl MluaVm {
                     });
 
                 let out = lua.create_table()?;
-                // `level` and `source` rather than the packed byte: a mod that
-                // had to know the bit layout would be a mod that breaks when
-                // the layout changes.
-                out.set("level", value.level())?;
-                out.set("source", value.is_source())?;
+                // `volume` rather than the packed word: a mod that had to know
+                // the bit layout would be a mod that breaks when the layout
+                // changes — as it just did.
+                //
+                // In CELLS of 27, the unit charter rule 5 uses for everything
+                // else, so a mod comparing a puddle against a bucket compares
+                // two numbers in the same units. There is no `source`: under a
+                // conserved model nothing sustains itself (Sub-Node Contract
+                // §4.2).
+                out.set("volume", value.volume())?;
                 out.set("empty", value.is_empty())?;
                 Ok(out)
             })
@@ -2580,10 +2585,10 @@ impl MluaVm {
                     return Ok(false);
                 };
 
-                let level: u8 = spec.get("level").unwrap_or(crate::fluid::MAX_LEVEL);
+                let volume: u32 = spec.get("volume").unwrap_or(crate::fluid::MAX_VOLUME);
 
                 // **Clearing needs no fluid named, and demanding one was a bug
-                // with teeth.** The stub documents `set_fluid(pos, {level = 0})`
+                // with teeth.** The stub documents `set_fluid(pos, {volume = 0})`
                 // to scoop; the implementation refused it as a missing field, so
                 // the reference mod's scoop raised an error, and a hook that
                 // errors disables its mod (charter rule 10). One attempt to pick
@@ -2594,14 +2599,14 @@ impl MluaVm {
                 // destroy the source" and "after a certain amount of placements
                 // it just stops working, like it gives up" — which were one bug
                 // wearing both faces.
-                let value = if level == 0 {
+                let value = if volume == 0 {
                     crate::fluid::Fluid::EMPTY
                 } else {
                     let name: Option<String> = spec.get("fluid").ok();
                     let Some(name) = name else {
                         return Err(mlua::Error::external(
                             "set_fluid: missing required field `fluid`. Name the registered \
-                             fluid to place, or pass `level = 0` to clear.",
+                             fluid to place, or pass `volume = 0` to clear.",
                         ));
                     };
                     let Some(id) = store.fluid_id(&name) else {
@@ -2609,11 +2614,7 @@ impl MluaVm {
                             "set_fluid: no fluid registered as `{name}`"
                         )));
                     };
-                    if spec.get("source").unwrap_or(false) {
-                        crate::fluid::Fluid::source(id)
-                    } else {
-                        crate::fluid::Fluid::flowing(id, level)
-                    }
+                    crate::fluid::Fluid::new(id, volume)
                 };
                 Ok(store.set_fluid_at(crate::BlockPos::new(x, y, z), value))
             })
@@ -3833,7 +3834,7 @@ fn read_patch(spec: &Table) -> mlua::Result<crate::ent::Patch> {
     Ok(patch)
 }
 
-/// `game.register_fluid{ id, material, flow_range, tick_rate }`.
+/// `game.register_fluid{ id, material, waterlogs_at, tick_rate, evaporates }`.
 ///
 /// The whole of what the engine needs to simulate and draw a fluid. Everything
 /// else a fluid might do — hurt you, make a sound, be drinkable — is the
@@ -3900,18 +3901,6 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     })?;
     let material = qualify_id(owner, &material).map_err(mlua::Error::external)?;
 
-    let flow_range: u8 = spec
-        .get("flow_range")
-        .unwrap_or(FluidRules::DEFAULT_FLOW_RANGE);
-    if flow_range == 0 || flow_range > crate::fluid::MAX_LEVEL {
-        return Err(mlua::Error::external(format!(
-            "register_fluid(\"{qualified}\"): flow_range must be 1..={}, got {flow_range}. The \
-             level a block holds IS how far the fluid has travelled, and there are only that \
-             many levels.",
-            crate::fluid::MAX_LEVEL
-        )));
-    }
-
     // Contract §4's threshold, as the registering mod's decision rather than the
     // engine's. Zero would make every block floor and the fluid would never move
     // at all, which reads as the engine ignoring the mod.
@@ -3937,19 +3926,13 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
         )));
     }
 
-    // How many neighbouring sources make a block a source of its own. Bounded
-    // by the four lateral directions: asking for five is asking for a rule that
-    // can never fire, which is a typo rather than an intention.
-    let renews_from: u8 = spec
-        .get("renews_from")
-        .unwrap_or(FluidRules::DEFAULT_RENEWS_FROM);
-    if renews_from > 4 {
-        return Err(mlua::Error::external(format!(
-            "register_fluid(\"{qualified}\"): renews_from must be 0..=4, got {renews_from}. It \
-             counts the four lateral neighbours, so anything above four is a rule that never \
-             fires."
-        )));
-    }
+    // A declared sink, and the one that can empty a world. `1` would evaporate
+    // a cell from every exposed block every fluid tick, which is a pond that
+    // vanishes while you look at it — legal, and almost certainly a typo for a
+    // rate, so it is allowed and not silently corrected.
+    let evaporates: u32 = spec
+        .get("evaporates")
+        .unwrap_or(FluidRules::DEFAULT_EVAPORATES);
 
     let color = fluid_colour(spec, &qualified)?;
 
@@ -3962,10 +3945,10 @@ fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
 
     let entry = lua.create_table()?;
     entry.set("material", material)?;
-    entry.set("flow_range", flow_range)?;
+
     entry.set("waterlogs_at", waterlogs_at)?;
     entry.set("tick_rate", tick_rate)?;
-    entry.set("renews_from", renews_from)?;
+    entry.set("evaporates", evaporates)?;
     entry.set("color_r", color[0])?;
     entry.set("color_g", color[1])?;
     entry.set("color_b", color[2])?;
@@ -4287,13 +4270,12 @@ const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "defa
 
 /// Fields `register_fluid` accepts. Anything else is a typo, and a typo that is
 /// silently ignored is a mod whose author cannot tell why nothing happened.
-const FLUID_FIELDS: [&str; 7] = [
+const FLUID_FIELDS: [&str; 6] = [
     "id",
     "material",
-    "flow_range",
     "waterlogs_at",
     "tick_rate",
-    "renews_from",
+    "evaporates",
     "color",
 ];
 
@@ -5227,7 +5209,7 @@ mod tests {
     #[test]
     fn clearing_fluid_needs_no_fluid_named() {
         // **The bug this exists for cost a whole play session.** The stubs
-        // document `set_fluid(pos, {level = 0})` as the way to scoop, and the
+        // document `set_fluid(pos, {volume = 0})` as the way to scoop, and the
         // implementation refused it as a missing `fluid` field. A hook that
         // errors disables its mod (charter rule 10), so the reference mod's
         // scoop killed `core_milk` on its first use and every placement
@@ -5248,9 +5230,9 @@ mod tests {
              game.register_on_tick(function()\n\
                turn = turn + 1\n\
                if turn == 1 then\n\
-                 game.set_fluid({x=1,y=2,z=3}, {fluid='test:milk', source=true})\n\
+                 game.set_fluid({x=1,y=2,z=3}, {fluid='test:milk', volume=27})\n\
                else\n\
-                 game.set_fluid({x=1,y=2,z=3}, {level=0})\n\
+                 game.set_fluid({x=1,y=2,z=3}, {volume=0})\n\
                end\n\
              end)",
         )
@@ -5562,7 +5544,7 @@ mod tests {
             from: crate::coords::BlockPos::new(1, 2, 3),
             into: crate::coords::BlockPos::new(2, 2, 3),
             fluid: "core_milk:milk".to_owned(),
-            level: 5,
+            volume: 19,
             blocked_by: rock,
             // Three cells filled, which is what `units` must come to.
             occupancy: 0b111,
@@ -5574,7 +5556,7 @@ mod tests {
             "assert(seen.from.x == 1 and seen.from.y == 2 and seen.from.z == 3, 'from')\n\
              assert(seen.into.x == 2 and seen.into.y == 2 and seen.into.z == 3, 'into')\n\
              assert(seen.fluid == 'core_milk:milk', 'fluid is ' .. tostring(seen.fluid))\n\
-             assert(seen.level == 5, 'level')\n\
+             assert(seen.volume == 19, 'volume is ' .. tostring(seen.volume))\n\
              assert(seen.occupancy == 7, 'occupancy')\n\
              assert(seen.units == 3, 'units is ' .. tostring(seen.units))\n\
              assert(seen.block == 'sponge:rock', 'block is ' .. tostring(seen.block))",
@@ -5600,7 +5582,7 @@ mod tests {
             from: crate::coords::BlockPos::new(0, 0, 0),
             into: crate::coords::BlockPos::new(1, 0, 0),
             fluid: "core_milk:milk".to_owned(),
-            level: 7,
+            volume: 27,
             blocked_by: MaterialId::UNKNOWN,
             occupancy: crate::block::OCCUPANCY_FULL,
         });

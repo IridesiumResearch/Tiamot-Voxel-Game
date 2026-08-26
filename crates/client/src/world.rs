@@ -86,7 +86,6 @@ pub struct ChunkStore {
     /// `tiamot_core::proto::FluidDef`. Two sides disagreeing about where a
     /// surface is would show as milk at one height on screen and another under
     /// your feet.
-    fluid_depths: [[u8; 8]; tiamot_core::fluid::MAX_FLUIDS + 1],
     /// What each fluid looks like from inside, as `0..=1` per channel.
     ///
     /// **The same space the sky's colours are in**, because this is fed to the
@@ -164,7 +163,6 @@ impl ChunkStore {
     /// which is the point of doing it anyway rather than relying on the order.
     pub fn set_fluid_table(&mut self, fluids: &[tiamot_core::proto::FluidDef]) {
         self.fluid_materials = [0; tiamot_core::fluid::MAX_FLUIDS + 1];
-        self.fluid_depths = [[0; 8]; tiamot_core::fluid::MAX_FLUIDS + 1];
         self.fluid_colours = [[1.0; 3]; tiamot_core::fluid::MAX_FLUIDS + 1];
         for def in fluids {
             let Some(slot) = usize::from(def.id).checked_sub(0) else {
@@ -174,39 +172,11 @@ impl ChunkStore {
                 continue;
             }
             self.fluid_materials[slot] = def.material;
-            self.fluid_depths[slot] = def.depths;
             self.fluid_colours[slot] = def.color.map(|channel| f32::from(channel) / 255.0);
         }
         if !self.fluid.is_empty() {
             self.mark_all_dirty();
         }
-    }
-
-    /// Every fluid source the client holds, in world blocks.
-    ///
-    /// **Temporary, for tracking sources while Task 11 is built.** A source and
-    /// a full flow block are the same colour and the same height, so from
-    /// inside a pond there is no way to see which block is feeding it. Walks
-    /// every held fluid layer, which is cheap only because dry chunks hold no
-    /// layer at all — a world with one pond walks one chunk.
-    #[must_use]
-    pub fn fluid_sources(&self) -> Vec<tiamot_core::BlockPos> {
-        let span = tiamot_core::CHUNK_BLOCKS as i32;
-        let mut out = Vec::new();
-        for (pos, layer) in &self.fluid {
-            for (index, value) in layer.blocks().enumerate() {
-                if !value.is_source() {
-                    continue;
-                }
-                let local = tiamot_core::coords::LocalBlock::from_index(index);
-                out.push(tiamot_core::BlockPos::new(
-                    pos.x * span + local.x as i32,
-                    pos.y * span + local.y as i32,
-                    pos.z * span + local.z as i32,
-                ));
-            }
-        }
-        out
     }
 
     /// What being inside a fluid looks like, `0..=1` per channel.
@@ -245,10 +215,11 @@ impl ChunkStore {
         if material == 0 {
             return None;
         }
-        let depth = *self
-            .fluid_depths
-            .get(slot)?
-            .get(usize::from(value.level()))?;
+        // **The volume IS the depth**, in cells of 27 (Sub-Node Contract
+        // §4.1). The server used to send a per-level lookup table so the two
+        // ends could not disagree; the conversion it existed for is an identity
+        // now, and a table beside the value would be a second source of truth.
+        let depth = u8::try_from(value.volume()).unwrap_or(u8::MAX);
         (depth > 0).then_some((material, depth))
     }
 
@@ -699,14 +670,16 @@ mod tests {
             id: 1,
             name: "test:milk".into(),
             material: STONE.get(),
-            depths: [0, 3, 6, 10, 13, 17, 20, 24],
             color: [255, 255, 255],
         }]);
 
         // Milk in the neighbour only, in the block against the shared face.
         let mut layer = FluidLayer::empty();
         let id = FluidId(1);
-        layer.set(LocalBlock::new(0, 4, 4), Fluid::source(id));
+        layer.set(
+            LocalBlock::new(0, 4, 4),
+            Fluid::new(id, tiamot_core::fluid::MAX_VOLUME),
+        );
         store.set_fluid(ChunkPos::new(1, 0, 0), layer);
 
         let fluid = store.fluid_for(ChunkPos::new(0, 0, 0));

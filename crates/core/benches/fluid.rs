@@ -39,7 +39,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use tiamot_core::coords::BlockPos;
-use tiamot_core::fluid::{Fluid, FluidId, Neighbourhood, Solver, Tuning};
+use tiamot_core::fluid::{Fluid, FluidId, MAX_VOLUME, Neighbourhood, Solver, Tuning};
+
+/// The world seed the benchmark's fluid runs under.
+///
+/// Fixed, because evaporation is seeded (charter rule 4) and a benchmark whose
+/// workload varied run to run would be measuring the seed.
+const SEED: u64 = 0x7B1A_3F2E_9C4D_5E60;
 
 const MILK: FluidId = FluidId(1);
 
@@ -86,7 +92,7 @@ impl Scene {
 
     fn spring(&mut self, solver: &mut Solver, x: i32, z: i32) {
         let at = BlockPos::new(x, 1, z);
-        self.fluid.insert((x, 1, z), Fluid::source(MILK));
+        self.fluid.insert((x, 1, z), Fluid::new(MILK, MAX_VOLUME));
         solver.touch(at);
     }
 }
@@ -127,7 +133,7 @@ fn settle(scene: &mut Scene, solver: &mut Solver) {
         if solver.is_settled() {
             return;
         }
-        solver.tick(scene, Tuning::DEFAULT, usize::MAX);
+        solver.tick(scene, Tuning::DEFAULT, usize::MAX, SEED, 0);
     }
 }
 
@@ -142,7 +148,7 @@ fn bench_settled(c: &mut Criterion) {
 
     c.bench_function("fluid_tick/settled", |b| {
         b.iter(|| {
-            let changes = solver.tick(&mut scene, Tuning::DEFAULT, VISITS);
+            let changes = solver.tick(&mut scene, Tuning::DEFAULT, VISITS, SEED, 0);
             assert!(changes.is_empty());
         });
     });
@@ -193,7 +199,7 @@ fn bench_spreading(c: &mut Criterion) {
                     solver.touch(BlockPos::new(x, 1, z));
                 }
             }
-            solver.tick(&mut scene, Tuning::DEFAULT, VISITS);
+            solver.tick(&mut scene, Tuning::DEFAULT, VISITS, SEED, 0);
         });
     });
 
@@ -225,10 +231,7 @@ fn bench_hole_preference(c: &mut Criterion) {
 
     // And with the preference off, which is what `hole_search = 0` buys a mod
     // that would rather have the speed.
-    let even = Tuning {
-        hole_search: 0,
-        ..Tuning::DEFAULT
-    };
+    let even = Tuning { ..Tuning::DEFAULT };
     group.bench_function("pitted_without_steering", |b| {
         b.iter(|| {
             let mut scene = Scene::pitted(20);
@@ -238,7 +241,7 @@ fn bench_hole_preference(c: &mut Criterion) {
                 if solver.is_settled() {
                     break;
                 }
-                solver.tick(&mut scene, even, usize::MAX);
+                solver.tick(&mut scene, even, usize::MAX, SEED, 0);
             }
         });
     });

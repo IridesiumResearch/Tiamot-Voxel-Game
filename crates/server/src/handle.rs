@@ -837,17 +837,17 @@ impl ServerHandle {
         let fluid_table: Vec<tiamot_core::proto::FluidDef> = fluids
             .iter_registered()
             .map(|(id, registered)| {
-                let mut depths = [0u8; 8];
-                for (level, depth) in depths.iter_mut().enumerate() {
-                    *depth =
-                        tiamot_core::fluid::Fluid::flowing(id, level as u8).depth_units() as u8;
-                }
+                // **No depth table any more.** It existed so a client and a
+                // server could not disagree about where a surface sits, back
+                // when a level had to be converted into twenty-sevenths to find
+                // out. A block's volume IS that number now (Sub-Node Contract
+                // §4.1), so sending a lookup table beside it would be shipping
+                // a second source of truth for a value both ends already hold.
                 tiamot_core::proto::FluidDef {
                     color: registered.color,
                     id: id.0,
                     name: registered.name.clone(),
                     material: registered.material.get(),
-                    depths,
                 }
             })
             .collect();
@@ -2486,7 +2486,11 @@ impl ServerHandle {
                         // checks an empty active set and allocates nothing.
                         if tick.is_multiple_of(crate::fluid::TICKS_PER_FLUID_TICK) {
                             let mut fluid = fluidics.write().expect("fluid lock");
-                            let changes = fluid.tick(&world, tick / crate::fluid::TICKS_PER_FLUID_TICK);
+                            let changes = fluid.tick(
+                                &world,
+                                tick / crate::fluid::TICKS_PER_FLUID_TICK,
+                                world.seed(),
+                            );
                             if !changes.is_empty() {
                                 // The whole layer, per touched chunk, rather
                                 // than a delta per block — see
@@ -2565,7 +2569,7 @@ impl ServerHandle {
                                         from: event.from,
                                         into: event.into,
                                         fluid: name,
-                                        level: event.level,
+                                        volume: event.volume,
                                         blocked_by: material,
                                         occupancy,
                                     });
