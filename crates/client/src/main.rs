@@ -103,7 +103,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // empty list beside a `singleplayer/` directory full of a player's
     // building, and the only way forward would be to make a second world.
     let mut library = library;
-    if library.entries.is_empty() && config.world_path.is_dir() {
+    // **`Library::exists`, not `entries.is_empty()`.** An emptied list and a
+    // missing one both have no entries and mean opposite things: this is for
+    // somebody who has never had a list, and asking about the length instead
+    // resurrected the world they had just pressed Forget on, every launch.
+    if !client::launcher::Library::exists(&data.join("worlds.toml")) && config.world_path.is_dir() {
         library.add(client::launcher::Entry {
             name: config.world_path.file_name().map_or_else(
                 || "Singleplayer".to_owned(),
@@ -115,6 +119,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Whatever it was played with was not recorded, so it is recorded
             // as what is on now: inventing a set would invent a warning.
             mods: catalogue.enabled(),
+            last_played: client::launcher::now_seconds(),
         });
         if let Err(err) = library.save(&data.join("worlds.toml")) {
             tracing::warn!("{err}");
@@ -989,6 +994,16 @@ impl Client {
             client::front::Action::Quit => false,
             client::front::Action::Open(entry) => self.open(&entry),
             client::front::Action::Create(name) => self.create(&name),
+            client::front::Action::Remember(entry) => {
+                self.library.add(*entry);
+                self.save_library();
+                true
+            }
+            client::front::Action::Forget(name) => {
+                self.library.forget(&name);
+                self.save_library();
+                true
+            }
         }
     }
 
@@ -1009,6 +1024,12 @@ impl Client {
                     } else {
                         Vec::new()
                     },
+                    // **Stamped on the way IN, not on the way out.** A world
+                    // is last played from the moment it opens; recording it on
+                    // leaving would lose the stamp for a session that ended in
+                    // a crash, which is exactly the session a player wants to
+                    // get back to.
+                    last_played: client::launcher::now_seconds(),
                     ..entry.clone()
                 });
                 self.save_library();
@@ -1033,6 +1054,7 @@ impl Client {
                 path: std::path::PathBuf::from("worlds").join(world_directory(name)),
             },
             mods: self.catalogue.enabled(),
+            last_played: client::launcher::now_seconds(),
         };
         self.open(&entry)
     }

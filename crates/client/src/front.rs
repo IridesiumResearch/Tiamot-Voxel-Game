@@ -44,6 +44,18 @@ pub enum Action {
     Open(Entry),
     /// Make a world with this name and the mods that are ticked.
     Create(String),
+    /// Keep this entry in the list. A server somebody typed an address for.
+    ///
+    /// Same reason as [`Action::Forget`]: a server added to this screen's copy
+    /// and never played was forgotten again the moment the screen was rebuilt.
+    Remember(Box<Entry>),
+    /// Drop this entry from the list, by name. Its files are not touched.
+    ///
+    /// **Carried out by the window rather than here**, because this screen is
+    /// given a COPY of the library and the window owns the one that gets
+    /// written. A removal that only happened here lasted until the screen was
+    /// rebuilt — which is what leaving a world does.
+    Forget(String),
     /// Close the window.
     Quit,
 }
@@ -139,6 +151,54 @@ impl Front {
         action
     }
 
+    /// Drops the highlighted entry from the list.
+    ///
+    /// **The list only.** Deleting somebody's world from a menu they were
+    /// browsing is not a thing a button should be able to do.
+    ///
+    /// Lifted out of the button so it can be tested: what went wrong here was
+    /// never the removal, it was that the removal stopped at this screen's copy
+    /// of the library, and the emitted [`Action`] is the half that fixes it.
+    fn forget_selected(&mut self) -> Action {
+        let Some(index) = self
+            .selected
+            .filter(|index| *index < self.library.entries.len())
+        else {
+            return Action::None;
+        };
+        let gone = self.library.entries.remove(index);
+        self.selected = None;
+        Action::Forget(gone.name)
+    }
+
+    /// Adds the server whose address is typed into the box.
+    fn remember_typed(&mut self) -> Action {
+        let address = self.address.trim().to_owned();
+        if address.is_empty() {
+            self.notice = Some("a server needs an address, like example.com:4433".into());
+            return Action::None;
+        }
+        let entry = Entry {
+            name: self.library.unused_name(&address),
+            kind: Kind::Remote { address },
+            mods: Vec::new(),
+            // A server nobody has played yet, stamped so it sorts to the top:
+            // it is the line the player just typed and is about to click, not
+            // the oldest thing they own.
+            last_played: crate::launcher::now_seconds(),
+        };
+        self.library.add(entry.clone());
+        self.address.clear();
+        // **By name, not by length.** The list is ordered by when things were
+        // last played, so the entry just added is not necessarily the last one.
+        self.selected = self
+            .library
+            .entries
+            .iter()
+            .position(|existing| existing.name == entry.name);
+        Action::Remember(Box::new(entry))
+    }
+
     /// The world list, and the two buttons.
     fn play_tab(&mut self, ui: &mut egui::Ui) -> Action {
         let mut action = Action::None;
@@ -180,14 +240,8 @@ impl Front {
                     None => Action::Open(entry),
                 };
             }
-            if ui.button("Forget").clicked()
-                && let Some(index) = self.selected
-                && index < self.library.entries.len()
-            {
-                // The list only. Deleting somebody's world from a menu they
-                // were browsing is not a thing a button should be able to do.
-                self.library.entries.remove(index);
-                self.selected = None;
+            if ui.button("Forget").clicked() {
+                action = self.forget_selected();
             }
         });
 
@@ -204,18 +258,7 @@ impl Front {
             ui.label("Server");
             ui.text_edit_singleline(&mut self.address);
             if ui.button("Add").clicked() {
-                let address = self.address.trim().to_owned();
-                if address.is_empty() {
-                    self.notice = Some("a server needs an address, like example.com:4433".into());
-                } else {
-                    self.library.add(Entry {
-                        name: self.library.unused_name(&address),
-                        kind: Kind::Remote { address },
-                        mods: Vec::new(),
-                    });
-                    self.address.clear();
-                    self.selected = Some(self.library.entries.len() - 1);
-                }
+                action = self.remember_typed();
             }
         });
         action
@@ -459,6 +502,7 @@ mod tests {
                 path: PathBuf::from("worlds").join(name),
             },
             mods: mods.iter().map(|id| (*id).to_owned()).collect(),
+            last_played: 0,
         }
     }
 
@@ -470,6 +514,80 @@ mod tests {
                 problem: None,
             },
         )
+    }
+
+    #[test]
+    fn forgetting_a_world_asks_the_window_to_write_the_list() {
+        // **The bug this is here for:** the removal used to happen only in this
+        // screen's copy of the library, so it came back on the next run — and
+        // on leaving a world, which rebuilds the screen from the window's copy.
+        let mut screen = front(vec![world("Home", &[]), world("Other", &[])]);
+        screen.selected = Some(0);
+        let action = screen.forget_selected();
+        assert_eq!(action, Action::Forget("Home".to_owned()));
+        assert_eq!(screen.library.entries.len(), 1, "gone from the screen too");
+        assert_eq!(screen.selected, None);
+    }
+
+    #[test]
+    fn forgetting_with_nothing_selected_asks_for_nothing() {
+        let mut screen = front(vec![world("Home", &[])]);
+        screen.selected = None;
+        assert_eq!(screen.forget_selected(), Action::None);
+        assert_eq!(screen.library.entries.len(), 1);
+    }
+
+    #[test]
+    fn a_server_typed_in_is_handed_to_the_window_to_keep() {
+        // Same fault as Forget, the other way round: a server added and not
+        // played was lost, because only playing one ever reached the library
+        // the window writes.
+        let mut screen = front(Vec::new());
+        screen.address = "  example.com:4433  ".to_owned();
+        let action = screen.remember_typed();
+        let Action::Remember(entry) = action else {
+            panic!("a typed address must reach the window");
+        };
+        assert_eq!(
+            entry.kind,
+            Kind::Remote {
+                address: "example.com:4433".to_owned()
+            },
+            "trimmed, because a pasted address brings whitespace with it"
+        );
+        assert_eq!(screen.library.entries.len(), 1);
+        assert!(screen.address.is_empty(), "the box is cleared");
+        assert_eq!(screen.selected, Some(0));
+    }
+
+    #[test]
+    fn a_server_just_added_is_the_one_highlighted() {
+        // **Selection is by name, not by length.** The list is ordered by when
+        // things were last played, so the entry just added is not the last one
+        // whenever anything else was played more recently... which cannot
+        // happen with a fresh stamp, so the case that bites is the reverse: an
+        // existing entry with a LATER stamp than the clock, from a file copied
+        // between machines. Either way, position beats arithmetic.
+        let mut screen = front(vec![Entry {
+            last_played: u64::MAX,
+            ..world("From the future", &[])
+        }]);
+        screen.address = "example.com:4433".to_owned();
+        screen.remember_typed();
+        let selected = screen.selected.expect("something is highlighted");
+        assert_eq!(
+            screen.library.entries[selected].name, "example.com:4433",
+            "the highlight followed the entry rather than the end of the list"
+        );
+    }
+
+    #[test]
+    fn an_empty_address_is_said_out_loud_rather_than_added() {
+        let mut screen = front(Vec::new());
+        screen.address = "   ".to_owned();
+        assert_eq!(screen.remember_typed(), Action::None);
+        assert!(screen.library.entries.is_empty());
+        assert!(screen.notice.is_some());
     }
 
     #[test]

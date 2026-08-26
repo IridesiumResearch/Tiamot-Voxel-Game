@@ -60,6 +60,31 @@ pub struct Entry {
     /// machine's to choose.
     #[serde(default)]
     pub mods: Vec<String>,
+    /// When this was last opened — or added, for one never opened — in seconds
+    /// since the Unix epoch.
+    ///
+    /// The list is ordered by this, so the world a player is in the middle of
+    /// is the one under the cursor. Stamped by the caller rather than read
+    /// from the clock inside [`Library::add`]: a list that orders itself by
+    /// what time it is when it is written is a list no test can pin down.
+    ///
+    /// Zero for a list written before this field existed. Those sort last,
+    /// which is the honest answer — nothing is known about when they were
+    /// played, and a world played yesterday should not lose its place to one
+    /// whose date is a guess.
+    #[serde(default)]
+    pub last_played: u64,
+}
+
+/// The wall clock, in seconds since the Unix epoch.
+///
+/// **Presentation, not simulation.** Ordering a menu is exactly the kind of
+/// thing charter rule 4 exempts; nothing here reaches a tick.
+#[must_use]
+pub fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 impl Entry {
@@ -70,10 +95,10 @@ impl Entry {
     }
 }
 
-/// The player's worlds and servers, in the order they were added.
+/// The player's worlds and servers, most recently played first.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Library {
-    /// Every world and server, newest last.
+    /// Every world and server, ordered by [`Entry::last_played`] descending.
     #[serde(default, rename = "world")]
     pub entries: Vec<Entry>,
 }
@@ -103,7 +128,26 @@ impl Library {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(err) => return Err(format!("could not read `{}`: {err}", path.display())),
         };
-        toml::from_str(&text).map_err(|err| format!("`{}` is not valid: {err}", path.display()))
+        let mut library: Self = toml::from_str(&text)
+            .map_err(|err| format!("`{}` is not valid: {err}", path.display()))?;
+        // A file written before `last_played` existed is in whatever order it
+        // was appended in, and one a player has edited by hand is in whatever
+        // order they left it. Ordering on the way in means the rest of the
+        // program never has to wonder.
+        library.order();
+        Ok(library)
+    }
+
+    /// Whether this machine has a world list yet.
+    ///
+    /// **The question [`Library::load`] deliberately cannot answer.** A missing
+    /// file and a list a player has emptied both read as no entries, and they
+    /// mean opposite things: the first is a first run, the second is somebody
+    /// who has just pressed Forget. Anything that adopts a pre-existing world
+    /// must ask this rather than looking at the length.
+    #[must_use]
+    pub fn exists(path: &Path) -> bool {
+        path.exists()
     }
 
     /// Writes the list, creating the directory if it is not there.
@@ -129,6 +173,17 @@ impl Library {
     pub fn add(&mut self, entry: Entry) {
         self.entries.retain(|existing| existing.name != entry.name);
         self.entries.push(entry);
+        self.order();
+    }
+
+    /// Puts the most recently played first.
+    ///
+    /// A stable sort, so two entries with the same stamp keep the order they
+    /// were added in — which is what a list of servers added in one sitting,
+    /// none of them played yet, should look like.
+    pub fn order(&mut self) {
+        self.entries
+            .sort_by_key(|entry| std::cmp::Reverse(entry.last_played));
     }
 
     /// Removes a world from the list. Does not touch its files.
@@ -332,6 +387,7 @@ mod tests {
                 path: PathBuf::from("worlds").join(name),
             },
             mods: mods.iter().map(|id| (*id).to_owned()).collect(),
+            last_played: 0,
         }
     }
 
@@ -382,9 +438,77 @@ mod tests {
                 address: "example.com:4433".to_owned(),
             },
             mods: Vec::new(),
+            last_played: 0,
         });
         library.save(&path).expect("save");
         assert_eq!(Library::load(&path).expect("load"), library);
+    }
+
+    #[test]
+    fn the_list_puts_the_world_you_played_last_at_the_top() {
+        let mut library = Library::default();
+        library.add(Entry {
+            last_played: 100,
+            ..local("Old", &[])
+        });
+        library.add(Entry {
+            last_played: 300,
+            ..local("Yesterday", &[])
+        });
+        library.add(Entry {
+            last_played: 200,
+            ..local("Middle", &[])
+        });
+        let order: Vec<&str> = library
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(order, vec!["Yesterday", "Middle", "Old"]);
+    }
+
+    #[test]
+    fn a_list_written_before_there_were_stamps_still_comes_back_in_an_order() {
+        // Every entry reads as never played, and the file is the old shape
+        // exactly: no `last_played` key at all.
+        let dir = scratch("no-stamps");
+        let path = dir.join("worlds.toml");
+        std::fs::write(
+            &path,
+            "[[world]]
+name = \"Home\"
+mods = []
+
+[world.kind]
+local = { path = \"worlds/home\" }
+",
+        )
+        .expect("write");
+        let library = Library::load(&path).expect("load");
+        assert_eq!(library.entries.len(), 1);
+        assert_eq!(library.entries[0].last_played, 0);
+    }
+
+    #[test]
+    fn an_emptied_list_is_not_a_first_run() {
+        // **The distinction the resurrecting world depended on.** Forgetting
+        // the only entry writes a file with no entries; a machine that has
+        // never run the client has no file. Both load as an empty library, so
+        // anything adopting a pre-existing world must ask `exists`.
+        let dir = scratch("emptied");
+        let path = dir.join("worlds.toml");
+        assert!(!Library::exists(&path), "nothing has been written yet");
+
+        let mut library = Library::default();
+        library.add(local("Home", &[]));
+        library.forget("Home");
+        library.save(&path).expect("save");
+
+        assert!(
+            Library::exists(&path),
+            "a list was written, and it is empty"
+        );
+        assert!(Library::load(&path).expect("load").entries.is_empty());
     }
 
     #[test]
@@ -434,6 +558,7 @@ mod tests {
                 address: "example.com:4433".to_owned(),
             },
             mods: Vec::new(),
+            last_played: 0,
         };
         assert_eq!(Library::mismatch(&server, &["core_ui".to_owned()]), None);
     }
