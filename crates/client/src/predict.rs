@@ -317,6 +317,25 @@ impl Predictor {
         y.abs() / total
     }
 
+    /// Renumbers the predictor to `tick`, forgetting what can never be
+    /// confirmed.
+    ///
+    /// **For a client that has run AHEAD of its server**, which is what a
+    /// paused singleplayer world does: the server's tick stands still while
+    /// this one keeps counting, so every input it files is stamped into a
+    /// future the server refuses. The outstanding predictions carry those same
+    /// tick numbers and can never be confirmed either, so they are dropped
+    /// rather than renumbered — a replay of inputs the server never applied
+    /// would move the body twice.
+    ///
+    /// The next authoritative state is what puts the body right; this only
+    /// makes the client's inputs acceptable again.
+    pub fn renumber(&mut self, tick: u64) {
+        self.tick = tick;
+        self.pending.clear();
+        self.remembered.clear();
+    }
+
     /// Advances one tick locally and records the input for replay.
     pub fn predict(&mut self, solid: &impl Solid, tick: u64, intent: Intent, tuning: &Tuning) {
         self.step(solid, intent, tuning, Ease::Record);

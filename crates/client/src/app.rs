@@ -1239,9 +1239,34 @@ impl App {
     /// fixed margin in front of it.
     fn resynchronise_tick(&mut self, server_tick: u64) {
         let want = server_tick + INPUT_LEAD;
-        if self.tick >= want {
-            return;
-        }
+
+        // **Ahead is a bug too, and it used to be a permanent one.**
+        //
+        // Reported from the window: after opening the pause menu in a
+        // singleplayer world, walking put the player straight back where they
+        // started, for ever, and their own body stopped animating. A paused
+        // world stops the SERVER's tick and not this one, so the client counts
+        // on through the menu — and `InputQueue::offer` refuses anything more
+        // than `MAX_LOOKAHEAD` past the tick being applied. The gap never
+        // closes on its own, because the server only catches up at the same
+        // 20 Hz the client is still running at. Every input after that menu was
+        // thrown away, which is exactly what "the game thinks it is still
+        // paused" looks like from inside.
+        //
+        // The bound is the server's own, not a number of this module's: this
+        // has to trigger before an input would be refused rather than after.
+        // See `resync_plan`, which decides and is tested on its own.
+        let steps = match resync_plan(self.tick, server_tick) {
+            Resync::Settled => return,
+            Resync::Ahead => {
+                self.tick = want;
+                if let Some(predictor) = self.predictor.as_mut() {
+                    predictor.renumber(want);
+                }
+                return;
+            }
+            Resync::Behind { steps } => steps,
+        };
 
         // **The counter is not the body, and moving one without the other is what
         // made a landing jolt.**
@@ -1262,7 +1287,7 @@ impl App {
         // the server uses for a tick nobody spoke for: the last one, minus the
         // jump, exactly as `InputQueue::take` repeats it. Bounded, because a
         // client that has been away for a minute must not replay a minute.
-        let gap = (want - self.tick).min(u64::from(MAX_RESYNC_CATCH_UP));
+        let gap = steps;
         let mut intent = self.previous_intent;
         intent.jump = false;
         for _ in 0..gap {
@@ -4723,6 +4748,52 @@ pub fn build_atlas(
     Atlas::build(&slots)
 }
 
+/// What a client's tick counter should do about the server's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resync {
+    /// Close enough. The client leads by roughly [`INPUT_LEAD`], as it should.
+    Settled,
+    /// So far ahead that the server would refuse its inputs. Snap back.
+    Ahead,
+    /// Behind: simulate this many skipped ticks, then take the label.
+    Behind {
+        /// Ticks to step through, bounded by [`MAX_RESYNC_CATCH_UP`].
+        steps: u64,
+    },
+}
+
+/// Which of those a client at `client` should do, given a server at `server`.
+///
+/// # Why ahead is a case at all
+///
+/// **A client that runs ahead of its server never recovers on its own.**
+/// `InputQueue::offer` refuses any tick more than
+/// [`tiamot_core::phys::input::MAX_LOOKAHEAD`] past the one being applied, and
+/// both ends then advance at the same 20 Hz — so a gap opened once stays open
+/// and every input from then on is thrown away. Reported from the window as
+/// walking putting the player back where they started after using the pause
+/// menu, which stops the SERVER's tick and not the client's.
+///
+/// The trigger is half the server's own bound rather than a number of this
+/// module's, so it fires before an input would be refused rather than after.
+const fn resync_plan(client: u64, server: u64) -> Resync {
+    let want = server + INPUT_LEAD;
+    if client > want + tiamot_core::phys::input::MAX_LOOKAHEAD / 2 {
+        return Resync::Ahead;
+    }
+    if client >= want {
+        return Resync::Settled;
+    }
+    let gap = want - client;
+    Resync::Behind {
+        steps: if gap < MAX_RESYNC_CATCH_UP as u64 {
+            gap
+        } else {
+            MAX_RESYNC_CATCH_UP as u64
+        },
+    }
+}
+
 /// Pairs of actions whose DEFAULT key is the same, as `(held, clashing)`.
 ///
 /// Defaults only: a player who has deliberately put two actions on one key has
@@ -4752,6 +4823,51 @@ fn shared_defaults(actions: &crate::input::Actions) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use tiamot_core::proto::MaterialDef;
+
+    #[test]
+    fn a_client_that_ran_ahead_of_its_server_snaps_back() {
+        use tiamot_core::phys::input::MAX_LOOKAHEAD;
+
+        // **Reported from the window**: after the pause menu, walking put the
+        // player straight back where they started, for ever, and their own body
+        // stopped animating. A paused world stops the SERVER's tick and not the
+        // client's, so the client counted on through the menu — and the server
+        // refuses any input more than `MAX_LOOKAHEAD` past the tick it is
+        // applying. Both ends then run at the same rate, so the gap never
+        // closes: every input after that menu was thrown away.
+        let server = 1_000;
+        let settled = server + INPUT_LEAD;
+
+        // A menu held open for ten seconds is 200 ticks of divergence.
+        assert_eq!(resync_plan(settled + 200, server), Resync::Ahead);
+
+        // The trigger is BEFORE the server would refuse, not after: a client
+        // exactly at the refusal bound is already broken.
+        assert_eq!(resync_plan(settled + MAX_LOOKAHEAD, server), Resync::Ahead);
+
+        // And a healthy lead is left alone — this must not fire on the normal
+        // case, which is a client leading by its own latency.
+        assert_eq!(resync_plan(settled, server), Resync::Settled);
+        assert_eq!(resync_plan(settled + 1, server), Resync::Settled);
+        assert_eq!(
+            resync_plan(settled + MAX_LOOKAHEAD / 2, server),
+            Resync::Settled,
+            "a client inside the server's own tolerance was snapped back"
+        );
+
+        // Behind is unchanged: simulate the gap, bounded, rather than renumber.
+        assert_eq!(
+            resync_plan(settled - 2, server),
+            Resync::Behind { steps: 2 }
+        );
+        assert_eq!(
+            resync_plan(settled - 500, server),
+            Resync::Behind {
+                steps: u64::from(MAX_RESYNC_CATCH_UP)
+            },
+            "a client that was away must not replay a minute of movement"
+        );
+    }
 
     #[test]
     fn two_actions_on_one_default_key_are_reported_to_the_player() {
