@@ -12,9 +12,19 @@
 // player is looking hardest at where their feet are.
 //
 // So this is not an approximation of a sun shadow and does not try to be. It is
-// a grounding cue, it works in all three lighting modes, it costs one quad per
-// body, and it is what Minecraft has been doing since before shadow maps were
-// affordable.
+// a grounding cue, it works in all three lighting modes, and it is what
+// Minecraft has been doing since before shadow maps were affordable.
+//
+// # A disc is a GRID of quads, not one
+//
+// One quad lies at one height, and the ground under a body on sub-node terrain
+// is not at one height — reported from the window as the shadow floating on
+// chiselled ground "instead of projecting down into" it. Each tile sits on the
+// ground under its own column.
+//
+// The falloff is still the DISC's: a tile carries where it sits within the disc
+// and how much of it it spans, so the soft rim is round across the group rather
+// than each tile fading into its own edge and leaving a grid of dots.
 //
 // # No geometry buffer
 //
@@ -30,16 +40,18 @@ struct Globals {
 @group(0) @binding(0) var<uniform> globals: Globals;
 
 struct Instance {
-    // Where the disc sits, camera-relative, in blocks. Already lifted clear of
-    // the surface it lies on by the caller.
+    // Where this TILE sits, camera-relative, in blocks. Already lifted clear of
+    // the surface it lies on by the caller. `w` is the tile's half-width as a
+    // fraction of the disc's radius.
     @location(0) centre: vec4<f32>,
-    // Radius in blocks in x, opacity in y. Two spare.
+    // Tile half-width in blocks in x, opacity in y, and the tile's offset from
+    // the disc's centre in zw — in units of the disc radius.
     @location(1) shape: vec4<f32>,
 };
 
 struct VertexOut {
     @builtin(position) clip: vec4<f32>,
-    // Position within the disc, -1 to 1 on each axis.
+    // Position within the DISC, -1 to 1 on each axis — not within the tile.
     @location(0) local: vec2<f32>,
     @location(1) @interpolate(flat) opacity: f32,
 };
@@ -57,16 +69,19 @@ fn vertex_main(@builtin(vertex_index) index: u32, instance: Instance) -> VertexO
         vec2<f32>(1.0, 1.0),
         vec2<f32>(-1.0, 1.0),
     );
-    let local = corners[index];
-    let radius = instance.shape.x;
+    let corner = corners[index];
+    let half = instance.shape.x;
 
-    // Flat on the ground: the disc lies in the xz plane, so its own y never
-    // changes. A billboard would face the camera and read as a sticker.
-    let world = instance.centre.xyz + vec3<f32>(local.x * radius, 0.0, local.y * radius);
+    // Flat on the ground: each tile lies in the xz plane at its own height, so
+    // the disc as a whole follows the surface. A billboard would face the
+    // camera and read as a sticker.
+    let world = instance.centre.xyz + vec3<f32>(corner.x * half, 0.0, corner.y * half);
 
     var out: VertexOut;
     out.clip = globals.view_projection * vec4<f32>(world, 1.0);
-    out.local = local;
+    // Where this corner is in the DISC: the tile's own offset, plus how far
+    // across the tile we are scaled into the disc's units.
+    out.local = instance.shape.zw + corner * instance.centre.w;
     out.opacity = instance.shape.y;
     return out;
 }

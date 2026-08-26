@@ -1100,13 +1100,13 @@ impl Renderer {
     ///
     /// **Every frame, like the entity list.** A blob is where a body is now;
     /// there is nothing to keep between frames.
-    pub fn set_blobs(&mut self, blobs: &[([f32; 3], f32, f32)]) {
+    pub fn set_blobs(&mut self, blobs: &[BlobTile]) {
         let instances: Vec<Blob> = blobs
             .iter()
             .take(self.blob_capacity)
-            .map(|(centre, radius, opacity)| Blob {
-                centre: [centre[0], centre[1], centre[2], 0.0],
-                shape: [*radius, *opacity, 0.0, 0.0],
+            .map(|tile| Blob {
+                centre: [tile.centre[0], tile.centre[1], tile.centre[2], tile.scale],
+                shape: [tile.half, tile.opacity, tile.offset[0], tile.offset[1]],
             })
             .collect();
         self.blob_count = u32::try_from(instances.len()).unwrap_or(0);
@@ -2015,12 +2015,13 @@ fn build_selection_pipeline(
         })
 }
 
-/// Most blob shadows one frame will draw.
+/// Most blob-shadow tiles one frame will draw.
 ///
-/// One per body in view. Far more than a populated area holds, and a hard
-/// ceiling on a buffer that is written every frame from a list a server
-/// controls the length of.
-const BLOB_CAPACITY: usize = 512;
+/// A disc is a grid of tiles rather than one quad, so this is bodies times
+/// tiles — around twenty each. Four thousand is a couple of hundred bodies,
+/// far more than a populated area holds, and it is a hard ceiling on a buffer
+/// written every frame from a list a server controls the length of.
+const BLOB_CAPACITY: usize = 4096;
 
 /// Most prop boxes one frame will draw.
 ///
@@ -2204,15 +2205,108 @@ pub fn dropped_boxes(at: [f32; 3], yaw: f32, shape: u32, uv: [f32; 4], item: boo
     boxes_of(&placed, DROP_HALF, shape, uv, item)
 }
 
+/// One sub-node column under a blob shadow, before it is placed in the world.
+///
+/// The pure half of the decision the disc used to get wrong: WHICH columns a
+/// disc covers and what height the ground is under each. Separated so it can be
+/// tested without a GPU, a world or a camera — the bug was never in the drawing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlobColumn {
+    /// Offset from the disc's centre, in cells.
+    pub offset: [f32; 2],
+    /// The surface under this column, in cells.
+    pub ground: f32,
+}
+
+/// How far either side of the middle a disc reaches, in sub-node columns.
+///
+/// A radius of 0.8 blocks is 2.4 cells, so two either side covers the widest
+/// disc the caller asks for.
+const BLOB_COLUMNS: i32 = 2;
+
+/// The columns a disc of `radius` cells covers, each with its own ground.
+///
+/// **Reported from the window**: the shadow "floats and looks strange when I am
+/// standing on blocks of sub-nodes, because it kinda just floats on top of them
+/// instead of projecting down into them." One quad lies at one height, and
+/// sub-node ground is not at one height — charter rule 19 keeps that terrain
+/// and the worldgen plan smooths everything, so it is the common case rather
+/// than a corner of one.
+///
+/// `ground_of` answers where the surface is under a column, in cells, or `None`
+/// for a column with nothing under it within reach. Those are left out: a hole
+/// in the disc is what standing on the lip of a drop should look like.
+pub fn blob_columns(
+    at: [f32; 3],
+    radius: f32,
+    mut ground_of: impl FnMut([f32; 3]) -> Option<f32>,
+) -> Vec<BlobColumn> {
+    let mut columns = Vec::with_capacity(((2 * BLOB_COLUMNS + 1) as usize).pow(2));
+    for iz in -BLOB_COLUMNS..=BLOB_COLUMNS {
+        for ix in -BLOB_COLUMNS..=BLOB_COLUMNS {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a handful of cells either side of the middle"
+            )]
+            let (dx, dz) = (ix as f32, iz as f32);
+            // Round, not square. A tile whose whole square falls outside the
+            // disc draws nothing anyway.
+            //
+            // At the FULL radius this drops nothing — a body's disc is 2.4
+            // cells and the far corner of the grid is 2.83 away, so part of
+            // even that tile is inside it. It earns its keep as the disc
+            // shrinks with height, which is most of the time a shadow is
+            // moving. Measured rather than assumed: the first version of the
+            // test below asserted it culled at full radius and was wrong.
+            if dx * dx + dz * dz > (radius + 0.5) * (radius + 0.5) {
+                continue;
+            }
+            if let Some(ground) = ground_of([at[0] + dx, at[1], at[2] + dz]) {
+                columns.push(BlobColumn {
+                    offset: [dx, dz],
+                    ground,
+                });
+            }
+        }
+    }
+    columns
+}
+
 /// One blob shadow, as the shader reads it.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Blob {
-    /// Camera-relative position of the disc's centre, in blocks. w unused.
+    /// Camera-relative position of this TILE's centre, in blocks.
+    ///
+    /// `w` is how much of the whole disc the tile spans, as a fraction of the
+    /// disc's radius, so the fragment stage can work out where in the disc it
+    /// is and fade accordingly.
     centre: [f32; 4],
-    /// Radius in blocks in x, opacity in y. Two spare, because a vertex
-    /// attribute is a `vec4` either way.
+    /// Tile half-width in blocks in x, opacity in y, and the tile's offset
+    /// from the disc's centre in z and w — the offset in units of the disc
+    /// radius, again so the falloff is the DISC's and not the tile's.
     shape: [f32; 4],
+}
+
+/// One tile of a blob shadow, as the caller describes it.
+///
+/// **A disc is several of these, not one.** A single quad lies at one height,
+/// and sub-node terrain under a body is not at one height — reported from the
+/// window as the shadow floating on chiselled ground "instead of projecting
+/// down into" it. Each tile sits on the ground under its own column, so the
+/// disc follows what it lies on.
+#[derive(Debug, Clone, Copy)]
+pub struct BlobTile {
+    /// Camera-relative centre of the tile, in blocks, already lifted clear.
+    pub centre: [f32; 3],
+    /// Half the tile's width, in blocks.
+    pub half: f32,
+    /// How dark the whole disc is.
+    pub opacity: f32,
+    /// Where this tile sits within the disc, in units of the disc's radius.
+    pub offset: [f32; 2],
+    /// The tile's half-width in units of the disc's radius.
+    pub scale: f32,
 }
 
 /// Everything the blob pass needs: two pipelines and a buffer.
@@ -2932,6 +3026,110 @@ fn make_depth_with(
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+#[cfg(test)]
+mod blob_tests {
+    use super::*;
+
+    /// A disc a little wider than two cells, which is what a body casts.
+    const RADIUS: f32 = 2.4;
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "these heights are the fixture's own constants handed straight back by the \
+                  probe, so exact equality is the question being asked"
+    )]
+    #[test]
+    fn a_disc_on_flat_ground_is_all_at_one_height() {
+        let columns = blob_columns([0.0, 6.0, 0.0], RADIUS, |_| Some(3.0));
+        assert!(!columns.is_empty());
+        assert!(
+            columns.iter().all(|column| column.ground == 3.0),
+            "flat ground should give one height"
+        );
+    }
+
+    #[expect(
+        clippy::float_cmp,
+        reason = "these heights are the fixture's own constants handed straight back by the \
+                  probe, so exact equality is the question being asked"
+    )]
+    #[test]
+    fn a_disc_over_a_step_follows_the_step() {
+        // **The reported bug, as a number.** One quad lies at one height, so on
+        // sub-node ground it floats over whatever is lower. Half of this disc
+        // is a cell lower than the other half, and the tiles have to say so.
+        let columns = blob_columns([0.0, 6.0, 0.0], RADIUS, |probe| {
+            Some(if probe[0] < 0.0 { 2.0 } else { 3.0 })
+        });
+
+        let low = columns.iter().filter(|c| c.ground == 2.0).count();
+        let high = columns.iter().filter(|c| c.ground == 3.0).count();
+        assert!(
+            low > 0 && high > 0,
+            "a disc straddling a step should sit at both heights, got {low} low and {high} high"
+        );
+        assert_eq!(low + high, columns.len(), "every column sits on something");
+
+        // And the low ones are the ones on the low side, rather than the split
+        // being anywhere at all.
+        assert!(
+            columns
+                .iter()
+                .all(|column| (column.ground == 2.0) == (column.offset[0] < 0.0)),
+            "the heights do not line up with the side of the step they are on"
+        );
+    }
+
+    #[test]
+    fn a_column_with_nothing_under_it_is_a_hole_rather_than_a_guess() {
+        // Standing on the lip of a drop: the half of the disc over the drop is
+        // simply absent. Filling it in at the near side's height would draw a
+        // shadow hanging in the air over the hole.
+        let columns = blob_columns([0.0, 6.0, 0.0], RADIUS, |probe| {
+            (probe[2] <= 0.0).then_some(3.0)
+        });
+        assert!(!columns.is_empty(), "the near half is still there");
+        assert!(
+            columns.iter().all(|column| column.offset[1] <= 0.0),
+            "a column over the drop was given a floor it does not have"
+        );
+    }
+
+    #[test]
+    fn a_full_width_disc_keeps_every_column_it_covers() {
+        // **Measured, not assumed.** The first version of this asserted the
+        // corners were culled at full radius; they are not, and should not be.
+        // A body's disc is 2.4 cells and the far corner of the grid is 2.83
+        // away, so part of even that tile is inside the circle.
+        let columns = blob_columns([0.0, 6.0, 0.0], RADIUS, |_| Some(0.0));
+        assert_eq!(
+            columns.len(),
+            ((2 * BLOB_COLUMNS + 1) as usize).pow(2),
+            "a column the disc covers was dropped"
+        );
+    }
+
+    #[test]
+    fn a_disc_shrunk_by_height_drops_the_columns_it_no_longer_covers() {
+        // The cull earns its keep here: the disc shrinks as a body leaves the
+        // ground, and a jumping player should not pay for a shadow the width of
+        // a standing one.
+        let columns = blob_columns([0.0, 6.0, 0.0], 1.0, |_| Some(0.0));
+        let square = ((2 * BLOB_COLUMNS + 1) as usize).pow(2);
+        assert!(
+            columns.len() < square,
+            "a disc a third the width still sent all {square} columns"
+        );
+        let far = 1.5 * 1.5;
+        assert!(
+            columns.iter().all(|column| {
+                column.offset[0] * column.offset[0] + column.offset[1] * column.offset[1] <= far
+            }),
+            "a column outside the disc was kept"
+        );
+    }
 }
 
 #[cfg(test)]

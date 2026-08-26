@@ -1426,7 +1426,17 @@ fn a_blob_shadow_darkens_the_ground_in_every_lighting_mode() {
         // that and read as "the blob does not work"; the shoreline taught the
         // same lesson an hour earlier. `App::place_blobs` applies the lift for
         // real; here it is spelled out.
-        renderer.set_blobs(&[([0.0, -11.98, 0.0], 2.0, 0.45)]);
+        // One tile spanning the whole disc, which is what a disc on FLAT
+        // ground reduces to. `App::place_blobs` splits it per sub-node column
+        // so it can follow chiselled ground; the shape of one tile is the same
+        // either way.
+        renderer.set_blobs(&[client::render::BlobTile {
+            centre: [0.0, -11.98, 0.0],
+            half: 2.0,
+            opacity: 0.45,
+            offset: [0.0, 0.0],
+            scale: 1.0,
+        }]);
         let marked = ground(&mut renderer);
         renderer.set_blobs(&[]);
 

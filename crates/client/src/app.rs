@@ -4163,8 +4163,21 @@ impl App {
             ));
         }
 
-        let mut blobs = Vec::with_capacity(feet.len());
+        // **A grid of tiles per body, not one quad.** Reported from the window:
+        // the disc "floats and looks strange when I am standing on blocks of
+        // sub-nodes, because it kinda just floats on top of them instead of
+        // projecting down into them." One quad lies at ONE height and sub-node
+        // ground is not at one height — charter rule 19 keeps that terrain, so
+        // this is the common case rather than a corner of one.
+        //
+        // One tile per sub-node column, each probed and placed on its own
+        // ground — see `render::blob_columns`, which is where that decision
+        // lives and is tested.
+        let mut blobs = Vec::with_capacity(feet.len() * 25);
         for (at, radius) in feet {
+            // The disc's own height, from under the body, decides whether it is
+            // drawn at all and how faded — ONE answer for the whole disc, so a
+            // jump fades it evenly rather than tile by tile.
             let Some(ground) = ground_below(&voxels, at, REACH * cells) else {
                 continue;
             };
@@ -4176,17 +4189,32 @@ impl App {
             if closeness <= 0.0 {
                 continue;
             }
+            let radius = radius * (0.6 + 0.4 * closeness);
+            // In cells, which is what the probe and the offsets below speak.
+            let reach = radius * cells;
             let corner = tiamot_core::BlockPos::from_chunk_corner(self.drawn_at(origin));
-            let world = [
-                f64::from(corner.x) + f64::from(at[0]) / f64::from(cells),
-                f64::from(corner.y) + f64::from(ground) / f64::from(cells) + f64::from(LIFT),
-                f64::from(corner.z) + f64::from(at[2]) / f64::from(cells),
-            ];
-            blobs.push((
-                self.camera.position.offset_to(world),
-                radius * (0.6 + 0.4 * closeness),
-                OPACITY * closeness,
-            ));
+
+            for column in crate::render::blob_columns(at, reach, |probe| {
+                ground_below(&voxels, probe, REACH * cells)
+            }) {
+                let [dx, dz] = column.offset;
+                let world = [
+                    f64::from(corner.x) + f64::from(at[0] + dx) / f64::from(cells),
+                    f64::from(corner.y)
+                        + f64::from(column.ground) / f64::from(cells)
+                        + f64::from(LIFT),
+                    f64::from(corner.z) + f64::from(at[2] + dz) / f64::from(cells),
+                ];
+                blobs.push(crate::render::BlobTile {
+                    centre: self.camera.position.offset_to(world),
+                    // Half a cell, in blocks: one tile covers one sub-node
+                    // column, which is the resolution the ground has.
+                    half: 0.5 / cells,
+                    opacity: OPACITY * closeness,
+                    offset: [dx / reach, dz / reach],
+                    scale: 0.5 / reach,
+                });
+            }
         }
         self.renderer.set_blobs(&blobs);
     }
