@@ -1136,6 +1136,12 @@ impl Client {
             if server.paused() != wanted {
                 server.set_paused(wanted);
             }
+            // **And the client stops with it.** Both sides of a paused world
+            // have to hold still: a client that went on predicting would come
+            // back from the menu holding a body the server never moved, and be
+            // corrected out of it over the next second and a half. Reported
+            // from the window as being pulled about after unpausing.
+            app.set_world_paused(wanted);
         }
 
         // **Quitting a world is not quitting the game.** It was, because

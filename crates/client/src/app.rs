@@ -830,6 +830,12 @@ pub struct App {
     /// sends its table, which is correct: a client with no table has nothing to
     /// place either.
     items: std::collections::BTreeSet<u16>,
+    /// Whether the world this client is looking at is stopped.
+    ///
+    /// Only ever true for an embedded server the client paused itself: a hosted
+    /// world has other people in it and does not stop for anybody's menu. See
+    /// [`App::walk`].
+    world_paused: bool,
     /// Where each material sits in the atlas, for whatever draws a slot.
     ///
     /// Kept beside the renderer's copy rather than read back out of it: the
@@ -1100,6 +1106,7 @@ impl App {
             heard: Vec::new(),
             step_sounds: std::collections::BTreeMap::new(),
             items: std::collections::BTreeSet::new(),
+            world_paused: false,
             stride: 0.0,
             last_step_at: [0.0; 3],
             volumes_dirty: false,
@@ -2863,6 +2870,15 @@ impl App {
         self.settings_open
     }
 
+    /// Says whether the world is stopped, so the client stops with it.
+    ///
+    /// **Set by whoever paused the server**, which is only ever the window of a
+    /// client that owns one. See [`App::walk`] for why running on through a
+    /// pause is not merely wasted work.
+    pub const fn set_world_paused(&mut self, paused: bool) {
+        self.world_paused = paused;
+    }
+
     /// Whether the pause menu is on the screen.
     #[must_use]
     pub const fn menu_open(&self) -> bool {
@@ -3842,6 +3858,25 @@ impl App {
         /// through the world in one frame; the server never saw those inputs
         /// and would drag them straight back.
         const MAX_CATCH_UP: u32 = 4;
+
+        // **A paused world advances neither side.** Snapping the tick back when
+        // the world restarts (see `resync_plan`) fixes a client that ran ahead,
+        // and a correction is still a correction: the body is put right rather
+        // than never having been wrong, and a player who started walking the
+        // instant they closed the menu felt themselves pulled about for the
+        // second and a half it took to smooth out. Reported from the window,
+        // after that first fix.
+        //
+        // So the client does not run at all while it is the one that paused the
+        // world. Only ever true for an embedded server — a hosted world has
+        // other people in it and does not stop for anybody's menu.
+        if self.world_paused {
+            // The carry is DROPPED rather than kept. Keeping it would bank the
+            // whole length of the menu and spend it on the way out, which is
+            // the fast-forward `MAX_CATCH_UP` exists to prevent.
+            self.tick_carry = 0.0;
+            return;
+        }
 
         self.tick_carry += dt;
         let mut spent = 0;

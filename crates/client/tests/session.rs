@@ -1199,6 +1199,69 @@ fn run_real_time(app: &mut App, seconds: f32, input: Input) {
 }
 
 #[test]
+fn a_paused_world_leaves_the_client_exactly_where_it_was() {
+    // **Reported from the window, twice.** First: after the pause menu, walking
+    // put the player back where they started for ever, because a paused world
+    // stops the SERVER's tick and not the client's and the server refuses an
+    // input too far ahead. Snapping the tick back fixed that — and left the
+    // second report, which is that a correction is still a correction: for
+    // about a second and a half after closing the menu the body was being
+    // pulled about while it was put right.
+    //
+    // So the client holds still too. Nothing to correct, because nothing was
+    // predicted that the server did not also simulate.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("paused-world");
+    let mut app = client("paused-world", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+    run_real_time(&mut app, 1.0, Input::default());
+
+    // Pause both sides, exactly as the window does.
+    server.set_paused(true);
+    app.set_world_paused(true);
+    let (before, _) = app.tick_pair();
+
+    // Walk into the menu. A real player's movement keys are released, but the
+    // point is that nothing the client is handed can move it while the world is
+    // stopped — a held key at the moment of pausing must not accumulate.
+    let walking = Input {
+        forward: 1.0,
+        ..Input::default()
+    };
+    run_real_time(&mut app, 1.0, walking);
+
+    let (during, _) = app.tick_pair();
+    assert_eq!(
+        during,
+        before,
+        "the client ran {} ticks while the world was paused, and every one of them is a \
+         correction waiting to happen",
+        during - before
+    );
+
+    // And it starts again on the other side.
+    server.set_paused(false);
+    app.set_world_paused(false);
+    run_real_time(&mut app, 0.75, Input::default());
+    let (after, _) = app.tick_pair();
+    assert!(
+        after > during,
+        "the client did not restart after the world did: still at tick {after}"
+    );
+
+    // **The whole point**: no correction to smooth out on the way back. This is
+    // the second report, as a number.
+    let correction = app.pacing().worst_correction_cells();
+    assert!(
+        correction < 1.0,
+        "unpausing left {correction} cells of correction to be pulled through"
+    );
+}
+
+#[test]
 fn jumping_in_real_time_leaves_no_correction_behind() {
     // **Reported from the window: `worst correction 5.79 cells (89% vertical)` at
     // a landing, intermittently, with the tick lead steady at 5.**
