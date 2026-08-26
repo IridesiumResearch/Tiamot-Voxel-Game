@@ -27,6 +27,13 @@ game.register_item{
     id = "sword",
     name = "Wooden Sword",
     description = "Proof that a carryable thing need not be a block.",
+    -- **Not optional in practice.** An item with no texture reaches a client
+    -- as a material with no tile, and what a player sees is the
+    -- missing-texture chequer — reported from the window as a pink and black
+    -- cube. The engine cannot invent a picture of a sword, so a mod that
+    -- registers one without a texture has registered something nobody can
+    -- look at.
+    texture = "textures/sword.png",
 }
 
 -- Somewhere to wear things.
@@ -62,13 +69,23 @@ game.register_action{
 
 --- How far above the feet a dropped stack appears, in blocks.
 local LIFT = 1.2
+--- How far in front of the body it starts, in blocks.
+local AHEAD = 0.8
+--- How hard it is thrown, in cells per tick.
+---
+--- Cells, not blocks: an entity's velocity is in the engine's own units, and
+--- three cells is one block. A toss rather than a throw — far enough to clear
+--- your own feet, close enough to pick up again without a walk.
+local THROW = 0.5
 --- How close a player has to be to pick something up, in blocks.
 local REACH = 1.5
 --- How long a dropped stack ignores the player who dropped it, in ticks.
 ---
---- Without this a drop is picked straight back up on the next tick, because the
---- thing you dropped is by definition within arm's reach of you.
-local SETTLE = 20
+--- **Three seconds, not one.** At one second a thrown stack was picked straight
+--- back up before it had finished landing — reported from the window as not
+--- being able to get rid of it. Long enough to walk away from, short enough
+--- that a stack dropped by accident is not a trip back across the map.
+local SETTLE = 60
 
 --- Dropped stacks this mod is looking after: entity id -> { owner, ticks }.
 local dropped = {}
@@ -82,24 +99,41 @@ local function body_of(uuid)
     return game.entity(id)
 end
 
---- Puts a stack on the ground where `body` is standing.
+--- Throws a stack out in front of `body`.
 ---
---- **Dropped at chest height rather than thrown forward**, and the reason is
---- charter rule 4. Throwing it in the direction somebody is facing means
---- `sin(yaw)` and `cos(yaw)`, and those are the platform's libm: two servers
---- running this mod would put the same dropped stack in slightly different
---- places, and that difference is then persisted world state. A mod that
---- genuinely needs a direction should ask the engine for one rather than
---- computing it — there is no such call yet, which is a finding and not a
---- workaround.
+--- **`body.facing` and not `math.sin(body.yaw)`**, and the difference is
+--- charter rule 4. Turning an angle into a direction in Lua calls the
+--- platform's libm, so two servers running this mod would put the same thrown
+--- stack in slightly different places — and that difference is then persisted
+--- world state. The engine works it out from a committed table instead
+--- (`detgen::trig`), so the answer is the same everywhere and this mod never
+--- has to know why.
+---
+--- The first version of this dropped straight down for want of that call, and
+--- it was reported from the window as not really being thrown.
 local function throw(body, stack)
     local id = game.spawn_entity{
-        pos = { x = body.pos.x, y = body.pos.y + LIFT, z = body.pos.z },
+        pos = {
+            x = body.pos.x + body.facing.x * AHEAD,
+            y = body.pos.y + LIFT,
+            z = body.pos.z + body.facing.z * AHEAD,
+        },
         item = stack,
         -- A small box, so gravity puts it on the floor. An entity with no
         -- collider is a marker and would hang in the air.
         collider = { width = 0.5, height = 0.5 },
     }
+    if id ~= nil then
+        -- A toss, so it arcs away rather than appearing at arm's length. Up a
+        -- little as well as out, which is what makes it look thrown.
+        game.set_entity(id, {
+            velocity = {
+                x = body.facing.x * THROW,
+                y = THROW * 0.5,
+                z = body.facing.z * THROW,
+            },
+        })
+    end
     return id
 end
 

@@ -2185,7 +2185,10 @@ const DROP_LIFT: f32 = 0.22;
 const DROP_HALF: f32 = 0.16;
 
 /// How fast a dropped item turns, in radians per second.
-const DROP_SPIN: f32 = 1.1;
+///
+/// Halved from the first attempt, which was reported from the window as too
+/// fast. About one turn every eleven seconds.
+const DROP_SPIN: f32 = 0.55;
 
 /// Which way a dropped item is facing this frame.
 ///

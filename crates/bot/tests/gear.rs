@@ -103,6 +103,15 @@ fn an_item_reaches_a_client_marked_as_something_it_cannot_build_with() {
             !sword.placeable,
             "an item reached the client as something you could build with"
         );
+        // **And it has a picture.** An item with no texture reaches a client as
+        // a material with no tile, which draws as the missing-texture chequer —
+        // reported from the window as a pink and black cube, on the first
+        // version of this mod, which registered no texture at all. The engine
+        // cannot invent a picture of a sword.
+        assert!(
+            sword.texture.is_some(),
+            "the item has no texture, so a player sees the missing-texture chequer"
+        );
 
         // The counter-example, so the assertion above is not vacuous: a block
         // registered by another mod is in the same table and IS placeable.
@@ -230,7 +239,10 @@ fn what_a_player_drops_lands_as_an_entity_and_comes_back() {
             "a dropped stack with no box would hang in the air"
         );
 
-        // And the mod picks it back up once its own settling time is past.
+        // And the mod picks it back up — once its settling time is past and
+        // somebody walks over it. **Walking is not optional here**: a thrown
+        // stack lands a couple of blocks away on purpose, so a test that stood
+        // still would be testing a drop that failed to go anywhere.
         let deadline = tokio::time::Instant::now() + PATIENCE;
         loop {
             if bot.inventory().iter().any(|stack| stack.material == sword) {
@@ -240,7 +252,9 @@ fn what_a_player_drops_lands_as_an_entity_and_comes_back() {
                 tokio::time::Instant::now() < deadline,
                 "the dropped stack was never picked back up"
             );
-            bot.recv().await.expect("recv");
+            // Forward, which is the way it was thrown.
+            let _ = bot.walk([0.0, 0.0, 1.0], 0, 4).await;
+            let _ = bot.walk([0.0, 0.0, -1.0], 0, 4).await;
         }
 
         bot.disconnect().await;
