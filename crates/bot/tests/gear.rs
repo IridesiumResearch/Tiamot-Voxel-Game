@@ -40,9 +40,18 @@ fn reference_mods() -> PathBuf {
 }
 
 fn start(name: &str) -> ServerHandle {
+    start_at(scratch(name))
+}
+
+/// Starts a server on a world directory that may already exist.
+///
+/// **Separate from [`start`] because that one WIPES.** A restart test needs the
+/// second server to find what the first one left, and a helper that clears the
+/// directory would quietly make it a test of two fresh worlds.
+fn start_at(world_path: PathBuf) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
-        world_path: scratch(name),
+        world_path,
         max_players: 8,
         allowlist: Allowlist::open(),
         view_distance: ViewDistance::MINIMUM,
@@ -64,13 +73,19 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 
 async fn join(server: &ServerHandle, name: &str) -> Bot {
-    let mut bot = Bot::connect(
-        server.local_addr(),
-        Identity::generate().expect("identity"),
-        server.cert_fingerprint(),
-    )
-    .await
-    .expect("connect");
+    join_as(server, name, Identity::generate().expect("identity")).await
+}
+
+/// The same, under an identity the caller keeps.
+///
+/// **Needed the moment a test reconnects to the same world.** A display name is
+/// a per-server claim bound to a UUID on first join (charter rule 13), so a
+/// second session under a fresh key is a different person asking for a name
+/// that is taken — which is the rule working, not a bug to route around.
+async fn join_as(server: &ServerHandle, name: &str, identity: Identity) -> Bot {
+    let mut bot = Bot::connect(server.local_addr(), identity, server.cert_fingerprint())
+        .await
+        .expect("connect");
     bot.join(name).await.expect("join");
     bot
 }
@@ -348,4 +363,122 @@ fn a_registered_view_reaches_the_player_at_the_size_it_asked_for() {
         bot.disconnect().await;
     });
     assert!(server.stop());
+}
+
+#[test]
+fn a_dropped_stack_can_still_be_picked_up_after_the_world_is_reopened() {
+    // **Reported from the window**: "dropped stacks laying on the ground look
+    // good but I am not able to pick them back up upon closing and reopening a
+    // world."
+    //
+    // The entity survived — entities are persisted — and the MOD's memory of it
+    // did not. `core_gear` kept the settling window in a Lua table, and its
+    // tick walked that table, so after a restart nothing ever looked at the
+    // item again: it lay there, drawn correctly, inert.
+    //
+    // The fix is to search outward from PLAYERS rather than from what the mod
+    // remembers, which is also the only way the mod can meet an item it did not
+    // throw.
+    let world = scratch("reload-pickup");
+    // **One identity across both sessions**, rebuilt from its seed, because the
+    // player coming back is the same player. A fresh key would be somebody else
+    // asking for a name that is already claimed — which is charter rule 13
+    // working, not something to route around.
+    let seed = Identity::generate().expect("identity").seed();
+    let sword;
+
+    // First session: get a sword, drop it, and leave it lying there.
+    {
+        let server = start_at(world.clone());
+        sword = block_on(async {
+            let mut bot = join_as(&server, "Dropper", Identity::from_seed(&seed)).await;
+            let sword = material_of(&bot, "core_gear:sword");
+
+            bot.chat("gear").await.expect("ask");
+            let deadline = tokio::time::Instant::now() + PATIENCE;
+            loop {
+                if bot.inventory().iter().any(|stack| stack.material == sword) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the reference item never arrived"
+                );
+                bot.recv().await.expect("recv");
+            }
+
+            bot.select_slot(0).await.expect("select");
+            bot.action("core_gear:drop", true).await.expect("press");
+
+            // On the ground, and out of the inventory, before the world closes.
+            bot.expect_entity(
+                |entity| entity.item.is_some_and(|stack| stack.material == sword),
+                PATIENCE,
+            )
+            .await
+            .expect("the dropped stack never appeared as an entity");
+            let deadline = tokio::time::Instant::now() + PATIENCE;
+            loop {
+                if !bot.inventory().iter().any(|stack| stack.material == sword) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "dropping it did not take it out of the inventory"
+                );
+                bot.recv().await.expect("recv");
+            }
+
+            bot.disconnect().await;
+            sword
+        });
+        server.stop();
+    }
+
+    // Second session: the same world, a fresh server, a fresh mod VM.
+    let server = start_at(world);
+    block_on(async {
+        let mut bot = join_as(&server, "Dropper", Identity::from_seed(&seed)).await;
+
+        // It is still there.
+        let dropped = bot
+            .expect_entity(
+                |entity| entity.item.is_some_and(|stack| stack.material == sword),
+                PATIENCE,
+            )
+            .await
+            .expect("the dropped stack did not survive the restart");
+
+        // And it can be picked up, which is what was broken. Walk to where it
+        // actually is rather than guessing.
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            if bot.inventory().iter().any(|stack| stack.material == sword) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stack survived the restart but could not be picked up: the mod never \
+                 adopted an item it did not remember throwing"
+            );
+            let at = bot
+                .entities()
+                .into_values()
+                .find(|entity| entity.item.is_some_and(|stack| stack.material == sword))
+                .unwrap_or_else(|| dropped.clone());
+            let cells = f32::from(u16::try_from(tiamot_core::SUBNODES_PER_AXIS).unwrap_or(3));
+            let span = tiamot_core::CHUNK_BLOCKS as f32;
+            let _ = bot
+                .move_to(
+                    at.chunk.x as f32 * span + at.local[0] / cells,
+                    0.0,
+                    at.chunk.z as f32 * span + at.local[2] / cells,
+                )
+                .await;
+            bot.sleep_ticks(4).await;
+        }
+
+        bot.disconnect().await;
+    });
+    server.stop();
 }

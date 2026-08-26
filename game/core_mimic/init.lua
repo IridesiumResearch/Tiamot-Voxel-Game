@@ -103,7 +103,17 @@ end
 --- engine's own physics does the rest, so the mimic walks, collides, steps up a
 --- lip and swims exactly as a player does. Setting `pos` would teleport it,
 --- and a mob that slides through walls is not eerie, it is broken.
-local function steer(id, self_pos, target, gait, anim)
+--- Below this it is standing still, in cells per tick, squared.
+---
+--- **Not zero.** A body resting against geometry keeps a hair of velocity from
+--- the solver, and the client applies exactly this rule to the local player for
+--- exactly this reason — see `IDLE_SPEED` in `crates/client/src/app.rs`: "a
+--- figure that walked on the spot whenever somebody leant on a wall would look
+--- broken in a way nobody could describe."
+local IDLE_SPEED_SQUARED = 0.05 * 0.05
+
+local function steer(id, me, target, gait, anim)
+    local self_pos = me.pos
     local dx, dz = target.x - self_pos.x, target.z - self_pos.z
 
     -- **The engine drives; this mod decides where to.**
@@ -141,6 +151,24 @@ local function steer(id, self_pos, target, gait, anim)
     -- `atan` is a transcendental, which charter rule 4 bans from the
     -- SIMULATION. This is not simulation: a heading changes nothing about where
     -- anything is, and the engine sends it quantised to a byte.
+    -- **The animation follows what the body DID, not what it was told to do.**
+    --
+    -- Reported from the window: the mimic "does sometimes start walking with
+    -- the walking animation even though he is not moving." `steer_entity`
+    -- returning true means "not arrived yet", which is not the same as "moved"
+    -- — a mimic pressed against a wall or stuck under a lip is still going
+    -- somewhere and getting nowhere, and it walked on the spot the whole time.
+    --
+    -- The velocity read here is last tick's, which is the right one to ask:
+    -- the question is whether the previous drive actually shifted it.
+    --
+    -- This does NOT touch the mimic standing still and copying what you were
+    -- doing a couple of seconds ago. That one is deliberate and is set
+    -- directly rather than through here — walking on the spot is the point of
+    -- it.
+    local speed = me.velocity.x * me.velocity.x + me.velocity.z * me.velocity.z
+    local moving = speed >= IDLE_SPEED_SQUARED
+
     game.set_entity(id, {
         -- **`math.atan` is the platform's libm, and this is a tick.** Charter
         -- rule 4: two servers running this mod can compute slightly different
@@ -151,7 +179,7 @@ local function steer(id, self_pos, target, gait, anim)
         -- committed `atan2` table beside the others, not something to work
         -- around here.
         yaw = math.atan(dx, dz),
-        anim = anim or ANIM_WALK,
+        anim = moving and (anim or ANIM_WALK) or ANIM_IDLE,
     })
 end
 
@@ -282,7 +310,7 @@ game.register_on_entity_step(function(id)
     -- **Punched.** Away from whoever is nearest, briefly, then back to normal.
     if now < flee_until then
         local from = (player and player.pos) or last_seen or self.pos
-        steer(id, self.pos, {
+        steer(id, self, {
             x = self.pos.x + (self.pos.x - from.x),
             y = self.pos.y,
             z = self.pos.z + (self.pos.z - from.z),
@@ -304,7 +332,7 @@ game.register_on_entity_step(function(id)
                     -- which is the part that reads as wrong.
                     game.set_entity(id, { drive = { walk = { x = 0, z = 0 } }, anim = past.anim })
                 else
-                    steer(id, self.pos, past, "walk", past.anim)
+                    steer(id, self, past, "walk", past.anim)
                 end
                 return
             end
@@ -328,5 +356,5 @@ game.register_on_entity_step(function(id)
         y = anchor.y,
         z = anchor.z + face[2] * WANDER_BLOCKS,
     }
-    steer(id, self.pos, wander_to, "walk", ANIM_WALK)
+    steer(id, self, wander_to, "walk", ANIM_WALK)
 end)

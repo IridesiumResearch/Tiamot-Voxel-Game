@@ -402,3 +402,111 @@ fn walk(dir: &Path, offenders: &mut Vec<String>) {
         }
     }
 }
+
+#[test]
+fn a_mimic_that_cannot_move_stands_still_rather_than_walking_on_the_spot() {
+    // **Reported from the window**: the mimic "does sometimes start walking
+    // with the walking animation even though he is not moving."
+    //
+    // `game.steer_entity` returning true means "not arrived yet", which is not
+    // the same as "moved". A mimic pressed against a wall is still going
+    // somewhere and getting nowhere, and it played the walk the whole time.
+    //
+    // The animation follows the body's own velocity now, which is the rule the
+    // client already applies to the local player — its `IDLE_SPEED` comment
+    // names this exact symptom: "a figure that walked on the spot whenever
+    // somebody leant on a wall would look broken in a way nobody could
+    // describe."
+    let world = scratch("stuck-world");
+    let server = start_in(&world);
+    block_on(async {
+        let mut ada = join_as(&server, Identity::generate().expect("identity"), "Ada").await;
+        let mimic = ada
+            .expect_entity(|entity| is_mimic(entity, "Ada"), PATIENCE)
+            .await
+            .expect("a mimic should appear");
+
+        // **First, catch it walking.** Without this the assertion below passes
+        // for a mimic that was never animated at all.
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let mut walked = false;
+        while !walked && tokio::time::Instant::now() < deadline {
+            ada.walk([0.0; 3], 0, 2).await.expect("stand");
+            walked = ada
+                .entities()
+                .get(&mimic.id)
+                .is_some_and(|entity| entity.anim == tiamot_core::ent::AnimTag::WALK.0);
+        }
+        assert!(
+            walked,
+            "the mimic never played a walk, so this proves nothing"
+        );
+
+        // Now wall it in where it stands: four sides and a lid, so whatever it
+        // is steering towards it cannot get there.
+        let seen = ada.entities();
+        let here = seen.get(&mimic.id).expect("the mimic is still there");
+        let at = world_of(here);
+        drop(seen);
+        // `detgen::floor_to_i32` rather than `f64::floor`: the ban list is one
+        // rule everywhere, and a test that reached round it would be the first
+        // place somebody looked for permission to do the same in a tick.
+        let block = |x: f64, y: f64, z: f64| {
+            tiamot_core::BlockPos::new(
+                tiamot_core::detgen::floor_to_i64(x) as i32,
+                tiamot_core::detgen::floor_to_i64(y) as i32,
+                tiamot_core::detgen::floor_to_i64(z) as i32,
+            )
+        };
+        let floor = ada
+            .material_table()
+            .expect("the server should have sent a material table")
+            .into_iter()
+            .find(|entry| entry.name == "core:white")
+            .map(|entry| entry.id)
+            .expect("the reference mods register a plain solid block");
+        for dy in 0..=2 {
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                assert!(
+                    server.seed_block(
+                        block(
+                            at[0] + f64::from(dx),
+                            at[1] + f64::from(dy),
+                            at[2] + f64::from(dz)
+                        ),
+                        floor
+                    ),
+                    "the world should accept a seeded wall"
+                );
+            }
+        }
+
+        // And it stops walking. Given time to notice: the animation follows
+        // last tick's velocity, and it has to actually stop first.
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let mut still = false;
+        while !still && tokio::time::Instant::now() < deadline {
+            ada.walk([0.0; 3], 0, 10).await.expect("stand");
+            // Several readings with the connection TURNING between them, so a
+            // mimic caught between two steps does not read as settled. Reading
+            // `entities()` five times without pumping is one snapshot read
+            // five times, which is a guard that guards nothing.
+            let mut idle = true;
+            for _ in 0..5 {
+                ada.walk([0.0; 3], 0, 2).await.expect("stand");
+                idle &= ada
+                    .entities()
+                    .get(&mimic.id)
+                    .is_some_and(|entity| entity.anim == tiamot_core::ent::AnimTag::IDLE.0);
+            }
+            still = idle;
+        }
+        assert!(
+            still,
+            "the mimic is walled in and still playing its walk, which is walking on the spot"
+        );
+
+        ada.disconnect().await;
+    });
+    server.stop();
+}

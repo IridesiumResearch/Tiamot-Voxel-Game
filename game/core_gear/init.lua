@@ -92,8 +92,45 @@ local REACH = 1.5
 --- that a stack dropped by accident is not a trip back across the map.
 local SETTLE = 60
 
+--- How long a dropped stack lasts before it gives up, in ticks.
+---
+--- Five minutes. Long enough that a stack dropped in a fight is still there
+--- when you come back for it, short enough that a world does not silt up with
+--- everything anybody has ever thrown away.
+---
+--- **The clock restarts if the world does**, because `dropped` is this mod's
+--- memory and does not survive a restart while the ENTITY does — see the
+--- adoption in the tick below. Persisting it would mean writing per-entity mod
+--- state, and for a fixture "an item you left across a restart lasts another
+--- five minutes" is a better answer than a saved table nobody can read.
+local DESPAWN = 20 * 60 * 5
+
 --- Dropped stacks this mod is looking after: entity id -> { owner, ticks }.
+---
+--- **In memory, and deliberately not persisted.** What it holds is a settling
+--- window and an age, both of which are meaningless after a restart: an item
+--- that was lying there before the server stopped has finished settling by any
+--- measure. The tick below adopts anything it finds that it does not know
+--- about, which is what makes a reloaded world's items pickable.
 local dropped = {}
+
+--- Everybody who has joined this session, as a set of UUIDs.
+---
+--- **The tick searches outward from PLAYERS, not from the items it remembers**,
+--- and that is the whole of the reload fix. Reported from the window as not
+--- being able to pick a dropped stack back up after closing and reopening a
+--- world: the entity came back from the database and this mod's memory of it
+--- did not, so nothing ever looked at it again.
+---
+--- There is no leave hook to pair with `register_on_player_join`, so an entry
+--- here outlives the player. That costs a `game.player_entity` call per tick
+--- per departed player and nothing else — `body_of` answers nil for anyone who
+--- is gone, and they are back in this table the moment they return anyway.
+local players = {}
+
+game.register_on_player_join(function(event)
+    players[event.player] = true
+end)
 
 --- Where a player is, or nil if they are not connected.
 local function body_of(uuid)
@@ -227,6 +264,26 @@ game.register_on_action(function(event)
 end)
 
 game.register_on_tick(function()
+    -- **Look outward from each player.** Anything lying near somebody is a
+    -- candidate whether or not this mod remembers throwing it, which is what
+    -- makes a stack survive the world being closed and reopened.
+    for uuid in pairs(players) do
+        local body = body_of(uuid)
+        if body ~= nil then
+            for _, id in ipairs(game.entities_in_radius(body.pos, REACH, "core_gear")) do
+                if dropped[id] == nil then
+                    local item = game.entity(id)
+                    if item ~= nil and item.item ~= nil then
+                        -- Adopted as SETTLED and owned by nobody: it has been
+                        -- lying there since before this mod was looking, so
+                        -- whoever is standing over it may have it.
+                        dropped[id] = { owner = nil, ticks = SETTLE }
+                    end
+                end
+            end
+        end
+    end
+
     for id, watch in pairs(dropped) do
         local item = game.entity(id)
         if item == nil or item.item == nil then
@@ -234,21 +291,28 @@ game.register_on_tick(function()
             dropped[id] = nil
         else
             watch.ticks = watch.ticks + 1
-            -- Nearest first, so two players reaching at once resolve the same
-            -- way on every server.
-            for _, near in ipairs(game.entities_in_radius(item.pos, REACH, "engine:player")) do
-                local person = game.entity(near)
-                if person ~= nil and person.owner ~= nil then
-                    local mine = person.owner == watch.owner
-                    if not (mine and watch.ticks < SETTLE) then
-                        game.give(person.owner, {
-                            material = item.item.material,
-                            shape = item.item.shape,
-                            units = item.item.units,
-                        })
-                        game.despawn_entity(id)
-                        dropped[id] = nil
-                        break
+            if watch.ticks > DESPAWN then
+                -- Given up on. Nothing is credited to anybody: an item nobody
+                -- collected is an item nobody gets.
+                game.despawn_entity(id)
+                dropped[id] = nil
+            else
+                -- Nearest first, so two players reaching at once resolve the
+                -- same way on every server.
+                for _, near in ipairs(game.entities_in_radius(item.pos, REACH, "engine:player")) do
+                    local person = game.entity(near)
+                    if person ~= nil and person.owner ~= nil then
+                        local mine = person.owner == watch.owner
+                        if not (mine and watch.ticks < SETTLE) then
+                            game.give(person.owner, {
+                                material = item.item.material,
+                                shape = item.item.shape,
+                                units = item.item.units,
+                            })
+                            game.despawn_entity(id)
+                            dropped[id] = nil
+                            break
+                        end
                     end
                 end
             end
