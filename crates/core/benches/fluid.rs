@@ -21,19 +21,24 @@
 //!   solver is a work queue rather than a sweep. A world where nothing is
 //!   flowing must cost nothing at all, and this measures the claim rather than
 //!   asserting it in a comment.
-//! - `spring_field` is the worst case the task names: a hundred sources opened
+//! - `pour_field` is the worst case the task names: a hundred buckets emptied
 //!   at once, all spreading, all competing for the same processing cap.
-//! - `one_spring` is what a player actually does — pour one thing, watch it
+//! - `one_pour` is what a player actually does — pour one thing, watch it
 //!   run — and is the figure to compare against fifty players doing it.
-//! - `draining` is the other half of a spring's life, and is not free: every
-//!   block that loses its parent has to be visited to find that out.
+//! - `relevelling` is the workload conservation creates that the old model had
+//!   no equivalent of: take a wall out of a settled pond and every block on
+//!   both sides has to move until the two halves agree.
+//! - `sinks` is what absorption and evaporation cost, measured against the same
+//!   pour with neither, so the price of each is readable rather than baked into
+//!   one number.
 //!
-//! # The hole preference is the expensive part
+//! # What used to be here and is not
 //!
-//! `Tuning::hole_search` makes a spring steer towards a drop, and paying for it
-//! means a bounded search from every block that might feed another. `flat` and
-//! `pitted` are the same scene with and without somewhere to fall, so the
-//! difference between them IS the cost of that behaviour.
+//! `hole_preference` measured `Tuning::hole_search`, which steered a spring
+//! towards a drop. Conserved fluid has no such rule and needs none — water goes
+//! downhill because volume falls, not because the solver went looking. A
+//! benchmark for a mechanism that no longer exists is worse than none: it runs,
+//! reports a number, and the number means nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -60,6 +65,8 @@ const VISITS: usize = 512;
 struct Scene {
     solid: BTreeSet<(i32, i32, i32)>,
     fluid: BTreeMap<(i32, i32, i32), Fluid>,
+    /// Whether every solid block drinks, for the sink benchmark.
+    absorbent: bool,
 }
 
 impl Scene {
@@ -74,23 +81,8 @@ impl Scene {
         scene
     }
 
-    /// The same, with a grid of holes in the floor to steer towards.
-    fn pitted(span: i32) -> Self {
-        let mut scene = Self::flat(span);
-        let mut x = -span + 3;
-        while x <= span - 3 {
-            let mut z = -span + 3;
-            while z <= span - 3 {
-                scene.solid.remove(&(x, 0, z));
-                scene.solid.insert((x, -2, z));
-                z += 7;
-            }
-            x += 7;
-        }
-        scene
-    }
-
-    fn spring(&mut self, solver: &mut Solver, x: i32, z: i32) {
+    /// Empties one bucket into a block, and wakes it.
+    fn pour(&mut self, solver: &mut Solver, x: i32, z: i32) {
         let at = BlockPos::new(x, 1, z);
         self.fluid.insert((x, 1, z), Fluid::new(MILK, MAX_VOLUME));
         solver.touch(at);
@@ -108,6 +100,14 @@ impl Neighbourhood for Scene {
         } else {
             0
         })
+    }
+
+    fn absorbency(&self, pos: BlockPos) -> u32 {
+        if self.absorbent && self.solid.contains(&(pos.x, pos.y, pos.z)) {
+            1
+        } else {
+            0
+        }
     }
 
     fn fluid(&self, pos: BlockPos) -> Fluid {
@@ -142,7 +142,7 @@ fn bench_settled(c: &mut Criterion) {
     // nothing is flowing costs one comparison against an empty set.
     let mut scene = Scene::flat(20);
     let mut solver = Solver::new();
-    scene.spring(&mut solver, 0, 0);
+    scene.pour(&mut solver, 0, 0);
     settle(&mut scene, &mut solver);
     assert!(solver.is_settled(), "the scene never settled");
 
@@ -157,25 +157,25 @@ fn bench_settled(c: &mut Criterion) {
 fn bench_spreading(c: &mut Criterion) {
     let mut group = c.benchmark_group("fluid_spreading");
 
-    // One spring, from placement to standstill. What a player does.
-    group.bench_function("one_spring_to_standstill", |b| {
+    // One bucket, from the click to standstill. What a player does.
+    group.bench_function("one_pour_to_standstill", |b| {
         b.iter(|| {
             let mut scene = Scene::flat(20);
             let mut solver = Solver::new();
-            scene.spring(&mut solver, 0, 0);
+            scene.pour(&mut solver, 0, 0);
             settle(&mut scene, &mut solver);
         });
     });
 
     // A hundred at once — the task's worst case.
-    group.bench_function("spring_field_to_standstill", |b| {
+    group.bench_function("pour_field_to_standstill", |b| {
         b.iter(|| {
             let mut scene = Scene::flat(40);
             let mut solver = Solver::new();
             for index in 0..100 {
                 let x = (index % 10) * 8 - 36;
                 let z = (index / 10) * 8 - 36;
-                scene.spring(&mut solver, x, z);
+                scene.pour(&mut solver, x, z);
             }
             settle(&mut scene, &mut solver);
         });
@@ -183,13 +183,13 @@ fn bench_spreading(c: &mut Criterion) {
 
     // The same field, one CAPPED tick at a time, which is what the server
     // actually runs. This is the number the processing cap exists to bound.
-    group.bench_function("spring_field_one_capped_tick", |b| {
+    group.bench_function("pour_field_one_capped_tick", |b| {
         let mut scene = Scene::flat(40);
         let mut solver = Solver::new();
         for index in 0..100 {
             let x = (index % 10) * 8 - 36;
             let z = (index / 10) * 8 - 36;
-            scene.spring(&mut solver, x, z);
+            scene.pour(&mut solver, x, z);
         }
         b.iter(|| {
             if solver.is_settled() {
@@ -206,72 +206,93 @@ fn bench_spreading(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_hole_preference(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fluid_hole_preference");
-
-    // The same spring on a floor with nothing to fall into, and on one with
-    // holes in it. The gap between these two IS what steering costs.
-    group.bench_function("flat", |b| {
+fn bench_relevelling(c: &mut Criterion) {
+    // **The workload conservation creates.** Under the old model, taking a
+    // wall out let a source feed somewhere new and the level fell away from it
+    // one block at a time. Under this one, two settled bodies at different
+    // heights have to exchange volume until they agree — every block on both
+    // sides moves, and none of them is finished until all of them are.
+    //
+    // This replaces the old `draining` case, which measured a source being
+    // taken away. There are no sources, and nothing drains: milk that has
+    // nowhere to go stays exactly where it is.
+    c.bench_function("fluid_tick/relevelling", |b| {
         b.iter(|| {
             let mut scene = Scene::flat(20);
             let mut solver = Solver::new();
-            scene.spring(&mut solver, 0, 0);
+            // A sealed pool on the left, kept apart from open floor by a wall.
+            for z in -6..=6 {
+                scene.solid.insert((0, 1, z));
+            }
+            for x in -6..0 {
+                for z in -6..=6 {
+                    scene.fluid.insert((x, 1, z), Fluid::new(MILK, MAX_VOLUME));
+                    solver.touch(BlockPos::new(x, 1, z));
+                }
+            }
+            settle(&mut scene, &mut solver);
+
+            // Out comes the wall.
+            for z in -6..=6 {
+                scene.solid.remove(&(0, 1, z));
+                solver.touch(BlockPos::new(0, 1, z));
+            }
+            settle(&mut scene, &mut solver);
+        });
+    });
+}
+
+fn bench_sinks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fluid_sinks");
+
+    // The same pour three ways, so the price of each sink is readable rather
+    // than buried in one figure. Absorption is a lookup per neighbour on every
+    // visit; evaporation is a hash per block open to the air.
+    group.bench_function("no_sinks", |b| {
+        b.iter(|| {
+            let mut scene = Scene::flat(20);
+            let mut solver = Solver::new();
+            scene.pour(&mut solver, 0, 0);
             settle(&mut scene, &mut solver);
         });
     });
 
-    group.bench_function("pitted", |b| {
+    let thirsty = Tuning {
+        evaporates: 8,
+        ..Tuning::DEFAULT
+    };
+    group.bench_function("evaporating", |b| {
         b.iter(|| {
-            let mut scene = Scene::pitted(20);
+            let mut scene = Scene::flat(20);
             let mut solver = Solver::new();
-            scene.spring(&mut solver, 0, 0);
-            settle(&mut scene, &mut solver);
-        });
-    });
-
-    // And with the preference off, which is what `hole_search = 0` buys a mod
-    // that would rather have the speed.
-    let even = Tuning { ..Tuning::DEFAULT };
-    group.bench_function("pitted_without_steering", |b| {
-        b.iter(|| {
-            let mut scene = Scene::pitted(20);
-            let mut solver = Solver::new();
-            scene.spring(&mut solver, 0, 0);
-            for _ in 0..500 {
+            scene.pour(&mut solver, 0, 0);
+            for tick in 0..500u64 {
                 if solver.is_settled() {
                     break;
                 }
-                solver.tick(&mut scene, even, usize::MAX, SEED, 0);
+                solver.tick(&mut scene, thirsty, usize::MAX, SEED, tick);
             }
+        });
+    });
+
+    group.bench_function("absorbing", |b| {
+        b.iter(|| {
+            let mut scene = Scene::flat(20);
+            scene.absorbent = true;
+            let mut solver = Solver::new();
+            scene.pour(&mut solver, 0, 0);
+            settle(&mut scene, &mut solver);
         });
     });
 
     group.finish();
 }
 
-fn bench_draining(c: &mut Criterion) {
-    // Taking a source away is not free: every block that lost its parent has to
-    // be visited to find that out, and the pond drains a level per tick.
-    c.bench_function("fluid_tick/draining", |b| {
-        b.iter(|| {
-            let mut scene = Scene::flat(20);
-            let mut solver = Solver::new();
-            scene.spring(&mut solver, 0, 0);
-            settle(&mut scene, &mut solver);
-
-            scene.set_fluid(BlockPos::new(0, 1, 0), Fluid::EMPTY);
-            solver.touch(BlockPos::new(0, 1, 0));
-            settle(&mut scene, &mut solver);
-            assert!(scene.fluid.is_empty(), "milk survived its source");
-        });
-    });
-}
-
 criterion_group!(
     benches,
     bench_settled,
     bench_spreading,
-    bench_hole_preference,
-    bench_draining
+    bench_relevelling,
+    bench_sinks
 );
 criterion_main!(benches);

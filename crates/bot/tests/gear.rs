@@ -240,9 +240,19 @@ fn what_a_player_drops_lands_as_an_entity_and_comes_back() {
         );
 
         // And the mod picks it back up — once its settling time is past and
-        // somebody walks over it. **Walking is not optional here**: a thrown
-        // stack lands a couple of blocks away on purpose, so a test that stood
-        // still would be testing a drop that failed to go anywhere.
+        // somebody walks over it.
+        //
+        // **Walked TO, using the position on the wire, rather than oscillating
+        // and hoping.** A thrown stack lands a couple of blocks away on
+        // purpose, so a test that stood still would test a drop that failed to
+        // go anywhere — but the first version of this walked blindly forward
+        // and back along z, which only works while the item happens to land on
+        // that line. It went red on the slowest CI runner and nowhere else,
+        // which is what a test with an unstated assumption about timing looks
+        // like: the bot was still settling onto the ground when it threw.
+        //
+        // The entity stream says where the thing IS. Re-read every leg, because
+        // a stack that has not finished falling is still moving.
         let deadline = tokio::time::Instant::now() + PATIENCE;
         loop {
             if bot.inventory().iter().any(|stack| stack.material == sword) {
@@ -252,9 +262,33 @@ fn what_a_player_drops_lands_as_an_entity_and_comes_back() {
                 tokio::time::Instant::now() < deadline,
                 "the dropped stack was never picked back up"
             );
-            // Forward, which is the way it was thrown.
-            let _ = bot.walk([0.0, 0.0, 1.0], 0, 4).await;
-            let _ = bot.walk([0.0, 0.0, -1.0], 0, 4).await;
+            let at = bot
+                .entities()
+                .into_values()
+                .find(|entity| entity.item.is_some_and(|stack| stack.material == sword))
+                .map(|entity| {
+                    let cells =
+                        f32::from(u16::try_from(tiamot_core::SUBNODES_PER_AXIS).unwrap_or(3));
+                    let span = tiamot_core::CHUNK_BLOCKS as f32;
+                    [
+                        entity.chunk.x as f32 * span + entity.local[0] / cells,
+                        entity.chunk.z as f32 * span + entity.local[2] / cells,
+                    ]
+                });
+            match at {
+                Some([x, z]) => {
+                    let _ = bot.move_to(x, 0.0, z).await;
+                    // Standing exactly on it is not walking over it: the mod
+                    // picks up on proximity each tick, so give the server a
+                    // few to notice.
+                    bot.sleep_ticks(4).await;
+                }
+                // Not on screen this instant — it may not have spawned into
+                // this client's view yet. Keep the connection turning.
+                None => {
+                    bot.recv().await.expect("recv");
+                }
+            }
         }
 
         bot.disconnect().await;
