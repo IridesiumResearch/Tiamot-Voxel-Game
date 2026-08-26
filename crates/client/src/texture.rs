@@ -698,7 +698,7 @@ mod tests {
         // together without a diff anyone can review.
         for (name, colour) in GROUND_CHAIN {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join(format!("../../game/core_milk/textures/{name}.png"));
+                .join(format!("../../game/core_blocks/textures/{name}.png"));
             let bytes = std::fs::read(&path).expect("the reference mod ships this texture");
             let decoded = decode_png(&bytes).expect("and it must be a decodable PNG");
             assert_eq!(

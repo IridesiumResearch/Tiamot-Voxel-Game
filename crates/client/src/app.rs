@@ -2325,6 +2325,7 @@ impl App {
                     return crate::render::viewmodel::Held {
                         tile: None,
                         shape: 0,
+                        item: false,
                         swing,
                     };
                 };
@@ -2335,6 +2336,9 @@ impl App {
                 crate::render::viewmodel::Held {
                     tile: Some([u0, v0, u1, v1]),
                     shape: stack.shape,
+                    // The same set the slots and the props read, so one sword
+                    // is one shape in every view (`f7f20e1` missed this one).
+                    item: self.items.contains(&stack.material),
                     swing,
                 }
             };

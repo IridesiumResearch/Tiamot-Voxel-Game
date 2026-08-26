@@ -18,11 +18,22 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use tiamot_core::identity::Allowlist;
+use tiamot_core::identity::{Allowlist, Identity};
 use tiamot_core::interest::ViewDistance;
 use tiamot_server::{ServerHandle, Settings};
 
 const MATERIALS: [&str; 2] = ["test:stone", "test:dirt"];
+
+/// Runs one future to completion. Most of this file drives the bot BINARY, so
+/// there is no runtime lying about; the one case that talks to the server
+/// directly builds its own.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(future)
+}
 
 /// Path to the `bot` binary built alongside this test.
 ///
@@ -330,6 +341,33 @@ fn replay_applies_a_recording_against_a_live_server() {
     let server = start("replay");
     let dir = scratch("replay-session");
     let session = dir.join("session.log");
+
+    // **The surface material, ASKED FOR rather than written down.** This used
+    // to place a hard-coded `2`, which was the id the reference world's top
+    // block happened to have — so giving the generator a layer of absorbent
+    // ground on top broke a test about the replay format, with an error about
+    // not carrying anything. A number that means "whatever the world is made
+    // of" has to be looked up or it is a guess with a date on it.
+    let surface = block_on(async {
+        let mut bot = bot::Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Surveyor").await.expect("join");
+        let id = bot
+            .material_table()
+            .expect("the server should have sent a material table")
+            .into_iter()
+            .find(|entry| entry.name == "core:ground")
+            .map(|entry| entry.id)
+            .expect("the reference generator's surface material");
+        bot.disconnect().await;
+        id
+    });
+
     std::fs::write(
         &session,
         // Digs first, then builds with what the digging yielded. A recording
@@ -339,11 +377,13 @@ fn replay_applies_a_recording_against_a_live_server() {
         // The worldgen fills BELOW its heightmap, so y = -1 is the highest
         // block that actually exists and y = 0 is the air above it — dig the
         // first, build in the second.
-        "# a tiny recorded session\n\
-         0 dig_block 2 -1 0\n\
-         2 dig_block 1 -1 0\n\
-         4 place 2 0 0 2\n\
-         6 place 1 0 0 2\n",
+        format!(
+            "# a tiny recorded session\n\
+             0 dig_block 2 -1 0\n\
+             2 dig_block 1 -1 0\n\
+             4 place 2 0 0 {surface}\n\
+             6 place 1 0 0 {surface}\n"
+        ),
     )
     .expect("write");
 

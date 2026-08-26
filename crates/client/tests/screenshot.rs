@@ -3124,6 +3124,7 @@ fn a_hand_is_on_screen_in_first_person_and_holds_what_is_selected() {
         client::render::viewmodel::Held {
             tile: Some([0.0, 0.0, 0.25, 0.25]),
             shape: 0,
+            item: false,
             swing: 0.0,
         },
     ));

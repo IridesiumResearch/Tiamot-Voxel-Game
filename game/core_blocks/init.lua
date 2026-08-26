@@ -84,6 +84,69 @@ game.register_block{
 game.log("registered core:crumb and core:pitch")
 
 
+-- **The saturation chain: ground that drinks, in three steps.**
+--
+-- Sub-Node Contract §4.3. The engine's mechanism is "this block takes `rate`
+-- cells of fluid per fluid tick and then becomes `becomes`"; everything else is
+-- here. Saturation is registered MATERIALS rather than state bits on a block,
+-- which is what lets this mod own the darker texture and lets another mod give
+-- saturated sand different behaviour without the engine ever learning what
+-- porosity is (charter rule 1).
+--
+-- **It lives with the BLOCKS and not with the milk.** Absorbency is a property
+-- of a material, not of a fluid — the engine's field is on `register_block` and
+-- names no fluid at all — so a world with two fluids in it has one answer for
+-- what dirt does, and a mod adding ground does not have to depend on a mod
+-- adding water.
+--
+-- **`soaked` does not absorb, and that is the whole shape of the behaviour.**
+-- Ground that kept drinking would be a drain: any pool, however deep, would
+-- eventually vanish into it. Stopping at the end of the chain means each block
+-- of ground takes 27 cells — one block's worth — and no more. So a puddle
+-- thinned out over a wide area soaks away completely, and a lake deep enough to
+-- swim in wets the ground under it and then stays. That is the difference
+-- between water disappearing when it has pooled out and water disappearing
+-- full stop.
+--
+-- Nine cells is a third of a block per fluid tick, chosen so the effect is
+-- visible in a few seconds rather than being something you wait out. **It is a
+-- mod's number**: raise it and a bucket vanishes into dry ground almost at
+-- once, which is realistic and can read as the bucket not working.
+--
+-- All three carry the step sound, because **the reference world's surface is
+-- made of them now**. A material no mod gave a sound to is silent by design
+-- (charter rule 1), which is right — and is exactly the trap when a material
+-- becomes the ground everybody walks on. Leaving it off made walking silent
+-- everywhere, and a client test caught it.
+game.register_block{
+    id = "ground",
+    sounds = { step = "step" },
+    name = "Ground",
+    description = "Dry. It drinks what is poured on it.",
+    textures = { all = "textures/ground.png" },
+    absorbs = { rate = 9, becomes = "damp" },
+}
+
+game.register_block{
+    id = "damp",
+    sounds = { step = "step" },
+    name = "Damp ground",
+    description = "It has had some, and it will take more.",
+    textures = { all = "textures/damp.png" },
+    absorbs = { rate = 9, becomes = "soaked" },
+}
+
+game.register_block{
+    id = "soaked",
+    sounds = { step = "step" },
+    name = "Soaked ground",
+    description = "As wet as it gets. It will not take any more.",
+    textures = { all = "textures/soaked.png" },
+}
+
+game.log("registered the saturation chain: core:ground, core:damp, core:soaked")
+
+
 -- The engine's movement cues, given a noise.
 --
 -- **The engine raises these; this mod decides what they sound like.** There is

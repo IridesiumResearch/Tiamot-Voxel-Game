@@ -107,6 +107,17 @@ const SKIN: [f32; 4] = [0.85, 0.66, 0.52, 1.0];
 pub struct Held {
     /// The atlas rectangle of what it holds, if it holds anything.
     pub tile: Option<[f32; 4]>,
+    /// Whether what it holds is an ITEM rather than a block.
+    ///
+    /// **The half of `f7f20e1` that was missed, and the one a player actually
+    /// looks at.** That commit made a slot draw a flat picture and made the
+    /// third-person and dropped props a slab, and left first person drawing a
+    /// cube — so the sword was still "rendered on a block" in the only view
+    /// most play happens in. Reported twice for that reason.
+    ///
+    /// An item ignores `shape`: it is not placeable, so it has no occupancy to
+    /// be cut to.
+    pub item: bool,
     /// The 27-bit occupancy it is cut to, or `0` for a whole block.
     ///
     /// **A cut is held as the thing it is.** A hand that drew a cube for both
@@ -160,7 +171,7 @@ pub fn pieces(hand: Hand, held: Held) -> Vec<Piece> {
         // Less than the arm's roll, so a held block leans with the swing
         // without spinning in the hand.
         let lean = roll * 0.4;
-        for cell in cells(held.shape) {
+        for cell in cells(held.shape, held.item) {
             pieces.push(cell.piece(centre, lean, tile));
         }
     }
@@ -175,8 +186,12 @@ pub fn pieces(hand: Hand, held: Held) -> Vec<Piece> {
 struct Cell {
     /// Offset from the centre of the block, in blocks.
     offset: [f32; 3],
-    /// Half-extent, in blocks.
-    half: f32,
+    /// Half-extent per axis, in blocks.
+    ///
+    /// Per axis rather than one number because an item is a picture with a
+    /// thickness — the same slab `render::held_boxes` builds, from the same
+    /// [`super::ITEM_THICKNESS`].
+    half: [f32; 3],
 }
 
 impl Cell {
@@ -202,7 +217,7 @@ impl Cell {
                 centre[2] + dz,
                 lean,
             ],
-            size: [self.half, self.half, self.half, 0.0],
+            size: [self.half[0], self.half[1], self.half[2], 0.0],
             uv: tile,
             tint: [1.0, 1.0, 1.0, 1.0],
         }
@@ -214,11 +229,24 @@ impl Cell {
 /// A whole block — loose material, or a mask with every cell — is ONE box, not
 /// twenty-seven: it is the common case by far, it looks identical, and a cut is
 /// the only thing that needs the cells drawn separately.
-fn cells(mask: u32) -> Vec<Cell> {
+fn cells(mask: u32, item: bool) -> Vec<Cell> {
+    // **An item is a picture with a thickness, not a solid.** A sword is not a
+    // cube, and drawing it as one wraps the same picture round three faces —
+    // reported from the window as a sword "rendered on a block".
+    if item {
+        return vec![Cell {
+            offset: [0.0; 3],
+            half: [
+                shape::BLOCK,
+                shape::BLOCK,
+                shape::BLOCK * super::ITEM_THICKNESS,
+            ],
+        }];
+    }
     if mask == 0 || mask == tiamot_core::inventory::Shape::ALL {
         return vec![Cell {
             offset: [0.0; 3],
-            half: shape::BLOCK,
+            half: [shape::BLOCK; 3],
         }];
     }
     let half = shape::BLOCK / 3.0;
@@ -236,7 +264,7 @@ fn cells(mask: u32) -> Vec<Cell> {
                 let along = |index: i32| (index - 1) as f32 * 2.0 * half;
                 cells.push(Cell {
                     offset: [along(x), along(y), along(z)],
-                    half,
+                    half: [half; 3],
                 });
             }
         }
@@ -497,6 +525,7 @@ mod tests {
         let held = Held {
             tile: Some([0.1, 0.1, 0.2, 0.2]),
             shape: 0,
+            item: false,
             swing: 0.0,
         };
         let main = pieces(Hand::Main, held);
@@ -540,6 +569,7 @@ mod tests {
             Held {
                 tile,
                 shape: 0,
+                item: false,
                 swing: 0.0,
             },
         );
@@ -553,6 +583,7 @@ mod tests {
             Held {
                 tile,
                 shape: mask,
+                item: false,
                 swing: 0.0,
             },
         );
@@ -572,9 +603,9 @@ mod tests {
         let envelope = |mask: u32| {
             let mut low = f32::MAX;
             let mut high = f32::MIN;
-            for cell in cells(mask) {
-                low = low.min(cell.offset[0] - cell.half);
-                high = high.max(cell.offset[0] + cell.half);
+            for cell in cells(mask, false) {
+                low = low.min(cell.offset[0] - cell.half[0]);
+                high = high.max(cell.offset[0] + cell.half[0]);
             }
             (low, high)
         };
@@ -591,10 +622,66 @@ mod tests {
             Held {
                 tile,
                 shape: tiamot_core::inventory::Shape::ALL,
+                item: false,
                 swing: 0.0,
             },
         );
         assert_eq!(all.len(), 2, "a whole mask is still one box");
+    }
+
+    #[test]
+    fn a_held_item_is_a_slab_and_a_held_block_is_a_cube() {
+        // **The bug this is here for, reported twice.** `f7f20e1` made a slot
+        // draw a flat picture and made the third-person and dropped props a
+        // slab, and left FIRST PERSON drawing a cube — so the sword was still
+        // "rendered on a block" in the view most play happens in.
+        //
+        // Measured as the box's proportions rather than by looking: a cube is
+        // the same through as it is across, and a picture is not.
+        let block = Held {
+            tile: Some([0.1, 0.1, 0.2, 0.2]),
+            shape: 0,
+            item: false,
+            swing: 0.0,
+        };
+        let item = Held {
+            item: true,
+            ..block
+        };
+
+        let cube = pieces(Hand::Main, block);
+        let slab = pieces(Hand::Main, item);
+        assert_eq!(cube.len(), 2, "an arm and the thing in it");
+        assert_eq!(slab.len(), 2, "an item is ONE box, never twenty-seven");
+
+        let held = |pieces: &[Piece]| pieces[1].size;
+        let (c, s) = (held(&cube), held(&slab));
+        assert!(
+            (c[0] - c[2]).abs() < f32::EPSILON,
+            "a held block should be as deep as it is wide: {c:?}"
+        );
+        assert!(
+            s[2] < s[0] * 0.5,
+            "a held item should be a picture with a thickness, not a cube: {s:?}"
+        );
+        assert!(
+            (s[0] - c[0]).abs() < f32::EPSILON,
+            "an item is thinner, not smaller: {s:?} against {c:?}"
+        );
+    }
+
+    #[test]
+    fn an_item_ignores_a_cut_because_it_has_none_to_ignore() {
+        // An item is not placeable, so it has no occupancy — a mask on one is
+        // a mod having said something impossible, and drawing 27 slabs for it
+        // would be the renderer agreeing.
+        let held = Held {
+            tile: Some([0.1, 0.1, 0.2, 0.2]),
+            shape: 0b101,
+            item: true,
+            swing: 0.0,
+        };
+        assert_eq!(pieces(Hand::Main, held).len(), 2);
     }
 
     #[expect(
@@ -617,6 +704,7 @@ mod tests {
             // Two cells apart along the block's own x, through the centre so
             // nothing else contributes.
             shape: (1 << 12) | (1 << 14),
+            item: false,
             swing: 0.0,
         };
         for swing in [0.0_f32, 0.25, 0.5, 1.0] {
@@ -641,6 +729,7 @@ mod tests {
         let held = Held {
             tile: None,
             shape: 0,
+            item: false,
             swing: 0.0,
         };
         let rest = pieces(Hand::Main, held)[0].placement;
@@ -672,6 +761,7 @@ mod tests {
             Held {
                 tile: None,
                 shape: 0,
+                item: false,
                 swing: 7.5,
             },
         )[0]
@@ -681,6 +771,7 @@ mod tests {
             Held {
                 tile: None,
                 shape: 0,
+                item: false,
                 swing: 1.0,
             },
         )[0]

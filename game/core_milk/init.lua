@@ -28,58 +28,15 @@ game.register_block{
     light_emit = { 2, 2, 2 },
 }
 
--- **The saturation chain: ground that drinks, in three steps.**
---
--- Sub-Node Contract §4.3. The engine's mechanism is "this block takes `rate`
--- cells per fluid tick and then becomes `becomes`"; everything else is here.
--- Saturation is registered MATERIALS rather than state bits on a block, which
--- is what lets this mod own the darker texture and lets another mod give
--- saturated sand different behaviour without the engine learning what porosity
--- is.
---
--- The chain terminates by the last link simply not naming a successor. Soaked
--- ground still drinks — a puddle standing on it keeps draining — but it has
--- nothing left to turn into. A mod that wanted saturated ground to stop
--- absorbing would leave `absorbs` off it entirely, and that is the difference
--- between ground that is full and ground that is a drain.
---
--- Nine cells is a third of a block per fluid tick, chosen so the effect is
--- visible in a few seconds rather than being something you have to wait out.
--- **It is a mod's number**: pour one bucket into a hole in dry ground and most
--- of it soaks away, which is realistic and can read as "the bucket did not
--- work". Tune it here, not in the engine.
-game.register_block{
-    id = "ground",
-    name = "Ground",
-    description = "Dry. It drinks what is poured on it.",
-    textures = { all = "textures/ground.png" },
-    absorbs = { rate = 9, becomes = "damp" },
-}
-
-game.register_block{
-    id = "damp",
-    name = "Damp ground",
-    description = "It has had some, and it will take more.",
-    textures = { all = "textures/damp.png" },
-    absorbs = { rate = 9, becomes = "soaked" },
-}
-
-game.register_block{
-    id = "soaked",
-    name = "Soaked ground",
-    description = "As wet as it gets. Still a drain, but it turns into nothing.",
-    textures = { all = "textures/soaked.png" },
-    absorbs = { rate = 9 },
-}
-
 game.register_fluid{
     id = "milk",
     material = "milk",
-    -- Every third fluid tick, so a spring runs at about 3 Hz rather than 10.
-    -- Reported from the window as spreading "about 3x the speed I would hope
-    -- for", which is a mod's opinion to hold and this is where it belongs —
-    -- the engine's rate is 10 Hz and stays that way for anything that wants it.
-    tick_rate = 3,
+    -- Every fourth fluid tick, so a pour runs at about 2.5 Hz. Reported from
+    -- the window twice: first as "about 3x the speed I would hope for" (which
+    -- took it from 1 to 3), then as wanting it "just slightly slower" again.
+    -- The engine's own rate is 10 Hz and stays that way for anything that
+    -- wants it; this is a mod's opinion about milk.
+    tick_rate = 4,
     -- **Milk does not evaporate.** A declared sink is the engine's mechanism
     -- and whether to use it is this mod's opinion (charter rule 1): a puddle
     -- that dries out is right for water in the sun and wrong for milk on a
@@ -151,6 +108,64 @@ game.register_block{
     -- along with it — which is `dominance` doing the job it exists for.
     dominance = 2.0,
 }
+
+-- **A lake, for looking at.** Say `lake` in chat.
+--
+-- There is no engine command for this and there should not be: putting fluid in
+-- the world is `game.set_fluid`, and deciding that a word in chat means "make me
+-- a pond" is a game's decision (charter rule 1). It is here because the thing
+-- most worth watching — a body of milk finding its level, wetting the ground
+-- under it and then stopping — takes more buckets to build by hand than anybody
+-- wants to carry.
+--
+-- Deliberately a BASIN rather than a slab of milk in mid-air: dug into the
+-- ground with a rim around it, so the milk has somewhere to be and something to
+-- level against. A pool poured onto open ground spreads until it is a cell deep
+-- everywhere and then soaks away, which is correct and is not what "spawn a
+-- lake" means.
+local LAKE_RADIUS = 4
+local LAKE_DEPTH = 2
+
+local function spawn_lake(player)
+    local body = game.player_entity(player)
+    local where = body and game.entity(body)
+    if not where then
+        return false
+    end
+
+    -- Rounded to blocks, and clear of the player so they are standing beside it
+    -- rather than in it.
+    local cx = math.floor(where.pos.x + 0.5) + LAKE_RADIUS + 3
+    local cz = math.floor(where.pos.z + 0.5)
+    local top = math.floor(where.pos.y + 0.5) - 1
+
+    for dx = -LAKE_RADIUS, LAKE_RADIUS do
+        for dz = -LAKE_RADIUS, LAKE_RADIUS do
+            -- Round-ish: the corners of the square stay as the rim.
+            if dx * dx + dz * dz <= LAKE_RADIUS * LAKE_RADIUS then
+                for depth = 0, LAKE_DEPTH - 1 do
+                    local at = { x = cx + dx, y = top - depth, z = cz + dz }
+                    game.set_block(at, "engine:air")
+                    game.set_fluid(at, { fluid = "core_milk:milk", volume = 27 })
+                end
+            end
+        end
+    end
+    return true
+end
+
+-- **Its own chat hook.** Several mods may listen; `core_gear` has one too, and
+-- neither has to know about the other.
+game.register_on_chat(function(event)
+    if event.text ~= "lake" then
+        return
+    end
+    if not spawn_lake(event.player) then
+        game.log("could not find " .. event.player .. " to put a lake beside")
+    end
+    -- Swallowed: it was a command, not something to say out loud.
+    return false
+end)
 
 game.register_on_fluid_flow(function(event)
     -- Only a sponge, and only where the milk actually is milk. A mod that

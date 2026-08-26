@@ -24,13 +24,13 @@ fn main() {
         &client::texture::Image::white_with_border(),
     );
 
-    // The saturation chain `core_milk` demonstrates: the same ground, darker
+    // The saturation chain `core_blocks` registers: the same ground, darker
     // each time it drinks. Sub-Node Contract §4.3 makes saturation a chain of
     // MATERIALS rather than state bits, and this is the half of that decision
     // the mod owns — the engine has no opinion about what wet dirt looks like.
     for (name, colour) in client::texture::GROUND_CHAIN {
         write(
-            &root.join(format!("core_milk/textures/{name}.png")),
+            &root.join(format!("core_blocks/textures/{name}.png")),
             &client::texture::Image::tinted_with_border(*colour),
         );
     }

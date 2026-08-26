@@ -81,26 +81,48 @@ fn the_reference_mods_load_in_dependency_order() {
 #[test]
 fn the_reference_generator_produces_the_half_white_world() {
     // The acceptance criterion, against the real mods: solid below y = 0, air
-    // above.
+    // above — and the top block of that solid is `core:ground`, which drinks.
+    // Milk poured on a world of nothing but `core:white` pools for ever,
+    // because there is nowhere for it to go.
     let mut host = host_for(&game_dir());
     host.freeze().expect("freeze");
     assert_eq!(host.phase(), Phase::Frozen);
 
-    let white = host
-        .vm()
-        .block_ids()
-        .get("core:white")
-        .copied()
-        .expect("the reference mod should register core:white");
+    let id_of = |name: &str| {
+        host.vm()
+            .block_ids()
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| panic!("the reference mods should register {name}"))
+    };
+    let white = id_of("core:white");
+    let ground = id_of("core:ground");
 
-    // Chunk (0, -1, 0) covers world y in -16..0 — entirely below the surface.
+    // Chunk (0, -1, 0) covers world y in -16..0 — entirely below the surface,
+    // so it is NOT uniform any more: the top layer of it is the ground.
     let below = host
         .generate_chunk(0, ChunkPos::new(0, -1, 0), MaterialId::AIR)
         .expect("generate");
     assert_eq!(
         below.is_uniform(),
-        Some(white),
-        "everything below y=0 should be core:white"
+        None,
+        "the chunk holding the surface is a layer of ground over white, not one material"
+    );
+    assert_eq!(
+        below
+            .get_block(tiamot_core::BlockPos::new(0, -1, 0))
+            .expect("in chunk")
+            .subnode(0),
+        ground,
+        "the top block of the world should be the absorbent layer"
+    );
+    assert_eq!(
+        below
+            .get_block(tiamot_core::BlockPos::new(0, -2, 0))
+            .expect("in chunk")
+            .subnode(0),
+        white,
+        "everything under the surface layer should be core:white"
     );
 
     // Chunk (0, 0, 0) covers world y in 0..16 — entirely above it.
@@ -142,9 +164,10 @@ fn generation_is_reproducible_through_the_script_path() {
 ///
 /// 1. **The shipped reference mods.** Proves the actual `game/` directory
 ///    generates identically everywhere. Its generator is a CONSTANT surface, so
-///    every chunk below y=0 hashes the same and every chunk above hashes the
-///    same — only two distinct values across any seed or position. That is
-///    correct for what it is, and it is a weak gate on its own.
+///    there are only THREE distinct values across any seed or position: the
+///    chunk holding the surface layer, a chunk entirely under it, and a chunk
+///    entirely above. That is correct for what it is, and it is a weak gate on
+///    its own.
 /// 2. **A noise-driven fixture**, below. That is where float determinism could
 ///    actually diverge, so that is what the gate has to cover.
 ///
@@ -152,17 +175,27 @@ fn generation_is_reproducible_through_the_script_path() {
 /// apply, and **updating the constant to match is not one of them.**
 #[test]
 fn the_reference_generator_matches_its_golden_hashes() {
-    // Only two distinct values exist, by construction — see above.
-    const BELOW: u64 = 0xf7f8_857e_48f9_2325;
+    // Only three distinct values exist, by construction — see above.
+    //
+    // **Rebaselined 2026-08-26**, when the generator grew a one-block layer of
+    // `core:ground` on top so that milk poured on the reference world has
+    // somewhere to soak. A deliberate change to what the generator PRODUCES is
+    // the sanctioned reason to move these; a difference with no such change is
+    // a float divergence and the constants stay put.
+    // Only SURFACE moved: a chunk entirely under the new layer, and one
+    // entirely above it, hash exactly what they did before. That is the shape
+    // a one-block change should have, and it is worth noticing that it does.
+    const SURFACE: u64 = 0x299b_1a1c_ebd4_b325;
+    const DEEP: u64 = 0xf7f8_857e_48f9_2325;
     const ABOVE: u64 = 0x4564_5dd3_5575_a325;
 
     const GOLDEN: [(u64, i32, i32, i32, u64); 6] = [
-        (0, 0, -1, 0, BELOW),
+        (0, 0, -1, 0, SURFACE),
         (0, 0, 0, 0, ABOVE),
-        (42, 3, -1, -7, BELOW),
-        (42, -100, -5, 100, BELOW),
+        (42, 3, -1, -7, SURFACE),
+        (42, -100, -5, 100, DEEP),
         (7, 0, 1, 0, ABOVE),
-        (u64::MAX, 12, -2, -12, BELOW),
+        (u64::MAX, 12, -2, -12, DEEP),
     ];
 
     tiamot_core::detgen::assert_ieee_mode();
@@ -171,10 +204,9 @@ fn the_reference_generator_matches_its_golden_hashes() {
 
     assert_golden(&mut host, &GOLDEN, "reference mods");
 
-    assert_ne!(
-        BELOW, ABOVE,
-        "the two halves must differ, or this proves nothing"
-    );
+    for (a, b) in [(SURFACE, DEEP), (SURFACE, ABOVE), (DEEP, ABOVE)] {
+        assert_ne!(a, b, "the three shapes must differ, or this proves nothing");
+    }
 }
 
 /// The noise-driven half of the script gate.

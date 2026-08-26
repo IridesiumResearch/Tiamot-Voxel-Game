@@ -362,16 +362,34 @@ fn scooping_a_shallow_puddle_gives_back_a_partial_bucket() {
             "the block holds {there} cells, which is not a partial bucket"
         );
 
+        // **Waited for before it is read, not merely read.** The milk arriving
+        // in the trough says nothing about whether the DEBIT for it has
+        // reached this client — they are two messages — so sampling here
+        // caught the inventory as it was before the first pour was charged,
+        // and the total expected below was then a bucket too high. Red on the
+        // slowest CI runner and nowhere else, which is what that always looks
+        // like.
+        let carried = 2 * tiamot_core::UNITS_PER_BLOCK;
+        assert!(
+            until(&mut bot, Duration::from_secs(20), |bot| {
+                bot.units_of(milk) == carried - tiamot_core::UNITS_PER_BLOCK
+            })
+            .await,
+            "the first pour was never charged: {} units of {carried}",
+            bot.units_of(milk)
+        );
         let before = bot.units_of(milk);
+
         pour_at(&mut bot, ground, milk).await;
 
         assert!(
-            until(&mut bot, Duration::from_secs(15), |bot| bot.units_of(milk)
+            until(&mut bot, Duration::from_secs(20), |bot| bot.units_of(milk)
                 == before + there)
             .await,
-            "a scoop of {there} cells credited {} units rather than {there} — a partial bucket \
-             was either rounded up to a whole one or refused",
-            bot.units_of(milk).saturating_sub(before)
+            "a scoop of {there} cells left {} units rather than {}: a partial bucket was \
+             either rounded up to a whole one or refused",
+            bot.units_of(milk),
+            before + there
         );
 
         bot.disconnect().await;
@@ -394,8 +412,8 @@ fn ground_that_drinks_gets_darker_and_the_milk_it_took_is_accounted_for() {
     block_on(async {
         let mut bot = join(&server, "Pourer").await;
         let milk = milk_id(&bot).await;
-        let ground = material_named(&bot, "core_milk:ground");
-        let damp = material_named(&bot, "core_milk:damp");
+        let ground = material_named(&bot, "core:ground");
+        let damp = material_named(&bot, "core:damp");
         stock_up(&server, &mut bot, milk, 2).await;
 
         let at = BlockPos::new(2, 4, 2);
@@ -434,6 +452,144 @@ fn ground_that_drinks_gets_darker_and_the_milk_it_took_is_accounted_for() {
             .await,
             "the ground turned damp without the puddle losing anything, so absorption \
              created the saturation out of nothing"
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn a_puddle_pooled_out_on_open_ground_soaks_away_and_leaves_the_ground_wet() {
+    // **Reported from the window**: "the water needs to disappear when fully
+    // pooled out, leaving behind a random [number of] saturated blocks
+    // underneath it."
+    //
+    // Both halves matter and they pull opposite ways. The milk has to GO — a
+    // bucket poured on open ground should not leave a permanent film — and the
+    // ground has to KEEP it, or the milk was destroyed rather than absorbed.
+    //
+    // What makes it terminate is that `core:soaked` does not absorb: each block
+    // of ground takes 27 cells, one block's worth, and no more. A puddle
+    // thinned out over a wide area therefore soaks away completely, while a
+    // lake deep enough to swim in wets the ground under it and then stays.
+    let server = start("pooled-out");
+    block_on(async {
+        let mut bot = join(&server, "Pourer").await;
+        let milk = milk_id(&bot).await;
+        stock_up(&server, &mut bot, milk, 1).await;
+
+        // The generated world is a layer of `core:ground` at y = -1 over
+        // `core:white`, so y = 0 is the first air block — `fill_below_heightmap`
+        // fills strictly BELOW the surface it is given. Nothing is seeded here
+        // on purpose: this is what a player standing anywhere and emptying a
+        // bucket actually gets.
+        let at = BlockPos::new(2, 0, 2);
+        bot.move_to(2.0, 0.0, 4.0).await.expect("walk to the pour");
+        pour_at(&mut bot, at, milk).await;
+
+        assert!(
+            until(&mut bot, Duration::from_secs(30), |bot| {
+                bot.fluid_at(at).volume() > 0
+            })
+            .await,
+            "the pour never landed, so there is nothing to watch soak away"
+        );
+
+        // And then it is gone — from the block it was poured into and from
+        // every block it spread to.
+        let footprint: Vec<BlockPos> = (-4..=4)
+            .flat_map(|dx| (-4..=4).map(move |dz| BlockPos::new(at.x + dx, at.y, at.z + dz)))
+            .collect();
+        assert!(
+            until(&mut bot, Duration::from_secs(60), |bot| {
+                footprint.iter().all(|pos| bot.fluid_at(*pos).is_empty())
+            })
+            .await,
+            "milk is still standing on open ground: {:?}",
+            footprint
+                .iter()
+                .map(|pos| bot.fluid_at(*pos).volume())
+                .filter(|volume| *volume > 0)
+                .collect::<Vec<_>>()
+        );
+
+        // **And the ground took it rather than the world losing it.** Without
+        // this the test passes for a solver that quietly deleted the puddle.
+        let damp = material_named(&bot, "core:damp");
+        let soaked = material_named(&bot, "core:soaked");
+        assert!(
+            footprint.iter().any(
+                |pos| became(&bot, BlockPos::new(pos.x, pos.y - 1, pos.z), damp)
+                    || became(&bot, BlockPos::new(pos.x, pos.y - 1, pos.z), soaked)
+            ),
+            "the milk vanished without wetting anything under it"
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn a_spawned_lake_wets_its_bed_and_then_stays() {
+    // **The other half of "water disappears when fully pooled out."** A thin
+    // puddle has to go; a lake must not. What separates them is that
+    // `core:soaked` stops absorbing — every block of bed takes one block's
+    // worth of milk and no more — so a body deep enough to matter wets what is
+    // under it and then holds.
+    //
+    // Also the test for the `lake` chat command itself, which exists because
+    // building a body of milk a bucket at a time is more carrying than anybody
+    // wants to do to look at a shoreline.
+    let server = start("spawned-lake");
+    block_on(async {
+        let mut bot = join(&server, "Pourer").await;
+
+        bot.chat("lake").await.expect("ask for a lake");
+
+        // Somewhere in the basin the mod digs: a few blocks along, at or just
+        // below the surface. Found rather than named, because where the lake
+        // lands depends on where the player is standing.
+        let basin: Vec<BlockPos> = (-12..=12)
+            .flat_map(|dx| {
+                (-12..=12).flat_map(move |dz| (-3..=0).map(move |dy| BlockPos::new(dx, dy, dz)))
+            })
+            .collect();
+        let held = |bot: &Bot| -> u32 { basin.iter().map(|pos| bot.fluid_at(*pos).volume()).sum() };
+
+        assert!(
+            until(&mut bot, Duration::from_secs(30), |bot| held(bot) > 27 * 8).await,
+            "the `lake` command produced no lake worth the name: {} cells",
+            held(&bot)
+        );
+
+        // Now let it settle and soak. It should lose SOME — the bed drinks —
+        // and then stop, rather than draining away like a puddle.
+        let full = held(&bot);
+        for _ in 0..12 {
+            bot.sleep_ticks(20).await;
+        }
+        let settled = held(&bot);
+
+        assert!(
+            settled > 0,
+            "the lake soaked away entirely, so nothing deep can ever stand"
+        );
+        assert!(
+            settled < full,
+            "the bed never drank anything: {full} cells before, {settled} after"
+        );
+
+        // And it has genuinely stopped, rather than being partway through
+        // draining when the test looked.
+        for _ in 0..6 {
+            bot.sleep_ticks(20).await;
+        }
+        assert_eq!(
+            held(&bot),
+            settled,
+            "the lake is still shrinking, so it is a slow puddle rather than a lake"
         );
 
         bot.disconnect().await;

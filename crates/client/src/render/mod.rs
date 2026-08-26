@@ -2159,11 +2159,15 @@ const DROP_HALF: f32 = 0.16;
 
 /// How thick a held or dropped ITEM is, as a share of its width.
 ///
+/// Shared with [`viewmodel`], which draws the SAME sword in first person: two
+/// constants would drift, and a sword that was a picture in one view and a
+/// slab of a different thickness in the other is worse than either.
+///
 /// **Minecraft's number, near enough**, and for the reason Minecraft has one at
 /// all: a picture with no thickness disappears edge-on, and one with a block's
 /// thickness is not a picture any more. An eighth reads as a sword rather than
 /// as a slab.
-const ITEM_THICKNESS: f32 = 0.125;
+pub(crate) const ITEM_THICKNESS: f32 = 0.125;
 
 /// How fast a dropped item turns, in radians per second.
 ///
