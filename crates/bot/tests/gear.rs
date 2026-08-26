@@ -429,6 +429,22 @@ fn a_dropped_stack_can_still_be_picked_up_after_the_world_is_reopened() {
                 bot.recv().await.expect("recv");
             }
 
+            // **Walk away before closing the world.** The settling window is
+            // three seconds and the throw lands a couple of blocks off, so a
+            // player who stands there long enough simply picks it back up —
+            // which is the mod working, and leaves this test with nothing to
+            // reopen. It failed exactly that way under a loaded test run,
+            // where the waiting above takes longer than the window.
+            for _ in 0..40 {
+                let _ = bot.walk([0.0, 0.0, -1.0], 0, 4).await;
+            }
+            let still_dropped = bot.inventory().iter().all(|stack| stack.material != sword);
+            assert!(
+                still_dropped,
+                "the sword was picked back up before the world closed, so the restart proves \
+                 nothing"
+            );
+
             bot.disconnect().await;
             sword
         });
