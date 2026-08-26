@@ -2008,6 +2008,10 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
     // Cloned out because the closure below borrows `app` mutably, and
     // the interface needs to read the atlas layout while it does.
     let tiles = app.tiles().clone();
+    // Cloned out for the same reason the tiles are: the closure below borrows
+    // `app` mutably and the interface has to know which materials are items
+    // while it does. A set of a handful of ids.
+    let items = app.items().clone();
     let atlas_texture = surface.atlas_texture;
     // **Points, not physical pixels.** `client::panel` sizes a sheet and egui
     // lays it out, and both work in points — measuring the window instead made
@@ -2039,7 +2043,7 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
             &context,
             app.dialogs(),
             app.views(),
-            client::icons::Icons::new(atlas_texture, Some(&tiles)),
+            client::icons::Icons::new(atlas_texture, Some(&tiles)).with_items(&items),
             size,
         );
         // **The interface makes its own noise, locally.** A click that waited
@@ -2057,7 +2061,7 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         draw_hud_scripts(
             app,
             &context,
-            client::icons::Icons::new(atlas_texture, Some(&tiles)),
+            client::icons::Icons::new(atlas_texture, Some(&tiles)).with_items(&items),
         );
         if lines.is_empty() && warnings.is_empty() && joined {
             return;

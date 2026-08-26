@@ -2119,6 +2119,7 @@ pub fn held_boxes(
     joint: &[f32; 16],
     shape: u32,
     uv: [f32; 4],
+    item: bool,
 ) -> Vec<Prop> {
     use glam::Mat4;
 
@@ -2130,15 +2131,30 @@ pub fn held_boxes(
         * Mat4::from_cols_array(joint)
         * Mat4::from_translation(glam::Vec3::from(HELD_GRIP));
 
-    boxes_of(&placed, HELD_HALF, shape, uv)
+    boxes_of(&placed, HELD_HALF, shape, uv, item)
 }
 
 /// A stack's boxes, inside a frame something else has placed.
 ///
 /// `half` is the half-extent of the WHOLE block; a cut's cells are a third of
 /// that each, so three of them fill exactly the block one box would have.
-fn boxes_of(placed: &glam::Mat4, half: f32, shape: u32, uv: [f32; 4]) -> Vec<Prop> {
+fn boxes_of(placed: &glam::Mat4, half: f32, shape: u32, uv: [f32; 4], item: bool) -> Vec<Prop> {
     use glam::Mat4;
+
+    // **An item is a picture with a thickness, not a solid.** A sword is not a
+    // cube and drawing it as one wraps the same picture round three faces —
+    // reported from the window as three swords at three angles. One thin slab
+    // instead: a flat sprite from the sides you look at it from, and enough
+    // depth that it is an object rather than a decal.
+    //
+    // A cut never applies: an item is not placeable, so it has no occupancy.
+    if item {
+        return vec![Prop {
+            model: (*placed * Mat4::from_scale(glam::vec3(half, half, half * ITEM_THICKNESS)))
+                .to_cols_array(),
+            uv,
+        }];
+    }
 
     if shape == 0 || shape == tiamot_core::inventory::Shape::ALL {
         return vec![Prop {
@@ -2184,6 +2200,14 @@ const DROP_LIFT: f32 = 0.22;
 /// SEEN from across a room, where a held one is already next to the eye.
 const DROP_HALF: f32 = 0.16;
 
+/// How thick a held or dropped ITEM is, as a share of its width.
+///
+/// **Minecraft's number, near enough**, and for the reason Minecraft has one at
+/// all: a picture with no thickness disappears edge-on, and one with a block's
+/// thickness is not a picture any more. An eighth reads as a sword rather than
+/// as a slab.
+const ITEM_THICKNESS: f32 = 0.125;
+
 /// How fast a dropped item turns, in radians per second.
 ///
 /// Halved from the first attempt, which was reported from the window as too
@@ -2211,12 +2235,12 @@ pub fn spin(seconds: f32, id: u64) -> f32 {
 /// Same geometry as a held one — a cut is its cells, a whole block is one box —
 /// so an item looks the same in a hand, in a slot and on the floor.
 #[must_use]
-pub fn dropped_boxes(at: [f32; 3], yaw: f32, shape: u32, uv: [f32; 4]) -> Vec<Prop> {
+pub fn dropped_boxes(at: [f32; 3], yaw: f32, shape: u32, uv: [f32; 4], item: bool) -> Vec<Prop> {
     use glam::Mat4;
 
     let placed = Mat4::from_translation(glam::vec3(at[0], at[1] + DROP_LIFT, at[2]))
         * Mat4::from_rotation_y(yaw);
-    boxes_of(&placed, DROP_HALF, shape, uv)
+    boxes_of(&placed, DROP_HALF, shape, uv, item)
 }
 
 /// One blob shadow, as the shader reads it.
@@ -2987,7 +3011,7 @@ mod tests {
             phase: 0.0,
             carrying: [false; 2],
         };
-        let boxes = held_boxes(&figure, &joint([3.0, 0.0, 0.0]), 0, [0.0; 4]);
+        let boxes = held_boxes(&figure, &joint([3.0, 0.0, 0.0]), 0, [0.0; 4], false);
         assert_eq!(boxes.len(), 1, "a whole block is one box");
 
         // At yaw zero the figure's axes are the world's, so the hand is its
@@ -3015,7 +3039,7 @@ mod tests {
             phase: 0.0,
             carrying: [false; 2],
         };
-        let boxes = held_boxes(&figure, &joint([3.0, 0.0, 0.0]), 0, [0.0; 4]);
+        let boxes = held_boxes(&figure, &joint([3.0, 0.0, 0.0]), 0, [0.0; 4], false);
         let at = placement(&boxes[0]);
 
         // The hand's own displacement from the body, which is what turned.
@@ -3033,6 +3057,46 @@ mod tests {
     }
 
     #[test]
+    fn a_held_item_is_a_slab_and_a_held_block_is_a_cube() {
+        // The world-space half of the same report: a sword in a hand or on the
+        // floor is a picture with a thickness, not a solid. One box either way,
+        // and the difference is its depth.
+        let figure = skinned::Figure {
+            offset: [0.0; 3],
+            yaw: 0.0,
+            anim: 0,
+            phase: 0.0,
+            carrying: [false; 2],
+        };
+        let block = held_boxes(&figure, &joint([0.0; 3]), 0, [0.0; 4], false);
+        let item = held_boxes(&figure, &joint([0.0; 3]), 0, [0.0; 4], true);
+        assert_eq!(block.len(), 1);
+        assert_eq!(item.len(), 1);
+
+        // The scale is on the diagonal: columns 0, 1 and 2 are x, y and z.
+        let scale = |prop: &Prop| [prop.model[0], prop.model[5], prop.model[10]];
+        let (b, i) = (scale(&block[0]), scale(&item[0]));
+        assert!(
+            (b[0] - b[2]).abs() < 1e-6,
+            "a block is not the same depth as it is wide: {b:?}"
+        );
+        assert!(
+            (i[0] - b[0]).abs() < 1e-6 && (i[1] - b[1]).abs() < 1e-6,
+            "an item is a different size across the face, not just through it: {i:?} against {b:?}"
+        );
+        assert!(
+            i[2].abs() < b[2].abs() * 0.5,
+            "an item is {} deep against a block's {}, which is not a slab",
+            i[2],
+            b[2]
+        );
+        assert!(
+            i[2].abs() > 0.0,
+            "an item with no thickness vanishes edge-on"
+        );
+    }
+
+    #[test]
     fn a_held_cut_is_one_box_per_cell_and_fills_the_block_it_came_from() {
         let figure = skinned::Figure {
             offset: [0.0; 3],
@@ -3042,7 +3106,7 @@ mod tests {
             carrying: [false; 2],
         };
         let mask = 0b111 << 12;
-        let cut = held_boxes(&figure, &joint([0.0; 3]), mask, [0.0; 4]);
+        let cut = held_boxes(&figure, &joint([0.0; 3]), mask, [0.0; 4], false);
         assert_eq!(cut.len(), mask.count_ones() as usize);
 
         // Three cells across is exactly the block one box would have been, in
@@ -3060,7 +3124,7 @@ mod tests {
             }
             (low, high)
         };
-        let whole = held_boxes(&figure, &joint([0.0; 3]), 0, [0.0; 4]);
+        let whole = held_boxes(&figure, &joint([0.0; 3]), 0, [0.0; 4], false);
         let (cut_low, cut_high) = extent(&cut);
         let (whole_low, whole_high) = extent(&whole);
         assert!(
@@ -3076,6 +3140,7 @@ mod tests {
             &joint([0.0; 3]),
             tiamot_core::inventory::Shape::ALL,
             [0.0; 4],
+            false,
         );
         assert_eq!(all.len(), 1);
     }

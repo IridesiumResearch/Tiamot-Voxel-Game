@@ -35,13 +35,41 @@ use crate::texture::TileMap;
 pub struct Icons<'a> {
     texture: Option<egui::TextureId>,
     tiles: Option<&'a TileMap>,
+    /// Materials that may not be placed: the items.
+    ///
+    /// **Because an item is not drawn like a block.** A block is a cube seen
+    /// from a corner and a sword is not — it is a picture of a sword, and
+    /// wrapping that picture around three faces makes three swords at three
+    /// angles. Reported from the window, of exactly that.
+    items: Option<&'a std::collections::BTreeSet<u16>>,
 }
 
 impl<'a> Icons<'a> {
     /// The bridge, from an egui texture id and the atlas layout.
     #[must_use]
     pub const fn new(texture: Option<egui::TextureId>, tiles: Option<&'a TileMap>) -> Self {
-        Self { texture, tiles }
+        Self {
+            texture,
+            tiles,
+            items: None,
+        }
+    }
+
+    /// The same, told which materials are items.
+    ///
+    /// Separate from [`Icons::new`] rather than a fourth argument everywhere: a
+    /// caller with no material table has no items either, and the frames before
+    /// one arrives are exactly when that is true.
+    #[must_use]
+    pub const fn with_items(mut self, items: &'a std::collections::BTreeSet<u16>) -> Self {
+        self.items = Some(items);
+        self
+    }
+
+    /// Whether this material is an item rather than a block.
+    #[must_use]
+    pub fn is_item(&self, material: u16) -> bool {
+        self.items.is_some_and(|items| items.contains(&material))
     }
 
     /// Where a material is, if the atlas is up.
@@ -79,11 +107,32 @@ impl<'a> Icons<'a> {
         material: u16,
         shape: u32,
     ) {
+        // **An item is a picture, not a solid.** A sword drawn as a cube is a
+        // sword wrapped around three faces at three angles, which is what a
+        // player sees and cannot unsee. Flat, filling the slot, the way every
+        // game that has both draws them.
+        if self.is_item(material) {
+            self.paint_flat(painter, rect, material);
+            return;
+        }
         if shape == 0 || shape == tiamot_core::inventory::Shape::ALL {
             self.paint_block(painter, rect, material);
             return;
         }
         self.paint_cells(painter, rect, material, shape);
+    }
+
+    /// Draws a material as a flat picture filling `rect`.
+    ///
+    /// One quad, textured if the atlas is up and tinted if it is not — the same
+    /// fallback everything else here takes, so an item degrades like a block on
+    /// the frames before the material table arrives.
+    pub fn paint_flat(&self, painter: &egui::Painter, rect: egui::Rect, material: u16) {
+        if let Some((texture, uv)) = self.of(material) {
+            painter.image(texture, rect, uv, egui::Color32::WHITE);
+        } else {
+            painter.rect_filled(rect, 2.0, crate::dialog::material_tint(material));
+        }
     }
 
     /// Draws a whole block as a cube seen from a corner.
@@ -247,6 +296,47 @@ mod tests {
         assert!(
             cut > block,
             "a three-cell cut drew {cut} vertices and a whole block drew {block}"
+        );
+    }
+
+    #[test]
+    fn an_item_is_a_flat_picture_and_a_block_is_a_cube() {
+        // **Reported from the window**: the sword appeared "placed on a block,
+        // three of them at different angles". It was — a whole material was
+        // drawn as a cube seen from a corner, and wrapping a picture of a sword
+        // round three faces makes three swords.
+        //
+        // Counted in vertices, as the cube test beside this one is: a flat
+        // picture is one quad and a cube is three, and no arrangement of one
+        // quad makes twelve corners.
+        let tiles = atlas().tiles_only();
+        let items: std::collections::BTreeSet<u16> = [1u16].into_iter().collect();
+        let icons = Icons::new(Some(egui::TextureId::User(3)), Some(&tiles)).with_items(&items);
+        let corners = |drawn: Vec<egui::epaint::Primitive>| {
+            drawn
+                .iter()
+                .map(|primitive| match primitive {
+                    egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                    egui::epaint::Primitive::Callback(_) => 0,
+                })
+                .sum::<usize>()
+        };
+
+        // Material 1 is in the item set, so it is a picture.
+        let item = corners(painted_stack(icons, 0));
+        assert!(
+            item <= 4,
+            "an item drew {item} vertices, which is more than one quad"
+        );
+
+        // The counter-example, and it is the whole test: the SAME call with the
+        // same material, told only that it is not an item, is a cube.
+        let empty = std::collections::BTreeSet::new();
+        let blocks = Icons::new(Some(egui::TextureId::User(3)), Some(&tiles)).with_items(&empty);
+        let block = corners(painted_stack(blocks, 0));
+        assert!(
+            block >= 12,
+            "a block drew {block} vertices, so this test is not comparing two shapes"
         );
     }
 

@@ -2386,6 +2386,7 @@ impl App {
                     &joint,
                     stack.shape,
                     self.tile_of(stack.material),
+                    self.items.contains(&stack.material),
                 ));
             }
         }
@@ -2425,6 +2426,7 @@ impl App {
                 crate::render::spin(now.as_secs_f32(), id),
                 stack.shape,
                 self.tile_of(stack.material),
+                self.items.contains(&stack.material),
             ));
         }
         props
@@ -2919,6 +2921,15 @@ impl App {
     #[must_use]
     pub const fn tiles(&self) -> &crate::texture::TileMap {
         &self.tiles
+    }
+
+    /// Materials that may not be placed: the items.
+    ///
+    /// Read by whatever draws a slot, because an item is drawn flat and a block
+    /// is drawn as a cube — see [`crate::icons::Icons::paint_stack`].
+    #[must_use]
+    pub const fn items(&self) -> &std::collections::BTreeSet<u16> {
+        &self.items
     }
 
     /// Whether the atlas texture is new and needs registering with egui.
