@@ -220,65 +220,137 @@ incremental paths, so the property test holding those two equal covers them.
 
 ---
 
-## 4. Fluid — block resolution
+## 4. Fluid — block resolution, volume in cells of 27
 
-Fluid is block-resolution. It reads sub-node occupancy for one purpose only:
-deciding whether a block is floor.
+Fluid is block-resolution: **one number per block**, never a per-cell mask. That
+number is a **volume in cells of 27** — the same unit as everything else in the
+engine (charter rule 5) — and it is **conserved**.
 
-- A block accepts fluid iff its occupancy is **at or below the registering
-  fluid's threshold**, `register_fluid{ waterlogs_at }`, in cells of 27.
-- A block at or above that threshold is **fluid-solid**: it neither holds nor
-  passes fluid, and a mod may swap it for a different block through
-  `on_fluid_flow` if it wants waterlogging.
-- **There is still exactly one fluid level per block.** A block that is part
-  terrain and part fluid stores one level, and that level is NOT reduced by how
-  much terrain is in the way.
+- A block's **capacity** is `27 − occupancy`. A block one third full of stone
+  holds one third less fluid, and a block at or above the registering fluid's
+  `waterlogs_at` threshold has no usable capacity at all: it is **fluid-solid**,
+  neither holding nor passing fluid. A mod may swap a fluid-solid block for a
+  different one through `on_fluid_flow` if it wants waterlogging.
+- Volume moves between blocks. It is never created. It leaves the world only
+  through a **declared sink**, and every sink is counted (§4.3).
+- Sub-node occupancy is read for exactly two purposes: computing capacity, and
+  deciding whether a block is floor. Nothing else about the lattice is
+  consulted.
 
-### Why the threshold, and what it replaces
+### 4.1 Why cells of 27, and what it retires
 
-This section used to read "a block accepts fluid iff its occupancy is empty",
-which made any block with a single chiselled cell waterproof. That is defensible
-on blocky terrain and wrong on the terrain this engine is for.
+This section used to run levels `1..=7`, Minecraft's number, and carried two
+apologies for it. Both are now gone.
 
-**Sub-node-smoothed terrain has no drops.** A smoothed hillside is a ramp
-*inside* blocks: every column's top block is `Partial`, so under the old rule
-every one of them was fluid-solid, nothing below any of them was a drop, and the
-solver saw a perfectly flat floor. Milk spread as a disc across a hillside,
-floating up to two-thirds of a block above ground that was smooth beneath it.
-Charter rule 19 keeps sub-node terrain and the worldgen plan smooths everything,
-so that is the COMMON case rather than a corner of one.
+**The volume lie is retired.** The old text said, on purpose, that "a block that
+is a third full of stone still holds a whole level of fluid… this is wrong and
+is deliberately not corrected." That was defensible while fluid was
+unconserved — nothing could measure the discrepancy. **Conservation makes it
+observable**: buckets measure volume, so a player can pour a bucket into
+chiselled ground and get more back out. Capacity of `27 − occupancy` is the
+correction, and it costs nothing, because occupancy is already computed for the
+floor test on the same block in the same visit.
 
-### The volume lie, stated on purpose
+**The `24/7` conversion is retired.** Levels had to be converted into
+twenty-sevenths for the mesher's surface height and the physics' submerged
+fraction, both of which speak in cells. Volume in cells *is* that number, so the
+conversion is an identity and the bridging method is gone.
 
-A block that is a third full of stone still holds a whole level of fluid. This
-is wrong and is deliberately not corrected: correcting it means fluid volume per
-sub-node, which is 27× the state and the thing the scope decision ruled out.
+**This does not make fluid sub-node resolution.** There is still exactly one
+volume per block and nothing writes a partial cell mask for fluid. The unit
+changed; the resolution did not. The 27× state cost the scope decision ruled out
+is not reopened by this section.
 
-The decision that makes it acceptable is that fluid quantities are **coarse by
-design** — a bucket holds a third, two thirds, or a full source — so a third of
-a block of unaccounted volume is inside the granularity anything can observe.
+### 4.2 The update rule
+
+Conserved, and applied to one block at a time in a fixed order. Stop early when
+the block empties.
+
+1. **Down first.** Move as much volume as the block below will accept.
+2. **Sideways.** For each horizontal neighbour that can accept fluid and holds
+   less than this block currently holds, lowest-holding first,
+   `transfer = (mine − theirs) / 2` in integer arithmetic, recomputing `mine`
+   after each transfer so a block can never give away more than it has. A
+   difference of one produces a transfer of zero, so **water settles without a
+   separate stability test** — that is the property that makes this terminate.
+3. **Stuck droplets.** A block holding one or two cells cannot split, so on a
+   slope it would leave permanent streaks. If a horizontal neighbour is empty
+   and the block beneath *that* neighbour is not full, move the whole volume
+   there.
+4. **Absorption** (§4.3).
+
+**Direction order is derived from the block's own coordinates, never from the
+tick counter.** A tick-derived rotation has to be persisted or a reloaded world
+diverges from a fresh one, and it makes every block in the world favour the same
+side on the same tick, which reads as a pulse across a large pond. Coordinates
+are stateless, survive reload, and decorrelate neighbours.
+
+**Unloaded neighbours are solid.** `Neighbourhood::occupancy` returns `None` for
+anything not loaded, and `None` is not zero: a flood must not run off the edge
+of the loaded world and a pond must not drain into a chunk that has not arrived.
+
+There are **no source blocks**. An infinite spring is a conservation violation
+by definition, so `flow_range`, `renews_from` and the source flag are gone with
+the model that needed them. Standing bodies of water large enough that draining
+them matters are a future mechanism, deliberately deferred — see §4.5.
+
+### 4.3 Declared sinks, and why they are counted
+
+Conservation with no sinks is a world that only ever gets wetter. Two sinks are
+allowed, and **the solver reports how much each one destroyed** rather than
+silently discarding it:
+
+- **Absorption.** Fluid touching a block a mod has declared absorbent loses
+  volume to it. What "absorbent" means, how much is lost, and what the block
+  turns into are the mod's (charter rule 1) — saturation is expressed as
+  **registered materials**, `dirt` → `damp_dirt` → `saturated_dirt`, not as
+  engine state bits. Chunks are palette-compressed so three materials are very
+  nearly free, the mod owns the darker texture, and a mod may give saturated
+  sand different behaviour from saturated dirt without the engine knowing what
+  porosity is.
+- **Evaporation.** A block with air above it may lose volume on a random tick.
+
+Both randomness sources are engine-provided seeded streams
+(`world_seed + chunk_coords + stream_name`, charter rule 4). A process RNG here
+fails the cross-platform hash gate — or worse, does not, and two servers drift.
+
+The conservation invariant charter rule 15 requires is therefore
+**`volume in = volume still present + absorbed + evaporated`**, which is only
+expressible because the sinks are counted. A solver that destroyed volume
+without reporting it would make the proptest unwritable.
+
+### 4.4 Surface height, and the block above
+
+Rendered surface height and the physics' submerged fraction are both
+`volume / 27` directly.
+
+**A block with fluid above it renders full, with no surface.** Only the topmost
+block of a body of fluid has a surface, which is what a body of water looks
+like. The old rule capped a full block at 24 cells of 27 so that a brim-full
+block still showed a surface below the block above it — a hack for a waterfall
+reading as a solid column. Conservation removes the need for it: falling fluid
+genuinely holds little volume per block, so a waterfall is thin because it is
+thin, not because the renderer was told to lie about it.
+
+### 4.5 What is deferred, and why it is safe to defer
+
+Large standing bodies of water — oceans — want a mask and a global sea level
+rather than physical blocks, because simulating an ocean block by block is
+ruinous and because a conserved ocean drains into the first cave anybody digs
+under it. That mechanism is **deliberately not built yet**.
+
+It is safe to defer because **no reference generator produces standing water**:
+every drop in a world comes out of a player's bucket. The day worldgen grows an
+ocean is the day this section needs its other half, and that is a mechanism
+task, not a tuning pass.
 
 ### Implemented by
 
 `crates/core/src/fluid/` — `Neighbourhood::occupancy` reports how full a block
-is, and the solver compares that against the fluid's own threshold. The world
-reports a fact; the policy lives with the fluid, so two fluids in one world may
-disagree about what counts as floor.
-
-### Depth, in sub-node units
-
-Fluid is stored per block, but two systems need to know how *full* a block is in
-the same units everything else speaks (charter rule 5): the mesher's surface
-height and the physics' submerged fraction. `Fluid::depth_units` is that bridge.
-
-- Level `n` of 7 fills `n × 24 / 7` cells of the block's 27.
-- **A full block is 24 cells, not 27.** A brim-full block still shows a surface
-  below the block above it; filling all 27 would make a waterfall read as a
-  solid column of milk rather than as falling milk.
-
-This is a presentation and physics convenience derived from the level. It is not
-sub-node fluid state — there is still exactly one level per block, and nothing
-writes a partial cell mask for fluid.
+is, the fluid's own `waterlogs_at` decides what that means for floor, and
+`Fluid::capacity` turns it into how much will fit. The world reports a fact; the
+policy lives with the fluid, so two fluids in one world may disagree about what
+counts as floor.
 
 ---
 
