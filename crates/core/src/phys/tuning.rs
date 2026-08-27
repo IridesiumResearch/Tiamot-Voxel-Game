@@ -182,11 +182,22 @@ impl Tuning {
         walk_speed: speed(4.3),
         sprint_speed: speed(5.6),
         sneak_speed: speed(1.3),
-        ground_friction: 0.6,
+        // **A little slide.** Reported from the window as wanting movement to
+        // start and stop softly rather than snapping: "a tiny bit of slide...
+        // when you stop the player slides just a tiny bit to make it feel more
+        // interactive and smooth."
+        //
+        // Was 0.6. Stopping distance is `v × f / (1 − f)`, so this takes it
+        // from about a third of a block to about half — noticeable underfoot
+        // and nowhere near ice. The acceleration below is derived from it and
+        // MUST move with it, or the top speed changes as a side effect.
+        ground_friction: 0.7,
         air_drag: 0.91,
         // Derived from the friction and the walk speed: a = v × (1 − f) / f.
-        // 0.645 × 0.4 / 0.6.
-        ground_acceleration: 0.43,
+        // 0.645 × 0.3 / 0.7. Lower than it was because the friction is higher,
+        // which is what keeps the top speed where it was — and is also what
+        // gives the start its ramp rather than a step.
+        ground_acceleration: 0.276_428_58,
         air_acceleration: 0.06,
         step_height: 1.0,
         buoyancy: 1.25,
@@ -246,6 +257,45 @@ impl Gait {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_acceleration_and_the_friction_still_settle_at_the_walk_speed() {
+        // **The pair that must move together.** A body accelerating against a
+        // friction settles at `a × f / (1 − f)`, so changing one alone changes
+        // the TOP SPEED as a side effect — which is how "a tiny bit of slide"
+        // would quietly become "and everybody walks faster".
+        //
+        // Asserted rather than commented, because the derivation lives in a
+        // comment beside two literals and nothing else was checking it.
+        let tuning = Tuning::DEFAULT;
+        let settled =
+            tuning.ground_acceleration * tuning.ground_friction / (1.0 - tuning.ground_friction);
+        assert!(
+            (settled - tuning.walk_speed).abs() < 0.005,
+            "acceleration {} against friction {} settles at {settled}, not the walk speed {}",
+            tuning.ground_acceleration,
+            tuning.ground_friction,
+            tuning.walk_speed
+        );
+    }
+
+    #[test]
+    fn a_body_slides_a_little_after_the_keys_are_released() {
+        // The reported feel, as a distance. `v × f / (1 − f)` is how far a body
+        // travels once nothing is driving it: far enough to notice underfoot
+        // and nowhere near ice.
+        let tuning = Tuning::DEFAULT;
+        let slide = tuning.walk_speed * tuning.ground_friction / (1.0 - tuning.ground_friction);
+        let cells = f32::from(u8::try_from(crate::SUBNODES_PER_AXIS).unwrap_or(3));
+        assert!(
+            slide > cells * 0.3,
+            "a stop of {slide} cells is not a slide anybody can feel"
+        );
+        assert!(
+            slide < cells * 0.9,
+            "a stop of {slide} cells is most of a block: that is ice, not a slide"
+        );
+    }
 
     #[test]
     fn the_jump_speed_clears_a_block_and_a_quarter() {

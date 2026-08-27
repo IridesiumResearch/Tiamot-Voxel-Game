@@ -433,15 +433,20 @@ const ENGINE_ACTIONS: &[(&str, &str, Option<Input>)] = &[
         "Sneak",
         Some(Input::Key(KeyCode::ShiftLeft)),
     ),
-    (
-        "engine:sneak_alt",
-        "Sneak (alternate)",
-        Some(Input::Key(KeyCode::ControlLeft)),
-    ),
+    // **No default any more**, because sprint took Left Control. It stays a
+    // registered action so a bindings file naming it still resolves and so it
+    // can be put back on a key by hand — removing it outright would silently
+    // drop a binding somebody had chosen.
+    ("engine:sneak_alt", "Sneak (alternate)", None),
+    // **Left Control, not Right Shift.** Sprinting has existed since Task 09
+    // and was reported from the window as missing, because nobody presses the
+    // right-hand shift key: it is the one modifier a hand on WASD cannot reach.
+    // Left Control is where every other game puts it, and Left Shift is
+    // already sneak.
     (
         "engine:sprint",
         "Sprint",
-        Some(Input::Key(KeyCode::ShiftRight)),
+        Some(Input::Key(KeyCode::ControlLeft)),
     ),
     (
         "engine:dig",
@@ -627,6 +632,49 @@ const ENGINE_ACTIONS: &[(&str, &str, Option<Input>)] = &[
         Some(Input::Key(KeyCode::KeyG)),
     ),
 ];
+
+#[cfg(test)]
+mod default_binding_tests {
+    use super::*;
+
+    /// Every engine action that ships with a key, as `(id, key)`.
+    fn bound() -> Vec<(&'static str, Input)> {
+        ENGINE_ACTIONS
+            .iter()
+            .filter_map(|(id, _, default)| default.map(|key| (*id, key)))
+            .collect()
+    }
+
+    #[test]
+    fn sprint_is_on_a_key_a_hand_on_wasd_can_reach() {
+        // **Reported from the window as missing.** Sprinting has existed since
+        // Task 09 and was bound to RIGHT shift — the one modifier a hand on
+        // WASD cannot reach, so nobody ever pressed it.
+        let key = bound()
+            .into_iter()
+            .find(|(id, _)| *id == "engine:sprint")
+            .map(|(_, key)| key)
+            .expect("sprint ships with a key");
+        assert_ne!(
+            key,
+            Input::Key(KeyCode::ShiftRight),
+            "sprint is back on the key nobody found"
+        );
+    }
+
+    #[test]
+    fn no_two_engine_actions_ship_on_one_key() {
+        // Two actions on one default key is a control that silently does
+        // something else — the clash `35f75c1` made the client say out loud,
+        // asserted here so the shipped set never has one to warn about.
+        let mut seen: std::collections::BTreeMap<Input, &str> = std::collections::BTreeMap::new();
+        for (id, key) in bound() {
+            if let Some(held) = seen.insert(key, id) {
+                panic!("`{held}` and `{id}` both default to {key:?}");
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -4112,6 +4112,8 @@ impl App {
             self.camera.position = Position::from_world(eye[0], eye[1], eye[2]);
         }
 
+        self.follow_speed(dt);
+
         // **The body's position is set in both views; only its VISIBILITY
         // changes.**
         //
@@ -4306,6 +4308,79 @@ impl App {
             }
         }
         self.renderer.set_blobs(&blobs);
+    }
+
+    /// The camera's field of view this frame, in radians.
+    ///
+    /// Exposed so a session test can watch it respond to movement: the whole
+    /// point of it is a thing a player feels, and "it looked right" is not a
+    /// gate anything can run.
+    #[must_use]
+    pub const fn fov(&self) -> f32 {
+        self.camera.fov_y
+    }
+
+    /// Widens the view with speed, and eases it back.
+    ///
+    /// **Reported from the window**: wanting movement to read as movement —
+    /// "when you start walking the camera zooms out just by a tiny bit", and
+    /// sprinting "should have an even more extreme fov change... make the fov
+    /// based on my speed."
+    ///
+    /// So it is the speed and not the gait. A gait is what you asked the server
+    /// for; speed is what the world let you have, so wading, being underwater
+    /// and being shoved all read correctly without any of them being special
+    /// cases here.
+    ///
+    /// Charter rule 4 exempts presentation from the float subset, and this is
+    /// as presentational as it gets: nothing here reaches the simulation, and
+    /// two machines disagreeing about a camera angle by a millionth is nobody's
+    /// problem.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "charter rule 4 exempts presentation; `exp` here eases a camera angle and \
+                  reaches nothing the simulation reads"
+    )]
+    fn follow_speed(&mut self, dt: f32) {
+        /// How much wider the view gets at a full sprint, in radians.
+        ///
+        /// Twelve degrees at the top end. Small enough that walking is a hint
+        /// rather than a lurch — the widening is proportional, so an ordinary
+        /// walk gets about two thirds of it.
+        const GAIN: f32 = 0.209;
+        /// How fast the view catches up, as a fraction of the gap per second.
+        ///
+        /// Eased rather than set, because the speed itself steps at 20 Hz and a
+        /// field of view that stepped with it would strobe. Slower coming back
+        /// than going out: a stop should settle rather than snap.
+        const OUT: f32 = 9.0;
+        const BACK: f32 = 5.0;
+
+        let base = self.config.fov_degrees.to_radians();
+        let Some(predictor) = self.predictor.as_ref() else {
+            self.camera.fov_y = base;
+            return;
+        };
+
+        // Horizontal only, and against the SPRINT speed so the scale is the
+        // fastest a body goes on foot. Falling is not travelling, and a player
+        // dropping down a shaft should not have the world flare open at them.
+        let velocity = predictor.body().velocity;
+        let speed = (velocity[0] * velocity[0] + velocity[2] * velocity[2]).sqrt();
+        let top = phys::Tuning::DEFAULT.sprint_speed;
+        let share = if top > 0.0 {
+            (speed / top).min(1.0)
+        } else {
+            0.0
+        };
+
+        let want = base + GAIN * share;
+        let rate = if want > self.camera.fov_y { OUT } else { BACK };
+        // Frame-rate independent easing: the fraction of the gap closed in one
+        // second is the same whatever the frame rate, which is the whole reason
+        // this is not `+= gap * 0.1`.
+        let eased = 1.0 - (-rate * dt.max(0.0)).exp();
+        self.camera.fov_y += (want - self.camera.fov_y) * eased;
     }
 
     /// Which clip the player's own figure is playing.

@@ -2213,3 +2213,57 @@ fn the_hotbar_is_the_first_slots_of_the_players_own_inventory() {
     app.shutdown();
     assert!(server.stop());
 }
+
+#[test]
+fn the_view_widens_as_you_move_and_eases_back_when_you_stop() {
+    // **Reported from the window**: "when you start walking the camera zooms
+    // out (fov) just by a tiny bit... sprinting should have an even more
+    // extreme fov change. make the fov based on my speed."
+    //
+    // Driven by SPEED rather than by the gait, so wading and being shoved read
+    // correctly without any of them being a special case — and so the number
+    // this asserts is the one a player actually sees.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("speed-fov");
+    let mut app = client("speed-fov", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+    run_real_time(&mut app, 0.5, Input::default());
+    let still = app.fov();
+
+    let walking = Input {
+        forward: 1.0,
+        ..Input::default()
+    };
+    run_real_time(&mut app, 1.0, walking);
+    let walked = app.fov();
+    assert!(
+        walked > still,
+        "walking did not widen the view: {walked} against {still} standing"
+    );
+
+    // Sprinting is further out, because it is faster — not because it is a
+    // different case.
+    let sprinting = Input {
+        forward: 1.0,
+        sprint: true,
+        ..Input::default()
+    };
+    run_real_time(&mut app, 1.5, sprinting);
+    let sprinted = app.fov();
+    assert!(
+        sprinted > walked,
+        "sprinting was no wider than walking: {sprinted} against {walked}"
+    );
+
+    // And it comes back. Given time, because it eases rather than snapping —
+    // a field of view that stepped with the 20 Hz tick would strobe.
+    run_real_time(&mut app, 2.0, Input::default());
+    let stopped = app.fov();
+    assert!(
+        (stopped - still).abs() < 1e-3,
+        "the view stayed at {stopped} after stopping, against {still} standing"
+    );
+}

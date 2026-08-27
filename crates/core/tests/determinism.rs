@@ -109,7 +109,15 @@ fn golden_fingerprints_match() {
 /// fell in. The script this hash covers walks, sprints AND sneaks, so its
 /// trajectory legitimately moves. The worldgen and light goldens pass unchanged
 /// again, which is the check that says the change stayed inside `phys`.
-const PHYSICS_GOLDEN: u64 = 3_534_023_337_547_755_370;
+///
+/// Regenerated a third time, case 3 again, when the ground friction went 0.6 →
+/// 0.7 to give movement a little slide and the ground acceleration moved with
+/// it to hold the top speed where it was. Reported from the window as wanting
+/// starts and stops to feel soft rather than snapped. The script this hash
+/// covers walks and sprints, so every trajectory in it legitimately moves; the
+/// worldgen, light and fluid goldens all pass unchanged, which is what says the
+/// change stayed inside `phys`.
+const PHYSICS_GOLDEN: u64 = 445_538_206_318_146_463;
 
 /// Runs the fixed physics scenario and hashes every tick of it.
 ///
