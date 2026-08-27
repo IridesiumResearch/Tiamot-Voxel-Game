@@ -336,21 +336,24 @@ pub fn placement_mask(units: u32) -> u32 {
     }
 
     let mut mask = 0;
-    let mut placed = 0;
-    // y outermost is what makes it bottom-up; the inner two are the canonical
-    // index order so the result is a contiguous run of indices per layer.
-    'fill: for y in 0..crate::SUBNODES_PER_AXIS {
-        for z in 0..crate::SUBNODES_PER_AXIS {
-            for x in 0..crate::SUBNODES_PER_AXIS {
-                if placed == units {
-                    break 'fill;
-                }
-                mask |= 1 << crate::block::subnode_index(x, y, z);
-                placed += 1;
-            }
-        }
+    for index in fill_order().take(units as usize) {
+        mask |= 1 << index;
     }
     mask
+}
+
+/// The order a block is filled in: bottom layer first, then the canonical index
+/// order within each layer.
+///
+/// **Shared with `place::plan`**, which fills the GAPS in a partly-mined block
+/// and has to use the same order or a half-placed block would look different
+/// depending on how it got that way.
+pub fn fill_order() -> impl Iterator<Item = usize> {
+    (0..crate::SUBNODES_PER_AXIS).flat_map(|y| {
+        (0..crate::SUBNODES_PER_AXIS).flat_map(move |z| {
+            (0..crate::SUBNODES_PER_AXIS).map(move |x| crate::block::subnode_index(x, y, z))
+        })
+    })
 }
 
 /// What breaking a block yields.

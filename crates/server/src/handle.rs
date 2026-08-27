@@ -1931,8 +1931,26 @@ impl ServerHandle {
                             // client that knows nothing about shapes sends.
                             let shape = tiamot_core::inventory::Shape::new(request.shape);
 
+                            // **What the target block already holds.** A block
+                            // brush fills the gaps in a partly-mined block
+                            // rather than colliding with what is left of it —
+                            // reported from the window as placing against a
+                            // half-mined block doing nothing and saying there
+                            // was already something there.
+                            let filled = world
+                                .block_cells(request.target.block(), &mut source)
+                                .map_or(0, |cells| {
+                                    let mut mask = 0;
+                                    for (index, cell) in cells.iter().enumerate() {
+                                        if !cell.is_air() {
+                                            mask |= 1 << index;
+                                        }
+                                    }
+                                    mask
+                                });
+
                             let outcome =
-                                tiamot_core::place::plan(request.target, held, shape, brush)
+                                tiamot_core::place::plan(request.target, held, shape, brush, filled)
                                 .and_then(|plan| {
                                     // Air only, judged cell by cell. Placing
                                     // into occupied space would have to decide

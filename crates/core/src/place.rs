@@ -98,14 +98,20 @@ pub struct Placement {
 /// crate's tests would otherwise have to fabricate to test 27 lines of bit
 /// twiddling.
 ///
+/// `filled` is what the target block already holds, as a 27-bit mask. A BLOCK
+/// brush fills the cells that are empty in it — see below — and the other two
+/// forms ignore it, because the caller still checks every cell they name.
+///
 /// # Errors
 ///
-/// [`Refusal::NothingHeld`] if `held` is zero.
+/// [`Refusal::NothingHeld`] if `held` is zero, or [`Refusal::Occupied`] if a
+/// block brush is aimed at a block with no room left in it.
 pub fn plan(
     target: SubNodePos,
     held: u32,
     shape: Option<crate::inventory::Shape>,
     brush: Brush,
+    filled: u32,
 ) -> Result<Placement, Refusal> {
     if held == 0 {
         return Err(Refusal::NothingHeld);
@@ -132,10 +138,37 @@ pub fn plan(
             units: 1,
         }),
         Brush::Block => {
-            let units = held.min(UNITS_PER_BLOCK);
+            // **The EMPTY cells, not the first N.** Reported from the window:
+            // placing a block against one that had been partly mined said
+            // "there is already something there" and did nothing, because the
+            // mask was a bottom-up run that overlapped what was left.
+            //
+            // A block brush means "make this block whole", so it fills what is
+            // missing and charges for exactly that. Holding less than the gap
+            // fills as much of it as there is, bottom-up, which is what
+            // `placement_mask` has always meant by an amount.
+            let empty = !filled & crate::block::OCCUPANCY_FULL;
+            if empty == 0 {
+                return Err(Refusal::Occupied);
+            }
+            let room = empty.count_ones();
+            let units = held.min(room);
+            // Take the lowest `units` empty cells: walk the same bottom-up
+            // order a whole block is filled in, keeping only the gaps.
+            let mut occupancy = 0;
+            let mut placed = 0;
+            for index in crate::inventory::fill_order() {
+                if placed == units {
+                    break;
+                }
+                if empty & (1 << index) != 0 {
+                    occupancy |= 1 << index;
+                    placed += 1;
+                }
+            }
             Ok(Placement {
                 block: target.block(),
-                occupancy: crate::inventory::placement_mask(units),
+                occupancy,
                 units,
             })
         }
@@ -299,11 +332,90 @@ fn last_cell_touched(high: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_block_brush_fills_what_a_dig_took_out() {
+        // **Reported from the window**: placing a block against one that had
+        // been partly mined said "there is already something there" and did
+        // nothing. The mask was a bottom-up run of the first N cells, which
+        // overlaps whatever is left of a half-mined block — so the caller's
+        // per-cell emptiness check refused it every time.
+        //
+        // A block brush means "make this block whole".
+        let dug = crate::inventory::placement_mask(9);
+        let filled = crate::block::OCCUPANCY_FULL & !dug;
+
+        let placed = plan(cell(0, 0, 0), UNITS_PER_BLOCK, None, Brush::Block, filled)
+            .expect("held a whole block");
+
+        assert_eq!(
+            placed.occupancy & filled,
+            0,
+            "the placement overlaps cells that are already there"
+        );
+        assert_eq!(
+            placed.occupancy | filled,
+            crate::block::OCCUPANCY_FULL,
+            "the block should end up whole"
+        );
+        assert_eq!(
+            placed.units,
+            UNITS_PER_BLOCK - filled.count_ones(),
+            "charged for the gap it filled and no more"
+        );
+    }
+
+    #[test]
+    fn holding_less_than_the_gap_fills_as_much_as_there_is() {
+        let filled = crate::inventory::placement_mask(9);
+        let placed = plan(cell(0, 0, 0), 4, None, Brush::Block, filled).expect("held four");
+
+        assert_eq!(placed.units, 4);
+        assert_eq!(placed.occupancy.count_ones(), 4);
+        assert_eq!(
+            placed.occupancy & filled,
+            0,
+            "it filled cells that were taken"
+        );
+    }
+
+    #[test]
+    fn a_block_with_no_room_left_is_still_refused() {
+        // Filling nothing is not a placement, and charging for it would be a
+        // conservation hole.
+        assert_eq!(
+            plan(
+                cell(0, 0, 0),
+                UNITS_PER_BLOCK,
+                None,
+                Brush::Block,
+                crate::block::OCCUPANCY_FULL
+            ),
+            Err(Refusal::Occupied)
+        );
+    }
+
+    #[test]
+    fn a_shaped_stack_still_places_its_own_shape_into_a_gapped_block() {
+        // A cut IS the thing being placed, so it is not reshaped to fit what is
+        // missing — the caller's per-cell check refuses an overlap, which is
+        // right: half a stair is not a stair.
+        let shape = crate::inventory::Shape::new(0b111).expect("three cells");
+        let placed = plan(
+            cell(0, 0, 0),
+            UNITS_PER_BLOCK,
+            Some(shape),
+            Brush::Block,
+            crate::inventory::placement_mask(9),
+        )
+        .expect("held plenty");
+        assert_eq!(placed.occupancy, shape.occupancy());
+    }
+
+    #[test]
     fn a_shaped_stack_places_its_shape_and_costs_its_cells() {
         use crate::inventory::Shape;
 
         let shape = Shape::new(0b1_0101).expect("three cells");
-        let placed = plan(cell(0, 0, 0), 100, Some(shape), Brush::Block).expect("held plenty");
+        let placed = plan(cell(0, 0, 0), 100, Some(shape), Brush::Block, 0).expect("held plenty");
         assert_eq!(
             placed.occupancy,
             shape.occupancy(),
@@ -319,7 +431,7 @@ mod tests {
         // thing being placed, so a tool changes what you take out of the world
         // and not what you put back — otherwise a whole stair's worth of
         // somebody's work buys one cell of stone.
-        let chiselled = plan(cell(1, 1, 1), 100, Some(shape), Brush::SubNode).expect("held");
+        let chiselled = plan(cell(1, 1, 1), 100, Some(shape), Brush::SubNode, 0).expect("held");
         assert_eq!(chiselled.occupancy, shape.occupancy());
         assert_eq!(chiselled.units, shape.cells());
     }
@@ -332,10 +444,16 @@ mod tests {
         // to decide which half, and there is no answer to that.
         let shape = Shape::new(0b1_1111).expect("five cells");
         assert!(matches!(
-            plan(cell(0, 0, 0), shape.cells() - 1, Some(shape), Brush::Block),
+            plan(
+                cell(0, 0, 0),
+                shape.cells() - 1,
+                Some(shape),
+                Brush::Block,
+                0
+            ),
             Err(Refusal::NothingHeld)
         ));
-        assert!(plan(cell(0, 0, 0), shape.cells(), Some(shape), Brush::Block).is_ok());
+        assert!(plan(cell(0, 0, 0), shape.cells(), Some(shape), Brush::Block, 0).is_ok());
     }
 
     use super::*;
@@ -347,8 +465,8 @@ mod tests {
 
     #[test]
     fn a_full_block_of_units_places_a_solid_block() {
-        let plan =
-            plan(cell(0, 0, 0), UNITS_PER_BLOCK, None, Brush::Block).expect("27 units is a block");
+        let plan = plan(cell(0, 0, 0), UNITS_PER_BLOCK, None, Brush::Block, 0)
+            .expect("27 units is a block");
         assert_eq!(plan.units, UNITS_PER_BLOCK);
         assert_eq!(plan.occupancy.count_ones(), UNITS_PER_BLOCK);
     }
@@ -357,8 +475,14 @@ mod tests {
     fn more_than_a_block_still_places_exactly_one() {
         // The surplus stays in the inventory. Placing two blocks' worth into
         // one block would destroy 27 units.
-        let plan =
-            plan(cell(0, 0, 0), UNITS_PER_BLOCK * 3 + 4, None, Brush::Block).expect("plenty held");
+        let plan = plan(
+            cell(0, 0, 0),
+            UNITS_PER_BLOCK * 3 + 4,
+            None,
+            Brush::Block,
+            0,
+        )
+        .expect("plenty held");
         assert_eq!(
             plan.units, UNITS_PER_BLOCK,
             "a placement consumed more than the block it filled"
@@ -370,7 +494,7 @@ mod tests {
         // The behaviour the chisel scenario depends on: 13 units is not a
         // block, and the answer is 13 cells rather than "you cannot".
         let plan =
-            plan(cell(0, 0, 0), 13, None, Brush::Block).expect("13 units is a partial block");
+            plan(cell(0, 0, 0), 13, None, Brush::Block, 0).expect("13 units is a partial block");
         assert_eq!(plan.units, 13);
         assert_eq!(plan.occupancy.count_ones(), 13);
         assert_ne!(
@@ -383,7 +507,7 @@ mod tests {
     #[test]
     fn holding_nothing_is_refused() {
         assert_eq!(
-            plan(cell(0, 0, 0), 0, None, Brush::Block),
+            plan(cell(0, 0, 0), 0, None, Brush::Block, 0),
             Err(Refusal::NothingHeld)
         );
     }
@@ -395,7 +519,7 @@ mod tests {
         for x in 0..3 {
             for y in 0..3 {
                 for z in 0..3 {
-                    let plan = plan(cell(x, y, z), 27, None, Brush::SubNode).expect("held");
+                    let plan = plan(cell(x, y, z), 27, None, Brush::SubNode, 0).expect("held");
                     assert_eq!(plan.units, 1, "a sub-node placement spent more than a unit");
                     assert_eq!(
                         plan.occupancy.count_ones(),
@@ -418,7 +542,7 @@ mod tests {
         // `%` on a negative coordinate is negative, which indexes the wrong
         // cell — or shifts by a negative amount and panics. The same trap
         // `Hit::block` documents, and it only reproduces west of the origin.
-        let plan = plan(cell(-1, -1, -1), 27, None, Brush::SubNode).expect("held");
+        let plan = plan(cell(-1, -1, -1), 27, None, Brush::SubNode, 0).expect("held");
         assert_eq!(plan.block, BlockPos::new(-1, -1, -1));
         let filled: Vec<[i64; 3]> = occupied_cells(&plan).collect();
         assert_eq!(
@@ -432,8 +556,8 @@ mod tests {
     fn a_subnode_brush_places_one_unit_however_much_is_held() {
         // A chisel is precision, not throughput: holding a hundred units does
         // not fill a hundred cells, and holding one is enough.
-        let many = plan(cell(1, 1, 1), 500, None, Brush::SubNode).expect("held");
-        let one = plan(cell(1, 1, 1), 1, None, Brush::SubNode).expect("held");
+        let many = plan(cell(1, 1, 1), 500, None, Brush::SubNode, 0).expect("held");
+        let one = plan(cell(1, 1, 1), 1, None, Brush::SubNode, 0).expect("held");
         assert_eq!(many, one, "how much was held changed a sub-node placement");
         assert_eq!(one.units, 1);
     }
@@ -444,11 +568,11 @@ mod tests {
         // fixed (bottom-up) so that it cannot depend on where the player was
         // looking, which would make the same action produce different geometry.
         // Deliberately NOT true of a sub-node brush — see the test above.
-        let first = plan(cell(0, 0, 0), 5, None, Brush::Block).expect("held");
+        let first = plan(cell(0, 0, 0), 5, None, Brush::Block, 0).expect("held");
         for x in 0..3 {
             for y in 0..3 {
                 for z in 0..3 {
-                    let other = plan(cell(x, y, z), 5, None, Brush::Block).expect("held");
+                    let other = plan(cell(x, y, z), 5, None, Brush::Block, 0).expect("held");
                     assert_eq!(
                         other, first,
                         "cell {x},{y},{z} planned differently from cell 0,0,0"
@@ -518,7 +642,7 @@ mod tests {
     fn a_placement_inside_a_standing_player_is_refused() {
         // The rule that stops a player being sealed into a block, and stops one
         // player entombing another.
-        let plan = plan(cell(3, 0, 3), UNITS_PER_BLOCK, None, Brush::Block).expect("held");
+        let plan = plan(cell(3, 0, 3), UNITS_PER_BLOCK, None, Brush::Block, 0).expect("held");
         let feet = Aabb::player_at([4.0, 1.0, 4.0]);
         assert!(
             blocks_a_body(&plan, &[(ChunkPos::new(0, 0, 0), feet)]),
@@ -530,7 +654,7 @@ mod tests {
     fn a_placement_beside_a_player_is_allowed() {
         // The counter-example that makes the test above mean something: if the
         // check were "always true" it would pass just as well.
-        let plan = plan(cell(30, 0, 30), UNITS_PER_BLOCK, None, Brush::Block).expect("held");
+        let plan = plan(cell(30, 0, 30), UNITS_PER_BLOCK, None, Brush::Block, 0).expect("held");
         let feet = Aabb::player_at([4.0, 1.0, 4.0]);
         assert!(
             !blocks_a_body(&plan, &[(ChunkPos::new(0, 0, 0), feet)]),
@@ -543,7 +667,7 @@ mod tests {
         // A body resting on a surface has its minimum exactly on the boundary.
         // Counting that as "inside" would make it impossible to place a block
         // against the ground anyone is standing on — which is most placements.
-        let plan = plan(cell(0, 0, 0), UNITS_PER_BLOCK, None, Brush::Block).expect("held");
+        let plan = plan(cell(0, 0, 0), UNITS_PER_BLOCK, None, Brush::Block, 0).expect("held");
         // Feet exactly on the top face of the block filling cells 0..3.
         let standing = Aabb::player_at([1.5, 3.0, 1.5]);
         assert!(
@@ -565,6 +689,7 @@ mod tests {
             UNITS_PER_BLOCK,
             None,
             Brush::Block,
+            0,
         )
         .expect("held");
         let body = Aabb::player_at([4.0, 1.0, 4.0]);
@@ -583,7 +708,7 @@ mod tests {
         // Bottom-up fill means a few spare nodes occupy the bottom layer only,
         // so a player whose feet are above that layer is not in the way. A
         // check that used the whole block's extent would refuse this.
-        let plan = plan(cell(0, 0, 0), 3, None, Brush::Block).expect("held");
+        let plan = plan(cell(0, 0, 0), 3, None, Brush::Block, 0).expect("held");
         assert_eq!(plan.occupancy.count_ones(), 3);
         let above = Aabb::player_at([1.5, 1.0, 1.5]);
         assert!(
@@ -603,7 +728,14 @@ mod tests {
         // Head height, not just feet: sealing someone's head in is as bad as
         // sealing their feet, and the body is 5.4 cells tall.
         let head_cell = PLAYER_HEIGHT as i32 - 1;
-        let plan = plan(cell(0, head_cell, 0), UNITS_PER_BLOCK, None, Brush::Block).expect("held");
+        let plan = plan(
+            cell(0, head_cell, 0),
+            UNITS_PER_BLOCK,
+            None,
+            Brush::Block,
+            0,
+        )
+        .expect("held");
         let body = Aabb::player_at([1.5, 0.0, 1.5]);
         assert!(
             blocks_a_body(&plan, &[(ChunkPos::new(0, 0, 0), body)]),

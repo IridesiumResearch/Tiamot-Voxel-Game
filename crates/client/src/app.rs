@@ -1912,11 +1912,42 @@ impl App {
     fn held_dig_target(&self) -> Option<tiamot_core::SubNodePos> {
         if self.locks_onto_a_block()
             && let Some(locked) = self.dig_lock
-            && self.block_has_material(locked)
+            && let Some(to_block) = self.toward(locked)
+            && keeps_lock(
+                to_block,
+                self.camera.forward().into(),
+                self.block_has_material(locked),
+            )
         {
             return Some(locked);
         }
         self.dig_target()
+    }
+
+    /// From the eye to the centre of a cell's block, in cells.
+    ///
+    /// `None` before there is a body to look from.
+    fn toward(&self, cell: tiamot_core::SubNodePos) -> Option<[f32; 3]> {
+        let predictor = self.predictor.as_ref()?;
+        let origin = predictor.origin();
+        let span = tiamot_core::CHUNK_SUBNODES as i32;
+        let eye = predictor.body().eye();
+        let block = cell.block();
+        // The block's middle, in the predictor's own chunk frame — the same
+        // space `looking_at` casts its ray in.
+        let axis = |world: i32, chunk: i32| {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a cell offset within a few chunks of the player"
+            )]
+            let corner = (world * tiamot_core::SUBNODES_PER_AXIS as i32 - chunk * span) as f32;
+            corner + 1.5
+        };
+        Some([
+            axis(block.x, origin.x) - eye[0],
+            axis(block.y, origin.y) - eye[1],
+            axis(block.z, origin.z) - eye[2],
+        ])
     }
 
     /// Whether the tool in hand takes whole blocks.
@@ -4929,6 +4960,86 @@ fn shared_defaults(actions: &crate::input::Actions) -> Vec<(String, String)> {
         }
     }
     clashes
+}
+/// Whether a held dig keeps chewing the block it started on.
+///
+/// # What the lock is for, and what it was doing wrong
+///
+/// Holding the button re-aims every frame, so without a lock a block that
+/// finished being dug would hand the crosshair straight to the one behind it and
+/// a held button would bore a tunnel. The lock keeps a dig on ONE block until
+/// that block is gone.
+///
+/// It used to hold on that condition alone — "the block still has something in
+/// it" — which is why walking forward with the button down kept eating the
+/// block behind you instead of taking the next one. Reported from the window:
+/// *"the previous block gets deleted before the next one; it should grab each
+/// next block as I walk."*
+///
+/// # Why it is not "the crosshair is still on it"
+///
+/// That was the first fix and it broke the case the lock exists for. A half-dug
+/// block lets the ray through, so the crosshair lands on the block BEHIND while
+/// the locked one still has material, and the dig tunnels —
+/// `a_held_dig_finishes_its_block_before_looking_through_the_hole` failed
+/// immediately and said so.
+///
+/// So the question is where the block IS, not what the ray hits: a dig holds
+/// while the block is still in FRONT of the player. Looking through a hole you
+/// made keeps it ahead of you; walking past it puts it behind, and the next
+/// block is taken.
+///
+/// `to_block` runs from the eye to the locked block's centre and `forward` is
+/// where the camera looks. Neither needs normalising, because only the SIGN of
+/// the dot product is read.
+fn keeps_lock(to_block: [f32; 3], forward: [f32; 3], block_has_material: bool) -> bool {
+    if !block_has_material {
+        return false;
+    }
+    let ahead = to_block[0] * forward[0] + to_block[1] * forward[1] + to_block[2] * forward[2];
+    ahead > 0.0
+}
+
+#[cfg(test)]
+mod dig_lock_tests {
+    use super::*;
+
+    /// Looking north, which is `+z`.
+    const NORTH: [f32; 3] = [0.0, 0.0, 1.0];
+
+    #[test]
+    fn a_dig_follows_you_to_the_next_block_as_you_walk() {
+        // **The reported bug.** The lock held on "the block still has something
+        // in it" alone, so walking forward with the button down kept eating the
+        // block behind you until it was gone. Walking past it puts it behind.
+        assert!(
+            !keeps_lock([0.0, 0.0, -4.0], NORTH, true),
+            "the block is behind the player and the dig stayed on it"
+        );
+    }
+
+    #[test]
+    fn looking_through_the_hole_you_made_keeps_the_block() {
+        // The case the lock exists for, and the one a "crosshair is still on
+        // it" rule broke: a half-dug block lets the ray through to the one
+        // behind, and dropping the lock there bores a tunnel.
+        assert!(keeps_lock([0.0, 0.0, 3.0], NORTH, true));
+    }
+
+    #[test]
+    fn an_empty_block_releases_the_crosshair() {
+        // What the lock exists to end: once the block is gone the next one is
+        // chosen normally, however squarely it is still being looked at.
+        assert!(!keeps_lock([0.0, 0.0, 3.0], NORTH, false));
+    }
+
+    #[test]
+    fn a_block_beside_you_is_already_let_go() {
+        // Exactly abeam is not in front. Walking along a wall reaches this the
+        // moment the block passes the shoulder, which is when the next one
+        // should be taken.
+        assert!(!keeps_lock([4.0, 0.0, 0.0], NORTH, true));
+    }
 }
 
 #[cfg(test)]
