@@ -1347,6 +1347,55 @@ impl Shared {
         }
     }
 
+    /// The inventory a player who has never played here would get.
+    ///
+    /// The template a stored blob is laid over — this session's views, at the
+    /// sizes this session's mods registered.
+    #[must_use]
+    pub fn fresh_inventory(&self) -> tiamot_core::inventory::Slots {
+        tiamot_core::inventory::Slots::for_player_with(&self.views)
+    }
+
+    /// Replaces a player's whole inventory, and tells their client.
+    ///
+    /// **How a saved inventory gets back in.** Loading happens on the tick
+    /// thread, which is where the world database is; this is the door into the
+    /// endpoint's own copy. Marks the inventory dirty, because a client that
+    /// joined a moment earlier has already been sent the empty one.
+    pub fn restore_inventory(&self, uuid: PlayerUuid, slots: tiamot_core::inventory::Slots) {
+        if let Ok(mut inventories) = self.inventories.lock() {
+            inventories.insert(uuid, slots);
+        }
+        if let Ok(mut dirty) = self.inventory_dirty.lock() {
+            dirty.insert(uuid);
+        }
+    }
+
+    /// Every player's inventory, for saving.
+    ///
+    /// A snapshot, taken under the lock and handed out by value: the caller is
+    /// the tick thread and must not hold this lock while it writes to a
+    /// database.
+    #[must_use]
+    pub fn all_inventories(&self) -> Vec<(PlayerUuid, tiamot_core::inventory::Slots)> {
+        self.inventories
+            .lock()
+            .map(|inventories| {
+                inventories
+                    .iter()
+                    .map(|(uuid, slots)| (*uuid, slots.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Forgets a player's inventory, once it has been written.
+    pub fn forget_inventory(&self, uuid: &PlayerUuid) {
+        if let Ok(mut inventories) = self.inventories.lock() {
+            inventories.remove(uuid);
+        }
+    }
+
     /// A player's slots, for a dialog to click on.
     #[must_use]
     pub fn slots_of(&self, uuid: &PlayerUuid) -> Option<tiamot_core::inventory::Slots> {

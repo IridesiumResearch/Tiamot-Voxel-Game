@@ -418,6 +418,72 @@ impl World {
         self.db.materials().to_runtime(world).ok()
     }
 
+    /// Reads a player's saved inventory, translated into this session's ids.
+    ///
+    /// `None` for somebody who has never played here, which is not an error —
+    /// it is what a first join looks like, and the caller keeps the fresh
+    /// inventory it already built. The count is how many stacks could not be
+    /// restored, so the caller can say so out loud.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the row cannot be read or does not decode.
+    pub fn load_player_slots(
+        &self,
+        uuid: &tiamot_core::PlayerUuid,
+        template: &inventory::Slots,
+    ) -> Result<Option<(inventory::Slots, usize)>, WorldError> {
+        let Some(blob) = self.db.load_player(&uuid.to_hex())? else {
+            return Ok(None);
+        };
+        // The version is the first byte, written by `save_player_slots`. A
+        // blob shorter than that is a row somebody truncated.
+        let Some((&version, rest)) = blob.split_first() else {
+            return Err(WorldError::Player {
+                player: uuid.to_hex(),
+                reason: "the stored row is empty".to_owned(),
+            });
+        };
+        tiamot_core::persist::playerdata::decode(version, rest, template, self.db.materials())
+            .map(Some)
+            .map_err(|source| WorldError::Player {
+                player: uuid.to_hex(),
+                reason: source.to_string(),
+            })
+    }
+
+    /// Writes a player's inventory, in world ids.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the row cannot be written.
+    pub fn save_player_slots(
+        &self,
+        uuid: &tiamot_core::PlayerUuid,
+        slots: &inventory::Slots,
+    ) -> Result<(), WorldError> {
+        let (bytes, dropped) = tiamot_core::persist::playerdata::encode(slots, self.db.materials());
+        if dropped > 0 {
+            tracing::warn!(
+                player = %uuid.to_hex(),
+                dropped,
+                "some stacks hold a material this world cannot name and were not saved"
+            );
+        }
+        // **The version travels WITH the blob**, in its first byte, rather than
+        // in the `version` column: `WorldDb::save_player` takes both, and
+        // keeping them together means a row read by anything else still says
+        // what shape it is.
+        let mut row = Vec::with_capacity(bytes.len() + 1);
+        row.push(tiamot_core::persist::playerdata::PLAYER_FORMAT_VERSION);
+        row.extend_from_slice(&bytes);
+        self.db.save_player(
+            &uuid.to_hex(),
+            tiamot_core::persist::playerdata::PLAYER_FORMAT_VERSION,
+            &row,
+        )
+    }
+
     #[must_use]
     pub fn resident(&self, pos: ChunkPos) -> Option<&Chunk> {
         self.cache.get(&pos)

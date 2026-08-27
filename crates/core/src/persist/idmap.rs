@@ -223,6 +223,33 @@ impl MaterialMap {
         }
     }
 
+    /// A map from an explicit list of `(runtime, world)` pairs.
+    ///
+    /// **For a caller that has a mapping and no database**: tests that need the
+    /// two id spaces to differ, which is the only way to catch a translation
+    /// that was quietly the identity. A real map comes from
+    /// [`IdTable::reconcile`], against the world's own `id_map` table.
+    #[must_use]
+    pub fn from_pairs(pairs: &[(MaterialId, u16)]) -> Self {
+        let width = pairs
+            .iter()
+            .map(|(runtime, _)| runtime.get() as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut runtime_to_world = vec![Self::UNMAPPED; width];
+        let mut world_to_runtime = BTreeMap::new();
+        for &(runtime, world) in pairs {
+            runtime_to_world[runtime.get() as usize] = world;
+            world_to_runtime.insert(world, runtime);
+        }
+        Self {
+            runtime_to_world,
+            world_to_runtime,
+            unknown: BTreeSet::new(),
+            passthrough: false,
+        }
+    }
+
     fn build(table: &IdTable, registry: &Registry, unknown: BTreeSet<MaterialId>) -> Self {
         let mut runtime_to_world = vec![Self::UNMAPPED; registry.len()];
         let mut world_to_runtime = BTreeMap::new();

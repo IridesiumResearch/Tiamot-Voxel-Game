@@ -34,6 +34,7 @@ pub mod codec;
 pub mod fluidmap;
 pub mod idmap;
 pub mod migrate;
+pub mod playerdata;
 pub mod schema;
 
 use std::path::{Path, PathBuf};
@@ -146,6 +147,15 @@ pub enum WorldError {
         mod_id: String,
         /// Which key.
         key: String,
+        /// Why.
+        reason: String,
+    },
+
+    /// A stored player row could not be read.
+    #[error("player `{player}`: {reason}")]
+    Player {
+        /// Whose row, as hex.
+        player: String,
         /// Why.
         reason: String,
     },

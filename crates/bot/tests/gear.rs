@@ -498,3 +498,72 @@ fn a_dropped_stack_can_still_be_picked_up_after_the_world_is_reopened() {
     });
     server.stop();
 }
+
+#[test]
+fn what_a_player_carries_survives_the_world_closing() {
+    // **Measured before it was fixed**: a bot got a sword, disconnected, the
+    // server restarted, and it rejoined with an empty inventory.
+    //
+    //     BEFORE: [StackDef { material: 9, units: 27, shape: 0 }]
+    //     AFTER:  []
+    //
+    // `WorldDb::save_player` and `load_player` existed in the persistence layer
+    // and nothing in the server called them — inventories lived in memory on
+    // the endpoint and were rebuilt empty at join. In singleplayer, quitting to
+    // the menu stops the server, so everything a player carried went with it
+    // every session.
+    let world = scratch("inventory-restart");
+    let seed = Identity::generate().expect("identity").seed();
+    let sword;
+    let before;
+
+    {
+        let server = start_at(world.clone());
+        (sword, before) = block_on(async {
+            let mut bot = join_as(&server, "Keeper", Identity::from_seed(&seed)).await;
+            let sword = material_of(&bot, "core_gear:sword");
+
+            bot.chat("gear").await.expect("ask");
+            let deadline = tokio::time::Instant::now() + PATIENCE;
+            loop {
+                if bot.inventory().iter().any(|stack| stack.material == sword) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the reference item never arrived"
+                );
+                bot.recv().await.expect("recv");
+            }
+            let before = bot.units_of(sword);
+            assert!(before > 0, "nothing to carry across the restart");
+
+            bot.disconnect().await;
+            (sword, before)
+        });
+        // **Stopped with the player still on it**, which is the case the
+        // leave-diff cannot cover: nobody watches the tick see them go when the
+        // server is the thing going away.
+        server.stop();
+    }
+
+    let server = start_at(world);
+    block_on(async {
+        let mut bot = join_as(&server, "Keeper", Identity::from_seed(&seed)).await;
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            if bot.units_of(sword) == before {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "came back carrying {} units of {} rather than {before}",
+                bot.units_of(sword),
+                sword
+            );
+            let _ = bot.walk([0.0; 3], 0, 2).await;
+        }
+        bot.disconnect().await;
+    });
+    server.stop();
+}

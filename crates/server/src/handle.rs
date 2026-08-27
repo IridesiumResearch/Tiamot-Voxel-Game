@@ -1574,6 +1574,35 @@ impl ServerHandle {
                             // was iterating them.
                             for uuid in &present {
                                 if known_players.insert(*uuid) {
+                                    // **What they were carrying when they last
+                                    // left.** Loaded here rather than at the
+                                    // handshake because this is the thread the
+                                    // world database is on; the client has
+                                    // already been sent the empty inventory a
+                                    // moment ago, and `restore_inventory`
+                                    // marks it dirty so the real one follows.
+                                    match world.load_player_slots(
+                                        uuid,
+                                        &shared.fresh_inventory(),
+                                    ) {
+                                        Ok(Some((slots, dropped))) => {
+                                            if dropped > 0 {
+                                                warn!(
+                                                    player = %uuid.to_hex(),
+                                                    dropped,
+                                                    "some stored stacks could not be restored"
+                                                );
+                                            }
+                                            shared.restore_inventory(*uuid, slots);
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => {
+                                            error!(
+                                                player = %uuid.to_hex(),
+                                                "could not read a saved inventory: {err}"
+                                            );
+                                        }
+                                    }
                                     joined.push(tiamot_core::script::JoinEvent {
                                         player: *uuid.as_bytes(),
                                         name: shared
@@ -1595,6 +1624,24 @@ impl ServerHandle {
                                     if !present.contains(uuid) {
                                         screens.forget_player(&uuid.to_hex());
                                     }
+                                }
+                            }
+                            // **And what they were carrying goes to disk.**
+                            // Driven by who IS here rather than by a disconnect
+                            // event, exactly as the body above is: a
+                            // disconnection the tick never saw would otherwise
+                            // lose an inventory rather than a mirror.
+                            for uuid in &known_players {
+                                if !present.contains(uuid) {
+                                    if let Some(slots) = shared.slots_of(uuid)
+                                        && let Err(err) = world.save_player_slots(uuid, &slots)
+                                    {
+                                        error!(
+                                            player = %uuid.to_hex(),
+                                            "could not save an inventory: {err}"
+                                        );
+                                    }
+                                    shared.forget_inventory(uuid);
                                 }
                             }
                             known_players.retain(|uuid| present.contains(uuid));
@@ -2763,6 +2810,19 @@ impl ServerHandle {
                     // case a player has every right to expect nothing is.
                     {
                         flush_mod_storage(&world, &mod_storage);
+                        // **Everybody still connected.** A clean shutdown is
+                        // the one case a player has every right to expect
+                        // nothing is lost, and the leave-diff above only fires
+                        // for somebody the tick SAW go — which nobody does when
+                        // the server stops under them.
+                        for (uuid, slots) in shared.all_inventories() {
+                            if let Err(err) = world.save_player_slots(&uuid, &slots) {
+                                error!(
+                                    player = %uuid.to_hex(),
+                                    "could not save an inventory on shutdown: {err}"
+                                );
+                            }
+                        }
                         let mobs = population.write().expect("entity lock").take_dirty();
                         if !mobs.is_empty()
                             && let Err(err) = world
