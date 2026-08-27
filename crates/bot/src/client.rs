@@ -1325,37 +1325,20 @@ impl Bot {
     /// Whether a cell edit setting `pos` to `material` has been broadcast.
     #[must_use]
     pub fn saw_subnode(&self, pos: tiamot_core::SubNodePos, material: u16) -> bool {
-        // **Every edit that could have filled that cell, not just the one
-        // spelling.** A cell can arrive as a `SubNode`, inside a `Partial`'s
-        // mask, or as a whole `Block` — asking only about the first makes this
-        // a question about the MESSAGE rather than about the world, and a
-        // change to how a placement is written then reads as the placement not
-        // happening.
-        let cell = 1
-            << tiamot_core::block::subnode_index(
-                pos.x.rem_euclid(3) as u32,
-                pos.y.rem_euclid(3) as u32,
-                pos.z.rem_euclid(3) as u32,
-            );
+        // **A SUB-NODE edit at that cell, which is what the name asks.** It is
+        // deliberately not "is that cell now this material": the edit that
+        // seeded a block also made every cell of it solid, so a broader
+        // question cannot tell a placement from the terrain it was aimed at.
+        // A test about a multi-cell placement reads the `Partial` itself —
+        // `placing_a_cut_stack_puts_that_cut_in_the_world` is the example.
         self.received().iter().any(|message| {
-            let ServerMessage::BlockDelta { edit, .. } = message else {
-                return false;
-            };
-            match edit {
-                tiamot_core::proto::Edit::SubNode {
-                    pos: at,
-                    material: got,
-                } => *at == pos && *got == material,
-                tiamot_core::proto::Edit::Partial {
-                    pos: at,
-                    material: got,
-                    occupancy,
-                } => *at == pos.block() && *got == material && occupancy & cell != 0,
-                tiamot_core::proto::Edit::Block {
-                    pos: at,
-                    material: got,
-                } => *at == pos.block() && *got == material,
-            }
+            matches!(
+                message,
+                ServerMessage::BlockDelta {
+                    edit: tiamot_core::proto::Edit::SubNode { pos: at, material: got },
+                    ..
+                } if *at == pos && *got == material
+            )
         })
     }
 

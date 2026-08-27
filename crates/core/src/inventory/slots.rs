@@ -458,7 +458,11 @@ impl Slots {
             if slot.material != stack.material || slot.shape != stack.shape {
                 continue;
             }
-            let giving = stack.units.min(u32::MAX - slot.units);
+            // **A slot holds one stack and no more.** What does not fit falls
+            // through to the next matching slot, then to an empty one, then to
+            // a slot the view grows for it.
+            let room = slot.capacity().saturating_sub(slot.units);
+            let giving = stack.units.min(room);
             if giving > 0
                 && let Ok(part) = stack.split(giving)
                 && slot.merge(part).is_err()
@@ -469,10 +473,20 @@ impl Slots {
                 return true;
             }
         }
-        if let Some(empty) = self.views[at].slots.iter_mut().find(|slot| slot.is_none()) {
-            *empty = Some(stack);
-        } else {
-            self.views[at].slots.push(Some(stack));
+        // A stack bigger than one slot holds is laid out over as many as it
+        // needs, rather than being refused or quietly truncated.
+        let cap = stack.capacity();
+        while !stack.is_empty() {
+            // Never fails: the amount asked for is the smaller of what is left
+            // and one slot's worth.
+            let Ok(part) = stack.split(stack.units.min(cap)) else {
+                break;
+            };
+            if let Some(empty) = self.views[at].slots.iter_mut().find(|slot| slot.is_none()) {
+                *empty = Some(part);
+            } else {
+                self.views[at].slots.push(Some(part));
+            }
         }
         true
     }
@@ -1023,6 +1037,71 @@ mod tests {
         assert!(
             held > PLAYER_MAIN_SLOTS,
             "the view should have grown past its starting size, got {held}"
+        );
+    }
+
+    #[test]
+    fn a_slot_holds_ninety_of_a_thing_and_the_rest_spills_over() {
+        // Asked for from the window: "let's make stacks 90 blocks". Counted in
+        // THINGS — ninety blocks of loose stone and ninety stairs are both one
+        // stack, so the cap in units differs and the count a player sees does
+        // not.
+        let mut inv = Slots {
+            views: vec![View::empty("player:main", 4)],
+            grab: Grab::default(),
+        };
+        let whole = crate::inventory::ITEMS_PER_STACK * UNITS_PER_BLOCK;
+        assert!(inv.insert(
+            "player:main",
+            Stack::new(MaterialId(3), whole + UNITS_PER_BLOCK).expect("stack")
+        ));
+        let slots: Vec<u32> = inv
+            .view("player:main")
+            .expect("main")
+            .slots
+            .iter()
+            .flatten()
+            .map(|stack| stack.units)
+            .collect();
+        assert_eq!(
+            slots,
+            vec![whole, UNITS_PER_BLOCK],
+            "ninety-one blocks should be a full stack and one block over"
+        );
+        assert_eq!(
+            inv.total_units(),
+            u64::from(whole + UNITS_PER_BLOCK),
+            "capping a slot lost material"
+        );
+    }
+
+    #[test]
+    fn a_stack_of_stairs_is_ninety_stairs_and_not_ninety_blocks_of_them() {
+        let cut = crate::inventory::Shape::new(0b11111).expect("a cut");
+        let one = cut.cells();
+        let mut inv = Slots {
+            views: vec![View::empty("player:main", 4)],
+            grab: Grab::default(),
+        };
+        assert!(
+            inv.insert(
+                "player:main",
+                Stack::shaped(MaterialId(3), cut, crate::inventory::ITEMS_PER_STACK + 1)
+                    .expect("stack")
+            )
+        );
+        let slots: Vec<u32> = inv
+            .view("player:main")
+            .expect("main")
+            .slots
+            .iter()
+            .flatten()
+            .map(|stack| stack.units)
+            .collect();
+        assert_eq!(
+            slots,
+            vec![crate::inventory::ITEMS_PER_STACK * one, one],
+            "a stack of stairs should hold ninety stairs, whatever a stair costs"
         );
     }
 

@@ -280,6 +280,12 @@ impl Stack {
     pub const fn display(&self) -> (u32, u32) {
         display(self.units)
     }
+
+    /// How many units of this a single slot holds.
+    #[must_use]
+    pub const fn capacity(&self) -> u32 {
+        stack_capacity(self.shape)
+    }
 }
 
 /// Splits a unit count into whole blocks and spare nodes.
@@ -305,6 +311,30 @@ pub const fn items(units: u32, shape: u32) -> Option<u32> {
     // so the division is guarded against a value that never arrives rather than
     // a case anything reaches.
     units.checked_div(shape.count_ones())
+}
+
+/// How many of a thing one slot holds.
+///
+/// **Counted in things, not units.** Ninety blocks of stone and ninety stairs
+/// are both a full stack, which is what a player means by one — a cap written
+/// in units would make a stack of stairs five times deeper than a stack of
+/// slabs for no reason anyone could see.
+///
+/// A slot that is full does not refuse what will not fit: the rest goes into
+/// the next slot, and the view grows if it has to. Nothing is ever lost to a
+/// cap.
+pub const ITEMS_PER_STACK: u32 = 90;
+
+/// The unit cap for one slot holding material cut to `shape`.
+///
+/// `None` is loose material, where the thing being counted is a block.
+#[must_use]
+pub const fn stack_capacity(shape: Option<Shape>) -> u32 {
+    let per_item = match shape {
+        Some(shape) => shape.cells(),
+        None => UNITS_PER_BLOCK,
+    };
+    ITEMS_PER_STACK * per_item
 }
 
 /// `(units / 27, units % 27)` — charter rule 5's display rule, in one place so
