@@ -35,6 +35,7 @@ pollster.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+socket2.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

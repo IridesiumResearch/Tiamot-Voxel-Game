@@ -793,6 +793,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "server",
+ "socket2",
  "symphonia",
  "thiserror 2.0.19",
  "tiamot-core",

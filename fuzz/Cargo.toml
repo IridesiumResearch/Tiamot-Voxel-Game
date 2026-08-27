@@ -72,3 +72,10 @@ path = "fuzz_targets/dialog_schema.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "beacon_decode"
+path = "fuzz_targets/beacon_decode.rs"
+test = false
+doc = false
+bench = false

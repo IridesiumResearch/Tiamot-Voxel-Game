@@ -17,6 +17,7 @@
 //! is [`crate::launcher`]'s and is tested without a window. What is here is the
 //! egui, the tab the player is on, and the one [`Action`] a frame produces.
 
+use crate::discovery::Discovery;
 use crate::launcher::{Catalogue, Entry, Kind, Library, Mismatch};
 
 /// Which page is showing.
@@ -86,6 +87,12 @@ pub struct Front {
     /// Where the interface-scale slider has been dragged to and not let go of.
     /// See [`crate::widget::settle`].
     scale_draft: Option<f32>,
+    /// Worlds heard on the local network, when the port could be opened.
+    ///
+    /// **Started with the screen and dropped with it**, so nothing listens
+    /// while a world is being played — a client in a world is not looking for
+    /// one, and a socket held open for the session is a socket to explain.
+    network: Option<Discovery>,
     /// Whether opening a local world should also listen for other machines.
     ///
     /// **Off by default, and deliberately.** A world that quietly accepted
@@ -109,6 +116,7 @@ impl Front {
             name,
             address: String::new(),
             confirming: None,
+            network: Discovery::start(),
             settings_dirty: false,
             catalogue_dirty: false,
             scale_draft: None,
@@ -296,7 +304,8 @@ impl Front {
                 action = self.remember_typed();
             }
         });
-        action
+
+        self.network_list(ui).unwrap_or(action)
     }
 
     /// The mod list: a box each, and a box at the top for all of them.
@@ -327,6 +336,70 @@ impl Front {
         // starts worlds from the one it kept, so a tick had to be carried back
         // across; see `Front::take_catalogue_dirty`.
         self.catalogue_dirty |= changed;
+    }
+
+    /// Worlds heard on the local network, and a way into one.
+    ///
+    /// Returns an action only when one was clicked, so the caller keeps
+    /// whatever it already had. Its own function because `play_tab` is long
+    /// enough without it, and because this half has nothing to do with the
+    /// library the rest of that tab is about.
+    fn network_list(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        let mut action = None;
+        // **Nobody types an address to join the machine next to them.** The
+        // report this is here for: "I don't want kids to have to type in a LAN
+        // server address." A world someone on this network has opened puts
+        // itself on this list; joining is one click and the ordinary join.
+        ui.add_space(10.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("On your network");
+            match &self.network {
+                Some(_) => ui.weak("listening"),
+                None => ui.weak("not listening — another program has the port"),
+            };
+        });
+        let worlds = self
+            .network
+            .as_ref()
+            .map(Discovery::worlds)
+            .unwrap_or_default();
+        if worlds.is_empty() {
+            ui.weak("Nothing found yet. A world has to be opened to the LAN to appear here.");
+        }
+        for world in worlds {
+            ui.horizontal(|ui| {
+                // A name from another machine, drawn as ONE label so it cannot
+                // be mistaken for the interface around it, and already filtered
+                // of anything that could rewrite the line (`discover::decode`).
+                let label = format!(
+                    "🖧  {}  —  {}/{} players",
+                    world.name, world.players, world.max_players
+                );
+                if world.compatible {
+                    if ui.button(label).clicked() {
+                        action = Some(Action::Open(Entry {
+                            name: world.name.clone(),
+                            kind: Kind::Remote {
+                                address: world.address.to_string(),
+                            },
+                            // A server somebody else runs decides its own mod
+                            // set and says so at join; this list is not a
+                            // claim about it.
+                            mods: Vec::new(),
+                            last_played: crate::launcher::now_seconds(),
+                        }));
+                    }
+                } else {
+                    // Shown and refused rather than hidden: "that world is a
+                    // different version" is an answer, and a world missing
+                    // from the list is a mystery.
+                    ui.add_enabled(false, egui::Button::new(label));
+                    ui.weak("different version");
+                }
+            });
+        }
+        action
     }
 
     /// The mod-set warning, when one is waiting.

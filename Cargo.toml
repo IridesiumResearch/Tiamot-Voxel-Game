@@ -42,6 +42,10 @@ publish = false
 # target platforms. Render, window, audio, and UI crates belong to `client`
 # alone; add them under the "client-only" heading below.
 [workspace.dependencies]
+# `SO_REUSEADDR` on the LAN discovery port, which `std::net` has no way to
+# set. Already in the tree under quinn; this makes it a direct dependency
+# rather than a second copy.
+socket2 = "0.6"
 # --- shared ---------------------------------------------------------------
 thiserror = "2.0"
 

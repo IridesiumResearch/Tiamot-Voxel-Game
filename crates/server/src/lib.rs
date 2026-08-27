@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod announce;
 pub mod cert;
 pub mod checkmods;
 pub mod config;

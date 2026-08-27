@@ -41,6 +41,7 @@ pub mod cache;
 pub mod camera;
 pub mod config;
 pub mod dialog;
+pub mod discovery;
 pub mod entities;
 pub mod front;
 pub mod icons;

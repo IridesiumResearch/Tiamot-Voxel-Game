@@ -138,3 +138,89 @@ fn a_world_kept_to_this_machine_admits_one_player() {
     });
     server.stop();
 }
+
+#[test]
+fn an_open_world_says_it_is_here_on_the_network() {
+    // **The other half of the report**: "I don't want kids to have to type in
+    // a LAN server address. I want them to be able to detect LAN servers."
+    // Binding to every interface makes a world reachable; this is what makes
+    // it findable.
+    //
+    // Listened for with a plain socket and decoded with the engine's own
+    // parser, so what is checked is the datagram that actually goes out and
+    // not a round trip through the code that sent it.
+    let server = start("announced", "127.0.0.1:0", 8);
+    let listening = match std::net::UdpSocket::bind(std::net::SocketAddr::from((
+        [0, 0, 0, 0],
+        tiamot_core::discover::PORT,
+    ))) {
+        Ok(socket) => socket,
+        Err(err) => {
+            // Another test binary on this machine has the port. Not a failure
+            // of the thing being tested.
+            eprintln!("skipped: the discovery port could not be opened here: {err}");
+            server.stop();
+            return;
+        }
+    };
+    listening
+        .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+        .expect("a read timeout");
+
+    let announcing = server
+        .announce("Ada's world")
+        .expect("a world should be able to announce itself");
+
+    let mut buffer = [0u8; tiamot_core::discover::MAX_DATAGRAM];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let heard = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an announcing world sent nothing in ten seconds"
+        );
+        let Ok((read, _)) = listening.recv_from(&mut buffer) else {
+            continue;
+        };
+        if let Some(beacon) = tiamot_core::discover::Beacon::decode(&buffer[..read]) {
+            break beacon;
+        }
+    };
+
+    assert_eq!(heard.name, "Ada's world");
+    assert_eq!(
+        heard.port,
+        server.local_addr().port(),
+        "the beacon named a port nothing is listening on"
+    );
+    assert_eq!(heard.max_players, 8);
+    assert_eq!(
+        heard.protocol,
+        tiamot_core::proto::PROTOCOL_VERSION,
+        "a beacon that did not say which protocol it speaks"
+    );
+
+    // **And it stops.** A beacon outliving its server advertises an address
+    // nothing answers on, which is a worse experience than not being listed:
+    // the player picks it and waits for a timeout.
+    announcing.stop();
+    let quiet_from = std::time::Instant::now();
+    let mut last_heard = None;
+    while std::time::Instant::now() - quiet_from < std::time::Duration::from_secs(3) {
+        let Ok((read, _)) = listening.recv_from(&mut buffer) else {
+            continue;
+        };
+        if tiamot_core::discover::Beacon::decode(&buffer[..read])
+            .is_some_and(|beacon| beacon.name == "Ada's world")
+        {
+            last_heard = Some(std::time::Instant::now());
+        }
+    }
+    if let Some(last) = last_heard {
+        assert!(
+            last - quiet_from < std::time::Duration::from_millis(1_500),
+            "the world was still announcing itself more than a second after being stopped"
+        );
+    }
+
+    server.stop();
+}

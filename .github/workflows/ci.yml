@@ -274,6 +274,15 @@ jobs:
             --target x86_64-unknown-linux-gnu \
             -- -max_total_time=60 -rss_limit_mb=2048
 
+      # The only parser in the engine that reads from a machine nobody chose
+      # to talk to: an open UDP port that anything on the network can write to,
+      # before a player has decided to join anything at all.
+      - name: Fuzz the discovery beacon (smoke)
+        run: |
+          cargo +nightly fuzz run beacon_decode \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=60 -rss_limit_mb=2048
+
       # **The crashing input, or the finding is only a stack trace.**
       # `fuzz/artifacts/` is gitignored, so until this existed a crash found
       # only on CI could not be reproduced without re-fuzzing locally and

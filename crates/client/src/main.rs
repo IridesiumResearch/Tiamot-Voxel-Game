@@ -219,6 +219,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         present_mode: "",
         connection,
         embedded,
+        beacon: None,
         window: None,
         held: Held::default(),
         bindings: Some(bindings),
@@ -456,6 +457,11 @@ struct Client {
     connection: Option<Connection>,
     /// Kept alive for as long as the client runs. Dropping it stops the world.
     embedded: Option<tiamot_server::ServerHandle>,
+    /// Saying this world is here, while it is open to the network.
+    ///
+    /// Dropped when the world is left, which stops the beacon — a world nobody
+    /// is hosting must not still be advertised.
+    beacon: Option<tiamot_server::announce::Announcer>,
     window: Option<Surface>,
     held: Held,
     /// The player's saved bindings, until the `App` exists to hold them.
@@ -592,6 +598,12 @@ impl ApplicationHandler for Client {
             && let Stage::Playing(app) = surface.stage
         {
             app.shutdown();
+        }
+        // **Before the world, every time.** A beacon outliving its server
+        // advertises an address nothing answers on, and the client that dials
+        // it gets a timeout rather than a reason.
+        if let Some(beacon) = self.beacon.take() {
+            beacon.stop();
         }
         if let Some(handle) = self.embedded.take() {
             handle.stop();
@@ -1047,6 +1059,12 @@ impl Client {
             });
             self.bindings = Some(bindings);
         }
+        // **Before the world, every time.** A beacon outliving its server
+        // advertises an address nothing answers on, and the client that dials
+        // it gets a timeout rather than a reason.
+        if let Some(beacon) = self.beacon.take() {
+            beacon.stop();
+        }
         if let Some(handle) = self.embedded.take() {
             handle.stop();
         }
@@ -1215,6 +1233,20 @@ impl Client {
                 // address", so opening a world to the LAN would have stopped
                 // the host from joining their own world.
                 let address = own_address(handle.local_addr());
+                // **A world open to the network says so on it.** Otherwise
+                // joining still means somebody reading an address off a screen
+                // and typing it, which is the report this exists to answer.
+                // Announced under the world's own name, which is what its
+                // owner would say it was called.
+                if lan {
+                    self.beacon = handle.announce(&entry.name);
+                    if self.beacon.is_none() {
+                        tracing::warn!(
+                            "this world is open but is not announcing itself; \
+                             others will have to type its address"
+                        );
+                    }
+                }
                 // Held on `Client`, because dropping it stops the world.
                 self.embedded = Some(handle);
                 address
@@ -1241,6 +1273,9 @@ impl Client {
         .map_err(|err| {
             // The server this failed to reach is stopped again, or a second
             // attempt would find the world already locked by the first.
+            if let Some(beacon) = self.beacon.take() {
+                beacon.stop();
+            }
             if let Some(handle) = self.embedded.take() {
                 handle.stop();
             }

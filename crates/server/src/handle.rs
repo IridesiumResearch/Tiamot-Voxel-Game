@@ -3046,6 +3046,21 @@ impl ServerHandle {
         self.shutdown()
     }
 
+    /// Announces this server on the local network under `name`.
+    ///
+    /// **Off unless asked**, like binding to more than loopback and for the
+    /// same reason: a beacon tells every machine on the segment that this port
+    /// is open. Returns `None` if no socket could be opened, which is not a
+    /// reason to stop hosting — the world is still reachable by address.
+    ///
+    /// Announcing stops when the returned [`crate::announce::Announcer`] is
+    /// dropped, so a caller that wants it for the life of the world holds it
+    /// beside the handle.
+    #[must_use]
+    pub fn announce(&self, name: &str) -> Option<crate::announce::Announcer> {
+        crate::announce::Announcer::start(name, self.local_addr.port(), &self.shared)
+    }
+
     fn shutdown(&mut self) -> bool {
         self.control.stop();
         // Wakes the accept loop. Without this the network thread is parked in
