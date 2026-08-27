@@ -3782,7 +3782,7 @@ impl App {
         // makes "nearest first" order the queue from 50,000 blocks away.
         let centre = self.camera_chunk();
         let due = self.store.take_dirty(centre, REMESH_BUDGET);
-        if due.is_empty() {
+        if due.positions.is_empty() {
             return 0;
         }
 
@@ -3798,7 +3798,7 @@ impl App {
         let mut meshing = std::time::Duration::ZERO;
         let mut rebuilt = 0;
 
-        for (index, pos) in due.iter().enumerate() {
+        for (index, pos) in due.positions.iter().enumerate() {
             let Some(chunk) = self.store.get(*pos) else {
                 continue;
             };
@@ -3837,8 +3837,17 @@ impl App {
             // protected, so time is what this spends. At least one chunk
             // always goes through — a budget that can rebuild nothing would let
             // a slow frame stop the world filling in for ever.
-            if started.elapsed() >= REMESH_TIME_BUDGET && index + 1 < due.len() {
-                self.store.requeue(&due[index + 1..]);
+            // **Never inside the urgent run.** Those are the chunks one
+            // frame's edits touched, and a chunk drawn without the neighbour
+            // whose face its edit exposed is a hole through the world — the
+            // report this ordering exists for. Everything after them is
+            // streaming and light, which can wait a frame without leaving a
+            // gap because their old meshes are still right.
+            if index + 1 >= due.urgent
+                && started.elapsed() >= REMESH_TIME_BUDGET
+                && index + 1 < due.positions.len()
+            {
+                self.store.requeue(&due.positions[index + 1..]);
                 break;
             }
         }

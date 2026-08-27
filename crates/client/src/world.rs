@@ -56,11 +56,46 @@ const NEIGHBOUR_OFFSETS: [(i32, i32, i32); 6] = [
 /// the loaded region that pops away a moment later.
 pub const ABSENT_POLICY: Absent = Absent::Solid;
 
+/// What one frame should rebuild, and how much of it cannot wait.
+///
+/// The first [`Due::urgent`] entries of [`Due::positions`] are the chunks an
+/// edit touched. A caller that gives up part way through must not give up
+/// inside them — see [`ChunkStore::urgent`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Due {
+    /// Chunks to rebuild, urgent ones first.
+    pub positions: Vec<ChunkPos>,
+    /// How many of the front of `positions` came from an edit.
+    pub urgent: usize,
+}
+
 /// The client's chunks, and which of them need remeshing.
 #[derive(Debug, Default)]
 pub struct ChunkStore {
     chunks: BTreeMap<ChunkPos, Chunk>,
     dirty: BTreeSet<ChunkPos>,
+    /// Chunks an EDIT dirtied, which have to be rebuilt together.
+    ///
+    /// **A chunk and the neighbour whose face its edit exposed are one piece
+    /// of work.** Chiselling the last cell of a chunk uncovers a face that
+    /// belongs to the chunk behind it, and the two are marked in the same
+    /// call — but a budget that cut between them drew the hole without the
+    /// face behind it, which is a window through the world to the sky until
+    /// the next frame got round to the neighbour.
+    ///
+    /// Reported from the window: "when doing tons of sculpting with the chisel
+    /// I sometimes see through to the skybox when the face of the node behind
+    /// doesn't quite load in time."
+    ///
+    /// Streaming and light keep the ordinary budget. This set is what an edit
+    /// touched, it is small — a sub-node edit reaches at most three
+    /// neighbours — and it is emptied every frame.
+    urgent: BTreeSet<ChunkPos>,
+    /// Whether marks are going into [`Self::urgent`] rather than
+    /// [`Self::dirty`]. Set only for the duration of one
+    /// [`ChunkStore::apply`], so every path that marks a chunk — and there are
+    /// several — lands in the right set without knowing about either.
+    urgent_marks: bool,
     /// Light levels, keyed by chunk.
     ///
     /// Separate from the chunks rather than a field on them, because the two
@@ -116,7 +151,7 @@ impl ChunkStore {
     /// How many chunks are waiting to be remeshed.
     #[must_use]
     pub fn dirty_len(&self) -> usize {
-        self.dirty.len()
+        self.dirty.len() + self.urgent.len()
     }
 
     /// The chunk at a position, if it is held.
@@ -340,6 +375,7 @@ impl ChunkStore {
     pub fn clear(&mut self) {
         self.chunks.clear();
         self.dirty.clear();
+        self.urgent.clear();
         self.light.clear();
     }
 
@@ -349,6 +385,18 @@ impl ChunkStore {
     /// is dropped rather than buffered: the chunk is outside the interest set,
     /// and when it comes back it comes back with the edit already in it.
     pub fn apply(&mut self, edit: &Edit) -> bool {
+        // **Marked urgent as it happens, not by comparing sets afterwards.**
+        // A difference against the queue as it stood misses a chunk that was
+        // ALREADY waiting — which is the case this exists for: a player who is
+        // walking while they chisel has streaming chunks in the queue, and the
+        // neighbour whose face the chisel uncovers is often one of them.
+        self.urgent_marks = true;
+        let landed = self.apply_inner(edit);
+        self.urgent_marks = false;
+        landed
+    }
+
+    fn apply_inner(&mut self, edit: &Edit) -> bool {
         match *edit {
             Edit::Block { pos, material } => {
                 self.write_block(pos, BlockValue::Uniform(MaterialId(material)))
@@ -445,7 +493,7 @@ impl ChunkStore {
         let (dx, dy, dz) = NEIGHBOUR_OFFSETS[axis * 2 + usize::from(positive)];
         let neighbour = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
         if self.chunks.contains_key(&neighbour) {
-            self.dirty.insert(neighbour);
+            self.mark(neighbour);
         }
     }
 
@@ -454,14 +502,18 @@ impl ChunkStore {
     /// Held is checked on the way out rather than here: a chunk can be marked
     /// and then unloaded before the remesh runs.
     fn mark(&mut self, pos: ChunkPos) {
-        self.dirty.insert(pos);
+        if self.urgent_marks {
+            self.urgent.insert(pos);
+        } else {
+            self.dirty.insert(pos);
+        }
     }
 
     fn mark_neighbours(&mut self, pos: ChunkPos) {
         for (dx, dy, dz) in NEIGHBOUR_OFFSETS {
             let neighbour = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
             if self.chunks.contains_key(&neighbour) {
-                self.dirty.insert(neighbour);
+                self.mark(neighbour);
             }
         }
     }
@@ -486,9 +538,26 @@ impl ChunkStore {
     ///
     /// Positions no longer held are dropped here rather than when they were
     /// unloaded, so an unload never has to walk the queue.
-    pub fn take_dirty(&mut self, centre: ChunkPos, budget: usize) -> Vec<ChunkPos> {
+    pub fn take_dirty(&mut self, centre: ChunkPos, budget: usize) -> Due {
+        // **The urgent set is not subject to the budget.** It is what one
+        // frame's edits touched, so it is bounded by how much a player and the
+        // mods can change in a tick, and holding half of it back is the hole
+        // this exists to close.
+        let urgent: Vec<ChunkPos> = std::mem::take(&mut self.urgent)
+            .into_iter()
+            .filter(|pos| self.chunks.contains_key(pos))
+            .collect();
+        // Never twice: a chunk in both sets is one rebuild.
+        for pos in &urgent {
+            self.dirty.remove(pos);
+        }
+
         if budget == 0 || self.dirty.is_empty() {
-            return Vec::new();
+            let count = urgent.len();
+            return Due {
+                positions: urgent,
+                urgent: count,
+            };
         }
 
         let mut candidates: Vec<ChunkPos> = std::mem::take(&mut self.dirty)
@@ -510,7 +579,14 @@ impl ChunkStore {
 
         let overflow = candidates.split_off(candidates.len().min(budget));
         self.dirty.extend(overflow);
-        candidates
+
+        let count = urgent.len();
+        let mut positions = urgent;
+        positions.extend(candidates);
+        Due {
+            positions,
+            urgent: count,
+        }
     }
 
     /// Puts chunks a remesh did not get to back in the queue.
@@ -704,9 +780,9 @@ mod tests {
         store.insert(chunk_at(1, 0, 0));
 
         let taken = store.take_dirty(ChunkPos::new(0, 0, 0), 16);
-        assert!(taken.contains(&ChunkPos::new(0, 0, 0)));
+        assert!(taken.positions.contains(&ChunkPos::new(0, 0, 0)));
         assert!(
-            taken.contains(&ChunkPos::new(1, 0, 0)),
+            taken.positions.contains(&ChunkPos::new(1, 0, 0)),
             "the neighbour must be remeshed when a chunk lands beside it"
         );
     }
@@ -727,7 +803,7 @@ mod tests {
         }));
 
         let taken = store.take_dirty(ChunkPos::new(0, 0, 0), 16);
-        assert_eq!(taken, vec![ChunkPos::new(0, 0, 0)]);
+        assert_eq!(taken.positions, vec![ChunkPos::new(0, 0, 0)]);
     }
 
     #[test]
@@ -746,7 +822,7 @@ mod tests {
 
         let taken = store.take_dirty(ChunkPos::new(0, 0, 0), 16);
         assert!(
-            taken.contains(&ChunkPos::new(1, 0, 0)),
+            taken.positions.contains(&ChunkPos::new(1, 0, 0)),
             "an edit on the shared plane must remesh the chunk across it: {taken:?}"
         );
     }
@@ -768,8 +844,75 @@ mod tests {
 
         let taken = store.take_dirty(ChunkPos::new(0, 0, 0), 16);
         assert!(
-            taken.contains(&ChunkPos::new(1, 0, 0)),
+            taken.positions.contains(&ChunkPos::new(1, 0, 0)),
             "chiselling the last cell must remesh across the boundary: {taken:?}"
+        );
+    }
+
+    #[test]
+    fn a_chisel_and_the_face_it_uncovers_are_rebuilt_in_the_same_frame() {
+        // **Reported from the window**: "when doing tons of sculpting with the
+        // chisel I sometimes see through to the skybox when the face of the
+        // node behind doesn't quite load in time."
+        //
+        // Chiselling the last cell of a chunk uncovers a face belonging to the
+        // chunk behind it. Both are marked — the test above proves that — but
+        // a budget that handed over one and held back the other drew the hole
+        // without anything behind it, which is a window through the world.
+        //
+        // Streaming has filled the queue, and the budget is one. The edit's
+        // chunks still both come out.
+        let mut store = ChunkStore::new();
+        store.insert(solid_at(0, 0, 0));
+        store.insert(solid_at(1, 0, 0));
+        for far in 2..8 {
+            store.insert(solid_at(far, 0, 0));
+        }
+        let _ = store.take_dirty(ChunkPos::new(0, 0, 0), 64);
+        // Chunks arriving, which is what a player walking while sculpting has
+        // a steady supply of.
+        for far in 2..8 {
+            store.insert(solid_at(far, 0, 0));
+        }
+
+        assert!(store.apply(&Edit::SubNode {
+            pos: SubNodePos::new(47, 20, 20),
+            material: MaterialId::AIR.0,
+        }));
+
+        let taken = store.take_dirty(ChunkPos::new(0, 0, 0), 1);
+        assert!(
+            taken.positions.contains(&ChunkPos::new(0, 0, 0))
+                && taken.positions.contains(&ChunkPos::new(1, 0, 0)),
+            "the chisel and the face behind it were split across frames: {taken:?}"
+        );
+        assert_eq!(
+            taken.urgent, 2,
+            "both should be marked urgent, so a time budget cannot split them either"
+        );
+        assert_eq!(
+            &taken.positions[..taken.urgent],
+            &[ChunkPos::new(0, 0, 0), ChunkPos::new(1, 0, 0)],
+            "the urgent chunks must be at the FRONT, or a caller that stops \
+             early stops inside them"
+        );
+    }
+
+    #[test]
+    fn a_chunk_arriving_is_not_urgent_and_still_waits_its_turn() {
+        // The counter-example: if everything were urgent, the budget would
+        // mean nothing and a player walking into new terrain would remesh the
+        // whole interest set in one frame.
+        let mut store = ChunkStore::new();
+        for far in 0..8 {
+            store.insert(solid_at(far, 0, 0));
+        }
+        let taken = store.take_dirty(ChunkPos::new(0, 0, 0), 2);
+        assert_eq!(taken.urgent, 0, "an arriving chunk is not an edit");
+        assert_eq!(
+            taken.positions.len(),
+            2,
+            "the budget stopped meaning anything: {taken:?}"
         );
     }
 
@@ -796,9 +939,10 @@ mod tests {
         }
 
         let taken = store.take_dirty(ChunkPos::new(5, 0, 0), 2);
-        assert_eq!(taken.len(), 2);
+        assert_eq!(taken.positions.len(), 2);
         assert!(
-            taken.contains(&ChunkPos::new(5, 0, 0)) && taken.contains(&ChunkPos::new(4, 0, 0)),
+            taken.positions.contains(&ChunkPos::new(5, 0, 0))
+                && taken.positions.contains(&ChunkPos::new(4, 0, 0)),
             "expected the two nearest chunks, got {taken:?}"
         );
     }
@@ -815,7 +959,7 @@ mod tests {
 
         let mut seen = BTreeSet::new();
         for _ in 0..6 {
-            seen.extend(store.take_dirty(ChunkPos::new(0, 0, 0), 2));
+            seen.extend(store.take_dirty(ChunkPos::new(0, 0, 0), 2).positions);
         }
         assert_eq!(seen.len(), 6, "every chunk must eventually be remeshed");
         assert_eq!(store.dirty_len(), 0);
@@ -833,16 +977,16 @@ mod tests {
         }
 
         let due = store.take_dirty(ChunkPos::new(0, 0, 0), 6);
-        assert_eq!(due.len(), 6);
+        assert_eq!(due.positions.len(), 6);
         assert_eq!(store.dirty_len(), 0, "take_dirty must hand over ownership");
 
         // One rebuilt, five abandoned.
-        store.requeue(&due[1..]);
+        store.requeue(&due.positions[1..]);
         assert_eq!(store.dirty_len(), 5);
 
         let rest = store.take_dirty(ChunkPos::new(0, 0, 0), 8);
         assert_eq!(
-            rest.len(),
+            rest.positions.len(),
             5,
             "the abandoned chunks did not come back and will never be remeshed"
         );
@@ -857,11 +1001,11 @@ mod tests {
 
         let taken = store.take_dirty(ChunkPos::new(0, 0, 0), 16);
         assert!(
-            !taken.contains(&ChunkPos::new(0, 0, 0)),
+            !taken.positions.contains(&ChunkPos::new(0, 0, 0)),
             "a chunk that is gone must not be remeshed: {taken:?}"
         );
         assert!(
-            taken.contains(&ChunkPos::new(1, 0, 0)),
+            taken.positions.contains(&ChunkPos::new(1, 0, 0)),
             "but its neighbour must be, or it keeps hiding the faces they shared"
         );
     }
@@ -949,11 +1093,11 @@ mod tests {
 
         let due = store.take_dirty(ChunkPos::new(0, 0, 0), 8);
         assert!(
-            due.contains(&ChunkPos::new(1, 0, 0)),
+            due.positions.contains(&ChunkPos::new(1, 0, 0)),
             "the neighbour was not remeshed, so its seam still shows the old light: {due:?}"
         );
         assert!(
-            due.contains(&ChunkPos::new(0, 0, 0)),
+            due.positions.contains(&ChunkPos::new(0, 0, 0)),
             "the chunk whose light changed was not remeshed either: {due:?}"
         );
     }

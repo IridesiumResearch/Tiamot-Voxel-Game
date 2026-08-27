@@ -471,7 +471,12 @@ fn an_edit_arrives_and_dirties_exactly_the_chunk_it_landed_in() {
 
     // Settle the queue so what follows is attributable to the edit alone.
     let spawn = seen.joined.expect("joined");
-    while !seen.store.take_dirty(spawn.chunk(), 1024).is_empty() {
+    while !seen
+        .store
+        .take_dirty(spawn.chunk(), 1024)
+        .positions
+        .is_empty()
+    {
         while let Some(event) = connection.poll() {
             seen.apply(event);
         }
@@ -499,7 +504,7 @@ fn an_edit_arrives_and_dirties_exactly_the_chunk_it_landed_in() {
         "the edit must come back from the server and land in the local copy"
     );
 
-    let dirty = seen.store.take_dirty(target.chunk(), 1024);
+    let dirty = seen.store.take_dirty(target.chunk(), 1024).positions;
     assert!(
         dirty.contains(&target.chunk()),
         "the chunk the edit landed in must be queued for a remesh: {dirty:?}"
