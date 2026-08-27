@@ -24,7 +24,7 @@ use client::cache::ContentCache;
 use client::config::{Config, ServerChoice};
 use client::input::{Bindings, Input as Control};
 use client::net::Connection;
-use client::render::{COLOUR_FORMAT, Gpu, Renderer};
+use client::render::{Gpu, Renderer};
 use tiamot_core::identity::Identity;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
@@ -786,7 +786,8 @@ impl Client {
 
         let egui_renderer = egui_wgpu::Renderer::new(
             &gpu.device,
-            COLOUR_FORMAT,
+            // The interface is drawn over the world, onto the surface.
+            gpu.surface_format(),
             egui_wgpu::RendererOptions {
                 // No MSAA and no depth: the HUD is flat text drawn last, and
                 // testing it against the world's depth buffer would let a
@@ -2258,7 +2259,7 @@ fn configure_surface(
         &gpu.device,
         &wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: COLOUR_FORMAT,
+            format: gpu.surface_format(),
             width: size.0,
             height: size.1,
             present_mode,

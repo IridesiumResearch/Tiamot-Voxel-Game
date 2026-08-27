@@ -47,11 +47,23 @@ use crate::texture::Atlas;
 pub use frustum::Frustum;
 pub use offscreen::Offscreen;
 
-/// The colour format everything renders into.
+/// The colour format of textures this client CREATES.
 ///
-/// `Rgba8UnormSrgb` rather than `Bgra8`: it is the format an offscreen target
-/// and a surface can both provide on every backend, so the screenshot tests and
-/// the window are not looking at differently-encoded pixels.
+/// The atlas, an offscreen screenshot target, the grading LUT's output — things
+/// whose format is the client's own choice. `Rgba8UnormSrgb` is supported
+/// everywhere for a texture, and using one format for all of them keeps the
+/// screenshot goldens comparable.
+///
+/// **It is NOT necessarily the format of a window's surface**, and assuming so
+/// was a crash on macOS: Metal offers a surface
+/// `[Bgra8Unorm, Bgra8UnormSrgb, Rgba16Float, Rgb10a2Unorm]` and nothing else,
+/// so `Surface::configure` refused this outright and the client aborted before
+/// it drew a frame. A surface's format is a runtime fact about the platform —
+/// see [`Gpu::surface_format`] — and the pipelines that draw into one are built
+/// against whatever it turns out to be.
+///
+/// No shader changes with it: a fragment stage writes RGBA and the swizzle to
+/// BGRA is the driver's business.
 pub const COLOUR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// The depth format.
@@ -428,6 +440,39 @@ pub struct Gpu {
     pub backend: String,
     /// Whether the device can draw in wireframe.
     pub polygon_mode_line: bool,
+    /// What the window's surface will actually accept, if there is one.
+    ///
+    /// `None` for a headless device. Captured here because this is where the
+    /// adapter is, and asking a surface what it supports needs one.
+    pub surface_format: Option<wgpu::TextureFormat>,
+}
+
+/// Chooses the format to configure a window's surface with.
+///
+/// **sRGB by preference**, because everything in this renderer is written
+/// expecting the hardware to do the conversion; a linear surface would show a
+/// washed-out world. The platform's own first choice is the fallback, and
+/// [`COLOUR_FORMAT`] only if it offers nothing at all.
+///
+/// # Why this is a function and not a constant
+///
+/// It used to be [`COLOUR_FORMAT`], on the reasoning that a surface can provide
+/// it on every backend. **That is false on macOS**, where Metal offers
+/// `[Bgra8Unorm, Bgra8UnormSrgb, Rgba16Float, Rgb10a2Unorm]` and nothing else —
+/// so `Surface::configure` refused it and the client aborted inside
+/// `app_did_finish_launching`, before drawing a frame, with a
+/// non-unwinding panic.
+///
+/// Nothing about a surface's format is knowable at compile time. Asking is the
+/// whole fix; the rest is making the pipelines that draw into it agree.
+#[must_use]
+pub fn pick_surface_format(supported: &[wgpu::TextureFormat]) -> wgpu::TextureFormat {
+    supported
+        .iter()
+        .copied()
+        .find(wgpu::TextureFormat::is_srgb)
+        .or_else(|| supported.first().copied())
+        .unwrap_or(COLOUR_FORMAT)
 }
 
 impl Gpu {
@@ -479,13 +524,28 @@ impl Gpu {
             reason: err.to_string(),
         })?;
 
+        // **What the surface will take, asked rather than assumed.** sRGB by
+        // preference, because everything in this renderer is written expecting
+        // the hardware to do the conversion; a linear surface would show a
+        // washed-out world. The first supported format is the fallback, which
+        // is what the platform itself lists first.
+        let surface_format =
+            surface.map(|surface| pick_surface_format(&surface.get_capabilities(&adapter).formats));
+
         Ok(Self {
             device,
             queue,
             adapter: info.name,
             backend: format!("{:?}", info.backend),
             polygon_mode_line: wireframe,
+            surface_format,
         })
+    }
+
+    /// The format a window's surface takes, or [`COLOUR_FORMAT`] headless.
+    #[must_use]
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.surface_format.unwrap_or(COLOUR_FORMAT)
     }
 
     /// Creates a device with no surface, for offscreen rendering.
@@ -686,9 +746,14 @@ impl Renderer {
 
         let bind_layout = build_bind_layout(&gpu);
 
-        let pipeline = build_pipeline(&gpu, &shader, &bind_layout, mode, COLOUR_FORMAT);
-        let fluid_pipeline =
-            build_fluid_pipeline(&gpu, &shader, &[Some(&bind_layout)], COLOUR_FORMAT);
+        // **The surface's format, not this client's own.** Every pipeline here
+        // draws into the window (mode 3 goes through an HDR target first and
+        // composites, which is the `_hdr` half of each pair). Building them
+        // against a format the surface refuses is a crash at `configure`, which
+        // is what macOS gave: Metal has no `Rgba8UnormSrgb` surface at all.
+        let target = gpu.surface_format();
+        let pipeline = build_pipeline(&gpu, &shader, &bind_layout, mode, target);
+        let fluid_pipeline = build_fluid_pipeline(&gpu, &shader, &[Some(&bind_layout)], target);
 
         let (blob_pipeline, blob_pipeline_hdr, blobs) = build_blobs(&gpu, &bind_layout);
         let (prop_pipeline, prop_pipeline_hdr, props) = build_props(&gpu, &bind_layout);
@@ -720,10 +785,9 @@ impl Renderer {
 
         // The engine's own rig, built in Rust and uploaded once. A mod-supplied
         // model goes through the same constructor — see `core::model`.
-        let hands = viewmodel::Viewmodel::new(&gpu, &view, &sampler, COLOUR_FORMAT);
+        let hands = viewmodel::Viewmodel::new(&gpu, &view, &sampler, target);
         let skinned = skinned::Skinned::new(&gpu, tiamot_core::model::humanoid());
-        let skinned_pipeline =
-            skinned::colour_pipeline(&gpu, &skinned, &bind_layout, mode, COLOUR_FORMAT);
+        let skinned_pipeline = skinned::colour_pipeline(&gpu, &skinned, &bind_layout, mode, target);
 
         Ok(Self {
             hands,
@@ -2329,7 +2393,7 @@ fn build_blobs(
         mapped_at_creation: false,
     });
     (
-        build_blob_pipeline(gpu, &shader, bind_layout, COLOUR_FORMAT),
+        build_blob_pipeline(gpu, &shader, bind_layout, gpu.surface_format()),
         build_blob_pipeline(gpu, &shader, bind_layout, graph::HDR_FORMAT),
         buffer,
     )
@@ -2378,7 +2442,7 @@ fn build_props(
         mapped_at_creation: false,
     });
     (
-        build_prop_pipeline(gpu, &shader, bind_layout, COLOUR_FORMAT),
+        build_prop_pipeline(gpu, &shader, bind_layout, gpu.surface_format()),
         build_prop_pipeline(gpu, &shader, bind_layout, graph::HDR_FORMAT),
         buffer,
     )
@@ -2550,7 +2614,7 @@ fn build_lines(
     let shader = gpu
         .device
         .create_shader_module(wgpu::include_wgsl!("selection.wgsl"));
-    let pipeline = build_selection_pipeline(gpu, &shader, bind_layout, COLOUR_FORMAT);
+    let pipeline = build_selection_pipeline(gpu, &shader, bind_layout, gpu.surface_format());
     (
         shader,
         pipeline,
@@ -3026,6 +3090,72 @@ fn make_depth_with(
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+#[cfg(test)]
+mod surface_format_tests {
+    use super::*;
+
+    /// What macOS actually offers, from the crash that prompted this.
+    const METAL: [wgpu::TextureFormat; 4] = [
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureFormat::Rgb10a2Unorm,
+    ];
+
+    #[test]
+    fn macos_gets_a_format_it_actually_supports() {
+        // **The crash, as a list.** `Surface::configure` refused
+        // `Rgba8UnormSrgb` outright — "not in list of supported formats" — and
+        // the client aborted before drawing a frame.
+        let chosen = pick_surface_format(&METAL);
+        assert!(
+            METAL.contains(&chosen),
+            "chose {chosen:?}, which the platform does not offer"
+        );
+        assert_ne!(
+            chosen, COLOUR_FORMAT,
+            "this is exactly the format macOS refuses"
+        );
+    }
+
+    #[test]
+    fn an_srgb_format_is_preferred_over_a_linear_one() {
+        // Everything here is written expecting the hardware to do the
+        // conversion, so a linear surface is a washed-out world — which is
+        // worse than a crash, because it looks like a lighting bug.
+        assert_eq!(
+            pick_surface_format(&METAL),
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            "the linear format comes FIRST in the list; preferring sRGB has to beat order"
+        );
+    }
+
+    #[test]
+    fn a_platform_offering_this_clients_own_format_keeps_it() {
+        // Vulkan and DX12 do offer it, and the screenshot goldens are taken in
+        // it — so where there is a choice, nothing should move.
+        let supported = [
+            wgpu::TextureFormat::Bgra8Unorm,
+            COLOUR_FORMAT,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ];
+        assert_eq!(pick_surface_format(&supported), COLOUR_FORMAT);
+    }
+
+    #[test]
+    fn nothing_srgb_at_all_still_answers_something_supported() {
+        let linear = [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba16Float,
+        ];
+        assert_eq!(
+            pick_surface_format(&linear),
+            wgpu::TextureFormat::Bgra8Unorm,
+            "a surface with no sRGB format still has to be configured with one of its own"
+        );
+    }
 }
 
 #[cfg(test)]

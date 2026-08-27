@@ -32,7 +32,7 @@
 //! white are both `1.0` by the time the pass could look. `Rgba16Float` keeps
 //! the headroom, and the composite is what brings it back into display range.
 
-use super::{COLOUR_FORMAT, DEPTH_FORMAT, Gpu};
+use super::{DEPTH_FORMAT, Gpu};
 
 /// The format the scene is drawn into before tonemapping.
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -477,7 +477,11 @@ impl Post {
             ],
             threshold: build("post-threshold", "threshold_main", HDR_FORMAT),
             blur: build("post-blur", "blur_main", HDR_FORMAT),
-            composite: build("post-composite", "composite_main", COLOUR_FORMAT),
+            // The one pass in this graph that writes to the WINDOW, so it is
+            // built against what the window takes rather than what this client
+            // would have chosen. Everything before it is an offscreen target
+            // whose format is ours.
+            composite: build("post-composite", "composite_main", gpu.surface_format()),
             uniforms: [
                 uniform("post-threshold-uniforms"),
                 uniform("post-blur-h-uniforms"),
