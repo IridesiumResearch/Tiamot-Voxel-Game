@@ -241,6 +241,29 @@ impl Slots {
         true
     }
 
+    /// Puts whatever is on the cursor back into the inventory.
+    ///
+    /// **A screen closing must not leave a stack in hand.** The cursor is where
+    /// a half-finished move lives, and a player who picks something up and
+    /// presses Escape has not agreed to put it anywhere — so it goes back
+    /// wherever it fits rather than staying in a place with no picture.
+    ///
+    /// Returns whether anything moved. What will not fit stays on the cursor,
+    /// which is better than destroying it: an inventory grows, so this only
+    /// fails for a view that has been removed under the player.
+    pub fn return_held(&mut self, view: &str) -> bool {
+        let Some(held) = self.grab.held.take() else {
+            return false;
+        };
+        if self.insert(view, held) {
+            return true;
+        }
+        // Nowhere to put it. Back on the cursor rather than gone — the next
+        // screen the player opens can still see it.
+        self.grab.held = Some(held);
+        false
+    }
+
     /// A right click: take half, or put down a single unit.
     ///
     /// **The halving is on UNITS.** Charter rule 5: 40 units splits into 20 and
@@ -571,6 +594,58 @@ fn place_one(mut held: Stack, there: Option<Stack>) -> (Option<Stack>, Option<St
         }
     };
     (slot, (!held.is_empty()).then_some(held))
+}
+
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+    use crate::material::MaterialId;
+
+    fn player() -> Slots {
+        Slots::for_player_with(&[])
+    }
+
+    #[test]
+    fn closing_a_screen_puts_what_is_in_hand_back() {
+        // **Reported from the window as items vanishing.** The stack was never
+        // lost — it is on the cursor, on the server — but a cursor has no
+        // picture once the screen is gone, and it would now sit there across a
+        // save as well.
+        let mut slots = player();
+        slots.views[0].slots[3] = Stack::new(MaterialId(2), 27);
+        assert!(slots.left_click(PLAYER_MAIN, 3), "picked it up");
+        assert!(slots.grab.held.is_some(), "it is in hand");
+        assert_eq!(slots.views[0].slots[3], None, "and out of its slot");
+
+        assert!(slots.return_held(PLAYER_MAIN));
+        assert_eq!(slots.grab.held, None, "the hand is empty again");
+        let total: u32 = slots.views[0]
+            .slots
+            .iter()
+            .flatten()
+            .map(|stack| stack.units)
+            .sum();
+        assert_eq!(total, 27, "and the units are back in the inventory");
+    }
+
+    #[test]
+    fn returning_an_empty_hand_changes_nothing() {
+        let mut slots = player();
+        assert!(!slots.return_held(PLAYER_MAIN));
+    }
+
+    #[test]
+    fn a_stack_with_nowhere_to_go_stays_in_hand_rather_than_vanishing() {
+        // Destroying it would be worse than leaving it: the next screen the
+        // player opens can still show it.
+        let mut slots = player();
+        slots.grab.held = Stack::new(MaterialId(2), 27);
+        assert!(!slots.return_held("nobody:such-view"));
+        assert!(
+            slots.grab.held.is_some(),
+            "an item with nowhere to go was destroyed"
+        );
+    }
 }
 
 #[cfg(test)]

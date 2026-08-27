@@ -195,8 +195,65 @@ impl Dialogs {
             let local = self.forms.entry(form.clone()).or_default();
             raised.extend(draw_form(ctx, form, screen, local, views, icons, area));
         }
+        // **Last, and over everything.** What is on the cursor is drawn after
+        // every screen, because it is above them by definition — a stack in
+        // your hand passes over the slots you are choosing between.
+        if !open.is_empty() {
+            paint_cursor_stack(ctx, views, icons);
+        }
         raised
     }
+}
+
+/// Draws the stack on the player's cursor, under the pointer.
+///
+/// # Why this was missing and what it looked like
+///
+/// Reported from the window: clicking a slot made the stack **vanish**. It was
+/// never lost — `Slots::grab` holds it on the SERVER, which is the right model
+/// (a move is two half-gestures, and a client that owned the middle of one
+/// could invent items by lying about what it took) — and `ViewUpdate::held`
+/// has always carried it to the client, and `ViewContents::held` has always
+/// stored it.
+///
+/// Nothing drew it. The whole path existed and the last step was never written,
+/// so a click emptied a slot and put the stack somewhere invisible.
+///
+/// # Where it comes from
+///
+/// Any view will do: the cursor is one stack for the whole player, and every
+/// `ViewUpdate` carries the same answer. Taking the first that has one means a
+/// screen over a mod's container shows it as readily as the inventory does.
+fn paint_cursor_stack(
+    ctx: &egui::Context,
+    views: &BTreeMap<String, ViewContents>,
+    icons: Icons<'_>,
+) {
+    let Some(stack) = views.values().find_map(|contents| contents.held) else {
+        return;
+    };
+    let Some(at) = ctx.pointer_latest_pos() else {
+        return;
+    };
+
+    // **A layer above every window**, or the stack would slide under the sheet
+    // it is being dragged across.
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("carried-stack"),
+    ));
+    // Centred on the pointer and a little smaller than a slot, so the cursor
+    // stays visible past its edges rather than being buried by it.
+    let side = (SLOT as f32) * 0.8;
+    let box_ = egui::Rect::from_center_size(at, egui::vec2(side, side));
+    icons.paint_stack(&painter, box_, stack.material, stack.shape);
+    painter.text(
+        box_.right_bottom(),
+        egui::Align2::RIGHT_BOTTOM,
+        stack_label(stack.units, stack.shape),
+        egui::FontId::proportional(11.0),
+        egui::Color32::WHITE,
+    );
 }
 
 /// One dialog a server has open on this screen.

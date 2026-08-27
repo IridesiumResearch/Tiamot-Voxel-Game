@@ -1402,6 +1402,24 @@ impl Shared {
         self.inventories.lock().ok()?.get(uuid).cloned()
     }
 
+    /// Puts whatever is on a player's cursor back into their inventory.
+    ///
+    /// **Called when a screen closes.** A stack in hand has no picture once the
+    /// screen it was picked up on is gone, so leaving it there is how an item
+    /// seems to disappear for good — and it stays there across a save now that
+    /// inventories persist. Returns whether anything moved.
+    pub fn return_held(&self, uuid: &PlayerUuid) -> bool {
+        let moved = self.inventories.lock().is_ok_and(|mut inventories| {
+            inventories
+                .get_mut(uuid)
+                .is_some_and(|slots| slots.return_held(PLAYER_MAIN))
+        });
+        if moved && let Ok(mut dirty) = self.inventory_dirty.lock() {
+            dirty.insert(*uuid);
+        }
+        moved
+    }
+
     /// Applies a slot click to a player's inventory, on the server's own copy.
     ///
     /// **The whole authority story in one function.** A client says which view

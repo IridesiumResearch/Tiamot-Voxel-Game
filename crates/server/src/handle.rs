@@ -2471,6 +2471,15 @@ impl ServerHandle {
                                 event,
                                 tiamot_core::proto::DialogEvent::Closed
                             );
+                            // **A stack in hand goes back when the screen
+                            // goes.** It has no picture once the screen it was
+                            // picked up on is gone, which is how an item seems
+                            // to disappear for good — and it would now stay
+                            // there across a save.
+                            if closing && shared.return_held(&uuid) {
+                                let _ = shared
+                                    .push_entity_messages(&uuid, shared.view_updates(&uuid));
+                            }
                             let verdict =
                                 source.did_dialog_event(&tiamot_core::script::DialogEvent {
                                     player: *uuid.as_bytes(),
