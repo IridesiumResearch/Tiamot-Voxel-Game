@@ -107,6 +107,9 @@ pub enum Action {
         material: u16,
         /// The occupancy to place it in, or `0` for loose material.
         shape: u32,
+        /// The outward normal of the surface it was placed against, or all
+        /// zeroes for no preference. See [`crate::place::oriented`].
+        face: [i8; 3],
     },
 
     /// Hit an entity.
@@ -419,10 +422,12 @@ impl Session {
                 target,
                 material,
                 shape,
+                face,
             } => Response::act(Action::Place {
                 target: *target,
                 material: *material,
                 shape: *shape,
+                face: *face,
             }),
             _ => return None,
         })

@@ -264,6 +264,7 @@ fn client_messages() -> Vec<Vec<u8>> {
             target: SubNodePos::new(6, 7, 8),
             material: 3,
             shape: 0,
+            face: [0; 3],
         },
         ClientMessage::Place {
             target: SubNodePos::new(i32::MAX, i32::MIN, 0),
@@ -272,11 +273,15 @@ fn client_messages() -> Vec<Vec<u8>> {
             // block's twenty-seven — which the server must read as loose rather
             // than as a shape nobody can hold.
             shape: u32::MAX,
+            face: [0; 3],
         },
         ClientMessage::Place {
             target: SubNodePos::new(0, 0, 0),
             material: 3,
             shape: 0b101,
+            // Protocol v34: a cut placed against a wall, which is the case
+            // that turns the geometry rather than leaving it as authored.
+            face: [1, 0, 0],
         },
         // Protocol v12. Missing until v15 — the checklist's re-seed step is the
         // one people skip, and a corpus that stops at an older variant means

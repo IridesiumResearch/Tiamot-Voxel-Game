@@ -313,6 +313,102 @@ pub const fn items(units: u32, shape: u32) -> Option<u32> {
     units.checked_div(shape.count_ones())
 }
 
+/// Which way a shape's authored FRONT is pointing.
+///
+/// A cut is made in the shape editor, which shows the block from outside with
+/// three faces labelled — front, top and side. Those labels are the only reason
+/// a shape has an orientation at all: without them a stair placed with its step
+/// facing a wall and one facing the room are the same object, and the player
+/// has no way to ask for either.
+///
+/// **Front is `+z` and top is `+y`**, which is what the editor draws, and the
+/// side it labels is `+x`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Facing {
+    /// As authored.
+    #[default]
+    North,
+    /// A quarter turn about the vertical axis: the front now points along `+x`.
+    East,
+    /// A half turn: the front points along `-z`.
+    South,
+    /// Three quarters: the front points along `-x`.
+    West,
+}
+
+impl Facing {
+    /// How many quarter turns from the authored orientation.
+    #[must_use]
+    pub const fn quarters(self) -> u32 {
+        match self {
+            Self::North => 0,
+            Self::East => 1,
+            Self::South => 2,
+            Self::West => 3,
+        }
+    }
+
+    /// The facing whose front points most nearly along `(dx, dz)`.
+    ///
+    /// Ties go to the `z` axis, which only matters on an exact diagonal and has
+    /// to go somewhere; picking by a rule rather than by whichever comparison
+    /// came first is what makes it the same answer on every machine.
+    #[must_use]
+    pub fn toward(dx: f32, dz: f32) -> Self {
+        if dz.abs() >= dx.abs() {
+            if dz >= 0.0 { Self::North } else { Self::South }
+        } else if dx >= 0.0 {
+            Self::East
+        } else {
+            Self::West
+        }
+    }
+}
+
+/// Turns an occupancy mask a quarter turn about the vertical axis, `quarters`
+/// times.
+///
+/// A permutation of the twenty-seven cells and nothing more: no arithmetic, so
+/// the cell count is preserved exactly and four turns are the identity. That is
+/// what makes it safe in simulation — charter rule 4 has nothing to object to
+/// in a table of bit moves.
+#[must_use]
+pub fn turned(mask: u32, quarters: u32) -> u32 {
+    let mut mask = mask & Shape::ALL;
+    for _ in 0..quarters % 4 {
+        mask = permute(mask, |x, y, z| (z, y, 2 - x));
+    }
+    mask
+}
+
+/// Turns an occupancy mask a quarter turn about the `x` axis, `quarters` times.
+///
+/// One turn takes the front face to the top. Three take it to the bottom, which
+/// is what a shape placed against a wall wants — see
+/// [`crate::place::oriented`].
+#[must_use]
+pub fn tipped(mask: u32, quarters: u32) -> u32 {
+    let mut mask = mask & Shape::ALL;
+    for _ in 0..quarters % 4 {
+        mask = permute(mask, |x, y, z| (x, z, 2 - y));
+    }
+    mask
+}
+
+/// Moves every set cell of `mask` to where `to` sends it.
+fn permute(mask: u32, to: impl Fn(u32, u32, u32) -> (u32, u32, u32)) -> u32 {
+    let mut out = 0;
+    for index in 0..crate::UNITS_PER_BLOCK as usize {
+        if mask & (1 << index) == 0 {
+            continue;
+        }
+        let (x, y, z) = crate::block::subnode_offset(index);
+        let (x, y, z) = to(x, y, z);
+        out |= 1 << crate::block::subnode_index(x, y, z);
+    }
+    out
+}
+
 /// How many of a thing one slot holds.
 ///
 /// **Counted in things, not units.** Ninety blocks of stone and ninety stairs
@@ -611,6 +707,82 @@ pub trait Access: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn four_quarter_turns_are_no_turn_at_all() {
+        // The property that makes a rotation a permutation rather than a
+        // transformation: nothing is lost and nothing is invented, so a shape
+        // survives being turned round and round.
+        for mask in [0b11111u32, 0b1010_1010_1010, 1 << 26, 0x7FF_FFFF, 1] {
+            assert_eq!(turned(mask, 4), mask, "{mask:#029b} did not come home");
+            assert_eq!(tipped(mask, 4), mask, "{mask:#029b} did not come home");
+            for quarters in 0..4 {
+                assert_eq!(
+                    turned(mask, quarters).count_ones(),
+                    mask.count_ones(),
+                    "turning {mask:#029b} {quarters} times changed how much there is"
+                );
+                assert_eq!(
+                    tipped(mask, quarters).count_ones(),
+                    mask.count_ones(),
+                    "tipping {mask:#029b} {quarters} times changed how much there is"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_turn_moves_the_front_to_the_side_and_back() {
+        // One cell at the middle of the front face, followed round.
+        let front = 1 << crate::block::subnode_index(1, 1, 2);
+        let east = 1 << crate::block::subnode_index(2, 1, 1);
+        let back = 1 << crate::block::subnode_index(1, 1, 0);
+        let west = 1 << crate::block::subnode_index(0, 1, 1);
+        assert_eq!(turned(front, 1), east);
+        assert_eq!(turned(front, 2), back);
+        assert_eq!(turned(front, 3), west);
+    }
+
+    #[test]
+    fn three_tips_put_the_front_face_underneath() {
+        // What a shape placed against a wall wants: the front pointing at the
+        // player's feet.
+        let front = 1 << crate::block::subnode_index(1, 1, 2);
+        let below = 1 << crate::block::subnode_index(1, 0, 1);
+        assert_eq!(tipped(front, 3), below);
+        let above = 1 << crate::block::subnode_index(1, 2, 1);
+        assert_eq!(tipped(front, 1), above, "one tip should go the other way");
+    }
+
+    #[test]
+    fn a_facing_points_at_whoever_is_asking() {
+        assert_eq!(Facing::toward(0.0, 4.0), Facing::North);
+        assert_eq!(Facing::toward(0.0, -4.0), Facing::South);
+        assert_eq!(Facing::toward(4.0, 0.0), Facing::East);
+        assert_eq!(Facing::toward(-4.0, 0.0), Facing::West);
+        // Mostly one way is that way.
+        assert_eq!(Facing::toward(1.0, 3.0), Facing::North);
+        assert_eq!(Facing::toward(-3.0, 1.0), Facing::West);
+        // An exact diagonal has to go somewhere, and it goes to the same
+        // somewhere every time.
+        assert_eq!(Facing::toward(2.0, 2.0), Facing::North);
+        assert_eq!(Facing::toward(2.0, 2.0), Facing::toward(2.0, 2.0));
+    }
+
+    #[test]
+    fn a_turned_stair_is_a_stair_and_not_a_lump() {
+        // A shape whose turns are all DIFFERENT, which a symmetrical one
+        // cannot show: four distinct masks means the orientation is real and
+        // not an expensive way of writing the same number.
+        let stair = 0b111 | (0b111 << 9) | (0b111 << 12);
+        let turns: std::collections::BTreeSet<u32> =
+            (0..4).map(|quarters| turned(stair, quarters)).collect();
+        assert_eq!(
+            turns.len(),
+            4,
+            "a stair should look different from every side: {turns:?}"
+        );
+    }
     /// A stair-ish shape: the lower half plus one step. Five cells.
     fn stair() -> Shape {
         Shape::new(0b101).expect("two cells is a shape")

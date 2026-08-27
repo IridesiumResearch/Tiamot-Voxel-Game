@@ -329,6 +329,50 @@ fn last_cell_touched(high: f64) -> i64 {
     }
 }
 
+/// Turns an authored cut so it faces the player who is placing it.
+///
+/// **Reported from the window**: "when placing a shape block it should always
+/// place where the front arrow is pointing toward the player. But when placing
+/// on a wall it should orient the front to the player's feet."
+///
+/// - Against a **wall** — a face whose normal is horizontal — the front goes
+///   downward, toward the feet of whoever placed it. That is what makes a run
+///   of stairs up a wall read as steps rather than as a row of identical lumps.
+/// - Against a **floor or ceiling**, and everywhere else, the front turns to
+///   the nearest quarter toward the player.
+///
+/// `toward` is the horizontal offset from the block to the player, in any
+/// consistent units — only its direction is read. `face` is the outward normal
+/// of the surface, with a zero vector meaning "no preference", in which case
+/// the cut is placed exactly as it was authored.
+///
+/// Placing is not the only way a cut reaches the world, so this is a separate
+/// function rather than something [`plan`] does: a mod writing geometry
+/// directly is placing a shape it computed, and turning that toward whoever
+/// happened to be nearby would be the engine second-guessing it.
+#[must_use]
+pub fn oriented(occupancy: u32, face: [i8; 3], toward: [f32; 2]) -> u32 {
+    // **No face, no opinion.** A mod writing computed geometry, and a client
+    // that knows nothing about orientation, both send this — and turning a
+    // shape they did not ask to have turned is the engine second-guessing
+    // them.
+    if face == [0; 3] {
+        return occupancy & crate::block::OCCUPANCY_FULL;
+    }
+    let against_a_wall = face[1] == 0 && (face[0] != 0 || face[2] != 0);
+    // Turned toward the player FIRST, then tipped. The two axes do not
+    // commute, and this order is the one a player can describe: "it faces me,
+    // and on a wall it faces my feet."
+    let facing = crate::inventory::Facing::toward(toward[0], toward[1]);
+    let turned = crate::inventory::turned(occupancy, facing.quarters());
+    if against_a_wall {
+        // Three, not one: one turn takes the front to the ceiling.
+        crate::inventory::tipped(turned, 3)
+    } else {
+        turned
+    }
+}
+
 /// The lowest `units` cells of `occupancy`, in [`crate::inventory::placement_mask`]'s
 /// bottom-up order.
 ///
@@ -445,6 +489,88 @@ mod tests {
     /// The bottom-up order, as a mask of the first `n` cells.
     fn run(n: u32) -> u32 {
         crate::inventory::placement_mask(n)
+    }
+
+    /// A cut with a distinct front, top and side, so that a wrong turn shows.
+    ///
+    /// Three cells: one on the front face, one on top, one on the right. A
+    /// symmetrical shape would survive every rotation and prove nothing.
+    fn signpost() -> u32 {
+        (1 << crate::block::subnode_index(1, 1, 2))
+            | (1 << crate::block::subnode_index(1, 2, 1))
+            | (1 << crate::block::subnode_index(2, 1, 1))
+    }
+
+    #[test]
+    fn a_cut_placed_on_the_ground_turns_its_front_toward_the_player() {
+        // Reported from the window: "when placing a shape block it should
+        // always place where the front arrow is pointing toward the player."
+        let front = 1 << crate::block::subnode_index(1, 1, 2);
+        let floor = [0i8, 1, 0];
+        // Standing to the north (+z), so the front stays where it was authored.
+        assert_eq!(oriented(front, floor, [0.0, 5.0]) & front, front);
+        // Standing to the east, so the front comes round to the east face.
+        assert_eq!(
+            oriented(front, floor, [5.0, 0.0]),
+            1 << crate::block::subnode_index(2, 1, 1)
+        );
+        // And behind, so it comes all the way round.
+        assert_eq!(
+            oriented(front, floor, [0.0, -5.0]),
+            1 << crate::block::subnode_index(1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_cut_placed_on_a_wall_turns_its_front_toward_the_players_feet() {
+        // The other half of the report. A wall is any face whose normal is
+        // horizontal; the front ends up underneath, which is what makes a run
+        // of stairs up a wall read as steps.
+        let front = 1 << crate::block::subnode_index(1, 1, 2);
+        let below = 1 << crate::block::subnode_index(1, 0, 1);
+        for wall in [[1i8, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1]] {
+            assert_eq!(
+                oriented(front, wall, [0.0, 5.0]),
+                below,
+                "against the wall {wall:?} the front did not end up underfoot"
+            );
+        }
+    }
+
+    #[test]
+    fn no_face_means_exactly_as_authored() {
+        // What a mod placing computed geometry gets, and what a client that
+        // knows nothing about orientation sends. The engine must not
+        // second-guess a shape nobody asked it to turn.
+        let cut = signpost();
+        // Asked from a direction that WOULD turn it, or this passes for the
+        // wrong reason — which is how the first version of this shipped
+        // turning a shape it had been told to leave alone.
+        for toward in [[0.0, 5.0], [5.0, 0.0], [0.0, -5.0], [-5.0, 0.0]] {
+            assert_eq!(
+                oriented(cut, [0; 3], toward),
+                cut,
+                "a cut with no face was turned toward {toward:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn turning_a_cut_never_changes_how_much_of_it_there_is() {
+        // The conservation half (charter rule 5): a rotation is a permutation
+        // of cells, so a stair costs the same wherever it points. A turn that
+        // dropped a cell would be material destroyed by looking at it from
+        // another angle.
+        let cut = signpost();
+        for face in [[0i8, 1, 0], [0, -1, 0], [1, 0, 0], [0, 0, -1], [0; 3]] {
+            for toward in [[0.0, 5.0], [5.0, 0.0], [0.0, -5.0], [-5.0, 0.0]] {
+                assert_eq!(
+                    oriented(cut, face, toward).count_ones(),
+                    cut.count_ones(),
+                    "face {face:?} toward {toward:?} changed the cell count"
+                );
+            }
+        }
     }
 
     #[test]

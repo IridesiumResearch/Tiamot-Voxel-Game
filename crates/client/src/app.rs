@@ -1780,12 +1780,29 @@ impl App {
     /// The cell a placement would fill: one step out of the surface.
     #[must_use]
     pub fn place_target(&self) -> Option<tiamot_core::SubNodePos> {
+        self.place_aim().map(|(target, _)| target)
+    }
+
+    /// The same, with the face the placement would be made against.
+    ///
+    /// The face is the outward normal of the surface, which is what turns a
+    /// crafted cut toward the player — or toward their feet on a wall. Only
+    /// this side knows what the crosshair is on; what it MEANS is the server's
+    /// (charter rule 2, and `place::oriented`).
+    #[must_use]
+    pub fn place_aim(&self) -> Option<(tiamot_core::SubNodePos, [i8; 3])> {
         let hit = self.looking_at()?;
-        self.target_of([
+        let target = self.target_of([
             hit.cell[0] + hit.normal[0],
             hit.cell[1] + hit.normal[1],
             hit.cell[2] + hit.normal[2],
-        ])
+        ])?;
+        let face = [
+            i8::try_from(hit.normal[0]).unwrap_or(0),
+            i8::try_from(hit.normal[1]).unwrap_or(0),
+            i8::try_from(hit.normal[2]).unwrap_or(0),
+        ];
+        Some((target, face))
     }
 
     /// A row of one block of every material the server registered, laid out
@@ -2054,13 +2071,14 @@ impl App {
             self.warn("that is not something you can build with".to_owned());
             return;
         }
-        let Some(target) = self.place_target() else {
+        let Some((target, face)) = self.place_aim() else {
             return;
         };
         self.connection.send(Command::Place {
             target,
             material: stack.material,
             shape: stack.shape,
+            face,
         });
     }
 

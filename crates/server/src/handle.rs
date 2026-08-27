@@ -2011,6 +2011,48 @@ impl ServerHandle {
                             // client that knows nothing about shapes sends.
                             let shape = tiamot_core::inventory::Shape::new(request.shape);
 
+                            // **Turned to face whoever placed it**, and toward
+                            // their feet against a wall — reported from the
+                            // window, and the reason a cut has a front at all.
+                            // The charge below matches on the AUTHORED shape,
+                            // which is what the player is carrying; only the
+                            // geometry turns.
+                            let placed_shape = shape.and_then(|shape| {
+                                let block = request.target.block();
+                                let toward = shared
+                                    .player_eye(&request.actor)
+                                    .map_or([0.0, 1.0], |(origin, eye)| {
+                                        // In cells, through the chunk
+                                        // difference — never a world-space f32
+                                        // (charter rule 7). The block's centre
+                                        // is a cell and a half in from its
+                                        // corner.
+                                        let span = |axis: usize| {
+                                            let chunks = match axis {
+                                                0 => origin.x - block.chunk().x,
+                                                _ => origin.z - block.chunk().z,
+                                            } as f32
+                                                * tiamot_core::CHUNK_SUBNODES as f32;
+                                            let corner = match axis {
+                                                0 => block.x,
+                                                _ => block.z,
+                                            }
+                                            .rem_euclid(tiamot_core::CHUNK_BLOCKS as i32)
+                                                as f32
+                                                * tiamot_core::SUBNODES_PER_AXIS as f32;
+                                            chunks + eye[axis] - (corner + 1.5)
+                                        };
+                                        [span(0), span(2)]
+                                    });
+                                tiamot_core::inventory::Shape::new(
+                                    tiamot_core::place::oriented(
+                                        shape.occupancy(),
+                                        request.face,
+                                        toward,
+                                    ),
+                                )
+                            });
+
                             // **What the target block already holds.** A block
                             // brush fills the gaps in a partly-mined block
                             // rather than colliding with what is left of it —
@@ -2030,7 +2072,7 @@ impl ServerHandle {
                                 });
 
                             let outcome =
-                                tiamot_core::place::plan(request.target, held, shape, brush, filled)
+                                tiamot_core::place::plan(request.target, held, placed_shape, brush, filled)
                                 .and_then(|plan| {
                                     // Air only, judged cell by cell. Placing
                                     // into occupied space would have to decide

@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 33;
+pub const PROTOCOL_VERSION: u32 = 34;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -132,6 +132,14 @@ pub const PROTOCOL_VERSION: u32 = 33;
 // safe, because postcard is not self-describing and an old client would read the
 // next keyframe's bytes as this one's grade. That is what the version check is
 // for: v9 and v10 refuse each other before either reads a keyframe.
+
+// v34 (post-14): `ClientMessage::Place` carries the FACE the placement was
+// made against, so the server can orient a cut stack — front toward the
+// player, or toward their feet against a wall. **A field on an existing
+// message**, which is the one shape of change this format does not make safe,
+// exactly as v24 and v13 were: postcard is not self-describing, so a v33 peer
+// would read the byte after the shape as the start of the next message. The
+// version check is what keeps the two apart.
 
 /// Largest inbound message the decoder will consider, in bytes.
 ///
@@ -746,6 +754,20 @@ pub enum ClientMessage {
         /// the server matches the pair, so the stairs they crafted stay in the
         /// inventory rather than the material draining out from under them.
         shape: u32,
+        /// The face this was placed against, as the outward normal of the
+        /// surface (protocol v34).
+        ///
+        /// **Presentation decides which face, the server decides what it
+        /// means.** Only the client knows what the crosshair was on, and only
+        /// the server may say what a cut stack does about it — a stair
+        /// arriving at a wall turns to face the floor, and one on the ground
+        /// turns to face the player. Charter rule 2 puts the second half here
+        /// and gives the client no say in the geometry.
+        ///
+        /// Exactly one component is non-zero for a real placement. Anything
+        /// else — including all zeroes from a client that does not care — means
+        /// "no preference", and the shape is placed as it was authored.
+        face: [i8; 3],
     },
 
     /// Ask for how far the server should stream chunks to this player.
@@ -2614,6 +2636,7 @@ mod tests {
                     target: SubNodePos::new(0, 0, 0),
                     material: 0,
                     shape: 0,
+                    face: [0; 3],
                 },
                 13,
             ),

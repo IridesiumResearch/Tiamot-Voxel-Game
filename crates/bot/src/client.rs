@@ -1661,10 +1661,34 @@ impl Bot {
         material: u16,
         shape: u32,
     ) -> Result<(), BotError> {
+        // No face, which means "as authored". A bot placing a cut is usually
+        // asking about the cut and not about which way it ends up pointing;
+        // `place_shape_against` is for when the orientation IS the question.
+        self.place_shape_against(target, material, shape, [0; 3])
+            .await
+    }
+
+    /// The same, said to have been placed against a particular face.
+    ///
+    /// The face is the outward normal of the surface, exactly as a client's
+    /// raycast reports it. The server turns a cut toward whoever placed it, and
+    /// toward their feet against a wall — see `place::oriented`.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn place_shape_against(
+        &mut self,
+        target: tiamot_core::SubNodePos,
+        material: u16,
+        shape: u32,
+        face: [i8; 3],
+    ) -> Result<(), BotError> {
         self.send(&tiamot_core::proto::ClientMessage::Place {
             target,
             material,
             shape,
+            face,
         })
         .await
     }

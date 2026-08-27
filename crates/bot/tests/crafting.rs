@@ -534,3 +534,92 @@ fn placing_a_cut_stack_puts_that_cut_in_the_world() {
     });
     server.stop();
 }
+
+#[test]
+fn a_cut_turns_to_face_whoever_places_it() {
+    // **Reported from the window**: "when placing a shape block it should
+    // always place where the front arrow is pointing toward the player. But
+    // when placing on a wall it should orient the front to the player's feet."
+    //
+    // The same cut, from the same stack, placed against the ground and against
+    // a wall. What is asserted is that the two land as DIFFERENT geometry of
+    // the same size — the orientation is real, and it costs nothing.
+    let server = start("turned-cut", write_bench("turned-cut"));
+    block_on(async {
+        let mut bot = join(&server, "Turner").await;
+        let stone = bot
+            .material_table()
+            .expect("a material table")
+            .into_iter()
+            .find(|entry| entry.name == "bench:stone")
+            .map(|entry| entry.id)
+            .expect("the bench registers stone");
+
+        // Two cuts, so there is one to place each way.
+        for _ in 0..2 {
+            bot.chat("craft").await.expect("craft");
+        }
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let cut = loop {
+            if let Some(stack) = bot.inventory().iter().find(|stack| stack.shape != 0) {
+                break *stack;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the recipe never produced a cut stack"
+            );
+            bot.recv().await.expect("recv");
+        };
+
+        let placed = |bot: &Bot, at: tiamot_core::SubNodePos| {
+            bot.received()
+                .into_iter()
+                .find_map(|message| match message {
+                    tiamot_core::proto::ServerMessage::BlockDelta {
+                        edit: tiamot_core::proto::Edit::Partial { pos, occupancy, .. },
+                        ..
+                    } if pos == at.block() => Some(occupancy),
+                    _ => None,
+                })
+        };
+
+        let land = async |bot: &mut Bot, at, face| {
+            bot.place_shape_against(at, stone, cut.shape, face)
+                .await
+                .expect("send");
+            let deadline = tokio::time::Instant::now() + PATIENCE;
+            loop {
+                if let Some(found) = placed(bot, at) {
+                    break found;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "nothing was written where the cut was placed against {face:?}; \
+                     the server said {:?}",
+                    bot.notices()
+                );
+                bot.recv().await.expect("recv");
+            }
+        };
+
+        // On the ground, and on a wall, in two different blocks.
+        let on_ground = tiamot_core::SubNodePos::new(7, 3, 7);
+        let on_wall = tiamot_core::SubNodePos::new(10, 3, 7);
+        let flat = land(&mut bot, on_ground, [0, 1, 0]).await;
+        let upright = land(&mut bot, on_wall, [1, 0, 0]).await;
+
+        assert_eq!(
+            flat.count_ones(),
+            upright.count_ones(),
+            "turning a cut changed how much of it there is: {flat:#029b} against {upright:#029b}"
+        );
+        assert_ne!(
+            flat, upright,
+            "the same cut landed identically on the ground and on a wall, so the face \
+             it was placed against is being ignored"
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}

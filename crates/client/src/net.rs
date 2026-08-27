@@ -486,6 +486,9 @@ pub enum Command {
         material: u16,
         /// The cut being placed, or `0` for loose material.
         shape: u32,
+        /// The outward normal of the surface it is being placed against, which
+        /// is what turns the cut to face the player.
+        face: [i8; 3],
     },
 
     /// Report that a mod-registered action was pressed or released.
@@ -1569,7 +1572,9 @@ fn to_wire(command: Command) -> ClientMessage {
             target,
             material,
             shape,
+            face,
         } => ClientMessage::Place {
+            face,
             target,
             material,
             shape,

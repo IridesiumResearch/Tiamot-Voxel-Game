@@ -538,6 +538,9 @@ pub struct PlacementRequest {
     /// A CLAIM, like the material: the server matches it against what the
     /// player actually has and places nothing if they have no such stack.
     pub shape: u32,
+    /// The surface it was placed against, for turning a cut to face the
+    /// player. All zeroes means no preference.
+    pub face: [i8; 3],
 }
 
 /// How many chunk requests the simulation serves per tick, across all players.
@@ -602,6 +605,7 @@ impl Shared {
         target: tiamot_core::SubNodePos,
         material: u16,
         shape: u32,
+        face: [i8; 3],
     ) -> bool {
         let Ok(mut queue) = self.placements.lock() else {
             return false;
@@ -614,6 +618,7 @@ impl Shared {
             target,
             material,
             shape,
+            face,
         });
         true
     }
@@ -2168,9 +2173,10 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 target,
                 material,
                 shape,
+                face,
             } => {
                 if let Some(uuid) = session.uuid()
-                    && !shared.queue_placement(uuid, *target, *material, *shape)
+                    && !shared.queue_placement(uuid, *target, *material, *shape, *face)
                 {
                     warn!("placement queue is full; dropping a placement");
                 }
