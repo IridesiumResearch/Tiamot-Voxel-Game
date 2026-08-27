@@ -283,6 +283,8 @@ pub enum Event {
         spawn: BlockPos,
         /// The server's tick when it said so.
         tick: u64,
+        /// Whether this player may use admin powers.
+        may_fly: bool,
     },
 
     /// A decoded chunk.
@@ -1108,11 +1110,13 @@ async fn session(
                 player_uuid,
                 spawn,
                 tick,
+                may_fly,
             } => {
                 let _ = events.send(Event::Joined {
                     uuid: player_uuid,
                     spawn,
                     tick,
+                    may_fly,
                 });
             }
 

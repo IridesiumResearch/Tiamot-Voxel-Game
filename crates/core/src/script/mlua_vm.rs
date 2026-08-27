@@ -2444,6 +2444,10 @@ impl MluaVm {
                     crate::ent::EntityId(id),
                     &crate::ent::access::Patch {
                         drive: Some(crate::phys::Intent {
+                            // A mod steers a body on the ground. Flight is a
+                            // permission a SERVER grants a player, not a mode a
+                            // mob asks for.
+                            fly: false,
                             walk: steer.walk,
                             jump: steer.jump,
                             gait,
@@ -3877,6 +3881,7 @@ fn read_patch(spec: &Table) -> mlua::Result<crate::ent::Patch> {
             }
         };
         patch.drive = Some(crate::phys::Intent {
+            fly: false,
             walk: [x, z],
             jump: drive.get::<Option<bool>>("jump")?.unwrap_or(false),
             gait,

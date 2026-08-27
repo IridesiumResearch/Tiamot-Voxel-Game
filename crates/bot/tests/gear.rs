@@ -54,6 +54,7 @@ fn start_at(world_path: PathBuf) -> ServerHandle {
         world_path,
         max_players: 8,
         allowlist: Allowlist::open(),
+        operators: Vec::new(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(reference_mods()),
         enabled_mods: None,

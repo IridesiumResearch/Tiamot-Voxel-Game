@@ -74,6 +74,17 @@ pub struct Config {
     #[serde(default)]
     pub seed: Option<u64>,
 
+    /// Who may use admin powers, as hex UUIDs.
+    ///
+    /// **Flight is the only one today**, and it is a permission rather than a
+    /// mode: every client can ask and the server honours it for these players
+    /// and nobody else. Empty is the default and the right answer for a public
+    /// server.
+    ///
+    /// A player's UUID is on the server's own log line when they join.
+    #[serde(default)]
+    pub operators: Vec<String>,
+
     /// Directory to load mods from.
     ///
     /// Absent means no mods. That is a legitimate configuration — the engine is
@@ -222,6 +233,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            operators: Vec::new(),
             bind_addr: Self::default_bind_addr(),
             world_path: Self::default_world_path(),
             max_players: Self::default_max_players(),

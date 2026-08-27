@@ -72,6 +72,7 @@ fn twenty_bots_for_sixty_seconds_leave_the_server_healthy() {
         world_path: dir,
         max_players: 64,
         allowlist: Allowlist::open(),
+        operators: Vec::new(),
         view_distance: ViewDistance::MINIMUM,
         // The reference mods, because the swarm DIGS rather than writing blocks
         // into the world. Charter rule 1 leaves the engine with no tools of its

@@ -847,6 +847,7 @@ mod tests {
         }
 
         let east = tiamot_core::phys::Intent {
+            fly: false,
             walk: [1.0, 0.0],
             jump: false,
             gait: tiamot_core::phys::Gait::Walk,

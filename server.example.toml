@@ -32,6 +32,18 @@ max_players = 16
 # README's own quick-start command names.
 mods_path = "game"
 
+# Who may use admin powers, as hex UUIDs. Empty by default, which is the right
+# answer for a public server.
+#
+# Flight is the only power today, and it is a PERMISSION rather than a mode:
+# every client can press the key and the server honours it for these players and
+# nobody else. A player's UUID appears on this server's own log line when they
+# join.
+#
+# A world you host for yourself from the client's menu makes YOU its operator
+# automatically — this list is for a dedicated server.
+#operators = ["9cb327465210..."]
+
 # How far players can see, in chunks. One chunk is 16 blocks.
 #
 # **This is the CEILING, not the setting.** Clients ask for a radius and the

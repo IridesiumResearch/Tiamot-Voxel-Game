@@ -69,6 +69,7 @@ fn start(name: &str) -> ServerHandle {
         world_path: scratch(&format!("{name}-world")),
         max_players: 32,
         allowlist: Allowlist::open(),
+        operators: Vec::new(),
         view_distance: ViewDistance::MINIMUM,
         // The reference mods, because scenarios now DIG rather than writing
         // blocks into the world. Charter rule 1 means the engine has no tools,

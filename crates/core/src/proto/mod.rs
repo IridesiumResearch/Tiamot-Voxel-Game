@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -221,6 +221,13 @@ pub mod actions {
     /// against falling is the safer answer to a contradiction, and a client
     /// sending both is buggy rather than expressing a preference.
     pub const SNEAK: u32 = 1 << 2;
+    /// Leave gravity behind, honoured only for a player the server allows it.
+    ///
+    /// **Asking is not being allowed.** Every client can set this bit; the
+    /// server ignores it for anybody who is not an operator, exactly as it
+    /// ignores a placement into occupied space. Charter rule 2: the client
+    /// says what it wants and the server decides what happens.
+    pub const FLY: u32 = 1 << 3;
 }
 
 /// An Ed25519 signature on the wire.
@@ -1004,6 +1011,17 @@ pub enum ServerMessage {
         spawn: BlockPos,
         /// The server's tick when this was sent.
         tick: u64,
+        /// Whether this player may use admin powers — flight, today.
+        ///
+        /// **Appended to this variant** (protocol v33). Safe because the
+        /// version is agreed in the handshake before a `JoinWorld` is ever
+        /// sent, so no client decodes this that did not build it.
+        ///
+        /// Sent rather than asked for, because a client that predicted flight
+        /// the server was about to refuse would be corrected back to the
+        /// ground every tick. Charter rule 2 decides; this is the decision
+        /// arriving.
+        may_fly: bool,
     },
     /// A chunk's contents.
     ChunkData {
@@ -2766,6 +2784,7 @@ mod tests {
                     player_uuid: [0u8; 32],
                     spawn: BlockPos::new(0, 0, 0),
                     tick: 0,
+                    may_fly: false,
                 },
                 4,
             ),

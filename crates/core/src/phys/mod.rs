@@ -284,6 +284,12 @@ pub struct Intent {
     pub jump: bool,
     /// How fast to try to move, and whether to guard against edges.
     pub gait: Gait,
+    /// Whether the body is flying: no gravity, and it rises and falls on the
+    /// jump and sneak keys.
+    ///
+    /// **A permission the SERVER grants**, not a state a client announces. The
+    /// bit reaches here already checked — see `proto::actions::FLY`.
+    pub fly: bool,
 }
 
 /// A body being simulated.
@@ -427,7 +433,22 @@ pub fn step_shaped(
     let wet = swim::submersion(solid, &shape.aabb(body.position)).fraction;
 
     // --- vertical velocity -------------------------------------------------
-    if intent.jump && body.on_ground {
+    if intent.fly {
+        // **No gravity, and vertical on the same two keys.** Rising and falling
+        // at the gait's own speed keeps one number in charge of how fast a body
+        // moves, so a sneaking descent is slow and a sprinting climb is quick
+        // without flight needing speeds of its own.
+        let climb = intent.gait.top_speed(tuning);
+        body.velocity[1] = if intent.jump {
+            climb
+        } else if intent.gait == Gait::Sneak {
+            -climb
+        } else {
+            // Held, not falling. A body that drifted down when nothing was
+            // pressed would be gravity by another name.
+            0.0
+        };
+    } else if intent.jump && body.on_ground {
         // A push off the bottom is still a jump. Standing in a shallow pool and
         // leaping out of it is the same action as leaping off dry ground, and
         // routing it through the swim branch would turn it into a feeble drift.

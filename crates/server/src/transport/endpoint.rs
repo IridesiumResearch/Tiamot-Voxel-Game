@@ -142,6 +142,13 @@ pub struct Shared {
     /// someone to the allowlist should not have to restart the server, which
     /// would disconnect everyone already playing.
     pub allowlist: std::sync::RwLock<Allowlist>,
+    /// Who may use admin powers, by UUID.
+    ///
+    /// Fixed at startup: an operator list that could change while the server
+    /// ran would want an audit trail and a way to say who changed it, and
+    /// neither exists yet. `server.toml` for a hosted world, and the client's
+    /// own identity for the one it hosts itself.
+    pub operators: std::collections::BTreeSet<PlayerUuid>,
     /// Maximum simultaneous players.
     pub max_players: u32,
     /// Where a new player starts.
@@ -469,7 +476,11 @@ pub fn anim_from_motion(
 /// [`ClientMessage::PlayerInput`]), so there is no rotation here and therefore
 /// no trigonometry in the simulation path — charter rule 4.
 #[must_use]
-pub fn intent_from_wire(movement: [f32; 3], actions: u32) -> tiamot_core::phys::Intent {
+pub fn intent_from_wire(
+    movement: [f32; 3],
+    actions: u32,
+    may_fly: bool,
+) -> tiamot_core::phys::Intent {
     use tiamot_core::phys::Gait;
     use tiamot_core::proto::actions as bits;
 
@@ -487,6 +498,11 @@ pub fn intent_from_wire(movement: [f32; 3], actions: u32) -> tiamot_core::phys::
         walk: [movement[0], movement[2]],
         jump: actions & bits::JUMP != 0,
         gait,
+        // **Asked AND allowed.** Every client can set the bit; only a player
+        // the server has made an operator gets it honoured. Charter rule 2: a
+        // client says what it wants and the server decides what happens, which
+        // is the same rule that refuses a placement into occupied space.
+        fly: may_fly && actions & bits::FLY != 0,
     }
 }
 
@@ -1339,6 +1355,12 @@ impl Shared {
     /// not exist yet is never sent and the screen is over nothing.
     ///
     /// Empty is a fact about a place, not the absence of one.
+    /// Whether this player may use admin powers.
+    #[must_use]
+    pub fn is_operator(&self, uuid: &PlayerUuid) -> bool {
+        self.operators.contains(uuid)
+    }
+
     pub fn ensure_inventory(&self, uuid: PlayerUuid) {
         if let Ok(mut inventories) = self.inventories.lock() {
             inventories
@@ -1933,6 +1955,10 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 current_players: shared.players.load(Ordering::Acquire),
                 spawn: shared.spawn,
                 tick: shared.tick(),
+                // **Decided here and sent with the join.** A client never asks
+                // whether it may fly; it is told, so it never predicts a power
+                // the server is about to ignore.
+                may_fly: session.uuid().is_some_and(|uuid| shared.is_operator(&uuid)),
                 now: unix_now(),
             };
             session.handle(&message, &context, &auth, &mut identities)
@@ -2088,7 +2114,12 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     // A refusal is ordinary traffic: a duplicate from the
                     // three-input redundancy, or an input whose tick has
                     // already been simulated.
-                    shared.queue_input(&uuid, *tick, intent_from_wire(*movement, *actions), *look);
+                    shared.queue_input(
+                        &uuid,
+                        *tick,
+                        intent_from_wire(*movement, *actions, shared.is_operator(&uuid)),
+                        *look,
+                    );
                 }
             }
             Action::Dig { target } => {
@@ -2276,6 +2307,33 @@ fn to_io(err: quinn::ConnectionError) -> frame::FrameError {
 }
 
 #[cfg(test)]
+mod fly_permission_tests {
+    use super::*;
+    use tiamot_core::proto::actions as bits;
+
+    #[test]
+    fn asking_to_fly_is_not_being_allowed_to() {
+        // **Charter rule 2**, on the one power a client can currently ask for.
+        // Every client can set the bit — the protocol has no way to stop it —
+        // and the server honours it for an operator and nobody else, exactly as
+        // it ignores a placement into occupied space.
+        let asked = bits::FLY | bits::JUMP;
+        assert!(
+            !intent_from_wire([0.0; 3], asked, false).fly,
+            "a player the server did not make an operator flew by asking"
+        );
+        assert!(intent_from_wire([0.0; 3], asked, true).fly);
+    }
+
+    #[test]
+    fn an_operator_who_does_not_press_it_does_not_fly() {
+        // The permission is not the state: being allowed to fly is not flying,
+        // or an operator could never walk.
+        assert!(!intent_from_wire([0.0; 3], bits::JUMP, true).fly);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2307,6 +2365,7 @@ mod tests {
             sky_keyframes: Vec::new(),
             time_of_day: std::sync::atomic::AtomicU64::new(0),
             allowlist: std::sync::RwLock::new(Allowlist::open()),
+            operators: std::collections::BTreeSet::new(),
             max_players: 2,
             spawn: tiamot_core::BlockPos::new(0, 1, 0),
             players: AtomicU32::new(0),

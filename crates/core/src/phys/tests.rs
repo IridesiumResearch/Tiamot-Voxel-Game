@@ -83,6 +83,72 @@ fn simulate(scene: &Scene, mut body: Body, intent: Intent, ticks: usize) -> Body
 }
 
 #[test]
+fn a_flying_body_ignores_gravity_and_holds_its_height() {
+    // **Flight is a permission the server grants** — see `proto::actions::FLY`
+    // — and this is what it does once granted. Nothing pressed means HELD: a
+    // body that drifted down would be gravity by another name.
+    let tuning = Tuning::DEFAULT;
+    let scene = Scene::new(0);
+    let mut body = Body::at([24.0, 12.0, 24.0]);
+    let hover = Intent {
+        walk: [0.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+        fly: true,
+    };
+
+    let started = body.position[1];
+    for _ in 0..40 {
+        body = step(&scene, body, hover, &tuning);
+    }
+    assert!(
+        (body.position[1] - started).abs() < 0.001,
+        "a hovering body drifted from {started} to {}",
+        body.position[1]
+    );
+}
+
+#[test]
+fn a_flying_body_rises_on_jump_and_sinks_on_sneak() {
+    let tuning = Tuning::DEFAULT;
+    let scene = Scene::new(0);
+    let base = Intent {
+        walk: [0.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+        fly: true,
+    };
+
+    let mut up = Body::at([24.0, 12.0, 24.0]);
+    for _ in 0..20 {
+        up = step(&scene, up, Intent { jump: true, ..base }, &tuning);
+    }
+    assert!(
+        up.position[1] > 12.5,
+        "it did not climb: {}",
+        up.position[1]
+    );
+
+    let mut down = Body::at([24.0, 12.0, 24.0]);
+    for _ in 0..20 {
+        down = step(
+            &scene,
+            down,
+            Intent {
+                gait: Gait::Sneak,
+                ..base
+            },
+            &tuning,
+        );
+    }
+    assert!(
+        down.position[1] < 11.5,
+        "it did not descend: {}",
+        down.position[1]
+    );
+}
+
+#[test]
 fn a_body_falls_and_lands_exactly_on_the_floor() {
     // "Exactly" is the assertion that matters. Landing approximately is what a
     // sweep that stops a whole velocity step short of the surface does, and it
@@ -123,6 +189,7 @@ fn a_body_slides_along_a_wall_instead_of_sticking_to_it() {
         walk: [1.0, 1.0],
         jump: false,
         gait: Gait::Walk,
+        fly: false,
     };
     let body = simulate(&scene, start, intent, 20);
 
@@ -145,6 +212,7 @@ fn a_step_up_of_one_subnode_succeeds_and_two_does_not() {
         walk: [1.0, 0.0],
         jump: false,
         gait: Gait::Walk,
+        fly: false,
     };
     let start = Body {
         position: [0.0, 0.0, 0.5],
@@ -202,6 +270,7 @@ fn sneaking_stops_at_the_edge_and_walking_does_not() {
             walk: [1.0, 0.0],
             jump: false,
             gait: Gait::Sneak,
+            fly: false,
         },
         60,
     );
@@ -221,6 +290,7 @@ fn sneaking_stops_at_the_edge_and_walking_does_not() {
             walk: [1.0, 0.0],
             jump: false,
             gait: Gait::Walk,
+            fly: false,
         },
         60,
     );
@@ -242,6 +312,7 @@ fn a_jump_clears_one_block_but_not_two() {
         walk: [0.0, 0.0],
         jump: true,
         gait: Gait::Walk,
+        fly: false,
     };
 
     let mut body = start;
@@ -297,6 +368,7 @@ fn the_same_inputs_produce_the_same_body() {
         walk: [0.7, 0.3],
         jump: true,
         gait: Gait::Sprint,
+        fly: false,
     };
 
     let first = simulate(&scene, Body::at([0.5, 3.0, 0.5]), intent, 200);
@@ -342,6 +414,7 @@ proptest! {
                     1 => Gait::Sprint,
                     _ => Gait::Sneak,
                 },
+                fly: false,
             };
             body = step(&scene, body, intent, &tuning);
 
@@ -414,6 +487,7 @@ fn climbing_a_stepped_passage_does_not_cost_a_walking_pace() {
         walk: [1.0, 0.0],
         jump: true,
         gait: Gait::Walk,
+        fly: false,
     };
     for _ in 0..200 {
         body = step(&scene, body, intent, &tuning);
@@ -460,6 +534,7 @@ fn a_body_pushing_off_a_riser_keeps_the_speed_it_jumped_with() {
             walk: [1.0, 0.0],
             jump: true,
             gait: Gait::Walk,
+            fly: false,
         },
         &tuning,
     );
@@ -481,6 +556,7 @@ fn a_body_pushing_off_a_riser_keeps_the_speed_it_jumped_with() {
             walk: [1.0, 0.0],
             jump: false,
             gait: Gait::Walk,
+            fly: false,
         },
         &tuning,
     );
@@ -547,6 +623,7 @@ fn a_body_wedged_in_a_corner_loses_the_same_speed_on_both_axes() {
         walk: [1.0, 1.0],
         jump: true,
         gait: Gait::Walk,
+        fly: false,
     };
     let tuning = Tuning::DEFAULT;
 
@@ -596,6 +673,7 @@ fn a_jump_into_a_ceiling_keeps_the_speed_it_was_taken_at() {
             walk: [1.0, 0.0],
             jump: true,
             gait: Gait::Walk,
+            fly: false,
         };
         for _ in 0..20 {
             body = step(scene, body, intent, &tuning);
@@ -624,6 +702,7 @@ fn a_jump_into_a_ceiling_keeps_the_speed_it_was_taken_at() {
         walk: [1.0, 0.0],
         jump: true,
         gait: Gait::Walk,
+        fly: false,
     };
     let mut previous = 0.0;
     for tick in 0..12 {
@@ -679,6 +758,7 @@ fn walking_over_single_subnodes_never_leaves_the_ground_or_stalls() {
         walk: [1.0, 0.0],
         jump: false,
         gait: Gait::Walk,
+        fly: false,
     };
     let tuning = Tuning::DEFAULT;
 
@@ -724,6 +804,7 @@ fn step_down_glues_a_body_to_a_lip_and_not_to_a_cliff() {
         walk: [1.0, 0.0],
         jump: false,
         gait: Gait::Walk,
+        fly: false,
     };
 
     // Ground everywhere below y = 0, plus a shelf of `height` cells that ends at
@@ -785,6 +866,7 @@ fn step_down_does_not_cancel_the_jump_that_started_this_tick() {
         walk: [0.0, 0.0],
         jump: true,
         gait: Gait::Walk,
+        fly: false,
     };
     body = step(&scene, body, intent, &tuning);
     assert!(
@@ -873,6 +955,7 @@ fn a_body_inside_geometry_can_still_walk_out_of_it() {
         walk: [1.0, 0.0],
         jump: false,
         gait: Gait::Walk,
+        fly: false,
     };
     for _ in 0..40 {
         body = step(&scene, body, east, &tuning);
@@ -968,6 +1051,7 @@ fn a_body_barely_inside_a_wall_is_neither_lifted_nor_shoved() {
         walk: [-1.0, 0.0],
         jump: false,
         gait: Gait::Walk,
+        fly: false,
     };
     for _ in 0..10 {
         body = step(&scene, body, away, &Tuning::DEFAULT);
@@ -1021,6 +1105,7 @@ fn walking_over_scattered_lips_never_dips() {
         walk: [1.0, 0.0],
         jump: false,
         gait: Gait::Walk,
+        fly: false,
     };
 
     for tick in 0..40 {
@@ -1062,6 +1147,7 @@ fn a_stride_does_not_carry_a_body_off_a_ledge() {
         walk: [1.0, 0.0],
         jump: false,
         gait: Gait::Walk,
+        fly: false,
     };
     for _ in 0..14 {
         body = step(&scene, body, intent, &Tuning::DEFAULT);
@@ -1151,6 +1237,7 @@ fn a_one_block_hole_dug_two_deep_swallows_a_walking_body() {
         walk: [1.0, 0.0],
         jump: false,
         gait: Gait::Walk,
+        fly: false,
     };
 
     let mut lowest = body.position[1];
@@ -1216,6 +1303,7 @@ fn letting_go_of_sneak_at_a_brink_does_not_tip_a_body_in() {
                 walk: [1.0, 0.0],
                 jump: false,
                 gait: Gait::Sneak,
+                fly: false,
             },
             &tuning,
         );

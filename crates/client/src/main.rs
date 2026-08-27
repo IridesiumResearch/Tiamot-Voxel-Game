@@ -140,8 +140,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let (address, embedded) = match config.server {
             ServerChoice::Remote(address) => (address, None),
             ServerChoice::Embedded => {
-                let handle =
-                    start_local_world(&config.world_path, config.view(), catalogue.enabled())?;
+                let handle = start_local_world(
+                    &config.world_path,
+                    config.view(),
+                    catalogue.enabled(),
+                    &identity.uuid_as_root(),
+                )?;
                 tracing::info!(addr = %handle.local_addr(), "embedded server listening");
                 (handle.local_addr(), Some(handle))
             }
@@ -254,6 +258,9 @@ impl Held {
             // expects — see `App::advance`.
             sneak: self.down,
             jump: self.up,
+            // Set by the App from what the server granted, not from a key —
+            // see `App::advance`. The key only asks.
+            fly: false,
             teleport,
         };
         // Mouse movement is a delta, so it is consumed rather than held: a
@@ -333,6 +340,7 @@ fn start_local_world(
     world_path: &std::path::Path,
     view: tiamot_core::interest::ViewDistance,
     enabled_mods: Vec<String>,
+    operator: &tiamot_core::identity::PlayerUuid,
 ) -> Result<tiamot_server::ServerHandle, Box<dyn std::error::Error>> {
     Ok(tiamot_server::ServerHandle::start(
         &tiamot_server::Settings {
@@ -340,6 +348,11 @@ fn start_local_world(
             world_path: world_path.to_path_buf(),
             max_players: 1,
             allowlist: tiamot_core::identity::Allowlist::open(),
+            // **Your own world, your own powers.** A player hosting a world for
+            // themselves is its operator, which is what makes flight available
+            // for testing without a command to type. A world somebody ELSE
+            // hosts decides for itself, and says so at join.
+            operators: vec![operator.to_hex()],
             view_distance: view,
             mods_path: Some(std::path::PathBuf::from(MODS_DIR)),
             enabled_mods: Some(enabled_mods),
@@ -717,6 +730,14 @@ impl Client {
                     "engine:third_person" | "engine:third_person_alt" if pressed => {
                         app.toggle_third_person();
                     }
+                    "engine:fly" if pressed => {
+                        let on = app.toggle_fly();
+                        if app.may_fly() {
+                            tracing::info!(on, "flight");
+                        } else {
+                            tracing::info!("flight is for operators; this server said no");
+                        }
+                    }
                     "engine:chunk_borders" if pressed => {
                         let on = app.toggle_chunk_borders();
                         tracing::info!(on, "chunk borders");
@@ -1063,6 +1084,7 @@ impl Client {
                     &self.data.join(path),
                     self.config.view(),
                     self.catalogue.enabled(),
+                    &identity.uuid_as_root(),
                 )
                 .map_err(|err| err.to_string())?;
                 let address = handle.local_addr();

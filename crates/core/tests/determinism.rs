@@ -165,6 +165,7 @@ fn physics_fingerprint() -> u64 {
                 1 => Gait::Sprint,
                 _ => Gait::Sneak,
             },
+            fly: false,
         };
         body = tiamot_core::phys::step(&Scene, body, intent, &Tuning::DEFAULT);
 

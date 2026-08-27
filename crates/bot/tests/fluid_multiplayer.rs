@@ -125,6 +125,7 @@ fn start(name: &str) -> (ServerHandle, PathBuf) {
         world_path: root.clone(),
         max_players: 4,
         allowlist: Allowlist::open(),
+        operators: Vec::new(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(mods),
         enabled_mods: None,

@@ -396,6 +396,7 @@ fn bench_mode(
         world_path: world,
         max_players: 64,
         allowlist: Allowlist::open(),
+        operators: Vec::new(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: mods.canonicalize().ok(),
         enabled_mods: None,

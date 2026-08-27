@@ -556,6 +556,7 @@ mod tests {
             walk: [1.0, 0.0],
             jump: false,
             gait: crate::phys::Gait::Sprint,
+            fly: false,
         };
         for _ in 0..40 {
             body = step(&voxels, body, intent, &Tuning::DEFAULT);

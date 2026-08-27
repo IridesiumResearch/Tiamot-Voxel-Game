@@ -855,6 +855,7 @@ mod tests {
             walk: [0.0, 0.0],
             jump: true,
             gait: Gait::Walk,
+            fly: false,
         };
         client.predict(&ground, 1, jumping, &Tuning::DEFAULT);
 
@@ -1010,6 +1011,7 @@ mod tests {
             walk: [1.0, 0.0],
             jump: false,
             gait: Gait::Walk,
+            fly: false,
         }
     }
 

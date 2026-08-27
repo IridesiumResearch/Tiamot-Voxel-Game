@@ -118,6 +118,7 @@ fn start(name: &str, mods: PathBuf) -> ServerHandle {
         world_path: scratch(&format!("{name}-world")),
         max_players: 4,
         allowlist: Allowlist::open(),
+        operators: Vec::new(),
         // The default rather than the minimum: the mobs have to be inside a
         // viewer's cylinder for replication to be part of what is measured, and
         // replication is a third of the cost.

@@ -437,6 +437,17 @@ pub struct Settings {
     pub max_players: u32,
     /// Who is permitted to join.
     pub allowlist: Allowlist,
+    /// Who may use admin powers, as hex UUIDs.
+    ///
+    /// **Flight is the first of them.** A permission and not a mode: every
+    /// client can ask, and the server honours it for these players and nobody
+    /// else (charter rule 2). A singleplayer client puts its own identity in
+    /// here when it starts its embedded world, which is what makes "fly for
+    /// testing" work without a command; a hosted server names them in
+    /// `server.toml`.
+    ///
+    /// Empty is the safe default and the right one for a public server.
+    pub operators: Vec<String>,
 
     /// How far players can see, in chunks.
     pub view_distance: tiamot_core::interest::ViewDistance,
@@ -1004,6 +1015,21 @@ impl ServerHandle {
             ),
             content: content_index,
             allowlist: std::sync::RwLock::new(settings.allowlist.clone()),
+            // **Parsed once, here, and anything unreadable is refused loudly.**
+            // A typo in an operator list is a player who silently does not get
+            // the powers somebody meant to give them, which is the kind of
+            // thing nobody notices until it matters.
+            operators: settings
+                .operators
+                .iter()
+                .filter_map(|hex| match tiamot_core::PlayerUuid::from_hex(hex) {
+                    Ok(uuid) => Some(uuid),
+                    Err(_) => {
+                        error!(operator = %hex, "operator is not a UUID and was ignored");
+                        None
+                    }
+                })
+                .collect(),
             max_players: settings.max_players,
             spawn: tiamot_core::BlockPos::new(0, 1, 0),
             players: AtomicU32::new(0),
@@ -2914,6 +2940,7 @@ impl ServerHandle {
             world_path: world_path.to_path_buf(),
             max_players,
             allowlist: Allowlist::open(),
+            operators: Vec::new(),
             view_distance: tiamot_core::interest::ViewDistance::DEFAULT,
             seed: None,
             mods_path: None,

@@ -325,6 +325,11 @@ pub struct JoinContext<'a> {
     pub spawn: crate::coords::BlockPos,
     /// The server's current tick.
     pub tick: u64,
+    /// Whether the joining player may use admin powers.
+    ///
+    /// Decided by the server from its operator list and sent with the join, so
+    /// a client never has to ask and never predicts a power it does not have.
+    pub may_fly: bool,
     /// Unix timestamp, for stamping `added_at` on a first join.
     ///
     /// Passed in rather than read here so this module stays a pure function of
@@ -795,6 +800,7 @@ impl Session {
             player_uuid: *uuid.as_bytes(),
             spawn: context.spawn,
             tick: context.tick,
+            may_fly: context.may_fly,
         })
     }
 
@@ -963,6 +969,7 @@ mod tests {
             current_players: 0,
             spawn: BlockPos::new(0, 1, 0),
             tick: 7,
+            may_fly: false,
             now: 1_700_000_000,
         }
     }

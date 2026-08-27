@@ -48,6 +48,7 @@ fn settings(dir: &std::path::Path, allowlist: Allowlist) -> Settings {
         world_path: dir.to_path_buf(),
         max_players: 8,
         allowlist,
+        operators: Vec::new(),
         rcon: None,
         view_distance: tiamot_core::interest::ViewDistance::MINIMUM,
         mods_path: None,

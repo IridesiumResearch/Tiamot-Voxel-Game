@@ -234,6 +234,11 @@ pub enum Teleport {
 /// key code — and the free-fly camera is held to the same rule even though it
 /// is the engine's own.
 #[derive(Debug, Default, Clone, Copy)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per movement key, which is what a keyboard is; a bitfield here would \
+              be less legible at every call site than the four it replaces"
+)]
 pub struct Input {
     /// Forward is positive.
     pub forward: f32,
@@ -249,6 +254,12 @@ pub struct Input {
     pub sneak: bool,
     /// Whether to jump.
     pub jump: bool,
+    /// Whether flight is on.
+    ///
+    /// **What the server GRANTED, not what was pressed.** A client that flew
+    /// locally while the server refused would be corrected back to the ground
+    /// every tick, which is worse than not flying at all.
+    pub fly: bool,
     /// A one-shot debug teleport.
     pub teleport: Option<Teleport>,
 }
@@ -298,6 +309,12 @@ pub fn intent_at_yaw(yaw: f32, input: Input) -> Intent {
         } else {
             phys::Gait::Walk
         },
+        // **Predicted the same way the server will judge it.** A client that
+        // flew locally while the server refused would be corrected back to the
+        // ground every tick; one that did not predict it would lurch a round
+        // trip behind its own key. So the client tracks what the server GRANTED
+        // — see `App::may_fly` — rather than what the player pressed.
+        fly: input.fly,
     }
 }
 
@@ -941,6 +958,10 @@ pub struct App {
     /// anything. What it does NOT do is change when mobs spawn or anything else
     /// the server decides — this is for looking at the sky, not for playing.
     time_override: bool,
+    /// Whether the server has said this player may fly.
+    may_fly: bool,
+    /// Whether flight is on.
+    flying: bool,
     /// What the connection reported about the server's certificate.
     server_label: String,
     /// The locally predicted body, once the world has been joined.
@@ -1102,6 +1123,8 @@ impl App {
             heard: Vec::new(),
             step_sounds: std::collections::BTreeMap::new(),
             items: std::collections::BTreeSet::new(),
+            may_fly: false,
+            flying: false,
             world_paused: false,
             stride: 0.0,
             last_step_at: [0.0; 3],
@@ -3630,45 +3653,12 @@ impl App {
 
                 Event::Materials { table, images } => self.adopt_atlas(&table, &images),
 
-                Event::Joined { spawn, tick, .. } => {
-                    let position = Position::from_world(
-                        f64::from(spawn.x) + 0.5,
-                        f64::from(spawn.y) + 2.0,
-                        f64::from(spawn.z) + 0.5,
-                    );
-                    self.camera.position = position;
-                    self.spawn = Some(position);
-                    self.tick = tick;
-                    self.joined = true;
-
-                    // **Ask for the radius this client was configured with.**
-                    // Sent on join rather than on connect because the server
-                    // only has a streamer for a player who has reached the
-                    // world. The answer comes back as `Event::ViewDistance`
-                    // carrying what was actually granted, which is what the fog
-                    // is then drawn from — asking is not getting, and the
-                    // server's own limit is the ceiling.
-                    self.connection.send(crate::net::Command::ViewDistance {
-                        horizontal: self.config.view_distance,
-                        vertical: self.config.vertical_view_distance,
-                    });
-
-                    // The body starts where the server said, in the same
-                    // (chunk, local cells) pair the server simulates in — no
-                    // conversion, so nothing to disagree about.
-                    let origin = spawn.chunk();
-                    let corner = tiamot_core::BlockPos::from_chunk_corner(origin);
-                    let cells = tiamot_core::SUBNODES_PER_AXIS as f32;
-                    self.predictor = Some(Predictor::new(
-                        origin,
-                        [
-                            (spawn.x - corner.x) as f32 * cells + cells / 2.0,
-                            (spawn.y - corner.y) as f32 * cells,
-                            (spawn.z - corner.z) as f32 * cells + cells / 2.0,
-                        ],
-                        tick,
-                    ));
-                }
+                Event::Joined {
+                    spawn,
+                    tick,
+                    may_fly,
+                    ..
+                } => self.joined_world(spawn, tick, may_fly),
 
                 Event::Chunk(chunk) => self.store.insert(*chunk),
 
@@ -3853,7 +3843,11 @@ impl App {
     }
 
     /// Moves the camera and records the frame time.
-    pub fn advance(&mut self, input: Input, dt: f32) {
+    pub fn advance(&mut self, mut input: Input, dt: f32) {
+        // **Whether the server allows it, not whether a key is down.** The
+        // client predicts what the server will do; predicting flight it is
+        // about to refuse would be a correction every tick.
+        input.fly = self.flying;
         self.last_dt = dt;
         // Smoothed rather than instantaneous. A per-frame number is unreadable,
         // and charter rule 18 cares about pacing — which a jittering readout
@@ -4308,6 +4302,81 @@ impl App {
             }
         }
         self.renderer.set_blobs(&blobs);
+    }
+
+    /// Takes up residence in the world the server just admitted this client to.
+    ///
+    /// Its own method because `pump_network` is at clippy's line ceiling, and
+    /// because joining is a thing worth naming rather than the longest arm of a
+    /// match.
+    fn joined_world(&mut self, spawn: tiamot_core::BlockPos, tick: u64, may_fly: bool) {
+        // Kept so the fly toggle can refuse, rather than predicting a power
+        // that would be ignored on arrival.
+        self.may_fly = may_fly;
+
+        let position = Position::from_world(
+            f64::from(spawn.x) + 0.5,
+            f64::from(spawn.y) + 2.0,
+            f64::from(spawn.z) + 0.5,
+        );
+        self.camera.position = position;
+        self.spawn = Some(position);
+        self.tick = tick;
+        self.joined = true;
+
+        // **Ask for the radius this client was configured with.**
+        // Sent on join rather than on connect because the server
+        // only has a streamer for a player who has reached the
+        // world. The answer comes back as `Event::ViewDistance`
+        // carrying what was actually granted, which is what the fog
+        // is then drawn from — asking is not getting, and the
+        // server's own limit is the ceiling.
+        self.connection.send(crate::net::Command::ViewDistance {
+            horizontal: self.config.view_distance,
+            vertical: self.config.vertical_view_distance,
+        });
+
+        // The body starts where the server said, in the same
+        // (chunk, local cells) pair the server simulates in — no
+        // conversion, so nothing to disagree about.
+        let origin = spawn.chunk();
+        let corner = tiamot_core::BlockPos::from_chunk_corner(origin);
+        let cells = tiamot_core::SUBNODES_PER_AXIS as f32;
+        self.predictor = Some(Predictor::new(
+            origin,
+            [
+                (spawn.x - corner.x) as f32 * cells + cells / 2.0,
+                (spawn.y - corner.y) as f32 * cells,
+                (spawn.z - corner.z) as f32 * cells + cells / 2.0,
+            ],
+            tick,
+        ));
+    }
+
+    /// Turns flight on or off, if the server has allowed this player any.
+    ///
+    /// Returns whether it is on afterwards. A player the server has not made an
+    /// operator gets `false` and no change: the bit would be ignored on arrival
+    /// anyway, and predicting a flight that is about to be refused is a
+    /// correction every tick rather than a feature.
+    pub fn toggle_fly(&mut self) -> bool {
+        if !self.may_fly {
+            return false;
+        }
+        self.flying = !self.flying;
+        self.flying
+    }
+
+    /// Whether the server has told this client it may fly.
+    #[must_use]
+    pub const fn may_fly(&self) -> bool {
+        self.may_fly
+    }
+
+    /// Whether flight is on right now.
+    #[must_use]
+    pub const fn flying(&self) -> bool {
+        self.flying
     }
 
     /// The camera's field of view this frame, in radians.

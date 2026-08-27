@@ -43,6 +43,7 @@ fn start(name: &str) -> ServerHandle {
         world_path: scratch(name),
         max_players: 8,
         allowlist: Allowlist::open(),
+        operators: Vec::new(),
         view_distance: ViewDistance::MINIMUM,
         mods_path: Some(reference_mods()),
         enabled_mods: None,

@@ -448,6 +448,7 @@ mod tests {
             walk: [1.0, 0.3],
             jump: true,
             gait: Gait::Sprint,
+            fly: false,
         };
 
         let start = Body::at([24.0, 12.0, 24.0]);
@@ -686,6 +687,7 @@ mod tests {
             walk: [1.0, 0.0],
             jump: true,
             gait: Gait::Walk,
+            fly: false,
         };
         let out = simulate(&Pool, start, swimming, 60);
         assert!(
@@ -704,6 +706,7 @@ mod tests {
                 walk: [0.0, 0.0],
                 jump: false,
                 gait: Gait::Walk,
+                fly: false,
             },
             40,
         );
@@ -849,6 +852,7 @@ mod tests {
             walk: [1.0, 0.0],
             jump: false,
             gait: Gait::Walk,
+            fly: false,
         };
 
         let dry = travelled(&DryGround, intent, 60);

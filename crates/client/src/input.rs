@@ -448,6 +448,15 @@ const ENGINE_ACTIONS: &[(&str, &str, Option<Input>)] = &[
         "Sprint",
         Some(Input::Key(KeyCode::ControlLeft)),
     ),
+    // **Only does anything for an operator.** The server decides and says so
+    // at join; for everybody else this key is inert rather than absent, because
+    // an action that vanished from the controls list depending on who you are
+    // would be a controls screen that changed shape between servers.
+    (
+        "engine:fly",
+        "Fly (operators only)",
+        Some(Input::Key(KeyCode::KeyN)),
+    ),
     (
         "engine:dig",
         "Break what you are looking at",

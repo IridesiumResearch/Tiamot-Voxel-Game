@@ -197,6 +197,7 @@ mod tests {
             walk: [1.0, 0.0],
             jump: true,
             gait: Gait::Walk,
+            fly: false,
         }
     }
 
@@ -271,6 +272,7 @@ mod tests {
                 walk: [0.0, 0.0],
                 jump: tick == at,
                 gait: Gait::Walk,
+                fly: false,
             };
             on_time = crate::phys::step(&scene, on_time, press(1), &tuning);
             a_tick_late = crate::phys::step(&scene, a_tick_late, press(2), &tuning);
@@ -320,6 +322,7 @@ mod tests {
             walk: [x, 0.0],
             jump: false,
             gait: Gait::Walk,
+            fly: false,
         }
     }
 
