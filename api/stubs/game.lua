@@ -574,6 +574,30 @@ function game.give(player, spec) end
 ---@return table|nil held
 function game.held(player) end
 
+---The heading of a direction across the ground, in radians.
+---
+---**The inverse of the `facing` `game.entity` reports, and the reason is charter
+---rule 4.** Lua's `math.atan` is the platform's libm, and a mod runs inside the
+---tick — so two servers running the same mod would compute slightly different
+---yaws, and a yaw is persisted entity state. This comes from a committed table
+---and is the same number on every machine.
+---
+---Arguments are a direction across the ground, `dx` then `dz`, in this engine's
+---world axes where `+z` is north. The result is in `-pi..=pi` and can be written
+---straight into `game.set_entity{ yaw = ... }`.
+---
+---A direction of no length answers `0`, because a vector pointing nowhere has no
+---heading and the simulation may not produce a NaN (charter rule 4).
+---
+---```lua
+---local to = { x = target.pos.x - me.pos.x, z = target.pos.z - me.pos.z }
+---game.set_entity(id, { yaw = game.heading(to.x, to.z) })
+---```
+---@param dx number
+---@param dz number
+---@return number radians
+function game.heading(dx, dz) end
+
 ---Takes material out of a player's inventory.
 ---
 ---The same spec as `game.give`, and the same defaults. **Returns how many

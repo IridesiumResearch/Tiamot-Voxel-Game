@@ -1929,6 +1929,35 @@ impl MluaVm {
         }
     }
 
+    /// `game.heading`, the deterministic arc tangent.
+    ///
+    /// **The inverse of `game.entity`'s `facing`, and the same reason.** Turning
+    /// a direction back into a yaw is what anything that points at something
+    /// does, and Lua's `math.atan` is the platform's libm — called inside the
+    /// tick, producing a heading that is then persisted entity state. Two
+    /// servers running the same mod diverge, quietly, in a saved world.
+    ///
+    /// A reference mod did exactly that for a day. It was recorded as a known
+    /// hazard rather than left to be found, and this is what closes it.
+    ///
+    /// Arguments are `(dx, dz)` and not `(y, x)`: what a mod has is a direction
+    /// across the ground, and asking it to know which of the two goes first in
+    /// a maths library's argument list is asking it to get that wrong.
+    fn install_heading(&self, game: &Table) -> Result<(), ScriptError> {
+        let heading = self
+            .lua
+            .create_function(|_, (dx, dz): (f32, f32)| {
+                // `(dx, dz)` in this engine's world axes, where `+z` is north:
+                // the same convention `facing` reports, so the round trip
+                // through the two is the identity.
+                Ok(crate::detgen::trig::atan2(dx, dz))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("heading", heading)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// The `game.inventory`, `game.give` and `game.take` functions.
     ///
     /// **Crafting is a mod's job, and this is what makes that possible.**
@@ -3161,6 +3190,7 @@ impl MluaVm {
 
         self.install_entity_api(mod_id, game)?;
         self.install_storage_api(mod_id, game)?;
+        self.install_heading(game)?;
 
         let (get_fluid, set_fluid) = self.fluid_functions()?;
         game.set("get_fluid", get_fluid)
@@ -7281,6 +7311,53 @@ mod entity_tests {
             ),
         )
         .expect("the mod read its own item back");
+    }
+
+    #[test]
+    fn a_mod_turns_a_direction_into_a_heading_and_back_again() {
+        // **The round trip that has to close.** A mod reads `facing` to point
+        // at something and `game.heading` to work out which way it is pointing,
+        // and both come from the same committed table — so a mob that looks at
+        // you and then walks that way does not drift a little every time.
+        //
+        // The reason this is engine surface at all is charter rule 4: Lua's
+        // `math.atan` is the platform's libm, and a yaw is persisted entity
+        // state. A reference mod called it for a day.
+        let (mut vm, store) = vm_with_entities();
+        load(
+            &mut vm,
+            "surveyor",
+            "id = nil\n\
+             game.register_on_tick(function()\n\
+               if id == nil then\n\
+                 id = game.spawn_entity{ pos = {x=0,y=0,z=0} }\n\
+               end\n\
+             end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+        assert!(vm.tick(1).expect("tick").is_empty());
+        assert_eq!(store.entities.lock().expect("lock").len(), 1);
+
+        vm.eval_in(
+            "surveyor",
+            // Eight directions, checked against what the engine's own facing
+            // would be: set the yaw, read the facing back, and the heading of
+            // that facing must be the yaw again.
+            "for step = 0, 7 do\n\
+               local yaw = step * (math.pi / 4) - math.pi\n\
+               game.set_entity(id, { yaw = yaw })\n\
+               local me = game.entity(id)\n\
+               local back = game.heading(me.facing.x, me.facing.z)\n\
+               local apart = math.abs(back - yaw)\n\
+               apart = math.min(apart, math.abs(apart - 2 * math.pi))\n\
+               assert(apart < 0.01, 'yaw ' .. yaw .. ' came back as ' .. back)\n\
+             end\n\
+             assert(game.heading(0, 0) == 0, 'a direction of no length has no heading')\n\
+             assert(math.abs(game.heading(1, 0) - math.pi / 2) < 0.01, 'east')\n\
+             assert(math.abs(game.heading(0, 1)) < 0.01, 'north is zero')",
+        )
+        .expect("the round trip through facing and heading");
     }
 
     #[test]

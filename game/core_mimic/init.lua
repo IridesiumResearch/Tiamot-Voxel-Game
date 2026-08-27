@@ -170,15 +170,14 @@ local function steer(id, me, target, gait, anim)
     local moving = speed >= IDLE_SPEED_SQUARED
 
     game.set_entity(id, {
-        -- **`math.atan` is the platform's libm, and this is a tick.** Charter
-        -- rule 4: two servers running this mod can compute slightly different
-        -- yaws, and a yaw is persisted entity state. The engine has a committed
-        -- table for `sin` and `cos` (`game.entity` reports `facing` from it)
-        -- and none yet for the inverse, so this is a KNOWN hazard rather than
-        -- an accident — recorded in `docs/float-determinism.md`. The fix is a
-        -- committed `atan2` table beside the others, not something to work
-        -- around here.
-        yaw = math.atan(dx, dz),
+        -- **`game.heading`, not `math.atan`.** Lua's is the platform's libm and
+        -- this is a tick: two servers running this mod would compute slightly
+        -- different yaws, and a yaw is persisted entity state. That was a known
+        -- hazard here for a day, recorded rather than left, and the engine has
+        -- a committed table for the inverse now — the same one `facing` is
+        -- built from, so turning a heading into a direction and back is the
+        -- identity rather than two libraries' opinions.
+        yaw = game.heading(dx, dz),
         anim = moving and (anim or ANIM_WALK) or ANIM_IDLE,
     })
 end

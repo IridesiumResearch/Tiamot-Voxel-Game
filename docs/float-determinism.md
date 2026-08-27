@@ -119,11 +119,18 @@ A mod must not compute one itself: Lua's `math.sin` is the platform's libm like
 any other, and a mod runs inside the tick. `game.entity` therefore reports
 `facing` as a vector, so a mod never has to.
 
-**The inverse direction is still open.** Turning a direction back into an angle
-needs `atan2`, there is no committed table for it, and at least one reference
-mod in `game/` calls Lua's. That is the same hazard and it is not yet fixed;
-whoever needs it next should add the table beside `sin` rather than reach for
-libm.
+**The inverse is closed too, as of 2026-08-27.** Turning a direction back into
+an angle needs `atan2`, and `detgen::trig::atan2` is the committed table for it —
+built the same way, folded into the first octant so one table's rounding answers
+the whole circle. `game.heading(dx, dz)` is what a mod calls, and it is the
+inverse of the `facing` a mod reads, so the round trip through the two is the
+identity rather than two libraries' opinions.
+
+It was open for a day, and a reference mod called Lua's `math.atan` for a yaw
+that is persisted entity state. It was written down here and beside the line
+while it was true, which is the point of this document: **a hazard nobody has
+written down is a hazard that gets rediscovered.** No mod in `game/` calls libm
+now, and none should.
 
 ### 2. `mul_add`
 
