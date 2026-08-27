@@ -239,6 +239,76 @@ fn is_sky(colour: [f32; 3]) -> bool {
 }
 
 #[test]
+fn a_tab_strip_answers_the_tab_that_was_clicked() {
+    // **Reported from the window**: the menus' tabs should look like browser
+    // tabs. What a drawn strip can get wrong that a row of labels cannot is
+    // WHICH one a click lands on — the widths are measured from the text, so
+    // any drift in the walk puts clicks on the neighbour.
+    //
+    // Clicked near each tab's EDGES rather than its middle. A first version
+    // aimed at the centres and passed with six pixels of drift per tab
+    // deliberately introduced, which is a test that only catches being a whole
+    // tab out; the edges catch the drift that would grow into it.
+    let ctx = egui::Context::default();
+    let labels = ["Play", "Mods", "Settings"];
+
+    // The strip's own geometry, measured the way it measures it.
+    let mut edges = Vec::new();
+    let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let font = egui::FontId::proportional(14.0);
+            let mut x = ui.available_rect_before_wrap().left();
+            for label in labels {
+                let width = ui
+                    .painter()
+                    .layout_no_wrap((*label).to_owned(), font.clone(), egui::Color32::WHITE)
+                    .rect
+                    .width()
+                    + 28.0;
+                edges.push((x, x + width));
+                x += width;
+            }
+            let _ = client::widget::tabs(ui, 0, &labels);
+        });
+    });
+
+    for (expected, (left, right)) in edges.iter().copied().enumerate() {
+        // Two pixels inside each end, which is as close to the seam as a
+        // player ever clicks.
+        for at_x in [left + 2.0, right - 2.0] {
+            let at = egui::pos2(at_x, 12.0);
+            let mut input = egui::RawInput::default();
+            input.events.push(egui::Event::PointerMoved(at));
+            input.events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            });
+            input.events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            });
+
+            let mut picked = None;
+            let _ = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    picked = client::widget::tabs(ui, 0, &labels);
+                });
+            });
+            assert_eq!(
+                picked,
+                Some(expected),
+                "a click at x {at_x} — inside `{}` — answered {picked:?}",
+                labels[expected]
+            );
+        }
+    }
+}
+
+#[test]
 fn distant_terrain_fades_into_the_sky() {
     // **Fog exists to hide the edge of the loaded world.** Without it, the far
     // chunk boundary is a hard line between terrain and sky and every chunk

@@ -142,7 +142,10 @@ local function shapes_tab(player)
         children[#children + 1] = {
             type = "label", text = "Nothing loose to cut — dig something first.",
         }
-        return { type = "container", direction = "column", gap = 6, children = children }
+        return {
+            type = "container", direction = "column", gap = 6,
+            align = "center", children = children,
+        }
     end
     children[#children + 1] = {
         type = "dropdown", name = "material", options = names, selected = pick,
@@ -163,7 +166,16 @@ local function shapes_tab(player)
             { type = "button", name = "reset", text = "Reset" },
         },
     }
-    return { type = "container", direction = "column", gap = 6, children = children }
+    -- **Centred down the sheet.** Reported from the window: the crafter sat
+    -- against the left edge with a lot of empty sheet beside it, because a
+    -- column lays its children out from the start unless it is told otherwise.
+    -- The editor is a square in the middle of a wide screen, so everything
+    -- above and below it should line up with the square rather than with the
+    -- margin.
+    return {
+        type = "container", direction = "column", gap = 6,
+        align = "center", children = children,
+    }
 end
 
 --- The screen: the tabs, then whichever tab is showing.

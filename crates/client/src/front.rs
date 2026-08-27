@@ -117,29 +117,38 @@ impl Front {
     /// `config` is edited in place — the settings tab writes straight to it and
     /// the window saves when [`Front::settings_dirty`] says so.
     pub fn draw(&mut self, ctx: &egui::Context, config: &mut crate::config::Config) -> Action {
+        const TABS: [(Tab, &str); 3] = [
+            (Tab::Play, "Play"),
+            (Tab::Mods, "Mods"),
+            (Tab::Settings, "Settings"),
+        ];
+
         let mut action = Action::None;
         // **The same sheet as every in-game screen**, so a page cannot decide
         // its own size and run off the edges — see `crate::panel::sheet`. The
         // tabs are this screen's own row under the shared bar, because it is
         // the one screen with nowhere to go Back to.
         crate::panel::sheet(ctx, "Tiamot", None, |ui| {
-            ui.horizontal(|ui| {
-                for (tab, label) in [
-                    (Tab::Play, "Play"),
-                    (Tab::Mods, "Mods"),
-                    (Tab::Settings, "Settings"),
-                ] {
-                    if ui.selectable_label(self.tab == tab, label).clicked() {
-                        self.tab = tab;
-                    }
+            // **Quit above the tabs, not beside them.** The strip draws the
+            // page edge across the whole sheet — that line under the inactive
+            // tabs and around the active one is what makes them tabs — so it
+            // needs the full width, and a button sharing the row would either
+            // be pushed off it or cut the line short.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Quit").clicked() {
+                    action = Action::Quit;
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Quit").clicked() {
-                        action = Action::Quit;
-                    }
-                });
             });
-            ui.separator();
+
+            let active = TABS
+                .iter()
+                .position(|(tab, _)| *tab == self.tab)
+                .unwrap_or(0);
+            let labels: Vec<&str> = TABS.iter().map(|(_, label)| *label).collect();
+            if let Some(picked) = crate::widget::tabs(ui, active, &labels) {
+                self.tab = TABS[picked].0;
+            }
+            ui.add_space(6.0);
 
             if let Some(notice) = &self.notice {
                 ui.colored_label(egui::Color32::from_rgb(230, 170, 90), notice);

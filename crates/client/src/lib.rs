@@ -58,6 +58,117 @@ pub mod trust;
 
 /// Interface controls whose behaviour is shared between screens.
 pub mod widget {
+    /// A row of tabs, drawn the way a browser draws them.
+    ///
+    /// Returns the index of one that was clicked, or `None`.
+    ///
+    /// # Why they are drawn rather than composed from labels
+    ///
+    /// Reported from the window as wanting the menus' tabs to LOOK like tabs.
+    /// egui's `selectable_label` is a highlighted word: nothing about it says
+    /// the strip below belongs to the one that is lit, and with three of them
+    /// in a row it reads as three buttons that happen to be next to each other.
+    ///
+    /// What makes a tab a tab is that the active one is JOINED to the page —
+    /// rounded at the top, square at the bottom, and sitting on a baseline the
+    /// inactive ones stay above. That is four rectangles and a line, and it is
+    /// worth them.
+    ///
+    /// **Engine screens only.** A mod's dialog draws its own tabs out of
+    /// buttons and a style, deliberately: the engine having one idea of what a
+    /// tab looks like is the thing `game/core_ui` says it does not want
+    /// imposed on it.
+    pub fn tabs(ui: &mut egui::Ui, active: usize, labels: &[&str]) -> Option<usize> {
+        /// How far the strip sits above the baseline it draws.
+        const HEIGHT: f32 = 26.0;
+        /// Padding either side of a label.
+        const PAD: f32 = 14.0;
+
+        let mut clicked = None;
+        let font = egui::FontId::proportional(14.0);
+        let widths: Vec<f32> = labels
+            .iter()
+            .map(|label| {
+                ui.painter()
+                    .layout_no_wrap((*label).to_owned(), font.clone(), egui::Color32::WHITE)
+                    .rect
+                    .width()
+                    + PAD * 2.0
+            })
+            .collect();
+
+        let total: f32 = widths.iter().sum();
+        let (strip, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width().max(total), HEIGHT + 2.0),
+            egui::Sense::hover(),
+        );
+        let baseline = strip.bottom() - 1.0;
+
+        let mut x = strip.left();
+        for (index, (label, width)) in labels.iter().zip(&widths).enumerate() {
+            let selected = index == active;
+            // The active tab reaches the baseline; the others stop short of it,
+            // which is what puts them behind the page rather than on it.
+            let top = if selected {
+                strip.top()
+            } else {
+                strip.top() + 3.0
+            };
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(x, top),
+                egui::pos2(x + width, baseline + if selected { 1.0 } else { -1.0 }),
+            );
+            let response = ui.interact(rect, ui.id().with(("tab", index)), egui::Sense::click());
+
+            let fill = if selected {
+                egui::Color32::from_gray(48)
+            } else if response.hovered() {
+                egui::Color32::from_gray(38)
+            } else {
+                egui::Color32::from_gray(30)
+            };
+            // Rounded at the top and square at the bottom: a tab is a page
+            // corner, not a pill.
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius {
+                    nw: 6,
+                    ne: 6,
+                    sw: 0,
+                    se: 0,
+                },
+                fill,
+            );
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                *label,
+                font.clone(),
+                if selected {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_gray(170)
+                },
+            );
+
+            if response.clicked() {
+                clicked = Some(index);
+            }
+            x += width;
+        }
+
+        // The page edge, drawn UNDER the active tab so the two are one shape.
+        let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(70));
+        let gap_from = strip.left() + widths.iter().take(active).sum::<f32>();
+        let gap_width = widths.get(active).copied().unwrap_or(0.0);
+        ui.painter()
+            .hline(strip.left()..=gap_from, baseline, stroke);
+        ui.painter()
+            .hline((gap_from + gap_width)..=strip.right(), baseline, stroke);
+
+        clicked
+    }
+
     /// What a settled slider should do with the value it is showing.
     ///
     /// Returns the draft to keep for the next frame, and the value to apply, in
