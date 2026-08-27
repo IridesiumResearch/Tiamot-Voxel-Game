@@ -131,6 +131,28 @@ pub struct Bot {
     reader: tokio::task::JoinHandle<()>,
     /// The fingerprint the server actually presented.
     cert_fingerprint: [u8; 32],
+    /// Which way this bot is looking, as `[yaw, pitch]` in turns.
+    ///
+    /// **Held rather than passed to every call**, because a real player's head
+    /// stays where they left it: a test that had to name the direction on each
+    /// step would be a test whose bot faced north whenever somebody forgot.
+    look: [f32; 2],
+}
+
+impl Bot {
+    /// Points this bot's head, as `[yaw, pitch]` in turns.
+    ///
+    /// Applies to every input sent afterwards, exactly as a mouse does. Yaw
+    /// zero is north; a quarter turn is east.
+    pub const fn look_at(&mut self, look: [f32; 2]) {
+        self.look = look;
+    }
+
+    /// Which way this bot is looking.
+    #[must_use]
+    pub const fn looking(&self) -> [f32; 2] {
+        self.look
+    }
 }
 
 impl Drop for Bot {
@@ -248,6 +270,8 @@ impl Bot {
         });
 
         Ok(Self {
+            // North, which is where a client starts. `look_at` moves it.
+            look: [0.0, 0.0],
             identity,
             endpoint,
             connection,
@@ -955,6 +979,29 @@ impl Bot {
         actions: u32,
         ticks: u64,
     ) -> Result<PlayerPosition, BotError> {
+        self.walk_facing(direction, actions, ticks, self.look).await
+    }
+
+    /// The same, looking a particular way.
+    ///
+    /// `look` is `[yaw, pitch]` in TURNS, as the wire carries it.
+    ///
+    /// **Every bot sent `[0.0, 0.0]` until this existed**, which meant every
+    /// body in every test faced north for ever — and yaw zero is the one value
+    /// where a camera's angle and a figure's agree. That is why the mirrored
+    /// body in `157f4a3` survived two fixes: nothing in the suite could turn
+    /// anybody, so nothing could see it.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if a read or write fails.
+    pub async fn walk_facing(
+        &mut self,
+        direction: [f32; 3],
+        actions: u32,
+        ticks: u64,
+        look: [f32; 2],
+    ) -> Result<PlayerPosition, BotError> {
         /// How far ahead of the server to keep the queue fed. Comfortably
         /// inside `phys::input::MAX_LOOKAHEAD`, and more than a round trip.
         const AHEAD: u64 = 8;
@@ -982,7 +1029,7 @@ impl Bot {
                 self.send(&ClientMessage::PlayerInput {
                     tick: last_processed_input + offset,
                     movement: direction,
-                    look: [0.0, 0.0],
+                    look,
                     actions,
                 })
                 .await?;
@@ -1155,6 +1202,13 @@ impl Bot {
                             known.yaw = delta.yaw;
                             known.pitch = delta.pitch;
                             known.anim = delta.anim;
+                        }
+                    }
+                }
+                ServerMessage::EntityArmed { entities } => {
+                    for armed in entities {
+                        if let Some(known) = live.get_mut(&armed.id) {
+                            known.hands = armed.hands;
                         }
                     }
                 }

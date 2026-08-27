@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -1478,6 +1478,17 @@ pub enum ServerMessage {
         /// The id the mod gave it.
         id: String,
     },
+
+    /// What entities in view are holding, when it changes.
+    ///
+    /// **Appended at the end** (protocol v32).
+    ///
+    /// On the reliable channel with the spawns, not with the state deltas: see
+    /// [`EntityHands`] for why the two belong on opposite ones.
+    EntityArmed {
+        /// One entry per entity whose hands changed.
+        entities: Vec<EntityHands>,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -1515,12 +1526,39 @@ pub struct EntityDef {
     /// entity with a stack and no [`EntityDef::model`] is an item, and one with
     /// a model is a rig.
     pub item: Option<StackDef>,
+    /// What it is holding: main hand, then off hand.
+    ///
+    /// **Appended at the end** (protocol v32).
+    ///
+    /// A different question from [`EntityDef::item`], which is the stack an
+    /// entity IS. Reported from the window as every other player having empty
+    /// hands: the client draws what the LOCAL player holds from its own
+    /// inventory, and nothing on the wire said what anybody else had.
+    ///
+    /// Two slots rather than the whole hotbar. Hands are what is drawn, so
+    /// hands are what has to be carried.
+    pub hands: [Option<StackDef>; 2],
     /// The label above it, already resolved to the current display name.
     ///
     /// Resolved by the server because the name bound to a UUID is a fact only
     /// it has (charter rule 13), and a client holding the UUID instead would
     /// show a stale name until it reconnected.
     pub nametag: Option<String>,
+}
+
+/// What one entity is holding now.
+///
+/// **Its own message and not a field on [`EntityDelta`]** (protocol v32). A
+/// position changes every tick and may be dropped; a hand changes rarely and
+/// may not. Carrying it in the delta would pay for it twenty times a second to
+/// send something usually unchanged, on the one channel where losing it leaves
+/// a sword invisible until its holder next switches slots.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EntityHands {
+    /// Opaque id.
+    pub id: u64,
+    /// Main hand, then off hand.
+    pub hands: [Option<StackDef>; 2],
 }
 
 /// Where one entity is now.
@@ -2076,45 +2114,19 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         // non-finite one propagates into every interpolation it takes part in
         // — the same hazard `PlayerState` has, from a different message.
         // Charter rule 14: a server is not trusted merely for being the server.
-        ServerMessage::EntitySpawn { entities } => {
-            check_len("entity_spawn", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
-            for entity in entities {
-                let finite = entity
-                    .local
-                    .iter()
-                    .chain(entity.velocity.iter())
-                    .chain(entity.collider.iter().flatten())
-                    .all(|value| value.is_finite());
-                if !finite {
-                    return Err(ProtocolError::FieldTooLarge {
-                        field: "entity_spawn",
-                        len: 0,
-                        limit: 0,
-                    });
-                }
-                if let Some(model) = &entity.model {
-                    check_len("entity_model", model.len(), MAX_ID_BYTES)?;
-                }
-                if let Some(nametag) = &entity.nametag {
-                    check_len("entity_nametag", nametag.len(), MAX_NAME_BYTES)?;
-                }
-                // **A shape is twenty-seven bits and a server is not trusted**
-                // (charter rule 14). A mask with bits above the block would
-                // index past the cells a renderer walks, which is the one thing
-                // in a stack that is not simply a number.
-                if let Some(item) = &entity.item
-                    && item.shape & !crate::inventory::Shape::ALL != 0
-                {
-                    return Err(ProtocolError::FieldTooLarge {
-                        field: "entity_item_shape",
-                        len: item.shape as usize,
-                        limit: crate::inventory::Shape::ALL as usize,
-                    });
-                }
-            }
-        }
+        ServerMessage::EntitySpawn { entities } => check_entity_spawns(entities)?,
         ServerMessage::EntityDespawn { entities } => {
             check_len("entity_despawn", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
+        }
+        // **A held stack is a shape, and a server is not trusted** (charter
+        // rule 14). The same check the spawn's item gets, for the same reason:
+        // a mask with bits above the block would index past the cells a
+        // renderer walks.
+        ServerMessage::EntityArmed { entities } => {
+            check_len("entity_armed", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
+            for entity in entities {
+                check_hands(&entity.hands)?;
+            }
         }
         ServerMessage::EntityState { entities, .. } => {
             check_len("entity_state", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
@@ -2174,6 +2186,79 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::SkyTable { .. }
         | ServerMessage::ViewDistance { .. }
         | ServerMessage::TimeOfDay { .. } => {}
+    }
+    Ok(())
+}
+
+/// Refuses an entity spawn a client could not safely draw.
+///
+/// **Entity positions reach the client's own frame arithmetic**, and a
+/// non-finite one propagates into every interpolation it takes part in — the
+/// same hazard `PlayerState` has, from a different message. Charter rule 14: a
+/// server is not trusted merely for being the server.
+///
+/// Lifted out of `validate_server_message` because that function is at clippy's
+/// line ceiling and this is the longest arm in it.
+fn check_entity_spawns(entities: &[EntityDef]) -> Result<(), ProtocolError> {
+    check_len("entity_spawn", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
+    for entity in entities {
+        let finite = entity
+            .local
+            .iter()
+            .chain(entity.velocity.iter())
+            .chain(entity.collider.iter().flatten())
+            .all(|value| value.is_finite());
+        if !finite {
+            return Err(ProtocolError::FieldTooLarge {
+                field: "entity_spawn",
+                len: 0,
+                limit: 0,
+            });
+        }
+        if let Some(model) = &entity.model {
+            check_len("entity_model", model.len(), MAX_ID_BYTES)?;
+        }
+        if let Some(nametag) = &entity.nametag {
+            check_len("entity_nametag", nametag.len(), MAX_NAME_BYTES)?;
+        }
+        // **A shape is twenty-seven bits and a server is not trusted** (charter
+        // rule 14). A mask with bits above the block would index past the cells
+        // a renderer walks, which is the one thing in a stack that is not
+        // simply a number.
+        if let Some(item) = &entity.item
+            && item.shape & !crate::inventory::Shape::ALL != 0
+        {
+            return Err(ProtocolError::FieldTooLarge {
+                field: "entity_item_shape",
+                len: item.shape as usize,
+                limit: crate::inventory::Shape::ALL as usize,
+            });
+        }
+        // And what it is HOLDING, which arrives by the same road and reaches
+        // the same renderer.
+        check_hands(&entity.hands)?;
+    }
+    Ok(())
+}
+
+/// Refuses a pair of hands holding a shape that is not one.
+///
+/// **A shape is twenty-seven bits and a server is not trusted** (charter rule
+/// 14). A mask with bits above the block would index past the cells a renderer
+/// walks, which is the one thing in a stack that is not simply a number.
+///
+/// Its own function because hands arrive by two roads — on a spawn and in
+/// their own message — and two copies of a bounds check is where one of them
+/// stops matching.
+fn check_hands(hands: &[Option<StackDef>; 2]) -> Result<(), ProtocolError> {
+    for held in hands.iter().flatten() {
+        if held.shape & !crate::inventory::Shape::ALL != 0 {
+            return Err(ProtocolError::FieldTooLarge {
+                field: "entity_hands_shape",
+                len: held.shape as usize,
+                limit: crate::inventory::Shape::ALL as usize,
+            });
+        }
     }
     Ok(())
 }
@@ -3084,6 +3169,14 @@ mod tests {
         assert_eq!(start[0], 34);
         let stop = encode(&ServerMessage::StopLoop { id: String::new() }).expect("encode");
         assert_eq!(stop[0], 35);
+        // Protocol v32. Appended at the END, which this test is what enforces:
+        // the first version of it sat beside `EntityState`, where it belonged
+        // by subject and shifted every ordinal after it by one.
+        let armed = encode(&ServerMessage::EntityArmed {
+            entities: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(armed[0], 36);
     }
 
     #[test]
@@ -3129,6 +3222,7 @@ mod tests {
 
         let infinite = ServerMessage::EntitySpawn {
             entities: vec![EntityDef {
+                hands: [None, None],
                 id: 1,
                 chunk: ChunkPos::new(0, 0, 0),
                 local: [0.0; 3],
@@ -3149,6 +3243,7 @@ mod tests {
         // physics, and would make a mob either always or never drawn.
         let bad_box = ServerMessage::EntitySpawn {
             entities: vec![EntityDef {
+                hands: [None, None],
                 id: 1,
                 chunk: ChunkPos::new(0, 0, 0),
                 local: [0.0; 3],

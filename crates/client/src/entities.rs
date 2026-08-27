@@ -71,6 +71,12 @@ pub struct Entity {
     pub nametag: Option<String>,
     /// The stack it looks like, for an item lying on the ground.
     pub item: Option<tiamot_core::proto::StackDef>,
+    /// What it is holding: main hand, then off hand.
+    ///
+    /// A different question from `item`, which is the stack an entity IS. Kept
+    /// out of the sample history on purpose: a hand is not interpolated, it
+    /// simply is what it last was.
+    pub hands: [Option<tiamot_core::proto::StackDef>; 2],
     /// Recent positions, oldest first.
     samples: Vec<Sample>,
 }
@@ -109,6 +115,7 @@ impl Entity {
         Self {
             model: def.model.clone(),
             item: def.item,
+            hands: def.hands,
             collider: def.collider,
             nametag: def.nametag.clone(),
             samples: vec![Sample {
@@ -329,6 +336,20 @@ impl Entities {
         }
     }
 
+    /// Records what entities are holding now.
+    ///
+    /// An update for an entity the client has never heard of is dropped, for
+    /// the same reason a delta for one is: the spawn is still in flight or was
+    /// lost, and an entity invented from a pair of hands would have no model,
+    /// no collider and no name.
+    pub fn rearmed(&mut self, entities: &[tiamot_core::proto::EntityHands]) {
+        for armed in entities {
+            if let Some(known) = self.held.get_mut(&armed.id) {
+                known.hands = armed.hands;
+            }
+        }
+    }
+
     /// Records a batch of state updates.
     ///
     /// An update for an entity the client has never heard of is dropped. It
@@ -355,6 +376,7 @@ mod tests {
 
     fn def(id: u64, x: f32) -> EntityDef {
         EntityDef {
+            hands: [None, None],
             id,
             chunk: ChunkPos::new(0, 0, 0),
             local: [x, 0.0, 0.0],

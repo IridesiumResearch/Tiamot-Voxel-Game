@@ -128,6 +128,7 @@ impl Population {
         velocity: Velocity,
         on_ground: bool,
         anim: tiamot_core::ent::AnimTag,
+        hands: tiamot_core::ent::Hands,
     ) -> EntityId {
         if let Some(&id) = self.players.get(&uuid)
             && let Some(entity) = self.entities.get_mut(id)
@@ -136,6 +137,7 @@ impl Population {
             entity.velocity = velocity;
             entity.on_ground = on_ground;
             entity.anim = anim;
+            entity.hands = hands;
             return id;
         }
 
@@ -145,6 +147,7 @@ impl Population {
         entity.velocity = velocity;
         entity.on_ground = on_ground;
         entity.anim = anim;
+        entity.hands = hands;
         entity.model = Some(tiamot_core::ent::HUMANOID_MODEL.to_owned());
         // The player's own box, so a client culls the drawn body against the
         // same shape the server collided it with (charter rule 2).
@@ -566,6 +569,7 @@ mod tests {
             Velocity::default(),
             true,
             tiamot_core::ent::AnimTag::IDLE,
+            tiamot_core::ent::Hands::default(),
         );
         // A real mob in the same chunk, so the chunk genuinely needs saving and
         // the test is about what goes IN the row rather than whether one exists.
@@ -594,6 +598,7 @@ mod tests {
             Velocity::default(),
             true,
             tiamot_core::ent::AnimTag::IDLE,
+            tiamot_core::ent::Hands::default(),
         );
         assert!(
             population.take_dirty().is_empty(),
@@ -607,6 +612,7 @@ mod tests {
                 Velocity::default(),
                 true,
                 tiamot_core::ent::AnimTag::WALK,
+                tiamot_core::ent::Hands::default(),
             );
         }
         assert!(
@@ -628,6 +634,7 @@ mod tests {
             Velocity::default(),
             true,
             tiamot_core::ent::AnimTag::IDLE,
+            tiamot_core::ent::Hands::default(),
         );
         let again = population.sync_player(
             uuid,
@@ -635,6 +642,7 @@ mod tests {
             Velocity([1.0, 0.0, 0.0]),
             false,
             tiamot_core::ent::AnimTag::WALK,
+            tiamot_core::ent::Hands::default(),
         );
         assert_eq!(first, again);
         assert_eq!(population.len(), 1);
@@ -659,6 +667,7 @@ mod tests {
                 Velocity::default(),
                 true,
                 tiamot_core::ent::AnimTag::IDLE,
+                tiamot_core::ent::Hands::default(),
             );
         }
         assert_eq!(population.len(), 2);
@@ -690,6 +699,7 @@ mod tests {
             Velocity::default(),
             true,
             tiamot_core::ent::AnimTag::IDLE,
+            tiamot_core::ent::Hands::default(),
         );
         let before = population.get(id).expect("mirror").transform;
 
@@ -715,6 +725,7 @@ mod tests {
             Velocity::default(),
             true,
             tiamot_core::ent::AnimTag::IDLE,
+            tiamot_core::ent::Hands::default(),
         );
         population.spawn(Entity::at(somewhere(home), "test:mob"));
 

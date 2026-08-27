@@ -1222,7 +1222,7 @@ fn a_paused_world_leaves_the_client_exactly_where_it_was() {
     // Pause both sides, exactly as the window does.
     server.set_paused(true);
     app.set_world_paused(true);
-    let (before, _) = app.tick_pair();
+    let (before, before_confirmed) = app.tick_pair();
 
     // Walk into the menu. A real player's movement keys are released, but the
     // point is that nothing the client is handed can move it while the world is
@@ -1233,13 +1233,25 @@ fn a_paused_world_leaves_the_client_exactly_where_it_was() {
     };
     run_real_time(&mut app, 1.0, walking);
 
-    let (during, _) = app.tick_pair();
-    assert_eq!(
-        during,
-        before,
-        "the client ran {} ticks while the world was paused, and every one of them is a \
-         correction waiting to happen",
-        during - before
+    // **How far AHEAD of the server it got, not what its counter reads.**
+    //
+    // The client is allowed to follow the server while paused: an input still
+    // in flight when the pause landed is processed, the server's tick moves,
+    // and `resync_plan` catches the client up to keep its lead. That is the
+    // client AGREEING with the server, and it predicts nothing — so it costs no
+    // correction, which the assertion at the end of this test is what proves.
+    //
+    // Asserting the counter did not move at all forbade that, and went red on
+    // macOS by exactly one tick. What must not happen is the client running
+    // ahead on its own, because every one of those ticks is a correction
+    // waiting to happen.
+    let (during, during_confirmed) = app.tick_pair();
+    let lead = |tick: u64, confirmed: u64| tick.saturating_sub(confirmed);
+    assert!(
+        lead(during, during_confirmed) <= lead(before, before_confirmed),
+        "the client got {} ticks ahead of the server while the world was paused, up from {}",
+        lead(during, during_confirmed),
+        lead(before, before_confirmed)
     );
 
     // And it starts again on the other side.

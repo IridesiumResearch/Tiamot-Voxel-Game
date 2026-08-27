@@ -214,6 +214,7 @@ impl Seen {
                 self.entities.spawned(&entities, std::time::Duration::ZERO);
             }
             Event::EntityDespawn(ids) => self.entities.despawned(&ids),
+            Event::EntityArmed(entities) => self.entities.rearmed(&entities),
             Event::EntityState { tick, entities } => {
                 self.entities
                     .moved(tick, &entities, std::time::Duration::ZERO);

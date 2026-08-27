@@ -74,6 +74,13 @@ pub struct Spawn {
     /// so putting it in the twenty-times-a-second message would be paying for
     /// it on every one of them. See [`Entity::item`].
     pub item: Option<crate::inventory::Stack>,
+    /// What it is holding.
+    ///
+    /// **On the spawn AND in its own message**, unlike [`Spawn::item`]: what an
+    /// item IS never changes, and what a body is HOLDING changes every time
+    /// somebody scrolls the wheel. It is not in [`Delta`] either — that is the
+    /// unreliable twenty-a-second channel and a lost hand would stay lost.
+    pub hands: crate::ent::Hands,
     /// What it is doing.
     pub anim: AnimTag,
     /// The label above it, unresolved.
@@ -89,6 +96,22 @@ pub struct Spawn {
     /// and a rebound name would stay stale on every screen until someone
     /// reconnected.
     pub nametag: Option<Nametag>,
+}
+
+/// What an entity a viewer already knows about is holding now.
+///
+/// Its own message rather than a field on [`Delta`], because the two have
+/// opposite shapes: a position changes every tick and may be dropped, and a
+/// hand changes rarely and may not. Putting it in the delta would pay for it
+/// twenty times a second to carry something that is usually the same, on a
+/// channel where losing it would leave a sword invisible until the next time
+/// the player switched slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Armed {
+    /// Which entity.
+    pub id: EntityId,
+    /// What it is holding now.
+    pub hands: crate::ent::Hands,
 }
 
 /// A change to an entity a viewer already knows about.
@@ -156,6 +179,7 @@ struct Sent {
     yaw: u8,
     pitch: i8,
     anim: AnimTag,
+    hands: crate::ent::Hands,
 }
 
 impl Sent {
@@ -166,6 +190,7 @@ impl Sent {
             yaw: quantise_yaw(entity.transform.yaw),
             pitch: quantise_pitch(entity.transform.pitch),
             anim: entity.anim,
+            hands: entity.hands,
         }
     }
 
@@ -192,13 +217,22 @@ pub struct Update {
     pub despawned: Vec<EntityId>,
     /// Entities that moved enough to be worth a packet.
     pub moved: Vec<Delta>,
+    /// Entities whose hands changed.
+    ///
+    /// Separate from `moved` because it goes on the reliable channel: a lost
+    /// position is corrected 50 ms later and a lost hand is not corrected at
+    /// all until the holder next changes it.
+    pub rearmed: Vec<Armed>,
 }
 
 impl Update {
     /// Whether there is nothing to send.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.spawned.is_empty() && self.despawned.is_empty() && self.moved.is_empty()
+        self.spawned.is_empty()
+            && self.despawned.is_empty()
+            && self.moved.is_empty()
+            && self.rearmed.is_empty()
     }
 }
 
@@ -264,10 +298,22 @@ impl Tracker {
             let now = Sent::of(entity);
             match self.known.get(&id) {
                 None => update.spawned.push(spawn_of(id, entity)),
-                Some(before) if now.differs_from(before) => {
-                    update.moved.push(delta_of(id, entity));
+                Some(before) => {
+                    if now.differs_from(before) {
+                        update.moved.push(delta_of(id, entity));
+                    }
+                    // Asked separately, because it is answered on a different
+                    // channel. `differs_from` deliberately does not look at
+                    // hands: a hand changing is not a reason to send a
+                    // position, and a position changing is not a reason to
+                    // resend a hand.
+                    if now.hands != before.hands {
+                        update.rearmed.push(Armed {
+                            id,
+                            hands: entity.hands,
+                        });
+                    }
                 }
-                Some(_) => {}
             }
             still_visible.insert(id, now);
         }
@@ -296,6 +342,7 @@ fn spawn_of(id: EntityId, entity: &Entity) -> Spawn {
         model: entity.model.clone(),
         collider: entity.collider,
         item: entity.item,
+        hands: entity.hands,
         anim: entity.anim,
         nametag: entity.nametag.clone(),
     }

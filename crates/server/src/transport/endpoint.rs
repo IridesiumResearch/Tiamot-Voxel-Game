@@ -1249,6 +1249,44 @@ impl Shared {
         took
     }
 
+    /// What a player has in each hand: main, then off.
+    ///
+    /// **Read fresh every tick and mirrored onto the player's entity**, so that
+    /// everybody who can see them can be told. Reported from the window as
+    /// every other player having empty hands: a client draws what the LOCAL
+    /// player holds from its own inventory, and nothing on the wire said what
+    /// anyone else had.
+    ///
+    /// The main hand is the selected hotbar slot — absent means slot zero,
+    /// which is where a client starts and stays until somebody presses a
+    /// hotbar key.
+    #[must_use]
+    pub fn hands_of(&self, uuid: &PlayerUuid) -> tiamot_core::ent::Hands {
+        let slot = self
+            .held_slot
+            .lock()
+            .ok()
+            .and_then(|held| held.get(uuid).copied())
+            .unwrap_or(0);
+        let Ok(inventories) = self.inventories.lock() else {
+            return tiamot_core::ent::Hands::default();
+        };
+        let Some(slots) = inventories.get(uuid) else {
+            return tiamot_core::ent::Hands::default();
+        };
+        let Some(view) = slots.view(PLAYER_MAIN) else {
+            return tiamot_core::ent::Hands::default();
+        };
+        tiamot_core::ent::Hands {
+            main: view.slots.get(slot).copied().flatten(),
+            off: view
+                .slots
+                .get(tiamot_core::inventory::PLAYER_OFFHAND_SLOT)
+                .copied()
+                .flatten(),
+        }
+    }
+
     /// What a player is carrying.
     #[must_use]
     pub fn inventory_of(&self, uuid: &PlayerUuid) -> Vec<tiamot_core::inventory::Stack> {

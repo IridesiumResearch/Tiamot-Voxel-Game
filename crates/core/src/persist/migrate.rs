@@ -148,6 +148,9 @@ fn v1_to_v2(v1: EntityV1) -> crate::ent::Entity {
         collider: v1.collider,
         model: v1.model,
         item: None,
+        // Not persisted — a hand is a view of a live inventory, so a thawed
+        // entity has none until its owner's next tick fills it in.
+        hands: crate::ent::Hands::default(),
         anim: crate::ent::AnimTag::default(),
         health: v1.health,
         nametag: v1.nametag,

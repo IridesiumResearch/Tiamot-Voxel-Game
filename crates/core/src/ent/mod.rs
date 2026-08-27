@@ -46,9 +46,10 @@ use std::collections::BTreeMap;
 
 pub use access::{Access, Patch};
 pub use component::{
-    AnimTag, Collider, HUMANOID_MODEL, Health, Nametag, Owner, Transform, Velocity, figure_yaw,
+    AnimTag, Collider, HUMANOID_MODEL, Hands, Health, Nametag, Owner, Transform, Velocity,
+    figure_yaw,
 };
-pub use replicate::{Delta, Spawn, Tracker, Update};
+pub use replicate::{Armed, Delta, Spawn, Tracker, Update};
 
 use crate::coords::ChunkPos;
 
@@ -156,6 +157,25 @@ pub struct Entity {
     /// [`Entity::model`] is an item; one with a model is a rig, and the stack
     /// is ignored.
     pub item: Option<crate::inventory::Stack>,
+    /// What this entity is HOLDING: main hand, then off hand.
+    ///
+    /// # Not the same field as [`Entity::item`], and not a mistake
+    ///
+    /// `item` is the stack an entity IS — a thing lying on the ground. This is
+    /// what a body has in its hands, which is a different question with a
+    /// different answer: a player is not a sword.
+    ///
+    /// **Not persisted.** It is read off the player's live inventory every
+    /// tick, exactly as position is read off their body — the same reason the
+    /// mirror itself is never saved. A hand is a view of an inventory, and the
+    /// inventory is what has to survive.
+    ///
+    /// Reported from the window as every other player having empty hands: the
+    /// client draws what the local player holds from its own inventory and had
+    /// nothing at all to draw anyone else's from, because nothing on the wire
+    /// said.
+    #[serde(skip)]
+    pub hands: Hands,
     /// Hit points, or `None` for something that cannot be hurt.
     pub health: Option<Health>,
     /// The label above it, or `None` for no label.
@@ -189,6 +209,7 @@ impl Entity {
             collider: None,
             model: None,
             item: None,
+            hands: Hands::default(),
             anim: AnimTag::default(),
             health: None,
             nametag: None,

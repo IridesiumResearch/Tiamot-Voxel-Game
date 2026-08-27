@@ -296,6 +296,31 @@ pub enum Nametag {
 
 /// Who an entity belongs to.
 ///
+/// What a body has in its hands: main, then off.
+///
+/// **Two slots and not the whole hotbar.** The client draws hands, so hands are
+/// what the wire has to carry — and every extra slot is a stack of somebody
+/// else's inventory sent to everybody who can see them. The whole bar was
+/// authorised and is not needed.
+///
+/// A `None` is an empty hand, which is drawn as an empty hand rather than as
+/// nothing: an arm is still there.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Hands {
+    /// The stack in the main hand.
+    pub main: Option<crate::inventory::Stack>,
+    /// The stack in the off hand.
+    pub off: Option<crate::inventory::Stack>,
+}
+
+impl Hands {
+    /// Whether both hands are empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.main.is_none() && self.off.is_none()
+    }
+}
+
 /// A UUID, never a name (charter rule 13). Survives the owner renaming
 /// themselves, going offline, and rotating their key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

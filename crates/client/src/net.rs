@@ -319,6 +319,13 @@ pub enum Event {
     /// them — see `ServerMessage::EntityDespawn`.
     EntityDespawn(Vec<u64>),
 
+    /// What entities in view are holding, when it changes.
+    ///
+    /// Reliable, like the spawn and unlike the state delta: a lost position is
+    /// corrected 50 ms later and a lost hand is not corrected at all until its
+    /// holder next changes it.
+    EntityArmed(Vec<tiamot_core::proto::EntityHands>),
+
     /// Where the entities in view are now.
     ///
     /// Superseded by the next one 50 ms later, which is what makes it safe to
@@ -1158,6 +1165,10 @@ async fn session(
 
             ServerMessage::EntityDespawn { entities } => {
                 let _ = events.send(Event::EntityDespawn(entities));
+            }
+
+            ServerMessage::EntityArmed { entities } => {
+                let _ = events.send(Event::EntityArmed(entities));
             }
 
             ServerMessage::EntityState { tick, entities } => {

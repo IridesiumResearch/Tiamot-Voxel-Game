@@ -59,6 +59,7 @@ fn truth(tick: u64) -> [f32; 3] {
 
 fn def(local: [f32; 3]) -> EntityDef {
     EntityDef {
+        hands: [None, None],
         id: 1,
         chunk: ChunkPos::new(0, 0, 0),
         local,

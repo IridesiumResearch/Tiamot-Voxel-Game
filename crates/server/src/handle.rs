@@ -148,6 +148,21 @@ fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
 ///
 /// `None` rather than a placeholder: a client that is sent no label draws none,
 /// and inventing `"<unnamed>"` would put engine copy on somebody's head.
+/// One stack, as the wire carries it.
+///
+/// Its own function because three messages send stacks now — what an entity IS,
+/// what it is HOLDING, and what is in a view — and three copies of the same
+/// four lines is where one of them quietly stops matching.
+fn stack_def(stack: tiamot_core::inventory::Stack) -> tiamot_core::proto::StackDef {
+    tiamot_core::proto::StackDef {
+        material: stack.material.0,
+        units: stack.units,
+        shape: stack
+            .shape
+            .map_or(0, tiamot_core::inventory::Shape::occupancy),
+    }
+}
+
 fn resolve_nametag(label: &tiamot_core::ent::Nametag, shared: &Shared) -> Option<String> {
     match label {
         tiamot_core::ent::Nametag::Text(text) => Some(text.clone()),
@@ -197,13 +212,11 @@ fn entity_messages(
                 anim: spawn.anim.0,
                 model: spawn.model,
                 collider: spawn.collider.map(|box_| [box_.width, box_.height]),
-                item: spawn.item.map(|stack| tiamot_core::proto::StackDef {
-                    material: stack.material.0,
-                    units: stack.units,
-                    shape: stack
-                        .shape
-                        .map_or(0, tiamot_core::inventory::Shape::occupancy),
-                }),
+                item: spawn.item.map(stack_def),
+                hands: [
+                    spawn.hands.main.map(stack_def),
+                    spawn.hands.off.map(stack_def),
+                ],
                 // Resolved here, where the roster is. Charter rule 13: a
                 // display name is a per-server claim bound to a UUID, so the
                 // engine stores the UUID and looks the name up at send time —
@@ -239,6 +252,25 @@ fn entity_messages(
             })
             .collect();
         messages.push(ServerMessage::EntityState { tick, entities });
+    }
+
+    // **After the spawns and on the reliable channel.** A viewer told what
+    // somebody is holding before it has been told they exist has nothing to
+    // apply it to; the tracker only reports a change for an entity it has
+    // already sent a spawn for, and this keeps that order on the wire.
+    if !update.rearmed.is_empty() {
+        let entities = update
+            .rearmed
+            .into_iter()
+            .map(|armed| tiamot_core::proto::EntityHands {
+                id: armed.id.0,
+                hands: [
+                    armed.hands.main.map(stack_def),
+                    armed.hands.off.map(stack_def),
+                ],
+            })
+            .collect();
+        messages.push(ServerMessage::EntityArmed { entities });
     }
 
     let _ = shared;
@@ -1521,6 +1553,10 @@ impl ServerHandle {
                                         tiamot_core::ent::Velocity(player.body.velocity),
                                         player.body.on_ground,
                                         player.anim,
+                                        // Read fresh, like the position above:
+                                        // a hand is a view of a live inventory
+                                        // and is never persisted with the body.
+                                        shared.hands_of(uuid),
                                     );
                                 }
                             }

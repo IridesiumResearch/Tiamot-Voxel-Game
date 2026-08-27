@@ -2365,31 +2365,87 @@ impl App {
     /// # What this does not do yet
     ///
     /// **Only the local player's.** Nothing on the wire says what somebody ELSE
-    /// is holding — an entity carries a position, a heading and an animation
-    /// tag, and nothing about an inventory — so every other figure in the world
-    /// still has empty hands. Closing that is a field on the entity stream and
-    /// a protocol version, not a change here.
+    /// is holding, which the entity stream carries as of protocol v32.
+    ///
+    /// The LOCAL player is still drawn from its own inventory rather than from
+    /// the stream: its body is not in the entity list it receives (the server
+    /// excludes a viewer from their own view), and its hand should follow a
+    /// slot change at once rather than after a round trip.
     fn place_props(&mut self, figure: Option<&crate::render::skinned::Figure>) {
         let mut props = self.dropped_props();
         if let Some(figure) = figure.filter(|_| self.third_person) {
-            for (joint, stack) in [
-                ("hand.r", self.hotbar.get(self.selected).copied().flatten()),
-                ("hand.l", self.offhand()),
-            ] {
-                let Some(stack) = stack else { continue };
-                let Some(joint) = self.renderer.attachment(figure, joint) else {
-                    continue;
-                };
-                props.extend(crate::render::held_boxes(
-                    figure,
-                    &joint,
-                    stack.shape,
-                    self.tile_of(stack.material),
-                    self.items.contains(&stack.material),
-                ));
-            }
+            let held = [
+                self.hotbar.get(self.selected).copied().flatten(),
+                self.offhand(),
+            ];
+            props.extend(self.hand_props(figure, held));
         }
+        props.extend(self.other_hand_props());
         self.renderer.set_props(&props);
+    }
+
+    /// What everybody else is holding.
+    ///
+    /// **Reported from the window**: every other figure had empty hands. The
+    /// client drew what the local player held from its own inventory and had
+    /// nothing at all to draw anyone else's from, because nothing on the wire
+    /// said. `EntityDef::hands` and `ServerMessage::EntityArmed` are what say.
+    fn other_hand_props(&self) -> Vec<crate::render::Prop> {
+        let now = self.since_start.elapsed();
+        let cells = f64::from(tiamot_core::SUBNODES_PER_AXIS);
+        let mut props = Vec::new();
+        for (id, entity) in self.entities.iter() {
+            if entity.hands.iter().all(Option::is_none)
+                || entity.model.as_deref() != Some(tiamot_core::ent::HUMANOID_MODEL)
+            {
+                continue;
+            }
+            let Some(pose) = entity.pose(now) else {
+                continue;
+            };
+            let corner = tiamot_core::BlockPos::from_chunk_corner(pose.chunk);
+            let feet = [
+                f64::from(corner.x) + f64::from(pose.local[0]) / cells,
+                f64::from(corner.y) + f64::from(pose.local[1]) / cells,
+                f64::from(corner.z) + f64::from(pose.local[2]) / cells,
+            ];
+            // **Rebuilt exactly as `place_entities` builds it**, because a hand
+            // hangs off a joint of the drawn rig and a figure posed even
+            // slightly differently would put the sword beside the arm rather
+            // than in it.
+            let figure = crate::render::skinned::Figure {
+                offset: self.camera.position.offset_to(feet),
+                yaw: pose.yaw,
+                anim: pose.anim,
+                phase: now.as_secs_f32() + (id % 977) as f32 * 0.037,
+                carrying: [entity.hands[0].is_some(), entity.hands[1].is_some()],
+            };
+            props.extend(self.hand_props(&figure, entity.hands));
+        }
+        props
+    }
+
+    /// The boxes one figure's hands hold.
+    fn hand_props(
+        &self,
+        figure: &crate::render::skinned::Figure,
+        held: [Option<tiamot_core::proto::StackDef>; 2],
+    ) -> Vec<crate::render::Prop> {
+        let mut props = Vec::new();
+        for (joint, stack) in [("hand.r", held[0]), ("hand.l", held[1])] {
+            let Some(stack) = stack else { continue };
+            let Some(joint) = self.renderer.attachment(figure, joint) else {
+                continue;
+            };
+            props.extend(crate::render::held_boxes(
+                figure,
+                &joint,
+                stack.shape,
+                self.tile_of(stack.material),
+                self.items.contains(&stack.material),
+            ));
+        }
+        props
     }
 
     /// Where a material is in the atlas, or the whole sheet if it is not there.
@@ -3510,6 +3566,7 @@ impl App {
             Event::EntitySpawn(entities) => self.entities.spawned(&entities, at),
             Event::EntityDespawn(ids) => self.entities.despawned(&ids),
             Event::EntityState { tick, entities } => self.entities.moved(tick, &entities, at),
+            Event::EntityArmed(entities) => self.entities.rearmed(&entities),
             // Every other event is handled where it arrives; this method exists
             // for the three that share a clock.
             _ => {}
@@ -3588,6 +3645,7 @@ impl App {
 
                 event @ (Event::EntitySpawn(_)
                 | Event::EntityDespawn(_)
+                | Event::EntityArmed(_)
                 | Event::EntityState { .. }) => self.entity_event(event),
 
                 Event::ChunkFluid(pos, layer) => self.store.set_fluid(pos, *layer),
@@ -4281,11 +4339,9 @@ impl App {
                 // stable across frames or the phase jitters, which is why it
                 // comes from the id rather than from anything about the frame.
                 phase: now.as_secs_f32() + (id % 977) as f32 * 0.037,
-                // **Nobody else's hands are known.** Nothing on the wire says
-                // what another entity is holding, so an arm held out for a
-                // block that is never drawn would be a pose with no reason.
-                // See `App::place_props`.
-                carrying: [false; 2],
+                // What the entity stream says it is holding, so the arm is out
+                // for something that is actually drawn — see `place_props`.
+                carrying: [entity.hands[0].is_some(), entity.hands[1].is_some()],
             });
         }
         self.renderer.set_entities(placed);

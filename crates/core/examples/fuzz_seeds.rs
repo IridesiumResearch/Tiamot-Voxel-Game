@@ -655,6 +655,7 @@ fn server_messages() -> Vec<Vec<u8>> {
         },
         ServerMessage::EntitySpawn {
             entities: vec![EntityDef {
+                hands: [None, None],
                 id: 9,
                 chunk: ChunkPos::new(0, 0, 0),
                 local: [1.0, 2.0, 3.0],
