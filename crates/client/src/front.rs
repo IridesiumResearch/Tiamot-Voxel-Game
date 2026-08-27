@@ -80,6 +80,9 @@ pub struct Front {
     pub notice: Option<String>,
     /// Whether a setting changed and `client.toml` wants writing.
     settings_dirty: bool,
+    /// Whether a mod was ticked or unticked, so `mods.toml` wants writing and
+    /// the window wants told.
+    catalogue_dirty: bool,
     /// Where the interface-scale slider has been dragged to and not let go of.
     /// See [`crate::widget::settle`].
     scale_draft: Option<f32>,
@@ -107,6 +110,7 @@ impl Front {
             address: String::new(),
             confirming: None,
             settings_dirty: false,
+            catalogue_dirty: false,
             scale_draft: None,
             host_on_lan: false,
         }
@@ -297,9 +301,11 @@ impl Front {
 
     /// The mod list: a box each, and a box at the top for all of them.
     fn mods_tab(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
         let mut all = self.catalogue.all_on();
         if ui.checkbox(&mut all, "Everything").changed() {
             self.catalogue.set_all(all);
+            changed = true;
         }
         ui.separator();
         {
@@ -308,7 +314,7 @@ impl Front {
             }
             for listing in &mut self.catalogue.mods {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut listing.enabled, &listing.name);
+                    changed |= ui.checkbox(&mut listing.enabled, &listing.name).changed();
                     ui.weak(&listing.id);
                 });
                 if !listing.description.is_empty() {
@@ -316,6 +322,11 @@ impl Front {
                 }
             }
         }
+        // Reported from the window: unticking a mod did nothing — the world
+        // still had it. The screen holds its OWN catalogue and the window
+        // starts worlds from the one it kept, so a tick had to be carried back
+        // across; see `Front::take_catalogue_dirty`.
+        self.catalogue_dirty |= changed;
     }
 
     /// The mod-set warning, when one is waiting.
@@ -369,6 +380,17 @@ impl Front {
     /// frame a slider is held.
     pub const fn take_settings_dirty(&mut self) -> bool {
         std::mem::replace(&mut self.settings_dirty, false)
+    }
+
+    /// Whether the mod selection changed since this was last asked.
+    ///
+    /// **The screen's catalogue is not the window's.** The window builds this
+    /// screen from a clone, because the screen outlives no world and the window
+    /// outlives every one of them — so a tick here has to be handed back, and a
+    /// window that never asked was starting worlds with whatever was ticked
+    /// when the client launched.
+    pub const fn take_catalogue_dirty(&mut self) -> bool {
+        std::mem::replace(&mut self.catalogue_dirty, false)
     }
 
     /// The settings that need no world.
@@ -547,6 +569,62 @@ mod tests {
         )
     }
 
+    fn listing(id: &str) -> crate::launcher::Listing {
+        crate::launcher::Listing {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            description: String::new(),
+            enabled: true,
+        }
+    }
+
+    /// Draws one frame, optionally clicking at `at` first.
+    ///
+    /// A real `egui` pass rather than a call to the tab function, because the
+    /// thing being tested is a checkbox reporting a change — which only a
+    /// widget that was actually clicked does.
+    fn frame(screen: &mut Front, ctx: &egui::Context, events: Vec<egui::Event>) {
+        // egui is built without `default_fonts`, so a bare context has no
+        // glyphs and every label lays out to nothing — which is a page with no
+        // widgets on it to click.
+        crate::app::install_fonts(ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut config = crate::config::Config::default();
+        let _ = ctx.run_ui(input, |_| {
+            let context = ctx.clone();
+            screen.draw(&context, &mut config);
+        });
+    }
+
+    /// Clicks at `at`, across the two frames egui needs to see one.
+    ///
+    /// A press and a release in a single pass is not a click: the widget has
+    /// to be drawn under the pointer while the button is down before the
+    /// release can land on it.
+    fn click(screen: &mut Front, ctx: &egui::Context, at: egui::Pos2) {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame(screen, ctx, vec![egui::Event::PointerMoved(at)]);
+        frame(
+            screen,
+            ctx,
+            vec![egui::Event::PointerMoved(at), button(true)],
+        );
+        frame(screen, ctx, vec![button(false)]);
+        frame(screen, ctx, Vec::new());
+    }
+
     #[test]
     fn opening_to_the_lan_is_off_until_somebody_asks_for_it() {
         // **A world reachable from the network is a decision, not a default.**
@@ -664,6 +742,73 @@ mod tests {
         assert!(
             !screen.take_settings_dirty(),
             "the same change asked to be saved twice"
+        );
+    }
+
+    #[test]
+    fn unticking_a_mod_is_handed_back_to_the_window() {
+        // **Reported from the window**: unticking a core mod left it in the
+        // world, and unticking everything left everything. The screen edits its
+        // OWN catalogue — the window builds it from a clone — so a tick that is
+        // not carried back reaches nothing that starts a world.
+        //
+        // Clicked for real, because the bug is downstream of a checkbox saying
+        // it changed, and a test that sets the field by hand skips the part
+        // that was missing.
+        let ctx = egui::Context::default();
+        let mut screen = front(Vec::new());
+        screen.catalogue.mods = vec![listing("core_worldgen")];
+        screen.tab = Tab::Mods;
+        frame(&mut screen, &ctx, Vec::new());
+        assert!(
+            !screen.take_catalogue_dirty(),
+            "nothing has been clicked yet"
+        );
+
+        // The box is found by sweeping the page rather than by computing where
+        // egui put it: the test is about there being a box that turns the mod
+        // off and hands the change back, not about exact spacing. The tab strip
+        // is skipped, because a click that changes page proves nothing.
+        let mut at = None;
+        'sweep: for y in (560..720).step_by(4) {
+            for x in (200..1100).step_by(4) {
+                let point = egui::pos2(x as f32, y as f32);
+                click(&mut screen, &ctx, point);
+                if screen.enabled_mods().is_empty() {
+                    at = Some(point);
+                    break 'sweep;
+                }
+                // A click that changed page is not one that says anything
+                // about this one; go back and carry on.
+                screen.tab = Tab::Mods;
+            }
+        }
+        let at = at.expect("no click anywhere on the mods page turned the mod off");
+        assert!(
+            screen.take_catalogue_dirty(),
+            "the mod was turned off at {at:?} without asking the window to notice"
+        );
+        assert!(
+            !screen.take_catalogue_dirty(),
+            "the same change was handed back twice"
+        );
+    }
+
+    #[test]
+    fn a_click_on_nothing_leaves_the_mod_set_alone() {
+        // The counter-example the sweep above needs: if any click anywhere
+        // marked the set changed, finding one that turned a mod off would
+        // prove nothing.
+        let ctx = egui::Context::default();
+        let mut screen = front(Vec::new());
+        screen.catalogue.mods = vec![listing("core_worldgen")];
+        screen.tab = Tab::Mods;
+        frame(&mut screen, &ctx, Vec::new());
+        click(&mut screen, &ctx, egui::pos2(1270.0, 710.0));
+        assert_eq!(screen.enabled_mods(), vec!["core_worldgen".to_owned()]);
+        assert!(
+            !screen.take_catalogue_dirty(),
+            "a click on empty space asked the window to save the mod set"
         );
     }
 

@@ -1096,14 +1096,17 @@ impl App {
             fov_y: config.fov_degrees.to_radians(),
             ..Camera::default()
         };
-        // Fog reaches the sky exactly where the loaded world stops, so terrain
-        // dissolves into the horizon rather than ending at a visible edge.
-        // Until a sky mod says otherwise this is the clear colour, so fog and
-        // background are the same colour by construction.
-        renderer.set_sky(
-            crate::render::sky_colour(),
-            f32::from(config.view_distance) * tiamot_core::CHUNK_BLOCKS as f32,
-        );
+        // **Every renderer setting the config holds, pushed once, here.**
+        // Reported from the window: shadows turned off on the front screen
+        // were still on after joining. The renderer is built with its own
+        // defaults and each of these had exactly one caller — the in-game key
+        // that toggles it — so a setting chosen anywhere else reached the file
+        // and the HUD and never reached the frame.
+        //
+        // Anything settable from the front screen belongs in this function,
+        // and the test below counts them so a new one cannot be added to the
+        // settings tab and quietly skipped here.
+        apply_to_renderer(&config, &mut renderer);
         // Opened before `config` is moved into the struct below. Never fails:
         // a machine with no sound device runs the game silently.
         let mixer = crate::audio::Mixer::open(config.volumes.clone());
@@ -5677,4 +5680,25 @@ mod tests {
             "digits are not the same width: {narrow} against {wide}"
         );
     }
+}
+
+/// Pushes every renderer-owned setting from `config` into `renderer`.
+///
+/// The single place a [`Config`] becomes renderer state. It exists because the
+/// alternative — each setting applied only by the key that toggles it — makes a
+/// renderer built at one moment silently ignore every choice made after it.
+///
+/// Fog far is here too: it reaches the sky exactly where the loaded world
+/// stops, so terrain dissolves into the horizon rather than ending at a visible
+/// edge, and until a sky mod says otherwise the fog colour IS the clear colour.
+///
+/// [`crate::config::RenderMode`] is not here and cannot be: it selects the
+/// pipelines at construction, so changing it rebuilds the renderer.
+pub fn apply_to_renderer(config: &Config, renderer: &mut Renderer) {
+    renderer.set_lighting_mode(config.lighting_mode);
+    renderer.set_shadow_quality(config.shadow_quality);
+    renderer.set_sky(
+        crate::render::sky_colour(),
+        f32::from(config.view_distance) * tiamot_core::CHUNK_BLOCKS as f32,
+    );
 }

@@ -425,6 +425,12 @@ fn start_local_world(
 struct Parked {
     renderer: Renderer,
     present_mode: &'static str,
+    /// What its pipelines were built for.
+    ///
+    /// Kept because the front screen can change the draw mode after the
+    /// renderer exists, and that one setting cannot be pushed into it — the
+    /// mode selects the pipelines, so a change means building a new one.
+    mode: client::config::RenderMode,
 }
 
 struct Client {
@@ -876,9 +882,11 @@ impl Client {
                 ..Default::default()
             },
         );
-        let mut renderer = Renderer::new(gpu.clone(), self.config.render_mode, size.0, size.1)?;
-        renderer.set_lighting_mode(self.config.lighting_mode);
-        renderer.set_shadow_quality(self.config.shadow_quality);
+        // Settings are pushed into it by `app::apply_to_renderer` when a world
+        // starts, and NOT here: the front screen sits between this moment and
+        // that one, so anything applied now is whatever the file said before
+        // the player touched it.
+        let renderer = Renderer::new(gpu.clone(), self.config.render_mode, size.0, size.1)?;
 
         let egui = egui::Context::default();
         // egui is built without `default_fonts`, so it has no glyphs until this
@@ -901,6 +909,7 @@ impl Client {
         self.parked = Some(Parked {
             renderer,
             present_mode,
+            mode: self.config.render_mode,
         });
 
         let stage = match self.connection.take() {
@@ -934,12 +943,48 @@ impl Client {
     /// Play — and the two must set the same things up.
     fn start_app(&mut self, connection: Connection) -> App {
         let Parked {
-            renderer,
+            mut renderer,
             present_mode,
+            mode,
         } = self
             .parked
             .take()
             .expect("the renderer is parked when the window is created");
+        // **The one setting that needs a new renderer.** Draw mode picks the
+        // pipelines when they are built, so a player who changed it on the
+        // front screen gets a rebuild here rather than the old pipelines and a
+        // setting that appears to do nothing. The stall is on the Play button,
+        // which is the one moment in the session where a pause is expected.
+        if mode != self.config.render_mode
+            && let Some(surface) = self.window.as_ref()
+        {
+            match Renderer::new(
+                surface.gpu.clone(),
+                self.config.render_mode,
+                surface.size.0,
+                surface.size.1,
+            ) {
+                Ok(rebuilt) => renderer = rebuilt,
+                Err(err) => {
+                    tracing::warn!(%err, "could not switch draw mode; keeping the last one");
+                }
+            }
+        }
+        // **And the one setting that lives on the surface.** Vsync is chosen
+        // when the surface is configured, which until now happened at window
+        // creation, on a resize, and on a surface loss — none of which a player
+        // ticking the box on the front screen performs.
+        let present_mode = match self.window.as_ref() {
+            Some(surface) => configure_surface(
+                &surface.surface,
+                &surface.gpu,
+                surface.size,
+                self.config.vsync,
+            ),
+            None => present_mode,
+        };
+        self.present_mode = present_mode;
+
         let mut app = App::with_bindings(
             self.config.clone(),
             connection,
@@ -997,6 +1042,7 @@ impl Client {
             self.config = config;
             self.parked = Some(Parked {
                 renderer,
+                mode: self.config.render_mode,
                 present_mode: self.present_mode,
             });
             self.bindings = Some(bindings);
@@ -1059,7 +1105,17 @@ impl Client {
         // world — and with no world there is nothing in it, so the menu would
         // be drawn over whatever the last frame left behind.
         clear(&surface.gpu, &view);
-        let action = draw_front(surface, &mut self.config, &view);
+        let (action, ticked) = draw_front(surface, &mut self.config, &view);
+        // **Carried back before the action is acted on.** `Action::Open` is in
+        // the same frame as the tick that changed the set, and a world started
+        // from the old catalogue is exactly the report: unticking a mod left
+        // it in the world.
+        if let Some(ticked) = ticked {
+            self.catalogue = ticked;
+            if let Err(err) = self.catalogue.save(&self.data.join("mods.toml")) {
+                tracing::warn!(%err, "could not save which mods are on");
+            }
+        }
         // **Read after drawing and before acting.** The tick box lives on the
         // screen that produced the action, and `open` borrows the window.
         let lan = match &surface.stage {
@@ -2068,11 +2124,14 @@ fn register_atlas(surface: &mut Surface) {
 /// The same egui plumbing the HUD uses, minus everything about a world: no
 /// atlas to register, no scale to apply from an `App` that does not exist, and
 /// nothing to save when it is over.
+///
+/// Returns the mod selection too, when it changed, because the screen edits a
+/// copy and the window is what starts worlds from it.
 fn draw_front(
     surface: &mut Surface,
     config: &mut Config,
     view: &wgpu::TextureView,
-) -> client::front::Action {
+) -> (client::front::Action, Option<client::launcher::Catalogue>) {
     // **Before the input is taken, not inside the frame.** `egui_winit` turns
     // a click into points using the zoom factor as it stands when the input is
     // read, and `paint_egui` turns points back into pixels using it as it
@@ -2083,11 +2142,15 @@ fn draw_front(
     let raw = surface.egui_state.take_egui_input(&surface.window);
     let mut action = client::front::Action::None;
     let mut dirty = false;
+    let mut catalogue = None;
     let output = surface.egui.run_ui(raw, |root| {
         if let Stage::Front(front) = &mut surface.stage {
             let context = root.ctx().clone();
             action = front.draw(&context, config);
             dirty = front.take_settings_dirty();
+            if front.take_catalogue_dirty() {
+                catalogue = Some(front.catalogue.clone());
+            }
         }
     });
     // **Written when it changes, not when the screen closes.** There is no
@@ -2101,7 +2164,7 @@ fn draw_front(
         .egui_state
         .handle_platform_output(&surface.window, output.platform_output);
     paint_egui(surface, output.shapes, output.textures_delta, view);
-    action
+    (action, catalogue)
 }
 
 /// Draws the HUD over the frame that has just been rendered.
