@@ -41,6 +41,46 @@ const CONFIG_FILE: &str = "client.toml";
 /// makes here and a world they host run the same content.
 const MODS_DIR: &str = "game";
 
+/// The address to dial a server this process just started.
+///
+/// A listener bound to the unspecified address reports it back, and the
+/// unspecified address is not a destination: QUIC refuses it as an invalid
+/// remote. The server is on this machine either way, so loopback is both
+/// correct and the shortest path to it.
+fn own_address(listening: std::net::SocketAddr) -> std::net::SocketAddr {
+    if listening.ip().is_unspecified() {
+        std::net::SocketAddr::from(([127, 0, 0, 1], listening.port()))
+    } else {
+        listening
+    }
+}
+
+/// This machine's address on the local network, if it has one.
+///
+/// **Asked of the routing table rather than of a name server.** A UDP socket
+/// that is "connected" to an address on the local network sends nothing — it
+/// only decides which interface it would use — and its own local address is
+/// then the one another machine on that network would reach this one at.
+/// `hostname` lookups answer with loopback on plenty of machines, which is the
+/// one answer that is never useful here.
+///
+/// `None` when there is no route out, which is what a machine with no network
+/// looks like.
+fn lan_address(port: u16) -> Option<String> {
+    let probe = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    // Any address on a private range will do: nothing is sent to it.
+    probe.connect(("192.168.1.1", 80)).ok()?;
+    let local = probe.local_addr().ok()?;
+    Some(format!("{}:{port}", local.ip()))
+}
+
+/// The port a world opened to the LAN listens on.
+///
+/// The same one the dedicated server defaults to, so there is one number to
+/// remember and one to open on a firewall. Fixed rather than chosen at random
+/// because the whole point is that somebody else can type it.
+const LAN_PORT: u16 = 47811;
+
 /// Where key bindings live, beside the config.
 ///
 /// Its own file rather than a section of `client.toml`: the settings screen
@@ -145,6 +185,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     config.view(),
                     catalogue.enabled(),
                     &identity.uuid_as_root(),
+                    // `menu = false` skips the front screen, so there is
+                    // nowhere to have ticked the box. A config-driven start is
+                    // the bot harness and a test rig, which want loopback.
+                    false,
                 )?;
                 tracing::info!(addr = %handle.local_addr(), "embedded server listening");
                 (handle.local_addr(), Some(handle))
@@ -341,12 +385,26 @@ fn start_local_world(
     view: tiamot_core::interest::ViewDistance,
     enabled_mods: Vec<String>,
     operator: &tiamot_core::identity::PlayerUuid,
+    lan: bool,
 ) -> Result<tiamot_server::ServerHandle, Box<dyn std::error::Error>> {
     Ok(tiamot_server::ServerHandle::start(
         &tiamot_server::Settings {
-            bind_addr: "127.0.0.1:0".parse()?,
+            // **Loopback unless asked otherwise.** A world hosted for one
+            // person should not be reachable from the network because it
+            // happens to be running; opening it is a decision somebody makes
+            // beside the button, per session.
+            //
+            // `LAN_PORT` rather than a random one when open, because the
+            // address has to be typeable by somebody standing next to you.
+            bind_addr: if lan {
+                std::net::SocketAddr::from(([0, 0, 0, 0], LAN_PORT))
+            } else {
+                "127.0.0.1:0".parse()?
+            },
             world_path: world_path.to_path_buf(),
-            max_players: 1,
+            // One is right for a world nobody else can reach, and would be a
+            // baffling refusal for one they can.
+            max_players: if lan { 8 } else { 1 },
             allowlist: tiamot_core::identity::Allowlist::open(),
             // **Your own world, your own powers.** A player hosting a world for
             // themselves is its operator, which is what makes flight available
@@ -1002,13 +1060,19 @@ impl Client {
         // be drawn over whatever the last frame left behind.
         clear(&surface.gpu, &view);
         let action = draw_front(surface, &mut self.config, &view);
+        // **Read after drawing and before acting.** The tick box lives on the
+        // screen that produced the action, and `open` borrows the window.
+        let lan = match &surface.stage {
+            Stage::Front(front) => front.host_on_lan,
+            Stage::Playing(_) => false,
+        };
         frame.present();
 
         match action {
             client::front::Action::None => true,
             client::front::Action::Quit => false,
-            client::front::Action::Open(entry) => self.open(&entry),
-            client::front::Action::Create(name) => self.create(&name),
+            client::front::Action::Open(entry) => self.open(&entry, lan),
+            client::front::Action::Create(name) => self.create(&name, lan),
             client::front::Action::Remember(entry) => {
                 self.library.add(*entry);
                 self.save_library();
@@ -1027,8 +1091,8 @@ impl Client {
     /// A failure is reported ON the front screen rather than to the terminal: a
     /// player who typed an address wrong is looking at the menu, and a log line
     /// they never see is the same as no message at all.
-    fn open(&mut self, entry: &client::launcher::Entry) -> bool {
-        match self.connect(entry) {
+    fn open(&mut self, entry: &client::launcher::Entry, lan: bool) -> bool {
+        match self.connect(entry, lan) {
             Ok(()) => {
                 self.library.add(client::launcher::Entry {
                     // The mods it is being played with NOW, so the next visit
@@ -1062,7 +1126,7 @@ impl Client {
     }
 
     /// Makes a world and opens it.
-    fn create(&mut self, name: &str) -> bool {
+    fn create(&mut self, name: &str, lan: bool) -> bool {
         let entry = client::launcher::Entry {
             name: name.to_owned(),
             kind: client::launcher::Kind::Local {
@@ -1071,11 +1135,11 @@ impl Client {
             mods: self.catalogue.enabled(),
             last_played: client::launcher::now_seconds(),
         };
-        self.open(&entry)
+        self.open(&entry, lan)
     }
 
     /// Starts whatever `entry` names and swaps the window into it.
-    fn connect(&mut self, entry: &client::launcher::Entry) -> Result<(), String> {
+    fn connect(&mut self, entry: &client::launcher::Entry, lan: bool) -> Result<(), String> {
         let identity = Identity::load_or_create(&self.identity_path)
             .map_err(|err| format!("this machine's identity could not be read: {err}"))?;
         let address = match &entry.kind {
@@ -1085,9 +1149,16 @@ impl Client {
                     self.config.view(),
                     self.catalogue.enabled(),
                     &identity.uuid_as_root(),
+                    lan,
                 )
                 .map_err(|err| err.to_string())?;
-                let address = handle.local_addr();
+                // **Loopback when the world listens on everything.** A server
+                // bound to `0.0.0.0` reports that as its address, and
+                // `0.0.0.0` is somewhere to listen rather than somewhere to
+                // connect — dialling it fails outright with "invalid remote
+                // address", so opening a world to the LAN would have stopped
+                // the host from joining their own world.
+                let address = own_address(handle.local_addr());
                 // Held on `Client`, because dropping it stops the world.
                 self.embedded = Some(handle);
                 address
@@ -1120,7 +1191,12 @@ impl Client {
             err.to_string()
         })?;
 
-        let app = self.start_app(connection);
+        let mut app = self.start_app(connection);
+        // **Only when it was actually opened**, and only for a world this
+        // machine runs: joining somebody else's server is not hosting one.
+        if lan && matches!(entry.kind, client::launcher::Kind::Local { .. }) {
+            app.set_hosting(lan_address(LAN_PORT));
+        }
         if let Some(surface) = self.window.as_mut() {
             surface.stage = Stage::Playing(Box::new(app));
             // **Taken on the way in.** A world opened from the menu used to
@@ -1705,6 +1781,7 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
     let mut resume = false;
     let mut controls = false;
     let mut quit = false;
+    let hosting = app.hosting().map(str::to_owned);
     let mut hud = app.hud_visible();
     let mut overlay = app.debug_overlay();
     let live = app.ui_scale();
@@ -1717,6 +1794,17 @@ fn draw_menu(app: &mut App, ctx: &egui::Context) {
         {
             ui.vertical_centered_justified(|ui| {
                 ui.add_space(6.0);
+                // **Where to tell people to connect.** Only when the world is
+                // actually open: a line that always showed an address would
+                // have people typing one at a server that refuses them.
+                if let Some(address) = &hosting {
+                    ui.label(format!("Open to your network at  {address}"));
+                    ui.label(
+                        "They join from Play → Server. The first connection pins this \
+                         machine's certificate.",
+                    );
+                    ui.add_space(6.0);
+                }
                 if ui.button("Settings").clicked() {
                     controls = true;
                 }

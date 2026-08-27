@@ -958,6 +958,11 @@ pub struct App {
     /// anything. What it does NOT do is change when mobs spawn or anything else
     /// the server decides — this is for looking at the sky, not for playing.
     time_override: bool,
+    /// The address others can join this world at, if it is open to the LAN.
+    ///
+    /// **A host who cannot tell anybody where to connect has not hosted
+    /// anything**, so this is shown on the pause menu rather than logged.
+    hosting: Option<String>,
     /// Whether the server has said this player may fly.
     may_fly: bool,
     /// Whether flight is on.
@@ -1123,6 +1128,7 @@ impl App {
             heard: Vec::new(),
             step_sounds: std::collections::BTreeMap::new(),
             items: std::collections::BTreeSet::new(),
+            hosting: None,
             may_fly: false,
             flying: false,
             world_paused: false,
@@ -4351,6 +4357,17 @@ impl App {
             ],
             tick,
         ));
+    }
+
+    /// Records that this client is hosting its world for other machines.
+    pub fn set_hosting(&mut self, address: Option<String>) {
+        self.hosting = address;
+    }
+
+    /// Where others can join this world, if it is open at all.
+    #[must_use]
+    pub fn hosting(&self) -> Option<&str> {
+        self.hosting.as_deref()
     }
 
     /// Turns flight on or off, if the server has allowed this player any.

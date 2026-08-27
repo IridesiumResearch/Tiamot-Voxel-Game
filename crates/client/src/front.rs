@@ -83,6 +83,13 @@ pub struct Front {
     /// Where the interface-scale slider has been dragged to and not let go of.
     /// See [`crate::widget::settle`].
     scale_draft: Option<f32>,
+    /// Whether opening a local world should also listen for other machines.
+    ///
+    /// **Off by default, and deliberately.** A world that quietly accepted
+    /// connections from the network because somebody once ticked a box is not
+    /// something to remember for them — this is a per-session choice, made
+    /// beside the button that acts on it.
+    pub host_on_lan: bool,
 }
 
 impl Front {
@@ -101,6 +108,7 @@ impl Front {
             confirming: None,
             settings_dirty: false,
             scale_draft: None,
+            host_on_lan: false,
         }
     }
 
@@ -243,6 +251,20 @@ impl Front {
             if ui.button("Forget").clicked() {
                 action = self.forget_selected();
             }
+            // **Only for a world this machine runs.** Joining somebody else's
+            // server is not hosting one, and a tick box that did nothing on
+            // half the list would be a control that lies.
+            let local = self
+                .selected
+                .and_then(|index| self.library.entries.get(index))
+                .is_some_and(Entry::is_local);
+            ui.add_enabled_ui(local, |ui| {
+                ui.checkbox(&mut self.host_on_lan, "Open to LAN")
+                    .on_hover_text(
+                        "Others on your network can join by typing this machine's address. \
+                         Off means the world is reachable only from this computer.",
+                    );
+            });
         });
 
         ui.add_space(6.0);
@@ -514,6 +536,15 @@ mod tests {
                 problem: None,
             },
         )
+    }
+
+    #[test]
+    fn opening_to_the_lan_is_off_until_somebody_asks_for_it() {
+        // **A world reachable from the network is a decision, not a default.**
+        // Off every time the screen is built, and deliberately not remembered:
+        // a box ticked once should not quietly open every world afterwards.
+        let screen = front(vec![world("Home", &[])]);
+        assert!(!screen.host_on_lan);
     }
 
     #[test]
