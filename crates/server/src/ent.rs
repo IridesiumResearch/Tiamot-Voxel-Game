@@ -323,6 +323,49 @@ impl Population {
         grouped
     }
 
+    /// Every entity that takes up room, for the crowd-separation pass.
+    ///
+    /// **Player mirrors are left out.** A player is in this store as a
+    /// transient copy of a body the tick steps itself, so including one would
+    /// have every player shove themselves — and the shove would land on the
+    /// mirror, which is overwritten from the real body a moment later.
+    ///
+    /// Slot order, which is the order charter rule 4 requires be a property of
+    /// the data rather than of a hash.
+    pub fn crowd(&self) -> impl Iterator<Item = (EntityId, tiamot_core::phys::Occupant)> + '_ {
+        self.entities.ids().into_iter().filter_map(move |id| {
+            if self.transient.contains(&id) {
+                return None;
+            }
+            let entity = self.entities.get(id)?;
+            let collider = entity.collider?;
+            Some((
+                id,
+                tiamot_core::phys::Occupant {
+                    origin: entity.transform.chunk,
+                    position: entity.transform.local,
+                    height: collider.height,
+                    width: collider.width,
+                    // Everything with a box is pushable for now. See
+                    // `Occupant::movable` for what the other answer is for.
+                    movable: true,
+                },
+            ))
+        })
+    }
+
+    /// Adds a horizontal nudge to an entity's velocity.
+    ///
+    /// Applied before [`Self::tick`] steps it, so terrain still decides where
+    /// it ends up. Silently does nothing for an id that has gone, which is
+    /// ordinary: the crowd was read a few statements ago.
+    pub fn nudge(&mut self, id: EntityId, push: [f32; 3]) {
+        if let Some(entity) = self.entities.get_mut(id) {
+            entity.velocity.0[0] += push[0];
+            entity.velocity.0[2] += push[2];
+        }
+    }
+
     /// Steps every entity by one tick.
     ///
     /// # Order
@@ -492,6 +535,67 @@ impl tiamot_core::ent::Access for Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_crowd_leaves_out_the_mirrors_of_players_who_move_themselves() {
+        // A player is in this store as a transient copy of a body the tick
+        // steps itself. Including one would have every player shove
+        // themselves, and the shove would land on the mirror — which is
+        // overwritten from the real body a moment later, so the bug would be
+        // invisible everywhere except in how a player felt.
+        let mut population = Population::new();
+        let real = population.spawn(mob(ChunkPos::new(0, 0, 0), [8.0, 0.0, 8.0]));
+        population.sync_player(
+            tiamot_core::PlayerUuid::from_bytes([7; 32]),
+            Transform::at(ChunkPos::new(0, 0, 0), [8.5, 0.0, 8.0]),
+            tiamot_core::ent::Velocity([0.0; 3]),
+            true,
+            tiamot_core::ent::AnimTag::IDLE,
+            tiamot_core::ent::Hands::default(),
+        );
+
+        let crowd: Vec<EntityId> = population.crowd().map(|(id, _)| id).collect();
+        assert_eq!(
+            crowd,
+            vec![real],
+            "a player's mirror was counted as somebody to push"
+        );
+    }
+
+    #[test]
+    fn a_body_in_the_crowd_is_pushed_out_of_a_players_space() {
+        // The entity half of "players should very subtly collide with mobs".
+        // A mob standing where a player is standing takes a nudge, and the
+        // nudge is horizontal — a crowd that can push up lifts things through
+        // ceilings.
+        let mut population = Population::new();
+        let standing = mob(ChunkPos::new(0, 0, 0), [8.0, 0.0, 8.0]);
+        let id = population.spawn(standing);
+
+        let player = tiamot_core::phys::Occupant {
+            origin: ChunkPos::new(0, 0, 0),
+            position: [8.2, 0.0, 8.0],
+            height: tiamot_core::phys::PLAYER_HEIGHT,
+            width: tiamot_core::phys::PLAYER_WIDTH,
+            movable: true,
+        };
+        let mut occupants = vec![player];
+        occupants.extend(population.crowd().map(|(_, occupant)| occupant));
+        let pushes = tiamot_core::phys::separate(&occupants);
+        population.nudge(id, pushes[1]);
+
+        let velocity = population.get(id).expect("the mob").velocity.0;
+        assert!(
+            velocity[0] < 0.0,
+            "a mob sharing a player's space was not pushed out of it: {velocity:?}"
+        );
+        assert_eq!(
+            velocity[1].to_bits(),
+            0,
+            "the mob was pushed vertically, which is how a crowd lifts things"
+        );
+    }
+
     use tiamot_core::MaterialId;
     use tiamot_core::ent::{Collider, Transform};
 

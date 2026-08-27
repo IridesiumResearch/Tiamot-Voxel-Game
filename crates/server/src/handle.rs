@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
-use tiamot_core::identity::Allowlist;
+use tiamot_core::identity::{Allowlist, PlayerUuid};
+use tiamot_core::phys::Occupant;
 use tiamot_core::proto::{ModEntry, ServerMessage};
 use tiamot_core::script::{HostError, MluaVm, ModHost, ScriptVm as _, VmLimits};
 use tiamot_core::session::store;
@@ -1462,6 +1463,59 @@ impl ServerHandle {
                         // the same lock for writing — a read guard held across
                         // one would deadlock the tick thread against itself.
                         // Nothing inside this loop enters a mod.
+                        // **Bodies make room for each other, before they
+                        // move.** Reported from the window as players wanting
+                        // to collide "very subtly" with mobs and each other.
+                        //
+                        // A velocity nudge rather than a constraint, added
+                        // here so the step that follows resolves it against
+                        // terrain — see `phys::crowd`. Computed from where
+                        // everything was at the end of last tick, which is one
+                        // tick of lag on a lean that takes a second.
+                        //
+                        // The two locks are taken one after the other and
+                        // neither is held across the other, which is what the
+                        // punch loop below does for the same pair.
+                        {
+                            let mobs: Vec<(tiamot_core::ent::EntityId, Occupant)> = population
+                                .read()
+                                .expect("entity lock")
+                                .crowd()
+                                .collect();
+                            let mut occupants: Vec<Occupant> = Vec::new();
+                            let mut people: Vec<PlayerUuid> = Vec::new();
+                            if let Ok(bodies) = shared.bodies.lock() {
+                                for (uuid, player) in bodies.iter() {
+                                    people.push(*uuid);
+                                    occupants.push(Occupant {
+                                        origin: player.origin,
+                                        position: player.body.position,
+                                        height: tiamot_core::phys::PLAYER_HEIGHT,
+                                        width: tiamot_core::phys::PLAYER_WIDTH,
+                                        movable: true,
+                                    });
+                                }
+                            }
+                            occupants.extend(mobs.iter().map(|(_, occupant)| *occupant));
+                            let pushes = tiamot_core::phys::separate(&occupants);
+                            let (for_people, for_mobs) = pushes.split_at(people.len());
+
+                            if let Ok(mut bodies) = shared.bodies.lock() {
+                                for (uuid, push) in people.iter().zip(for_people) {
+                                    if let Some(player) = bodies.get_mut(uuid) {
+                                        player.body.velocity[0] += push[0];
+                                        player.body.velocity[2] += push[2];
+                                    }
+                                }
+                            }
+                            if for_mobs.iter().any(|push| push[0] != 0.0 || push[2] != 0.0) {
+                                let mut mobs_out = population.write().expect("entity lock");
+                                for ((id, _), push) in mobs.iter().zip(for_mobs) {
+                                    mobs_out.nudge(*id, *push);
+                                }
+                            }
+                        }
+
                         if let Ok(mut bodies) = shared.bodies.lock() {
                             let fluid = fluidics.read().expect("fluid lock");
                             for player in bodies.values_mut() {
