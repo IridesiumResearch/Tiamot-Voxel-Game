@@ -1325,14 +1325,37 @@ impl Bot {
     /// Whether a cell edit setting `pos` to `material` has been broadcast.
     #[must_use]
     pub fn saw_subnode(&self, pos: tiamot_core::SubNodePos, material: u16) -> bool {
+        // **Every edit that could have filled that cell, not just the one
+        // spelling.** A cell can arrive as a `SubNode`, inside a `Partial`'s
+        // mask, or as a whole `Block` — asking only about the first makes this
+        // a question about the MESSAGE rather than about the world, and a
+        // change to how a placement is written then reads as the placement not
+        // happening.
+        let cell = 1
+            << tiamot_core::block::subnode_index(
+                pos.x.rem_euclid(3) as u32,
+                pos.y.rem_euclid(3) as u32,
+                pos.z.rem_euclid(3) as u32,
+            );
         self.received().iter().any(|message| {
-            matches!(
-                message,
-                ServerMessage::BlockDelta {
-                    edit: tiamot_core::proto::Edit::SubNode { pos: at, material: got },
-                    ..
-                } if *at == pos && *got == material
-            )
+            let ServerMessage::BlockDelta { edit, .. } = message else {
+                return false;
+            };
+            match edit {
+                tiamot_core::proto::Edit::SubNode {
+                    pos: at,
+                    material: got,
+                } => *at == pos && *got == material,
+                tiamot_core::proto::Edit::Partial {
+                    pos: at,
+                    material: got,
+                    occupancy,
+                } => *at == pos.block() && *got == material && occupancy & cell != 0,
+                tiamot_core::proto::Edit::Block {
+                    pos: at,
+                    material: got,
+                } => *at == pos.block() && *got == material,
+            }
         })
     }
 
@@ -1636,12 +1659,29 @@ impl Bot {
         target: tiamot_core::SubNodePos,
         material: u16,
     ) -> Result<(), BotError> {
+        self.place_shape_from_inventory(target, material, 0).await
+    }
+
+    /// The same, spending a stack cut to `shape`.
+    ///
+    /// **Every bot placed loose material until this existed.** `shape: 0` was
+    /// hard-coded, so nothing in the suite had ever placed a cut stack — which
+    /// is how "placing a stair puts down a stair" could be broken and green,
+    /// the same shape of hole `Bot::walk`'s hard-coded look left around yaw.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn place_shape_from_inventory(
+        &mut self,
+        target: tiamot_core::SubNodePos,
+        material: u16,
+        shape: u32,
+    ) -> Result<(), BotError> {
         self.send(&tiamot_core::proto::ClientMessage::Place {
             target,
             material,
-            // Loose material. A bot that wants to place a cut stack builds the
-            // message itself; this helper is the ordinary case.
-            shape: 0,
+            shape,
         })
         .await
     }

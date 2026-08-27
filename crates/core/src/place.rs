@@ -329,8 +329,275 @@ fn last_cell_touched(high: f64) -> i64 {
     }
 }
 
+/// The lowest `units` cells of `occupancy`, in [`crate::inventory::placement_mask`]'s
+/// bottom-up order.
+///
+/// A plan is charged for before it is written, and the charge can come up
+/// short — another connection of the same player spending between the check
+/// and the debit is enough. What gets written is then what was actually paid
+/// for, and this decides which cells those are.
+///
+/// `units` at or above the cell count returns `occupancy` unchanged, so the
+/// ordinary path costs a comparison.
+#[must_use]
+pub fn trim(occupancy: u32, units: u32) -> u32 {
+    if units >= occupancy.count_ones() {
+        return occupancy;
+    }
+    let mut kept = 0;
+    let mut taken = 0;
+    for index in crate::inventory::fill_order() {
+        if taken == units {
+            break;
+        }
+        if occupancy & (1 << index) != 0 {
+            kept |= 1 << index;
+            taken += 1;
+        }
+    }
+    kept
+}
+
+/// The edits that write `cells` of `material` into `pos`, per Sub-Node
+/// Contract §7.2.
+///
+/// `filled` is what the block already holds and `same` says whether all of it
+/// is `material` — the caller has the world and this does not.
+///
+/// **Why this is not one edit.** [`crate::proto::Edit::Partial`] SETS a block,
+/// so a partial naming only the new cells deletes everything else in it. Where
+/// the existing content is the same material the union is exact and one edit
+/// does; where it is not, each cell goes in on its own, because a `Partial`
+/// carries a single material and would transmute what it landed beside.
+///
+/// Returns an empty vector for an empty `cells`, which is not an edit.
+#[must_use]
+pub fn writes(
+    pos: BlockPos,
+    cells: u32,
+    material: u16,
+    filled: u32,
+    same: bool,
+) -> Vec<crate::proto::Edit> {
+    use crate::proto::Edit;
+
+    let cells = cells & crate::block::OCCUPANCY_FULL;
+    if cells == 0 {
+        return Vec::new();
+    }
+    // **One cell is an `Edit::SubNode`, whatever else is in the block.** That
+    // is what the variant means, it preserves everything it does not name, and
+    // it describes one cell in one position rather than in a 27-bit mask. A
+    // chisel's placement is this case and has always gone out this way.
+    if cells.is_power_of_two() {
+        return vec![Edit::SubNode {
+            pos: cell_pos(pos, cells.trailing_zeros() as usize),
+            material,
+        }];
+    }
+    if filled == 0 || same {
+        let union = cells | filled;
+        return vec![if union == crate::block::OCCUPANCY_FULL {
+            Edit::Block { pos, material }
+        } else {
+            Edit::Partial {
+                pos,
+                material,
+                occupancy: union,
+            }
+        }];
+    }
+    crate::inventory::fill_order()
+        .filter(|index| cells & (1 << index) != 0)
+        .map(|index| Edit::SubNode {
+            pos: cell_pos(pos, index),
+            material,
+        })
+        .collect()
+}
+
+/// How many units an edit this module produced writes.
+///
+/// Only meaningful for [`writes`]' own output — a `Block` edit is a whole
+/// block, a `Partial` is its set bits, a `SubNode` is one cell. Used to refund
+/// exactly the part of a charge that did not land when one of several per-cell
+/// writes fails.
+#[must_use]
+pub fn edit_units(edit: &crate::proto::Edit) -> u32 {
+    match edit {
+        crate::proto::Edit::Block { .. } => UNITS_PER_BLOCK,
+        crate::proto::Edit::Partial { occupancy, .. } => {
+            (occupancy & crate::block::OCCUPANCY_FULL).count_ones()
+        }
+        crate::proto::Edit::SubNode { .. } => 1,
+    }
+}
+
+/// Where a block's `index`th cell is in the world.
+fn cell_pos(pos: BlockPos, index: usize) -> SubNodePos {
+    let (x, y, z) = subnode_offset(index);
+    let base = |v: i32, o: u32| v * SUBNODES_PER_AXIS as i32 + o as i32;
+    SubNodePos::new(base(pos.x, x), base(pos.y, y), base(pos.z, z))
+}
+
 #[cfg(test)]
 mod tests {
+    /// The bottom-up order, as a mask of the first `n` cells.
+    fn run(n: u32) -> u32 {
+        crate::inventory::placement_mask(n)
+    }
+
+    #[test]
+    fn a_trim_keeps_the_lowest_cells_of_the_plan_and_not_a_fresh_run() {
+        // A cut stack trimmed by a short payment must still be made of ITS
+        // cells. The distinction only shows on a shape whose cells are not a
+        // bottom-up run — a run trims to a shorter run either way, which is
+        // why testing this on one would prove nothing.
+        // Cells 1, 3, 9 and 12 — deliberately NOT starting at cell 0, because
+        // a shape whose lowest cells happen to be the first cells of the fill
+        // order trims to the same mask either way and proves nothing.
+        let cut = (1 << 1) | (1 << 3) | (1 << 9) | (1 << 12);
+        let trimmed = trim(cut, 3);
+        assert_eq!(trimmed.count_ones(), 3, "trimmed to the units paid for");
+        assert_eq!(trimmed & !cut, 0, "trim invented a cell the plan never had");
+        assert_ne!(trimmed, run(3), "trim fell back to a bottom-up run");
+    }
+
+    #[test]
+    fn a_trim_at_or_above_the_cell_count_changes_nothing() {
+        let stair = 0b11111;
+        assert_eq!(trim(stair, 5), stair);
+        assert_eq!(trim(stair, 99), stair, "paying more than a shape costs");
+    }
+
+    #[test]
+    fn one_cell_is_a_subnode_edit_and_never_a_mask() {
+        // The chisel's own placement. `Edit::Partial` would say the same thing
+        // about the world and say it in a form that has to carry every other
+        // cell of the block with it to stay true.
+        for filled in [0, run(9)] {
+            let edits = writes(BlockPos::new(0, 0, 0), 1 << 13, 7, filled, true);
+            assert!(
+                matches!(edits.as_slice(), [crate::proto::Edit::SubNode { .. }]),
+                "one cell became {edits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_into_an_empty_block_is_one_partial_of_exactly_the_plan() {
+        let cells = 0b1_0000_0000_0000_0001_0001;
+        let edits = writes(BlockPos::new(1, 2, 3), cells, 7, 0, true);
+        assert_eq!(
+            edits,
+            vec![crate::proto::Edit::Partial {
+                pos: BlockPos::new(1, 2, 3),
+                material: 7,
+                occupancy: cells,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_write_that_completes_a_block_is_a_block_and_not_a_full_mask() {
+        // Sub-Node Contract §0: canonical form is an invariant, so the two
+        // spellings of a full block must not both be able to reach the world.
+        let filled = run(20);
+        let gaps = !filled & crate::block::OCCUPANCY_FULL;
+        let edits = writes(BlockPos::new(0, 0, 0), gaps, 7, filled, true);
+        assert_eq!(
+            edits,
+            vec![crate::proto::Edit::Block {
+                pos: BlockPos::new(0, 0, 0),
+                material: 7,
+            }]
+        );
+    }
+
+    #[test]
+    fn filling_the_gaps_in_a_block_carries_what_was_already_in_it() {
+        // **`Edit::Partial` SETS a block.** One naming only the new cells
+        // deletes everything else — material destroyed on a path no player
+        // caused, which charter rule 5 forbids. The union is what makes the
+        // replace faithful.
+        let filled = run(10);
+        let gaps = 0b111 << 24;
+        let edits = writes(BlockPos::new(0, 0, 0), gaps, 7, filled, true);
+        let crate::proto::Edit::Partial { occupancy, .. } = edits[0] else {
+            panic!("expected one partial, got {edits:?}");
+        };
+        assert_eq!(
+            occupancy,
+            filled | gaps,
+            "the ten cells already in the block were not carried into the write"
+        );
+    }
+
+    #[test]
+    fn filling_the_gaps_beside_another_material_goes_in_cell_by_cell() {
+        // A `Partial` carries ONE material, so using one here would convert
+        // everything it landed beside. Per-cell writes preserve what they do
+        // not name, and the result is the `Mixed` block §0 exists for.
+        let filled = run(10);
+        let gaps = 0b101 << 24;
+        let edits = writes(BlockPos::new(0, 0, 0), gaps, 7, filled, false);
+        assert_eq!(
+            edits.len(),
+            2,
+            "expected one write per added cell: {edits:?}"
+        );
+        assert!(
+            edits
+                .iter()
+                .all(|edit| matches!(edit, crate::proto::Edit::SubNode { .. })),
+            "a partial would have flattened the other material: {edits:?}"
+        );
+        for edit in &edits {
+            let crate::proto::Edit::SubNode { pos, .. } = edit else {
+                unreachable!()
+            };
+            assert_eq!(pos.block(), BlockPos::new(0, 0, 0), "a cell left its block");
+        }
+    }
+
+    #[test]
+    fn every_cell_a_write_names_is_one_the_plan_asked_for() {
+        // The whole defect this section exists for, stated as an invariant: no
+        // write path may introduce a cell the plan did not choose. Checked
+        // across both shapes of write.
+        let filled = run(9);
+        for cells in [0b111u32, 0b1010_1010, 1 << 26, 0b11111] {
+            let cells = cells & !filled;
+            if cells == 0 {
+                continue;
+            }
+            for same in [true, false] {
+                let mut written = 0;
+                for edit in writes(BlockPos::new(0, 0, 0), cells, 7, filled, same) {
+                    match edit {
+                        crate::proto::Edit::Partial { occupancy, .. } => written |= occupancy,
+                        crate::proto::Edit::SubNode { pos, .. } => {
+                            written |= 1 << cell_index(pos);
+                        }
+                        crate::proto::Edit::Block { .. } => {
+                            written |= crate::block::OCCUPANCY_FULL;
+                        }
+                    }
+                }
+                assert_eq!(
+                    written & !(cells | filled),
+                    0,
+                    "a write named a cell outside the plan for {cells:#029b}, same={same}"
+                );
+                assert_eq!(
+                    cells & !written,
+                    0,
+                    "a write dropped a planned cell for {cells:#029b}, same={same}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_block_brush_fills_what_a_dig_took_out() {
         // **Reported from the window**: placing a block against one that had

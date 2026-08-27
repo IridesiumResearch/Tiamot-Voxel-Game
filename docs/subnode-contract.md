@@ -408,19 +408,58 @@ own; the tool the player holds carries one, and a mod says which.
   without a mod-registered tool because the engine has no rule of its own for
   breaking things; placing has no such rule to be missing, and refusing it would
   let a mod set strand an inventory with no way to spend it.
+- **A block brush fills the GAPS in a block that has been partly mined**, not
+  the first N cells from the bottom. Those are the same mask in an empty block
+  and different masks in a carved one, where the bottom-up run overlaps what is
+  left and the placement is refused — reported from the window as placing
+  against a half-mined block doing nothing and saying something was already
+  there. The gaps are taken in `placement_mask`'s bottom-up order, so a partial
+  payment still fills deterministically.
+
+**A stack cut to a shape places its cut, whatever brush is held.** The cut *is*
+the thing being carried: a chisel does not get to spend a whole crafted stair to
+put down one of its cells, and a block brush does not get to flatten it into a
+bottom-up run of the same number of cells. A tool decides what comes OUT of the
+world; what goes back in is whatever is in the player's hand. Only loose
+material — a stack with no cut — is subject to the brush at all.
 
 **Occupancy is judged per cell, never per block.** A placement is refused if any
 cell it would fill is already occupied — so a chiselled block's empty cells can
-be filled, and a whole-block placement into a block with anything in it is
-refused because its cells overlap.
+be filled, and a whole-block placement into a block with no room left is refused
+because its cells overlap.
 
 Together these are what make carving **reversible**: a cell taken out of a block
 can be put back into the same cell of the same block. Without either half — a
 fill anchored to the block's bottom, or a refusal that looked at the whole block
 — sub-node resolution would exist only for removal.
 
-Task 09 implements this; `crates/core/src/place.rs` is the implementation and
-`a_chiselled_cell_goes_back_into_the_cell_it_came_out_of` is the test.
+### 7.2 Writing a placement — the plan's cells, and never a count
+
+**The edit a placement produces carries the planned cells themselves.** It is
+never re-derived downstream from how MANY units were paid: `placement_mask(n)`
+is the answer to "what does loose material look like", and applying it to a
+plan that already chose its cells silently replaces a crafted shape, or a set
+of gaps, with a bottom-up run of the same size. That is one defect with two
+faces — a crafted stair placing as a lump, and a gap-fill landing in the wrong
+cells.
+
+**A write into a block that already holds something must MERGE.**
+`Edit::Partial` sets the whole block, so sending one that names only the new
+cells deletes everything else in it — material destroyed on a path no player
+caused and charter rule 5 forbids. Two shapes of write follow:
+
+- The block is empty, or everything in it is the material being placed: one
+  `Edit::Partial` carrying the UNION of what was there and what is being added
+  (canonicalising to `Edit::Block` when that union is full).
+- The block holds a different material: one `Edit::SubNode` per added cell, in
+  `placement_mask`'s order. Each preserves what it does not name, and the
+  result is a `Mixed` block — the storage form §0 exists for.
+
+Task 09 implements §7.1; `crates/core/src/place.rs` is the implementation and
+`a_chiselled_cell_goes_back_into_the_cell_it_came_out_of` is the test. §7.2 is
+`place::trim` and `place::writes`, and
+`placing_a_cut_stack_puts_that_cut_in_the_world` is the test that would have
+caught its absence.
 
 ---
 

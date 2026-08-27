@@ -2078,77 +2078,85 @@ impl ServerHandle {
                                 continue;
                             }
 
-                            // A full block goes out as `Edit::Block`, not as a
-                            // `Partial` with every bit set. The two produce
-                            // identical geometry, so sending the second form
-                            // would mean the same result arrived as two
-                            // different messages depending on how it was made —
-                            // and everything watching for a block appearing
-                            // would have to know about both.
+                            // **The plan's OWN cells.** Sub-Node Contract §7.2:
+                            // what gets written is never re-derived from how
+                            // many units were paid. `placement_mask(paid)` is
+                            // the answer to "what does loose material look
+                            // like", and using it here quietly replaced a
+                            // crafted shape with a bottom-up lump of the same
+                            // size — reported from the window as shape crafting
+                            // placing "that many nodes in a block" instead of
+                            // the shape — and put a gap-fill in the wrong cells
+                            // for the same reason.
                             //
-                            // A sub-node placement goes out as `Edit::SubNode`
-                            // for a stronger reason than symmetry with digging:
-                            // `Edit::Partial` REPLACES a block, so sending one
-                            // cell that way would delete whatever else was in
-                            // the block — the conservation hole the occupancy
-                            // check above exists to prevent, reintroduced by
-                            // the message that reports the placement.
-                            let edit = match brush {
-                                tiamot_core::dig::Brush::SubNode => {
-                                    tiamot_core::proto::Edit::SubNode {
-                                        pos: request.target,
-                                        material: request.material,
-                                    }
-                                }
-                                tiamot_core::dig::Brush::Block => {
-                                    let occupancy =
-                                        tiamot_core::inventory::placement_mask(paid);
-                                    if paid >= tiamot_core::UNITS_PER_BLOCK {
-                                        tiamot_core::proto::Edit::Block {
-                                            pos: plan.block,
-                                            material: request.material,
-                                        }
-                                    } else {
-                                        tiamot_core::proto::Edit::Partial {
-                                            pos: plan.block,
-                                            material: request.material,
-                                            occupancy,
-                                        }
-                                    }
-                                }
-                            };
-                            match world.apply(&edit, &mut source) {
-                                Ok(_) => {
-                                    relight.push(edited_block(&edit));
-                                    // A pond finds out there is somewhere new
-                                    // to go the same way it finds out a wall
-                                    // came down: every edit wakes it, whichever
-                                    // path the edit arrived by.
-                                    fluidics
-                                        .write()
-                                        .expect("fluid lock")
-                                        .touch(edited_block(&edit));
-                                    shared.broadcast(ServerMessage::BlockDelta {
-                                        edit,
-                                        actor: Some(*request.actor.as_bytes()),
+                            // Trimmed to what was actually paid, because the
+                            // debit above can come up short.
+                            let cells = tiamot_core::place::trim(plan.occupancy, paid);
+
+                            // Whether everything already in the block is the
+                            // material going in decides whether one `Partial`
+                            // can carry the union or each cell has to go in on
+                            // its own — a `Partial` SETS the block, so one
+                            // naming only the new cells deletes the rest.
+                            let same = filled == 0
+                                || world
+                                    .block_cells(plan.block, &mut source)
+                                    .is_ok_and(|held| {
+                                        held.iter()
+                                            .all(|cell| cell.is_air() || *cell == material)
                                     });
+                            let edits = tiamot_core::place::writes(
+                                plan.block,
+                                cells,
+                                request.material,
+                                filled,
+                                same,
+                            );
+
+                            // Counted, because a per-cell write is several
+                            // edits and refunding the whole charge after some
+                            // of them landed would mint material.
+                            let mut failure = None;
+                            let mut applied = 0;
+                            for edit in edits {
+                                match world.apply(&edit, &mut source) {
+                                    Ok(_) => {
+                                        applied += tiamot_core::place::edit_units(&edit);
+                                        relight.push(edited_block(&edit));
+                                        // A pond finds out there is somewhere
+                                        // new to go the same way it finds out a
+                                        // wall came down: every edit wakes it,
+                                        // whichever path the edit arrived by.
+                                        fluidics
+                                            .write()
+                                            .expect("fluid lock")
+                                            .touch(edited_block(&edit));
+                                        shared.broadcast(ServerMessage::BlockDelta {
+                                            edit,
+                                            actor: Some(*request.actor.as_bytes()),
+                                        });
+                                    }
+                                    Err(err) => failure = Some(err),
                                 }
-                                Err(err) => {
-                                    // The write failed after the charge, so
-                                    // give it back. Anything else destroys
-                                    // material on a path a player did not cause
-                                    // and cannot see.
-                                    shared.credit(
-                                        request.actor,
-                                        tiamot_core::inventory::Stack::new(material, paid)
-                                            .into_iter()
-                                            .collect(),
-                                    );
-                                    debug!(
-                                        actor = %request.actor.short(),
-                                        "a placement would not apply: {err}"
-                                    );
-                                }
+                            }
+                            if let Some(err) = failure {
+                                // The write failed after the charge, so give
+                                // back what did not land. Anything else either
+                                // destroys material on a path a player did not
+                                // cause and cannot see, or mints it.
+                                shared.credit(
+                                    request.actor,
+                                    tiamot_core::inventory::Stack::new(
+                                        material,
+                                        paid.saturating_sub(applied),
+                                    )
+                                    .into_iter()
+                                    .collect(),
+                                );
+                                debug!(
+                                    actor = %request.actor.short(),
+                                    "a placement would not apply: {err}"
+                                );
                             }
                         }
 

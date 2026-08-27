@@ -444,3 +444,93 @@ fn what_a_player_chisels_is_what_the_mod_gets_back() {
     });
     server.stop();
 }
+
+#[test]
+fn placing_a_cut_stack_puts_that_cut_in_the_world() {
+    // **Reported from the window**: "shape crafting appears to be broken. It
+    // does not place the shape you make, it just places that many nodes in a
+    // block."
+    //
+    // That is the loose-material path: `placement_mask(units)` fills the first
+    // N cells bottom-up, which is what a block brush does with rubble. A cut
+    // must place ITS OWN cells.
+    //
+    // Nothing in the suite had ever placed one, because `place_from_inventory`
+    // hard-coded `shape: 0`.
+    let server = start("place-a-cut", write_bench("place-a-cut"));
+    block_on(async {
+        let mut bot = join(&server, "Mason").await;
+        let stone = bot
+            .material_table()
+            .expect("a material table")
+            .into_iter()
+            .find(|entry| entry.name == "bench:stone")
+            .map(|entry| entry.id)
+            .expect("the bench registers stone");
+
+        // The bench's own recipe: 27 loose units become one stack cut to
+        // `STAIR`, which is five cells.
+        bot.chat("craft").await.expect("craft");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            if bot.inventory().iter().any(|stack| stack.shape != 0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the recipe never produced a cut stack: {:?}",
+                bot.inventory()
+            );
+            bot.recv().await.expect("recv");
+        }
+        let cut = bot
+            .inventory()
+            .iter()
+            .find(|stack| stack.shape != 0)
+            .copied()
+            .expect("a cut stack");
+
+        // In reach, empty, and not where the player is standing — a placement
+        // inside a body is refused with "someone is standing there".
+        let at = tiamot_core::SubNodePos::new(7, 3, 7);
+        bot.place_shape_from_inventory(at, stone, cut.shape)
+            .await
+            .expect("the placement should reach the server");
+
+        // **What the world got, from the edit the server broadcast.** A
+        // placement of a cut is a `Partial` carrying its occupancy, so this is
+        // the shape itself rather than a count of cells.
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let placed = loop {
+            let found = bot
+                .received()
+                .into_iter()
+                .find_map(|message| match message {
+                    tiamot_core::proto::ServerMessage::BlockDelta {
+                        edit: tiamot_core::proto::Edit::Partial { pos, occupancy, .. },
+                        ..
+                    } if pos == at.block() => Some(occupancy),
+                    _ => None,
+                });
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no partial block was written where the cut was placed; the server said {:?}",
+                bot.notices()
+            );
+            bot.recv().await.expect("recv");
+        };
+
+        assert_eq!(
+            placed, cut.shape,
+            "placed {placed:#029b} where the stack is cut to {:#029b} — the same NUMBER of \
+             cells in the wrong arrangement is exactly the reported bug",
+            cut.shape
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
