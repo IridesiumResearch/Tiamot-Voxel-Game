@@ -20,10 +20,17 @@ world_path = "world"
 # Maximum simultaneously connected players. Must be at least 1.
 max_players = 16
 
-# Directory to load mods from. Absent means no mods, which is a legitimate
-# configuration: the engine is mechanisms and the content is mods, so a server
-# with none is empty rather than broken.
-#mods_path = "game"
+# Directory to load mods from, relative to the server's working directory.
+#
+# **On by default here, because a server with no mods has no blocks.** Absent is
+# a legitimate configuration — the engine is mechanisms and the content is mods,
+# so a server with none is empty rather than broken — but it is not a sensible
+# first run: no blocks, no tools, no worldgen and no sounds are registered, and
+# what a player joins is unbuildable air that looks like a broken build.
+#
+# Commented out, this file produced exactly that, and it is the file the
+# README's own quick-start command names.
+mods_path = "game"
 
 # How far players can see, in chunks. One chunk is 16 blocks.
 #

@@ -319,6 +319,26 @@ max_players = 64
             .canonicalize()
             .expect("server.example.toml should exist at the repo root");
 
-        Config::load(&example).expect("shipped example config should be valid");
+        let config = Config::load(&example).expect("shipped example config should be valid");
+
+        // **And it loads MODS.** Valid is not the same as usable: with
+        // `mods_path` commented out — which is how this file shipped — the
+        // server the README's own quick-start command starts registers no
+        // blocks, no tools, no worldgen and no sounds, and what a player joins
+        // is unbuildable air that looks like a broken build.
+        //
+        // Reported from a Mac by somebody following the README.
+        let mods = config
+            .mods_path
+            .as_deref()
+            .expect("the example must load mods, or a first run is an empty world");
+        assert!(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join(mods)
+                .is_dir(),
+            "the example names `{}`, which is not a directory in this repository",
+            mods.display()
+        );
     }
 }
