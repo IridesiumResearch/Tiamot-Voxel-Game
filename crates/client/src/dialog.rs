@@ -83,6 +83,19 @@ struct Local {
     /// what the server said last is how "the mod changed it" is told apart
     /// from "the mod is repeating itself".
     adopted: BTreeMap<String, u32>,
+    /// Which way round each shape editor's cube is being looked at.
+    ///
+    /// **A view and not a value.** The cut is always held in authored
+    /// coordinates, so turning the cube changes what a player is looking at
+    /// and never what they are making — and the mod is never told, because
+    /// there is nothing here it could act on.
+    turn: BTreeMap<String, crate::shape_view::Turn>,
+    /// How far the pointer has been dragged across each cube since it last
+    /// turned, in points.
+    ///
+    /// Kept so a slow drag accumulates into a turn instead of needing one
+    /// fast enough to cross the threshold in a single frame.
+    swung: BTreeMap<String, f32>,
 }
 
 /// Every open dialog's local state.
@@ -652,16 +665,41 @@ fn paint_shape_editor(
         local.shape.insert(node.name.clone(), sent);
     }
     let mut mask = local.shape.get(&node.name).copied().unwrap_or(sent);
+    let mut turn = local.turn.get(&node.name).copied().unwrap_or(0);
 
     // Square, and centred: the projection fits a six-by-six box and stretching
     // it would put the cells' faces out of true with each other.
     let side = rect.width().min(rect.height());
     let area = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
-    let response = ui.allocate_rect(rect, egui::Sense::click());
+    let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
+    // **Dragged to orbit, in quarter turns.** Asked for from the window: a
+    // cube you can turn round to see the other side of what you are carving.
+    // It snaps rather than following the pointer, because a quarter turn is a
+    // permutation of the twenty-seven cells and everything else here — the
+    // depth order, which three faces are visible, which cell a click landed
+    // on — is exact under one and approximate under any other angle.
+    if response.dragged() {
+        let swung = local.swung.entry(node.name.clone()).or_default();
+        *swung += response.drag_delta().x;
+        while swung.abs() >= DRAG_PER_TURN {
+            let step = if *swung > 0.0 { 1 } else { 3 };
+            turn = (turn + step) % 4;
+            *swung -= DRAG_PER_TURN * if step == 1 { 1.0 } else { -1.0 };
+        }
+        local.turn.insert(node.name.clone(), turn);
+    }
+    if response.drag_stopped() {
+        // A part-turn that never completed is not a turn, and carrying it into
+        // the next drag would make the cube jump on a touch.
+        local.swung.remove(&node.name);
+    }
 
     // Cells, not a stack: the editor's whole block is twenty-seven cells to
     // chisel at, where a whole block in a slot is loose material.
-    paint.icons.paint_cells(ui.painter(), area, material, mask);
+    let seen = crate::shape_view::as_seen(mask, turn);
+    paint.icons.paint_cells(ui.painter(), area, material, seen);
+    paint_face_labels(ui, area, seen, turn);
 
     let clicked = if response.clicked() {
         Some(false)
@@ -673,9 +711,12 @@ fn paint_shape_editor(
     if let Some(adding) = clicked
         && let Some(at) = response.interact_pointer_pos()
     {
-        mask = match crate::shape_view::pick(area, mask, at) {
-            Some(((x, y, z), face)) if adding => crate::shape_view::restore(mask, x, y, z, face),
-            Some(((x, y, z), _)) => crate::shape_view::chisel(mask, x, y, z),
+        // **Picked in the turned cube and applied to the authored one.** The
+        // player is clicking what they can see; the cut is stored the way it
+        // was made, so every cell has to come back through the turn.
+        mask = match crate::shape_view::pick(area, seen, at) {
+            Some((cell, face)) if adding => crate::shape_view::restore_seen(mask, turn, cell, face),
+            Some((cell, _)) => crate::shape_view::chisel_seen(mask, turn, cell),
             // Nothing under the cursor. A right click on an empty block seeds
             // the middle cell, so a player who chiselled everything away is not
             // left with a screen they cannot get out of.
@@ -691,6 +732,58 @@ fn paint_shape_editor(
                 },
             );
         }
+    }
+}
+
+/// How far the pointer has to travel across the cube to turn it a quarter.
+///
+/// A drag rather than a threshold on speed: a player turning the cube to look
+/// at the back of what they are carving wants to do it slowly and see each
+/// side, and a flick-only gesture would skip past two of them.
+const DRAG_PER_TURN: f32 = 48.0;
+
+/// Writes `front`, `top` and `side` on the faces they belong to.
+///
+/// **The arrows are what give a cut an orientation a player can ask for.** The
+/// engine turns a placed cut so its front faces whoever placed it, and toward
+/// their feet on a wall (`place::oriented`) — which is a rule nobody can use
+/// without being able to see which face the front is.
+///
+/// Deliberately quiet: small, dim, and drawn only on a face the cube is
+/// actually showing. Two of the three are visible at once from most angles,
+/// and the back and the left carry nothing, which is itself the answer to
+/// "which way round is this".
+fn paint_face_labels(ui: &egui::Ui, area: egui::Rect, mask: u32, turn: crate::shape_view::Turn) {
+    // Nothing to write on. A block chiselled away to nothing has no faces, and
+    // labels floating in the space where it was would be worse than none.
+    if mask == 0 {
+        return;
+    }
+    let painter = ui.painter();
+    let colour = ui.visuals().weak_text_color();
+    for face in [
+        crate::shape_view::Face::Top,
+        crate::shape_view::Face::Right,
+        crate::shape_view::Face::Front,
+    ] {
+        let Some(label) = crate::shape_view::label(face, turn) else {
+            continue;
+        };
+        // The whole block's face, not a cell's: the label belongs to the cut
+        // rather than to whichever cell happens to be in the corner, and a
+        // carved block has no single cell that is "the middle of this side".
+        let corners = crate::shape_view::block_corners(area, face);
+        let centre = corners
+            .iter()
+            .fold(egui::Vec2::ZERO, |sum, corner| sum + corner.to_vec2())
+            / 4.0;
+        painter.text(
+            centre.to_pos2(),
+            egui::Align2::CENTER_CENTER,
+            label.text(),
+            egui::FontId::proportional(11.0),
+            colour,
+        );
     }
 }
 

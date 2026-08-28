@@ -73,6 +73,110 @@ impl Face {
     }
 }
 
+/// How many quarter turns the cube has been orbited by.
+///
+/// **Quarter turns, not a free orbit**, and the reason is that everything else
+/// in this module is exact. The projection's depth order is `x + y + z`
+/// *exactly*, three faces are visible and always the same three, and a click
+/// lands on a cell rather than nearly on one. A turn is a permutation of the
+/// twenty-seven cells, so all of that survives it unchanged — where an
+/// arbitrary angle would make each of those approximately true and would need
+/// its own proof.
+///
+/// The cut a player is editing is always held in AUTHORED coordinates. This is
+/// a way of looking at it and nothing more, which is why nothing outside this
+/// module and the widget that draws it has to know a turn exists.
+pub type Turn = u32;
+
+/// The mask as it appears after `turn` quarter turns.
+#[must_use]
+pub fn as_seen(mask: u32, turn: Turn) -> u32 {
+    tiamot_core::inventory::turned(mask, turn)
+}
+
+/// Where a cell the player clicked on is in the authored block.
+///
+/// The inverse of the turn that [`as_seen`] applied. Without it, chiselling a
+/// cube that has been turned round takes out the cell that WOULD have been
+/// under the pointer had nobody turned it.
+#[must_use]
+pub fn authored_cell(cell: (i32, i32, i32), turn: Turn) -> (i32, i32, i32) {
+    let (mut x, mut y, mut z) = cell;
+    // Three forward turns are one backward turn, which avoids writing the
+    // inverse permutation out and getting one of its two minus signs wrong.
+    for _ in 0..(4 - turn % 4) % 4 {
+        let (nx, ny, nz) = (z, y, SIDE - 1 - x);
+        (x, y, z) = (nx, ny, nz);
+    }
+    (x, y, z)
+}
+
+/// What one of the three visible faces is a face OF, in the authored block.
+///
+/// Returns the outward normal in authored coordinates, so a caller can ask
+/// whether the face a player is looking at is the cut's front, its top or its
+/// side — which is what the arrows on the cube say.
+#[must_use]
+pub fn authored_normal(face: Face, turn: Turn) -> [i32; 3] {
+    let mut normal = match face {
+        Face::Top => [0, 1, 0],
+        Face::Right => [1, 0, 0],
+        Face::Front => [0, 0, 1],
+    };
+    // The same backward turn as `authored_cell`, and expressed the same way:
+    // the FORWARD map, applied `4 - turn` times. On a direction rather than on
+    // a position, so there is no re-centring and the sign moves instead.
+    //
+    // Writing the inverse out directly is what got this wrong the first time —
+    // an inverse applied `4 - turn` times is the forward map, so the arrows
+    // turned the opposite way to the cube.
+    for _ in 0..(4 - turn % 4) % 4 {
+        normal = [normal[2], normal[1], -normal[0]];
+    }
+    normal
+}
+
+/// Which of the cut's own faces a visible face is, if it is a labelled one.
+///
+/// **The three labels are what give a cut an orientation at all.** The engine
+/// turns a placed cut so its front faces the player (`place::oriented`), and a
+/// player cannot ask for that without being able to see which face the front
+/// is. `None` for the back and the left, which have no arrow: they are the
+/// other side of two that do.
+#[must_use]
+pub fn label(face: Face, turn: Turn) -> Option<Label> {
+    match authored_normal(face, turn) {
+        [0, 1, 0] => Some(Label::Top),
+        [0, 0, 1] => Some(Label::Front),
+        [1, 0, 0] => Some(Label::Side),
+        _ => None,
+    }
+}
+
+/// One of the cut's three labelled faces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Label {
+    /// `+y`. Stays up when the cut is placed.
+    Top,
+    /// `+z`. Turned toward whoever places the cut.
+    Front,
+    /// `+x`. Named so that a player can tell a turned cube from an untouched
+    /// one even when the front is round the back.
+    Side,
+}
+
+impl Label {
+    /// What to write on the face.
+    #[must_use]
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Front => "front",
+            Self::Side => "side",
+        }
+    }
+}
+
 /// The bit a cell occupies in an occupancy mask.
 ///
 /// `index = x + 3*y + 9*z`, the layout `core::block` documents and the one a
@@ -230,6 +334,31 @@ pub fn restore(mask: u32, x: i32, y: i32, z: i32, face: Face) -> u32 {
     }
 }
 
+/// What a left click on a TURNED cube does to the authored cut.
+///
+/// The player clicks what they can see; the cut is stored the way it was made.
+/// Every gesture on a turned cube has to come back through the turn, and this
+/// is where that happens — inline at the widget it was one call in the wrong
+/// coordinates away from taking out a cell on the other side of the block.
+#[must_use]
+pub fn chisel_seen(mask: u32, turn: Turn, cell: (i32, i32, i32)) -> u32 {
+    let (x, y, z) = authored_cell(cell, turn);
+    chisel(mask, x, y, z)
+}
+
+/// What a right click on a turned cube does to the authored cut.
+///
+/// The face that was clicked is a face of the VIEW, so the neighbour is found
+/// in the view and the whole answer turned back. Turning the answer rather
+/// than the neighbour is what makes it impossible for this to disagree with
+/// what was drawn.
+#[must_use]
+pub fn restore_seen(mask: u32, turn: Turn, cell: (i32, i32, i32), face: Face) -> u32 {
+    let seen = as_seen(mask, turn);
+    let restored = restore(seen, cell.0, cell.1, cell.2, face);
+    as_seen(restored, (4 - turn % 4) % 4)
+}
+
 /// The cell a right click fills when there is nothing left to click on.
 ///
 /// **So the editor is never a dead end.** A player who chisels every cell away
@@ -243,6 +372,122 @@ pub const fn seed() -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_chisel_on_a_turned_cube_takes_the_cell_that_was_clicked() {
+        // **The failure this rules out is silent and total**: a click that
+        // lands on the cell the pointer is over and removes one somewhere else
+        // in the block. Every turn other than none would do it, and the shape
+        // still looks like a shape afterwards.
+        let full = 0x7FF_FFFF;
+        for turn in 0..4 {
+            let seen_cell = (2, 1, 0);
+            let after = chisel_seen(full, turn, seen_cell);
+            let seen = as_seen(after, turn);
+            assert!(
+                !filled(seen, seen_cell.0, seen_cell.1, seen_cell.2),
+                "at turn {turn} the cell that was clicked is still there"
+            );
+            assert_eq!(
+                after.count_ones(),
+                26,
+                "at turn {turn} a chisel took more or less than one cell"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restore_on_a_turned_cube_puts_the_cell_where_it_was_asked_for() {
+        for turn in 0..4 {
+            let one = bit(1, 1, 1);
+            let after = restore_seen(one, turn, (1, 1, 1), Face::Top);
+            assert_eq!(
+                after.count_ones(),
+                2,
+                "at turn {turn} a restore added other than one cell"
+            );
+            // The cell that appeared is the one ON TOP of the middle, whatever
+            // way round the cube is: the top face does not move.
+            assert!(
+                filled(after, 1, 2, 1),
+                "at turn {turn} the new cell landed somewhere other than on top"
+            );
+        }
+    }
+
+    #[test]
+    fn turning_the_cube_never_changes_the_cut() {
+        // A view is a view. If turning could change the mask, a player would
+        // craft a different shape depending on which way they happened to be
+        // looking when they finished.
+        let cut = 0b1_0011_0101_1100_0011;
+        for turn in 0..4 {
+            assert_eq!(
+                as_seen(as_seen(cut, turn), (4 - turn % 4) % 4),
+                cut,
+                "turn {turn} did not come back"
+            );
+        }
+    }
+
+    #[test]
+    fn turning_the_cube_and_turning_it_back_is_no_turn_at_all() {
+        for turn in 0..4 {
+            for cell in [(0, 0, 0), (2, 1, 0), (1, 1, 1), (2, 2, 2), (0, 2, 1)] {
+                let seen = {
+                    // Where the cell ends up when the cube is turned: the same
+                    // permutation `as_seen` applies to the mask.
+                    let mask = bit(cell.0, cell.1, cell.2);
+                    let turned = as_seen(mask, turn);
+                    (0..SIDE)
+                        .flat_map(|z| {
+                            (0..SIDE).flat_map(move |y| (0..SIDE).map(move |x| (x, y, z)))
+                        })
+                        .find(|(x, y, z)| filled(turned, *x, *y, *z))
+                        .expect("a turn must not lose the cell")
+                };
+                assert_eq!(
+                    authored_cell(seen, turn),
+                    cell,
+                    "a click on a cube turned {turn} times found the wrong cell"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_front_arrow_follows_the_cube_round() {
+        // Untouched, the front faces the viewer and the side is on the right.
+        assert_eq!(label(Face::Front, 0), Some(Label::Front));
+        assert_eq!(label(Face::Right, 0), Some(Label::Side));
+        assert_eq!(label(Face::Top, 0), Some(Label::Top));
+
+        // One turn brings the front round to the right-hand face, and what was
+        // the left side comes into view — which has no label, because it is the
+        // back of the one that does.
+        assert_eq!(label(Face::Right, 1), Some(Label::Front));
+        assert_eq!(label(Face::Front, 1), None);
+
+        // Two turns and the front is round the back: neither visible vertical
+        // face is labelled, and the top still is.
+        assert_eq!(label(Face::Front, 2), None);
+        assert_eq!(label(Face::Right, 2), None);
+        assert_eq!(label(Face::Top, 2), Some(Label::Top));
+
+        // Three, and the front is on the face toward the viewer again? No —
+        // it is the SIDE that comes round to the front.
+        assert_eq!(label(Face::Front, 3), Some(Label::Side));
+    }
+
+    #[test]
+    fn the_top_is_the_top_from_every_side() {
+        // Turning about the vertical axis cannot move the top face, and a
+        // label that drifted would tell a player their cut was upside down.
+        for turn in 0..4 {
+            assert_eq!(label(Face::Top, turn), Some(Label::Top));
+            assert_eq!(authored_normal(Face::Top, turn), [0, 1, 0]);
+        }
+    }
     use super::*;
 
     const FULL: u32 = (1 << 27) - 1;
