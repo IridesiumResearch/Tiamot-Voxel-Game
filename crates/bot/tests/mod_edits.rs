@@ -66,9 +66,20 @@ fn write_builder(name: &str) -> PathBuf {
 }
 
 fn start(name: &str, mods: PathBuf) -> ServerHandle {
+    start_at(name, mods, scratch(&format!("{name}-world")))
+}
+
+/// The same, over a world directory the caller names — for a test that stops a
+/// server and starts another onto the same world.
+fn start_at(name: &str, mods: PathBuf, world: PathBuf) -> ServerHandle {
+    let _ = name;
+    start_with(mods, world)
+}
+
+fn start_with(mods: PathBuf, world: PathBuf) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
-        world_path: scratch(&format!("{name}-world")),
+        world_path: world,
         max_players: 4,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -454,4 +465,146 @@ fn two_items_a_mod_says_are_different_stay_different() {
             bot.recv().await.expect("recv");
         }
     });
+}
+
+/// Two mods, so the world's id order and a later session's can differ.
+///
+/// `first` registers a block nobody else does. Removing it on the second run
+/// shifts every id after it, which is the only way the WORLD ids in a chunk and
+/// the RUNTIME ids `game.get_block_id` hands out stop coinciding.
+fn write_pair(name: &str, with_first: bool) -> PathBuf {
+    let root = scratch(name);
+    if with_first {
+        let dir = root.join("first");
+        std::fs::create_dir_all(&dir).expect("mod dir");
+        std::fs::write(
+            dir.join("mod.toml"),
+            "id = \"first\"\nname = \"First\"\nversion = \"0.1.0\"\n\
+             license = \"GPL-3.0-only\"\n",
+        )
+        .expect("manifest");
+        // Several blocks, so removing this mod shifts the other's ids by more
+        // than one and a coincidence is that much less likely.
+        std::fs::write(
+            dir.join("init.lua"),
+            "for n = 1, 5 do game.register_block{ id = \"filler_\" .. n } end\n",
+        )
+        .expect("script");
+    }
+
+    let dir = root.join("second");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"second\"\nname = \"Second\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+local ground = game.register_block{ id = "ground" }
+local brick = game.register_block{ id = "brick" }
+game.register_block{ id = "agreed" }
+game.register_block{ id = "disagreed" }
+
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(game.flat_heightmap(0), ground)
+end)
+
+local said = false
+game.register_on_tick(function()
+    game.set_block({ x = 2, y = 9, z = 2 }, "second:brick")
+    if said then
+        return
+    end
+    local at = game.get_block({ x = 2, y = 9, z = 2 })
+    if at == nil then
+        return
+    end
+    said = true
+    -- The whole claim: what `get_block` reports is comparable against what
+    -- `get_block_id` hands out. A world id here reads as a different block.
+    if at.material == brick then
+        game.set_block({ x = 4, y = 9, z = 2 }, "second:agreed")
+    else
+        game.set_block({ x = 4, y = 9, z = 2 }, "second:disagreed")
+    end
+end)
+"#,
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_block_read_back_is_in_the_id_space_a_mod_speaks() {
+    // **Charter rule 8, and a defect that shipped for one day.** A chunk holds
+    // WORLD ids — stable across sessions, which is what the database needs —
+    // and `game.get_block_id` hands out RUNTIME ids, which registration
+    // produces. In a world made and opened by the same mod set the two
+    // coincide, which is why the first test of `game.get_block` passed while
+    // it returned the wrong one.
+    //
+    // So this makes them diverge: a world created with two mods and reopened
+    // with one, which shifts every id the removed mod was in front of.
+    let world = scratch("id-space-world");
+
+    // First run: both mods, so `second:brick` gets a world id after the
+    // filler blocks.
+    let server = start_at("id-space-1", write_pair("id-space-1", true), world.clone());
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Bystander").await.expect("join");
+        let brick = bot
+            .material_table()
+            .expect("a material table")
+            .into_iter()
+            .find(|entry| entry.name == "second:brick")
+            .map(|entry| entry.id)
+            .expect("the mod registers a brick");
+        bot.expect_block(PLACED, brick, PATIENCE)
+            .await
+            .expect("the mod should place its brick");
+    });
+    assert!(server.stop(), "the world did not flush cleanly");
+
+    // Second run: the filler mod is gone, so `second:brick`'s RUNTIME id is
+    // lower than the WORLD id the chunk was written with.
+    let server = start_at("id-space-2", write_pair("id-space-2", false), world);
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        // A different name: the world remembers that "Bystander" belongs to
+        // the first run's identity, and a name is a per-server claim bound to
+        // a UUID (charter rule 13).
+        bot.join("Onlooker").await.expect("join");
+
+        let table = bot.material_table().expect("a material table");
+        let id = |name: &str| {
+            table
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.id)
+                .unwrap_or_else(|| panic!("the mod registers {name}"))
+        };
+        bot.expect_block(BlockPos::new(4, 9, 2), id("second:agreed"), PATIENCE)
+            .await
+            .expect(
+                "`game.get_block` reported a material a mod cannot compare against — \
+                 a world id where a runtime id was wanted",
+            );
+    });
+    server.stop();
 }

@@ -180,9 +180,32 @@ impl sight::Access for Shared {
         let Some(view) = chunk.get_block(pos) else {
             return sight::Reading::Absent;
         };
+        // **In the id space a mod can compare against.** A chunk holds WORLD
+        // ids — stable across sessions, which is what the database needs — and
+        // `game.get_block_id` hands out RUNTIME ids, which is what registration
+        // produces. Charter rule 8 says those are different numbers, and
+        // handing a mod the wrong one is a comparison that works whenever the
+        // two happen to coincide and fails when they do not: a world opened
+        // with a different mod set from the one that made it.
+        //
+        // The same defect as the fluid-pour one this codebase already carries a
+        // note about, and it shipped in `game.get_block` for exactly one day.
+        //
+        // A material no mod registered has no runtime id, and comes back as
+        // `engine:unknown`'s — which is what charter rule 8 promises a
+        // preserved id reads as, rather than as air, which would invite a mod
+        // to build over it.
+        let runtime = |material: tiamot_core::MaterialId| {
+            if material.is_air() {
+                return material;
+            }
+            world
+                .runtime_material(material.0)
+                .unwrap_or(tiamot_core::MaterialId::UNKNOWN)
+        };
         match view {
             tiamot_core::BlockView::Uniform(material) => sight::Reading::Single {
-                material,
+                material: runtime(material),
                 occupancy: if material.is_air() {
                     0
                 } else {
@@ -193,11 +216,11 @@ impl sight::Access for Shared {
                 material,
                 occupancy,
             } => sight::Reading::Single {
-                material,
+                material: runtime(material),
                 occupancy: occupancy & tiamot_core::block::OCCUPANCY_FULL,
             },
             tiamot_core::BlockView::Mixed(cells) => {
-                sight::Reading::Mixed(Box::new(std::array::from_fn(|index| cells[index])))
+                sight::Reading::Mixed(Box::new(std::array::from_fn(|index| runtime(cells[index]))))
             }
         }
     }

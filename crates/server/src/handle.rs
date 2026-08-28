@@ -1425,6 +1425,16 @@ impl ServerHandle {
                     // network, so a join the tick never saw cannot be missed.
                     let mut known_players: std::collections::BTreeSet<tiamot_core::PlayerUuid> =
                         std::collections::BTreeSet::new();
+                    // **What each of them was called**, kept because the leave
+                    // hook needs it and the online roster does not have it any
+                    // more: by the time the tick notices somebody has gone,
+                    // they are out of it. A name is a per-server claim bound to
+                    // a UUID (charter rule 13), so this is a convenience for
+                    // saying something about them and never their identity.
+                    let mut known_names: std::collections::BTreeMap<
+                        tiamot_core::PlayerUuid,
+                        String,
+                    > = std::collections::BTreeMap::new();
 
                     let mut held = Some(world);
 
@@ -1770,14 +1780,16 @@ impl ServerHandle {
                                             );
                                         }
                                     }
+                                    let name = shared
+                                        .online
+                                        .lock()
+                                        .ok()
+                                        .and_then(|online| online.get(uuid).cloned())
+                                        .unwrap_or_default();
+                                    known_names.insert(*uuid, name.clone());
                                     joined.push(tiamot_core::script::JoinEvent {
                                         player: *uuid.as_bytes(),
-                                        name: shared
-                                            .online
-                                            .lock()
-                                            .ok()
-                                            .and_then(|online| online.get(uuid).cloned())
-                                            .unwrap_or_default(),
+                                        name,
                                     });
                                 }
                             }
@@ -1812,6 +1824,27 @@ impl ServerHandle {
                                             store.close_all(*uuid, slots)
                                         });
                                     }
+                                    // **Then the mods, and then the save.** A
+                                    // mod dropping what somebody was carrying
+                                    // has to be able to read and empty their
+                                    // inventory, so the hook runs before the
+                                    // row is written and after the containers
+                                    // are back — or it would find a chest's
+                                    // contents among their own.
+                                    let outcome =
+                                        source.player_left(&tiamot_core::script::LeaveEvent {
+                                            player: *uuid.as_bytes(),
+                                            name: known_names
+                                                .get(uuid)
+                                                .cloned()
+                                                .unwrap_or_default(),
+                                        });
+                                    for (mod_id, err) in &outcome.faults {
+                                        error!(
+                                            mod_id = %mod_id,
+                                            "mod disabled after an on_player_leave failure: {err}"
+                                        );
+                                    }
                                     if let Some(slots) = shared.slots_of(uuid)
                                         && let Err(err) = world.save_player_slots(uuid, &slots)
                                     {
@@ -1824,6 +1857,10 @@ impl ServerHandle {
                                 }
                             }
                             known_players.retain(|uuid| present.contains(uuid));
+                            // And their names, or the map keeps a row per
+                            // person who has ever joined for the life of the
+                            // server.
+                            known_names.retain(|uuid, _| present.contains(uuid));
                         }
 
                         // Digging, after movement so a dig is judged against

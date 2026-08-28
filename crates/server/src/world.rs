@@ -237,6 +237,17 @@ impl Generator {
         }
     }
 
+    /// Tells the mods somebody has gone.
+    pub fn player_left(
+        &mut self,
+        event: &tiamot_core::script::LeaveEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().player_leave(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
     /// Tells the mods somebody hit something.
     ///
     /// A mod may refuse it, which is what "the hit did not land" means — and

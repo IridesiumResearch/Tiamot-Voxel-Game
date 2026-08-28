@@ -82,9 +82,13 @@ const PUNCHERS: &str = "tiamot.punchers";
 
 /// Registry key holding the mods that registered `on_player_join`.
 const JOINERS: &str = "tiamot.joiners";
+/// Registry key for the mods listening for a departure.
+const LEAVERS: &str = "tiamot.leavers";
 
 /// Hook name used in registry keys and in fault messages.
 const HOOK_JOIN: &str = "on_player_join";
+/// The `on_player_leave` hook's name.
+const HOOK_LEAVE: &str = "on_player_leave";
 /// The registry key holding every `on_action` callback.
 const ACTORS: &str = "tiamot.actors";
 const DIALOGISTS: &str = "tiamot.dialogists";
@@ -1039,6 +1043,16 @@ impl ScriptVm for MluaVm {
         self.run_hook(HOOK_JOIN, JOINERS, &table)
     }
 
+    fn player_leave(&mut self, event: &crate::script::LeaveEvent) -> HookOutcome {
+        let Ok(table) = self.hook_event(event.player).and_then(|table| {
+            table.set("name", event.name.as_str())?;
+            Ok(table)
+        }) else {
+            return HookOutcome::allow();
+        };
+        self.run_hook(HOOK_LEAVE, LEAVERS, &table)
+    }
+
     fn action(&mut self, event: &crate::script::ActionEvent) -> HookOutcome {
         let Ok(table) = self.hook_event(event.player).and_then(|table| {
             table.set("id", event.id.as_str())?;
@@ -1524,6 +1538,11 @@ impl MluaVm {
         game.set(
             "register_on_player_join",
             self.hook_registrar(mod_id, HOOK_JOIN, JOINERS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
+        game.set(
+            "register_on_player_leave",
+            self.hook_registrar(mod_id, HOOK_LEAVE, LEAVERS)?,
         )
         .map_err(|err| self.vm_error(&err))?;
         game.set(
@@ -3703,7 +3722,7 @@ impl MluaVm {
         // with no clue as to why — which is exactly what `DIALOGISTS` did when
         // it was added to the constants and forgotten here.
         for list in [
-            DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS, ACTORS, DIALOGISTS, CHATTERS,
+            DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS, LEAVERS, ACTORS, DIALOGISTS, CHATTERS,
         ] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
             self.lua

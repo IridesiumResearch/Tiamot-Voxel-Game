@@ -662,6 +662,28 @@ pub struct JoinEvent {
     pub name: String,
 }
 
+/// A player has gone.
+///
+/// **The other half of a join, and a mod needs both.** Anything a mod keeps per
+/// player — a party, a claim, a timer, a bar it was drawing — is bookkeeping it
+/// can start on a join and could never end. `game.storage` persists across a
+/// session either way; what this is for is everything that should NOT.
+///
+/// Fired from the tick that noticed, after any container they had open has been
+/// put back and **before their inventory is written**, so a mod that wants to
+/// drop what they were carrying can still read and empty it.
+///
+/// It fires for a disconnection the server never saw coming as well as a clean
+/// one: the tick compares who is present against who was, so a dropped
+/// connection is the same event as a goodbye.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaveEvent {
+    /// Who left, canonically (charter rule 13).
+    pub player: [u8; 32],
+    /// What they were called on this server.
+    pub name: String,
+}
+
 /// A player pressed or released an action their server's mod registered.
 ///
 /// **An observation, not a veto.** The player pressed a key; nothing a mod says
@@ -1052,6 +1074,9 @@ pub trait ScriptVm: Sized {
     /// not a mod's decision to make here: an allowlist is charter rule 13's
     /// business and happens long before a body exists.
     fn player_join(&mut self, event: &JoinEvent) -> HookOutcome;
+
+    /// Runs every `on_player_leave` hook.
+    fn player_leave(&mut self, event: &LeaveEvent) -> HookOutcome;
 
     /// Asks every registered `on_punch` whether a hit lands.
     ///
