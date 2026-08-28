@@ -662,6 +662,27 @@ pub struct JoinEvent {
     pub name: String,
 }
 
+/// One block the engine chose to offer a mod this tick.
+///
+/// **The mechanism behind everything that happens on its own**: a crop
+/// growing, grass spreading onto bare earth, a sapling becoming a tree, leaves
+/// decaying, fire going out, ice melting. None of those is a thing a player
+/// did, and without this a mod could only make them happen to blocks it had
+/// remembered itself — which leaves out every block worldgen made.
+///
+/// **Only for materials a mod asked about.** The engine picks cells at random
+/// and looks at what is in them; a Lua call happens only when the material has
+/// a handler. Otherwise a busy world would spend its tick calling into a script
+/// about stone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RandomTickEvent {
+    /// The block, in world blocks.
+    pub pos: crate::coords::BlockPos,
+    /// What is in it, as a RUNTIME id — the number `game.get_block_id` hands
+    /// out, which is what a mod can compare against (charter rule 8).
+    pub material: crate::MaterialId,
+}
+
 /// A player has gone.
 ///
 /// **The other half of a join, and a mod needs both.** Anything a mod keeps per
@@ -1081,6 +1102,19 @@ pub trait ScriptVm: Sized {
 
     /// Runs every `on_player_leave` hook.
     fn player_leave(&mut self, event: &LeaveEvent) -> HookOutcome;
+
+    /// Runs the handler for one randomly-chosen block.
+    ///
+    /// Called only for a material some mod registered — see
+    /// [`ScriptVm::random_tick_materials`].
+    fn random_tick(&mut self, event: &RandomTickEvent) -> HookOutcome;
+
+    /// Which materials have a random-tick handler, after the freeze.
+    ///
+    /// **Asked once and kept**, because the alternative is a call into the VM
+    /// for every cell the engine samples — thousands a tick, almost all of them
+    /// stone.
+    fn random_tick_materials(&self) -> Vec<MaterialId>;
 
     /// Asks every registered `on_punch` whether a hit lands.
     ///

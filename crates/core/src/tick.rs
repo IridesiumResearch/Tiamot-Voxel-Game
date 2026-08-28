@@ -25,6 +25,8 @@
 //! expected to feed it a monotonic source (`Instant::elapsed`), and the API
 //! shape makes anything else awkward on purpose.
 
+pub mod random;
+
 use core::time::Duration;
 
 /// Simulation steps per second.

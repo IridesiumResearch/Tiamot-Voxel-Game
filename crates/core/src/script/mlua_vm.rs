@@ -84,6 +84,17 @@ const PUNCHERS: &str = "tiamot.punchers";
 const JOINERS: &str = "tiamot.joiners";
 /// Registry key for the mods listening for a departure.
 const LEAVERS: &str = "tiamot.leavers";
+/// Registry table of random-tick handlers, keyed by numeric material id.
+///
+/// **By material and not by mod**, unlike every other hook: the engine picks
+/// cells and looks at what is in them, so the lookup has to go from a material
+/// to a callback rather than from a mod to a list. One handler per material —
+/// a second registration is an error, for the reason a second `on_player_join`
+/// is.
+const RANDOM_TICKS: &str = "tiamot.random_ticks";
+/// The same, mapping a material id to the mod that owns its handler, for
+/// attributing a fault (charter rule 10).
+const RANDOM_TICK_OWNERS: &str = "tiamot.random_tick_owners";
 
 /// Hook name used in registry keys and in fault messages.
 const HOOK_JOIN: &str = "on_player_join";
@@ -1053,6 +1064,72 @@ impl ScriptVm for MluaVm {
         self.run_hook(HOOK_LEAVE, LEAVERS, &table)
     }
 
+    fn random_tick(&mut self, event: &crate::script::RandomTickEvent) -> HookOutcome {
+        let mut outcome = HookOutcome::allow();
+        let Ok(handlers) = self.lua.named_registry_value::<Table>(RANDOM_TICKS) else {
+            return outcome;
+        };
+        let Ok(callback) = handlers.get::<mlua::Function>(event.material.0) else {
+            // Nothing registered for this material. The engine filters before
+            // it gets here, so this is a material whose mod was disabled since
+            // the set was taken — ordinary, and nothing to say about it.
+            return outcome;
+        };
+        let owner = self
+            .lua
+            .named_registry_value::<Table>(RANDOM_TICK_OWNERS)
+            .ok()
+            .and_then(|owners| owners.get::<String>(event.material.0).ok())
+            .unwrap_or_default();
+        if self.faulted.contains(&owner) {
+            return outcome;
+        }
+
+        let Ok(table) = self.lua.create_table() else {
+            return outcome;
+        };
+        if table.set("x", event.pos.x).is_err()
+            || table.set("y", event.pos.y).is_err()
+            || table.set("z", event.pos.z).is_err()
+            || table.set("material", event.material.0).is_err()
+        {
+            return outcome;
+        }
+
+        if self.arm_budget(self.limits.instructions_per_call).is_err() {
+            return outcome;
+        }
+        let result = callback.call::<mlua::Value>(table);
+        self.disarm_budget();
+
+        if let Err(err) = result {
+            let error = Self::classify(&err, &owner, "random_tick");
+            self.faulted.insert(owner.clone());
+            tracing::error!(
+                mod_id = %owner,
+                error = %error,
+                "disabling mod after a random_tick failure"
+            );
+            outcome.faults.push((owner, error));
+        }
+        outcome
+    }
+
+    fn random_tick_materials(&self) -> Vec<MaterialId> {
+        let Ok(handlers) = self.lua.named_registry_value::<Table>(RANDOM_TICKS) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<MaterialId> = handlers
+            .pairs::<u16, mlua::Value>()
+            .filter_map(Result::ok)
+            .map(|(id, _)| MaterialId(id))
+            .collect();
+        // Sorted so the caller's set is built in one order whatever the table
+        // iteration gave — charter rule 4's habit, even where nothing hashes.
+        ids.sort_unstable();
+        ids
+    }
+
     fn action(&mut self, event: &crate::script::ActionEvent) -> HookOutcome {
         let Ok(table) = self.hook_event(event.player).and_then(|table| {
             table.set("id", event.id.as_str())?;
@@ -1545,6 +1622,8 @@ impl MluaVm {
             self.hook_registrar(mod_id, HOOK_LEAVE, LEAVERS)?,
         )
         .map_err(|err| self.vm_error(&err))?;
+        game.set("register_random_tick", self.random_tick_registrar(mod_id)?)
+            .map_err(|err| self.vm_error(&err))?;
         game.set(
             "register_on_action",
             self.hook_registrar(mod_id, HOOK_ACTION, ACTORS)?,
@@ -1572,6 +1651,42 @@ impl MluaVm {
     /// One implementation for both: they differ only in which list they append
     /// to and which registry key they write, and the version with two copies
     /// had already drifted by the time the second one was written.
+    /// Builds `game.register_random_tick` for one mod.
+    ///
+    /// **Keyed by material, not by mod.** The engine picks cells and looks at
+    /// what is in them, so what it needs is a way from a material to a
+    /// callback. One handler per material: a second registration is an error
+    /// rather than a replacement, exactly as it is for the per-mod hooks, and
+    /// for the same reason — the silent loss of the first is worse than a
+    /// refusal a mod author reads at load.
+    fn random_tick_registrar(&self, mod_id: &str) -> Result<mlua::Function, ScriptError> {
+        let owner = mod_id.to_owned();
+        self.lua
+            .create_function(
+                move |lua, (material, callback): (mlua::Value, mlua::Function)| {
+                    let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                    if frozen {
+                        return Err(mlua::Error::external(format!(
+                            "mod `{owner}`: registration is closed"
+                        )));
+                    }
+                    let material = material_of(lua, &material)?;
+                    let handlers: Table = lua.named_registry_value(RANDOM_TICKS)?;
+                    if handlers.contains_key(material.0)? {
+                        return Err(mlua::Error::external(format!(
+                            "mod `{owner}`: a random tick is already registered for that \
+                             material; one handler per material"
+                        )));
+                    }
+                    handlers.set(material.0, callback)?;
+                    let owners: Table = lua.named_registry_value(RANDOM_TICK_OWNERS)?;
+                    owners.set(material.0, owner.as_str())?;
+                    Ok(())
+                },
+            )
+            .map_err(|err| self.vm_error(&err))
+    }
+
     fn hook_registrar(
         &self,
         mod_id: &str,
@@ -3722,7 +3837,17 @@ impl MluaVm {
         // with no clue as to why — which is exactly what `DIALOGISTS` did when
         // it was added to the constants and forgotten here.
         for list in [
-            DIGGERS, PLACERS, PUNCHERS, FLOWERS, JOINERS, LEAVERS, ACTORS, DIALOGISTS, CHATTERS,
+            DIGGERS,
+            PLACERS,
+            PUNCHERS,
+            FLOWERS,
+            JOINERS,
+            LEAVERS,
+            ACTORS,
+            DIALOGISTS,
+            CHATTERS,
+            RANDOM_TICKS,
+            RANDOM_TICK_OWNERS,
         ] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
             self.lua

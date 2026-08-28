@@ -76,3 +76,7 @@ harness = false
 [[bench]]
 name = "perception"
 harness = false
+
+[[bench]]
+name = "random_tick"
+harness = false

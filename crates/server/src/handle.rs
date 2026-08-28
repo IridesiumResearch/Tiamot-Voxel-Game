@@ -387,6 +387,15 @@ const SAVE_INTERVAL_TICKS: u64 = 40;
 /// terrain resident — where nothing else bounds the work.
 const RELIGHTS_PER_TICK: usize = 4;
 
+/// How many resident chunks get random ticks in one tick of the simulation.
+///
+/// **A budget, not a rule.** Charter rule 18 gives all of simulation 50 ms for
+/// fifty players, and sampling is cheap but not free — three block lookups per
+/// chunk, plus a Lua call for each hit. A world with more resident chunks than
+/// this gets through them over several ticks rather than all at once, which
+/// changes how often a given block comes up and stops nothing.
+const MAX_RANDOM_TICK_CHUNKS: usize = 512;
+
 /// How often the time of day goes out, in ticks.
 ///
 /// Once a second. The clock advances every tick, but a client interpolates
@@ -1243,6 +1252,12 @@ impl ServerHandle {
                     let containers = std::sync::Arc::new(std::sync::Mutex::new(
                         crate::containers::Containers::new(),
                     ));
+                    // Materials some mod asked for a random tick on. Empty on a
+                    // server whose mods want none, which is the ordinary case
+                    // and costs nothing.
+                    let mut random_tick_materials: std::collections::BTreeSet<
+                        tiamot_core::MaterialId,
+                    > = std::collections::BTreeSet::new();
 
                     // The world itself, lent to the mods for the part of each
                     // tick that runs their callbacks — everything they may learn
@@ -1324,6 +1339,12 @@ impl ServerHandle {
                                     error!("could not read the world's containers: {err}");
                                 }
                             }
+                            // **Which materials any mod wants a turn at.**
+                            // Asked once, after the freeze: the alternative is
+                            // a call into the VM for every cell the engine
+                            // samples, thousands a tick, almost all of them
+                            // stone.
+                            random_tick_materials.extend(host.vm().random_tick_materials());
                             host.vm_mut().set_container_access(std::sync::Arc::new(
                                 crate::containers::Shared::new(
                                     std::sync::Arc::clone(&containers),
@@ -2473,7 +2494,59 @@ impl ServerHandle {
                         // has one, which is the point: a mod reading terrain is
                         // reading a world nothing else is halfway through
                         // changing.
+                        // **Blocks that get a turn this tick.** The cells are
+                        // chosen with the world in hand and offered to the mods
+                        // inside the lending window below, because a handler
+                        // will want to read and write the world — see
+                        // `crate::lease`.
+                        //
+                        // Filtered by material HERE rather than in the VM: a
+                        // busy world samples thousands of cells a tick and
+                        // almost all of them are stone, so the Lua call has to
+                        // be the rare case.
+                        let mut random_ticks: Vec<tiamot_core::script::RandomTickEvent> =
+                            Vec::new();
+                        if !random_tick_materials.is_empty() {
+                            let seed = world.seed();
+                            let mut budget = MAX_RANDOM_TICK_CHUNKS;
+                            for chunk in world.resident_positions() {
+                                if budget == 0 {
+                                    break;
+                                }
+                                budget -= 1;
+                                for pos in tiamot_core::tick::random::cells(seed, chunk, tick) {
+                                    let Some(material) = world.material_at(pos) else {
+                                        continue;
+                                    };
+                                    // The world stores WORLD ids and a mod
+                                    // speaks RUNTIME ones (charter rule 8), so
+                                    // the set is compared — and the event
+                                    // carried — in the mod's own space.
+                                    let Some(material) = world.runtime_material(material.0) else {
+                                        continue;
+                                    };
+                                    if random_tick_materials.contains(&material) {
+                                        random_ticks.push(
+                                            tiamot_core::script::RandomTickEvent {
+                                                pos,
+                                                material,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         let (returned, ()) = sight.lending(world, || {
+                            for event in &random_ticks {
+                                let outcome = source.random_ticked(event);
+                                for (mod_id, err) in &outcome.faults {
+                                    error!(
+                                        mod_id = %mod_id,
+                                        "mod disabled after a random_tick failure: {err}"
+                                    );
+                                }
+                            }
                             // Arrivals first: a mod that spawns something for a
                             // new player should have done it before that
                             // player's first tick runs, not after.

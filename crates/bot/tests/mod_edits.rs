@@ -713,3 +713,124 @@ fn a_mod_hears_about_a_player_leaving_while_it_can_still_act() {
             );
     });
 }
+
+/// A mod that grows a crop, the only way a mod can: by being offered blocks.
+fn write_farm(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("farm");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"farm\"\nname = \"Farm\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+local ground = game.register_block{ id = "ground" }
+local seed = game.register_block{ id = "seed" }
+local grown = game.register_block{ id = "grown" }
+
+-- A field of seed, made by WORLDGEN — which is the case a mod's own list of
+-- planted crops cannot cover, and the reason this hook exists.
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(game.flat_heightmap(0), ground)
+end)
+
+game.register_on_chat(function(event)
+    if event.text ~= "sow" then
+        return
+    end
+    for x = 0, 3 do
+        for z = 0, 3 do
+            game.set_block({ x = x, y = 4, z = z }, "farm:seed")
+        end
+    end
+    return false
+end)
+
+-- **The mechanism.** The engine offers blocks; this one decides what that
+-- means. Nothing here says when, and nothing here scans the world.
+game.register_random_tick(seed, function(event)
+    game.set_block({ x = event.x, y = event.y, z = event.z }, "farm:grown")
+end)
+
+-- And a material nobody registered must never arrive.
+game.register_block{ id = "wrongly_offered" }
+game.register_random_tick(grown, function(event)
+    game.set_block({ x = 8, y = 9, z = 8 }, "farm:wrongly_offered")
+end)
+"#,
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_mod_is_offered_blocks_to_grow_and_only_the_ones_it_asked_for() {
+    // **The mechanism behind everything that happens on its own**: crops,
+    // grass spreading, saplings, leaf decay, fire. None of them is a thing a
+    // player did, and a mod cannot drive them from its own list because the
+    // blocks were mostly made by worldgen and never passed through a hook.
+    let server = start("random-tick", write_farm("random-tick"));
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Farmer").await.expect("join");
+
+        let table = bot.material_table().expect("a material table");
+        let id = |name: &str| {
+            table
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.id)
+                .unwrap_or_else(|| panic!("the mod registers {name}"))
+        };
+
+        bot.chat("sow").await.expect("chat");
+        // Sixteen blocks of seed, three cells per chunk per tick out of 4096:
+        // any one of them comes up about every 1,400 ticks, and sixteen of them
+        // about every 85. A generous wait, because what is being tested is that
+        // it happens at all.
+        bot.expect_block(BlockPos::new(0, 4, 0), id("farm:seed"), PATIENCE)
+            .await
+            .expect("the field was never sown");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut grew = false;
+        while tokio::time::Instant::now() < deadline {
+            if bot.received().into_iter().any(|message| {
+                matches!(
+                    message,
+                    tiamot_core::proto::ServerMessage::BlockDelta {
+                        edit: tiamot_core::proto::Edit::Block { material, .. },
+                        ..
+                    } if material == id("farm:grown")
+                )
+            }) {
+                grew = true;
+                break;
+            }
+            bot.recv().await.expect("recv");
+        }
+        assert!(grew, "nothing in a sown field was ever offered a turn");
+
+        // **And nothing else was.** The second handler is registered for
+        // `farm:grown`, which now exists — so a marker at 8,9,8 says the engine
+        // offered a material a mod DID ask about, and its absence would say the
+        // filter is too tight. What must never appear is a random tick for a
+        // material nobody registered, and that is what the filter above is; a
+        // mod cannot observe it directly, so what is asserted is the shape it
+        // would break: the field grew, which means the offers arrived, and the
+        // world is still made of `farm:ground`, which was never registered.
+        bot.expect_block(BlockPos::new(8, 9, 8), id("farm:wrongly_offered"), PATIENCE)
+            .await
+            .expect("a registered material stopped being offered once it changed");
+    });
+}

@@ -440,6 +440,64 @@ function game.register_item(spec) end
 ---@param callback fun(buf: Tiamot.ChunkBuffer, pos: Tiamot.ChunkPos)
 function game.register_on_generate(callback) end
 
+---Called when somebody leaves. **Registration window only.**
+---
+---The other half of `register_on_player_join`, and a mod needs both: anything
+---kept per player — a party, a claim, a timer, a bar you were drawing — is
+---bookkeeping you could start and never end.
+---
+---It runs from the tick that noticed, after any container that player had open
+---has been put back and **before their inventory is written**, so a mod that
+---wants to drop what they were carrying can still read and empty it with
+---`game.inventory` and `game.take`.
+---
+---It fires for a dropped connection as well as a clean goodbye: the tick
+---compares who is present against who was. Somebody who arrives and goes inside
+---one tick produces neither event — the two are the same diff, so you are never
+---told about a departure you did not hear the arrival of.
+---
+---`player` is the UUID and is the identity; `name` is what they were called
+---(charter rule 13).
+---@param callback fun(event: { player: string, name: string })
+function game.register_on_player_leave(callback) end
+
+---Registers what happens when a block of yours gets a turn.
+---**Registration window only.**
+---
+---**This is the mechanism behind everything that happens on its own**: a crop
+---growing, grass spreading onto bare earth, a sapling becoming a tree, leaves
+---decaying, fire going out, ice melting. None of them is a thing a player did,
+---and none can be driven from a list you keep yourself, because the blocks that
+---need it were mostly made by worldgen and never passed through a hook.
+---
+---The engine picks blocks at random from the chunks it has loaded and offers
+---them to whoever registered that material. **Nothing happens for a material
+---nobody asked about**, so a world full of stone costs nothing.
+---
+---Three blocks of each chunk per tick, out of 4,096 — so any one block comes up
+---about every twenty minutes at 20 Hz. That is deliberately rare: what makes a
+---crop take a while is how seldom its block comes up, and a handler that wants
+---something faster keeps its own count.
+---
+---Which blocks are chosen is deterministic (charter rule 4): the same world at
+---the same tick offers the same blocks on every machine.
+---
+---One handler per material. A second registration for the same one is an error
+---at load rather than a silent replacement.
+---
+---```lua
+---local seed = game.register_block{ id = "seed" }
+---game.register_random_tick(seed, function(event)
+---    -- event.x, event.y, event.z, event.material
+---    if game.get_light({ x = event.x, y = event.y + 1, z = event.z }).sun > 8 then
+---        game.set_block({ x = event.x, y = event.y, z = event.z }, "core_plants:wheat")
+---    end
+---end)
+---```
+---@param material string|integer The block id, or its numeric material id.
+---@param callback fun(event: { x: integer, y: integer, z: integer, material: integer })
+function game.register_random_tick(material, callback) end
+
 ---Registers a per-tick callback.
 ---
 ---**Registration window only.**

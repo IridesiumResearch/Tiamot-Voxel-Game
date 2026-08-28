@@ -237,6 +237,26 @@ impl Generator {
         }
     }
 
+    /// Offers one randomly-chosen block to whichever mod asked for it.
+    pub fn random_ticked(
+        &mut self,
+        event: &tiamot_core::script::RandomTickEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().random_tick(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
+    /// Which materials have a random-tick handler.
+    #[must_use]
+    pub fn random_tick_materials(&self) -> Vec<tiamot_core::MaterialId> {
+        match self {
+            Self::Mods(generator) => generator.host.vm().random_tick_materials(),
+            Self::Air(_) => Vec::new(),
+        }
+    }
+
     /// Tells the mods somebody has gone.
     pub fn player_left(
         &mut self,
@@ -575,6 +595,42 @@ impl World {
     /// [`WorldError`] if the row cannot be deleted.
     pub fn delete_container(&self, name: &str) -> Result<(), WorldError> {
         self.db.delete_container(name)
+    }
+
+    /// Every resident chunk's position, in a fixed order.
+    ///
+    /// **Sorted, and that is not tidiness.** The cache is a `HashMap`, whose
+    /// iteration order is not even stable run to run on one machine (charter
+    /// rule 4). A caller that walks a bounded number of chunks — the random
+    /// tick does — would otherwise pick a different set each run, so which
+    /// crops grew would depend on the allocator.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the keys are SORTED before they leave this function, which is the whole \
+                  point of it — the lint's hazard is an unordered iteration reaching a \
+                  result, and the only way out of here is ordered"
+    )]
+    #[must_use]
+    pub fn resident_positions(&self) -> Vec<ChunkPos> {
+        let mut out: Vec<ChunkPos> = self.cache.keys().copied().collect();
+        out.sort_unstable_by_key(|pos| (pos.x, pos.y, pos.z));
+        out
+    }
+
+    /// What one block is made of, without loading anything.
+    ///
+    /// `None` where the chunk is not resident, or the block is air or mixed —
+    /// a caller asking this wants "is this block one particular material", and
+    /// a mixed block is not one. The world id, as the chunk stores it.
+    #[must_use]
+    pub fn material_at(&self, pos: tiamot_core::BlockPos) -> Option<MaterialId> {
+        match self.resident(pos.chunk())?.get_block(pos)? {
+            tiamot_core::BlockView::Uniform(material)
+            | tiamot_core::BlockView::Partial { material, .. } => {
+                (!material.is_air()).then_some(material)
+            }
+            tiamot_core::BlockView::Mixed(_) => None,
+        }
     }
 
     #[must_use]
