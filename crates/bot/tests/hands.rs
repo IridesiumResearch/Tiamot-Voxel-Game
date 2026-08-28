@@ -136,12 +136,16 @@ fn one_player_sees_what_another_is_holding() {
         assert!(
             until(&mut ada, PATIENCE, |bot| {
                 bot.entities().get(&bert_body.id).is_some_and(|entity| {
-                    entity.hands[0].is_some_and(|stack| stack.material == sword)
+                    entity.hands[0]
+                        .as_ref()
+                        .is_some_and(|stack| stack.material == sword)
                 })
             })
             .await,
             "Ada never saw the sword in Bert's hand: {:?}",
-            ada.entities().get(&bert_body.id).map(|entity| entity.hands)
+            ada.entities()
+                .get(&bert_body.id)
+                .map(|entity| entity.hands.clone())
         );
 
         ada.disconnect().await;

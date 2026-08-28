@@ -553,7 +553,7 @@ pub struct ChunkRequest {
 /// this says only what somebody asked for. What it becomes — a `Uniform` block,
 /// a `Partial` one, or nothing at all — is decided on the tick thread against
 /// the world and every body in it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PlacementRequest {
     /// Who asked, and who pays for it.
     pub actor: PlayerUuid,
@@ -569,6 +569,9 @@ pub struct PlacementRequest {
     /// The surface it was placed against, for turning a cut to face the
     /// player. All zeroes means no preference.
     pub face: [i8; 3],
+    /// Which stack they claim to be spending, when a mod says two of the same
+    /// material and cut are different things.
+    pub detail: Option<String>,
 }
 
 /// How many chunk requests the simulation serves per tick, across all players.
@@ -634,6 +637,7 @@ impl Shared {
         material: u16,
         shape: u32,
         face: [i8; 3],
+        detail: Option<String>,
     ) -> bool {
         let Ok(mut queue) = self.placements.lock() else {
             return false;
@@ -647,6 +651,7 @@ impl Shared {
             material,
             shape,
             face,
+            detail,
         });
         true
     }
@@ -721,6 +726,7 @@ impl Shared {
         uuid: &PlayerUuid,
         material: tiamot_core::MaterialId,
         shape: Option<tiamot_core::inventory::Shape>,
+        detail: Option<&str>,
         units: u32,
     ) -> u32 {
         let Ok(mut inventories) = self.inventories.lock() else {
@@ -729,7 +735,7 @@ impl Shared {
         let Some(held) = inventories.get_mut(uuid) else {
             return 0;
         };
-        let taken = held.take(PLAYER_MAIN, material, shape, units);
+        let taken = held.take(PLAYER_MAIN, material, shape, detail, units);
         if taken > 0
             && let Ok(mut dirty) = self.inventory_dirty.lock()
         {
@@ -1285,13 +1291,14 @@ impl Shared {
         view: &str,
         material: tiamot_core::material::MaterialId,
         shape: Option<tiamot_core::inventory::Shape>,
+        detail: Option<&str>,
         units: u32,
     ) -> u32 {
         let took = self
             .inventories
             .lock()
             .map(|mut inventories| match inventories.get_mut(uuid) {
-                Some(slots) => slots.take(view, material, shape, units),
+                Some(slots) => slots.take(view, material, shape, detail, units),
                 None => 0,
             })
             .unwrap_or(0);
@@ -1332,11 +1339,11 @@ impl Shared {
             return tiamot_core::ent::Hands::default();
         };
         tiamot_core::ent::Hands {
-            main: view.slots.get(slot).copied().flatten(),
+            main: view.slots.get(slot).cloned().flatten(),
             off: view
                 .slots
                 .get(tiamot_core::inventory::PLAYER_OFFHAND_SLOT)
-                .copied()
+                .cloned()
                 .flatten(),
         }
     }
@@ -1364,21 +1371,26 @@ impl Shared {
         let Some(slots) = self.slots_of(uuid) else {
             return Vec::new();
         };
-        let wire = |stack: tiamot_core::inventory::Stack| tiamot_core::proto::StackDef {
+        let wire = |stack: &tiamot_core::inventory::Stack| tiamot_core::proto::StackDef {
             material: stack.material.0,
             units: stack.units,
             shape: stack
                 .shape
                 .map_or(0, tiamot_core::inventory::Shape::occupancy),
+            detail: stack.detail.clone(),
         };
-        let held = slots.grab.held.map(wire);
+        let held = slots.grab.held.as_ref().map(wire);
         slots
             .views
             .iter()
             .map(|view| ServerMessage::ViewUpdate {
                 view: view.name.clone(),
-                slots: view.slots.iter().map(|slot| slot.map(wire)).collect(),
-                held,
+                slots: view
+                    .slots
+                    .iter()
+                    .map(|slot| slot.as_ref().map(wire))
+                    .collect(),
+                held: held.clone(),
             })
             .collect()
     }
@@ -1915,6 +1927,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                             material: stack.material.0,
                             units: stack.units,
                             shape: stack.shape.map_or(0, tiamot_core::inventory::Shape::occupancy),
+                            detail: stack.detail,
                         })
                         .collect();
                     frame::write(&mut send, &ServerMessage::InventoryUpdate { stacks }).await?;
@@ -2281,9 +2294,17 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 material,
                 shape,
                 face,
+                detail,
             } => {
                 if let Some(uuid) = session.uuid()
-                    && !shared.queue_placement(uuid, *target, *material, *shape, *face)
+                    && !shared.queue_placement(
+                        uuid,
+                        *target,
+                        *material,
+                        *shape,
+                        *face,
+                        detail.clone(),
+                    )
                 {
                     warn!("placement queue is full; dropping a placement");
                 }

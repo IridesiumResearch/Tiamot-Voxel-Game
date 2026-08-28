@@ -39,7 +39,7 @@ use crate::persist::idmap::MaterialMap;
 /// out of bytes, which is what `ENTITY_FORMAT_VERSION`'s comment claimed
 /// otherwise until it was measured. A new field is a new version and a
 /// migration step.
-pub const PLAYER_FORMAT_VERSION: u8 = 1;
+pub const PLAYER_FORMAT_VERSION: u8 = 2;
 
 /// One stack, with a world material id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +47,71 @@ struct StoredStack {
     material: u16,
     units: u32,
     shape: Option<u32>,
+    /// A mod's own word for which item this is (format v2).
+    ///
+    /// **It has to persist or it is not an item's identity.** A sword worn to
+    /// half that came back whole after a rejoin would be a durability system
+    /// the world forgets, and a named block would be a name that lasts one
+    /// session.
+    ///
+    /// `default` so a v1 row, written before this existed, reads as a plain
+    /// stack rather than failing the whole inventory.
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+/// A stack as format v1 wrote one: before a mod could say which item it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredStackV1 {
+    material: u16,
+    units: u32,
+    shape: Option<u32>,
+}
+
+/// A view as v1 wrote one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredViewV1 {
+    name: String,
+    slots: Vec<Option<StoredStackV1>>,
+}
+
+/// An inventory as v1 wrote one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredSlotsV1 {
+    views: Vec<StoredViewV1>,
+    held: Option<StoredStackV1>,
+}
+
+impl From<StoredStackV1> for StoredStack {
+    fn from(old: StoredStackV1) -> Self {
+        Self {
+            material: old.material,
+            units: old.units,
+            shape: old.shape,
+            // Nothing said, which is what a plain stack is.
+            detail: None,
+        }
+    }
+}
+
+impl From<StoredSlotsV1> for StoredSlots {
+    fn from(old: StoredSlotsV1) -> Self {
+        Self {
+            views: old
+                .views
+                .into_iter()
+                .map(|view| StoredView {
+                    name: view.name,
+                    slots: view
+                        .slots
+                        .into_iter()
+                        .map(|slot| slot.map(Into::into))
+                        .collect(),
+                })
+                .collect(),
+            held: old.held.map(Into::into),
+        }
+    }
 }
 
 /// One view, by name.
@@ -100,6 +165,7 @@ pub fn encode(slots: &Slots, materials: &MaterialMap) -> (Vec<u8>, usize) {
             material,
             units: stack.units,
             shape: stack.shape.map(Shape::occupancy),
+            detail: stack.detail.clone(),
         })
     };
 
@@ -137,11 +203,23 @@ pub fn decode(
     template: &Slots,
     materials: &MaterialMap,
 ) -> Result<(Slots, usize), PlayerDataError> {
-    if version != PLAYER_FORMAT_VERSION {
-        return Err(PlayerDataError::UnknownVersion { version });
-    }
-    let stored: StoredSlots =
-        postcard::from_bytes(bytes).map_err(|_| PlayerDataError::Decode { version })?;
+    // **Old versions are migrated, not refused.** Postcard is not
+    // self-describing, so a v1 row read as v2 takes the next stack's first byte
+    // as this one's detail tag and every slot after it is nonsense — which is
+    // why the version is checked at all. Refusing outright would be worse
+    // still: it empties the inventory of everyone who was playing before the
+    // upgrade, which is exactly what charter rule 8's round trip is about.
+    let stored: StoredSlots = match version {
+        PLAYER_FORMAT_VERSION => {
+            postcard::from_bytes(bytes).map_err(|_| PlayerDataError::Decode { version })?
+        }
+        1 => {
+            let old: StoredSlotsV1 =
+                postcard::from_bytes(bytes).map_err(|_| PlayerDataError::Decode { version })?;
+            old.into()
+        }
+        _ => return Err(PlayerDataError::UnknownVersion { version }),
+    };
 
     let mut dropped = 0;
     let mut load = |stack: &Option<StoredStack>| -> Option<Stack> {
@@ -156,6 +234,7 @@ pub fn decode(
         };
         Some(Stack {
             shape: stack.shape.and_then(Shape::new),
+            detail: stack.detail.clone(),
             ..built
         })
     };
@@ -265,6 +344,71 @@ mod tests {
             back.views[0].slots[0].as_ref().map(material_of),
             Some(MaterialId(3)),
             "the stack came back as this session's id for the same world material"
+        );
+    }
+
+    #[test]
+    fn a_detail_survives_the_trip() {
+        // **An item's identity has to persist or it is not one.** A sword worn
+        // to half that came back whole after a rejoin is a durability system
+        // the world forgets.
+        let mut slots = template();
+        let mut stack = Stack::new(MaterialId(2), 1).expect("stack");
+        stack.detail = Some("worn=7".to_owned());
+        assert!(slots.insert("player:main", stack));
+
+        let (bytes, _) = encode(&slots, &shifted());
+        let (back, lost) =
+            decode(PLAYER_FORMAT_VERSION, &bytes, &template(), &shifted()).expect("decode");
+        assert_eq!(lost, 0);
+        assert_eq!(
+            back.view("player:main")
+                .and_then(|view| view.slots[0].as_ref())
+                .and_then(|stack| stack.detail.clone()),
+            Some("worn=7".to_owned()),
+            "a mod's own word for which item this is did not survive the save"
+        );
+    }
+
+    #[test]
+    fn an_inventory_written_before_details_existed_still_loads() {
+        // **Migrated, not refused.** Postcard is not self-describing, so a v1
+        // row read as v2 takes the next stack's first byte as this one's
+        // detail tag — which is why the version is checked. Refusing outright
+        // would empty the inventory of everyone who was playing before the
+        // upgrade, which is the opposite of charter rule 8's round trip.
+        let old = StoredSlotsV1 {
+            views: vec![StoredViewV1 {
+                name: "player:main".to_owned(),
+                slots: vec![
+                    Some(StoredStackV1 {
+                        // A WORLD id, which `shifted` maps back to runtime 1.
+                        material: 7,
+                        units: 30,
+                        shape: Some(0b101),
+                    }),
+                    None,
+                ],
+            }],
+            held: None,
+        };
+        let bytes = postcard::to_allocvec(&old).expect("encode v1");
+
+        let (back, lost) = decode(1, &bytes, &template(), &shifted()).expect("decode v1");
+        assert_eq!(lost, 0, "a v1 inventory lost stacks on the way in");
+        let stack = back
+            .view("player:main")
+            .and_then(|view| view.slots[0].as_ref())
+            .expect("the v1 stack");
+        assert_eq!(stack.units, 30);
+        assert_eq!(
+            stack.shape.map(Shape::occupancy),
+            Some(0b101),
+            "the cut did not survive the migration"
+        );
+        assert_eq!(
+            stack.detail, None,
+            "a v1 stack said nothing, so it says nothing"
         );
     }
 

@@ -472,6 +472,25 @@ fn player_of(uuid: &str, what: &str) -> mlua::Result<[u8; 32]> {
         })
 }
 
+/// A mod's own word for WHICH stack this is, out of a give/take table.
+///
+/// **Refused rather than truncated** when it is too long: a mod told its word
+/// did not fit can send a shorter one, and a mod whose word was quietly cut
+/// short has two items it believes are the same and the engine says are not.
+fn detail_of(spec: &Table) -> mlua::Result<Option<String>> {
+    let Some(detail) = spec.get::<Option<String>>("detail")? else {
+        return Ok(None);
+    };
+    if detail.len() > crate::inventory::MAX_DETAIL {
+        return Err(mlua::Error::external(format!(
+            "a stack's `detail` is at most {} bytes, and this one is {}",
+            crate::inventory::MAX_DETAIL,
+            detail.len()
+        )));
+    }
+    Ok(Some(detail))
+}
+
 /// The cut a spec asked for, and whether it was spelled at all.
 ///
 /// A mask of every cell means a whole block, which is loose material and no
@@ -523,7 +542,7 @@ fn stack_of(lua: &mlua::Lua, spec: &Table) -> mlua::Result<Option<crate::invento
 }
 
 /// One stack, as a mod reads it.
-fn stack_table(lua: &mlua::Lua, stack: crate::inventory::Stack) -> mlua::Result<Table> {
+fn stack_table(lua: &mlua::Lua, stack: &crate::inventory::Stack) -> mlua::Result<Table> {
     let (blocks, nodes) = stack.display();
     let entry = lua.create_table()?;
     entry.set("material", stack.material.0)?;
@@ -535,6 +554,10 @@ fn stack_table(lua: &mlua::Lua, stack: crate::inventory::Stack) -> mlua::Result<
     // the test for "is this a cut" and a mask of zero never has to mean two
     // different things.
     entry.set("shape", stack.shape.map(crate::inventory::Shape::occupancy))?;
+    // The mod's own word for which item this is, absent when it never said
+    // one — so `if slot.detail then` is the test, and the empty string stays
+    // available as something a mod could mean.
+    entry.set("detail", stack.detail.clone())?;
     Ok(entry)
 }
 
@@ -1995,7 +2018,7 @@ impl MluaVm {
                     .unwrap_or_default();
                 let list = lua.create_table()?;
                 for stack in stacks {
-                    list.push(stack_table(lua, stack)?)?;
+                    list.push(stack_table(lua, &stack)?)?;
                 }
                 Ok(list)
             })
@@ -2017,9 +2040,14 @@ impl MluaVm {
                 // Nothing to give is not an error and not a change: a recipe
                 // that yields zero of something is a recipe with a condition
                 // in it, and the mod already knows what it asked for.
-                let Some(stack) = crate::inventory::Stack::new(material, units)
-                    .map(|stack| crate::inventory::Stack { shape, ..stack })
-                else {
+                let detail = detail_of(&spec)?;
+                let Some(stack) = crate::inventory::Stack::new(material, units).map(|stack| {
+                    crate::inventory::Stack {
+                        shape,
+                        detail,
+                        ..stack
+                    }
+                }) else {
                     return Ok(false);
                 };
                 let accepted = slot.lock().ok().and_then(|slot| {
@@ -2041,7 +2069,10 @@ impl MluaVm {
                     .ok()
                     .and_then(|slot| slot.as_ref().map(|access| access.held(player)))
                     .flatten();
-                stack.map(|stack| stack_table(lua, stack)).transpose()
+                stack
+                    .as_ref()
+                    .map(|stack| stack_table(lua, stack))
+                    .transpose()
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("held", held).map_err(|err| self.vm_error(&err))?;
@@ -2061,9 +2092,11 @@ impl MluaVm {
                 // A mod that asked for more than the player has can put back
                 // what it took; one told only `false` would have to ask twice
                 // to find out how much that was.
+                let detail = detail_of(&spec)?;
                 let took = slot.lock().ok().and_then(|slot| {
-                    slot.as_ref()
-                        .map(|access| access.take(player, &view, material, shape, units))
+                    slot.as_ref().map(|access| {
+                        access.take(player, &view, material, shape, detail.as_deref(), units)
+                    })
                 });
                 Ok(took.unwrap_or(0))
             })
@@ -2939,6 +2972,7 @@ impl MluaVm {
                     "item",
                     entity
                         .item
+                        .as_ref()
                         .map(|stack| stack_table(lua, stack))
                         .transpose()?,
                 )?;
@@ -7732,7 +7766,7 @@ mod entity_tests {
         {
             let entities = store.entities.lock().expect("lock");
             let (_, entity) = entities.iter().next().expect("one entity");
-            let item = entity.item.expect("the entity is an item");
+            let item = entity.item.as_ref().expect("the entity is an item");
             assert_eq!(item.material.0, 7);
             assert_eq!(
                 item.shape.map(crate::inventory::Shape::occupancy),

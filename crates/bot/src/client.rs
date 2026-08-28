@@ -1208,7 +1208,7 @@ impl Bot {
                 ServerMessage::EntityArmed { entities } => {
                     for armed in entities {
                         if let Some(known) = live.get_mut(&armed.id) {
-                            known.hands = armed.hands;
+                            known.hands = armed.hands.clone();
                         }
                     }
                 }
@@ -1689,6 +1689,9 @@ impl Bot {
             material,
             shape,
             face,
+            // Plain material. A bot spending a stack a mod has marked builds
+            // the message itself, the way it does for a cut.
+            detail: None,
         })
         .await
     }

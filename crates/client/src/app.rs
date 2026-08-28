@@ -2123,7 +2123,7 @@ impl App {
         // beside them, so the cut goes with the request and the server matches
         // the pair.
         self.swing();
-        let Some(stack) = self.hotbar.get(self.selected).copied().flatten() else {
+        let Some(stack) = self.hotbar.get(self.selected).cloned().flatten() else {
             self.warn("nothing selected to build with".to_owned());
             return;
         };
@@ -2143,6 +2143,10 @@ impl App {
             material: stack.material,
             shape: stack.shape,
             face,
+            // **Which stack, when a mod says two are different things.** The
+            // same reason the cut travels: a player placing a named block must
+            // not have it paid for out of their plain ones.
+            detail: stack.detail.clone(),
         });
     }
 
@@ -2489,7 +2493,7 @@ impl App {
             };
             let main = crate::render::viewmodel::pieces(
                 crate::render::viewmodel::Hand::Main,
-                held(self.hotbar.get(self.selected).copied().flatten()),
+                held(self.hotbar.get(self.selected).cloned().flatten()),
             );
             let off = crate::render::viewmodel::pieces(
                 crate::render::viewmodel::Hand::Off,
@@ -2520,10 +2524,10 @@ impl App {
         let mut props = self.dropped_props();
         if let Some(figure) = figure.filter(|_| self.third_person) {
             let held = [
-                self.hotbar.get(self.selected).copied().flatten(),
+                self.hotbar.get(self.selected).cloned().flatten(),
                 self.offhand(),
             ];
-            props.extend(self.hand_props(figure, held));
+            props.extend(self.hand_props(figure, &held));
         }
         props.extend(self.other_hand_props());
         self.renderer.set_props(&props);
@@ -2565,7 +2569,7 @@ impl App {
                 phase: now.as_secs_f32() + (id % 977) as f32 * 0.037,
                 carrying: [entity.hands[0].is_some(), entity.hands[1].is_some()],
             };
-            props.extend(self.hand_props(&figure, entity.hands));
+            props.extend(self.hand_props(&figure, &entity.hands));
         }
         props
     }
@@ -2574,10 +2578,10 @@ impl App {
     fn hand_props(
         &self,
         figure: &crate::render::skinned::Figure,
-        held: [Option<tiamot_core::proto::StackDef>; 2],
+        held: &[Option<tiamot_core::proto::StackDef>; 2],
     ) -> Vec<crate::render::Prop> {
         let mut props = Vec::new();
-        for (joint, stack) in [("hand.r", held[0]), ("hand.l", held[1])] {
+        for (joint, stack) in [("hand.r", &held[0]), ("hand.l", &held[1])] {
             let Some(stack) = stack else { continue };
             let Some(joint) = self.renderer.attachment(figure, joint) else {
                 continue;
@@ -2611,7 +2615,9 @@ impl App {
         let cells = f64::from(tiamot_core::SUBNODES_PER_AXIS);
         let mut props = Vec::new();
         for (id, entity) in self.entities.iter() {
-            let Some(stack) = entity.item else { continue };
+            let Some(stack) = entity.item.as_ref() else {
+                continue;
+            };
             let Some(pose) = entity.pose(now) else {
                 continue;
             };
@@ -2647,7 +2653,7 @@ impl App {
             .map(|contents| contents.slots.as_slice())
             .unwrap_or_default();
         self.hotbar = (0..HOTBAR_SLOTS)
-            .map(|index| slots.get(index).copied().flatten())
+            .map(|index| slots.get(index).cloned().flatten())
             .collect();
     }
 
@@ -3530,7 +3536,7 @@ impl App {
     pub fn selected_material(&self) -> Option<u16> {
         self.hotbar
             .get(self.selected)
-            .copied()
+            .cloned()
             .flatten()
             .map(|stack| stack.material)
     }
@@ -3597,7 +3603,7 @@ impl App {
                 contents
                     .slots
                     .get(tiamot_core::inventory::PLAYER_OFFHAND_SLOT)
-                    .copied()
+                    .cloned()
                     .flatten()
             })
     }
@@ -4252,7 +4258,7 @@ impl App {
             anim: self.gait(),
             phase: self.since_start.elapsed().as_secs_f32(),
             carrying: [
-                self.hotbar.get(self.selected).copied().flatten().is_some(),
+                self.hotbar.get(self.selected).cloned().flatten().is_some(),
                 self.offhand().is_some(),
             ],
         };
@@ -4962,7 +4968,7 @@ impl App {
             .hotbar
             .iter()
             .map(|slot| {
-                slot.map(|stack| tiamot_core::hud::Carried {
+                slot.as_ref().map(|stack| tiamot_core::hud::Carried {
                     material: tiamot_core::MaterialId(stack.material),
                     // The string id, because that is what is canonical (charter
                     // rule 8) and the number is per-session. A script showing a
@@ -4974,6 +4980,7 @@ impl App {
                         .unwrap_or_else(|| format!("#{}", stack.material)),
                     units: stack.units,
                     shape: stack.shape,
+                    detail: stack.detail.clone(),
                 })
             })
             .collect();
@@ -4986,6 +4993,7 @@ impl App {
                 .unwrap_or_else(|| format!("#{}", stack.material)),
             units: stack.units,
             shape: stack.shape,
+            detail: stack.detail.clone(),
         });
         let voxels = phys::Voxels::new(&self.store, predictor.origin());
         let looking_at = self.looking_at().map(|hit| {

@@ -472,7 +472,7 @@ fn a_player_can_dig_and_then_build_with_what_they_dug() {
     );
     app.stop_digging();
 
-    let carried = app.carried()[0];
+    let carried = app.carried()[0].clone();
     assert!(
         carried.units >= tiamot_core::UNITS_PER_BLOCK,
         "short: {carried:?}"
@@ -2202,8 +2202,8 @@ fn the_hotbar_is_the_first_slots_of_the_players_own_inventory() {
     assert_eq!(hotbar.len(), 9, "the number keys reach nine places");
     for (index, slot) in hotbar.iter().enumerate() {
         assert_eq!(
-            *slot,
-            slots.get(index).copied().flatten(),
+            slot.as_ref(),
+            slots.get(index).and_then(Option::as_ref),
             "hotbar slot {index} is not the inventory's slot {index}"
         );
     }

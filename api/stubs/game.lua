@@ -577,6 +577,9 @@ function game.set_tool(player, tool) end
 ---Answers an empty list during worldgen, when nobody is carrying anything yet.
 ---@param player string A player UUID in hex, as a hook event reports one.
 ---@param view string? Which view. Defaults to "player:main".
+---Each stack reports `{ material, units, blocks, nodes, count, shape, detail }`.
+---`detail` is your own word for which item it is, absent when nothing said one —
+---see `game.give`.
 ---@return table[] stacks
 function game.inventory(player, view) end
 
@@ -594,13 +597,29 @@ function game.inventory(player, view) end
 ---cells in `shape` for a cut. `shape` is a 27-bit occupancy mask over the
 ---block's sub-nodes, indexed `x + 3*y + 9*z`; leave it out for loose material.
 ---
----Two stacks stack only if they are the same material AND the same shape, so
----giving somebody a cut never merges it into the rubble they were carrying.
+---`detail` is YOUR OWN word for which item this is, and the engine never looks
+---inside it. **Without it, two swords are one sword**: stacks merge on being the
+---same thing, and being the same thing was material and cut — so one sword worn
+---to eleven and another worn to four became one stack of two swords. Set a
+---`detail` and they stay apart; leave it out and they stack as before.
+---
+---It is carried WITH the stack rather than being an id into a table of your own,
+---so there is no lifetime to get wrong: a stack that ceases to exist takes its
+---detail with it. Up to 256 bytes, refused rather than truncated. It survives
+---the save, the wire, being dropped on the ground and being picked back up.
+---
+---```lua
+---game.give(uuid, { material = "core_tools:sword", count = 1, detail = "wear=0" })
+---```
+---
+---Two stacks stack only if they are the same material AND the same shape AND the
+---same detail, so giving somebody a cut never merges it into the rubble they were
+---carrying, and giving them a named block never merges it into their plain ones.
 ---
 ---Returns false for a player who is not connected, or for a quantity of zero.
 ---An inventory never refuses for lack of room — it grows.
 ---@param player string A player UUID in hex.
----@param spec table
+---@param spec { material: string|integer, units: integer?, count: integer?, shape: integer?, detail: string?, view: string? }
 ---@return boolean gave
 function game.give(player, spec) end
 
@@ -653,9 +672,12 @@ function game.heading(dx, dz) end
 ---
 ---The cut is part of what is being spent: taking loose stone will not empty the
 ---stairs the player crafted out of it, and taking stairs will not drain their
----rubble.
+---rubble. **So is the `detail`, matched EXACTLY**, with no detail meaning a plain
+---stack — a recipe asking for stone must not melt down the named sword somebody
+---left in the same view. A mod that does want any of them reads `game.inventory`,
+---which reports each stack's detail, and asks for the ones it wants by name.
 ---@param player string A player UUID in hex.
----@param spec table
+---@param spec { material: string|integer, units: integer?, count: integer?, shape: integer?, detail: string?, view: string? }
 ---@return integer units How many units were removed.
 function game.take(player, spec) end
 

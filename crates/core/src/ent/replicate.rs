@@ -106,7 +106,7 @@ pub struct Spawn {
 /// twenty times a second to carry something that is usually the same, on a
 /// channel where losing it would leave a sword invisible until the next time
 /// the player switched slots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Armed {
     /// Which entity.
     pub id: EntityId,
@@ -172,7 +172,7 @@ pub struct Tracker {
 }
 
 /// The last thing a viewer was told about one entity.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Sent {
     chunk: ChunkPos,
     local: [f32; 3],
@@ -190,7 +190,7 @@ impl Sent {
             yaw: quantise_yaw(entity.transform.yaw),
             pitch: quantise_pitch(entity.transform.pitch),
             anim: entity.anim,
-            hands: entity.hands,
+            hands: entity.hands.clone().clone(),
         }
     }
 
@@ -310,7 +310,7 @@ impl Tracker {
                     if now.hands != before.hands {
                         update.rearmed.push(Armed {
                             id,
-                            hands: entity.hands,
+                            hands: entity.hands.clone().clone(),
                         });
                     }
                 }
@@ -341,8 +341,8 @@ fn spawn_of(id: EntityId, entity: &Entity) -> Spawn {
         velocity: entity.velocity,
         model: entity.model.clone(),
         collider: entity.collider,
-        item: entity.item,
-        hands: entity.hands,
+        item: entity.item.clone().clone(),
+        hands: entity.hands.clone().clone(),
         anim: entity.anim,
         nametag: entity.nametag.clone(),
     }

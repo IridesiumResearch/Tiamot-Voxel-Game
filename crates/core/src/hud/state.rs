@@ -20,6 +20,11 @@ pub struct Carried {
     /// A HUD showing a hotbar wants to draw a stair differently from a block of
     /// the same stone, and this is the only thing that tells them apart.
     pub shape: u32,
+    /// A mod's own word for which item this is, if it said one.
+    ///
+    /// A durability bar under a slot, or a name over it. Opaque to the engine
+    /// — see [`crate::inventory::Stack::detail`].
+    pub detail: Option<String>,
 }
 
 impl Carried {

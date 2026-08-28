@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 36;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -133,6 +133,12 @@ pub const PROTOCOL_VERSION: u32 = 35;
 // next keyframe's bytes as this one's grade. That is what the version check is
 // for: v9 and v10 refuse each other before either reads a keyframe.
 
+// v36 (post-14): `StackDef` and `ClientMessage::Place` carry a DETAIL — a
+// mod's own opaque word for which item this is, so two swords worn to
+// different amounts are two stacks rather than one. **A field on existing
+// messages**, the shape of change this format does not make safe, exactly as
+// v34 and v24 were: the version check is what keeps a v35 peer from reading
+// the bytes after a shape as the start of the next message.
 // v35 (post-14): appended `ServerMessage::HudValues`, so a mod can send its
 // own values to its own HUD script — the engine has no health bar and should
 // not, and a mod that could compute one and not draw it could not finish the
@@ -479,7 +485,7 @@ pub struct SoundDef {
 /// shape of change postcard does not make safe, exactly as v10 and v13 were. The
 /// version check is what keeps a v23 client from reading these bytes as the old
 /// pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StackDef {
     /// World material id.
     pub material: u16,
@@ -487,6 +493,17 @@ pub struct StackDef {
     pub units: u32,
     /// The 27-bit occupancy each item is cut to, or `0` for loose material.
     pub shape: u32,
+    /// What a mod says this particular stack is (protocol v36).
+    ///
+    /// Opaque to the engine and to the client alike — see
+    /// [`crate::inventory::Stack::detail`]. It travels because it is part of
+    /// what makes two stacks the same stack: a client that could not see it
+    /// could not tell one sword from another, and could not say which of them
+    /// it wanted to spend.
+    ///
+    /// Capped on decode at [`crate::inventory::MAX_DETAIL`], because this is
+    /// what a server sent (charter rule 14).
+    pub detail: Option<String>,
 }
 
 /// A sound bound to a named event.
@@ -772,6 +789,15 @@ pub enum ClientMessage {
         /// else — including all zeroes from a client that does not care — means
         /// "no preference", and the shape is placed as it was authored.
         face: [i8; 3],
+        /// WHICH stack is being spent, when a mod has said two are different
+        /// things (protocol v36).
+        ///
+        /// Matched exactly against what the player holds, `None` meaning a
+        /// plain one — see [`crate::inventory::Stack::detail`]. Without it a
+        /// player placing a named block would have it paid for out of their
+        /// plain ones, which is the shape defect the `shape` field above was
+        /// added to fix.
+        detail: Option<String>,
     },
 
     /// Ask for how far the server should stream chunks to this player.
@@ -2118,7 +2144,24 @@ fn check_view(view: &str, slots: &[Option<StackDef>]) -> Result<(), ProtocolErro
         "view_slots",
         slots.len(),
         crate::ui::Limits::default().grid_slots,
-    )
+    )?;
+    for stack in slots.iter().flatten() {
+        check_stack(stack)?;
+    }
+    Ok(())
+}
+
+/// Bounds one stack a server sent.
+///
+/// The detail is a mod's own opaque word (see
+/// [`crate::inventory::Stack::detail`]) and travels on several messages, so the
+/// bound lives in one place rather than at each of them — which is where one of
+/// them would quietly stop having it.
+fn check_stack(stack: &StackDef) -> Result<(), ProtocolError> {
+    match &stack.detail {
+        Some(detail) => check_len("stack_detail", detail.len(), crate::inventory::MAX_DETAIL),
+        None => Ok(()),
+    }
 }
 
 /// Bounds a dialog a server sent, and the tree in it.
@@ -2265,6 +2308,11 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         ServerMessage::SoundTable { sounds } => check_sounds(sounds)?,
         ServerMessage::HudScripts { scripts } => check_hud_scripts(scripts)?,
         ServerMessage::HudValues { mod_id, values } => check_hud_values(mod_id, values)?,
+        ServerMessage::InventoryUpdate { stacks } => {
+            for stack in stacks {
+                check_stack(stack)?;
+            }
+        }
         message @ (ServerMessage::SoundBindings { .. }
         | ServerMessage::StartLoop { .. }
         | ServerMessage::StopLoop { .. }) => check_cue_message(message)?,
@@ -2278,7 +2326,6 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::ChunkUnload { .. }
         | ServerMessage::EntityStateDelta { .. }
         | ServerMessage::Disconnect { .. }
-        | ServerMessage::InventoryUpdate { .. }
         | ServerMessage::MaterialTable { .. }
         | ServerMessage::ToolTable { .. }
         | ServerMessage::ChunkLight { .. }
@@ -2303,6 +2350,10 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
 fn check_entity_spawns(entities: &[EntityDef]) -> Result<(), ProtocolError> {
     check_len("entity_spawn", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
     for entity in entities {
+        check_hands(&entity.hands)?;
+        if let Some(item) = &entity.item {
+            check_stack(item)?;
+        }
         let finite = entity
             .local
             .iter()
@@ -2360,6 +2411,7 @@ fn check_hands(hands: &[Option<StackDef>; 2]) -> Result<(), ProtocolError> {
                 limit: crate::inventory::Shape::ALL as usize,
             });
         }
+        check_stack(held)?;
     }
     Ok(())
 }
@@ -2698,6 +2750,7 @@ mod tests {
                     material: 0,
                     shape: 0,
                     face: [0; 3],
+                    detail: None,
                 },
                 13,
             ),

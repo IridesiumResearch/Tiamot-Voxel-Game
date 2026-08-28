@@ -500,6 +500,9 @@ pub enum Command {
         /// The outward normal of the surface it is being placed against, which
         /// is what turns the cut to face the player.
         face: [i8; 3],
+        /// Which stack is being spent, when a mod says two of the same
+        /// material and cut are different things.
+        detail: Option<String>,
     },
 
     /// Report that a mod-registered action was pressed or released.
@@ -1590,8 +1593,10 @@ fn to_wire(command: Command) -> ClientMessage {
             material,
             shape,
             face,
+            detail,
         } => ClientMessage::Place {
             face,
+            detail,
             target,
             material,
             shape,

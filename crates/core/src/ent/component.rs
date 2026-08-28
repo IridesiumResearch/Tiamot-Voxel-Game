@@ -305,7 +305,7 @@ pub enum Nametag {
 ///
 /// A `None` is an empty hand, which is drawn as an empty hand rather than as
 /// nothing: an arm is still there.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Hands {
     /// The stack in the main hand.
     pub main: Option<crate::inventory::Stack>,

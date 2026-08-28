@@ -180,7 +180,7 @@ fn what_a_player_digs_shows_up_in_the_slots_core_uis_screen_draws() {
             })
             .await
             .expect("the dug block never reached a slot");
-        let units = slots[0].expect("a stack in the first slot").units;
+        let units = slots[0].as_ref().expect("a stack in the first slot").units;
         assert!(units > 0);
         assert!(
             slots.len() >= 27,
@@ -569,7 +569,7 @@ fn the_offhand_key_swaps_and_swapping_twice_puts_it_back() {
             })
             .await
             .expect("the dug block never reached a slot");
-        let held = slots[0].expect("a stack in the first slot");
+        let held = slots[0].clone().expect("a stack in the first slot");
         assert!(
             slots.len() > tiamot_core::inventory::PLAYER_OFFHAND_SLOT,
             "there is nowhere for the off-hand to be: {} slots",
@@ -593,8 +593,8 @@ fn the_offhand_key_swaps_and_swapping_twice_puts_it_back() {
             .await
             .expect("nothing ever reached the off-hand");
         assert_eq!(
-            swapped[tiamot_core::inventory::PLAYER_OFFHAND_SLOT],
-            Some(held),
+            swapped[tiamot_core::inventory::PLAYER_OFFHAND_SLOT].as_ref(),
+            Some(&held),
             "what was in the hand is not what is in the off-hand"
         );
         assert!(swapped[0].is_none(), "the hand should be empty now");
@@ -610,7 +610,11 @@ fn the_offhand_key_swaps_and_swapping_twice_puts_it_back() {
             })
             .await
             .expect("it never came back");
-        assert_eq!(back[0], Some(held), "two presses did not put it back");
+        assert_eq!(
+            back[0].as_ref(),
+            Some(&held),
+            "two presses did not put it back"
+        );
         assert!(back[tiamot_core::inventory::PLAYER_OFFHAND_SLOT].is_none());
 
         let after: u32 = bot.inventory().iter().map(|stack| stack.units).sum();

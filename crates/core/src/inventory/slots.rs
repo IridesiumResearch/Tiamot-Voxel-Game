@@ -255,7 +255,7 @@ impl Slots {
         let Some(held) = self.grab.held.take() else {
             return false;
         };
-        if self.insert(view, held) {
+        if self.insert(view, held.clone()) {
             return true;
         }
         // Nowhere to put it. Back on the cursor rather than gone — the next
@@ -323,12 +323,12 @@ impl Slots {
             let giving = moving.units.min(u32::MAX - slot.units);
             if giving > 0
                 && let Ok(part) = moving.split(giving)
-                && slot.merge(part).is_err()
+                && slot.merge(&part).is_err()
             {
                 // Refused after the units were already out: put them back
                 // rather than drop them. Belt and braces behind the guard
                 // above, because this is a conservation law.
-                let _ = moving.merge(part);
+                let _ = moving.merge(&part);
             }
             if moving.is_empty() {
                 break;
@@ -337,7 +337,7 @@ impl Slots {
         if !moving.is_empty()
             && let Some(empty) = self.views[to].slots.iter_mut().find(|slot| slot.is_none())
         {
-            *empty = Some(moving);
+            *empty = Some(moving.clone());
             moving.units = 0;
         }
 
@@ -410,9 +410,9 @@ impl Slots {
             let giving = moving.units.min(u32::MAX - stack.units);
             if giving > 0
                 && let Ok(part) = moving.split(giving)
-                && stack.merge(part).is_err()
+                && stack.merge(&part).is_err()
             {
-                let _ = moving.merge(part);
+                let _ = moving.merge(&part);
             }
             if moving.is_empty() {
                 break;
@@ -424,7 +424,7 @@ impl Slots {
                 .copied()
                 .find(|slot| self.views[at].slots[*slot].is_none())
         {
-            self.views[at].slots[empty] = Some(moving);
+            self.views[at].slots[empty] = Some(moving.clone());
             moving.units = 0;
         }
 
@@ -465,9 +465,9 @@ impl Slots {
             let giving = stack.units.min(room);
             if giving > 0
                 && let Ok(part) = stack.split(giving)
-                && slot.merge(part).is_err()
+                && slot.merge(&part).is_err()
             {
-                let _ = stack.merge(part);
+                let _ = stack.merge(&part);
             }
             if stack.is_empty() {
                 return true;
@@ -495,11 +495,17 @@ impl Slots {
     ///
     /// Walks slots in order, so a player spending material empties the stack
     /// they can see first rather than one chosen by a hash.
+    /// `detail` names WHICH stack, matched exactly, with `None` meaning a
+    /// plain one. **Exactly, not "any"** — a recipe asking for stone must not
+    /// melt down the named sword somebody left in the same view, and a mod
+    /// that does want any reads the inventory and asks for each detail it
+    /// finds. See [`super::Stack::detail`].
     pub fn take(
         &mut self,
         view: &str,
         material: MaterialId,
         shape: Option<super::Shape>,
+        detail: Option<&str>,
         units: u32,
     ) -> u32 {
         let Some(at) = self.index_of(view) else {
@@ -515,7 +521,10 @@ impl Slots {
             // stair must not have it paid for out of their loose rubble, or the
             // stairs they crafted would sit in the inventory while the material
             // quietly drained away.
-            if stack.material != material || stack.shape != shape {
+            if stack.material != material
+                || stack.shape != shape
+                || stack.detail.as_deref() != detail
+            {
                 continue;
             }
             let taking = stack.units.min(left);
@@ -539,7 +548,7 @@ impl Slots {
         let Some(view) = self.view(view) else {
             return Vec::new();
         };
-        super::consolidate(view.slots.iter().flatten().copied())
+        super::consolidate(view.slots.iter().flatten().cloned())
     }
 
     /// The view holding `index`, if both the view and the slot exist.
@@ -572,9 +581,10 @@ fn merge_or_swap(held: Stack, there: Stack) -> (Option<Stack>, Option<Stack>) {
         return (Some(held), Some(there));
     }
     let mut merged = there;
-    match merged.merge(held) {
+    match merged.merge(&held) {
         Ok(()) => (Some(merged), None),
-        // Overflow: leave both alone rather than lose the difference.
+        // Overflow, or a mod's own difference: leave both alone rather than
+        // lose what would not fit.
         Err(_) => (Some(merged), Some(held)),
     }
 }
@@ -594,16 +604,24 @@ fn place_one(mut held: Stack, there: Option<Stack>) -> (Option<Stack>, Option<St
         // that had already been split out of the hand went nowhere. Found by
         // `no_run_of_clicks_changes_how_many_units_exist` the moment its
         // generator started producing shaped stacks.
-        Some(mut there) if there.material == one.material && there.shape == one.shape => {
-            if there.merge(one).is_err() {
-                let _ = held.merge(one);
+        // **And the detail**, for the reason the shape is here: a held item a
+        // mod says is different from the one in the slot must not merge, and
+        // `merge` refusing after the unit has been split out of the hand is
+        // where a unit goes missing.
+        Some(mut there)
+            if there.material == one.material
+                && there.shape == one.shape
+                && there.detail == one.detail =>
+        {
+            if there.merge(&one).is_err() {
+                let _ = held.merge(&one);
             }
             Some(there)
         }
         // Nowhere to put one unit; nothing happens and the hand keeps
         // everything it had.
         Some(there) => {
-            let _ = held.merge(one);
+            let _ = held.merge(&one);
             Some(there)
         }
     };
@@ -755,6 +773,7 @@ mod tests {
         assert!(inv.left_click(PLAYER_MAIN, 0));
         assert_eq!(
             inv.view(PLAYER_MAIN).expect("view").slots[0]
+                .as_ref()
                 .expect("the slot took what was held")
                 .shape,
             Some(shape),
@@ -811,24 +830,39 @@ mod tests {
 
         // Taking the cut takes it from the cut slot only.
         assert_eq!(
-            inv.take(PLAYER_MAIN, STONE, Some(shape), shape.cells()),
+            inv.take(PLAYER_MAIN, STONE, Some(shape), None, shape.cells()),
             shape.cells()
         );
         assert_eq!(
-            inv.views[0].slots[0].expect("loose survives").units,
+            inv.views[0].slots[0]
+                .as_ref()
+                .expect("loose survives")
+                .units,
             50,
             "the loose material was spent on a shaped placement"
         );
-        assert_eq!(inv.views[0].slots[1].expect("cut survives").count(), 2);
+        assert_eq!(
+            inv.views[0].slots[1]
+                .as_ref()
+                .expect("cut survives")
+                .count(),
+            2
+        );
 
         // And loose takes from loose, not from the cut.
-        assert_eq!(inv.take(PLAYER_MAIN, STONE, None, 50), 50);
+        assert_eq!(inv.take(PLAYER_MAIN, STONE, None, None, 50), 50);
         assert!(inv.views[0].slots[0].is_none());
-        assert_eq!(inv.views[0].slots[1].expect("cut survives").count(), 2);
+        assert_eq!(
+            inv.views[0].slots[1]
+                .as_ref()
+                .expect("cut survives")
+                .count(),
+            2
+        );
 
         // Asking for a cut nobody holds takes nothing rather than falling back.
         let other = Shape::new(0b11).expect("another cut");
-        assert_eq!(inv.take(PLAYER_MAIN, STONE, Some(other), 2), 0);
+        assert_eq!(inv.take(PLAYER_MAIN, STONE, Some(other), None, 2), 0);
     }
 
     use super::*;
@@ -856,7 +890,7 @@ mod tests {
     }
 
     fn at(slots: &Slots, view: &str, index: usize) -> Option<Stack> {
-        slots.view(view).and_then(|v| v.slots[index])
+        slots.view(view).and_then(|v| v.slots[index].clone())
     }
 
     /// Arbitrary slots, and a run of arbitrary clicks over them.
@@ -959,7 +993,7 @@ mod tests {
                     );
                 }
                 for (material, units) in takes {
-                    let took = slots.take("player:main", MaterialId(material), None, units);
+                    let took = slots.take("player:main", MaterialId(material), None, None, units);
                     expected -= u64::from(took);
                     prop_assert_eq!(
                         slots.total_units(),
@@ -1160,20 +1194,23 @@ mod tests {
             grab: Grab::default(),
         };
         // Spanning two slots, first one emptied.
-        assert_eq!(inv.take("player:main", STONE, None, 7), 7);
+        assert_eq!(inv.take("player:main", STONE, None, None, 7), 7);
         assert!(
             at(&inv, "player:main", 0).is_none(),
             "an emptied slot must be None"
         );
-        assert_eq!(at(&inv, "player:main", 2).expect("partial").units, 2);
+        assert_eq!(
+            at(&inv, "player:main", 2).as_ref().expect("partial").units,
+            2
+        );
         assert_eq!(inv.total_units(), 11);
 
         // Asking for more than there is takes what there is and says so.
-        assert_eq!(inv.take("player:main", STONE, None, 99), 2);
-        assert_eq!(inv.take("player:main", STONE, None, 1), 0);
+        assert_eq!(inv.take("player:main", STONE, None, None, 99), 2);
+        assert_eq!(inv.take("player:main", STONE, None, None, 1), 0);
         // A material nobody has, and a view nobody has.
-        assert_eq!(inv.take("player:main", MaterialId(77), None, 5), 0);
-        assert_eq!(inv.take("nosuch:view", DIRT, None, 5), 0);
+        assert_eq!(inv.take("player:main", MaterialId(77), None, None, 5), 0);
+        assert_eq!(inv.take("nosuch:view", DIRT, None, None, 5), 0);
         assert_eq!(inv.total_units(), 9, "only the dirt should be left");
     }
 
@@ -1207,7 +1244,7 @@ mod tests {
         let mut inv = slots(vec![stack(STONE, 40), None]);
         assert!(inv.right_click("player:main", 0));
 
-        let held = inv.grab.held.expect("something in hand");
+        let held = inv.grab.held.clone().expect("something in hand");
         let left = at(&inv, "player:main", 0).expect("something behind");
         assert_eq!(held.units, 20, "the hand should hold half");
         assert_eq!(left.units, 20, "and half should stay");
@@ -1227,13 +1264,13 @@ mod tests {
         // a unit to rounding — which is the bug this rules out.
         let mut inv = slots(vec![stack(STONE, 41), None]);
         inv.right_click("player:main", 0);
-        assert_eq!(inv.grab.held.expect("hand").units, 21);
+        assert_eq!(inv.grab.held.as_ref().expect("hand").units, 21);
         assert_eq!(at(&inv, "player:main", 0).expect("behind").units, 20);
 
         // One unit cannot be halved: the hand takes it and the slot empties.
         let mut inv = slots(vec![stack(STONE, 1), None]);
         inv.right_click("player:main", 0);
-        assert_eq!(inv.grab.held.expect("hand").units, 1);
+        assert_eq!(inv.grab.held.as_ref().expect("hand").units, 1);
         assert!(
             at(&inv, "player:main", 0).is_none(),
             "an emptied slot must be None, never a zero stack"
@@ -1249,7 +1286,10 @@ mod tests {
         inv.grab.held = stack(STONE, UNITS_PER_BLOCK);
         inv.right_click("player:main", 0);
         assert_eq!(at(&inv, "player:main", 0).expect("placed").units, 1);
-        assert_eq!(inv.grab.held.expect("hand").units, UNITS_PER_BLOCK - 1);
+        assert_eq!(
+            inv.grab.held.as_ref().expect("hand").units,
+            UNITS_PER_BLOCK - 1
+        );
 
         // Onto a matching stack it tops it up.
         inv.right_click("player:main", 0);
@@ -1261,7 +1301,7 @@ mod tests {
         inv2.grab.held = stack(STONE, 10);
         inv2.right_click("player:main", 0);
         assert_eq!(at(&inv2, "player:main", 0).expect("still dirt").units, 5);
-        assert_eq!(inv2.grab.held.expect("hand").units, 10);
+        assert_eq!(inv2.grab.held.as_ref().expect("hand").units, 10);
         assert_eq!(inv.total_units(), before);
     }
 
@@ -1270,7 +1310,7 @@ mod tests {
         // Take.
         let mut inv = slots(vec![stack(STONE, 30), None]);
         inv.left_click("player:main", 0);
-        assert_eq!(inv.grab.held.expect("hand").units, 30);
+        assert_eq!(inv.grab.held.as_ref().expect("hand").units, 30);
         assert!(at(&inv, "player:main", 0).is_none());
 
         // Place into an empty slot.
@@ -1289,8 +1329,8 @@ mod tests {
         inv.grab.held = stack(DIRT, 7);
         inv.left_click("player:main", 1);
         assert_eq!(at(&inv, "player:main", 1).expect("swapped").material, DIRT);
-        assert_eq!(inv.grab.held.expect("hand").material, STONE);
-        assert_eq!(inv.grab.held.expect("hand").units, 35);
+        assert_eq!(inv.grab.held.as_ref().expect("hand").material, STONE);
+        assert_eq!(inv.grab.held.as_ref().expect("hand").units, 35);
     }
 
     #[test]

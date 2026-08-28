@@ -35,7 +35,7 @@ use crate::material::MaterialId;
 /// database and not a peer, so it is not hostile input (charter rule 14): what
 /// comes off the wire is [`crate::proto::StackDef`], which the decoder checks.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct Stack {
     /// What this is made of.
@@ -47,7 +47,45 @@ pub struct Stack {
     /// See [`Shape`]. `None` is loose material — what digging yields and what
     /// a full block places from.
     pub shape: Option<Shape>,
+
+    /// What a MOD says this particular stack is, and the engine never reads.
+    ///
+    /// # Why a stack has one at all
+    ///
+    /// Because without it, two swords are one sword. A stack's identity was
+    /// material and cut, and stacks merge on identity — so a mod could not
+    /// give one sword eleven durability and another four, could not name an
+    /// item, could not enchant one, could not write in a book. Every one of
+    /// those is "this item is not that item", and there was no way to say it.
+    ///
+    /// # Why the engine does not look inside
+    ///
+    /// Charter rule 1. Durability, enchantments and names are a mod's rules,
+    /// so this is an opaque string the engine carries, persists, sends, and
+    /// compares for equality — nothing else. Two stacks merge when their
+    /// details are equal, which is what makes ninety identical arrows one
+    /// stack and two differently-worn swords two.
+    ///
+    /// # Why it is carried rather than looked up
+    ///
+    /// An id into a mod's own table would keep [`Stack`] `Copy` and hand every
+    /// mod the same unsolved problem: knowing when the last stack holding an
+    /// id is gone, so the row can go too. Carrying the payload has no lifetime
+    /// to get wrong — a stack that ceases to exist takes its detail with it.
+    ///
+    /// `None` is the ordinary case and costs a word. Capped at
+    /// [`MAX_DETAIL`] where it is set and again where it is decoded, because
+    /// the second is reading what a server sent (charter rule 14).
+    pub detail: Option<String>,
 }
+
+/// The longest a [`Stack::detail`] may be.
+///
+/// Room for a mod's own serialised item state — a damage value, a list of
+/// enchantment ids, a name — and a hard stop against a stack that is a
+/// document. A mod with more to say than this about one item is describing
+/// something that wants a world position and a container, not a slot.
+pub const MAX_DETAIL: usize = 256;
 
 /// A sub-node arrangement a quantity of material has been cut to.
 ///
@@ -125,6 +163,13 @@ pub enum StackError {
         right: Option<Shape>,
     },
 
+    /// Merging two stacks a mod has said are different things.
+    ///
+    /// See [`Stack::detail`]. The engine has no idea what the difference IS,
+    /// which is the point — it only knows the two are not interchangeable.
+    #[error("cannot merge stacks a mod says are different items")]
+    DetailMismatch,
+
     /// Merging two stacks of different materials.
     #[error("cannot merge {left:?} with {right:?}: different materials")]
     MaterialMismatch {
@@ -163,6 +208,7 @@ impl Stack {
             material,
             units,
             shape: None,
+            detail: None,
         })
     }
 
@@ -216,7 +262,7 @@ impl Stack {
     /// [`StackError::MaterialMismatch`] if the materials differ, or
     /// [`StackError::Overflow`] if the total would not fit. On error this stack
     /// is left unchanged.
-    pub fn merge(&mut self, other: Self) -> Result<(), StackError> {
+    pub fn merge(&mut self, other: &Self) -> Result<(), StackError> {
         if self.material != other.material {
             return Err(StackError::MaterialMismatch {
                 left: self.material,
@@ -232,6 +278,13 @@ impl Stack {
                 left: self.shape,
                 right: other.shape,
             });
+        }
+        // **And a mod's own answer to "is this the same item".** Two swords
+        // worn to different amounts are not one stack of swords; nor are a
+        // named item and a plain one. The engine cannot tell what the
+        // difference is and does not need to — see `Stack::detail`.
+        if self.detail != other.detail {
+            return Err(StackError::DetailMismatch);
         }
         // Checked rather than saturating: silently capping would destroy
         // material, and this arithmetic is a conservation law.
@@ -266,6 +319,10 @@ impl Stack {
             material: self.material,
             units,
             shape: self.shape,
+            // **The split half is the same item.** Taking ten arrows off a
+            // stack of ninety gives ten of what was there, detail included, or
+            // the two halves would refuse to merge back together.
+            detail: self.detail.clone(),
         })
     }
 
@@ -525,6 +582,7 @@ pub fn break_block(block: BlockView<'_>) -> Vec<Stack> {
                             material,
                             units: 1,
                             shape: None,
+                            detail: None,
                         },
                     ),
                 }
@@ -563,6 +621,7 @@ pub fn removed_units(before: BlockView<'_>, after: BlockView<'_>) -> Vec<Stack> 
                     material: was,
                     units: 1,
                     shape: None,
+                    detail: None,
                 },
             ),
         }
@@ -586,11 +645,23 @@ pub fn consolidate(stacks: impl IntoIterator<Item = Stack>) -> Vec<Stack> {
         // and sorting by the pair keeps the result ordered without a second
         // pass. Ascending material first, so drop order is unchanged for the
         // loose material that is almost all of it.
-        let key = (stack.material, stack.shape);
-        match merged.binary_search_by_key(&key, |existing| (existing.material, existing.shape)) {
+        let key = (stack.material, stack.shape, stack.detail.as_deref());
+        // **And the detail, or consolidating loses it.** Two stacks a mod says
+        // are different items must stay two entries; sorting by the pair alone
+        // put them next to each other and the merge below then refused, which
+        // is correct but only because the key found the right neighbour.
+        match merged.binary_search_by(|existing| {
+            (
+                existing.material,
+                existing.shape,
+                existing.detail.as_deref(),
+            )
+                .cmp(&key)
+        }) {
             Ok(found) => {
-                if merged[found].merge(stack).is_err() {
-                    // Overflow: keep it separate rather than losing material.
+                if merged[found].merge(&stack).is_err() {
+                    // Overflow, or a mod's own difference: keep it separate
+                    // rather than losing material.
                     merged.insert(found + 1, stack);
                 }
             }
@@ -612,6 +683,29 @@ pub fn units_of(stacks: &[Stack], material: MaterialId) -> u32 {
     stacks
         .iter()
         .filter(|stack| stack.material == material)
+        .fold(0u32, |total, stack| total.saturating_add(stack.units))
+}
+
+/// The same, for one particular kind of stack.
+///
+/// **What a placement has to ask.** `units_of` counts every stack of a
+/// material, and a player holding one named block and sixty plain ones has
+/// sixty-one of neither: spending the named one against the total would let
+/// them place a block they do not have. Matched the way
+/// [`crate::inventory::Slots::take`] matches, so what is counted is what can
+/// then be spent.
+#[must_use]
+pub fn units_of_exactly(
+    stacks: &[Stack],
+    material: MaterialId,
+    shape: Option<Shape>,
+    detail: Option<&str>,
+) -> u32 {
+    stacks
+        .iter()
+        .filter(|stack| {
+            stack.material == material && stack.shape == shape && stack.detail.as_deref() == detail
+        })
         .fold(0u32, |total, stack| total.saturating_add(stack.units))
 }
 
@@ -701,6 +795,7 @@ pub trait Access: Send + Sync {
         view: &str,
         material: MaterialId,
         shape: Option<Shape>,
+        detail: Option<&str>,
         units: u32,
     ) -> u32;
 }
@@ -828,7 +923,7 @@ mod tests {
 
         let mut mine = Stack::shaped(MaterialId(3), shape, 2).expect("stack");
         assert!(
-            mine.merge(Stack::shaped(MaterialId(3), shape, 3).expect("stack"))
+            mine.merge(&Stack::shaped(MaterialId(3), shape, 3).expect("stack"))
                 .is_ok()
         );
         assert_eq!(mine.count(), 5);
@@ -837,7 +932,7 @@ mod tests {
         // second are NOT quietly folded in.
         let before = mine.units;
         assert!(matches!(
-            mine.merge(Stack::shaped(MaterialId(3), other, 1).expect("stack")),
+            mine.merge(&Stack::shaped(MaterialId(3), other, 1).expect("stack")),
             Err(StackError::ShapeMismatch { .. })
         ));
         assert_eq!(mine.units, before, "a refused merge changed the stack");
@@ -845,7 +940,7 @@ mod tests {
         // And shaped never merges with loose, which is the case that would
         // otherwise silently turn somebody's work back into rubble.
         assert!(matches!(
-            mine.merge(Stack::new(MaterialId(3), 27).expect("loose")),
+            mine.merge(&Stack::new(MaterialId(3), 27).expect("loose")),
             Err(StackError::ShapeMismatch { .. })
         ));
     }
@@ -933,7 +1028,8 @@ mod tests {
             vec![Stack {
                 material: STONE,
                 units: 27,
-                shape: None
+                shape: None,
+                detail: None,
             }]
         );
     }
@@ -954,7 +1050,8 @@ mod tests {
             vec![Stack {
                 material: STONE,
                 units: 3,
-                shape: None
+                shape: None,
+                detail: None,
             }]
         );
     }
@@ -974,17 +1071,20 @@ mod tests {
                 Stack {
                     material: STONE,
                     units: 2,
-                    shape: None
+                    shape: None,
+                    detail: None,
                 },
                 Stack {
                     material: DIRT,
                     units: 1,
-                    shape: None
+                    shape: None,
+                    detail: None,
                 },
                 Stack {
                     material: GRASS,
                     units: 1,
-                    shape: None
+                    shape: None,
+                    detail: None,
                 },
             ]
         );
@@ -1021,15 +1121,67 @@ mod tests {
             material: STONE,
             units: 10,
             shape: None,
+            detail: None,
         };
         stack
-            .merge(Stack {
+            .merge(&Stack {
                 material: STONE,
                 units: 5,
                 shape: None,
+                detail: None,
             })
             .expect("merge");
         assert_eq!(stack.units, 15);
+    }
+
+    #[test]
+    fn two_items_a_mod_says_are_different_do_not_become_one() {
+        // **The whole reason a stack has a detail.** Without it, a sword worn
+        // to eleven and one worn to four are one stack of two swords, and
+        // there is no way for a mod to say otherwise.
+        let mut worn = Stack::new(STONE, 1).expect("stack");
+        worn.detail = Some("wear=11".to_owned());
+        let mut fresh = Stack::new(STONE, 1).expect("stack");
+        fresh.detail = Some("wear=4".to_owned());
+
+        assert_eq!(worn.merge(&fresh), Err(StackError::DetailMismatch));
+        assert_eq!(worn.units, 1, "a refused merge changed the stack");
+
+        // And the same word merges, or a mod could never have ninety arrows.
+        let mut same = Stack::new(STONE, 1).expect("stack");
+        same.detail = Some("wear=11".to_owned());
+        assert_eq!(worn.merge(&same), Ok(()));
+        assert_eq!(worn.units, 2);
+    }
+
+    #[test]
+    fn a_plain_stack_and_a_marked_one_are_two_stacks() {
+        // The case a player meets first: one named block among sixty plain
+        // ones. Consolidation is what an inventory listing is built from, so a
+        // detail lost here is a detail lost everywhere.
+        let plain = Stack::new(STONE, 60).expect("stack");
+        let mut named = Stack::new(STONE, 1).expect("stack");
+        named.detail = Some("mine".to_owned());
+
+        let merged = consolidate([plain, named]);
+        assert_eq!(merged.len(), 2, "the named block was folded into the pile");
+        assert_eq!(
+            merged.iter().map(|stack| stack.units).sum::<u32>(),
+            61,
+            "consolidating changed how much there is"
+        );
+    }
+
+    #[test]
+    fn splitting_keeps_which_item_it_is() {
+        // Ten arrows off a stack of ninety are ten of what was there, or the
+        // two halves would refuse to merge back together — which is material
+        // that can be split and never rejoined.
+        let mut stack = Stack::new(STONE, 90).expect("stack");
+        stack.detail = Some("fire".to_owned());
+        let taken = stack.split(10).expect("split");
+        assert_eq!(taken.detail, stack.detail);
+        assert_eq!(stack.merge(&taken), Ok(()), "the halves would not rejoin");
     }
 
     #[test]
@@ -1038,12 +1190,14 @@ mod tests {
             material: STONE,
             units: 10,
             shape: None,
+            detail: None,
         };
         let err = stack
-            .merge(Stack {
+            .merge(&Stack {
                 material: DIRT,
                 units: 5,
                 shape: None,
+                detail: None,
             })
             .expect_err("materials differ");
         assert!(matches!(err, StackError::MaterialMismatch { .. }));
@@ -1058,12 +1212,14 @@ mod tests {
             material: STONE,
             units: u32::MAX,
             shape: None,
+            detail: None,
         };
         let err = stack
-            .merge(Stack {
+            .merge(&Stack {
                 material: STONE,
                 units: 1,
                 shape: None,
+                detail: None,
             })
             .expect_err("should overflow");
         assert!(matches!(err, StackError::Overflow { .. }));
@@ -1080,6 +1236,7 @@ mod tests {
             material: STONE,
             units: 30,
             shape: None,
+            detail: None,
         };
         let taken = stack.split(12).expect("split");
         assert_eq!(
@@ -1087,7 +1244,8 @@ mod tests {
             Stack {
                 material: STONE,
                 units: 12,
-                shape: None
+                shape: None,
+                detail: None,
             }
         );
         assert_eq!(stack.units, 18);
@@ -1099,6 +1257,7 @@ mod tests {
             material: STONE,
             units: 30,
             shape: None,
+            detail: None,
         };
         let taken = stack.split(30).expect("split");
         assert_eq!(taken.units, 30);
@@ -1111,6 +1270,7 @@ mod tests {
             material: STONE,
             units: 5,
             shape: None,
+            detail: None,
         };
         let err = stack.split(6).expect_err("insufficient");
         assert!(matches!(err, StackError::Insufficient { .. }));
@@ -1124,21 +1284,25 @@ mod tests {
                 material: GRASS,
                 units: 3,
                 shape: None,
+                detail: None,
             },
             Stack {
                 material: STONE,
                 units: 4,
                 shape: None,
+                detail: None,
             },
             Stack {
                 material: GRASS,
                 units: 2,
                 shape: None,
+                detail: None,
             },
             Stack {
                 material: STONE,
                 units: 1,
                 shape: None,
+                detail: None,
             },
         ]);
         assert_eq!(
@@ -1147,12 +1311,14 @@ mod tests {
                 Stack {
                     material: STONE,
                     units: 5,
-                    shape: None
+                    shape: None,
+                    detail: None,
                 },
                 Stack {
                     material: GRASS,
                     units: 5,
-                    shape: None
+                    shape: None,
+                    detail: None,
                 },
             ]
         );
@@ -1165,11 +1331,13 @@ mod tests {
                 material: STONE,
                 units: u32::MAX,
                 shape: None,
+                detail: None,
             },
             Stack {
                 material: STONE,
                 units: 100,
                 shape: None,
+                detail: None,
             },
         ]);
         assert_eq!(stacks.len(), 2, "material must not be destroyed");
@@ -1183,16 +1351,19 @@ mod tests {
                 material: MaterialId::AIR,
                 units: 27,
                 shape: None,
+                detail: None,
             },
             Stack {
                 material: STONE,
                 units: 0,
                 shape: None,
+                detail: None,
             },
             Stack {
                 material: STONE,
                 units: 3,
                 shape: None,
+                detail: None,
             },
         ]);
         assert_eq!(
@@ -1200,7 +1371,8 @@ mod tests {
             vec![Stack {
                 material: STONE,
                 units: 3,
-                shape: None
+                shape: None,
+                detail: None,
             }]
         );
     }

@@ -754,6 +754,9 @@ impl HudVm {
             slot.set("blocks", blocks)?;
             slot.set("nodes", nodes)?;
             slot.set("shape", (entry.shape != 0).then_some(entry.shape))?;
+            // A mod's own word for which item this is, for the mod that set it
+            // — a durability bar, or a name under the slot.
+            slot.set("detail", entry.detail.clone())?;
             // Items, for a cut. `nil` for loose material, where blocks and
             // spare nodes is the display and a count means nothing.
             slot.set("count", entry.count())?;
@@ -860,6 +863,7 @@ mod tests {
                 // and thirteen spare nodes.
                 units: 40,
                 shape: 0,
+                detail: None,
             })],
             ..State::default()
         }
@@ -924,6 +928,7 @@ end)
             name: "core_blocks:white".to_owned(),
             units: CUT.count_ones(),
             shape: CUT,
+            detail: None,
         })];
         assert!(vm.draw(&cut_state).is_empty(), "the reference HUD faulted");
         let drawn = commands(&vm);

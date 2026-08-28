@@ -343,3 +343,115 @@ fn world_x(at: &bot::client::PlayerPosition) -> f64 {
         f64::from(at.chunk.x) * f64::from(tiamot_core::CHUNK_SUBNODES) + f64::from(at.local[0]);
     cells / f64::from(tiamot_core::SUBNODES_PER_AXIS)
 }
+
+/// A mod that hands out two of the same thing, told apart by a detail.
+fn write_smith(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("smith");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"smith\"\nname = \"Smith\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+local ground = game.register_block{ id = "ground" }
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(game.flat_heightmap(0), ground)
+end)
+
+-- Two swords, worn to different amounts. Same material, same cut: only the
+-- mod's own word tells them apart.
+game.register_on_player_join(function(event)
+    game.give(event.player, { material = "smith:ground", units = 1, detail = "wear=11" })
+    game.give(event.player, { material = "smith:ground", units = 1, detail = "wear=4" })
+    game.give(event.player, { material = "smith:ground", units = 27 })
+end)
+
+game.register_on_chat(function(event)
+    if event.text ~= "melt" then
+        return
+    end
+    -- Asking for plain material must not reach either sword.
+    local took = game.take(event.player, { material = "smith:ground", units = 99 })
+    game.give(event.player, { material = "smith:ground", units = took, detail = "melted" })
+    return false
+end)
+"#,
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn two_items_a_mod_says_are_different_stay_different() {
+    // **The whole reason a stack carries a detail**, end to end: through
+    // `game.give`, the server's slots, the wire and back out to a client. Two
+    // swords worn to different amounts are two stacks; a recipe asking for
+    // plain material reaches neither.
+    let server = start("details", write_smith("details"));
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Smith").await.expect("join");
+
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let marked: Vec<Option<String>> = bot
+                .inventory()
+                .iter()
+                .map(|stack| stack.detail.clone())
+                .collect();
+            if marked.len() == 3 {
+                assert!(
+                    marked.contains(&Some("wear=11".to_owned()))
+                        && marked.contains(&Some("wear=4".to_owned()))
+                        && marked.contains(&None),
+                    "the two swords and the plain material did not stay three stacks: {marked:?}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected three stacks, got {marked:?}"
+            );
+            bot.recv().await.expect("recv");
+        }
+
+        // And a recipe asking for plain material takes only the plain material.
+        bot.chat("melt").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let details: Vec<Option<String>> = bot
+                .inventory()
+                .iter()
+                .map(|stack| stack.detail.clone())
+                .collect();
+            if details.contains(&Some("melted".to_owned())) {
+                assert!(
+                    details.contains(&Some("wear=11".to_owned()))
+                        && details.contains(&Some("wear=4".to_owned())),
+                    "melting down the plain material took the swords too: {details:?}"
+                );
+                assert!(
+                    !details.contains(&None),
+                    "the plain material was not the thing that melted: {details:?}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "nothing melted: {details:?}"
+            );
+            bot.recv().await.expect("recv");
+        }
+    });
+}

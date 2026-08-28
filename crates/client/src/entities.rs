@@ -114,8 +114,8 @@ impl Entity {
     fn from_def(def: &EntityDef, at: Duration) -> Self {
         Self {
             model: def.model.clone(),
-            item: def.item,
-            hands: def.hands,
+            item: def.item.clone().clone(),
+            hands: def.hands.clone().clone(),
             collider: def.collider,
             nametag: def.nametag.clone(),
             samples: vec![Sample {
@@ -345,7 +345,7 @@ impl Entities {
     pub fn rearmed(&mut self, entities: &[tiamot_core::proto::EntityHands]) {
         for armed in entities {
             if let Some(known) = self.held.get_mut(&armed.id) {
-                known.hands = armed.hands;
+                known.hands.clone_from(&armed.hands);
             }
         }
     }

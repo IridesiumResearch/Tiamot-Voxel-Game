@@ -110,6 +110,9 @@ pub enum Action {
         /// The outward normal of the surface it was placed against, or all
         /// zeroes for no preference. See [`crate::place::oriented`].
         face: [i8; 3],
+        /// Which stack is being spent, when a mod says two are different
+        /// things. See [`crate::inventory::Stack::detail`].
+        detail: Option<String>,
     },
 
     /// Hit an entity.
@@ -423,11 +426,13 @@ impl Session {
                 material,
                 shape,
                 face,
+                detail,
             } => Response::act(Action::Place {
                 target: *target,
                 material: *material,
                 shape: *shape,
                 face: *face,
+                detail: detail.clone(),
             }),
             _ => return None,
         })

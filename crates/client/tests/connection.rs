@@ -660,6 +660,7 @@ fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
                 name: "core_blocks:white".to_owned(),
                 units: 27,
                 shape: 0,
+                detail: None,
             }),
             Some(tiamot_core::hud::Carried {
                 material: tiamot_core::MaterialId(4),
@@ -668,6 +669,7 @@ fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
                 // thirteen spare nodes, and the HUD must say so.
                 units: 40,
                 shape: 0,
+                detail: None,
             }),
             None,
             Some(tiamot_core::hud::Carried {
@@ -675,6 +677,7 @@ fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
                 name: "core_blocks:grey".to_owned(),
                 units: 9,
                 shape: 0,
+                detail: None,
             }),
         ],
         ..tiamot_core::hud::State::default()

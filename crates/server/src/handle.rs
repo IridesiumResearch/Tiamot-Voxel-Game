@@ -154,13 +154,14 @@ fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
 /// Its own function because three messages send stacks now — what an entity IS,
 /// what it is HOLDING, and what is in a view — and three copies of the same
 /// four lines is where one of them quietly stops matching.
-fn stack_def(stack: tiamot_core::inventory::Stack) -> tiamot_core::proto::StackDef {
+fn stack_def(stack: &tiamot_core::inventory::Stack) -> tiamot_core::proto::StackDef {
     tiamot_core::proto::StackDef {
         material: stack.material.0,
         units: stack.units,
         shape: stack
             .shape
             .map_or(0, tiamot_core::inventory::Shape::occupancy),
+        detail: stack.detail.clone(),
     }
 }
 
@@ -213,10 +214,10 @@ fn entity_messages(
                 anim: spawn.anim.0,
                 model: spawn.model,
                 collider: spawn.collider.map(|box_| [box_.width, box_.height]),
-                item: spawn.item.map(stack_def),
+                item: spawn.item.as_ref().map(stack_def),
                 hands: [
-                    spawn.hands.main.map(stack_def),
-                    spawn.hands.off.map(stack_def),
+                    spawn.hands.main.as_ref().map(stack_def),
+                    spawn.hands.off.as_ref().map(stack_def),
                 ],
                 // Resolved here, where the roster is. Charter rule 13: a
                 // display name is a per-server claim bound to a UUID, so the
@@ -266,8 +267,8 @@ fn entity_messages(
             .map(|armed| tiamot_core::proto::EntityHands {
                 id: armed.id.0,
                 hands: [
-                    armed.hands.main.map(stack_def),
-                    armed.hands.off.map(stack_def),
+                    armed.hands.main.as_ref().map(stack_def),
+                    armed.hands.off.as_ref().map(stack_def),
                 ],
             })
             .collect();
@@ -1977,9 +1978,17 @@ impl ServerHandle {
                         // out the reason for itself, so it has to be sent one.
                         for request in shared.drain_placements() {
                             let material = tiamot_core::MaterialId(request.material);
-                            let held = tiamot_core::inventory::units_of(
+                            // **What they hold of THIS stack**, not of this
+                            // material. A player with one named block and
+                            // sixty plain ones has sixty-one of neither, and
+                            // counting the total would let them place a block
+                            // they do not have — the shape defect the cut
+                            // fixed, in the detail's clothes.
+                            let held = tiamot_core::inventory::units_of_exactly(
                                 &shared.inventory_of(&request.actor),
                                 material,
+                                tiamot_core::inventory::Shape::new(request.shape),
+                                request.detail.as_deref(),
                             );
 
                             // **An item is not a block.** Everything a player
@@ -2219,7 +2228,13 @@ impl ServerHandle {
                             // on any path where the debit came up short —
                             // another connection of theirs spending it between
                             // the check and here is enough.
-                            let paid = shared.debit(&request.actor, material, shape, plan.units);
+                            let paid = shared.debit(
+                                &request.actor,
+                                material,
+                                shape,
+                                request.detail.as_deref(),
+                                plan.units,
+                            );
                             if paid == 0 {
                                 shared.tell(
                                     &request.actor,
@@ -2294,12 +2309,22 @@ impl ServerHandle {
                                 // back what did not land. Anything else either
                                 // destroys material on a path a player did not
                                 // cause and cannot see, or mints it.
+                                // **Given back as what it was.** A refund that
+                                // dropped the cut or the detail would turn a
+                                // crafted stair, or somebody's named block,
+                                // into loose rubble on a path they did not
+                                // cause and cannot see.
                                 shared.credit(
                                     request.actor,
                                     tiamot_core::inventory::Stack::new(
                                         material,
                                         paid.saturating_sub(applied),
                                     )
+                                    .map(|stack| tiamot_core::inventory::Stack {
+                                        shape,
+                                        detail: request.detail.clone(),
+                                        ..stack
+                                    })
                                     .into_iter()
                                     .collect(),
                                 );
@@ -3310,7 +3335,7 @@ impl tiamot_core::inventory::Access for Carried {
             .view(tiamot_core::inventory::PLAYER_MAIN)?
             .slots
             .get(slot)
-            .copied()
+            .cloned()
             .flatten()
     }
 
@@ -3320,10 +3345,12 @@ impl tiamot_core::inventory::Access for Carried {
         view: &str,
         material: tiamot_core::material::MaterialId,
         shape: Option<tiamot_core::inventory::Shape>,
+        detail: Option<&str>,
         units: u32,
     ) -> u32 {
         let uuid = tiamot_core::identity::PlayerUuid::from_bytes(player);
-        self.shared.take(&uuid, view, material, shape, units)
+        self.shared
+            .take(&uuid, view, material, shape, detail, units)
     }
 }
 

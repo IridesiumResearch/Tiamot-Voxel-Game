@@ -405,7 +405,7 @@ fn splitting_a_stack_in_a_dialog_respects_the_twenty_seven_unit_arithmetic() {
             })
             .await
             .expect("the dug block never reached a slot");
-        let first = before[0].expect("a stack in slot 0");
+        let first = before[0].clone().expect("a stack in slot 0");
         let (material, units) = (first.material, first.units);
         assert!(units > 1, "need more than one unit to halve, got {units}");
 
@@ -425,13 +425,13 @@ fn splitting_a_stack_in_a_dialog_respects_the_twenty_seven_unit_arithmetic() {
             .until_view("player:main", |slots| {
                 slots
                     .first()
-                    .and_then(|slot| *slot)
+                    .and_then(|slot| slot.as_ref())
                     .is_none_or(|stack| stack.units < units)
             })
             .await
             .expect("the split never happened");
 
-        let behind = after[0].map_or(0, |stack| stack.units);
+        let behind = after[0].as_ref().map_or(0, |stack| stack.units);
         let held = bot.held().map_or(0, |stack| stack.units);
         assert_eq!(
             behind + held,
@@ -465,13 +465,15 @@ fn splitting_a_stack_in_a_dialog_respects_the_twenty_seven_unit_arithmetic() {
             .until_view("player:main", |slots| {
                 slots
                     .first()
-                    .and_then(|slot| *slot)
+                    .and_then(|slot| slot.as_ref())
                     .is_some_and(|stack| stack.units == units)
             })
             .await
             .expect("the halves never merged back");
         assert_eq!(
-            merged[0].map(|stack| (stack.material, stack.units)),
+            merged[0]
+                .as_ref()
+                .map(|stack| (stack.material, stack.units)),
             Some((material, units))
         );
         assert_eq!(bot.held(), None, "the hand should be empty after placing");
@@ -543,7 +545,7 @@ fn a_forged_slot_move_cannot_invent_items() {
         .expect("send");
         let after = bot
             .until_view("player:main", |slots| {
-                slots.first().and_then(|slot| *slot).is_none()
+                slots.first().and_then(|slot| slot.as_ref()).is_none()
             })
             .await
             .expect("the honest click never landed, so this test proves nothing");

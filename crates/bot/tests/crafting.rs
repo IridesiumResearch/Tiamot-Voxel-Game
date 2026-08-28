@@ -487,7 +487,7 @@ fn placing_a_cut_stack_puts_that_cut_in_the_world() {
             .inventory()
             .iter()
             .find(|stack| stack.shape != 0)
-            .copied()
+            .cloned()
             .expect("a cut stack");
 
         // In reach, empty, and not where the player is standing — a placement
@@ -562,7 +562,7 @@ fn a_cut_turns_to_face_whoever_places_it() {
         let deadline = tokio::time::Instant::now() + PATIENCE;
         let cut = loop {
             if let Some(stack) = bot.inventory().iter().find(|stack| stack.shape != 0) {
-                break *stack;
+                break stack.clone();
             }
             assert!(
                 tokio::time::Instant::now() < deadline,

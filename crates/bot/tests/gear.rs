@@ -241,7 +241,12 @@ fn what_a_player_drops_lands_as_an_entity_and_comes_back() {
         // And appears on the floor.
         let dropped = bot
             .expect_entity(
-                |entity| entity.item.is_some_and(|stack| stack.material == sword),
+                |entity| {
+                    entity
+                        .item
+                        .as_ref()
+                        .is_some_and(|stack| stack.material == sword)
+                },
                 PATIENCE,
             )
             .await
@@ -281,7 +286,12 @@ fn what_a_player_drops_lands_as_an_entity_and_comes_back() {
             let at = bot
                 .entities()
                 .into_values()
-                .find(|entity| entity.item.is_some_and(|stack| stack.material == sword))
+                .find(|entity| {
+                    entity
+                        .item
+                        .as_ref()
+                        .is_some_and(|stack| stack.material == sword)
+                })
                 .map(|entity| {
                     let cells =
                         f32::from(u16::try_from(tiamot_core::SUBNODES_PER_AXIS).unwrap_or(3));
@@ -413,7 +423,12 @@ fn a_dropped_stack_can_still_be_picked_up_after_the_world_is_reopened() {
 
             // On the ground, and out of the inventory, before the world closes.
             bot.expect_entity(
-                |entity| entity.item.is_some_and(|stack| stack.material == sword),
+                |entity| {
+                    entity
+                        .item
+                        .as_ref()
+                        .is_some_and(|stack| stack.material == sword)
+                },
                 PATIENCE,
             )
             .await
@@ -460,7 +475,12 @@ fn a_dropped_stack_can_still_be_picked_up_after_the_world_is_reopened() {
         // It is still there.
         let dropped = bot
             .expect_entity(
-                |entity| entity.item.is_some_and(|stack| stack.material == sword),
+                |entity| {
+                    entity
+                        .item
+                        .as_ref()
+                        .is_some_and(|stack| stack.material == sword)
+                },
                 PATIENCE,
             )
             .await
@@ -481,7 +501,12 @@ fn a_dropped_stack_can_still_be_picked_up_after_the_world_is_reopened() {
             let at = bot
                 .entities()
                 .into_values()
-                .find(|entity| entity.item.is_some_and(|stack| stack.material == sword))
+                .find(|entity| {
+                    entity
+                        .item
+                        .as_ref()
+                        .is_some_and(|stack| stack.material == sword)
+                })
                 .unwrap_or_else(|| dropped.clone());
             let cells = f32::from(u16::try_from(tiamot_core::SUBNODES_PER_AXIS).unwrap_or(3));
             let span = tiamot_core::CHUNK_BLOCKS as f32;

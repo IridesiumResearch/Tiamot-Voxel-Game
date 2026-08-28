@@ -524,6 +524,7 @@ mod tests {
                     material: 2,
                     units: 243,
                     shape: 0,
+                    detail: None,
                 }]),
                 _ => Reply::Done,
             },

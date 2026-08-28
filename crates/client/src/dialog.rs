@@ -236,7 +236,7 @@ fn paint_cursor_stack(
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
 ) {
-    let Some(stack) = views.values().find_map(|contents| contents.held) else {
+    let Some(stack) = views.values().find_map(|contents| contents.held.as_ref()) else {
         return;
     };
     let Some(at) = ctx.pointer_latest_pos() else {
@@ -1231,7 +1231,7 @@ fn paint_slot(
     // What the server last said is in it.
     if let Some(stack) = views
         .get(view)
-        .and_then(|contents| contents.slots.get(usize::from(index)).copied().flatten())
+        .and_then(|contents| contents.slots.get(usize::from(index)).cloned().flatten())
     {
         let (material, units) = (stack.material, stack.units);
         paint

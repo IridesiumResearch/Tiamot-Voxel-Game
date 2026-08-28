@@ -265,6 +265,7 @@ fn client_messages() -> Vec<Vec<u8>> {
             material: 3,
             shape: 0,
             face: [0; 3],
+            detail: None,
         },
         ClientMessage::Place {
             target: SubNodePos::new(i32::MAX, i32::MIN, 0),
@@ -274,6 +275,7 @@ fn client_messages() -> Vec<Vec<u8>> {
             // than as a shape nobody can hold.
             shape: u32::MAX,
             face: [0; 3],
+            detail: None,
         },
         ClientMessage::Place {
             target: SubNodePos::new(0, 0, 0),
@@ -282,6 +284,7 @@ fn client_messages() -> Vec<Vec<u8>> {
             // Protocol v34: a cut placed against a wall, which is the case
             // that turns the geometry rather than leaving it as authored.
             face: [1, 0, 0],
+            detail: None,
         },
         // Protocol v12. Missing until v15 — the checklist's re-seed step is the
         // one people skip, and a corpus that stops at an older variant means
@@ -737,6 +740,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                     material: 3,
                     units: 40,
                     shape: 0,
+                    detail: None,
                 }),
                 None,
                 // Protocol v24: a shaped stack, which is the shape a decoder
@@ -745,12 +749,14 @@ fn server_messages() -> Vec<Vec<u8>> {
                     material: 4,
                     units: 27,
                     shape: 0b1_0101,
+                    detail: None,
                 }),
             ],
             held: Some(tiamot_core::proto::StackDef {
                 material: 3,
                 units: 13,
                 shape: 0,
+                detail: None,
             }),
         },
         // Protocol v23: the cue table and the loops.
