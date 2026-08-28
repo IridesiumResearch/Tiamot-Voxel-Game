@@ -263,6 +263,9 @@ pub struct MluaVm {
     storage: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::storage::Access>>>>,
     /// Where `game.set_hud` sends a mod's own HUD values.
     hud: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::hud::Access>>>>,
+    /// Where the container calls reach the world's chests.
+    containers:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::inventory::Containers>>>>,
     /// Where `game.line_of_sight` looks, while the tick has lent the world out.
     ///
     /// Unlike every other slot here, what is behind this one comes and goes
@@ -623,6 +626,7 @@ impl ScriptVm for MluaVm {
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
             storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
             hud: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            containers: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sight: std::sync::Arc::new(std::sync::Mutex::new(None)),
             paths: std::sync::Arc::new(std::sync::Mutex::new(None)),
             edits: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -771,6 +775,12 @@ impl ScriptVm for MluaVm {
 
     fn set_hud_access(&mut self, access: std::sync::Arc<dyn crate::hud::Access>) {
         if let Ok(mut slot) = self.hud.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_container_access(&mut self, access: std::sync::Arc<dyn crate::inventory::Containers>) {
+        if let Ok(mut slot) = self.containers.lock() {
             *slot = Some(access);
         }
     }
@@ -3143,6 +3153,99 @@ impl MluaVm {
         Ok(())
     }
 
+    /// Puts the container calls on the `game` table.
+    ///
+    /// **Not namespaced by mod, unlike storage and HUD values.** A container is
+    /// a place in the world and two mods may legitimately want at the same one
+    /// — a hopper feeding a furnace is exactly that. The name is the mod's to
+    /// choose and to keep unique, the way a block id is.
+    fn install_container_api(&self, game: &Table) -> Result<(), ScriptError> {
+        macro_rules! reach {
+            ($slot:expr, $default:expr, $call:expr) => {
+                $slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map($call))
+                    .unwrap_or($default)
+            };
+        }
+
+        let slot = std::sync::Arc::clone(&self.containers);
+        let make = self
+            .lua
+            .create_function(move |_, (name, slots): (String, usize)| {
+                if name.is_empty() {
+                    return Err(mlua::Error::external(
+                        "game.make_container needs a name; it is how the container is found again",
+                    ));
+                }
+                if slots == 0 || slots > crate::inventory::MAX_VIEW_SLOTS {
+                    return Err(mlua::Error::external(format!(
+                        "a container has 1 to {} slots, and this one asked for {slots}",
+                        crate::inventory::MAX_VIEW_SLOTS
+                    )));
+                }
+                Ok(reach!(slot, false, |access| access.ensure(&name, slots)))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("make_container", make)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.containers);
+        let open = self
+            .lua
+            .create_function(move |_, (name, uuid): (String, String)| {
+                let player = player_of(&uuid, "open_container")?;
+                Ok(reach!(slot, false, |access| access.open(&name, player)))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("open_container", open)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.containers);
+        let close = self
+            .lua
+            .create_function(move |_, (name, uuid): (String, String)| {
+                let player = player_of(&uuid, "close_container")?;
+                Ok(reach!(slot, false, |access| access.close(&name, player)))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("close_container", close)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.containers);
+        let read = self
+            .lua
+            .create_function(move |lua, name: String| {
+                let stacks: Vec<crate::inventory::Stack> =
+                    reach!(slot, Vec::new(), |access| access.contents(&name));
+                let list = lua.create_table()?;
+                for stack in &stacks {
+                    list.push(stack_table(lua, stack)?)?;
+                }
+                Ok(list)
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("container", read)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.containers);
+        let remove = self
+            .lua
+            .create_function(move |lua, name: String| {
+                let stacks: Vec<crate::inventory::Stack> =
+                    reach!(slot, Vec::new(), |access| access.remove(&name));
+                let list = lua.create_table()?;
+                for stack in &stacks {
+                    list.push(stack_table(lua, stack)?)?;
+                }
+                Ok(list)
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("break_container", remove)
+            .map_err(|err| self.vm_error(&err))
+    }
+
     /// Puts `game.set_hud` on the `game` table.
     ///
     /// **The mod id is captured, never passed**, exactly as `game.storage`'s
@@ -3435,6 +3538,7 @@ impl MluaVm {
         self.install_entity_api(mod_id, game)?;
         self.install_storage_api(mod_id, game)?;
         self.install_hud_api(mod_id, game)?;
+        self.install_container_api(game)?;
         self.install_heading(game)?;
 
         let (get_fluid, set_fluid) = self.fluid_functions()?;

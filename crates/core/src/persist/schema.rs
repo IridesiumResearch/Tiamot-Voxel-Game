@@ -154,6 +154,24 @@ CREATE TABLE IF NOT EXISTS mod_storage (
     PRIMARY KEY (mod_id, key)
 );
 
+-- Inventories that belong to the WORLD rather than to a player: a chest, a
+-- furnace, a hopper. Named by the mod that made them, which is how one is
+-- found again when somebody opens the block it belongs to.
+--
+-- Kept here rather than in `mod_storage` because the engine owns the slots. A
+-- mod serialising its own chests would be a mod reimplementing stacking,
+-- conservation and the material id map — and getting one of them wrong
+-- somewhere the engine could have got it right.
+--
+-- Additive, like `mod_storage`: `CREATE TABLE IF NOT EXISTS` gives an older
+-- world the new table empty on the next open, so this does not bump
+-- SCHEMA_VERSION.
+CREATE TABLE IF NOT EXISTS containers (
+    name    TEXT PRIMARY KEY,
+    version INT NOT NULL,
+    data    BLOB NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS entities_by_chunk
     ON entities (domain, chunk_x, chunk_y, chunk_z);
 

@@ -1579,3 +1579,53 @@ mod placement_tests {
         }
     }
 }
+
+/// The seam a mod reaches world-anchored inventories through.
+///
+/// Chests, furnaces, hoppers: an inventory that belongs to a place rather than
+/// to a person. The engine owns the slots — their stacking, their conservation
+/// and their persistence — and the mod owns everything else about them, which
+/// is why they are named by a string the mod chooses rather than by a block
+/// position the engine would have to understand.
+///
+/// A container is **lent to one player at a time**. Opening one puts its view
+/// into that player's own slots, so every mechanism that already exists works
+/// on it unchanged; lending it twice would give two players a copy each and let
+/// the second to close overwrite the first. See `server::containers`.
+pub trait Containers: Send + Sync {
+    /// Makes a container if there is not one already. Returns whether it is new.
+    ///
+    /// The size applies to one being MADE; an existing container keeps the size
+    /// it has, because resizing somebody's chest under them is a decision a mod
+    /// should have to make out loud.
+    fn ensure(&self, name: &str, slots: usize) -> bool;
+
+    /// Opens a container for a player, so their screen can show it.
+    ///
+    /// Returns whether it opened. `false` means there is no such container, the
+    /// player is not connected, or somebody else has it — and the third is the
+    /// case worth telling the player about.
+    fn open(&self, name: &str, player: [u8; 32]) -> bool;
+
+    /// Closes one, putting its contents back into the world.
+    ///
+    /// Happens on its own when the screen closes and when the player leaves; a
+    /// mod calls this when it wants the container back for its own reasons.
+    fn close(&self, name: &str, player: [u8; 32]) -> bool;
+
+    /// What is in a container, when nobody has it open.
+    ///
+    /// Empty for one that is open — reading a copy that is about to be replaced
+    /// would be worse than reading nothing.
+    fn contents(&self, name: &str) -> Vec<Stack>;
+
+    /// Removes a container and hands back what was in it.
+    ///
+    /// **Nothing is destroyed.** The contents come back so the mod that broke
+    /// the block can drop them; emptying a chest into nowhere is a conservation
+    /// hole on a path a player caused and can see (charter rule 5).
+    ///
+    /// Empty and untouched while somebody has it open: those items are in
+    /// another player's hands.
+    fn remove(&self, name: &str) -> Vec<Stack>;
+}

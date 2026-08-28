@@ -484,6 +484,88 @@ impl World {
         )
     }
 
+    /// Every container the world holds, decoded into views.
+    ///
+    /// The count is how many stacks could not be restored — a material whose
+    /// mod is gone, or a row that no longer fits — so a caller can say so out
+    /// loud rather than have a chest quietly come back short.
+    ///
+    /// `sized` says how many slots a container of that name should have. A
+    /// container the mods no longer know about keeps whatever it was stored
+    /// with, because forgetting the size would be deciding to throw away rows
+    /// of somebody's chest on behalf of a mod that is not there to ask.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the rows cannot be read.
+    pub fn load_containers(
+        &self,
+        sized: &dyn Fn(&str) -> Option<usize>,
+    ) -> Result<(Vec<(String, inventory::View)>, usize), WorldError> {
+        let mut out = Vec::new();
+        let mut dropped = 0;
+        for (name, blob) in self.db.load_containers()? {
+            let Some((&version, rest)) = blob.split_first() else {
+                tracing::warn!(container = %name, "a container row is empty and was skipped");
+                continue;
+            };
+            let stored_slots = sized(&name).unwrap_or(tiamot_core::inventory::MAX_VIEW_SLOTS);
+            match tiamot_core::persist::containers::decode(
+                version,
+                rest,
+                &name,
+                stored_slots,
+                self.db.materials(),
+            ) {
+                Ok((view, lost)) => {
+                    dropped += lost;
+                    out.push((name, view));
+                }
+                Err(err) => {
+                    // One unreadable container is not a world that will not
+                    // open. Said out loud, and the rest come back.
+                    tracing::warn!(container = %name, "could not read a container: {err}");
+                }
+            }
+        }
+        Ok((out, dropped))
+    }
+
+    /// Writes one container.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the row cannot be written.
+    pub fn save_container(&self, name: &str, view: &inventory::View) -> Result<(), WorldError> {
+        let (bytes, dropped) = tiamot_core::persist::containers::encode(view, self.db.materials());
+        if dropped > 0 {
+            tracing::warn!(
+                container = %name,
+                dropped,
+                "some stacks hold a material this world cannot name and were not saved"
+            );
+        }
+        // The version travels with the blob, in its first byte, for the reason
+        // a player's does: a row read by anything else still says its shape.
+        let mut row = Vec::with_capacity(bytes.len() + 1);
+        row.push(tiamot_core::persist::containers::CONTAINER_FORMAT_VERSION);
+        row.extend_from_slice(&bytes);
+        self.db.save_container(
+            name,
+            tiamot_core::persist::containers::CONTAINER_FORMAT_VERSION,
+            &row,
+        )
+    }
+
+    /// Forgets a container whose block has been broken.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the row cannot be deleted.
+    pub fn delete_container(&self, name: &str) -> Result<(), WorldError> {
+        self.db.delete_container(name)
+    }
+
     #[must_use]
     pub fn resident(&self, pos: ChunkPos) -> Option<&Chunk> {
         self.cache.get(&pos)

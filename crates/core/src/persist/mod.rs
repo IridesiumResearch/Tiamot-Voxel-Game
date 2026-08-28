@@ -31,6 +31,7 @@
 //! see [`crate::chunk::CorruptChunk`].
 
 pub mod codec;
+pub mod containers;
 pub mod fluidmap;
 pub mod idmap;
 pub mod migrate;
@@ -1018,6 +1019,51 @@ impl WorldDb {
              ON CONFLICT(uuid) DO UPDATE SET version = excluded.version, data = excluded.data",
             params![uuid, i64::from(version), data],
         )?;
+        Ok(())
+    }
+
+    /// Every container the world holds, by name, with its version byte first.
+    ///
+    /// Loaded whole at startup: a container is a handful of stacks and a world
+    /// has as many as somebody has placed chests. Fetching one at a time as
+    /// blocks are opened would put a database read inside the tick, on a path
+    /// a player is standing there waiting on.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn load_containers(&self) -> Result<Vec<(String, Vec<u8>)>, WorldError> {
+        let mut statement = self.conn.prepare("SELECT name, data FROM containers")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Writes one container's contents.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn save_container(&self, name: &str, version: u8, data: &[u8]) -> Result<(), WorldError> {
+        self.conn.execute(
+            "INSERT INTO containers (name, version, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET version = excluded.version, data = excluded.data",
+            params![name, i64::from(version), data],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets a container, for one whose block has been broken.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn delete_container(&self, name: &str) -> Result<(), WorldError> {
+        self.conn
+            .execute("DELETE FROM containers WHERE name = ?1", params![name])?;
         Ok(())
     }
 

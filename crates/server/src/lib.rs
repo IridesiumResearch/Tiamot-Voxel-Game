@@ -22,6 +22,7 @@ pub mod announce;
 pub mod cert;
 pub mod checkmods;
 pub mod config;
+pub mod containers;
 pub mod content;
 pub mod ent;
 pub mod fluid;

@@ -1498,6 +1498,29 @@ impl Shared {
     /// and which slot it clicked; this is where that becomes a change, against
     /// state the client cannot reach. A click on a slot that is not there does
     /// nothing (charter rule 14), and the caller learns nothing changed.
+    /// Runs `visit` against one player's inventory, if they are connected.
+    ///
+    /// **The only way in from outside**, so nothing else has to know the lock
+    /// is there. Used by the container store, which moves a view between the
+    /// world and a player and needs both halves under one lock or a container
+    /// can exist in two places for an instant.
+    pub fn with_slots<T>(
+        &self,
+        uuid: &PlayerUuid,
+        visit: impl FnOnce(&mut tiamot_core::inventory::Slots) -> T,
+    ) -> Option<T> {
+        let mut inventories = self.inventories.lock().ok()?;
+        let slots = inventories.get_mut(uuid)?;
+        Some(visit(slots))
+    }
+
+    /// Says a player's inventory has changed, so the next pass sends it.
+    pub fn mark_inventory_dirty(&self, uuid: &PlayerUuid) {
+        if let Ok(mut dirty) = self.inventory_dirty.lock() {
+            dirty.insert(*uuid);
+        }
+    }
+
     pub fn click_slot(
         &self,
         uuid: &PlayerUuid,

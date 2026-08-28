@@ -299,6 +299,39 @@ fn flush_mod_storage(
     }
 }
 
+/// Writes the containers whose contents changed, and forgets the broken ones.
+///
+/// Logged rather than fatal, like a mod's storage: a chest that could not be
+/// saved is bad and a server that stopped over it is worse. The names are
+/// drained, so a failure here means the change is written on the next pass
+/// rather than lost — the store keeps it either way, because the version in
+/// memory is the one players are looking at.
+fn flush_containers(
+    world: &crate::world::World,
+    containers: &std::sync::Mutex<crate::containers::Containers>,
+) {
+    let Ok(mut store) = containers.lock() else {
+        return;
+    };
+    let (dirty, gone) = store.take_pending();
+    for name in dirty {
+        // A container somebody has open is IN their slots, so there is nothing
+        // here to write — and what they do with it is written when they close
+        // it. Skipped rather than saved empty, which is what reading a lent
+        // container would produce.
+        if let Some(view) = store.contents(&name)
+            && let Err(err) = world.save_container(&name, view)
+        {
+            error!("could not save container `{name}`: {err}");
+        }
+    }
+    for name in gone {
+        if let Err(err) = world.delete_container(&name) {
+            error!("could not forget container `{name}`: {err}");
+        }
+    }
+}
+
 fn broadcast_light(
     shared: &Shared,
     lighting: &crate::light::Lighting,
@@ -1203,6 +1236,13 @@ impl ServerHandle {
                     let mod_storage = std::sync::Arc::new(std::sync::RwLock::new(
                         crate::storage::ModStorage::new(),
                     ));
+                    // Chests, furnaces, hoppers: inventories that belong to the
+                    // world rather than to a player. A `Mutex` and not an
+                    // `RwLock` because opening one MOVES a view between here and
+                    // a player's own slots, and there is no read half of that.
+                    let containers = std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::containers::Containers::new(),
+                    ));
 
                     // The world itself, lent to the mods for the part of each
                     // tick that runs their callbacks — everything they may learn
@@ -1255,6 +1295,41 @@ impl ServerHandle {
                             // than by scanning the table, so a mod that is no
                             // longer installed keeps its rows untouched instead
                             // of being resurrected into memory and written back.
+                            // **Before any mod runs**, so a mod that opens a
+                            // chest in its first tick finds what was in it
+                            // rather than an empty one it then overwrites.
+                            //
+                            // Sizes are not known here: the mods have not said
+                            // which container is which, and a container whose
+                            // mod is gone must keep the rows it has rather than
+                            // be trimmed on behalf of nobody. `sized` therefore
+                            // answers `None` and each comes back the size it
+                            // was stored at.
+                            match world.load_containers(&|_| None) {
+                                Ok((restored, dropped)) => {
+                                    if dropped > 0 {
+                                        warn!(
+                                            dropped,
+                                            "some stacks in containers hold a material this \
+                                             world can no longer name"
+                                        );
+                                    }
+                                    if let Ok(mut store) = containers.lock() {
+                                        for (name, view) in restored {
+                                            store.restore(name, view);
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    error!("could not read the world's containers: {err}");
+                                }
+                            }
+                            host.vm_mut().set_container_access(std::sync::Arc::new(
+                                crate::containers::Shared::new(
+                                    std::sync::Arc::clone(&containers),
+                                    std::sync::Arc::clone(&shared),
+                                ),
+                            ));
                             if let Ok(mut storage) = mod_storage.write() {
                                 for mod_id in host.resolved().ids() {
                                     match world.load_mod_storage(mod_id) {
@@ -1725,6 +1800,18 @@ impl ServerHandle {
                             // lose an inventory rather than a mirror.
                             for uuid in &known_players {
                                 if !present.contains(uuid) {
+                                    // **Anything they had open comes back
+                                    // first.** A container lent to somebody
+                                    // who has gone is one nobody can open
+                                    // again, and its contents would be written
+                                    // into that player's row as theirs —
+                                    // duplicating them for the player and
+                                    // losing them from the world.
+                                    if let Ok(mut store) = containers.lock() {
+                                        let _ = shared.with_slots(uuid, |slots| {
+                                            store.close_all(*uuid, slots)
+                                        });
+                                    }
                                     if let Some(slots) = shared.slots_of(uuid)
                                         && let Err(err) = world.save_player_slots(uuid, &slots)
                                     {
@@ -2703,6 +2790,21 @@ impl ServerHandle {
                             // picked up on is gone, which is how an item seems
                             // to disappear for good — and it would now stay
                             // there across a save.
+                            // **And any container that screen had open.** A
+                            // container lent to somebody whose screen has gone
+                            // is a container nobody can ever open again — and
+                            // its contents would sit in a player's slots,
+                            // saved as theirs.
+                            if closing
+                                && let Ok(mut store) = containers.lock()
+                            {
+                                let put_back = shared
+                                    .with_slots(&uuid, |slots| store.close_all(uuid, slots))
+                                    .unwrap_or_default();
+                                if !put_back.is_empty() {
+                                    shared.mark_inventory_dirty(&uuid);
+                                }
+                            }
                             if closing && shared.return_held(&uuid) {
                                 let _ = shared
                                     .push_entity_messages(&uuid, shared.view_updates(&uuid));
@@ -2996,6 +3098,8 @@ impl ServerHandle {
                             // every tick would otherwise be a database write
                             // every tick.
                             flush_mod_storage(&world, &mod_storage);
+                        flush_containers(&world, &containers);
+                            flush_containers(&world, &containers);
 
                             let mobs = population.write().expect("entity lock").take_dirty();
                             if !mobs.is_empty()
@@ -3051,6 +3155,19 @@ impl ServerHandle {
                         // nothing is lost, and the leave-diff above only fires
                         // for somebody the tick SAW go — which nobody does when
                         // the server stops under them.
+                        // **Containers come back BEFORE the inventories are
+                        // written**, or a chest somebody had open is saved as
+                        // part of that player and lost from the world — which
+                        // is a duplication on their side and a hole on the
+                        // world's.
+                        if let Ok(mut store) = containers.lock() {
+                            for (uuid, _) in shared.all_inventories() {
+                                let _ = shared
+                                    .with_slots(&uuid, |slots| store.close_all(uuid, slots));
+                            }
+                            store.mark_all();
+                        }
+                        flush_containers(&world, &containers);
                         for (uuid, slots) in shared.all_inventories() {
                             if let Err(err) = world.save_player_slots(&uuid, &slots) {
                                 error!(

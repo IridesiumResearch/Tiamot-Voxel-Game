@@ -936,6 +936,9 @@ pub trait ScriptVm: Sized {
     /// Points `game.storage` at the server's store.
     fn set_storage_access(&mut self, access: std::sync::Arc<dyn crate::storage::Access>);
 
+    /// Points the container API at the world's containers.
+    fn set_container_access(&mut self, access: std::sync::Arc<dyn crate::inventory::Containers>);
+
     /// Points `game.set_hud` at the per-player HUD values.
     ///
     /// The same seam as the others, and the reason it is one: the engine has

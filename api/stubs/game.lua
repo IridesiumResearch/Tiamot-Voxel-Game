@@ -283,6 +283,100 @@ function game.register_sky(spec) end
 ---@param spec Tiamot.ToolSpec
 function game.register_tool(spec) end
 
+---Makes an inventory that belongs to the WORLD rather than to a player.
+---Returns whether it is new.
+---
+---**A chest, a furnace, a hopper.** `game.register_view` gives every player one
+---of something — an armour rack, a tool belt — and that is the wrong shape for a
+---box in the ground: there is one of it, wherever it is, and whoever opens it
+---sees the same contents.
+---
+---`name` is yours to choose and yours to keep unique, the way a block id is. A
+---position in it is the obvious choice, because that is how you will find it
+---again: `"core_chest:at:" .. x .. "," .. y .. "," .. z`. **Not namespaced by
+---mod**, unlike `game.storage`, because two mods may legitimately want at the
+---same container — a hopper feeding a furnace is exactly that.
+---
+---The size applies to a container being MADE. An existing one keeps the size it
+---has, so calling this every time a chest is opened is safe and is the intended
+---shape: make-if-absent, then open.
+---
+---The engine owns the slots — stacking, unit conservation, the id map and the
+---save. You own where it is, what may go in it and who may open it.
+---@param name string
+---@param slots integer 1 to 256.
+---@return boolean created
+function game.make_container(name, slots) end
+
+---Opens a container for a player, so a screen can show it. Returns whether it
+---opened.
+---
+---Draw it with an `item_grid` naming the same string, in a dialog you show that
+---player. Clicks then work exactly as they do for their own inventory: left,
+---right, and shift to move a stack across.
+---
+---**One player at a time.** `false` means there is no such container, the player
+---is not here, or somebody else has it open — and the last is worth saying out
+---loud, because "somebody is using that" is a sentence a player understands.
+---Two people in one chest would each be shown a copy, and whoever closed second
+---would write theirs over the other's.
+---
+---It closes on its own when that player's screen closes and when they leave, so
+---the ordinary case needs no bookkeeping from you.
+---
+---```lua
+---local name = "core_chest:at:" .. x .. "," .. y .. "," .. z
+---game.make_container(name, 27)
+---if game.open_container(name, event.player) then
+---    game.show_dialog{ player = event.player, form = "chest", tree = {
+---        type = "container", direction = "column", children = {
+---            { type = "label", text = "Chest" },
+---            { type = "item_grid", view = name, columns = 9, first = 1, count = 27 },
+---            { type = "item_grid", view = "player:main", columns = 9, first = 1, count = 27 },
+---        },
+---    }}
+---else
+---    game.chat_to(event.player, "somebody is using that")
+---end
+---```
+---@param name string
+---@param player string The player's UUID, in hex.
+---@return boolean opened
+function game.open_container(name, player) end
+
+---Closes a container, putting its contents back into the world. Returns whether
+---anything came back.
+---
+---You rarely need this: closing the screen and leaving both do it. It is here
+---for a mod that wants the container back for its own reasons — to read it, or
+---to break the block it belongs to.
+---@param name string
+---@param player string The player's UUID, in hex.
+---@return boolean closed
+function game.close_container(name, player) end
+
+---What is in a container, in the same shape `game.inventory` reports stacks.
+---
+---**Empty while somebody has it open**, because those contents are in that
+---player's screen and about to change — answering with a copy that is already
+---stale would be worse than answering with nothing. Close it first if you need
+---to know.
+---@param name string
+---@return table[] stacks
+function game.container(name) end
+
+---Removes a container and hands back everything that was in it.
+---
+---**Nothing is destroyed.** The contents come back so you can drop them where
+---the block was; an engine that emptied a chest into nowhere would be a
+---conservation hole (charter rule 5) on a path a player caused and can see.
+---
+---Returns an empty list, and removes nothing, while somebody has it open: those
+---items are in another player's hands.
+---@param name string
+---@return table[] stacks What was in it.
+function game.break_container(name) end
+
 ---Registers an inventory view: a place stacks may sit, given to every player.
 ---Registration window only.
 ---
