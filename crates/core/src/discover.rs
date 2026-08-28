@@ -135,13 +135,25 @@ impl Beacon {
             return None;
         }
         let name = std::str::from_utf8(&body[HEADER..]).ok()?;
-        let name = check_name(name).ok()?;
+        let checked = check_name(name).ok()?;
+        // **A name the sender padded is a SECOND spelling of this beacon.**
+        // `check_name` trims, which is right for a host naming its own world
+        // and wrong here: accepting `" Home "` and reporting `"Home"` means two
+        // datagrams mean one beacon, and the second is one this crate could
+        // never have produced.
+        //
+        // Found by `beacon_decode` on its first run — the input was a name
+        // beginning with a newline, which trims away and takes the length with
+        // it.
+        if checked.len() != name.len() {
+            return None;
+        }
         Some(Self {
             protocol: u32::from_le_bytes([body[0], body[1], body[2], body[3]]),
             port: field(4),
             players: field(6),
             max_players: field(8),
-            name: name.to_owned(),
+            name: checked.to_owned(),
         })
     }
 }
@@ -259,11 +271,26 @@ mod tests {
     }
 
     #[test]
-    fn a_name_is_taken_as_trimmed_by_both_ends() {
+    fn a_name_is_trimmed_by_the_sender_and_never_by_the_reader() {
+        // The host trims, so a world called `"  Home  "` goes out as `"Home"`.
         let bytes = beacon("  Home  ").encode().expect("encode");
         assert_eq!(
             Beacon::decode(&bytes).map(|found| found.name),
             Some("Home".to_owned())
+        );
+
+        // The reader does NOT, because trimming on the way in gives one beacon
+        // two spellings — and the second is one this crate could not have
+        // sent. **Found by the fuzzer on its first run**, as a name beginning
+        // with a newline.
+        let mut padded = Vec::from(MAGIC);
+        padded.extend_from_slice(&[0; HEADER - 1]);
+        padded.push(5);
+        padded.extend_from_slice(b"\nHome");
+        assert_eq!(
+            Beacon::decode(&padded),
+            None,
+            "a padded name decoded, so one beacon has two spellings on the wire"
         );
     }
 }

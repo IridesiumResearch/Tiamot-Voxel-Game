@@ -44,6 +44,15 @@
 !/fuzz/corpus/dialog_schema/seed-*.bin
 !/fuzz/corpus/dialog_schema/regression-*.bin
 
+# The discovery beacon's corpus, same rule and same reason: the format is a
+# couple of dozen bytes and a fuzzer derives thousands of entries from it in
+# under a minute. What is worth keeping is every input that has ever crashed
+# the decoder — `regression-padded-name.bin` is the first, found on the target's
+# first run.
+/fuzz/corpus/beacon_decode/*
+!/fuzz/corpus/beacon_decode/seed-*.bin
+!/fuzz/corpus/beacon_decode/regression-*.bin
+
 /fuzz/coverage/
 /fuzz/Cargo.lock
 
