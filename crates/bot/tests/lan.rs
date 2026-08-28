@@ -167,8 +167,12 @@ fn an_open_world_says_it_is_here_on_the_network() {
         .set_read_timeout(Some(std::time::Duration::from_millis(500)))
         .expect("a read timeout");
 
+    // A name nothing else uses. **The discovery port is shared by
+    // construction** — that is what it is for — so this listener hears every
+    // other test binary `cargo` is running at the same time, and a beacon is
+    // only this test's if it says so.
     let announcing = server
-        .announce("Ada's world")
+        .announce("an announced world under test")
         .expect("a world should be able to announce itself");
 
     let mut buffer = [0u8; tiamot_core::discover::MAX_DATAGRAM];
@@ -181,12 +185,14 @@ fn an_open_world_says_it_is_here_on_the_network() {
         let Ok((read, _)) = listening.recv_from(&mut buffer) else {
             continue;
         };
-        if let Some(beacon) = tiamot_core::discover::Beacon::decode(&buffer[..read]) {
+        if let Some(beacon) = tiamot_core::discover::Beacon::decode(&buffer[..read])
+            && beacon.name == "an announced world under test"
+        {
             break beacon;
         }
     };
 
-    assert_eq!(heard.name, "Ada's world");
+    assert_eq!(heard.name, "an announced world under test");
     assert_eq!(
         heard.port,
         server.local_addr().port(),
@@ -210,7 +216,7 @@ fn an_open_world_says_it_is_here_on_the_network() {
             continue;
         };
         if tiamot_core::discover::Beacon::decode(&buffer[..read])
-            .is_some_and(|beacon| beacon.name == "Ada's world")
+            .is_some_and(|beacon| beacon.name == "an announced world under test")
         {
             last_heard = Some(std::time::Instant::now());
         }

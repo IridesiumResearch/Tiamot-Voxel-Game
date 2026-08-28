@@ -66,7 +66,19 @@ impl Discovery {
     /// is broken.
     #[must_use]
     pub fn start() -> Option<Self> {
-        let socket = bind().ok()?;
+        Self::listening_on(PORT)
+    }
+
+    /// The same, on a port of the caller's choosing.
+    ///
+    /// **Only the tests pass anything but [`PORT`].** They do it because the
+    /// discovery port is shared by construction — that is the whole point of
+    /// it — so a test that listens there hears every other test on the machine,
+    /// including ones in other binaries that `cargo` is running at the same
+    /// time. A private port makes a test about this listener rather than about
+    /// what else happens to be running.
+    fn listening_on(port: u16) -> Option<Self> {
+        let socket = bind(port).ok()?;
         // So the thread notices it has been stopped rather than parking in
         // `recv_from` until the next beacon, which on a quiet network is never.
         socket
@@ -182,14 +194,14 @@ impl std::fmt::Debug for Discovery {
 /// `SO_REUSEADDR` before the bind: a player hosting a world and a second client
 /// on the same machine both want this port, and without it the second one gets
 /// nothing and shows an empty list.
-fn bind() -> std::io::Result<UdpSocket> {
+fn bind(port: u16) -> std::io::Result<UdpSocket> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )?;
     socket.set_reuse_address(true)?;
-    socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), PORT).into())?;
+    socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port).into())?;
     Ok(socket.into())
 }
 
@@ -197,8 +209,20 @@ fn bind() -> std::io::Result<UdpSocket> {
 mod tests {
     use super::*;
 
-    /// Sends one beacon to the loopback broadcast and returns what it said.
-    fn announce(name: &str, port: u16) -> std::io::Result<()> {
+    /// A port of this test's own.
+    ///
+    /// **Not [`PORT`].** Every binary `cargo` runs at once shares that one, so
+    /// a test listening there hears the bot suite's announcer and its own
+    /// neighbours — which is exactly what a discovery port is FOR, and exactly
+    /// what makes it useless for an assertion about one listener. Caught by
+    /// `cargo bench --workspace -- --test`, where the interleaving differs
+    /// enough to make it fail rather than merely being able to.
+    const HEARD: u16 = 47_897;
+    /// And another, for the test that asserts nothing arrives.
+    const QUIET: u16 = 47_898;
+
+    /// Sends one beacon to a port on this machine.
+    fn announce(name: &str, port: u16, to: u16) -> std::io::Result<()> {
         let beacon = Beacon {
             protocol: tiamot_core::proto::PROTOCOL_VERSION,
             port,
@@ -209,26 +233,29 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))?;
         socket.set_broadcast(true)?;
         let bytes = beacon.encode().expect("a valid name");
-        socket.send_to(&bytes, SocketAddr::from((Ipv4Addr::LOCALHOST, PORT)))?;
+        socket.send_to(&bytes, SocketAddr::from((Ipv4Addr::LOCALHOST, to)))?;
         Ok(())
     }
 
     #[test]
     fn a_world_that_announces_itself_turns_up_in_the_list() {
-        let Some(listening) = Discovery::start() else {
-            // A sandbox with no UDP, or a port already held. Not a failure:
-            // the whole feature degrades to an empty list.
-            eprintln!("skipped: the discovery port could not be opened here");
+        let Some(listening) = Discovery::listening_on(HEARD) else {
+            // A sandbox with no UDP. Not a failure: the whole feature degrades
+            // to an empty list.
+            eprintln!("skipped: a UDP port could not be opened here");
             return;
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         let heard = loop {
-            if announce("Ada's world", 47811).is_err() {
+            if announce("a world under test", 47811, HEARD).is_err() {
                 eprintln!("skipped: this machine cannot send a datagram");
                 return;
             }
-            let worlds = listening.worlds();
-            if let Some(found) = worlds.into_iter().find(|w| w.name == "Ada's world") {
+            if let Some(found) = listening
+                .worlds()
+                .into_iter()
+                .find(|world| world.name == "a world under test")
+            {
                 break found;
             }
             assert!(
@@ -248,23 +275,36 @@ mod tests {
 
     #[test]
     fn a_datagram_that_is_not_a_beacon_adds_nothing() {
-        let Some(listening) = Discovery::start() else {
-            eprintln!("skipped: the discovery port could not be opened here");
+        let Some(listening) = Discovery::listening_on(QUIET) else {
+            eprintln!("skipped: a UDP port could not be opened here");
             return;
         };
         let Ok(socket) = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))) else {
             eprintln!("skipped: this machine cannot send a datagram");
             return;
         };
-        let before = listening.worlds().len();
         for junk in [&b"hello"[..], &[0xff; 400], &[]] {
-            let _ = socket.send_to(junk, SocketAddr::from((Ipv4Addr::LOCALHOST, PORT)));
+            let _ = socket.send_to(junk, SocketAddr::from((Ipv4Addr::LOCALHOST, QUIET)));
         }
+        // **A count, and it is only safe to count because the port is this
+        // test's own.** On the real port the number changes whenever anything
+        // else on the machine announces itself.
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            listening.worlds().len(),
-            before,
-            "something that is not a beacon was listed as a world"
+        assert!(
+            listening.worlds().is_empty(),
+            "something that is not a beacon was listed as a world: {:?}",
+            listening.worlds()
         );
+
+        // Non-vacuous: the same listener DOES hear a real one.
+        assert!(announce("a real one", 47811, QUIET).is_ok());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while listening.worlds().is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the listener heard nothing at all, so refusing junk proves nothing"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
