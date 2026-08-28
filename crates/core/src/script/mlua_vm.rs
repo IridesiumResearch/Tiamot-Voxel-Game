@@ -2320,6 +2320,72 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))
     }
 
+    /// The `game.get_block` function, built once per mod environment.
+    ///
+    /// # Why `nil` rather than air
+    ///
+    /// Air is an ANSWER — `{ material = game.AIR, occupancy = 0 }` — and `nil`
+    /// means the engine could not say: the chunk is not loaded, or there is no
+    /// world behind the VM at all. A mod that could not tell those apart would
+    /// eventually build into terrain that was merely unloaded, and the mistake
+    /// would show up as a hole in somebody's house rather than as an error
+    /// anybody could catch.
+    fn block_reader(&self) -> Result<mlua::Function, ScriptError> {
+        let sight = std::sync::Arc::clone(&self.sight);
+        self.lua
+            .create_function(move |lua, position: Table| {
+                let x: i32 = position.get("x")?;
+                let y: i32 = position.get("y")?;
+                let z: i32 = position.get("z")?;
+
+                let reading = sight
+                    .lock()
+                    .map_err(|_| {
+                        mlua::Error::external(
+                            "the world lease is poisoned; the simulation thread panicked",
+                        )
+                    })?
+                    .as_ref()
+                    .map_or(crate::sight::Reading::Unavailable, |access| {
+                        access.block_at(crate::BlockPos::new(x, y, z))
+                    });
+
+                match reading {
+                    crate::sight::Reading::Absent | crate::sight::Reading::Unavailable => {
+                        Ok(mlua::Value::Nil)
+                    }
+                    crate::sight::Reading::Single {
+                        material,
+                        occupancy,
+                    } => {
+                        let out = lua.create_table()?;
+                        out.set("material", material.0)?;
+                        out.set("occupancy", occupancy)?;
+                        Ok(mlua::Value::Table(out))
+                    }
+                    crate::sight::Reading::Mixed(cells) => {
+                        // **`cells` only when there are several**, because a
+                        // twenty-seven entry table on every call would be a
+                        // cost paid by every mod scanning a region to find the
+                        // one block in a thousand that is mixed.
+                        let out = lua.create_table()?;
+                        let list = lua.create_table()?;
+                        let mut occupancy = 0u32;
+                        for (index, cell) in cells.iter().enumerate() {
+                            list.set(index + 1, cell.0)?;
+                            if !cell.is_air() {
+                                occupancy |= 1 << index;
+                            }
+                        }
+                        out.set("cells", list)?;
+                        out.set("occupancy", occupancy)?;
+                        Ok(mlua::Value::Table(out))
+                    }
+                }
+            })
+            .map_err(|err| self.vm_error(&err))
+    }
+
     /// The `game.line_of_sight` function, built once per mod environment.
     ///
     /// # Three answers, not two
@@ -3203,6 +3269,9 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
 
         let get_light = self.light_reader()?;
+        let get_block = self.block_reader()?;
+        game.set("get_block", get_block)
+            .map_err(|err| self.vm_error(&err))?;
         game.set("get_light", get_light)
             .map_err(|err| self.vm_error(&err))?;
 
@@ -3289,6 +3358,8 @@ impl MluaVm {
         // How many of a thing a slot holds. A recipe that makes "as many as
         // will fit" needs the number, and a mod that guessed it would be wrong
         // the day the engine changed it.
+        game.set("OCCUPANCY_FULL", crate::block::OCCUPANCY_FULL)
+            .map_err(|err| self.vm_error(&err))?;
         game.set("ITEMS_PER_STACK", crate::inventory::ITEMS_PER_STACK)
             .map_err(|err| self.vm_error(&err))?;
         game.set("AIR", MaterialId::AIR.get())
@@ -5194,6 +5265,9 @@ mod tests {
     struct Eye {
         reply: std::sync::Mutex<Option<crate::sight::Sighting>>,
         asked: std::sync::Mutex<Vec<([f64; 3], [f64; 3])>>,
+        /// What `block_at` should answer, and where it was asked.
+        block: std::sync::Mutex<Option<crate::sight::Reading>>,
+        blocks_asked: std::sync::Mutex<Vec<crate::BlockPos>>,
     }
 
     impl crate::sight::Access for Eye {
@@ -5206,6 +5280,17 @@ mod tests {
                 .ok()
                 .and_then(|reply| *reply)
                 .unwrap_or(crate::sight::Sighting::Unavailable)
+        }
+
+        fn block_at(&self, pos: crate::BlockPos) -> crate::sight::Reading {
+            if let Ok(mut asked) = self.blocks_asked.lock() {
+                asked.push(pos);
+            }
+            self.block
+                .lock()
+                .ok()
+                .and_then(|reply| reply.clone())
+                .unwrap_or(crate::sight::Reading::Unavailable)
         }
     }
 
@@ -6345,6 +6430,86 @@ mod tests {
              game.set_block({x=3,y=0,z=0}, 'test:unknown')\n\
            end\n\
          end)";
+
+    /// Reads one block and writes what it found, so a test can read it back
+    /// through the world-edit slate.
+    const READER_MOD: &str = "game.register_on_tick(function()\n\
+           local at = game.get_block({x=1,y=2,z=3})\n\
+           if at == nil then\n\
+             game.set_block({x=0,y=0,z=0}, 'test:unknown')\n\
+           elseif at.cells then\n\
+             game.set_block({x=1,y=0,z=0}, 'test:mixed_' .. #at.cells .. '_' .. at.cells[2])\n\
+           else\n\
+             game.set_block({x=2,y=0,z=0}, 'test:one_' .. at.material .. '_' .. at.occupancy)\n\
+           end\n\
+         end)";
+
+    #[test]
+    fn a_mod_can_read_a_block_and_tells_absent_from_air() {
+        // **Air is an answer and absence is not.** A mod that could not tell
+        // "there is nothing here" from "I cannot say" would eventually build
+        // into terrain that was merely unloaded — a hole in somebody's house
+        // rather than an error anybody could catch.
+        let mut vm = vm();
+        let slate = std::sync::Arc::new(Slate::default());
+        vm.set_world_edit(
+            std::sync::Arc::clone(&slate) as std::sync::Arc<dyn crate::script::WorldEdit>
+        );
+        let eye = std::sync::Arc::new(Eye::default());
+
+        load(&mut vm, "reader", READER_MOD).expect("load");
+        let _ = vm.freeze();
+
+        // No world behind the VM at all, which is what worldgen sees.
+        assert!(vm.tick(1).expect("tick").is_empty());
+        vm.set_sight_access(std::sync::Arc::clone(&eye) as std::sync::Arc<dyn crate::sight::Access>);
+
+        // A chunk that is not loaded: the same `nil`, and deliberately — both
+        // mean "the engine cannot say".
+        *eye.block.lock().expect("block") = Some(crate::sight::Reading::Absent);
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        // Air, which is NOT nil.
+        *eye.block.lock().expect("block") = Some(crate::sight::Reading::Single {
+            material: crate::MaterialId::AIR,
+            occupancy: 0,
+        });
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        // A partly-filled block of one material.
+        *eye.block.lock().expect("block") = Some(crate::sight::Reading::Single {
+            material: crate::MaterialId(7),
+            occupancy: 0b101,
+        });
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        // And a mixed one, which is the only case that carries cells.
+        let mut cells = [crate::MaterialId::AIR; crate::block::SUBNODES_PER_BLOCK];
+        cells[1] = crate::MaterialId(9);
+        *eye.block.lock().expect("block") = Some(crate::sight::Reading::Mixed(Box::new(cells)));
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        let written = slate.written.lock().expect("slate");
+        let names: Vec<&str> = written.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "test:unknown",
+                "test:unknown",
+                "test:one_0_0",
+                "test:one_7_5",
+                "test:mixed_27_9",
+            ],
+            "a block reached Lua as the wrong value"
+        );
+
+        // And it asked about the block it was told to, rather than the chunk
+        // or the cell — an off-by-a-frame here reads a neighbour for ever.
+        assert_eq!(
+            eye.blocks_asked.lock().expect("asked").as_slice(),
+            &[crate::BlockPos::new(1, 2, 3); 4]
+        );
+    }
 
     #[test]
     fn line_of_sight_reports_clear_blocked_and_unknown_separately() {

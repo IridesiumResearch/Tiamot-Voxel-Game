@@ -116,3 +116,118 @@ fn a_block_a_mod_places_reaches_the_world() {
             .expect("a mod's set_block should land in the world and be broadcast");
     });
 }
+
+/// A mod that READS a block and reports what it found by writing a marker.
+///
+/// The reporting-by-marker trick is `perception.rs`'s: there is no "read a
+/// block" message on the wire and there should not be one, so a mod's answer
+/// reaches a test the only way anything reaches a client — as an edit.
+fn write_reader(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("reader");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"reader\"\nname = \"Reader\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+local ground = game.register_block{ id = "ground" }
+local brick = game.register_block{ id = "brick" }
+game.register_block{ id = "saw_ground" }
+game.register_block{ id = "saw_brick" }
+game.register_block{ id = "saw_air" }
+game.register_block{ id = "saw_nothing" }
+
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(game.flat_heightmap(0), ground)
+end)
+
+-- Put something down, then read the world back: the block it placed, a block
+-- of the terrain under it, empty space beside it, and somewhere nobody has
+-- loaded.
+local reported = false
+game.register_on_tick(function()
+    game.set_block({ x = 2, y = 9, z = 2 }, "reader:brick")
+    if reported then
+        return
+    end
+    local placed = game.get_block({ x = 2, y = 9, z = 2 })
+    if placed == nil or placed.material ~= brick then
+        return
+    end
+    reported = true
+
+    if placed.occupancy == game.OCCUPANCY_FULL then
+        game.set_block({ x = 4, y = 9, z = 2 }, "reader:saw_brick")
+    end
+
+    local under = game.get_block({ x = 2, y = -1, z = 2 })
+    if under ~= nil and under.material == ground then
+        game.set_block({ x = 5, y = 9, z = 2 }, "reader:saw_ground")
+    end
+
+    -- **Air is an answer**, and this is the assertion that matters most:
+    -- nothing there reads as air, not as nil.
+    local beside = game.get_block({ x = 2, y = 9, z = 3 })
+    if beside ~= nil and beside.material == game.AIR and beside.occupancy == 0 then
+        game.set_block({ x = 6, y = 9, z = 2 }, "reader:saw_air")
+    end
+
+    -- And somewhere nobody is standing, which must NOT be generated to answer.
+    if game.get_block({ x = 40000, y = 9, z = 40000 }) == nil then
+        game.set_block({ x = 7, y = 9, z = 2 }, "reader:saw_nothing")
+    end
+end)
+"#,
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_mod_can_read_the_world_it_writes_to() {
+    // **The seam test.** `game.get_block` reaches the world through the same
+    // lease `line_of_sight` does, and a lease nobody installed answers
+    // "unavailable" for ever without erroring — which is exactly how
+    // `set_block` was dead on every real server for three tasks.
+    //
+    // Four markers, one per thing a mod has to be able to tell apart: its own
+    // block, the terrain, empty space, and somewhere it cannot see.
+    let server = start("read", write_reader("read"));
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Bystander").await.expect("join");
+
+        let table = bot
+            .material_table()
+            .expect("the server sends a material table on join");
+        let id = |name: &str| {
+            table
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.id)
+                .unwrap_or_else(|| panic!("the mod registers {name}"))
+        };
+
+        for (at, marker) in [
+            (BlockPos::new(4, 9, 2), "reader:saw_brick"),
+            (BlockPos::new(5, 9, 2), "reader:saw_ground"),
+            (BlockPos::new(6, 9, 2), "reader:saw_air"),
+            (BlockPos::new(7, 9, 2), "reader:saw_nothing"),
+        ] {
+            bot.expect_block(at, id(marker), PATIENCE)
+                .await
+                .unwrap_or_else(|err| panic!("the mod never reported {marker}: {err}"));
+        }
+    });
+}

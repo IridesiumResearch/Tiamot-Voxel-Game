@@ -244,6 +244,7 @@ function Stream:next_bool() end
 ---@class Tiamot.Game
 ---@field CHUNK_BLOCKS integer Blocks along each axis of a chunk. 16.
 ---@field UNITS_PER_BLOCK integer Sub-node units in a block. 27.
+---@field OCCUPANCY_FULL integer Every one of a block's 27 sub-nodes, as a mask. Compare `game.get_block`'s `occupancy` against it to ask "is this a whole block".
 ---@field ITEMS_PER_STACK integer How many of a thing one inventory slot holds. 90. Anything over it spills into the next slot rather than being refused, so this is what a recipe means by "a stack" and never a limit on what a player may own.
 ---@field AIR integer The numeric id of air. Always 0.
 ---@field mod_id string Your mod's id, and your registration namespace.
@@ -363,6 +364,50 @@ function game.register_on_generate(callback) end
 ---server's tick.
 ---@param callback fun(dt_ticks: integer)
 function game.register_on_tick(callback) end
+
+---What a block holds, right now.
+---
+---**The question every world-aware mod starts with.** A chest, a furnace, a
+---crop, a door, a wire: each of them begins with "what is at this position",
+---and until this existed a mod could write a block and never read one back.
+---
+---`nil` means the engine could not say — the chunk is not loaded, or you asked
+---from `register_on_generate`, where there is no world yet. **Air is not nil**:
+---empty space answers `{ material = game.AIR, occupancy = 0 }`. A mod that
+---could not tell those apart would eventually build into terrain that was
+---merely unloaded, and the mistake would be a hole in somebody's house rather
+---than an error anybody could catch.
+---
+---The chunk is never GENERATED to answer. A mod asking about somewhere far
+---away must not be able to make the server generate a chunk inside the tick
+---budget, one call at a time, for nobody standing there.
+---
+---`occupancy` is the 27-bit mask indexed `x + 3*y + 9*z`, the same convention
+---the shape editor and `on_place` use. A whole block is `game.OCCUPANCY_FULL`.
+---
+---`cells` is present ONLY when the block holds more than one material, and is
+---then 27 entries in that same index order. It is left out otherwise because a
+---twenty-seven entry table on every call is a cost paid by every mod scanning a
+---region for the one block in a thousand that is mixed.
+---
+---```lua
+---local at = game.get_block{ x = 4, y = 12, z = -7 }
+---if at and at.material == game.get_block_id("core_blocks:stone")
+---    and at.occupancy == game.OCCUPANCY_FULL then
+---    -- a whole block of stone
+---end
+---
+----- One cell of it, whichever form it came back in:
+---local function cell_at(at, index)          -- index is 0..26
+---    if at == nil then return nil end
+---    if at.cells then return at.cells[index + 1] end
+---    if at.occupancy & (1 << index) ~= 0 then return at.material end
+---    return game.AIR
+---end
+---```
+---@param position Tiamot.BlockPos
+---@return { material: integer|nil, occupancy: integer, cells: integer[]|nil }|nil
+function game.get_block(position) end
 
 ---The light at a block, right now.
 ---

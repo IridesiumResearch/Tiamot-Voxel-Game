@@ -94,6 +94,51 @@ pub enum Sighting {
 pub trait Access: Send + Sync {
     /// Whether `from` can see `to`. Both in world blocks, as a mod speaks them.
     fn line_of_sight(&self, from: [f64; 3], to: [f64; 3]) -> Sighting;
+
+    /// What one block holds.
+    ///
+    /// **The question every world-aware mod starts with.** A chest, a furnace,
+    /// a crop, a door, a wire: each of them begins with "what is at this
+    /// position", and until this existed a mod could WRITE a block and never
+    /// read one back.
+    fn block_at(&self, pos: crate::coords::BlockPos) -> Reading;
+}
+
+/// What the engine can tell a mod about one block.
+///
+/// **Air is an answer and absence is not.** A mod that could not tell "there is
+/// nothing here" from "I cannot say" would eventually build into terrain that
+/// was merely unloaded, and the mistake would be a hole in somebody's house
+/// rather than an error anybody could catch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reading {
+    /// One material, filling the cells set in `occupancy`.
+    ///
+    /// Covers all of the contract's `Uniform` and `Partial`, and air: air is
+    /// [`crate::MaterialId::AIR`] with an empty mask. Sub-Node Contract §0.
+    Single {
+        /// What it is made of.
+        material: crate::MaterialId,
+        /// Which of its 27 cells are filled, indexed `x + 3y + 9z`.
+        occupancy: u32,
+    },
+
+    /// Two or more materials, one entry per cell in the same index order.
+    ///
+    /// Boxed because this variant is the rare one and the enum is returned by
+    /// value from a call a mod may make thousands of times a tick.
+    Mixed(Box<[crate::MaterialId; crate::block::SUBNODES_PER_BLOCK]>),
+
+    /// The chunk is not loaded, so the engine does not know.
+    ///
+    /// **Never generated to find out.** A mod asking about somewhere far away
+    /// must not be able to make the server generate a chunk inside the tick
+    /// budget, one call at a time, with nobody near it.
+    Absent,
+
+    /// There is no world to read right now — during worldgen, or in a test with
+    /// no server behind the VM. See [`Access`].
+    Unavailable,
 }
 
 /// Whether nothing solid stands between two world points.

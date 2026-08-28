@@ -160,6 +160,47 @@ impl sight::Access for Shared {
             Sighting::Blocked
         }
     }
+
+    fn block_at(&self, pos: tiamot_core::BlockPos) -> sight::Reading {
+        use tiamot_core::phys::ChunkLookup as _;
+
+        let Ok(slot) = self.slot.lock() else {
+            return sight::Reading::Unavailable;
+        };
+        let Some(world) = slot.as_ref() else {
+            return sight::Reading::Unavailable;
+        };
+        // **Resident only, and deliberately.** `World::chunk` generates what is
+        // missing; a mod asking about somewhere far away must not be able to
+        // make the server generate a chunk inside the tick budget, one call at
+        // a time, for nobody.
+        let Some(chunk) = world.chunk(pos.chunk()) else {
+            return sight::Reading::Absent;
+        };
+        let Some(view) = chunk.get_block(pos) else {
+            return sight::Reading::Absent;
+        };
+        match view {
+            tiamot_core::BlockView::Uniform(material) => sight::Reading::Single {
+                material,
+                occupancy: if material.is_air() {
+                    0
+                } else {
+                    tiamot_core::block::OCCUPANCY_FULL
+                },
+            },
+            tiamot_core::BlockView::Partial {
+                material,
+                occupancy,
+            } => sight::Reading::Single {
+                material,
+                occupancy: occupancy & tiamot_core::block::OCCUPANCY_FULL,
+            },
+            tiamot_core::BlockView::Mixed(cells) => {
+                sight::Reading::Mixed(Box::new(std::array::from_fn(|index| cells[index])))
+            }
+        }
+    }
 }
 
 impl path::Access for Shared {
