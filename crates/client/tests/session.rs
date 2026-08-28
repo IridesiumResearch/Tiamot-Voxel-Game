@@ -2269,3 +2269,72 @@ fn the_view_widens_as_you_move_and_eases_back_when_you_stop() {
         "the view stayed at {stopped} after stopping, against {still} standing"
     );
 }
+
+#[test]
+fn a_broken_block_does_not_hand_the_dig_straight_to_the_one_behind_it() {
+    // **Asked for from the window**: "add an extremely minute pause after
+    // deleting a given block that has another block behind it, so that people
+    // can keep from breaking the back block behind the one they are focusing
+    // on."
+    //
+    // Holding the button through a break otherwise starts on whatever the hole
+    // reveals in the same frame, and a player who wanted one block has taken
+    // two.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("break-pause");
+    let mut app = client("break-pause", &server, gpu);
+    assert!(
+        run_frames(&mut app, |app| app.joined() && app.predicting()),
+        "never joined: {:?}",
+        app.warnings()
+    );
+
+    // Down into the ground, so there is certainly something behind the block
+    // being dug — which is the only case the pause applies to.
+    app.look_down_by(std::f32::consts::FRAC_PI_4);
+    assert!(
+        run_frames(&mut app, |app| app.dig_target().is_some()),
+        "the crosshair found nothing to dig"
+    );
+    for _ in 0..30 {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    // Hold the button until a block comes apart and the pause takes hold.
+    let mut paused = false;
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        app.advance(Input::default(), 1.0 / 60.0);
+        app.dig();
+        if app.dig_paused() {
+            paused = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    assert!(
+        paused,
+        "a block was dug through with something behind it and the dig carried \
+         straight on into it"
+    );
+
+    // And it is a pause, not a stop: it lets go on its own.
+    let deadline = Instant::now() + PATIENCE;
+    while app.dig_paused() {
+        assert!(
+            Instant::now() < deadline,
+            "the pause after a break never ended, so the button is dead"
+        );
+        assert!(app.pump_network(), "the connection ended");
+        app.advance(Input::default(), 1.0 / 60.0);
+        app.dig();
+        std::thread::sleep(Duration::from_millis(16));
+    }
+
+    app.stop_digging();
+}

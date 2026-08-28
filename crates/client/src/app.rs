@@ -706,6 +706,16 @@ impl Pacing {
 /// at a hundred frames a second would be a hundred of them.
 const PUNCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// How long a held dig waits after a block comes apart, before starting on
+/// whatever the hole revealed.
+///
+/// **Asked for from the window as "extremely minute".** Long enough to let go
+/// of the button on purpose and short enough that clearing a face of blocks
+/// does not feel like waiting — a fifth of a second, which is four ticks. It
+/// only applies when something is actually behind, so a player mining across a
+/// surface never meets it.
+const BREAK_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// How long one swing of a hand takes.
 ///
 /// Short enough that a held dig reads as repeated swings rather than one long
@@ -808,6 +818,17 @@ pub struct App {
     /// does not lock: taking one named cell is the whole point of it, and
     /// pointing through a hole to reach the cell behind is what it is for.
     dig_lock: Option<tiamot_core::SubNodePos>,
+    /// When digging may start again after a block came apart.
+    ///
+    /// **Asked for from the window**: "add an extremely minute pause after
+    /// deleting a given block that has another block behind it, so that people
+    /// can keep from breaking the back block behind the one they are focusing
+    /// on." Holding the button through a break otherwise starts on whatever
+    /// the hole reveals in the same frame.
+    ///
+    /// Only set when something IS behind — a pause with nothing to dig would
+    /// be a delay a player could feel and never see the point of.
+    dig_resumes_at: Option<std::time::Duration>,
     /// Whether the player was on the ground last frame, for the landing cue.
     was_on_ground: bool,
     /// The sandbox that runs pushed HUD scripts, if one could be built.
@@ -1160,6 +1181,7 @@ impl App {
             warnings: Vec::new(),
             cues: std::collections::BTreeMap::new(),
             dig_lock: None,
+            dig_resumes_at: None,
             was_on_ground: true,
             hud_vm: match tiamot_core::script::HudVm::new(tiamot_core::script::HudLimits::default())
             {
@@ -1943,6 +1965,31 @@ impl App {
             self.stop_digging();
             return;
         }
+        let now = self.since_start.elapsed();
+        if let Some(until) = self.dig_resumes_at {
+            if now < until {
+                return;
+            }
+            self.dig_resumes_at = None;
+        }
+
+        // **A block that came apart under the crosshair.** If the hole reveals
+        // something, hold off for a moment rather than starting on it in the
+        // same frame the last one finished.
+        if let Some(locked) = self.dig_lock
+            && !self.block_has_material(locked)
+        {
+            self.dig_lock = None;
+            if self
+                .dig_target()
+                .is_some_and(|next| next.block() != locked.block())
+            {
+                self.dig_resumes_at = Some(now + BREAK_PAUSE);
+                self.stop_digging();
+                return;
+            }
+        }
+
         let Some(target) = self.held_dig_target() else {
             return;
         };
@@ -1950,6 +1997,16 @@ impl App {
         self.connection.send(Command::Dig {
             target: Some(target),
         });
+    }
+
+    /// Whether a held dig is waiting out the pause after a block came apart.
+    ///
+    /// For the tests, and for anything that wants to show the player why the
+    /// button they are holding is not doing anything.
+    #[must_use]
+    pub fn dig_paused(&self) -> bool {
+        self.dig_resumes_at
+            .is_some_and(|until| self.since_start.elapsed() < until)
     }
 
     /// What this frame's dig is aimed at, honouring the held-button lock.
@@ -5184,11 +5241,47 @@ fn shared_defaults(actions: &crate::input::Actions) -> Vec<(String, String)> {
 /// where the camera looks. Neither needs normalising, because only the SIGN of
 /// the dot product is read.
 fn keeps_lock(to_block: [f32; 3], forward: [f32; 3], block_has_material: bool) -> bool {
+    /// Half a block, in cells: the box reaches this far either side of its
+    /// centre on every axis.
+    const HALF: f32 = tiamot_core::SUBNODES_PER_AXIS as f32 / 2.0;
+
     if !block_has_material {
         return false;
     }
-    let ahead = to_block[0] * forward[0] + to_block[1] * forward[1] + to_block[2] * forward[2];
-    ahead > 0.0
+    // **Does the line of sight still go THROUGH the block**, which is a
+    // stronger question than whether the block is in front. "In front" is a
+    // whole half of the world: walking along a wall with the button down kept
+    // the first block for as long as it was anywhere ahead, so the crosshair
+    // moved on and the dig did not — reported from the window twice, as a dig
+    // that "only retargets once the previous block is finished".
+    //
+    // Looking into the hole you have made still passes through the block, so
+    // this keeps the case the lock exists for: a half-dug block lets the ray
+    // reach the one behind, and retargeting there bores a tunnel.
+    //
+    // A slab test against the block's box, which is three cells across and so
+    // 1.5 either side of its centre.
+    let mut near = 0.0f32;
+    let mut far = f32::INFINITY;
+    for axis in 0..3 {
+        let direction = forward[axis];
+        let centre = to_block[axis];
+        if direction.abs() <= f32::EPSILON {
+            // Parallel to this pair of faces: either the ray is already
+            // between them for its whole length, or it never is.
+            if centre.abs() > HALF {
+                return false;
+            }
+            continue;
+        }
+        let one = (centre - HALF) / direction;
+        let other = (centre + HALF) / direction;
+        near = near.max(one.min(other));
+        far = far.min(one.max(other));
+    }
+    // `near <= far` is a hit, and `near` starting at zero is what keeps a block
+    // BEHIND the eye from counting.
+    near <= far
 }
 
 #[cfg(test)]
@@ -5215,6 +5308,31 @@ mod dig_lock_tests {
         // it" rule broke: a half-dug block lets the ray through to the one
         // behind, and dropping the lock there bores a tunnel.
         assert!(keeps_lock([0.0, 0.0, 3.0], NORTH, true));
+    }
+
+    #[test]
+    fn walking_past_a_block_hands_the_dig_to_the_one_you_are_looking_at() {
+        // **The reported bug, twice over.** "In front of me" is half the
+        // world: a block four cells to the side and three ahead is still
+        // ahead, so the old rule held the lock while the crosshair sat on a
+        // different block entirely — which is what "it only retargets once the
+        // previous block is finished" looks like from the window.
+        assert!(
+            !keeps_lock([4.0, 0.0, 3.0], NORTH, true),
+            "the crosshair had moved off the block and the dig stayed on it"
+        );
+        // And the counter-example that makes it a real distinction: the same
+        // block, straight ahead, is kept.
+        assert!(keeps_lock([0.0, 0.0, 3.0], NORTH, true));
+    }
+
+    #[test]
+    fn a_block_at_the_edge_of_the_crosshair_is_still_under_it() {
+        // A block is three cells across, so its box reaches 1.5 either side of
+        // its centre. Just inside is a hit and just outside is not — the line
+        // has to be somewhere, and this is where.
+        assert!(keeps_lock([1.4, 0.0, 3.0], NORTH, true), "just inside");
+        assert!(!keeps_lock([1.6, 0.0, 3.0], NORTH, true), "just outside");
     }
 
     #[test]

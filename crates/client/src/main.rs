@@ -316,6 +316,38 @@ impl Held {
     }
 }
 
+/// Where a NEW world's files should go.
+///
+/// The name a player typed, made safe by [`world_directory`], and then made
+/// unique against what is already on disk.
+fn unused_world_directory(data: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let worlds = std::path::Path::new("worlds");
+    let slug = world_directory(name);
+    let free = |candidate: &std::path::Path| !data.join(candidate).exists();
+
+    let first = worlds.join(&slug);
+    if free(&first) {
+        return first;
+    }
+    // **Checked against the DISK, not against the list.** Forgetting a world
+    // takes it out of the list and deliberately leaves its files alone, so a
+    // name that is free in the list can still have a save sitting under it —
+    // and a new world pointed at that directory opens the old one. Reported
+    // from the window as a fresh "New world" arriving with all the previous
+    // one's building in it.
+    //
+    // Bounded rather than looped for ever: a thousand worlds of one name is
+    // somebody's directory being unwritable, and the last candidate is used
+    // whatever it holds, because refusing to make a world at all is worse.
+    for suffix in 2..1000 {
+        let candidate = worlds.join(format!("{slug}-{suffix}"));
+        if free(&candidate) {
+            return candidate;
+        }
+    }
+    first
+}
+
 /// A directory name a world's title can safely become.
 ///
 /// **Not the title itself.** A player may call a world anything, including
@@ -1204,7 +1236,7 @@ impl Client {
         let entry = client::launcher::Entry {
             name: name.to_owned(),
             kind: client::launcher::Kind::Local {
-                path: std::path::PathBuf::from("worlds").join(world_directory(name)),
+                path: unused_world_directory(&self.data, name),
             },
             mods: self.catalogue.enabled(),
             last_played: client::launcher::now_seconds(),
@@ -2565,6 +2597,67 @@ fn grab(window: &Window, grab: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_new_world_never_opens_a_forgotten_one() {
+        // **Reported from the window**: forget a world called "New world",
+        // make another called "New world", and the new one arrives with all
+        // the old one's building in it.
+        //
+        // Forgetting takes a world out of the LIST and deliberately leaves its
+        // files alone, so the name is free and the directory is not. Checking
+        // the list would have found nothing wrong; the disk is what has to be
+        // asked.
+        let root = std::env::temp_dir().join("tiamot-world-names");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch");
+
+        let first = super::unused_world_directory(&root, "New world");
+        assert_eq!(first, std::path::Path::new("worlds").join("new-world"));
+
+        // The world now exists on disk, as it would after being played once.
+        std::fs::create_dir_all(root.join(&first)).expect("world dir");
+
+        let second = super::unused_world_directory(&root, "New world");
+        assert_ne!(
+            second, first,
+            "a second world of the same name was pointed at the first one's save"
+        );
+        assert!(
+            !root.join(&second).exists(),
+            "and the one it picked is free"
+        );
+
+        // And again, so the rule is "the next free one" rather than "one more".
+        std::fs::create_dir_all(root.join(&second)).expect("world dir");
+        let third = super::unused_world_directory(&root, "New world");
+        assert!(third != first && third != second, "{third:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_world_name_that_is_not_a_path_still_becomes_one() {
+        // **Not a duplicate of the `world_directory` test below.** That one is
+        // about the slug; this is about the whole path the uniquifying step
+        // builds out of it, which is the part that could newly escape.
+        let root = std::env::temp_dir().join("tiamot-world-names-safe");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch");
+        for name in ["../../etc", "a/b", "   ", "..", ""] {
+            let path = super::unused_world_directory(&root, name);
+            assert!(
+                path.starts_with("worlds"),
+                "`{name}` produced {path:?}, which is outside the worlds directory"
+            );
+            assert_eq!(
+                path.components().count(),
+                2,
+                "`{name}` produced {path:?}, which is more than one directory deep"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
     use super::{hotbar_slot, world_directory};
 
     /// A click lands where the widget is drawn, whatever the interface scale.
