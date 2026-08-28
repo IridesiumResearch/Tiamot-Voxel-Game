@@ -3237,3 +3237,43 @@ fn a_hand_is_on_screen_in_first_person_and_holds_what_is_selected() {
          hand is, so this is not a hand"
     );
 }
+
+#[test]
+fn a_renderer_takes_every_setting_the_config_holds() {
+    // **Reported from the window**: "the menu settings when outside the game do
+    // not seem to take hold and apply to the game. If I turn off shadows in the
+    // settings they will still be in when rejoining."
+    //
+    // The renderer is built when the WINDOW is, and the front screen sits
+    // between that moment and Play. Lighting mode and shadow quality had one
+    // caller each — the in-game key that toggles them — so a setting chosen
+    // anywhere else reached the file, and the HUD, and never the frame.
+    //
+    // This is the gate on `app::apply_to_renderer` being the single place a
+    // `Config` becomes renderer state: a setting added to the front screen and
+    // not to that function fails here.
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+
+    // Deliberately not the defaults, and deliberately not what a fresh
+    // renderer holds: an assertion against a value that was already there
+    // would pass without anything having been applied.
+    let wanted = client::config::Config {
+        shadow_quality: client::config::ShadowQuality::Off,
+        lighting_mode: client::config::LightingMode::Beautiful,
+        view_distance: 5,
+        ..client::config::Config::default()
+    };
+    assert_ne!(
+        renderer.shadow_quality(),
+        wanted.shadow_quality,
+        "the fixture asks for the shadow setting the renderer already had, so it proves nothing"
+    );
+
+    client::app::apply_to_renderer(&wanted, &mut renderer);
+
+    assert_eq!(renderer.shadow_quality(), wanted.shadow_quality);
+    assert_eq!(renderer.lighting_mode(), wanted.lighting_mode);
+}

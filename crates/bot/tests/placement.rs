@@ -654,3 +654,86 @@ fn a_different_material_steps_to_the_next_block_rather_than_mixing() {
     });
     server.stop();
 }
+
+#[test]
+fn one_block_can_hold_two_materials_at_once() {
+    // **Asked from the window**: can a block have twenty-two sub-nodes of
+    // stone and five of gold?
+    //
+    // Yes, and this is the proof through the path a player would use rather
+    // than through the storage form: chisel five cells of one material into a
+    // block of another, then break the whole thing and count what comes back.
+    // If a mixed block had quietly flattened to one material, the credit would
+    // say so.
+    let server = start("two-materials");
+    block_on(async {
+        let mut bot = join(&server, "Mason").await;
+        let stone = stone();
+        let dirt = material(1);
+
+        let quarry = BlockPos::new(2, 1, 3);
+        let carved = BlockPos::new(4, 1, 3);
+        mine_a_block(&mut bot, &server, quarry, dirt).await;
+
+        // Twenty-two cells of stone, five gaps.
+        assert!(
+            server.seed_partial(carved, stone, tiamot_core::inventory::placement_mask(22)),
+            "seed queue full"
+        );
+        bot.expect_partial(carved, stone, 22, Duration::from_secs(10))
+            .await
+            .expect("the carved block should land");
+
+        // A chisel, so each placement is one cell. A BLOCK brush would step
+        // around the stone instead — which is the other half of this pair, and
+        // deliberate: see `place::landing`.
+        bot.hold_brush(tiamot_core::dig::Brush::SubNode.name())
+            .await
+            .expect("the reference mods register a chisel");
+
+        for index in tiamot_core::inventory::fill_order().skip(22) {
+            let (ox, oy, oz) = tiamot_core::block::subnode_offset(index);
+            let cell = SubNodePos::new(
+                carved.x * 3 + ox as i32,
+                carved.y * 3 + oy as i32,
+                carved.z * 3 + oz as i32,
+            );
+            bot.place_from_inventory(cell, dirt).await.expect("send");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !bot.saw_subnode(cell, dirt) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "a chiselled cell of the other material never landed at {cell:?}; \
+                     the server said {:?}",
+                    bot.notices()
+                );
+                bot.recv().await.expect("recv");
+            }
+        }
+
+        // Break the whole thing and count. Twenty-two of one and five of the
+        // other, out of a block that is now neither.
+        bot.hold_brush(tiamot_core::dig::Brush::Block.name())
+            .await
+            .expect("the reference mods register a block tool");
+        bot.dig_block(carved).await.expect("the block should break");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if held(&bot, stone) == 22 && held(&bot, dirt) == 27 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "breaking a block of 22 stone and 5 dirt credited {} stone and {} dirt \
+                 (27 dirt means the five spent came back)",
+                held(&bot, stone),
+                held(&bot, dirt)
+            );
+            bot.recv().await.expect("recv");
+        }
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
