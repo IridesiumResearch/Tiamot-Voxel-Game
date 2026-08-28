@@ -66,4 +66,6 @@ pub struct ScriptFile {
 }
 
 pub use frame::{Anchor, Builtin, Command, Fill, Frame, HudError, Limits, Mark, VIRTUAL_HEIGHT};
-pub use state::{Carried, HeldTool, Look, State};
+pub use state::{
+    Access, Carried, HeldTool, Look, MAX_KEY, MAX_TEXT, MAX_VALUES, State, Value, Values,
+};

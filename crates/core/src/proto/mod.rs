@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 34;
+pub const PROTOCOL_VERSION: u32 = 35;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -133,6 +133,10 @@ pub const PROTOCOL_VERSION: u32 = 34;
 // next keyframe's bytes as this one's grade. That is what the version check is
 // for: v9 and v10 refuse each other before either reads a keyframe.
 
+// v35 (post-14): appended `ServerMessage::HudValues`, so a mod can send its
+// own values to its own HUD script — the engine has no health bar and should
+// not, and a mod that could compute one and not draw it could not finish the
+// job. Appended, never inserted.
 // v34 (post-14): `ClientMessage::Place` carries the FACE the placement was
 // made against, so the server can orient a cut stack — front toward the
 // player, or toward their feet against a wall. **A field on an existing
@@ -1529,6 +1533,30 @@ pub enum ServerMessage {
         /// One entry per entity whose hands changed.
         entities: Vec<EntityHands>,
     },
+
+    /// What one mod wants ITS OWN HUD script to show this player.
+    ///
+    /// **Appended at the end** (protocol v35). The first attempt put it beside
+    /// `HudScripts`, where it reads better and shifts the ordinal of every
+    /// variant after it — caught by
+    /// `appended_server_variants_keep_their_ordinals`, which exists for
+    /// exactly that and has now earned its keep twice.
+    ///
+    /// Per player, because health and hunger and everything like them differ
+    /// per player; per mod, because a script sees only what its own mod sent —
+    /// the isolation `game.storage` has, and a property of the surface rather
+    /// than of good behaviour.
+    ///
+    /// The whole set each time, not a delta. A mod computes what it wants
+    /// shown and says so; the server sends it when it differs from what that
+    /// player was last told. A delta would need the two ends to agree about a
+    /// history, and the set is a handful of numbers.
+    HudValues {
+        /// Whose values these are, and whose script will see them.
+        mod_id: String,
+        /// The values, by name.
+        values: Vec<(String, crate::hud::Value)>,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -1941,6 +1969,38 @@ fn check_hud_scripts(scripts: &[HudScriptDef]) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// One mod's HUD values, checked as what a server sent (charter rule 14).
+///
+/// Every bound is the one the setting side applies, so a mod hears about a
+/// value it cannot send and a client refuses one it should never have been
+/// sent. **A non-finite number is refused here** rather than passed on: it
+/// reaches a script's arithmetic and comes back out as a bar of width NaN,
+/// which draws as nothing and reads as the HUD being broken.
+fn check_hud_values(
+    mod_id: &str,
+    values: &[(String, crate::hud::Value)],
+) -> Result<(), ProtocolError> {
+    check_len("hud_values_mod_id", mod_id.len(), MAX_ID_BYTES)?;
+    check_len("hud_values", values.len(), crate::hud::MAX_VALUES)?;
+    for (key, value) in values {
+        check_len("hud_value_key", key.len(), crate::hud::MAX_KEY)?;
+        match value {
+            crate::hud::Value::Text(text) => {
+                check_len("hud_value_text", text.len(), crate::hud::MAX_TEXT)?;
+            }
+            crate::hud::Value::Number(number) if !number.is_finite() => {
+                return Err(ProtocolError::FieldTooLarge {
+                    field: "hud_value_number",
+                    len: 0,
+                    limit: 0,
+                });
+            }
+            crate::hud::Value::Number(_) | crate::hud::Value::Flag(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// The two messages whose floats reach the client's own arithmetic.
 ///
 /// A non-finite position propagates into every interpolation it takes part in,
@@ -2204,6 +2264,7 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         ServerMessage::ActionTable { actions } => check_actions(actions)?,
         ServerMessage::SoundTable { sounds } => check_sounds(sounds)?,
         ServerMessage::HudScripts { scripts } => check_hud_scripts(scripts)?,
+        ServerMessage::HudValues { mod_id, values } => check_hud_values(mod_id, values)?,
         message @ (ServerMessage::SoundBindings { .. }
         | ServerMessage::StartLoop { .. }
         | ServerMessage::StopLoop { .. }) => check_cue_message(message)?,
@@ -3209,6 +3270,17 @@ mod tests {
         })
         .expect("encode");
         assert_eq!(start[0], 34);
+
+        // Protocol v35, a mod's own HUD values, and currently the newest. The
+        // first attempt at this one was written beside `HudScripts`, where it
+        // reads better and shifts every ordinal after it; this line is what
+        // said so.
+        let values = encode(&ServerMessage::HudValues {
+            mod_id: String::new(),
+            values: Vec::new(),
+        })
+        .expect("encode");
+        assert_eq!(values[0], 37);
         let stop = encode(&ServerMessage::StopLoop { id: String::new() }).expect("encode");
         assert_eq!(stop[0], 35);
         // Protocol v32. Appended at the END, which this test is what enforces:

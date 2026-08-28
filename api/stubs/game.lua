@@ -974,6 +974,45 @@ function game.time_of_day() end
 ---@return integer told
 function game.stop_loop(id) end
 
+---Sets what YOUR HUD script should show one player. Returns whether they are here.
+---
+---**The engine has no health bar, no hunger bar and no experience bar, and
+---should not** — what any of those mean is yours (charter rule 1). But a mod
+---that could compute one and not draw it could not finish the job, so this is
+---the channel: you set values per player, and your own HUD script sees them as
+---`state.values`. No other mod's script can read them, and you cannot read
+---another's.
+---
+---**Replaces your whole set for that player**, rather than merging, because a
+---mod computes what it wants shown and says so — merging makes "this value is
+---gone now" impossible to express. Nothing goes over the network when the values
+---have not changed, so setting the same health every tick costs nothing.
+---
+---Values are numbers, strings and booleans. Anything else is refused rather than
+---coerced, and so is a number that is not one: a value quietly changed gives you
+---a HUD that disagrees with your own arithmetic. At most 32 values, names up to
+---32 bytes, strings up to 64 — a HUD line, not a document.
+---
+---They are forgotten when the player leaves, because it is your mod that knows
+---what they should say when they come back.
+---
+---```lua
+----- Server side, from your tick or a damage hook:
+---game.set_hud(uuid, { health = hp, max_health = 20, poisoned = poison > 0 })
+---
+----- And in your HUD script:
+---hud.on_draw(function(state)
+---    local hp = state.values.health
+---    if hp then
+---        hud.rect(8, 8, hp * 6, 8, { r = 200, g = 40, b = 40 })
+---    end
+---end)
+---```
+---@param player string The player's UUID, in hex.
+---@param values table<string, number|string|boolean>
+---@return boolean shown
+function game.set_hud(player, values) end
+
 ---Registers a HUD script this mod wants clients to run. Registration window only.
 ---
 ---**This is the only thing your mod can send that RUNS on a player's machine**,
@@ -1041,6 +1080,12 @@ function game.stop_loop(id) end
 ---
 ---Chat and the settings screen are not in `hud.hide_builtin` and never will be —
 ---moderation and rebinding have to work whatever a server pushes.
+---`state.values` is what YOUR mod sent this player with `game.set_hud`, and
+---nothing else — another mod's values are not reachable from here, the same way
+---its `game.storage` is not. **This is how a health bar gets its number.** The
+---engine has no health, hunger or experience of its own (charter rule 1); it
+---carries what you computed and reads none of it.
+---
 ---@param file string Path to the Lua file inside your mod directory.
 function game.register_hud_script(file) end
 

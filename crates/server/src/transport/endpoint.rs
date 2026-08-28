@@ -278,6 +278,18 @@ pub struct Shared {
     pub entity_messages:
         std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, Vec<ServerMessage>>>,
 
+    /// What each mod wants each player's HUD to show, and whether that player
+    /// has been told yet.
+    ///
+    /// **A map, not a queue**, and that is the whole reason this is not sent
+    /// through `entity_messages`: these are the latest STATE rather than a
+    /// stream of events, so a mod that sets a value sixty times between two
+    /// network passes costs one message and cannot overflow anything. A queue
+    /// would have to bound itself and then decide which health bar to drop.
+    pub hud_values: std::sync::Mutex<
+        std::collections::BTreeMap<PlayerUuid, std::collections::BTreeMap<String, HudSlot>>,
+    >,
+
     /// Every distributable file the loaded mods supply, by hash.
     ///
     /// Built once at startup and immutable thereafter. Rebuilding it while the
@@ -341,6 +353,15 @@ pub struct Shared {
     /// connected *count* on this struct, and two fields whose names differ only
     /// by what they happen to hold is how the wrong one gets locked.
     pub bodies: Arc<PlayerBodies>,
+}
+
+/// One mod's HUD values for one player, and whether they have been sent.
+#[derive(Debug, Clone, Default)]
+pub struct HudSlot {
+    /// What the mod last asked for.
+    pub values: tiamot_core::hud::Values,
+    /// Whether the player has been told this version.
+    pub sent: bool,
 }
 
 /// The connected players' authoritative bodies, behind the tick's lock.
@@ -742,6 +763,11 @@ impl Shared {
         if let Ok(mut bodies) = self.bodies.lock() {
             bodies.remove(uuid);
         }
+        // **And what their HUD was being told**, or a server nobody restarts
+        // accumulates a set of values per player who has ever joined. A mod
+        // sets them again when they come back, because it is the mod that
+        // knows what they should say.
+        self.forget_hud_values(uuid);
     }
 
     /// Files an input against the tick it belongs to.
@@ -1519,6 +1545,66 @@ impl Shared {
     /// Bounded per player: the queue is drained on that player's own connection
     /// task, and a client that spams refusable requests faster than it reads
     /// would otherwise grow this without limit.
+    /// Sets what one mod's HUD script should show one player.
+    ///
+    /// Replaces that mod's whole set for that player, because a mod computes
+    /// what it wants shown and says so — merging would make "this value is
+    /// gone now" impossible to express without a second call.
+    ///
+    /// Nothing is queued when the values are unchanged: a mod setting the same
+    /// health sixty times a second should cost nothing on the wire.
+    pub fn set_hud_values(
+        &self,
+        uuid: &PlayerUuid,
+        mod_id: &str,
+        values: tiamot_core::hud::Values,
+    ) {
+        let Ok(mut all) = self.hud_values.lock() else {
+            return;
+        };
+        let slot = all
+            .entry(*uuid)
+            .or_default()
+            .entry(mod_id.to_owned())
+            .or_default();
+        if slot.values == values && slot.sent {
+            return;
+        }
+        slot.values = values;
+        slot.sent = false;
+    }
+
+    /// Takes the HUD values one player has not been told yet.
+    pub fn unsent_hud_values(&self, uuid: &PlayerUuid) -> Vec<ServerMessage> {
+        let Ok(mut all) = self.hud_values.lock() else {
+            return Vec::new();
+        };
+        let Some(mods) = all.get_mut(uuid) else {
+            return Vec::new();
+        };
+        mods.iter_mut()
+            .filter(|(_, slot)| !slot.sent)
+            .map(|(mod_id, slot)| {
+                slot.sent = true;
+                ServerMessage::HudValues {
+                    mod_id: mod_id.clone(),
+                    values: slot
+                        .values
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Forgets everything a player was being shown, when they leave.
+    pub fn forget_hud_values(&self, uuid: &PlayerUuid) {
+        if let Ok(mut all) = self.hud_values.lock() {
+            all.remove(uuid);
+        }
+    }
+
     pub fn tell(&self, uuid: &PlayerUuid, text: String) {
         if let Ok(mut notices) = self.notices.lock() {
             let queue = notices.entry(*uuid).or_default();
@@ -1574,6 +1660,14 @@ impl Shared {
     /// Returns `false` only if nothing is listening at all.
     pub fn kick(&self, uuid: PlayerUuid, reason: String) -> bool {
         self.kicks.send((uuid, reason)).is_ok()
+    }
+
+    /// Whether one player is in world right now.
+    #[must_use]
+    pub fn is_online(&self, uuid: &PlayerUuid) -> bool {
+        self.online
+            .lock()
+            .is_ok_and(|online| online.contains_key(uuid))
     }
 
     /// Everyone currently in world, name and identity.
@@ -1873,6 +1967,12 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     // and the split that matters (what is re-sent and what is
                     // not) is already in the message shapes.
                     for message in shared.take_entity_messages(&uuid) {
+                        frame::write(&mut send, &message).await?;
+                    }
+                    // What a mod wants this player's own HUD to show. Sent
+                    // only when it differs from what they were last told, so a
+                    // mod recomputing the same health every tick costs nothing.
+                    for message in shared.unsent_hud_values(&uuid) {
                         frame::write(&mut send, &message).await?;
                     }
                     // Why the last thing they asked for did not happen. Sent
@@ -2398,6 +2498,7 @@ mod tests {
             inventory_dirty: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             entity_messages: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            hud_values: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             kicks: tokio::sync::broadcast::channel(4).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             bodies: Arc::default(),

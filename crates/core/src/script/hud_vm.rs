@@ -325,7 +325,7 @@ impl HudVm {
             // fault: a mod may push a script that only reacts to something.
             return Ok(());
         };
-        let table = self.state_table(state)?;
+        let table = self.state_table(state, &self.scripts[index].mod_id)?;
 
         super::budget::arm(&self.lua, self.limits.instructions_per_frame)?;
         let outcome = callback.call::<()>(table);
@@ -710,8 +710,24 @@ impl HudVm {
     }
 
     /// Builds the read-only state table handed to a draw callback.
-    fn state_table(&self, state: &State) -> mlua::Result<Table> {
+    fn state_table(&self, state: &State, mod_id: &str) -> mlua::Result<Table> {
         let table = self.lua.create_table()?;
+        // **This mod's values and no other's.** The state carries every mod's,
+        // keyed by id, and a script is handed the entry for the mod that
+        // pushed it — so `state.values` needs no namespacing and there is
+        // nowhere in the surface for a script to name somebody else's. The
+        // same isolation `game.storage` has on the other side.
+        let values = self.lua.create_table()?;
+        if let Some(mine) = state.values.get(mod_id) {
+            for (key, value) in mine {
+                match value {
+                    crate::hud::Value::Number(number) => values.set(key.as_str(), *number)?,
+                    crate::hud::Value::Text(text) => values.set(key.as_str(), text.as_str())?,
+                    crate::hud::Value::Flag(flag) => values.set(key.as_str(), *flag)?,
+                }
+            }
+        }
+        table.set("values", values)?;
         table.set("x", state.position[0])?;
         table.set("y", state.position[1])?;
         table.set("z", state.position[2])?;
@@ -957,6 +973,87 @@ end)
             )),
             "loose material asked for a shape"
         );
+    }
+
+    #[test]
+    fn a_script_sees_its_own_mods_values_and_no_others() {
+        // **The isolation is the whole design.** A HUD script is handed the
+        // values its OWN mod set, so `state.values` needs no namespacing and
+        // there is nowhere in the surface for one mod to read another's — the
+        // same shape `game.storage` has on the server side.
+        let mut vm = vm();
+        for mod_id in ["core_health", "core_magic"] {
+            vm.load(
+                mod_id,
+                r#"
+hud.on_draw(function(state)
+    local shown = {}
+    for name, value in pairs(state.values) do
+        shown[#shown + 1] = name .. "=" .. tostring(value)
+    end
+    table.sort(shown)
+    hud.text{ anchor = "top", x = 0, y = 0, text = table.concat(shown, ",") }
+end)
+"#,
+            )
+            .expect("load");
+        }
+
+        let mut state = state();
+        state.values.insert(
+            "core_health".to_owned(),
+            [
+                ("health".to_owned(), crate::hud::Value::Number(12.0)),
+                ("poisoned".to_owned(), crate::hud::Value::Flag(true)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        state.values.insert(
+            "core_magic".to_owned(),
+            [("school".to_owned(), crate::hud::Value::Text("fire".into()))]
+                .into_iter()
+                .collect(),
+        );
+
+        assert!(vm.draw(&state).is_empty(), "a good script has no faults");
+        let lines: Vec<String> = commands(&vm)
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::Text { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "health=12.0,poisoned=true".to_owned(),
+                "school=fire".to_owned(),
+            ],
+            "a script saw values that were not its mod's"
+        );
+    }
+
+    #[test]
+    fn a_script_whose_mod_sent_nothing_gets_an_empty_table_and_not_nil() {
+        // A HUD drawn before its mod has said anything, which is every HUD for
+        // the first frame or two. `state.values.health` must be nil rather
+        // than an error about indexing nil — the difference between a bar that
+        // is not there yet and a script that is disabled for a session.
+        let mut vm = vm();
+        vm.load(
+            "core_health",
+            r#"
+hud.on_draw(function(state)
+    if state.values.health == nil then
+        hud.text{ anchor = "top", x = 0, y = 0, text = "no values yet" }
+    end
+end)
+"#,
+        )
+        .expect("load");
+        assert!(vm.draw(&state()).is_empty(), "a good script has no faults");
+        assert_eq!(commands(&vm).len(), 1, "the script did not run cleanly");
     }
 
     #[test]

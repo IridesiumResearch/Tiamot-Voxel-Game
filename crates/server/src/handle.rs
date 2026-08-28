@@ -1044,6 +1044,7 @@ impl ServerHandle {
             seeds: std::sync::Mutex::new(std::collections::VecDeque::new()),
             notices: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             entity_messages: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            hud_values: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             // Capacity is per-receiver backlog, not a total. 1024 messages at
             // 20 Hz is roughly fifty seconds behind before a client starts
             // losing them, which is far longer than a connection worth keeping.
@@ -1240,6 +1241,13 @@ impl ServerHandle {
                                     std::sync::Arc::clone(&population),
                                     std::sync::Arc::clone(&shared.bodies),
                                 ),
+                            ));
+                            // And a mod's own numbers on a mod's own HUD. The
+                            // engine has no health bar and should not (charter
+                            // rule 1); this is the channel it carries and does
+                            // not read.
+                            host.vm_mut().set_hud_access(std::sync::Arc::new(
+                                crate::hud::Shared::new(std::sync::Arc::clone(&shared)),
                             ));
                             // A mod's own facts, read from the world before it
                             // can ask for them. Loaded per loaded mod rather

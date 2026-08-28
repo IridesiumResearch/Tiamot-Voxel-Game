@@ -838,6 +838,12 @@ pub struct App {
     /// says so once, because a client that refused to run without a scripting
     /// VM would be a client nobody could play on.
     hud_vm: Option<tiamot_core::script::HudVm>,
+    /// What each mod wants this player's HUD to show, by mod id.
+    ///
+    /// Held here rather than inside the VM because it arrives on the network
+    /// and the VM is rebuilt when a script is replaced; a value that vanished
+    /// because a mod reloaded its own script would be a bar that blinked.
+    hud_values: std::collections::BTreeMap<String, tiamot_core::hud::Values>,
     /// Sounds this client has been told about and not yet played.
     ///
     /// A queue rather than an immediate call, because playing one belongs to
@@ -1183,6 +1189,7 @@ impl App {
             dig_lock: None,
             dig_resumes_at: None,
             was_on_ground: true,
+            hud_values: std::collections::BTreeMap::new(),
             hud_vm: match tiamot_core::script::HudVm::new(tiamot_core::script::HudLimits::default())
             {
                 Ok(vm) => Some(vm),
@@ -3807,6 +3814,12 @@ impl App {
                 Event::Sounds { sounds } => self.sounds = sounds,
 
                 Event::HudScript { mod_id, source } => self.adopt_hud_script(&mod_id, &source),
+                // **Replaced, not merged.** The server sends a mod's whole set
+                // each time it changes, so a value a mod stopped sending stops
+                // being shown — which merging would make impossible to say.
+                Event::HudValues { mod_id, values } => {
+                    self.hud_values.insert(mod_id, values);
+                }
 
                 Event::SoundBindings { bindings } => self.adopt_bindings(bindings),
 
@@ -5013,6 +5026,7 @@ impl App {
                 name: tool.name.clone(),
                 brush: tool.brush.clone(),
             }),
+            values: self.hud_values.clone(),
         })
     }
 

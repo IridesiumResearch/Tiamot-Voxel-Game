@@ -181,6 +181,17 @@ pub enum Event {
         id: String,
     },
 
+    /// What one mod wants this player's HUD to show.
+    ///
+    /// The whole set for that mod each time, replacing what it said before —
+    /// see [`tiamot_core::proto::ServerMessage::HudValues`].
+    HudValues {
+        /// Whose values these are, and whose script will be handed them.
+        mod_id: String,
+        /// The values, by name.
+        values: tiamot_core::hud::Values,
+    },
+
     /// A pushed HUD script has arrived and is ready to run.
     ///
     /// One event per script rather than one for the table, because they arrive
@@ -1302,6 +1313,12 @@ async fn session(
                 let _ = events.send(Event::StopLoop { id });
             }
 
+            ServerMessage::HudValues { mod_id, values } => {
+                let _ = events.send(Event::HudValues {
+                    mod_id,
+                    values: values.into_iter().collect(),
+                });
+            }
             ServerMessage::HudScripts { scripts } => {
                 // The same pipeline as a sound, for the same reason: by hash,
                 // after the join, and a client that already has the bytes asks

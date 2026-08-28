@@ -26,6 +26,7 @@ pub mod content;
 pub mod ent;
 pub mod fluid;
 pub mod handle;
+pub mod hud;
 pub mod lease;
 pub mod light;
 pub mod rcon;

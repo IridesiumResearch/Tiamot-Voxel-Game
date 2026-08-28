@@ -936,6 +936,14 @@ pub trait ScriptVm: Sized {
     /// Points `game.storage` at the server's store.
     fn set_storage_access(&mut self, access: std::sync::Arc<dyn crate::storage::Access>);
 
+    /// Points `game.set_hud` at the per-player HUD values.
+    ///
+    /// The same seam as the others, and the reason it is one: the engine has
+    /// no health bar and should not (charter rule 1), so the only way a mod's
+    /// numbers reach a mod's own HUD script is a channel the engine carries
+    /// and does not read.
+    fn set_hud_access(&mut self, access: std::sync::Arc<dyn crate::hud::Access>);
+
     /// Points `game.line_of_sight` at the world.
     ///
     /// **Unlike every other setter here, what is behind this handle appears and

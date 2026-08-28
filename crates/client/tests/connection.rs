@@ -178,6 +178,7 @@ struct Seen {
     dialogs: std::collections::BTreeMap<String, tiamot_core::ui::Tree>,
     /// HUD scripts the server pushed, with their source, in arrival order.
     hud_scripts: Vec<(String, String)>,
+    hud_values: std::collections::BTreeMap<String, tiamot_core::hud::Values>,
     /// Which sound each named event plays, as the server last said.
     bindings: Vec<tiamot_core::proto::SoundBinding>,
     /// Loops currently running, by id.
@@ -197,6 +198,9 @@ impl Seen {
             }
             Event::Joined { spawn, .. } => self.joined = Some(spawn),
             Event::View { .. } => {}
+            Event::HudValues { mod_id, values } => {
+                self.hud_values.insert(mod_id, values);
+            }
             Event::HudScript { mod_id, source } => {
                 self.hud_scripts.push((mod_id, source));
             }
@@ -743,4 +747,122 @@ fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
 
     connection.shutdown();
     assert!(server.stop());
+}
+
+/// A server running one mod that pushes a HUD script and feeds it values.
+///
+/// Its own mod rather than a change to `game/`: what is under test is the
+/// CHANNEL, and a reference mod that happened to use it would make the test
+/// about that mod instead.
+fn start_with_a_gauge(name: &str) -> ServerHandle {
+    let mods = scratch(&format!("{name}-mods"));
+    let dir = mods.join("gauge");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"gauge\"\nname = \"Gauge\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("hud.lua"),
+        r#"
+hud.on_draw(function(state)
+    local hp = state.values.health
+    if hp ~= nil then
+        hud.text{ anchor = "top", x = 0, y = 0, text = "hp " .. hp .. " " .. state.values.name }
+    end
+end)
+"#,
+    )
+    .expect("hud script");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+game.register_block{ id = "ground" }
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(game.flat_heightmap(0), game.get_block_id("gauge:ground"))
+end)
+game.register_hud_script("hud.lua")
+
+-- Whatever this mod decides health is. The engine has none (charter rule 1);
+-- it carries the number and reads none of it.
+game.register_on_player_join(function(event)
+    game.set_hud(event.player, { health = 17, name = "Ada" })
+end)
+"#,
+    )
+    .expect("script");
+
+    ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: scratch(&format!("{name}-world")),
+        max_players: 4,
+        allowlist: Allowlist::open(),
+        operators: Vec::new(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(mods),
+        enabled_mods: None,
+        seed: Some(4242),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("start")
+}
+
+#[test]
+fn a_mods_own_numbers_reach_a_mods_own_hud_script() {
+    // **The whole channel, end to end**: a mod sets values on the server, they
+    // cross the wire, the client holds them, and the mod's OWN script is
+    // handed them and draws with them.
+    //
+    // This is what a health bar is made of. The engine has no health, hunger
+    // or experience and should not — but a mod that could compute one and not
+    // draw it could not finish the job, which is the gap this closes.
+    let server = start_with_a_gauge("hud-values");
+    let home = Home::new("hud-values");
+    let mut connection = home.open(&server);
+    let mut seen = Seen::default();
+
+    assert!(
+        pump(&mut connection, &mut seen, |seen| !seen
+            .hud_scripts
+            .is_empty()
+            && seen.hud_values.contains_key("gauge")),
+        "the values never arrived; scripts={:?} values={:?} warnings={:?}",
+        seen.hud_scripts.len(),
+        seen.hud_values,
+        seen.warnings
+    );
+
+    let (mod_id, source) = seen.hud_scripts[0].clone();
+    assert_eq!(mod_id, "gauge");
+
+    let mut vm =
+        tiamot_core::script::HudVm::new(tiamot_core::script::HudLimits::default()).expect("hud vm");
+    vm.load(&mod_id, &source).expect("the HUD script loads");
+
+    let state = tiamot_core::hud::State {
+        values: seen.hud_values.clone(),
+        ..tiamot_core::hud::State::default()
+    };
+    assert!(vm.draw(&state).is_empty(), "the script faulted");
+
+    let drawn: Vec<String> = vm
+        .with_frame(|frame| {
+            frame
+                .commands()
+                .iter()
+                .filter_map(|command| match command {
+                    tiamot_core::hud::Command::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .expect("a frame");
+    assert_eq!(
+        drawn,
+        ["hp 17.0 Ada".to_owned()],
+        "the mod's own values did not reach its own script"
+    );
 }

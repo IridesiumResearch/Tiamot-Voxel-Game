@@ -261,6 +261,8 @@ pub struct MluaVm {
     entities: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::ent::Access>>>>,
     /// Where `game.storage` reaches, once there is a world.
     storage: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::storage::Access>>>>,
+    /// Where `game.set_hud` sends a mod's own HUD values.
+    hud: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::hud::Access>>>>,
     /// Where `game.line_of_sight` looks, while the tick has lent the world out.
     ///
     /// Unlike every other slot here, what is behind this one comes and goes
@@ -597,6 +599,7 @@ impl ScriptVm for MluaVm {
             dialogs: std::sync::Arc::new(std::sync::Mutex::new(None)),
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
             storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            hud: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sight: std::sync::Arc::new(std::sync::Mutex::new(None)),
             paths: std::sync::Arc::new(std::sync::Mutex::new(None)),
             edits: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -739,6 +742,12 @@ impl ScriptVm for MluaVm {
 
     fn set_storage_access(&mut self, access: std::sync::Arc<dyn crate::storage::Access>) {
         if let Ok(mut slot) = self.storage.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_hud_access(&mut self, access: std::sync::Arc<dyn crate::hud::Access>) {
+        if let Ok(mut slot) = self.hud.lock() {
             *slot = Some(access);
         }
     }
@@ -3100,6 +3109,83 @@ impl MluaVm {
         Ok(())
     }
 
+    /// Puts `game.set_hud` on the `game` table.
+    ///
+    /// **The mod id is captured, never passed**, exactly as `game.storage`'s
+    /// is: a mod cannot set another's HUD values because there is nowhere in
+    /// the surface to name one.
+    fn install_hud_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let slot = std::sync::Arc::clone(&self.hud);
+        let mine = mod_id.to_owned();
+        let set = self
+            .lua
+            .create_function(move |_, (uuid, values): (String, Table)| {
+                let player = player_of(&uuid, "set_hud")?;
+                let mut out = crate::hud::Values::new();
+                for pair in values.pairs::<String, mlua::Value>() {
+                    let (key, value) = pair?;
+                    if out.len() >= crate::hud::MAX_VALUES {
+                        return Err(mlua::Error::external(format!(
+                            "game.set_hud takes at most {} values",
+                            crate::hud::MAX_VALUES
+                        )));
+                    }
+                    if key.len() > crate::hud::MAX_KEY {
+                        return Err(mlua::Error::external(format!(
+                            "game.set_hud value names are at most {} bytes, and `{key}` is longer",
+                            crate::hud::MAX_KEY
+                        )));
+                    }
+                    // **Refused, not truncated or coerced.** A mod told that a
+                    // value did not fit can decide what to send instead; one
+                    // whose value was quietly changed has a HUD that disagrees
+                    // with its own arithmetic.
+                    let value = match value {
+                        mlua::Value::Boolean(flag) => crate::hud::Value::Flag(flag),
+                        mlua::Value::Integer(number) => {
+                            #[expect(
+                                clippy::cast_precision_loss,
+                                reason = "a HUD number is drawn, not computed with"
+                            )]
+                            crate::hud::Value::Number(number as f64)
+                        }
+                        mlua::Value::Number(number) => {
+                            if !number.is_finite() {
+                                return Err(mlua::Error::external(format!(
+                                    "game.set_hud was given `{key}` as a number that is not one"
+                                )));
+                            }
+                            crate::hud::Value::Number(number)
+                        }
+                        mlua::Value::String(text) => {
+                            let text = text.to_str()?.to_owned();
+                            if text.len() > crate::hud::MAX_TEXT {
+                                return Err(mlua::Error::external(format!(
+                                    "game.set_hud text is at most {} bytes, and `{key}`'s is longer",
+                                    crate::hud::MAX_TEXT
+                                )));
+                            }
+                            crate::hud::Value::Text(text)
+                        }
+                        other => {
+                            return Err(mlua::Error::external(format!(
+                                "game.set_hud takes numbers, strings and booleans; `{key}` is a {}",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    out.insert(key, value);
+                }
+                Ok(slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|hud| hud.set_hud(&mine, player, out)))
+                    .unwrap_or(false))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("set_hud", set).map_err(|err| self.vm_error(&err))
+    }
+
     /// Puts `game.storage` on the `game` table.
     ///
     /// A table with three functions rather than three `game.*` entries, because
@@ -3314,6 +3400,7 @@ impl MluaVm {
 
         self.install_entity_api(mod_id, game)?;
         self.install_storage_api(mod_id, game)?;
+        self.install_hud_api(mod_id, game)?;
         self.install_heading(game)?;
 
         let (get_fluid, set_fluid) = self.fluid_functions()?;

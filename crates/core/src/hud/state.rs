@@ -117,4 +117,70 @@ pub struct State {
     pub dig: Option<super::Fill>,
     /// The tool in hand, if any is registered.
     pub tool: Option<HeldTool>,
+    /// What each mod has sent to its OWN HUD script, by mod id.
+    ///
+    /// **The engine has no health bar, no hunger bar and no experience bar,
+    /// and should not.** Charter rule 1 puts what those mean in a mod — and a
+    /// mod that could compute them and not draw them would be a mod that could
+    /// not finish the job. This is the channel: the server-side half sets
+    /// values per player, and a script sees the ones its own mod sent under
+    /// `state.values`.
+    ///
+    /// Keyed by mod id here and flattened by the VM, so a script cannot read
+    /// another mod's values — the same isolation `game.storage` has, and for
+    /// the same reason: it is a property of the surface rather than of good
+    /// behaviour.
+    pub values: std::collections::BTreeMap<String, Values>,
 }
+
+/// One mod's HUD values, by name.
+pub type Values = std::collections::BTreeMap<String, Value>;
+
+/// A value a mod sends to its own HUD script.
+///
+/// # Why these three and nothing nested
+///
+/// A HUD draws numbers, words and switches. A nested structure would be a
+/// second serialisation format on a path where **the client decodes what a
+/// server it does not trust sent it** (charter rule 14), and every one of its
+/// depths would be a bound to check. A mod with something structured to say
+/// flattens it into keys, which is what it would have to do to draw it anyway.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Value {
+    /// A quantity: hit points, hunger, a countdown, a fraction.
+    Number(f64),
+    /// A word: a status, a name, a formatted total.
+    Text(String),
+    /// A switch: poisoned, sneaking, in combat.
+    Flag(bool),
+}
+
+/// The seam a mod sets its own HUD values through.
+///
+/// One method, and the mod id is passed by the VM rather than by the script —
+/// the same isolation [`crate::storage::Access`] has, and for the same reason:
+/// a mod cannot name another's values because there is nowhere in the surface
+/// to put the name.
+pub trait Access: Send + Sync {
+    /// Replaces what one mod wants one player's HUD to show.
+    ///
+    /// Returns whether the player was there to tell. Replacing rather than
+    /// merging, because a mod computes what it wants shown and says so —
+    /// merging makes "this value is gone now" impossible to express.
+    fn set_hud(&self, mod_id: &str, player: [u8; 32], values: Values) -> bool;
+}
+
+/// How many values one mod may send one player.
+///
+/// Checked where they are SET, so a mod hears about it, and again where they
+/// are decoded, because the second is reading what a server sent.
+pub const MAX_VALUES: usize = 32;
+
+/// The longest a value's name may be.
+pub const MAX_KEY: usize = 32;
+
+/// The longest a [`Value::Text`] may be.
+///
+/// A HUD line, not a paragraph: anything longer is a mod trying to send a
+/// document through a channel sized for a label.
+pub const MAX_TEXT: usize = 64;
