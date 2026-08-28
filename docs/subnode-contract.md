@@ -415,6 +415,17 @@ own; the tool the player holds carries one, and a mod says which.
   against a half-mined block doing nothing and saying something was already
   there. The gaps are taken in `placement_mask`'s bottom-up order, so a partial
   payment still fills deterministically.
+- **A block brush tops up its OWN material and steps around anything else.**
+  Filling the gaps in a carved block is what makes carving reversible; it is
+  not an invitation to mix. A block brush aimed at a block holding a different
+  material lands in the next block along the face instead, leaving the gaps
+  empty — reported from the window, and `place::landing` is the rule. With no
+  face to step along it is refused rather than guessed at.
+  **Mixing is still possible and still deliberate**: a sub-node brush places
+  one cell of anything into any block with room, which is how a block of
+  twenty-two stone and five gold gets made. The distinction is the point — a
+  brush that addresses whole blocks should not produce a block nobody could
+  have asked for.
 
 **A stack cut to a shape places its cut, whatever brush is held.** The cut *is*
 the thing being carried: a chisel does not get to spend a whole crafted stair to

@@ -329,6 +329,45 @@ fn last_cell_touched(high: f64) -> i64 {
     }
 }
 
+/// Where a block-brush placement lands, given what is already in the block.
+///
+/// **Reported from the window**: "when right clicking on a partially empty
+/// block with a different material it should place the block in the next slot
+/// over or up or whatever, even if that leaves an empty space."
+///
+/// A block brush tops up a carved block — that is what makes carving
+/// reversible (§7.1) — but only with the material already in it. Somebody
+/// building a dirt wall against a chiselled stone one is not asking to mix the
+/// two, and the block they are pointing at having room is a fact about the
+/// stone rather than an invitation.
+///
+/// `holds_other` is whether the target's block contains any material that is
+/// not the one being placed. `face` is the surface the placement was made
+/// against; `None` comes back when a step is needed and there is no face to
+/// step along, which is a refusal rather than a guess.
+///
+/// Mixing is still possible and still deliberate: a **sub-node brush** places
+/// one cell of anything into any block with room, which is how a block of
+/// twenty-two stone and five gold gets made.
+#[must_use]
+pub fn landing(target: SubNodePos, holds_other: bool, face: [i8; 3]) -> Option<SubNodePos> {
+    if !holds_other {
+        return Some(target);
+    }
+    if face == [0; 3] {
+        return None;
+    }
+    // A whole block along the face, in cells. The cell within the block does
+    // not matter — a block brush fills the block, not the cell — so stepping
+    // by three keeps the same offset inside the new one.
+    let step = |axis: usize, value: i32| value + i32::from(face[axis]) * SUBNODES_PER_AXIS as i32;
+    Some(SubNodePos::new(
+        step(0, target.x),
+        step(1, target.y),
+        step(2, target.z),
+    ))
+}
+
 /// Turns an authored cut so it faces the player who is placing it.
 ///
 /// **Reported from the window**: "when placing a shape block it should always

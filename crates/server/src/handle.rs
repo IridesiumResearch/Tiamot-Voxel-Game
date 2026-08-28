@@ -2053,26 +2053,69 @@ impl ServerHandle {
                                 )
                             });
 
-                            // **What the target block already holds.** A block
-                            // brush fills the gaps in a partly-mined block
-                            // rather than colliding with what is left of it —
-                            // reported from the window as placing against a
-                            // half-mined block doing nothing and saying there
-                            // was already something there.
-                            let filled = world
-                                .block_cells(request.target.block(), &mut source)
-                                .map_or(0, |cells| {
+                            // **What a block already holds**, as a mask of
+                            // occupied cells and whether any of it is somebody
+                            // else's material.
+                            let contents = |at: tiamot_core::BlockPos,
+                                                world: &mut crate::world::World,
+                                                source: &mut dyn crate::world::ChunkSource| {
+                                world.block_cells(at, source).map_or((0, false), |cells| {
                                     let mut mask = 0;
+                                    let mut other = false;
                                     for (index, cell) in cells.iter().enumerate() {
-                                        if !cell.is_air() {
-                                            mask |= 1 << index;
+                                        if cell.is_air() {
+                                            continue;
                                         }
+                                        mask |= 1 << index;
+                                        other |= *cell != material;
                                     }
-                                    mask
-                                });
+                                    (mask, other)
+                                })
+                            };
+
+                            // **A block brush tops up its OWN material.** A
+                            // block brush fills the gaps in a partly-mined
+                            // block rather than colliding with what is left of
+                            // it — reported from the window — but somebody
+                            // building a dirt wall against a chiselled stone
+                            // one is not asking to mix the two, so a different
+                            // material steps to the next block along the face.
+                            // Reported from the window as well; the two halves
+                            // are Sub-Node Contract §7.1.
+                            //
+                            // A sub-node brush is exempt: placing one cell of
+                            // anything into a block with room is how a mixed
+                            // block gets made on purpose.
+                            let (there, holds_other) =
+                                contents(request.target.block(), &mut world, &mut source);
+                            let target = if matches!(brush, tiamot_core::dig::Brush::Block)
+                                && placed_shape.is_none()
+                            {
+                                match tiamot_core::place::landing(
+                                    request.target,
+                                    holds_other && there != 0,
+                                    request.face,
+                                ) {
+                                    Some(target) => target,
+                                    None => {
+                                        shared.tell(
+                                            &request.actor,
+                                            tiamot_core::place::Refusal::Occupied.to_string(),
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                request.target
+                            };
+                            let filled = if target == request.target {
+                                there
+                            } else {
+                                contents(target.block(), &mut world, &mut source).0
+                            };
 
                             let outcome =
-                                tiamot_core::place::plan(request.target, held, placed_shape, brush, filled)
+                                tiamot_core::place::plan(target, held, placed_shape, brush, filled)
                                 .and_then(|plan| {
                                     // Air only, judged cell by cell. Placing
                                     // into occupied space would have to decide
@@ -3081,6 +3124,18 @@ impl ServerHandle {
     pub fn seed_subnode(&self, pos: tiamot_core::SubNodePos, material: u16) -> bool {
         self.shared
             .queue_seed(tiamot_core::proto::Edit::SubNode { pos, material })
+    }
+
+    /// The same, for a block that is only partly filled.
+    ///
+    /// For arranging the carved block a test is about to act on, without
+    /// mining one cell at a time to get there.
+    pub fn seed_partial(&self, pos: tiamot_core::BlockPos, material: u16, occupancy: u32) -> bool {
+        self.shared.queue_seed(tiamot_core::proto::Edit::Partial {
+            pos,
+            material,
+            occupancy,
+        })
     }
 
     /// The address the server is actually listening on.

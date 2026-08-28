@@ -146,10 +146,18 @@ impl Front {
             // tabs and around the active one is what makes them tabs — so it
             // needs the full width, and a button sharing the row would either
             // be pushed off it or cut the line short.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Quit").clicked() {
-                    action = Action::Quit;
-                }
+            //
+            // **The `horizontal` is what gives it a row.** `with_layout` on
+            // its own claims the whole REMAINING height of a top-down `Ui` and
+            // centres its contents in it, so the button came out floating two
+            // hundred points above everything else — reported from the window
+            // as "the quit button is way up above the tabs randomly".
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Quit").clicked() {
+                        action = Action::Quit;
+                    }
+                });
             });
 
             let active = TABS
@@ -656,7 +664,7 @@ mod tests {
     /// A real `egui` pass rather than a call to the tab function, because the
     /// thing being tested is a checkbox reporting a change — which only a
     /// widget that was actually clicked does.
-    fn frame(screen: &mut Front, ctx: &egui::Context, events: Vec<egui::Event>) {
+    fn frame(screen: &mut Front, ctx: &egui::Context, events: Vec<egui::Event>) -> Action {
         // egui is built without `default_fonts`, so a bare context has no
         // glyphs and every label lays out to nothing — which is a page with no
         // widgets on it to click.
@@ -670,10 +678,12 @@ mod tests {
             ..Default::default()
         };
         let mut config = crate::config::Config::default();
+        let mut acted = Action::None;
         let _ = ctx.run_ui(input, |_| {
             let context = ctx.clone();
-            screen.draw(&context, &mut config);
+            acted = screen.draw(&context, &mut config);
         });
+        acted
     }
 
     /// Clicks at `at`, across the two frames egui needs to see one.
@@ -681,7 +691,7 @@ mod tests {
     /// A press and a release in a single pass is not a click: the widget has
     /// to be drawn under the pointer while the button is down before the
     /// release can land on it.
-    fn click(screen: &mut Front, ctx: &egui::Context, at: egui::Pos2) {
+    fn click(screen: &mut Front, ctx: &egui::Context, at: egui::Pos2) -> Action {
         let button = |pressed| egui::Event::PointerButton {
             pos: at,
             button: egui::PointerButton::Primary,
@@ -694,8 +704,9 @@ mod tests {
             ctx,
             vec![egui::Event::PointerMoved(at), button(true)],
         );
-        frame(screen, ctx, vec![button(false)]);
+        let acted = frame(screen, ctx, vec![button(false)]);
         frame(screen, ctx, Vec::new());
+        acted
     }
 
     #[test]
@@ -840,10 +851,12 @@ mod tests {
 
         // The box is found by sweeping the page rather than by computing where
         // egui put it: the test is about there being a box that turns the mod
-        // off and hands the change back, not about exact spacing. The tab strip
-        // is skipped, because a click that changes page proves nothing.
+        // off and hands the change back, not about exact spacing. The WHOLE
+        // sheet, because a narrower window is a guess about the layout that
+        // goes stale the first time anything above the list changes height —
+        // which is exactly what fixing the Quit button's row did.
         let mut at = None;
-        'sweep: for y in (560..720).step_by(4) {
+        'sweep: for y in (0..720).step_by(4) {
             for x in (200..1100).step_by(4) {
                 let point = egui::pos2(x as f32, y as f32);
                 click(&mut screen, &ctx, point);
@@ -864,6 +877,50 @@ mod tests {
         assert!(
             !screen.take_catalogue_dirty(),
             "the same change was handed back twice"
+        );
+    }
+
+    #[test]
+    fn quit_sits_on_the_row_above_the_tabs() {
+        // **Reported from the window**: "the quit button on the main menu is
+        // way up above the tabs randomly."
+        //
+        // `with_layout` in a top-down `Ui` claims the whole REMAINING height
+        // and centres its contents in it, so a right-aligned button on its own
+        // came out floating half a sheet away from everything else. Wrapping it
+        // in a row is what gives it a row's height.
+        //
+        // Found by sweeping rather than computed, because the assertion is
+        // about where the two end up and not about which egui calls were made.
+        let ctx = egui::Context::default();
+        let mut screen = front(vec![world("Home", &[])]);
+        frame(&mut screen, &ctx, Vec::new());
+
+        let mut quit = None;
+        let mut strip = None;
+        'sweep: for y in (0..720).step_by(4) {
+            for x in (200..1100).step_by(6) {
+                let point = egui::pos2(x as f32, y as f32);
+                screen.tab = Tab::Mods;
+                let acted = click(&mut screen, &ctx, point);
+                if quit.is_none() && matches!(acted, Action::Quit) {
+                    quit = Some(point);
+                }
+                if strip.is_none() && screen.tab != Tab::Mods {
+                    strip = Some(point);
+                }
+                if quit.is_some() && strip.is_some() {
+                    break 'sweep;
+                }
+            }
+        }
+        let quit = quit.expect("no click anywhere on the screen quit");
+        let strip = strip.expect("no click anywhere on the screen changed tab");
+        assert!(
+            (quit.y - strip.y).abs() < 60.0,
+            "Quit is at {quit:?} and the tab strip is at {strip:?} — {:.0} points apart, \
+             which reads as a button floating somewhere of its own",
+            (quit.y - strip.y).abs()
         );
     }
 

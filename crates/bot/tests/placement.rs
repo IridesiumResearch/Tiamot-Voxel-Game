@@ -39,11 +39,16 @@ const MATERIALS: [&str; 2] = ["test:stone", "test:dirt"];
 const CHISELLED_CELLS: u32 = 13;
 
 fn stone() -> u16 {
+    material(0)
+}
+
+/// The `index`th of [`MATERIALS`], as the world id it is registered with.
+fn material(index: usize) -> u16 {
     let mut registry = tiamot_core::Registry::new();
     let mut id = MaterialId::AIR;
-    for (index, name) in MATERIALS.iter().enumerate() {
+    for (at, name) in MATERIALS.iter().enumerate() {
         let assigned = registry.register(name).expect("register");
-        if index == 0 {
+        if at == index {
             id = assigned;
         }
     }
@@ -512,4 +517,140 @@ fn placing_inside_a_player_is_refused() {
     });
 
     assert!(server.stop());
+}
+
+#[test]
+fn topping_up_a_half_mined_block_fills_its_gaps_and_keeps_what_was_left() {
+    // **Reported from the window**: "right clicking on a partially empty block
+    // with the same material does not seem to fill up the empty subnodes."
+    //
+    // Two halves, and the second is the one that was silently wrong: the plan
+    // picks the EMPTY cells, and the write has to be those cells. Rebuilding
+    // it from a count gives a bottom-up run that overlaps what was left — and
+    // `Edit::Partial` sets the whole block, so the overlap DELETED material.
+    let server = start("top-up");
+    block_on(async {
+        let mut bot = join(&server, "Mason").await;
+        let stone = stone();
+
+        // A block to spend, and a block to carve at.
+        let quarry = BlockPos::new(3, 1, 3);
+        let carved = BlockPos::new(5, 1, 3);
+        mine_a_block(&mut bot, &server, quarry, stone).await;
+        assert_eq!(held(&bot, stone), 27, "a whole block is twenty-seven units");
+
+        // Nine cells of stone, left in the bottom layer.
+        assert!(
+            server.seed_partial(carved, stone, tiamot_core::inventory::placement_mask(9)),
+            "seed queue full"
+        );
+        bot.expect_partial(carved, stone, 9, Duration::from_secs(10))
+            .await
+            .expect("the carved block should land");
+
+        // Aimed at an empty cell INSIDE it — which is what looking into the
+        // hollow and right-clicking does.
+        let gap = SubNodePos::new(carved.x * 3 + 1, carved.y * 3 + 2, carved.z * 3 + 1);
+        bot.place_from_inventory(gap, stone).await.expect("send");
+
+        // Full: the eighteen that were missing, and the nine that were there.
+        bot.expect_block(carved, stone, Duration::from_secs(10))
+            .await
+            .expect("topping up a carved block should make it whole again");
+
+        // And the charge is for the GAPS only. Twenty-seven minus eighteen.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if held(&bot, stone) == 9 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "filling eighteen gaps should cost eighteen units, and left {} of 27",
+                held(&bot, stone)
+            );
+            bot.recv().await.expect("recv");
+        }
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn a_different_material_steps_to_the_next_block_rather_than_mixing() {
+    // **Reported from the window**: "when right clicking on a partially empty
+    // block with a different material it should place the block in the next
+    // slot over or up or whatever, even if that leaves an empty space."
+    //
+    // A block brush tops up its own material — that is what makes carving
+    // reversible — but somebody building a dirt wall against a chiselled stone
+    // one is not asking to mix the two. The stone keeps its gaps and the dirt
+    // goes next door.
+    let server = start("step-off");
+    block_on(async {
+        let mut bot = join(&server, "Mason").await;
+        let stone = stone();
+        let dirt = material(1);
+
+        // A block of dirt to spend, and a carved block of stone to aim at.
+        let quarry = BlockPos::new(2, 1, 3);
+        let carved = BlockPos::new(4, 1, 3);
+        mine_a_block(&mut bot, &server, quarry, dirt).await;
+        assert_eq!(held(&bot, dirt), 27);
+
+        // Cleared, because the world above the carved block is whatever the
+        // reference worldgen put there and a placement into solid ground is
+        // refused for a reason that has nothing to do with this test.
+        let above = BlockPos::new(carved.x, carved.y + 1, carved.z);
+        assert!(
+            server.seed_block(above, MaterialId::AIR.0),
+            "seed queue full"
+        );
+        assert!(
+            server.seed_partial(carved, stone, tiamot_core::inventory::placement_mask(9)),
+            "seed queue full"
+        );
+        bot.expect_partial(carved, stone, 9, Duration::from_secs(10))
+            .await
+            .expect("the carved block should land");
+
+        // Aimed into the hollow, against the top face of the stone that is
+        // left — which is the gesture the report describes.
+        let gap = SubNodePos::new(carved.x * 3 + 1, carved.y * 3 + 2, carved.z * 3 + 1);
+        bot.place_shape_against(gap, dirt, 0, [0, 1, 0])
+            .await
+            .expect("send");
+
+        // The dirt is in the block ABOVE, whole.
+        if bot
+            .expect_block(above, dirt, Duration::from_secs(10))
+            .await
+            .is_err()
+        {
+            panic!(
+                "the dirt did not land in the next block up; the server said {:?}",
+                bot.notices()
+            );
+        }
+
+        // And the stone is untouched: still nine cells, still stone. Anything
+        // else is material destroyed by placing something beside it.
+        assert!(
+            !bot.received().into_iter().any(|message| matches!(
+                message,
+                tiamot_core::proto::ServerMessage::BlockDelta {
+                    edit: tiamot_core::proto::Edit::Partial { pos, material, .. },
+                    ..
+                } if pos == carved && material == dirt
+            )),
+            "the carved stone block was written with dirt"
+        );
+        bot.expect_partial(carved, stone, 9, Duration::from_secs(2))
+            .await
+            .expect("the stone that was there should still be there");
+
+        bot.disconnect().await;
+    });
+    server.stop();
 }
