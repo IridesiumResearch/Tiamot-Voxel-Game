@@ -676,6 +676,10 @@ pub struct JoinEvent {
 /// It fires for a disconnection the server never saw coming as well as a clean
 /// one: the tick compares who is present against who was, so a dropped
 /// connection is the same event as a goodbye.
+///
+/// **Somebody who arrives and goes inside one tick produces neither event.**
+/// Both halves are the same diff, so the two are missed together rather than a
+/// mod being told about a departure it never heard the arrival of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaveEvent {
     /// Who left, canonically (charter rule 13).

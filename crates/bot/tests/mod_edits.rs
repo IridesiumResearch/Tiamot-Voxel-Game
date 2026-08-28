@@ -608,3 +608,108 @@ fn a_block_read_back_is_in_the_id_space_a_mod_speaks() {
     });
     server.stop();
 }
+
+/// A mod that reacts to somebody leaving.
+fn write_doorman(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("doorman");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"doorman\"\nname = \"Doorman\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+local ground = game.register_block{ id = "ground" }
+game.register_block{ id = "waved" }
+game.register_block{ id = "had_stuff" }
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(game.flat_heightmap(0), ground)
+end)
+
+game.register_on_player_join(function(event)
+    game.give(event.player, { material = "doorman:ground", units = 27 })
+end)
+
+game.register_on_player_leave(function(event)
+    game.set_block({ x = 3, y = 9, z = 3 }, "doorman:waved")
+    -- **The inventory must still be readable here.** A mod dropping what
+    -- somebody was carrying is the whole reason this hook runs before the row
+    -- is written.
+    for _, stack in ipairs(game.inventory(event.player)) do
+        if stack.units > 0 then
+            game.set_block({ x = 4, y = 9, z = 3 }, "doorman:had_stuff")
+        end
+    end
+end)
+"#,
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_mod_hears_about_a_player_leaving_while_it_can_still_act() {
+    // **The other half of a join.** Anything a mod keeps per player — a party,
+    // a claim, a timer, a bar it was drawing — is bookkeeping it could start
+    // and never end.
+    //
+    // The ordering is the part worth testing: a mod that wants to drop what
+    // somebody was carrying has to be able to read their inventory, so the
+    // hook runs before the row is written.
+    let server = start("leaving", write_doorman("leaving"));
+    block_on(async {
+        let mut going = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        going.join("Ada").await.expect("join");
+        // **Wait for the tick to SEE her.** Joins and leaves are both a diff
+        // against who is present, so somebody who arrives and goes inside one
+        // 50 ms tick produces neither event — which is coherent, and is not
+        // what this test is about.
+        going
+            .walk([0.0, 0.0, 0.0], 0, 3)
+            .await
+            .expect("stand still for a few ticks");
+
+        // A second player, to watch — the world only reaches somebody who is in
+        // it, and the one who left is by definition not.
+        let mut watcher = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        watcher.join("Bert").await.expect("join");
+
+        going.disconnect().await;
+
+        let table = watcher.material_table().expect("a material table");
+        let id = |name: &str| {
+            table
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.id)
+                .unwrap_or_else(|| panic!("the mod registers {name}"))
+        };
+        watcher
+            .expect_block(BlockPos::new(3, 9, 3), id("doorman:waved"), PATIENCE)
+            .await
+            .expect("no mod heard about a player leaving");
+        watcher
+            .expect_block(BlockPos::new(4, 9, 3), id("doorman:had_stuff"), PATIENCE)
+            .await
+            .expect(
+                "the hook ran after the inventory was gone, so a mod cannot drop \
+                 what somebody was carrying",
+            );
+    });
+}
