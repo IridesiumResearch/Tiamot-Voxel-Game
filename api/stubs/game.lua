@@ -244,6 +244,7 @@ function Stream:next_bool() end
 ---@class Tiamot.Game
 ---@field CHUNK_BLOCKS integer Blocks along each axis of a chunk. 16.
 ---@field UNITS_PER_BLOCK integer Sub-node units in a block. 27.
+---@field ITEMS_PER_STACK integer How many of a thing one inventory slot holds. 90. Anything over it spills into the next slot rather than being refused, so this is what a recipe means by "a stack" and never a limit on what a player may own.
 ---@field AIR integer The numeric id of air. Always 0.
 ---@field mod_id string Your mod's id, and your registration namespace.
 game = {}

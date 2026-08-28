@@ -163,6 +163,7 @@ local function shapes_tab(player)
         type = "container", direction = "row", gap = 6,
         children = {
             { type = "button", name = "make", text = "Make one" },
+            { type = "button", name = "make_stack", text = "Make stack" },
             { type = "button", name = "reset", text = "Reset" },
         },
     }
@@ -246,7 +247,7 @@ game.register_on_dialog_event(function(event)
     elseif event.name == "reset" then
         cut[event.player] = 0x7FFFFFF
         redraw(event.player)
-    elseif event.name == "make" then
+    elseif event.name == "make" or event.name == "make_stack" then
         local list = stock(event.player)
         local entry = list[chosen[event.player] or 1]
         local mask = cut[event.player] or 0x7FFFFFF
@@ -258,15 +259,33 @@ game.register_on_dialog_event(function(event)
             redraw(event.player)
             return
         end
-        local spent = game.take(event.player, { material = entry.material, units = cost })
-        if spent < cost then
+
+        -- **As many as will fit, or as many as are paid for.** "Make stack"
+        -- is one gesture for what was ninety clicks; a player who cannot
+        -- afford ninety gets what they can afford rather than nothing, which
+        -- is what "make" already did for one.
+        local want = 1
+        if event.name == "make_stack" then
+            want = math.min(game.ITEMS_PER_STACK, math.floor(entry.units / cost))
+            if want < 1 then
+                redraw(event.player)
+                return
+            end
+        end
+
+        local price = cost * want
+        local spent = game.take(event.player, { material = entry.material, units = price })
+        if spent < price then
             -- Put back exactly what was taken. `game.take` reports the amount
-            -- so a mod that cannot finish never has to guess.
+            -- so a mod that cannot finish never has to guess. Deliberately not
+            -- "keep what was afforded": the count was decided from what the
+            -- player held a moment ago, and if that changed underneath, the
+            -- honest answer is to leave it exactly as it was.
             if spent > 0 then
                 game.give(event.player, { material = entry.material, units = spent })
             end
         else
-            game.give(event.player, { material = entry.material, shape = mask, count = 1 })
+            game.give(event.player, { material = entry.material, shape = mask, count = want })
         end
         redraw(event.player)
     end

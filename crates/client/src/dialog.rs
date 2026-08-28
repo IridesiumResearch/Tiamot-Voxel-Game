@@ -90,12 +90,6 @@ struct Local {
     /// and never what they are making — and the mod is never told, because
     /// there is nothing here it could act on.
     turn: BTreeMap<String, crate::shape_view::Turn>,
-    /// How far the pointer has been dragged across each cube since it last
-    /// turned, in points.
-    ///
-    /// Kept so a slow drag accumulates into a turn instead of needing one
-    /// fast enough to cross the threshold in a single frame.
-    swung: BTreeMap<String, f32>,
 }
 
 /// Every open dialog's local state.
@@ -671,29 +665,7 @@ fn paint_shape_editor(
     // it would put the cells' faces out of true with each other.
     let side = rect.width().min(rect.height());
     let area = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
-    let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-
-    // **Dragged to orbit, in quarter turns.** Asked for from the window: a
-    // cube you can turn round to see the other side of what you are carving.
-    // It snaps rather than following the pointer, because a quarter turn is a
-    // permutation of the twenty-seven cells and everything else here — the
-    // depth order, which three faces are visible, which cell a click landed
-    // on — is exact under one and approximate under any other angle.
-    if response.dragged() {
-        let swung = local.swung.entry(node.name.clone()).or_default();
-        *swung += response.drag_delta().x;
-        while swung.abs() >= DRAG_PER_TURN {
-            let step = if *swung > 0.0 { 1 } else { 3 };
-            turn = (turn + step) % 4;
-            *swung -= DRAG_PER_TURN * if step == 1 { 1.0 } else { -1.0 };
-        }
-        local.turn.insert(node.name.clone(), turn);
-    }
-    if response.drag_stopped() {
-        // A part-turn that never completed is not a turn, and carrying it into
-        // the next drag would make the cube jump on a touch.
-        local.swung.remove(&node.name);
-    }
+    let response = ui.allocate_rect(rect, egui::Sense::click());
 
     // Cells, not a stack: the editor's whole block is twenty-seven cells to
     // chisel at, where a whole block in a slot is loose material.
@@ -708,6 +680,32 @@ fn paint_shape_editor(
     } else {
         None
     };
+
+    // **Two real buttons, not a hand-rolled hit test.** Asked for from the
+    // window: a cube you turn with left and right arrows. A drag was the first
+    // answer and the wrong one — the gesture that turns the cube and the
+    // gesture that chisels a cell were the same button, so a click with a
+    // little movement in it did both.
+    //
+    // Placed AFTER the cube is allocated, so egui gives them the click: a
+    // later widget wins an overlap. Testing the pointer against the arrows'
+    // rectangles by hand instead looks equivalent and is not — the cube's own
+    // response has already decided whether it is the thing being interacted
+    // with.
+    let (left, right) = turn_arrows(rect);
+    let step = if turn_arrow(ui, left, true) {
+        Some(3)
+    } else if turn_arrow(ui, right, false) {
+        Some(1)
+    } else {
+        None
+    };
+    if let Some(step) = step {
+        turn = (turn + step) % 4;
+        local.turn.insert(node.name.clone(), turn);
+        return;
+    }
+
     if let Some(adding) = clicked
         && let Some(at) = response.interact_pointer_pos()
     {
@@ -735,12 +733,51 @@ fn paint_shape_editor(
     }
 }
 
-/// How far the pointer has to travel across the cube to turn it a quarter.
+/// How big the turn arrows are, in points.
+const ARROW: f32 = 26.0;
+
+/// Where the two turn arrows sit inside a shape editor.
 ///
-/// A drag rather than a threshold on speed: a player turning the cube to look
-/// at the back of what they are carving wants to do it slowly and see each
-/// side, and a flick-only gesture would skip past two of them.
-const DRAG_PER_TURN: f32 = 48.0;
+/// The TOP corners, out of the way of the cube — which is drawn in the largest
+/// centred SQUARE of the widget, so the corners of a wider one are empty and
+/// the corners of a square one are the parts of it furthest from anything a
+/// player wants to click.
+///
+/// **Top rather than bottom, and that is not a matter of taste.** A dialog is
+/// drawn inside the shared sheet's scroll area, and the bottom of a widget that
+/// fills it does not take clicks — the arrows were down there first, drew
+/// perfectly, and did nothing. Caught by
+/// `an_arrow_turns_the_cube_and_does_not_chisel_it`, which sweeps the whole
+/// screen for a click that turns the cube and found none.
+fn turn_arrows(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+    let size = egui::vec2(ARROW, ARROW);
+    let inset = 2.0;
+    let left = egui::Rect::from_min_size(egui::pos2(rect.left() + inset, rect.top() + inset), size);
+    let right = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - ARROW - inset, rect.top() + inset),
+        size,
+    );
+    (left, right)
+}
+
+/// One turn arrow, as a button. Reports whether it was pressed.
+///
+/// Quiet on purpose: they are a way to look at the thing being made rather
+/// than part of making it, and drawing them as loudly as the Make button would
+/// say otherwise.
+fn turn_arrow(ui: &mut egui::Ui, rect: egui::Rect, pointing_left: bool) -> bool {
+    let glyph = if pointing_left { "◀" } else { "▶" };
+    ui.put(
+        rect,
+        egui::Button::new(egui::RichText::new(glyph).size(13.0).weak()),
+    )
+    .on_hover_text(if pointing_left {
+        "Turn the block left"
+    } else {
+        "Turn the block right"
+    })
+    .clicked()
+}
 
 /// Writes `front`, `top` and `side` on the faces they belong to.
 ///
@@ -1292,6 +1329,138 @@ mod tests {
             }
         }
         covered
+    }
+
+    /// A shape editor on screen, that a test can click at.
+    ///
+    /// One context and one `Dialogs` for the whole sweep: building them per
+    /// point costs a font atlas each time, which turned a sub-second test into
+    /// a fifty-second one.
+    struct Editor {
+        ctx: egui::Context,
+        dialogs: Dialogs,
+        open: BTreeMap<String, Screen>,
+        views: BTreeMap<String, ViewContents>,
+    }
+
+    impl Editor {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            crate::app::install_fonts(&ctx);
+            let mut node = Node::new(Widget::ShapeEditor {
+                shape: 0x7FF_FFFF,
+                material: 1,
+            });
+            node.name = "cut".to_owned();
+            let mut open = BTreeMap::new();
+            open.insert(
+                "mod:screen".to_owned(),
+                Screen::new(Tree { nodes: vec![node] }, false),
+            );
+            let mut editor = Self {
+                ctx,
+                dialogs: Dialogs::default(),
+                open,
+                views: BTreeMap::new(),
+            };
+            // Twice: the first pass has no fonts laid out, so nothing is where
+            // a player would find it.
+            editor.frame(Vec::new());
+            editor.frame(Vec::new());
+            editor
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> Vec<Raised> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 720.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut raised = Vec::new();
+            let dialogs = &mut self.dialogs;
+            let open = &self.open;
+            let views = &self.views;
+            let _ = self.ctx.run_ui(raw, |root| {
+                let ctx = root.ctx().clone();
+                raised = dialogs.draw(&ctx, open, views, Icons::default(), (1280.0, 720.0));
+            });
+            raised
+        }
+
+        fn click(&mut self, at: egui::Pos2) -> Vec<Raised> {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            self.frame(vec![egui::Event::PointerMoved(at), button(true)]);
+            let raised = self.frame(vec![button(false)]);
+            self.frame(Vec::new());
+            raised
+        }
+
+        fn turn(&self) -> crate::shape_view::Turn {
+            self.dialogs
+                .forms
+                .get("mod:screen")
+                .and_then(|local| local.turn.get("cut").copied())
+                .unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn an_arrow_turns_the_cube_and_does_not_chisel_it() {
+        // **Asked for from the window**: left and right arrows rather than a
+        // drag. The drag was the wrong answer for a reason worth keeping
+        // written down — the gesture that turned the cube and the gesture that
+        // chiselled a cell were the same button, so a click with a little
+        // movement in it did both.
+        //
+        // Two claims: the arrow turns the view, and it does not touch the cut.
+        // The second is the one that matters, because a chisel raises an event
+        // the mod acts on and spends the player's material.
+        let mut editor = Editor::new();
+        let mut found = None;
+        'sweep: for y in (0..720).step_by(6) {
+            for x in (0..1280).step_by(6) {
+                let at = egui::pos2(x as f32, y as f32);
+                let raised = editor.click(at);
+                if editor.turn() != 0 {
+                    found = Some((at, raised));
+                    break 'sweep;
+                }
+            }
+        }
+        let (at, raised) = found.expect("no click anywhere on the editor turned the cube");
+        assert!(
+            !raised
+                .iter()
+                .any(|event| matches!(event.event, DialogEvent::Chiselled { .. })),
+            "the arrow at {at:?} also chiselled: {raised:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_arrows_are_apart_and_inside_the_widget() {
+        // Geometry only, so a layout change that overlapped them or pushed one
+        // off the widget fails here rather than as a button that does the
+        // other one's job.
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 200.0));
+        let (left, right) = super::turn_arrows(rect);
+        assert!(rect.contains_rect(left) && rect.contains_rect(right));
+        assert!(
+            !left.intersects(right),
+            "the two arrows overlap: {left:?} and {right:?}"
+        );
+        assert!(
+            left.center().x < right.center().x,
+            "left is not on the left"
+        );
     }
 
     #[test]

@@ -620,3 +620,109 @@ fn the_offhand_key_swaps_and_swapping_twice_puts_it_back() {
     });
     assert!(server.stop());
 }
+
+#[test]
+fn making_a_stack_makes_as_many_as_the_player_can_pay_for() {
+    // **Asked for from the window**: a "make stack" button in the shape
+    // crafter, because ninety of a cut was ninety clicks.
+    //
+    // Driven against the REAL `core_ui`, through the real widget tree, because
+    // the failure this rules out is the one that keeps happening: a button a
+    // mod draws whose name nothing handles looks exactly like a button that
+    // works until somebody presses it.
+    let server = start("make-stack");
+    block_on(async {
+        let mut bot = join(&server, "Maker").await;
+
+        // Something to cut. Digging one block is twenty-seven units.
+        bot.dig_block(tiamot_core::BlockPos::new(0, -1, 0))
+            .await
+            .expect("the block should break");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let loose = loop {
+            let held: u32 = bot.inventory().iter().map(|stack| stack.units).sum();
+            if held >= 27 {
+                break held;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "digging a block credited {held} units"
+            );
+            bot.recv().await.expect("recv");
+        };
+
+        bot.action("core_ui:inventory", true).await.expect("press");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        while !bot
+            .dialogs()
+            .iter()
+            .any(|(form, _)| form == "core_ui:inventory")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the inventory never opened"
+            );
+            bot.recv().await.expect("recv");
+        }
+
+        // The shapes page, then a cut. `chiselled` is what the editor reports,
+        // and the mod keeps it — so this is the same path a player's clicks
+        // take, minus the clicking.
+        bot.dialog_event(
+            "core_ui:inventory",
+            tiamot_core::proto::DialogEvent::Pressed {
+                name: "tab_shapes".to_owned(),
+            },
+        )
+        .await
+        .expect("send");
+        // A four-cell cut, so a block of twenty-seven pays for six of them.
+        let cut = 0b1111u32;
+        bot.dialog_event(
+            "core_ui:inventory",
+            tiamot_core::proto::DialogEvent::Chiselled {
+                name: "cut".to_owned(),
+                shape: cut,
+            },
+        )
+        .await
+        .expect("send");
+        bot.dialog_event(
+            "core_ui:inventory",
+            tiamot_core::proto::DialogEvent::Pressed {
+                name: "make_stack".to_owned(),
+            },
+        )
+        .await
+        .expect("send");
+
+        let cost = cut.count_ones();
+        let expected = loose / cost;
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let made: u32 = bot
+                .inventory()
+                .iter()
+                .filter(|stack| stack.shape == cut)
+                .map(|stack| stack.units / cost)
+                .sum();
+            if made == expected {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "one press should have made {expected} of the cut, and made {made}: {:?}",
+                bot.inventory()
+            );
+            bot.recv().await.expect("recv");
+        }
+
+        // Conservation, which is the claim underneath: a stack was made out of
+        // what was paid for and nothing else.
+        let held: u32 = bot.inventory().iter().map(|stack| stack.units).sum();
+        assert_eq!(held, loose, "units went missing making a stack");
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}

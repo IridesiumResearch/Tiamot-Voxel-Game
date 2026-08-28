@@ -3286,6 +3286,11 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         game.set("UNITS_PER_BLOCK", crate::UNITS_PER_BLOCK)
             .map_err(|err| self.vm_error(&err))?;
+        // How many of a thing a slot holds. A recipe that makes "as many as
+        // will fit" needs the number, and a mod that guessed it would be wrong
+        // the day the engine changed it.
+        game.set("ITEMS_PER_STACK", crate::inventory::ITEMS_PER_STACK)
+            .map_err(|err| self.vm_error(&err))?;
         game.set("AIR", MaterialId::AIR.get())
             .map_err(|err| self.vm_error(&err))?;
         game.set("mod_id", mod_id)
