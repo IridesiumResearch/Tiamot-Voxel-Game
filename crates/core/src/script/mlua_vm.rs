@@ -3043,6 +3043,60 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         game.set("player_entity", lookup)
             .map_err(|err| self.vm_error(&err))?;
+
+        // **Moving a player is not patching their entity.** A player is in the
+        // store as a transient copy of a body the tick steps from their own
+        // inputs; a position written to it is overwritten within the tick and
+        // nothing says so. These two write the authoritative body instead.
+        let slot = std::sync::Arc::clone(&self.entities);
+        let send = self
+            .lua
+            .create_function(move |_, (uuid, position): (String, Table)| {
+                let player = player_of(&uuid, "move_player")?;
+                let to = [
+                    position.get::<f64>("x")?,
+                    position.get::<f64>("y")?,
+                    position.get::<f64>("z")?,
+                ];
+                if to.iter().any(|axis| !axis.is_finite()) {
+                    return Err(mlua::Error::external(
+                        "game.move_player was given a position that is not a number",
+                    ));
+                }
+                Ok(slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|store| store.move_player(player, to)))
+                    .unwrap_or(false))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("move_player", send)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.entities);
+        let shove = self
+            .lua
+            .create_function(move |_, (uuid, impulse): (String, Table)| {
+                let player = player_of(&uuid, "push_player")?;
+                let push = [
+                    impulse.get::<f32>("x")?,
+                    impulse.get::<f32>("y")?,
+                    impulse.get::<f32>("z")?,
+                ];
+                if push.iter().any(|axis| !axis.is_finite()) {
+                    return Err(mlua::Error::external(
+                        "game.push_player was given an impulse that is not a number",
+                    ));
+                }
+                Ok(slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|store| store.shove_player(player, push)))
+                    .unwrap_or(false))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("push_player", shove)
+            .map_err(|err| self.vm_error(&err))?;
         Ok(())
     }
 
@@ -7359,9 +7413,31 @@ mod entity_tests {
     #[derive(Default)]
     struct Menagerie {
         entities: std::sync::Mutex<crate::ent::Entities>,
+        /// Where players have been sent, and how hard they have been pushed.
+        ///
+        /// A log rather than a body, because the authoritative body lives on
+        /// the server and what is under test here is the trip through Lua.
+        moved: std::sync::Mutex<Vec<([u8; 32], [f64; 3])>>,
+        shoved: std::sync::Mutex<Vec<([u8; 32], [f32; 3])>>,
+        /// Whether there is a player of that name to move at all.
+        connected: std::sync::Mutex<bool>,
     }
 
     impl crate::ent::Access for Menagerie {
+        fn move_player(&self, uuid: [u8; 32], to: [f64; 3]) -> bool {
+            if let Ok(mut moved) = self.moved.lock() {
+                moved.push((uuid, to));
+            }
+            self.connected.lock().is_ok_and(|there| *there)
+        }
+
+        fn shove_player(&self, uuid: [u8; 32], impulse: [f32; 3]) -> bool {
+            if let Ok(mut shoved) = self.shoved.lock() {
+                shoved.push((uuid, impulse));
+            }
+            self.connected.lock().is_ok_and(|there| *there)
+        }
+
         fn spawn(&self, entity: crate::ent::Entity) -> Option<crate::ent::EntityId> {
             self.entities.lock().ok().map(|mut e| e.spawn(entity))
         }
@@ -7424,6 +7500,114 @@ mod entity_tests {
             std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::ent::Access>
         );
         (vm, store)
+    }
+
+    #[test]
+    fn moving_and_pushing_a_player_reach_the_body_and_report_back() {
+        // **The distinction this API exists to make.** Patching a player's
+        // entity writes a mirror the tick overwrites; these write the body. A
+        // mod cannot tell the difference by looking, which is why the surface
+        // has to.
+        let (mut vm, store) = vm_with_entities();
+        let uuid = "ab".repeat(32);
+        *store.connected.lock().expect("connected") = true;
+
+        load(
+            &mut vm,
+            "mover",
+            &format!(
+                "game.register_on_tick(function()\n\
+                   local went = game.move_player('{uuid}', {{x=10.5,y=64.0,z=-3.25}})\n\
+                   local shoved = game.push_player('{uuid}', {{x=0.0,y=0.9,z=0.0}})\n\
+                   if went and shoved then game.log('both') end\n\
+                 end)"
+            ),
+        )
+        .expect("load");
+        let _ = vm.freeze();
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        let moved = store.moved.lock().expect("moved");
+        assert_eq!(moved.len(), 1, "the move did not reach the engine");
+        // Bit-exact, and deliberately: these numbers make the trip through
+        // Lua unchanged or the API is lying about where it puts people. A
+        // tolerance here would hide a conversion that nearly works.
+        assert_eq!(
+            moved[0].1.map(f64::to_bits),
+            [10.5f64, 64.0, -3.25].map(f64::to_bits),
+            "it arrived somewhere else: {:?}",
+            moved[0].1
+        );
+        let shoved = store.shoved.lock().expect("shoved");
+        assert_eq!(shoved.len(), 1, "the push did not reach the engine");
+        assert!(
+            (shoved[0].1[1] - 0.9).abs() < 1e-6,
+            "the impulse arrived as {:?}",
+            shoved[0].1
+        );
+        assert_eq!(
+            moved[0].0, shoved[0].0,
+            "the two calls named different players"
+        );
+    }
+
+    #[test]
+    fn moving_a_player_who_is_not_here_answers_false_rather_than_erroring() {
+        // A player disconnects between a mod deciding to move them and the
+        // call landing. That is ordinary, and a mod written around an error
+        // there would be a mod written around the server's timing.
+        let (mut vm, store) = vm_with_entities();
+        *store.connected.lock().expect("connected") = false;
+        let uuid = "cd".repeat(32);
+
+        load(
+            &mut vm,
+            "mover",
+            &format!(
+                "game.register_on_tick(function()\n\
+                   if game.move_player('{uuid}', {{x=0,y=0,z=0}}) then\n\
+                     error('a player who is not here was moved')\n\
+                   end\n\
+                 end)"
+            ),
+        )
+        .expect("load");
+        let _ = vm.freeze();
+        assert!(
+            vm.tick(1).expect("tick").is_empty(),
+            "the mod was disabled, so it saw something other than false"
+        );
+    }
+
+    #[test]
+    fn a_position_that_is_not_a_number_is_refused_rather_than_placed() {
+        // Charter rule 4: NaN must not reach simulation state. A mod computing
+        // a position from a division it did not check is how one gets there,
+        // and a body at NaN is a body no correction can bring back.
+        let (mut vm, store) = vm_with_entities();
+        *store.connected.lock().expect("connected") = true;
+        let uuid = "ef".repeat(32);
+
+        load(
+            &mut vm,
+            "mover",
+            &format!(
+                "game.register_on_tick(function()\n\
+                   game.move_player('{uuid}', {{x=0/0,y=0,z=0}})\n\
+                 end)"
+            ),
+        )
+        .expect("load");
+        let _ = vm.freeze();
+        assert_eq!(
+            vm.tick(1).expect("tick").len(),
+            1,
+            "a position of NaN was accepted"
+        );
+        assert!(
+            store.moved.lock().expect("moved").is_empty(),
+            "a position of NaN reached the engine"
+        );
     }
 
     #[test]

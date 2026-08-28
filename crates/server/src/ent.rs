@@ -459,13 +459,22 @@ impl Population {
 /// the arrangement that would deadlock.
 pub struct Shared {
     population: std::sync::Arc<std::sync::RwLock<Population>>,
+    /// The players' authoritative bodies.
+    ///
+    /// **Not the mirrors in `population`.** A mod moving a player has to write
+    /// the body the tick steps, because the mirror is a copy of it that is
+    /// overwritten every tick — see `Access::move_player`.
+    bodies: std::sync::Arc<crate::transport::PlayerBodies>,
 }
 
 impl Shared {
-    /// Wraps a store the simulation thread owns.
+    /// Wraps the stores the simulation thread owns.
     #[must_use]
-    pub const fn new(population: std::sync::Arc<std::sync::RwLock<Population>>) -> Self {
-        Self { population }
+    pub const fn new(
+        population: std::sync::Arc<std::sync::RwLock<Population>>,
+        bodies: std::sync::Arc<crate::transport::PlayerBodies>,
+    ) -> Self {
+        Self { population, bodies }
     }
 }
 
@@ -507,6 +516,50 @@ impl tiamot_core::ent::Access for Shared {
         // The mirror index the tick already keeps, not a scan: a body is put
         // there the moment a player connects and taken out when they go.
         self.population.read().ok()?.player_body(&uuid)
+    }
+
+    fn move_player(&self, uuid: [u8; 32], to: [f64; 3]) -> bool {
+        let uuid = tiamot_core::PlayerUuid::from_bytes(uuid);
+        // A world position, split back into the (chunk, local) pair charter
+        // rule 7 requires — the same conversion an entity's `pos` patch makes,
+        // and for the same reason: a world-space `f32` loses precision long
+        // before the world runs out.
+        let at = tiamot_core::ent::Transform::from_world(to[0], to[1], to[2]);
+        if !at.chunk.in_world() {
+            return false;
+        }
+        let Ok(mut bodies) = self.bodies.lock() else {
+            return false;
+        };
+        let Some(player) = bodies.get_mut(&uuid) else {
+            return false;
+        };
+        player.origin = at.chunk;
+        player.body.position = at.local;
+        // **Velocity goes with them.** A player teleported mid-fall who kept
+        // their speed arrives at the far end already moving, which reads as
+        // the destination throwing them.
+        player.body.velocity = [0.0; 3];
+        true
+    }
+
+    fn shove_player(&self, uuid: [u8; 32], impulse: [f32; 3]) -> bool {
+        let uuid = tiamot_core::PlayerUuid::from_bytes(uuid);
+        let Ok(mut bodies) = self.bodies.lock() else {
+            return false;
+        };
+        let Some(player) = bodies.get_mut(&uuid) else {
+            return false;
+        };
+        for (velocity, push) in player.body.velocity.iter_mut().zip(impulse) {
+            *velocity += push;
+        }
+        // Off the ground, or the next step's friction eats a shove that was
+        // meant to move somebody standing still.
+        if impulse[1] > 0.0 {
+            player.body.on_ground = false;
+        }
+        true
     }
 
     fn within(&self, centre: [f64; 3], radius: f64, source: Option<&str>) -> Vec<EntityId> {

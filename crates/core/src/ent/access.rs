@@ -143,6 +143,34 @@ pub trait Access: Send + Sync {
     /// its own script state and checks it itself — the engine has no idea what a
     /// "hostile" is (charter rule 1).
     fn within(&self, centre: [f64; 3], radius: f64, source: Option<&str>) -> Vec<EntityId>;
+
+    /// Puts a connected player's body somewhere else.
+    ///
+    /// **Why this is not [`Access::patch`] on their mirror.** A player is in
+    /// the entity store as a transient COPY of a body the tick steps from
+    /// their own inputs, and that copy is overwritten every tick — so writing
+    /// a position to it does nothing, silently, which is the worst shape a
+    /// failure can take. This writes the authoritative body, and the ordinary
+    /// correction the client already applies carries it.
+    ///
+    /// A teleport, not a walk: nothing is swept, so a mod that names the
+    /// inside of a wall gets a player inside a wall. That is the same bargain
+    /// [`Patch::pos`](super::Patch) makes for a mob and for the same reason —
+    /// the alternative is the engine refusing a move a mod meant.
+    ///
+    /// Returns whether it happened. `false` means the player is not connected
+    /// or the position is outside the world.
+    fn move_player(&self, uuid: [u8; 32], to: [f64; 3]) -> bool;
+
+    /// Adds to a connected player's velocity, in cells per tick.
+    ///
+    /// Knockback, an explosion, a jump pad. Added rather than set, because
+    /// every one of those is a push ON a body that is already doing something
+    /// — and a mod that wants to stop somebody dead can read the velocity off
+    /// their mirror and cancel it.
+    ///
+    /// Returns whether the player was there to push.
+    fn shove_player(&self, uuid: [u8; 32], impulse: [f32; 3]) -> bool;
 }
 
 #[cfg(test)]

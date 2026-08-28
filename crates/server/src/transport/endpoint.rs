@@ -340,8 +340,15 @@ pub struct Shared {
     /// Named `bodies` rather than `players` because `players` is already the
     /// connected *count* on this struct, and two fields whose names differ only
     /// by what they happen to hold is how the wrong one gets locked.
-    pub bodies: std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, PlayerSim>>,
+    pub bodies: Arc<PlayerBodies>,
 }
+
+/// The connected players' authoritative bodies, behind the tick's lock.
+///
+/// **Named and shared** because a mod moving a player has to write THESE — the
+/// mirrors in the entity store are copies the tick overwrites, so a position
+/// written to one does nothing, silently. See `ent::Access::move_player`.
+pub type PlayerBodies = std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, PlayerSim>>;
 
 /// One player's simulated body and the inputs waiting to move it.
 #[derive(Debug, Clone)]
@@ -2393,7 +2400,7 @@ mod tests {
             entity_messages: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             kicks: tokio::sync::broadcast::channel(4).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-            bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            bodies: Arc::default(),
             tools: std::collections::BTreeMap::new(),
             hardness: std::collections::BTreeMap::new(),
             default_tool: None,

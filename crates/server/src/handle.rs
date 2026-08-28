@@ -1054,7 +1054,7 @@ impl ServerHandle {
             view_distance: settings.view_distance,
             kicks: tokio::sync::broadcast::channel(64).0,
             online: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-            bodies: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            bodies: std::sync::Arc::default(),
             hardness,
             held_slot: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             // The runtime ids of everything a mod registered as an item. Looked
@@ -1236,7 +1236,10 @@ impl ServerHandle {
                             // handle in the frozen API and the reason
                             // `ent::Access` also takes `&self`.
                             host.vm_mut().set_entity_access(std::sync::Arc::new(
-                                crate::ent::Shared::new(std::sync::Arc::clone(&population)),
+                                crate::ent::Shared::new(
+                                    std::sync::Arc::clone(&population),
+                                    std::sync::Arc::clone(&shared.bodies),
+                                ),
                             ));
                             // A mod's own facts, read from the world before it
                             // can ask for them. Loaded per loaded mod rather

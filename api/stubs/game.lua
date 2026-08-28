@@ -1491,6 +1491,13 @@ function game.despawn_entity(id) end
 ---per-server claim that can be rebound, UUIDs are identity. Store the UUID if you
 ---mean "this player"; `game.storage` takes strings for exactly that.
 ---
+---**A player's body has no `health`.** The engine has no damage model (charter
+---rule 1), so a player's mirror carries no health component and setting one on it
+---would not survive the tick, let alone a rejoin. Keep player stats in
+---`game.storage`, keyed on the UUID: that persists with the world and is yours to
+---define. `health` on an entity YOUR mod spawned is a different thing and works
+---as documented.
+---
 ---`nametag` is a literal label somebody set. `nametag_player` is a UUID whose
 ---CURRENT display name the engine resolves when it draws the tag — a player's
 ---own body has the second, never the first.
@@ -1534,6 +1541,53 @@ function game.entity(id) end
 ---@param spec { pos?: { x: number, y: number, z: number }, velocity?: { x: number, y: number, z: number }, yaw?: number, pitch?: number, health?: integer, anim?: integer, drive?: { walk?: { x: number, z: number }, jump?: boolean, gait?: "walk"|"sprint"|"sneak" } }
 ---@return boolean changed
 function game.set_entity(id, spec) end
+
+---Puts a connected player somewhere else. Returns whether it happened.
+---
+---**Not `game.set_entity` on their body.** A player is in the entity store as a
+---transient COPY of a body the engine steps from their own inputs, and that copy
+---is overwritten every tick — so a position written to it does nothing, silently,
+---which is the worst shape a failure can take. This writes the body itself and
+---the client's ordinary correction carries it.
+---
+---A teleport, not a walk: nothing is swept, so naming the inside of a wall puts
+---a player inside a wall. Check with `game.get_block` first if that matters.
+---Velocity is cleared, because somebody teleported mid-fall who kept their speed
+---arrives already moving, which reads as the destination throwing them.
+---
+---`false` means the player is not connected, or the position is outside the
+---world.
+---
+---```lua
+----- A respawn point, remembered per player and keyed on the UUID.
+---local home = game.storage.get("home:" .. event.player)
+---if home then
+---    game.move_player(event.player, home)
+---end
+---```
+---@param player string The player's UUID, in hex.
+---@param position { x: number, y: number, z: number }
+---@return boolean moved
+function game.move_player(player, position) end
+
+---Adds to a connected player's velocity, in cells per tick. Returns whether the
+---player was there to push.
+---
+---Knockback, an explosion, a jump pad. **Added, not set**, because every one of
+---those is a push ON a body already doing something — and a mod that wants to
+---stop somebody dead can read the velocity off their body with `game.entity` and
+---push back by the same amount.
+---
+---An upward push also takes them off the ground, or the next step's friction
+---eats a shove meant to move somebody standing still.
+---
+---```lua
+---game.push_player(event.player, { x = 0, y = 0.9, z = 0 })   -- a jump pad
+---```
+---@param player string The player's UUID, in hex.
+---@param impulse { x: number, y: number, z: number }
+---@return boolean pushed
+function game.push_player(player, impulse) end
 
 ---Every entity within `radius` blocks of a position, nearest first.
 ---

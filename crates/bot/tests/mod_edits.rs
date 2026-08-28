@@ -231,3 +231,115 @@ fn a_mod_can_read_the_world_it_writes_to() {
         }
     });
 }
+
+/// A mod that teleports and shoves whoever says so in chat.
+fn write_mover(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("mover");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"mover\"\nname = \"Mover\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+local ground = game.register_block{ id = "ground" }
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(game.flat_heightmap(0), ground)
+end)
+
+game.register_on_chat(function(event)
+    if event.text == "away" then
+        game.move_player(event.player, { x = 40.5, y = 6.0, z = 24.5 })
+        return false
+    end
+    if event.text == "up" then
+        game.push_player(event.player, { x = 0, y = 2.0, z = 0 })
+        return false
+    end
+end)
+"#,
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_mod_can_move_a_player_and_the_client_is_told() {
+    // **The seam test.** A player is in the entity store as a transient copy
+    // of a body the tick steps, so `set_entity` on one is overwritten within
+    // the tick and nothing says so — the failure this API is shaped to avoid,
+    // and one only a real server can demonstrate.
+    let server = start("move", write_mover("move"));
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Traveller").await.expect("join");
+
+        // Where the server says the body is, before and after.
+        let here = bot.walk([0.0, 0.0, 0.0], 0, 3).await.expect("stand");
+        let start = world_x(&here);
+
+        bot.chat("away").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let arrived = loop {
+            let at = bot.walk([0.0, 0.0, 0.0], 0, 1).await.expect("stand");
+            let x = world_x(&at);
+            if (x - 40.5).abs() < 1.5 {
+                break x;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a mod moved the player to x=40.5 and the server still says x={x} \
+                 (it started at {start})"
+            );
+        };
+        assert!(
+            (arrived - start).abs() > 1.0,
+            "the player was already where the mod sent them, so this proves nothing"
+        );
+
+        // And a shove reaches the body too: upward, so it shows as leaving the
+        // ground rather than as a position a walk could explain.
+        let mut left_the_ground = false;
+        bot.chat("up").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(tiamot_core::proto::ServerMessage::PlayerState { velocity, .. }) = bot
+                .received()
+                .into_iter()
+                .rev()
+                .find(|m| matches!(m, tiamot_core::proto::ServerMessage::PlayerState { .. }))
+                && velocity[1] > 0.5
+            {
+                left_the_ground = true;
+                break;
+            }
+            bot.recv().await.expect("recv");
+        }
+        assert!(
+            left_the_ground,
+            "a mod pushed the player upward and the body never moved"
+        );
+    });
+}
+
+/// A player state's world `x`, in BLOCKS — the unit a mod speaks.
+///
+/// The wire carries cells (charter rule 5: 27 to a block), and `move_player`
+/// takes blocks like every other mod-facing position. Comparing the two
+/// directly is a factor of three, which looks exactly like a teleport landing
+/// three times too far away.
+fn world_x(at: &bot::client::PlayerPosition) -> f64 {
+    let cells =
+        f64::from(at.chunk.x) * f64::from(tiamot_core::CHUNK_SUBNODES) + f64::from(at.local[0]);
+    cells / f64::from(tiamot_core::SUBNODES_PER_AXIS)
+}
