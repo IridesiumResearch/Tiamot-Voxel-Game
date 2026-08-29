@@ -452,6 +452,7 @@ fn flush_containers(
 
 fn broadcast_light(
     shared: &Shared,
+    domain: &str,
     lighting: &crate::light::Lighting,
     touched: &std::collections::BTreeSet<tiamot_core::ChunkPos>,
 ) {
@@ -459,10 +460,16 @@ fn broadcast_light(
         let Some(layer) = lighting.layer(*pos) else {
             continue;
         };
-        shared.broadcast(ServerMessage::ChunkLight {
-            pos: *pos,
-            light: tiamot_core::light::codec::encode(layer),
-        });
+        // Scoped, like every other message about a place: light belongs to the
+        // terrain under it, and the same position is different terrain in
+        // another space.
+        shared.broadcast_in(
+            domain,
+            ServerMessage::ChunkLight {
+                pos: *pos,
+                light: tiamot_core::light::codec::encode(layer),
+            },
+        );
     }
 }
 
@@ -2847,7 +2854,7 @@ impl ServerHandle {
                                     control.note_full_relight();
                                     light.chunk_loaded(&request.domain, &world, request.pos)
                                 };
-                                broadcast_light(&shared, &light, &touched);
+                                broadcast_light(&shared, tiamot_core::domain::OVERWORLD, &light, &touched);
                             }
                             // Fluid travels with the chunk, and always — an
                             // empty layer is ONE byte, so telling a client
@@ -2883,7 +2890,7 @@ impl ServerHandle {
                             for pos in relight.drain(..) {
                                 touched.extend(light.edited(tiamot_core::domain::OVERWORLD, &world, pos));
                             }
-                            broadcast_light(&shared, &light, &touched);
+                            broadcast_light(&shared, tiamot_core::domain::OVERWORLD, &light, &touched);
                         }
 
                         // Chunks that arrived this tick, whatever brought
@@ -2891,29 +2898,73 @@ impl ServerHandle {
                         // reading. Asking the world what arrived rather than
                         // hunting every load site means the next route somebody
                         // adds is lit too, instead of being silently black.
-                        let arrived = world.take_arrived(tiamot_core::domain::OVERWORLD);
-                        if !arrived.is_empty() {
-                            // **The milk that was there before, before anything
-                            // else looks at the chunk.** Fluid is not derived
-                            // state — there is no function from terrain back to
-                            // "somebody poured here" — so a chunk arriving
-                            // without its saved pond is a pond that is gone.
-                            //
-                            // Ahead of the relight budget below on purpose: a
+                        // **Per domain.** A chunk that came into memory in a
+                        // ship is not the overworld's chunk at those
+                        // coordinates, and its entities are stored under its
+                        // own key — so an arrival list shared between spaces
+                        // would load one domain's mobs into another and leave
+                        // the rest behind for ever.
+                        let resident: Vec<String> = world
+                            .resident_domains()
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect();
+                        for domain in resident {
+                            let arrived = world.take_arrived(&domain);
+                            if arrived.is_empty() {
+                                continue;
+                            }
+
+                            // **The mobs that live there**, before anything
+                            // else looks at the chunk: a chunk arriving without
+                            // them is a mob that is gone. The guard is because
+                            // chunks arrive twice — the lighting defers what it
+                            // cannot relight by putting them back on this list.
+                            let mut mobs = population.write().expect("entity lock");
+                            for pos in &arrived {
+                                if mobs.knows(&domain, *pos) {
+                                    continue;
+                                }
+                                match world.load_entities(&domain, *pos) {
+                                    Ok(entities) => mobs.chunk_loaded(&domain, *pos, entities),
+                                    Err(err) => {
+                                        // Left unread so the next arrival
+                                        // retries. Treating a failed read as
+                                        // "empty" would quietly delete a mob.
+                                        error!(?domain, ?pos, "could not load the entities for a chunk: {err}");
+                                    }
+                                }
+                            }
+                            drop(mobs);
+
+                            // **Fluid and light are the overworld's alone, and
+                            // that is a limitation rather than a decision.**
+                            // `Fluidics` and `Lighting` key their layers by
+                            // position with no domain, so running another
+                            // space's arrivals through them would write a
+                            // ship's light into the overworld's layer at the
+                            // same coordinates — corrupting the one that works
+                            // to half-serve the one that does not. A second
+                            // domain is dark and dry until they are keyed like
+                            // the entity store now is.
+                            if domain != tiamot_core::domain::OVERWORLD {
+                                continue;
+                            }
+
+                            // **The milk that was there before.** Fluid is not
+                            // derived state — there is no function from terrain
+                            // back to "somebody poured here" — so a chunk
+                            // arriving without its saved pond is a pond that is
+                            // gone. Ahead of the relight budget on purpose: a
                             // chunk whose relight is deferred still needs its
                             // fluid, or the deferral would decide whether the
                             // milk in it survived.
                             let mut fluid = fluidics.write().expect("fluid lock");
                             for pos in &arrived {
-                                // Already read: the lighting defers what it
-                                // cannot relight by putting the chunk back into
-                                // this same list, so chunks arrive twice.
-                                // Loading again would replace the live layer
-                                // with the last thing written to disk.
                                 if fluid.knows(*pos) {
                                     continue;
                                 }
-                                match world.load_fluid(tiamot_core::domain::OVERWORLD, *pos) {
+                                match world.load_fluid(&domain, *pos) {
                                     // Recorded as read either way — a chunk with
                                     // no row is dry, which is an answer.
                                     Ok(layer) => fluid.chunk_loaded(*pos, layer.unwrap_or_default()),
@@ -2926,27 +2977,6 @@ impl ServerHandle {
                                 }
                             }
                             drop(fluid);
-
-                            // **And the entities that live there**, for the
-                            // same reason and with the same guard: a chunk
-                            // arriving without its mobs is a mob that is gone,
-                            // and chunks arrive twice.
-                            let mut mobs = population.write().expect("entity lock");
-                            for pos in &arrived {
-                                if mobs.knows(tiamot_core::domain::OVERWORLD, *pos) {
-                                    continue;
-                                }
-                                match world.load_entities(tiamot_core::domain::OVERWORLD, *pos) {
-                                    Ok(entities) => mobs.chunk_loaded(tiamot_core::domain::OVERWORLD, *pos, entities),
-                                    Err(err) => {
-                                        // Left unread so the next arrival
-                                        // retries. Treating a failed read as
-                                        // "empty" would quietly delete a mob.
-                                        error!(?pos, "could not load the entities for a chunk: {err}");
-                                    }
-                                }
-                            }
-                            drop(mobs);
 
                             let mut light = lighting.write().expect("lighting lock");
                             let mut touched = std::collections::BTreeSet::new();
@@ -2961,14 +2991,14 @@ impl ServerHandle {
                                     // chunks black for as long as they stayed
                                     // loaded, which is the kind of bug that
                                     // only shows up after a teleport.
-                                    world.defer_arrival(tiamot_core::domain::OVERWORLD, pos);
+                                    world.defer_arrival(&domain, pos);
                                     continue;
                                 }
                                 control.note_full_relight();
-                                touched.extend(light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos));
+                                touched.extend(light.chunk_loaded(&domain, &world, pos));
                                 done += 1;
                             }
-                            broadcast_light(&shared, &light, &touched);
+                            broadcast_light(&shared, &domain, &light, &touched);
                         }
                         control.note_lit_chunks(lighting.read().expect("lighting lock").len());
 

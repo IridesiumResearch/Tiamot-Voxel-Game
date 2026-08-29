@@ -544,3 +544,134 @@ fn an_edit_in_another_domain_survives_a_restart_and_the_overworld_is_untouched()
          one space's edits are landing in another's rows"
     );
 }
+
+#[test]
+fn a_mob_spawned_in_another_domain_comes_back_after_a_restart() {
+    // **The arrival housekeeping, per domain.** Entities are stored under
+    // `(domain, chunk)`, so a chunk arriving in a ship has to be asked about
+    // the ship's mobs — a shared arrival list would load the overworld's and
+    // leave the ship's on disk for ever, which reads as the ship being empty
+    // every time somebody comes back to it.
+    let world = scratch("mob-persist-world");
+    let mods = write_mod(
+        "mobpersist",
+        "game.register_on_chat(function(event)\n\
+         \x20   if event.text == 'attic' then\n\
+         \x20       local body = game.player_entity(event.player)\n\
+         \x20       game.transfer_entity(body, 'places:attic', { x = 8, y = 4, z = 8 })\n\
+         \x20       return false\n\
+         \x20   elseif event.text == 'spawn' then\n\
+         \x20       local body = game.player_entity(event.player)\n\
+         \x20       local me = game.entity(body)\n\
+         \x20       local mob = game.spawn_entity{\n\
+         \x20           pos = { x = me.pos.x + 1, y = me.pos.y, z = me.pos.z },\n\
+         \x20           model = 'places:ground',\n\
+         \x20       }\n\
+         \x20       if mob then\n\
+         \x20           game.transfer_entity(mob, 'places:attic',\n\
+         \x20               { x = me.pos.x + 1, y = me.pos.y, z = me.pos.z })\n\
+         \x20       end\n\
+         \x20       return false\n\
+         \x20   end\n\
+         end)",
+    );
+
+    let first = restart_at(world.clone(), mods);
+    block_on(async {
+        let mut bot = join(&first, "Keeper").await;
+        settle_for(&mut bot, 40).await;
+        bot.chat("attic").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "never moved");
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+        settle_for(&mut bot, 40).await;
+        bot.chat("spawn").await.expect("chat");
+        settle_for(&mut bot, 60).await;
+        bot.disconnect().await;
+    });
+    assert!(first.stop(), "the world should close cleanly");
+
+    // Asked of the world file: a mob in the attic must be written under the
+    // ATTIC's key and not the overworld's, and there must be one.
+    let mut registry = tiamot_core::Registry::new();
+    let db = tiamot_core::persist::WorldDb::open(
+        world.join(tiamot_server::handle::WORLD_FILE),
+        &mut registry,
+    )
+    .expect("reopen the world");
+
+    // **The entities table, not just "something was stored".** Chunk rows alone
+    // would satisfy a check on `stored_domains`, and the chunks are written
+    // because the player stood there — which would make this pass with the mob
+    // still in the overworld or nowhere at all.
+    let home = tiamot_core::ChunkPos::new(0, 0, 0);
+    let in_the_attic = db
+        .load_chunk_entities_in("places:attic", home)
+        .expect("read the attic's entities");
+    assert_eq!(
+        in_the_attic.len(),
+        1,
+        "the attic holds {} entities at {home:?}, so a mob moved into it was \
+         not written under its domain",
+        in_the_attic.len()
+    );
+
+    let in_the_overworld = db
+        .load_chunk_entities(home)
+        .expect("read the overworld's entities");
+    assert!(
+        in_the_overworld.is_empty(),
+        "the overworld still holds {} entities at {home:?}: a mob that moved \
+         out was left behind as a copy, which is how a world fills up with \
+         everything that ever travelled",
+        in_the_overworld.len()
+    );
+    drop(db);
+
+    // **And it comes back.** Written correctly is half of it; the other half is
+    // the arrival housekeeping asking the ATTIC about the attic's chunks. A
+    // shared arrival list loads the overworld's mobs and leaves the ship's on
+    // disk for ever, which reads as the ship being empty every time somebody
+    // returns to it.
+    //
+    // Seen through replication, which is domain-scoped — so an entity reaching
+    // a player standing in the attic is an entity that is in the attic.
+    let second = restart_at(
+        world,
+        write_mod(
+            "mobpersist-again",
+            "game.register_on_chat(function(event)\n\
+         \x20   if event.text == 'attic' then\n\
+         \x20       local body = game.player_entity(event.player)\n\
+         \x20       game.transfer_entity(body, 'places:attic', { x = 8, y = 4, z = 8 })\n\
+         \x20       return false\n\
+         \x20   end\n\
+         end)",
+        ),
+    );
+    block_on(async {
+        let mut bot = join(&second, "Returner").await;
+        settle_for(&mut bot, 40).await;
+        assert!(
+            !saw_a_spawn(&bot),
+            "somebody was already visible in the overworld, so seeing a body in \
+             the attic would prove nothing"
+        );
+
+        bot.chat("attic").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !saw_a_spawn(&bot) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the mob stored in the attic never came back when somebody \
+                 returned to it"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+
+        bot.disconnect().await;
+    });
+    second.stop();
+}
