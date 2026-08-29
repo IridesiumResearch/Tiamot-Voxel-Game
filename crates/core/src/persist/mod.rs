@@ -1387,7 +1387,7 @@ impl WorldDb {
     /// any registry says, and this is how one whose mod was removed is found
     /// and preserved rather than quietly orphaned (charter rule 8).
     ///
-    /// Sorted, so nothing downstream of this depends on SQLite's row order.
+    /// Sorted, so nothing downstream of this depends on `SQLite`'s row order.
     ///
     /// # Errors
     ///
