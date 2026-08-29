@@ -154,7 +154,10 @@ impl sight::Access for Shared {
             return Sighting::Unavailable;
         };
 
-        if sight::between(world, from, to) {
+        // Bound to a domain before the trait sees it: sight is cast through
+        // the terrain of the space the looker is in, and `ChunkLookup` cannot
+        // carry which that is.
+        if sight::between(&world.solid(tiamot_core::domain::OVERWORLD), from, to) {
             Sighting::Clear
         } else {
             Sighting::Blocked
@@ -162,8 +165,6 @@ impl sight::Access for Shared {
     }
 
     fn block_at(&self, pos: tiamot_core::BlockPos) -> sight::Reading {
-        use tiamot_core::phys::ChunkLookup as _;
-
         let Ok(slot) = self.slot.lock() else {
             return sight::Reading::Unavailable;
         };
@@ -173,8 +174,9 @@ impl sight::Access for Shared {
         // **Resident only, and deliberately.** `World::chunk` generates what is
         // missing; a mod asking about somewhere far away must not be able to
         // make the server generate a chunk inside the tick budget, one call at
-        // a time, for nobody.
-        let Some(chunk) = world.chunk(pos.chunk()) else {
+        // a time, for nobody. `Solid::resident` is the half that cannot.
+        let terrain = world.solid(tiamot_core::domain::OVERWORLD);
+        let Some(chunk) = terrain.resident(pos.chunk()) else {
             return sight::Reading::Absent;
         };
         let Some(view) = chunk.get_block(pos) else {
@@ -234,7 +236,12 @@ impl path::Access for Shared {
         // search, so there is nothing here worth taking out of the tick's
         // pathfinding budget — and a mob that could not steer because somebody
         // else had searched would stop walking for no reason it could see.
-        Some(path::steer(world, from, to, height.max(1)))
+        Some(path::steer(
+            &world.solid(tiamot_core::domain::OVERWORLD),
+            from,
+            to,
+            height.max(1),
+        ))
     }
 
     fn find_path(&self, from: [f64; 3], to: [f64; 3], options: path::Options) -> path::Route {
@@ -269,7 +276,12 @@ impl path::Access for Shared {
             ..options
         };
 
-        let (route, spent) = path::search_counted(world, from, to, &options);
+        let (route, spent) = path::search_counted(
+            &world.solid(tiamot_core::domain::OVERWORLD),
+            from,
+            to,
+            &options,
+        );
         // A saturating subtract, spelled out. `fetch_update` says this in one
         // call and is deprecated on nightly in favour of a `try_update` that
         // stable does not have yet — and the fuzz job builds this crate on
@@ -346,7 +358,11 @@ mod tests {
 
         let mut world = world();
         world
-            .chunk(ChunkPos::new(0, 0, 0), &mut Empty)
+            .chunk(
+                tiamot_core::domain::OVERWORLD,
+                ChunkPos::new(0, 0, 0),
+                &mut Empty,
+            )
             .expect("the chunk loads");
 
         let (world, seen) = lease.lending(world, || {
@@ -374,7 +390,11 @@ mod tests {
         let mut world = world();
         let stone = MaterialId(1);
         world
-            .chunk(ChunkPos::new(0, 0, 0), &mut Empty)
+            .chunk(
+                tiamot_core::domain::OVERWORLD,
+                ChunkPos::new(0, 0, 0),
+                &mut Empty,
+            )
             .expect("the chunk loads");
         for x in 0..16 {
             for z in 0..16 {
@@ -390,6 +410,7 @@ mod tests {
     fn place(world: &mut World, pos: tiamot_core::BlockPos, material: MaterialId) {
         world
             .apply(
+                tiamot_core::domain::OVERWORLD,
                 &tiamot_core::proto::Edit::Block {
                     pos,
                     material: material.get(),

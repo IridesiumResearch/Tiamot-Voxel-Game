@@ -1502,7 +1502,7 @@ impl ServerHandle {
                         // is the whole use, and it goes first so the player's
                         // own actions this tick see the arranged world.
                         for edit in shared.drain_seeds() {
-                            match world.apply(&edit, &mut source) {
+                            match world.apply(tiamot_core::domain::OVERWORLD, &edit, &mut source) {
                                 Ok(_) => {
                                     relight.push(edited_block(&edit));
                                     // What the block will ACCEPT has changed,
@@ -1528,7 +1528,7 @@ impl ServerHandle {
                         // from the network tasks instead would make the result
                         // depend on which connection won a lock.
                         for (actor, edit) in shared.drain_edits() {
-                            match world.apply(&edit, &mut source) {
+                            match world.apply(tiamot_core::domain::OVERWORLD, &edit, &mut source) {
                                 Ok((_, removed)) => {
                                     relight.push(edited_block(&edit));
                                     // A pond finds out there is somewhere new
@@ -1638,8 +1638,14 @@ impl ServerHandle {
                             let fluid = fluidics.read().expect("fluid lock");
                             for player in bodies.values_mut() {
                                 let intent = player.inputs.take(tick);
+                                // Bound to the domain this body is in before
+                                // the physics sees it: `ChunkLookup` takes a
+                                // position and no domain, so a body would
+                                // otherwise collide against whichever domain
+                                // the lookup happened to be built over.
+                                let terrain = world.solid(tiamot_core::domain::OVERWORLD);
                                 let voxels = tiamot_core::phys::Voxels::with_fluid(
-                                    &world,
+                                    &terrain,
                                     &*fluid,
                                     player.origin,
                                 );
@@ -1908,10 +1914,10 @@ impl ServerHandle {
                             // asks its one cell, as it always did.
                             let material = match brush {
                                 tiamot_core::dig::Brush::SubNode => world
-                                    .subnode(target, &mut source)
+                                    .subnode(tiamot_core::domain::OVERWORLD, target, &mut source)
                                     .unwrap_or(tiamot_core::MaterialId::AIR),
                                 tiamot_core::dig::Brush::Block => world
-                                    .block_cells(target.block(), &mut source)
+                                    .block_cells(tiamot_core::domain::OVERWORLD, target.block(), &mut source)
                                     .ok()
                                     .and_then(|cells| {
                                         cells.into_iter().find(|material| !material.is_air())
@@ -1959,7 +1965,7 @@ impl ServerHandle {
                                 }
                                 tiamot_core::dig::Brush::Block => {
                                     let cells = world
-                                        .block_cells(target.block(), &mut source)
+                                        .block_cells(tiamot_core::domain::OVERWORLD, target.block(), &mut source)
                                         .unwrap_or(tiamot_core::block::EMPTY_CELLS);
                                     shared.block_hardness_of(&tiamot_core::block::BlockView::Mixed(
                                         &cells,
@@ -1972,7 +1978,7 @@ impl ServerHandle {
                             let cells = match brush {
                                 tiamot_core::dig::Brush::SubNode => 1,
                                 tiamot_core::dig::Brush::Block => world
-                                    .block_cells(target.block(), &mut source)
+                                    .block_cells(tiamot_core::domain::OVERWORLD, target.block(), &mut source)
                                     .map(|cells| {
                                         cells
                                             .iter()
@@ -2083,7 +2089,7 @@ impl ServerHandle {
                                 }
                             };
                             for edit in edits {
-                                match world.apply(&edit, &mut source) {
+                                match world.apply(tiamot_core::domain::OVERWORLD, &edit, &mut source) {
                                     Ok((_, removed)) => {
                                         relight.push(edited_block(&edit));
                                         // A pond finds out there is somewhere
@@ -2224,7 +2230,7 @@ impl ServerHandle {
                             let contents = |at: tiamot_core::BlockPos,
                                                 world: &mut crate::world::World,
                                                 source: &mut dyn crate::world::ChunkSource| {
-                                world.block_cells(at, source).map_or((0, false), |cells| {
+                                world.block_cells(tiamot_core::domain::OVERWORLD, at, source).map_or((0, false), |cells| {
                                     let mut mask = 0;
                                     let mut other = false;
                                     for (index, cell) in cells.iter().enumerate() {
@@ -2300,6 +2306,7 @@ impl ServerHandle {
                                                 };
                                                 world
                                                     .subnode(
+                            tiamot_core::domain::OVERWORLD,
                                                         tiamot_core::SubNodePos::new(x, y, z),
                                                         &mut source,
                                                     )
@@ -2410,7 +2417,7 @@ impl ServerHandle {
                             // naming only the new cells deletes the rest.
                             let same = filled == 0
                                 || world
-                                    .block_cells(plan.block, &mut source)
+                                    .block_cells(tiamot_core::domain::OVERWORLD, plan.block, &mut source)
                                     .is_ok_and(|held| {
                                         held.iter()
                                             .all(|cell| cell.is_air() || *cell == material)
@@ -2429,7 +2436,7 @@ impl ServerHandle {
                             let mut failure = None;
                             let mut applied = 0;
                             for edit in edits {
-                                match world.apply(&edit, &mut source) {
+                                match world.apply(tiamot_core::domain::OVERWORLD, &edit, &mut source) {
                                     Ok(_) => {
                                         applied += tiamot_core::place::edit_units(&edit);
                                         relight.push(edited_block(&edit));
@@ -2509,13 +2516,13 @@ impl ServerHandle {
                         if !random_tick_materials.is_empty() {
                             let seed = world.seed();
                             let mut budget = MAX_RANDOM_TICK_CHUNKS;
-                            for chunk in world.resident_positions() {
+                            for chunk in world.resident_positions(tiamot_core::domain::OVERWORLD) {
                                 if budget == 0 {
                                     break;
                                 }
                                 budget -= 1;
                                 for pos in tiamot_core::tick::random::cells(seed, chunk, tick) {
-                                    let Some(material) = world.material_at(pos) else {
+                                    let Some(material) = world.material_at(tiamot_core::domain::OVERWORLD, pos) else {
                                         continue;
                                     };
                                     // The world stores WORLD ids and a mod
@@ -2570,7 +2577,7 @@ impl ServerHandle {
                         // thread, and an unbounded drain would let one player
                         // joining stall the world for everyone.
                         for request in shared.take_chunk_requests() {
-                            let blob = match world.chunk(request.pos, &mut source) {
+                            let blob = match world.chunk(tiamot_core::domain::OVERWORLD, request.pos, &mut source) {
                                 Ok(chunk) => {
                                     let chunk = chunk.clone();
                                     world.db().chunk_blob(request.pos, &chunk).ok()
@@ -2602,7 +2609,7 @@ impl ServerHandle {
                                     std::iter::once(request.pos).collect()
                                 } else {
                                     control.note_full_relight();
-                                    light.chunk_loaded(&world, request.pos)
+                                    light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, request.pos)
                                 };
                                 broadcast_light(&shared, &light, &touched);
                             }
@@ -2638,7 +2645,7 @@ impl ServerHandle {
                             let mut light = lighting.write().expect("lighting lock");
                             let mut touched = std::collections::BTreeSet::new();
                             for pos in relight.drain(..) {
-                                touched.extend(light.edited(&world, pos));
+                                touched.extend(light.edited(tiamot_core::domain::OVERWORLD, &world, pos));
                             }
                             broadcast_light(&shared, &light, &touched);
                         }
@@ -2648,7 +2655,7 @@ impl ServerHandle {
                         // reading. Asking the world what arrived rather than
                         // hunting every load site means the next route somebody
                         // adds is lit too, instead of being silently black.
-                        let arrived = world.take_arrived();
+                        let arrived = world.take_arrived(tiamot_core::domain::OVERWORLD);
                         if !arrived.is_empty() {
                             // **The milk that was there before, before anything
                             // else looks at the chunk.** Fluid is not derived
@@ -2670,7 +2677,7 @@ impl ServerHandle {
                                 if fluid.knows(*pos) {
                                     continue;
                                 }
-                                match world.load_fluid(*pos) {
+                                match world.load_fluid(tiamot_core::domain::OVERWORLD, *pos) {
                                     // Recorded as read either way — a chunk with
                                     // no row is dry, which is an answer.
                                     Ok(layer) => fluid.chunk_loaded(*pos, layer.unwrap_or_default()),
@@ -2693,7 +2700,7 @@ impl ServerHandle {
                                 if mobs.knows(*pos) {
                                     continue;
                                 }
-                                match world.load_entities(*pos) {
+                                match world.load_entities(tiamot_core::domain::OVERWORLD, *pos) {
                                     Ok(entities) => mobs.chunk_loaded(*pos, entities),
                                     Err(err) => {
                                         // Left unread so the next arrival
@@ -2718,11 +2725,11 @@ impl ServerHandle {
                                     // chunks black for as long as they stayed
                                     // loaded, which is the kind of bug that
                                     // only shows up after a teleport.
-                                    world.defer_arrival(pos);
+                                    world.defer_arrival(tiamot_core::domain::OVERWORLD, pos);
                                     continue;
                                 }
                                 control.note_full_relight();
-                                touched.extend(light.chunk_loaded(&world, pos));
+                                touched.extend(light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos));
                                 done += 1;
                             }
                             broadcast_light(&shared, &light, &touched);
@@ -2974,7 +2981,7 @@ impl ServerHandle {
                             population
                                 .write()
                                 .expect("entity lock")
-                                .tick(&world, &fluid);
+                                .tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
                         }
 
                         // **What each player is told about the entities.**
@@ -3038,6 +3045,7 @@ impl ServerHandle {
                         if tick.is_multiple_of(crate::fluid::TICKS_PER_FLUID_TICK) {
                             let mut fluid = fluidics.write().expect("fluid lock");
                             let changes = fluid.tick(
+                                        tiamot_core::domain::OVERWORLD,
                                 &world,
                                 tick / crate::fluid::TICKS_PER_FLUID_TICK,
                                 world.seed(),
@@ -3096,7 +3104,7 @@ impl ServerHandle {
                                     .absorbed
                                     .iter()
                                     .filter_map(|taken| {
-                                        let block = world.resident(taken.pos.chunk())?;
+                                        let block = world.resident(tiamot_core::domain::OVERWORLD, taken.pos.chunk())?;
                                         let becomes = fluid
                                             .absorbs_block(&block.get_block_local(taken.pos.local()))?
                                             .becomes?;
@@ -3113,7 +3121,7 @@ impl ServerHandle {
                                     pos,
                                     material: becomes.0,
                                 };
-                                match world.apply(&edit, &mut source) {
+                                match world.apply(tiamot_core::domain::OVERWORLD, &edit, &mut source) {
                                     Ok(_) => {
                                         relight.push(pos);
                                         // The pond has to hear about it too: a
@@ -3146,7 +3154,7 @@ impl ServerHandle {
                                     continue;
                                 };
                                 let cells = world
-                                    .block_cells(event.into, &mut source)
+                                    .block_cells(tiamot_core::domain::OVERWORLD, event.into, &mut source)
                                     .unwrap_or(tiamot_core::block::EMPTY_CELLS);
                                 // The first non-air cell names the block: a
                                 // mixed block has no single material, and the
@@ -3214,6 +3222,7 @@ impl ServerHandle {
                             let mobs = population.write().expect("entity lock").take_dirty();
                             if !mobs.is_empty()
                                 && let Err(err) = world.save_entities(
+                                    tiamot_core::domain::OVERWORLD,
                                     mobs.iter().map(|(pos, held)| (*pos, held.as_slice())),
                                 )
                             {
@@ -3228,7 +3237,7 @@ impl ServerHandle {
                             let dirty = fluidics.write().expect("fluid lock").take_dirty();
                             if !dirty.is_empty()
                                 && let Err(err) =
-                                    world.save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                                    world.save_fluid(tiamot_core::domain::OVERWORLD, dirty.iter().map(|(pos, layer)| (*pos, layer)))
                             {
                                 // Put them back rather than dropping them. A
                                 // failed write that also forgot what it was
@@ -3289,14 +3298,14 @@ impl ServerHandle {
                         let mobs = population.write().expect("entity lock").take_dirty();
                         if !mobs.is_empty()
                             && let Err(err) = world
-                                .save_entities(mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
+                                .save_entities(tiamot_core::domain::OVERWORLD, mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
                         {
                             error!("could not save entities: {err}");
                         }
                         let dirty = fluidics.write().expect("fluid lock").take_dirty();
                         if !dirty.is_empty()
                             && let Err(err) =
-                                world.save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                                world.save_fluid(tiamot_core::domain::OVERWORLD, dirty.iter().map(|(pos, layer)| (*pos, layer)))
                         {
                             error!("could not save fluid on shutdown: {err}");
                         }
@@ -3771,7 +3780,7 @@ fn crumble_bites(
     count: u32,
     toward: [f64; 3],
 ) -> Vec<tiamot_core::proto::Edit> {
-    let Ok(cells) = world.block_cells(block, source) else {
+    let Ok(cells) = world.block_cells(tiamot_core::domain::OVERWORLD, block, source) else {
         return Vec::new();
     };
     let order = tiamot_core::dig::crumble_order(world.seed(), block, toward);

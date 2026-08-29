@@ -33,7 +33,7 @@
 //! it, and it is what charter rule 6 means by "only modified **or generated**
 //! chunks persist".
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use tiamot_core::block::{BlockView, Cells, EMPTY_CELLS};
 use tiamot_core::fluid::FluidLayer;
@@ -351,11 +351,15 @@ impl ChunkSource for Generator {
     }
 }
 
-/// The live world.
-pub struct World {
-    db: WorldDb,
-    /// The seed every generator is handed. Fixed for the world's lifetime.
-    seed: u64,
+/// One domain's chunks, in memory.
+///
+/// Each domain has its own, because a domain is its own coordinate frame: two
+/// of them hold a chunk at `(0, 0, 0)` and those are different chunks. Keying
+/// one cache by `(domain, pos)` would have worked and been worse — every
+/// lookup would carry a string, and the per-domain lists that a save and an
+/// arrival walk would have to be filtered out of a shared one.
+#[derive(Default)]
+struct Space {
     /// Chunks currently in memory.
     cache: HashMap<ChunkPos, Chunk>,
     /// Chunks changed since the last save.
@@ -369,6 +373,27 @@ pub struct World {
     /// can only arrive once between drains — it is already in the cache the
     /// second time.
     arrived: Vec<ChunkPos>,
+}
+
+/// The live world: every domain in it, over one database.
+///
+/// **Every chunk operation names a domain.** Not a convenience refused on
+/// principle — a default would be a silent overworld, and a caller that forgot
+/// to say which domain it meant would edit, stream, or collide against the
+/// wrong one with nothing to notice it. Criterion A3 is that a player sees
+/// nothing of a domain they are not in, and the cheapest way to hold that is to
+/// make the compiler ask the question at every call.
+pub struct World {
+    db: WorldDb,
+    /// The seed every generator is handed. Fixed for the world's lifetime.
+    seed: u64,
+    /// The chunks of each domain anything has touched this session.
+    ///
+    /// Created on first use, so a registered domain nobody has visited costs
+    /// nothing in memory exactly as it costs nothing on disk. A `BTreeMap`
+    /// because charter rule 4 forbids anything observable depending on hash
+    /// order, and which domains exist is observable.
+    domains: BTreeMap<String, Space>,
 }
 
 impl World {
@@ -391,9 +416,7 @@ impl World {
         Ok(Self {
             db,
             seed,
-            cache: HashMap::new(),
-            dirty: Vec::new(),
-            arrived: Vec::new(),
+            domains: BTreeMap::new(),
         })
     }
 
@@ -409,16 +432,38 @@ impl World {
         &self.db
     }
 
-    /// How many chunks are cached.
+    /// How many chunks are cached, across every domain.
     #[must_use]
     pub fn cached(&self) -> usize {
-        self.cache.len()
+        self.domains.values().map(|space| space.cache.len()).sum()
     }
 
-    /// How many chunks are waiting to be written.
+    /// Every domain this world has chunks in memory for.
+    ///
+    /// The ones a tick has to visit. A registered domain nobody has been to is
+    /// not here, which is the point — it costs nothing until somebody goes.
+    #[must_use]
+    pub fn resident_domains(&self) -> Vec<&str> {
+        self.domains.keys().map(String::as_str).collect()
+    }
+
+    /// One domain's chunks, creating the space on first use.
+    ///
+    /// Split off `self` so the caller can hold the database and the seed at the
+    /// same time, which every load and generate needs.
+    fn space_of<'a>(domains: &'a mut BTreeMap<String, Space>, domain: &str) -> &'a mut Space {
+        if !domains.contains_key(domain) {
+            domains.insert(domain.to_owned(), Space::default());
+        }
+        domains
+            .get_mut(domain)
+            .expect("just inserted if it was absent")
+    }
+
+    /// How many chunks are waiting to be written, across every domain.
     #[must_use]
     pub fn dirty(&self) -> usize {
-        self.dirty.len()
+        self.domains.values().map(|space| space.dirty.len()).sum()
     }
 
     /// A chunk if it is already in memory, without generating or loading one.
@@ -611,8 +656,11 @@ impl World {
                   result, and the only way out of here is ordered"
     )]
     #[must_use]
-    pub fn resident_positions(&self) -> Vec<ChunkPos> {
-        let mut out: Vec<ChunkPos> = self.cache.keys().copied().collect();
+    pub fn resident_positions(&self, domain: &str) -> Vec<ChunkPos> {
+        let Some(space) = self.domains.get(domain) else {
+            return Vec::new();
+        };
+        let mut out: Vec<ChunkPos> = space.cache.keys().copied().collect();
         out.sort_unstable_by_key(|pos| (pos.x, pos.y, pos.z));
         out
     }
@@ -623,8 +671,8 @@ impl World {
     /// a caller asking this wants "is this block one particular material", and
     /// a mixed block is not one. The world id, as the chunk stores it.
     #[must_use]
-    pub fn material_at(&self, pos: tiamot_core::BlockPos) -> Option<MaterialId> {
-        match self.resident(pos.chunk())?.get_block(pos)? {
+    pub fn material_at(&self, domain: &str, pos: tiamot_core::BlockPos) -> Option<MaterialId> {
+        match self.resident(domain, pos.chunk())?.get_block(pos)? {
             tiamot_core::BlockView::Uniform(material)
             | tiamot_core::BlockView::Partial { material, .. } => {
                 (!material.is_air()).then_some(material)
@@ -634,8 +682,8 @@ impl World {
     }
 
     #[must_use]
-    pub fn resident(&self, pos: ChunkPos) -> Option<&Chunk> {
-        self.cache.get(&pos)
+    pub fn resident(&self, domain: &str, pos: ChunkPos) -> Option<&Chunk> {
+        self.domains.get(domain)?.cache.get(&pos)
     }
 
     /// Puts a chunk back on the arrival list.
@@ -644,8 +692,8 @@ impl World {
     /// tick — lighting caps how many chunks it relights per tick, and what it
     /// does not reach has to come back rather than stay dark for as long as it
     /// remains loaded.
-    pub fn defer_arrival(&mut self, pos: ChunkPos) {
-        self.arrived.push(pos);
+    pub fn defer_arrival(&mut self, domain: &str, pos: ChunkPos) {
+        Self::space_of(&mut self.domains, domain).arrived.push(pos);
     }
 
     /// Chunks that have entered memory since this was last called, and clears
@@ -659,8 +707,8 @@ impl World {
     /// chunks does not walk them every tick to find the one that just arrived.
     ///
     /// Lighting is the caller: a chunk with blocks and no light renders black.
-    pub fn take_arrived(&mut self) -> Vec<ChunkPos> {
-        std::mem::take(&mut self.arrived)
+    pub fn take_arrived(&mut self, domain: &str) -> Vec<ChunkPos> {
+        std::mem::take(&mut Self::space_of(&mut self.domains, domain).arrived)
     }
 
     /// Loads a chunk, generating it if the world has never seen it.
@@ -670,27 +718,31 @@ impl World {
     /// [`WorldError`] if the database read or the decode fails.
     pub fn chunk(
         &mut self,
+        domain: &str,
         pos: ChunkPos,
         source: &mut dyn ChunkSource,
     ) -> Result<&mut Chunk, WorldError> {
-        if !self.cache.contains_key(&pos) {
-            let chunk = match self.db.load_chunk(pos)? {
+        let Self { db, seed, domains } = self;
+        let seed = *seed;
+        let space = Self::space_of(domains, domain);
+        if !space.cache.contains_key(&pos) {
+            let chunk = match db.load_chunk_in(domain, pos)? {
                 Some(chunk) => chunk,
                 None => {
                     // Never visited. Generate it and mark it dirty so it is
                     // written — see the module docs on why a generated chunk is
                     // stored rather than regenerated later.
-                    let generated = source.generate(pos, self.seed);
-                    if !self.dirty.contains(&pos) {
-                        self.dirty.push(pos);
+                    let generated = source.generate(pos, seed);
+                    if !space.dirty.contains(&pos) {
+                        space.dirty.push(pos);
                     }
                     generated
                 }
             };
-            self.cache.insert(pos, chunk);
-            self.arrived.push(pos);
+            space.cache.insert(pos, chunk);
+            space.arrived.push(pos);
         }
-        Ok(self
+        Ok(space
             .cache
             .get_mut(&pos)
             .expect("just inserted if it was absent"))
@@ -709,6 +761,7 @@ impl World {
     /// [`EditError`] if the material is unknown or the chunk is unreachable.
     pub fn apply(
         &mut self,
+        domain: &str,
         edit: &Edit,
         source: &mut dyn ChunkSource,
     ) -> Result<(ChunkPos, Vec<Stack>), EditError> {
@@ -734,12 +787,12 @@ impl World {
             return Err(EditError::UnknownMaterial { id: material.0 });
         }
 
-        let chunk = self
-            .chunk(chunk_pos, source)
-            .map_err(|err| EditError::Unreachable {
-                pos: chunk_pos,
-                source: Box::new(err),
-            })?;
+        let chunk =
+            self.chunk(domain, chunk_pos, source)
+                .map_err(|err| EditError::Unreachable {
+                    pos: chunk_pos,
+                    source: Box::new(err),
+                })?;
 
         // Snapshot the affected block's cells BEFORE the edit. A `BlockView`
         // borrows the chunk, so it cannot outlive the mutation — the 27 cells
@@ -789,8 +842,9 @@ impl World {
             .map_or(EMPTY_CELLS, |view| std::array::from_fn(|i| view.subnode(i)));
         let removed = inventory::removed_units(BlockView::Mixed(&before), BlockView::Mixed(&after));
 
-        if !self.dirty.contains(&chunk_pos) {
-            self.dirty.push(chunk_pos);
+        let space = Self::space_of(&mut self.domains, domain);
+        if !space.dirty.contains(&chunk_pos) {
+            space.dirty.push(chunk_pos);
         }
         Ok((chunk_pos, removed))
     }
@@ -802,13 +856,14 @@ impl World {
     /// [`WorldError`] if the chunk cannot be reached.
     pub fn block_material(
         &mut self,
+        domain: &str,
         pos: BlockPos,
         source: &mut dyn ChunkSource,
     ) -> Result<MaterialId, WorldError> {
         // Sub-node zero, which for a uniform block is the whole block. A caller
         // that needs the full contents asks for the chunk.
         Ok(self
-            .chunk(pos.chunk(), source)?
+            .chunk(domain, pos.chunk(), source)?
             .get_block(pos)
             .map_or(MaterialId::AIR, |view| view.subnode(0)))
     }
@@ -826,11 +881,12 @@ impl World {
     /// [`WorldError`] if the chunk cannot be reached.
     pub fn block_cells(
         &mut self,
+        domain: &str,
         pos: BlockPos,
         source: &mut dyn ChunkSource,
     ) -> Result<Cells, WorldError> {
         Ok(self
-            .chunk(pos.chunk(), source)?
+            .chunk(domain, pos.chunk(), source)?
             .get_block(pos)
             .map_or(EMPTY_CELLS, |view| {
                 std::array::from_fn(|index| view.subnode(index))
@@ -844,11 +900,12 @@ impl World {
     /// [`WorldError`] if the chunk cannot be reached.
     pub fn subnode(
         &mut self,
+        domain: &str,
         pos: SubNodePos,
         source: &mut dyn ChunkSource,
     ) -> Result<MaterialId, WorldError> {
         Ok(self
-            .chunk(pos.chunk(), source)?
+            .chunk(domain, pos.chunk(), source)?
             .get_subnode(pos)
             .unwrap_or(MaterialId::AIR))
     }
@@ -860,30 +917,36 @@ impl World {
     /// [`WorldError`] if a write fails. Chunks that failed stay dirty, so the
     /// next save retries rather than dropping the edit.
     pub fn save_dirty(&mut self) -> Result<usize, WorldError> {
-        if self.dirty.is_empty() {
-            return Ok(0);
-        }
-
+        let Self { db, domains, .. } = self;
         let mut written = 0;
-        let mut failed = Vec::new();
-        for pos in std::mem::take(&mut self.dirty) {
-            let Some(chunk) = self.cache.get(&pos) else {
-                // Evicted between being dirtied and being saved. That would be
-                // a lost edit, so it is a bug rather than a condition — but
-                // dropping it silently is worse than saying so.
-                warn!(?pos, "a dirty chunk was evicted before it could be saved");
+        for (domain, space) in domains.iter_mut() {
+            if space.dirty.is_empty() {
                 continue;
-            };
-            match self.db.save_chunk(pos, chunk) {
-                Ok(()) => written += 1,
-                Err(err) => {
-                    warn!(?pos, "could not save chunk: {err}");
-                    failed.push(pos);
+            }
+            let mut failed = Vec::new();
+            for pos in std::mem::take(&mut space.dirty) {
+                let Some(chunk) = space.cache.get(&pos) else {
+                    // Evicted between being dirtied and being saved. That would
+                    // be a lost edit, so it is a bug rather than a condition —
+                    // but dropping it silently is worse than saying so.
+                    warn!(
+                        ?domain,
+                        ?pos,
+                        "a dirty chunk was evicted before it could be saved"
+                    );
+                    continue;
+                };
+                match db.save_chunk_in(domain, pos, chunk) {
+                    Ok(()) => written += 1,
+                    Err(err) => {
+                        warn!(?domain, ?pos, "could not save chunk: {err}");
+                        failed.push(pos);
+                    }
                 }
             }
+            // Keep the failures dirty so the next save tries again.
+            space.dirty = failed;
         }
-        // Keep the failures dirty so the next save tries again.
-        self.dirty = failed;
         Ok(written)
     }
 
@@ -901,8 +964,12 @@ impl World {
     /// # Errors
     ///
     /// [`WorldError`] if the read or the decode fails.
-    pub fn load_fluid(&self, pos: ChunkPos) -> Result<Option<FluidLayer>, WorldError> {
-        self.db.load_chunk_fluid(pos)
+    pub fn load_fluid(
+        &self,
+        domain: &str,
+        pos: ChunkPos,
+    ) -> Result<Option<FluidLayer>, WorldError> {
+        self.db.load_chunk_fluid_in(domain, pos)
     }
 
     /// Writes fluid layers for chunks whose milk has changed.
@@ -917,9 +984,10 @@ impl World {
     /// failure changes nothing and the caller can retry.
     pub fn save_fluid<'a>(
         &mut self,
+        domain: &str,
         layers: impl IntoIterator<Item = (ChunkPos, &'a FluidLayer)>,
     ) -> Result<usize, WorldError> {
-        self.db.save_chunk_fluid_batch(layers)
+        self.db.save_chunk_fluid_batch_in(domain, layers)
     }
 
     /// Reads the entities anchored to a chunk.
@@ -929,9 +997,10 @@ impl World {
     /// [`WorldError`] on a SQL failure or an undecodable entity.
     pub fn load_entities(
         &self,
+        domain: &str,
         pos: ChunkPos,
     ) -> Result<Vec<tiamot_core::ent::Entity>, WorldError> {
-        self.db.load_chunk_entities(pos)
+        self.db.load_chunk_entities_in(domain, pos)
     }
 
     /// Replaces the entities anchored to each chunk given.
@@ -944,11 +1013,12 @@ impl World {
     /// [`WorldError`] on a SQL failure or an unencodable entity.
     pub fn save_entities<'a>(
         &mut self,
+        domain: &str,
         chunks: impl IntoIterator<Item = (ChunkPos, &'a [tiamot_core::ent::Entity])>,
     ) -> Result<usize, WorldError> {
         let mut written = 0;
         for (pos, entities) in chunks {
-            self.db.save_chunk_entities(pos, entities)?;
+            self.db.save_chunk_entities_in(domain, pos, entities)?;
             written += entities.len();
         }
         Ok(written)
@@ -976,6 +1046,29 @@ impl World {
         self.db.save_mod_storage(mod_id, bag)
     }
 
+    /// The terrain of one domain, for the physics to collide against.
+    ///
+    /// A domain nothing has visited answers `None` to every chunk, which is
+    /// what an unloaded chunk answers anyway — so a body in an empty domain
+    /// falls, exactly as it would at the edge of a streamed-in overworld.
+    #[must_use]
+    pub fn solid(&self, domain: &str) -> Solid<'_> {
+        Solid {
+            space: self.domains.get(domain),
+        }
+    }
+
+    /// Drops one domain's cached chunks without saving them.
+    ///
+    /// Stages an eviction, which is the only way to test that a dirty chunk
+    /// lost before a save is reported rather than dropped in silence.
+    #[cfg(test)]
+    fn evict(&mut self, domain: &str) {
+        if let Some(space) = self.domains.get_mut(domain) {
+            space.cache.clear();
+        }
+    }
+
     /// Flushes and closes the database.
     ///
     /// # Errors
@@ -987,12 +1080,35 @@ impl World {
     }
 }
 
-/// Lets the physics collide against the world without being able to change it.
+/// Lets the physics collide against ONE DOMAIN without being able to change it.
 ///
 /// Note which trait this is: [`tiamot_core::phys::ChunkLookup`] reads resident
 /// chunks, and is not the [`ChunkSource`] above, which generates them. Both
 /// exist here and they mean opposite things — see [`World::resident`].
-impl tiamot_core::phys::ChunkLookup for World {
+///
+/// **A domain and not a world**, because a body collides against the terrain of
+/// the space it is in and against nothing else. The trait takes a position and
+/// no domain, so the domain has to be bound before the physics is handed
+/// anything — which is what this is for. Implementing it on `World` was right
+/// while there was one domain and would now mean every body in the world
+/// falling through every floor but the overworld's.
+pub struct Solid<'a> {
+    space: Option<&'a Space>,
+}
+
+impl Solid<'_> {
+    /// One of this domain's chunks, if it is in memory.
+    ///
+    /// Never loads and never generates: a caller holding one of these is inside
+    /// a tick, and pulling a chunk off the disk there is how a body walking
+    /// into unexplored ground stalls the whole server.
+    #[must_use]
+    pub fn resident(&self, pos: ChunkPos) -> Option<&Chunk> {
+        self.space?.cache.get(&pos)
+    }
+}
+
+impl tiamot_core::phys::ChunkLookup for Solid<'_> {
     fn chunk(&self, pos: ChunkPos) -> Option<&Chunk> {
         self.resident(pos)
     }
@@ -1088,7 +1204,10 @@ mod tests {
             assert_eq!(dirty.len(), 1, "the pour did not mark its chunk");
             assert_eq!(
                 world
-                    .save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                    .save_fluid(
+                        tiamot_core::domain::OVERWORLD,
+                        dirty.iter().map(|(pos, layer)| (*pos, layer))
+                    )
                     .expect("save"),
                 1
             );
@@ -1099,7 +1218,7 @@ mod tests {
         // heard of the pond.
         let world = reopen("fluid-round-trip");
         let layer = world
-            .load_fluid(chunk)
+            .load_fluid(tiamot_core::domain::OVERWORLD, chunk)
             .expect("read")
             .expect("the pond was not written");
 
@@ -1138,21 +1257,27 @@ mod tests {
             fluidics.set(pond, Fluid::new(FluidId(1), MAX_VOLUME));
             let dirty = fluidics.take_dirty();
             world
-                .save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                .save_fluid(
+                    tiamot_core::domain::OVERWORLD,
+                    dirty.iter().map(|(pos, layer)| (*pos, layer)),
+                )
                 .expect("save the pond");
 
             fluidics.set(pond, Fluid::EMPTY);
             let dirty = fluidics.take_dirty();
             assert_eq!(dirty.len(), 1, "the drain was not queued for writing");
             world
-                .save_fluid(dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                .save_fluid(
+                    tiamot_core::domain::OVERWORLD,
+                    dirty.iter().map(|(pos, layer)| (*pos, layer)),
+                )
                 .expect("save the drain");
             world.close().expect("close");
         }
 
         assert!(
             reopen("fluid-drain-round-trip")
-                .load_fluid(chunk)
+                .load_fluid(tiamot_core::domain::OVERWORLD, chunk)
                 .expect("read")
                 .is_none(),
             "a pond that was emptied came back after a restart"
@@ -1167,7 +1292,11 @@ mod tests {
         let mut flat = Flat::new(ids[0]);
 
         let material = world
-            .block_material(BlockPos::new(0, -5, 0), &mut flat)
+            .block_material(
+                tiamot_core::domain::OVERWORLD,
+                BlockPos::new(0, -5, 0),
+                &mut flat,
+            )
             .expect("read");
 
         assert_eq!(material, ids[0], "the generator should have filled this");
@@ -1184,7 +1313,9 @@ mod tests {
         let mut flat = Flat::new(ids[0]);
         let pos = BlockPos::new(0, -5, 0);
 
-        world.block_material(pos, &mut flat).expect("read");
+        world
+            .block_material(tiamot_core::domain::OVERWORLD, pos, &mut flat)
+            .expect("read");
         assert_eq!(
             world.dirty(),
             1,
@@ -1194,10 +1325,12 @@ mod tests {
 
         // Drop the cache and read again with a generator that would produce
         // something DIFFERENT. The stored chunk must win.
-        world.cache.clear();
+        world.evict(tiamot_core::domain::OVERWORLD);
         let mut changed = Flat::new(ids[1]);
         assert_eq!(
-            world.block_material(pos, &mut changed).expect("read"),
+            world
+                .block_material(tiamot_core::domain::OVERWORLD, pos, &mut changed)
+                .expect("read"),
             ids[0],
             "the stored chunk must win over a changed generator"
         );
@@ -1214,7 +1347,9 @@ mod tests {
         let pos = BlockPos::new(1, -1, 1);
 
         for _ in 0..5 {
-            world.block_material(pos, &mut flat).expect("read");
+            world
+                .block_material(tiamot_core::domain::OVERWORLD, pos, &mut flat)
+                .expect("read");
         }
         assert_eq!(
             flat.generated.len(),
@@ -1259,7 +1394,11 @@ mod tests {
         let mut air = Air;
         assert_eq!(
             world
-                .block_material(BlockPos::new(0, -100, 0), &mut air)
+                .block_material(
+                    tiamot_core::domain::OVERWORLD,
+                    BlockPos::new(0, -100, 0),
+                    &mut air
+                )
                 .expect("read"),
             MaterialId::AIR
         );
@@ -1273,6 +1412,7 @@ mod tests {
 
         world
             .apply(
+                tiamot_core::domain::OVERWORLD,
                 &Edit::Block {
                     pos,
                     material: ids[0].0,
@@ -1282,7 +1422,12 @@ mod tests {
             .expect("apply");
 
         assert_eq!(world.dirty(), 1);
-        assert_eq!(world.block_material(pos, &mut air).expect("read"), ids[0]);
+        assert_eq!(
+            world
+                .block_material(tiamot_core::domain::OVERWORLD, pos, &mut air)
+                .expect("read"),
+            ids[0]
+        );
     }
 
     #[test]
@@ -1294,6 +1439,7 @@ mod tests {
         for x in 0..5 {
             world
                 .apply(
+                    tiamot_core::domain::OVERWORLD,
                     &Edit::Block {
                         pos: BlockPos::new(x, 0, 0),
                         material: ids[0].0,
@@ -1315,6 +1461,7 @@ mod tests {
 
         let err = world
             .apply(
+                tiamot_core::domain::OVERWORLD,
                 &Edit::Block {
                     pos: BlockPos::new(9999, 0, 9999),
                     material: 60_000,
@@ -1348,6 +1495,7 @@ mod tests {
 
         let err = world
             .apply(
+                tiamot_core::domain::OVERWORLD,
                 &Edit::Block {
                     pos: BlockPos::new(0, 0, 0),
                     material: unregistered.0,
@@ -1360,6 +1508,7 @@ mod tests {
         for id in &ids {
             world
                 .apply(
+                    tiamot_core::domain::OVERWORLD,
                     &Edit::Block {
                         pos: BlockPos::new(0, 0, 0),
                         material: id.0,
@@ -1382,6 +1531,7 @@ mod tests {
         let pos = BlockPos::new(1, 2, 3);
         world
             .apply(
+                tiamot_core::domain::OVERWORLD,
                 &Edit::Block {
                     pos,
                     material: ids[1].0,
@@ -1393,9 +1543,11 @@ mod tests {
         assert_eq!(world.save_dirty().expect("save"), 1);
         assert_eq!(world.dirty(), 0, "a save clears the dirty set");
 
-        world.cache.clear();
+        world.evict(tiamot_core::domain::OVERWORLD);
         assert_eq!(
-            world.block_material(pos, &mut air).expect("read"),
+            world
+                .block_material(tiamot_core::domain::OVERWORLD, pos, &mut air)
+                .expect("read"),
             ids[1],
             "the edit must have reached the database"
         );
@@ -1412,6 +1564,7 @@ mod tests {
 
         world
             .apply(
+                tiamot_core::domain::OVERWORLD,
                 &Edit::Block {
                     pos,
                     material: ids[3].0,
@@ -1420,17 +1573,23 @@ mod tests {
             )
             .expect("apply");
         world.save_dirty().expect("save");
-        world.cache.clear();
+        world.evict(tiamot_core::domain::OVERWORLD);
 
         assert_eq!(
-            world.block_material(pos, &mut flat).expect("read"),
+            world
+                .block_material(tiamot_core::domain::OVERWORLD, pos, &mut flat)
+                .expect("read"),
             ids[3],
             "the edit must survive"
         );
         // And its neighbour is still the generated material.
         assert_eq!(
             world
-                .block_material(BlockPos::new(3, -3, 2), &mut flat)
+                .block_material(
+                    tiamot_core::domain::OVERWORLD,
+                    BlockPos::new(3, -3, 2),
+                    &mut flat
+                )
                 .expect("read"),
             ids[0],
             "the surrounding terrain must be intact"
@@ -1446,6 +1605,7 @@ mod tests {
         let pos = SubNodePos::new(4, 5, 6);
         world
             .apply(
+                tiamot_core::domain::OVERWORLD,
                 &Edit::SubNode {
                     pos,
                     material: ids[2].0,
@@ -1454,10 +1614,12 @@ mod tests {
             )
             .expect("apply");
         world.save_dirty().expect("save");
-        world.cache.clear();
+        world.evict(tiamot_core::domain::OVERWORLD);
 
         assert_eq!(
-            world.subnode(pos, &mut air).expect("read"),
+            world
+                .subnode(tiamot_core::domain::OVERWORLD, pos, &mut air)
+                .expect("read"),
             ids[2],
             "a sub-node edit must survive a save and reload"
         );
@@ -1473,6 +1635,7 @@ mod tests {
         let target = SubNodePos::new(3, 3, 3);
         world
             .apply(
+                tiamot_core::domain::OVERWORLD,
                 &Edit::Block {
                     pos: target.block(),
                     material: ids[0].0,
@@ -1482,6 +1645,7 @@ mod tests {
             .expect("fill the block");
         world
             .apply(
+                tiamot_core::domain::OVERWORLD,
                 &Edit::SubNode {
                     pos: target,
                     material: ids[3].0,
@@ -1490,12 +1654,21 @@ mod tests {
             )
             .expect("chisel one cell");
         world.save_dirty().expect("save");
-        world.cache.clear();
+        world.evict(tiamot_core::domain::OVERWORLD);
 
-        assert_eq!(world.subnode(target, &mut air).expect("read"), ids[3]);
         assert_eq!(
             world
-                .subnode(SubNodePos::new(target.x + 1, target.y, target.z), &mut air)
+                .subnode(tiamot_core::domain::OVERWORLD, target, &mut air)
+                .expect("read"),
+            ids[3]
+        );
+        assert_eq!(
+            world
+                .subnode(
+                    tiamot_core::domain::OVERWORLD,
+                    SubNodePos::new(target.x + 1, target.y, target.z),
+                    &mut air,
+                )
                 .expect("read"),
             ids[0],
             "the neighbouring cell must be untouched"

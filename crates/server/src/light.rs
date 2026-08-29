@@ -154,7 +154,12 @@ impl Lighting {
     ///
     /// Costly, and never worth doing twice: see the module docs for what it
     /// measures and for the guard the tick keeps in front of it.
-    pub fn chunk_loaded(&mut self, world: &World, pos: ChunkPos) -> BTreeSet<ChunkPos> {
+    pub fn chunk_loaded(
+        &mut self,
+        domain: &str,
+        world: &World,
+        pos: ChunkPos,
+    ) -> BTreeSet<ChunkPos> {
         self.layers.entry(pos).or_insert_with(LightLayer::dark);
 
         // Exactly the chunk. The blocks around it are handled as a boundary
@@ -177,7 +182,7 @@ impl Lighting {
         // client cannot tell "dark" from "not arrived yet", and every
         // underground chunk goes unreported.
         touched.chunks.insert(pos);
-        self.with_centre(world, pos, &mut touched, |lit| {
+        self.with_centre(domain, world, pos, &mut touched, |lit| {
             propagate::relight(lit, region);
         });
         self.compact(&touched.chunks);
@@ -187,9 +192,9 @@ impl Lighting {
     /// Re-lights around a block whose content just changed.
     ///
     /// Returns every chunk whose light changed.
-    pub fn edited(&mut self, world: &World, pos: BlockPos) -> BTreeSet<ChunkPos> {
+    pub fn edited(&mut self, domain: &str, world: &World, pos: BlockPos) -> BTreeSet<ChunkPos> {
         let mut touched = Touched::default();
-        self.with_centre(world, pos.chunk(), &mut touched, |lit| {
+        self.with_centre(domain, world, pos.chunk(), &mut touched, |lit| {
             propagate::edited(lit, pos);
         });
         self.compact(&touched.chunks);
@@ -209,6 +214,7 @@ impl Lighting {
     /// loaded.
     fn with_centre(
         &mut self,
+        domain: &str,
         world: &World,
         centre: ChunkPos,
         touched: &mut Touched,
@@ -217,7 +223,7 @@ impl Lighting {
         let held = self.layers.remove(&centre);
         let lit_here = held.is_some();
         let mut lit = Lit {
-            world,
+            terrain: world.solid(domain),
             lighting: self,
             touched,
             centre,
@@ -270,7 +276,7 @@ struct Touched {
 /// this, and the propagation itself is the rest. Memoising the *world* chunk
 /// the same way was measured first and bought 3%, so it was not kept.
 struct Lit<'a> {
-    world: &'a World,
+    terrain: crate::world::Solid<'a>,
     lighting: &'a mut Lighting,
     touched: &'a mut Touched,
     /// The chunk this pass is centred on, taken out of the map for the
@@ -304,12 +310,12 @@ impl Neighbourhood for Lit<'_> {
         // chunk. A flood reaching unexplored terrain would otherwise turn a
         // lamp into unbounded worldgen inside the tick, which is the same trap
         // collision documents at `World::resident`.
-        let chunk = self.world.resident(pos.chunk())?;
+        let chunk = self.terrain.resident(pos.chunk())?;
         Some(chunk.faces(pos.local()))
     }
 
     fn emission(&self, pos: BlockPos) -> Light {
-        let Some(chunk) = self.world.resident(pos.chunk()) else {
+        let Some(chunk) = self.terrain.resident(pos.chunk()) else {
             return Light::DARK;
         };
         self.lighting
@@ -394,7 +400,9 @@ mod tests {
 
     /// Loads a chunk so it is resident, without caring what is in it.
     fn resident(world: &mut World, pos: ChunkPos) {
-        world.chunk(pos, &mut Empty).expect("chunk");
+        world
+            .chunk(tiamot_core::domain::OVERWORLD, pos, &mut Empty)
+            .expect("chunk");
     }
 
     #[test]
@@ -404,7 +412,7 @@ mod tests {
         let pos = ChunkPos::new(0, 0, 0);
         resident(&mut world, pos);
 
-        light.chunk_loaded(&world, pos);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos);
 
         assert_eq!(light.at(BlockPos::new(8, 15, 8)).sun(), MAX_LEVEL);
         assert_eq!(
@@ -422,7 +430,9 @@ mod tests {
         resident(&mut world, pos);
         // Fill it solid so sunlight cannot get in, then hollow out a room.
         {
-            let chunk = world.chunk(pos, &mut Empty).expect("chunk");
+            let chunk = world
+                .chunk(tiamot_core::domain::OVERWORLD, pos, &mut Empty)
+                .expect("chunk");
             for index in 0..tiamot_core::BLOCKS_PER_CHUNK {
                 chunk.set_block_local(
                     tiamot_core::coords::LocalBlock::from_index(index),
@@ -445,7 +455,7 @@ mod tests {
             );
         }
 
-        light.chunk_loaded(&world, pos);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos);
 
         assert_eq!(light.at(BlockPos::new(8, 8, 8)).red(), MAX_LEVEL);
         assert_eq!(light.at(BlockPos::new(9, 8, 8)).red(), MAX_LEVEL - 1);
@@ -468,20 +478,26 @@ mod tests {
         resident(&mut world, west);
         resident(&mut world, east);
 
-        light.chunk_loaded(&world, west);
-        light.chunk_loaded(&world, east);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, west);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, east);
 
         // The block either side of the boundary is lit from the sky in both
         // chunks, so instead put a lamp at the very edge of the west chunk and
         // check it crosses.
         {
-            let chunk = world.chunk(west, &mut Empty).expect("chunk");
+            let chunk = world
+                .chunk(tiamot_core::domain::OVERWORLD, west, &mut Empty)
+                .expect("chunk");
             chunk.set_block_local(
                 tiamot_core::coords::LocalBlock::new(15, 8, 8),
                 BlockValue::Uniform(LAMP),
             );
         }
-        let touched = light.edited(&world, BlockPos::new(-1, 8, 8));
+        let touched = light.edited(
+            tiamot_core::domain::OVERWORLD,
+            &world,
+            BlockPos::new(-1, 8, 8),
+        );
 
         assert!(
             touched.contains(&east),
@@ -504,7 +520,7 @@ mod tests {
         resident(&mut world, pos);
         let before = world.cached();
 
-        light.chunk_loaded(&world, pos);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos);
 
         assert_eq!(
             world.cached(),
@@ -524,7 +540,9 @@ mod tests {
         let mut light = lighting();
         let pos = ChunkPos::new(0, -4, 0);
         {
-            let chunk = world.chunk(pos, &mut Empty).expect("chunk");
+            let chunk = world
+                .chunk(tiamot_core::domain::OVERWORLD, pos, &mut Empty)
+                .expect("chunk");
             for index in 0..tiamot_core::BLOCKS_PER_CHUNK {
                 chunk.set_block_local(
                     tiamot_core::coords::LocalBlock::from_index(index),
@@ -533,7 +551,7 @@ mod tests {
             }
         }
 
-        let touched = light.chunk_loaded(&world, pos);
+        let touched = light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos);
 
         assert!(
             touched.contains(&pos),
@@ -553,7 +571,7 @@ mod tests {
         let mut light = lighting();
         let pos = ChunkPos::new(0, 0, 0);
         resident(&mut world, pos);
-        light.chunk_loaded(&world, pos);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos);
         assert_eq!(light.len(), 1);
 
         light.forget(pos);
@@ -570,7 +588,7 @@ mod tests {
         let mut light = lighting();
         let pos = ChunkPos::new(0, 0, 0);
         resident(&mut world, pos);
-        light.chunk_loaded(&world, pos);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos);
 
         let layer = light.layer(pos).expect("lit");
         assert!(
@@ -595,8 +613,8 @@ mod tests {
         let next = ChunkPos::new(1, 0, 0);
         resident(&mut world, here);
         resident(&mut world, next);
-        light.chunk_loaded(&world, here);
-        light.chunk_loaded(&world, next);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, here);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, next);
 
         // A block just inside the first chunk's far edge, and one just over the
         // line in the second.
@@ -605,13 +623,15 @@ mod tests {
         assert_eq!(across.chunk(), next, "the test aims at the wrong chunk");
 
         {
-            let chunk = world.chunk(here, &mut Empty).expect("chunk");
+            let chunk = world
+                .chunk(tiamot_core::domain::OVERWORLD, here, &mut Empty)
+                .expect("chunk");
             chunk.set_block_local(
                 tiamot_core::coords::LocalBlock::new(15, 8, 8),
                 BlockValue::Uniform(LAMP),
             );
         }
-        let touched = light.edited(&world, lamp);
+        let touched = light.edited(tiamot_core::domain::OVERWORLD, &world, lamp);
 
         assert!(
             light.at(across).red() > 0,
@@ -626,13 +646,15 @@ mod tests {
 
         // And now take it away again.
         {
-            let chunk = world.chunk(here, &mut Empty).expect("chunk");
+            let chunk = world
+                .chunk(tiamot_core::domain::OVERWORLD, here, &mut Empty)
+                .expect("chunk");
             chunk.set_block_local(
                 tiamot_core::coords::LocalBlock::new(15, 8, 8),
                 BlockValue::AIR,
             );
         }
-        let touched = light.edited(&world, lamp);
+        let touched = light.edited(tiamot_core::domain::OVERWORLD, &world, lamp);
 
         assert_eq!(
             light.at(across).red(),

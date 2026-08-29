@@ -380,7 +380,10 @@ impl Population {
     ///
     /// A marker with no box has no physics to run. It can still be moved by a
     /// mod writing its transform; it simply does not fall.
-    pub fn tick(&mut self, world: &World, fluid: &crate::fluid::Fluidics) {
+    pub fn tick(&mut self, domain: &str, world: &World, fluid: &crate::fluid::Fluidics) {
+        // Bound once for the whole pass: every body here is in this domain, and
+        // `ChunkLookup` has no way to carry one.
+        let terrain = world.solid(domain);
         for id in self.entities.ids() {
             // A player's mirror has already moved this tick, under its own
             // inputs. Stepping it again would apply a second tick of gravity to
@@ -409,7 +412,7 @@ impl Population {
             // chunk inside the tick budget. It reads the fluid too, so a mob
             // floats in the same milk a player does — charter rule 2, one
             // simulation.
-            let voxels = phys::Voxels::with_fluid(world, fluid, origin);
+            let voxels = phys::Voxels::with_fluid(&terrain, fluid, origin);
             let stepped = phys::step_shaped(&voxels, body, drive, &phys::Tuning::DEFAULT, collider);
 
             // Charter rule 7: keep the local part inside one chunk so it never
@@ -679,7 +682,9 @@ mod tests {
 
     /// A chunk with a solid floor in its bottom block layer.
     fn floor(world: &mut World, pos: ChunkPos) {
-        world.chunk(pos, &mut Empty).expect("chunk");
+        world
+            .chunk(tiamot_core::domain::OVERWORLD, pos, &mut Empty)
+            .expect("chunk");
         let corner = tiamot_core::BlockPos::from_chunk_corner(pos);
         fill(world, corner.y, STONE);
     }
@@ -690,6 +695,7 @@ mod tests {
             for z in 0..16 {
                 world
                     .apply(
+                        tiamot_core::domain::OVERWORLD,
                         &tiamot_core::proto::Edit::Block {
                             pos: tiamot_core::BlockPos::new(x, y, z),
                             material: material.get(),
@@ -846,7 +852,9 @@ mod tests {
         // other players on your screen sinking into the floor.
         let mut world = world();
         let home = ChunkPos::new(0, 0, 0);
-        world.chunk(home, &mut Empty).expect("chunk");
+        world
+            .chunk(tiamot_core::domain::OVERWORLD, home, &mut Empty)
+            .expect("chunk");
 
         let mut population = Population::new();
         let uuid = player();
@@ -862,7 +870,7 @@ mod tests {
 
         let fluid = crate::fluid::Fluidics::default();
         for _ in 0..10 {
-            population.tick(&world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
         }
 
         let after = population.get(id).expect("mirror").transform;
@@ -964,7 +972,7 @@ mod tests {
         let fluid = crate::fluid::Fluidics::default();
 
         for _ in 0..200 {
-            population.tick(&world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
         }
 
         let entity = population.get(id).expect("live");
@@ -993,6 +1001,7 @@ mod tests {
             for z in 0..16 {
                 world
                     .apply(
+                        tiamot_core::domain::OVERWORLD,
                         &tiamot_core::proto::Edit::Block {
                             pos: tiamot_core::BlockPos::new(4, y, z),
                             material: STONE.get(),
@@ -1027,7 +1036,7 @@ mod tests {
 
         let fluid = crate::fluid::Fluidics::default();
         for _ in 0..120 {
-            population.tick(&world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
         }
 
         let travelled = |id| population.get(id).expect("live").transform.local[0] - start;
@@ -1059,7 +1068,7 @@ mod tests {
         let world = world();
         let fluid = crate::fluid::Fluidics::default();
         for _ in 0..10 {
-            population.tick(&world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
         }
 
         let entity = population.get(marker).expect("live");

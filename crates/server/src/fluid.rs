@@ -419,7 +419,7 @@ impl Fluidics {
     ///
     /// Returns every change, for broadcasting and re-meshing. Empty for a
     /// settled world, and it does not even take a lock to find that out.
-    pub fn tick(&mut self, world: &World, fluid_tick: u64, seed: u64) -> Vec<Flow> {
+    pub fn tick(&mut self, domain: &str, world: &World, fluid_tick: u64, seed: u64) -> Vec<Flow> {
         // **Taken on every path**, including the two that do no work. A write a
         // mod made is a change whatever the solver decides afterwards, and
         // dropping it on the viscosity check would lose it for good rather
@@ -446,7 +446,7 @@ impl Fluidics {
         // is borrowed immutably, which is the same trick `Lit` plays for light.
         let mut solver = std::mem::take(&mut self.solver);
         let mut view = Wet {
-            world,
+            terrain: world.solid(domain),
             layers: &mut self.layers,
             absorbency: &self.absorbency,
         };
@@ -548,7 +548,7 @@ impl tiamot_core::phys::FluidLookup for Fluidics {
 
 /// The world plus its fluid, as the solver needs to see it.
 struct Wet<'a> {
-    world: &'a World,
+    terrain: crate::world::Solid<'a>,
     layers: &'a mut HashMap<ChunkPos, FluidLayer>,
     absorbency: &'a Absorbency,
 }
@@ -565,7 +565,7 @@ impl Neighbourhood for Wet<'_> {
     /// it spread, inside the tick. `None` is that case, and the solver treats it
     /// as floor.
     fn occupancy(&self, pos: BlockPos) -> Option<u32> {
-        let chunk = self.world.resident(pos.chunk())?;
+        let chunk = self.terrain.resident(pos.chunk())?;
         Some(chunk.get_block_local(pos.local()).filled_cells())
     }
 
@@ -578,7 +578,7 @@ impl Neighbourhood for Wet<'_> {
         if self.absorbency.is_empty() {
             return 0;
         }
-        let Some(chunk) = self.world.resident(pos.chunk()) else {
+        let Some(chunk) = self.terrain.resident(pos.chunk()) else {
             return 0;
         };
         self.absorbency
@@ -703,7 +703,7 @@ mod tests {
         let mut registry = tiamot_core::Registry::new();
         let db = tiamot_core::persist::WorldDb::open(&path, &mut registry).expect("open");
         let world = crate::world::World::open(db, 1).expect("world");
-        let changes = fluidics.tick(&world, 0, 0);
+        let changes = fluidics.tick(tiamot_core::domain::OVERWORLD, &world, 0, 0);
 
         assert!(
             changes.iter().any(|flow| flow.pos == block),
@@ -711,7 +711,7 @@ mod tests {
         );
         // And exactly once: a write reported again on the next tick would
         // re-broadcast a chunk for ever.
-        let again = fluidics.tick(&world, 1, 0);
+        let again = fluidics.tick(tiamot_core::domain::OVERWORLD, &world, 1, 0);
         assert!(
             !again
                 .iter()
