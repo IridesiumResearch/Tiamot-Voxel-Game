@@ -320,17 +320,29 @@ fn a_mod_can_move_a_player_and_the_client_is_told() {
 
         // And a shove reaches the body too: upward, so it shows as leaving the
         // ground rather than as a position a walk could explain.
+        //
+        // **Every state since the shove, not the newest one.** An upward
+        // velocity lasts the few ticks it takes gravity to cancel it, and the
+        // server sends a state per tick — so a version of this that looked only
+        // at the most recent one stepped straight over the evidence whenever a
+        // batch arrived together. It passed here twenty-five times in a row and
+        // failed on CI, which is what a bet on how fast the machine is looks
+        // like from the outside.
+        //
+        // Counted from BEFORE the request, so nothing the earlier half of this
+        // test did — a teleport, and the landing after it — can satisfy it.
+        let already = bot.received().len();
         let mut left_the_ground = false;
         bot.chat("up").await.expect("chat");
         let deadline = tokio::time::Instant::now() + PATIENCE;
         while tokio::time::Instant::now() < deadline {
-            if let Some(tiamot_core::proto::ServerMessage::PlayerState { velocity, .. }) = bot
-                .received()
-                .into_iter()
-                .rev()
-                .find(|m| matches!(m, tiamot_core::proto::ServerMessage::PlayerState { .. }))
-                && velocity[1] > 0.5
-            {
+            if bot.received().into_iter().skip(already).any(|message| {
+                matches!(
+                    message,
+                    tiamot_core::proto::ServerMessage::PlayerState { velocity, .. }
+                        if velocity[1] > 0.5
+                )
+            }) {
                 left_the_ground = true;
                 break;
             }
