@@ -1018,3 +1018,138 @@ fn a_ship_with_somebody_in_it_is_not_scuttled() {
          (domains: {stored:?})"
     );
 }
+
+#[test]
+fn what_a_player_carries_and_who_they_are_survive_the_move() {
+    // **Criterion: identity and inventory survive a transfer.** Moving between
+    // spaces is a handoff of a body, not a new session — so what they were
+    // carrying is still theirs on the far side. The engine has no idea what an
+    // inventory means (charter rule 1); what it must not do is drop one.
+    let server = start(
+        "carry",
+        write_mod(
+            "carry",
+            "game.register_on_chat(function(event)\n\
+             \x20   if event.text == 'attic' then\n\
+             \x20       local body = game.player_entity(event.player)\n\
+             \x20       game.transfer_entity(body, 'places:attic', { x = 8, y = 4, z = 8 })\n\
+             \x20       return false\n\
+             \x20   end\n\
+             end)",
+        ),
+    );
+    block_on(async {
+        let mut bot = join(&server, "Carrier").await;
+        settle_for(&mut bot, 40).await;
+
+        // Dig something, so there is something to carry. Non-vacuous by
+        // construction: an empty inventory survives every possible bug.
+        let here = bot.settle().await.expect("settle").block();
+        let block = tiamot_core::BlockPos::new(here.x + 1, here.y - 1, here.z);
+        bot.dig_block(block).await.expect("dig");
+        let carried: u32 = bot
+            .await_inventory(Duration::from_secs(5))
+            .await
+            .expect("inventory")
+            .iter()
+            .map(|stack| stack.units)
+            .sum();
+        assert!(carried > 0, "nothing was picked up, so nothing can be lost");
+
+        bot.chat("attic").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "never moved");
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+        settle_for(&mut bot, 60).await;
+
+        let still: u32 = bot
+            .await_inventory(Duration::from_secs(5))
+            .await
+            .expect("inventory")
+            .iter()
+            .map(|stack| stack.units)
+            .sum();
+        assert_eq!(
+            still, carried,
+            "a player carrying {carried} units arrived in another domain with \
+             {still}"
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn a_ship_keeps_what_was_built_in_it_across_a_restart() {
+    // **Criterion: a runtime instance is indistinguishable from a registered
+    // domain downstream.** `places:attic` is registered in the window and
+    // `places:ship/17` is made while the world runs, and persistence must not
+    // be able to tell them apart — the instance's edits belong under the
+    // instance's own key.
+    let world = scratch("ship-persist-world");
+    let mods = write_mod(
+        "shippersist",
+        "game.register_on_chat(function(event)\n\
+         \x20   if event.text == 'aboard' then\n\
+         \x20       local body = game.player_entity(event.player)\n\
+         \x20       local id = game.create_domain('places:ship', '17')\n\
+         \x20       game.transfer_entity(body, id, { x = 8, y = 4, z = 8 })\n\
+         \x20       return false\n\
+         \x20   end\n\
+         end)",
+    );
+    let dug = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    let server = restart_at(world.clone(), mods);
+    let target = std::sync::Arc::clone(&dug);
+    block_on(async {
+        let mut bot = join(&server, "Shipwright").await;
+        settle_for(&mut bot, 40).await;
+        bot.chat("aboard").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).as_deref() != Some("places:ship/17") {
+            assert!(tokio::time::Instant::now() < deadline, "never boarded");
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+        settle_for(&mut bot, 40).await;
+
+        let here = bot.settle().await.expect("settle").block();
+        let block = tiamot_core::BlockPos::new(here.x + 1, here.y - 1, here.z);
+        bot.dig_block(block).await.expect("dig aboard");
+        *target.lock().expect("lock") = Some(block);
+        bot.disconnect().await;
+    });
+    assert!(server.stop(), "the world should close cleanly");
+
+    let block = dug.lock().expect("lock").expect("a block was dug");
+    let mut registry = tiamot_core::Registry::new();
+    let db = tiamot_core::persist::WorldDb::open(
+        world.join(tiamot_server::handle::WORLD_FILE),
+        &mut registry,
+    )
+    .expect("reopen");
+
+    let aboard = db
+        .load_chunk_in("places:ship/17", block.chunk())
+        .expect("read")
+        .expect("the ship's chunk was written when somebody stood in it");
+    assert_eq!(
+        aboard.get_block(block).map(|view| view.filled_cells()),
+        Some(0),
+        "what was built in a ship made at runtime did not survive the restart"
+    );
+
+    let overworld = db
+        .load_chunk(block.chunk())
+        .expect("read")
+        .expect("the overworld chunk exists");
+    assert!(
+        overworld
+            .get_block(block)
+            .is_some_and(|view| view.filled_cells() > 0),
+        "a dig aboard a runtime instance landed in the overworld's rows"
+    );
+}
