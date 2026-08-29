@@ -2246,8 +2246,15 @@ impl ServerHandle {
                                     )
                                 }
                             };
+                            // **The actor's domain, not the world's.** An edit
+                            // happens in the space the player making it is
+                            // standing in, and the positions mean different
+                            // places between spaces — so applying it to the
+                            // overworld would dig a hole under somebody who is
+                            // nowhere near it.
+                            let where_they_are = shared.player_domain(&uuid);
                             for edit in edits {
-                                match world.apply(tiamot_core::domain::OVERWORLD, &edit, &mut source) {
+                                match world.apply(&where_they_are, &edit, &mut source) {
                                     Ok((_, removed)) => {
                                         relight.push(edited_block(&edit));
                                         // A pond finds out there is somewhere
@@ -2259,10 +2266,13 @@ impl ServerHandle {
                                             .expect("fluid lock")
                                             .touch(edited_block(&edit));
                                         shared.credit(uuid, removed);
-                                        shared.broadcast(ServerMessage::BlockDelta {
-                                            edit,
-                                            actor: Some(*uuid.as_bytes()),
-                                        });
+                                        shared.broadcast_in(
+                                            &where_they_are,
+                                            ServerMessage::BlockDelta {
+                                                edit,
+                                                actor: Some(*uuid.as_bytes()),
+                                            },
+                                        );
                                     }
                                     Err(err) => {
                                         debug!(actor = %uuid.short(), "a dig bite would not apply: {err}");

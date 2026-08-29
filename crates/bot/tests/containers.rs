@@ -21,7 +21,16 @@ use tiamot_core::identity::{Allowlist, Identity};
 use tiamot_core::interest::ViewDistance;
 use tiamot_server::{ServerHandle, Settings};
 
-const PATIENCE: Duration = Duration::from_secs(10);
+/// How long to wait for something the server has to tick before it is true.
+///
+/// **Thirty seconds, not ten.** Nothing here is slower for it — every wait ends
+/// on the condition it is watching — and ten was a bet on how fast the machine
+/// is that `what_goes_into_a_container_survives_a_disconnect_and_a_restart`
+/// lost once under a full parallel workspace run, where a dig has every other
+/// test binary to share the machine with. Verified not to be a regression
+/// before it was widened: the whole suite passes on its own and passed on a
+/// re-run of the workspace.
+const PATIENCE: Duration = Duration::from_secs(30);
 
 /// The container every test here uses.
 const CHEST: &str = "chests:at:1,2,3";
@@ -217,7 +226,10 @@ fn what_goes_into_a_container_survives_a_disconnect_and_a_restart() {
                 tokio::time::Instant::now() < deadline,
                 "the chest holds {inside} units, not 27"
             );
-            bot.recv().await.expect("recv");
+            // Timed out, so the DEADLINE is what ends this loop. A bare `recv`
+            // blocks for ever on a server that has gone quiet, which turns a
+            // failure into a hang and a hang into a killed job with no message.
+            let _ = tokio::time::timeout(Duration::from_millis(100), bot.recv()).await;
         }
         bot.disconnect().await;
     });

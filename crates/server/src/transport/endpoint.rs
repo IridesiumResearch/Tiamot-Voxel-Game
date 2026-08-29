@@ -221,7 +221,7 @@ pub struct Shared {
     /// costs that client messages rather than stalling the simulation — the
     /// right trade, because the alternative is one bad connection pausing the
     /// world for everyone.
-    pub outbound: tokio::sync::broadcast::Sender<ServerMessage>,
+    pub outbound: tokio::sync::broadcast::Sender<Broadcast>,
 
     /// Identities an admin has asked to disconnect.
     ///
@@ -563,6 +563,23 @@ pub struct ChunkRequest {
     /// harmlessly. A shared queue of replies would need the simulation to know
     /// which connections still exist.
     pub reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+}
+
+/// One broadcast, and who it is for.
+///
+/// The domain is carried rather than resolved at the sender: who is in which
+/// space changes every tick, and a sender that wanted to know would have to
+/// take the body lock to send a message.
+#[derive(Debug, Clone)]
+pub struct Broadcast {
+    /// The domain this is for, or `None` for everyone in the world.
+    ///
+    /// `None` is right for anything that is not about a place — chat, the
+    /// tables sent at join, a player list. Anything about the world says which
+    /// world.
+    pub only: Option<String>,
+    /// What to send.
+    pub message: ServerMessage,
 }
 
 /// A player asking to place material.
@@ -1067,6 +1084,19 @@ impl Shared {
                 .filter(|player| player.domain == domain)
                 .count()
         })
+    }
+
+    /// Which domain a player is in.
+    ///
+    /// The overworld for anybody the server has no body for, which is the
+    /// honest answer for a request that arrived as its sender disconnected.
+    #[must_use]
+    pub fn player_domain(&self, uuid: &PlayerUuid) -> String {
+        self.bodies
+            .lock()
+            .ok()
+            .and_then(|bodies| bodies.get(uuid).map(|player| player.domain.clone()))
+            .unwrap_or_else(|| tiamot_core::domain::OVERWORLD.to_owned())
     }
 
     /// Which domain a player is in, and where they are in it.
@@ -1616,7 +1646,28 @@ impl Shared {
     ///
     /// A send with no receivers is not an error — it means nobody is connected.
     pub fn broadcast(&self, message: ServerMessage) {
-        let _ = self.outbound.send(message);
+        let _ = self.outbound.send(Broadcast {
+            only: None,
+            message,
+        });
+    }
+
+    /// Queues a message for every in-world player IN ONE DOMAIN.
+    ///
+    /// **What makes an edit stay in the space it happened in.** Positions are
+    /// identical between domains, so a block delta that reached everybody would
+    /// land as terrain changing under somebody standing nowhere near it — which
+    /// is what an untested `broadcast` did, and what the two-domain interest
+    /// test caught.
+    ///
+    /// Filtered at the connection rather than at the sender, because who is
+    /// where changes every tick and the sender would have to hold the body lock
+    /// to find out.
+    pub fn broadcast_in(&self, domain: &str, message: ServerMessage) {
+        let _ = self.outbound.send(Broadcast {
+            only: Some(domain.to_owned()),
+            message,
+        });
     }
 
     /// Queues a line of text for one player.
@@ -2129,8 +2180,18 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                     Ok(outbound) => {
                         // Only in-world players receive world state. A peer
                         // mid-handshake must not learn what anyone is building.
-                        if session.phase() == tiamot_core::session::Phase::InWorld {
-                            frame::write(&mut send, &outbound).await?;
+                        //
+                        // And only players in the domain it happened in, when
+                        // it says one: a body sees the space it is in and no
+                        // other, and the positions mean different places
+                        // between them.
+                        let mine = outbound.only.is_none_or(|domain| {
+                            streamer
+                                .as_ref()
+                                .is_some_and(|streamer| streamer.domain() == domain)
+                        });
+                        if mine && session.phase() == tiamot_core::session::Phase::InWorld {
+                            frame::write(&mut send, &outbound.message).await?;
                         }
                         continue;
                     }
