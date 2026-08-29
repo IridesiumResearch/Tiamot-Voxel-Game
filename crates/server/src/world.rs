@@ -1091,6 +1091,26 @@ impl World {
         }
     }
 
+    /// Removes a domain's chunks, from memory and from the world file.
+    ///
+    /// **Its siblings are untouched**, which is the whole reason the storage is
+    /// keyed by `(domain, position)`: a delete that named only positions would
+    /// take the same coordinates out of every space.
+    ///
+    /// The caller decides whether the domain may go — whether anything is
+    /// inside it is not something the world knows. This is the half that
+    /// happens once that is settled.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the rows cannot be removed. The in-memory space is
+    /// dropped either way: it belongs to a domain that no longer exists, and
+    /// keeping it would mean a destroyed ship still had terrain.
+    pub fn forget_domain(&mut self, domain: &str) -> Result<(), WorldError> {
+        self.domains.remove(domain);
+        self.db.remove_domain(domain)
+    }
+
     /// Flushes and closes the database.
     ///
     /// # Errors

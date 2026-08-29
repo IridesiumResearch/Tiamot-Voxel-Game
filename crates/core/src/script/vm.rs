@@ -996,6 +996,13 @@ pub trait ScriptVm: Sized {
     /// frozen API is installed before there is a world to have entities in.
     fn set_entity_access(&mut self, access: std::sync::Arc<dyn crate::ent::Access>);
 
+    /// Hands the VM the live domain registry.
+    ///
+    /// Set after the freeze, like the other access handles: what a mod
+    /// registered is fixed by then, and what it can still do — make an
+    /// instance, unmake one — is what this is for.
+    fn set_domain_access(&mut self, access: std::sync::Arc<dyn crate::domain::Access>);
+
     /// Points `game.storage` at the server's store.
     fn set_storage_access(&mut self, access: std::sync::Arc<dyn crate::storage::Access>);
 

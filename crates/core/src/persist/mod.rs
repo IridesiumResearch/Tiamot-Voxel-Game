@@ -196,6 +196,18 @@ pub enum WorldError {
         /// Version this build writes.
         expected: i64,
     },
+
+    /// A request to delete the domain every world is made of.
+    ///
+    /// Its own variant rather than a silent no-op: a mod asking for this has a
+    /// bug, and answering "done" to "delete the whole world" is how the bug
+    /// stays hidden until somebody's save is empty.
+    #[error(
+        "`{}` cannot be destroyed: it is the domain every chunk written before \
+         domains existed belongs to, so deleting it means deleting the world",
+        DEFAULT_DOMAIN
+    )]
+    OverworldIsNotDestroyable,
 }
 
 /// The same block, under a different fluid id.
@@ -1378,6 +1390,36 @@ impl WorldDb {
             .collect::<Vec<_>>()
             .join("\n");
         self.set_meta(meta_keys::DOMAIN_INSTANCES, text.as_bytes())
+    }
+
+    /// Removes everything stored under one domain.
+    ///
+    /// Chunks, their fluid and their entities, in one transaction — so a world
+    /// is never left holding a ship's terrain without its mobs, or the other
+    /// way round.
+    ///
+    /// **Named domains only.** The overworld is refused: it is the domain every
+    /// row written before Task 15a belongs to, and "delete the overworld" is a
+    /// request to empty the world, which no mod should be able to make by
+    /// passing the wrong string.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure, and [`WorldError::OverworldIsNotDestroyable`] for an
+    /// attempt on the overworld.
+    pub fn remove_domain(&self, domain: &str) -> Result<(), WorldError> {
+        if domain == DEFAULT_DOMAIN {
+            return Err(WorldError::OverworldIsNotDestroyable);
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        for table in ["chunks", "chunk_fluid", "entities"] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE domain = ?1"),
+                params![domain],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Every domain this world has anything stored under.

@@ -1409,6 +1409,34 @@ function game.register_fluid(spec) end
 ---@param spec { id: string, kind: string?, scale: number?, instanced: boolean? }
 function game.register_domain(spec) end
 
+---Makes an instance of a template, or hands back the one already there.
+---
+---Returns its id — `template/key` — which is what you pass to
+---`game.transfer_entity`. `nil` if the template is not an instanced one, or the
+---key is unusable (letters, digits and `_`).
+---
+---**Making the same one twice is not an error and empties nothing.** A mod
+---re-entering a ship it already made calls this every time, and a "create" that
+---wiped would be a ship that emptied on its second visit. So this is how you
+---both make one and find one again.
+---@param template string
+---@param key string
+---@return string? id
+function game.create_domain(template, key) end
+
+---Removes an instance and everything stored in it. Permanent.
+---
+---**Refused while anything is inside**, entity or player — the same defect as
+---breaking a container somebody has open. Returns whether the request was
+---carried; the removal itself happens at the end of the tick, so move everybody
+---out and destroy it in the same callback and the order will be right.
+---
+---Only instances. A domain registered in the window is part of the world's
+---shape and cannot be destroyed, and neither can `overworld`.
+---@param id string
+---@return boolean
+function game.destroy_domain(id) end
+
 ---What a block holds.
 ---
 ---`volume` is how much is in it, in CELLS of 27 — the same unit inventory

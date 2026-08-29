@@ -1187,3 +1187,67 @@ fn a_fresh_world_stores_nothing_under_any_domain() {
         "an untouched world already had storage under a domain"
     );
 }
+
+#[test]
+fn destroying_a_domain_takes_its_rows_and_leaves_its_siblings() {
+    // **Why the storage is keyed by `(domain, position)`.** A delete that named
+    // only positions would take the same coordinates out of every space — so
+    // scuttling one ship would gut the overworld under it and every other ship
+    // parked at those coordinates.
+    let path = scratch("remove-domain");
+    let mut registry = registry_with(&["test:stone"]);
+    let stone = registry.register("test:stone").expect("register");
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+
+    let pos = ChunkPos::new(0, 0, 0);
+    db.save_chunk(pos, &Chunk::new(pos, stone)).expect("save");
+    db.save_chunk_in("mod:ship/17", pos, &Chunk::new(pos, stone))
+        .expect("save");
+    db.save_chunk_in("mod:ship/18", pos, &Chunk::new(pos, stone))
+        .expect("save");
+
+    db.remove_domain("mod:ship/17").expect("destroy");
+
+    assert_eq!(
+        db.stored_domains().expect("read"),
+        vec!["mod:ship/18".to_owned(), DEFAULT_DOMAIN.to_owned()],
+        "destroying one domain took another's rows with it"
+    );
+    assert!(
+        db.load_chunk_in("mod:ship/17", pos)
+            .expect("read")
+            .is_none(),
+        "the destroyed domain's chunk is still there"
+    );
+    assert!(
+        db.load_chunk_in("mod:ship/18", pos)
+            .expect("read")
+            .is_some(),
+        "a sibling at the same position was destroyed too"
+    );
+    assert!(
+        db.load_chunk(pos).expect("read").is_some(),
+        "the overworld at the same position was destroyed too"
+    );
+}
+
+#[test]
+fn the_overworld_cannot_be_destroyed() {
+    // A mod asking for this has a bug, and answering "done" to "delete the
+    // whole world" is how that bug stays hidden until somebody's save is empty.
+    let path = scratch("remove-overworld");
+    let mut registry = registry_with(&["test:stone"]);
+    let stone = registry.register("test:stone").expect("register");
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+    let pos = ChunkPos::new(0, 0, 0);
+    db.save_chunk(pos, &Chunk::new(pos, stone)).expect("save");
+
+    assert!(
+        db.remove_domain(DEFAULT_DOMAIN).is_err(),
+        "the overworld was deleted on request"
+    );
+    assert!(
+        db.load_chunk(pos).expect("read").is_some(),
+        "the refusal still emptied the world"
+    );
+}

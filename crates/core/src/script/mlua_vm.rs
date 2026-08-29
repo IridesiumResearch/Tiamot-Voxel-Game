@@ -282,6 +282,11 @@ pub struct MluaVm {
     edits: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::script::WorldEdit>>>>,
     /// Where the `game.*_entity` calls reach, once there is a world.
     entities: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::ent::Access>>>>,
+    /// Where `create_domain` and `destroy_domain` reach.
+    ///
+    /// A slot like the others, and set after the freeze for the same reason:
+    /// the stores it names do not exist while mods are loading.
+    domains: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::domain::Access>>>>,
     /// Where `game.storage` reaches, once there is a world.
     storage: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::storage::Access>>>>,
     /// Where `game.set_hud` sends a mod's own HUD values.
@@ -647,6 +652,7 @@ impl ScriptVm for MluaVm {
             sounds: std::sync::Arc::new(std::sync::Mutex::new(None)),
             dialogs: std::sync::Arc::new(std::sync::Mutex::new(None)),
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            domains: std::sync::Arc::new(std::sync::Mutex::new(None)),
             storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
             hud: std::sync::Arc::new(std::sync::Mutex::new(None)),
             containers: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -786,6 +792,12 @@ impl ScriptVm for MluaVm {
 
     fn set_entity_access(&mut self, access: std::sync::Arc<dyn crate::ent::Access>) {
         if let Ok(mut slot) = self.entities.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_domain_access(&mut self, access: std::sync::Arc<dyn crate::domain::Access>) {
+        if let Ok(mut slot) = self.domains.lock() {
             *slot = Some(access);
         }
     }
@@ -3312,6 +3324,47 @@ impl MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("transfer_entity", transfer)
+            .map_err(|err| self.vm_error(&err))?;
+        self.install_domain_runtime(game)?;
+        Ok(())
+    }
+
+    /// `game.create_domain` and `game.destroy_domain`.
+    ///
+    /// The half of the domain API that keeps working after the freeze, because
+    /// instances are made and unmade while the world runs — see
+    /// [`crate::domain`] for why the registration window could not have named
+    /// them.
+    fn install_domain_runtime(&self, game: &Table) -> Result<(), ScriptError> {
+        let slot = std::sync::Arc::clone(&self.domains);
+        let create = self
+            .lua
+            .create_function(move |_, (template, key): (String, String)| {
+                // The instance's id, or nil. A mod uses the id to transfer
+                // things in, so handing back a boolean would mean it had to
+                // rebuild `template/key` itself — and that spelling is the
+                // engine's, not something a mod should have to know.
+                Ok(slot.lock().ok().and_then(|slot| {
+                    slot.as_ref()
+                        .and_then(|store| store.create(&template, &key))
+                }))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("create_domain", create)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.domains);
+        let destroy = self
+            .lua
+            .create_function(move |_, id: String| {
+                Ok(slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|store| store.destroy(&id)))
+                    .unwrap_or(false))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("destroy_domain", destroy)
             .map_err(|err| self.vm_error(&err))?;
         Ok(())
     }

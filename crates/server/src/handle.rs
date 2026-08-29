@@ -994,6 +994,14 @@ impl ServerHandle {
             },
         );
 
+        // The domains the mods registered. Read here, with everything else the
+        // freeze made final, and handed to the simulation thread that owns the
+        // registry they go into.
+        let registered_domains = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_domains())
+            .unwrap_or_default();
+
         // The fluids the mods registered, keyed by world material id for the
         // same reason emissions are.
         let mut fluids = crate::fluid::fluids_from_rules(
@@ -1332,6 +1340,22 @@ impl ServerHandle {
                     // which has nothing to queue anything.
                     let mut entity_access: Option<std::sync::Arc<crate::ent::Shared>> = None;
 
+                    // Every domain this world has. Built from what mods
+                    // registered and from what the world already contains, so a
+                    // space whose mod was removed is preserved rather than
+                    // orphaned (charter rule 8).
+                    let domains = std::sync::Arc::new(std::sync::RwLock::new({
+                        let mut registry = tiamot_core::domain::Registry::new();
+                        for (id, spec) in &registered_domains {
+                            if let Err(err) = registry.register(id, spec.clone()) {
+                                error!(%err, "a mod's domain was refused");
+                            }
+                        }
+                        registry.freeze();
+                        registry
+                    }));
+                    let mut domain_access: Option<std::sync::Arc<crate::domains::Shared>> = None;
+
                     // Light is derived and lives only in memory — see
                     // `crate::light`. It is built here rather than in `Shared`
                     // because only the simulation thread may touch it: every
@@ -1424,6 +1448,14 @@ impl ServerHandle {
                             ));
                             entity_access = Some(std::sync::Arc::clone(&access));
                             host.vm_mut().set_entity_access(access);
+                            // And the domains, whose runtime half keeps working
+                            // after the freeze because instances are made and
+                            // unmade while the world runs.
+                            let spaces = std::sync::Arc::new(crate::domains::Shared::new(
+                                std::sync::Arc::clone(&domains),
+                            ));
+                            domain_access = Some(std::sync::Arc::clone(&spaces));
+                            host.vm_mut().set_domain_access(spaces);
                             // And a mod's own numbers on a mod's own HUD. The
                             // engine has no health bar and should not (charter
                             // rule 1); this is the channel it carries and does
@@ -2715,6 +2747,39 @@ impl ServerHandle {
                                 &population,
                                 &shared,
                             );
+                        }
+
+                        // **Destroys, after the transfers.** In that order on
+                        // purpose: a mod that moves everybody out of a ship and
+                        // then scuttles it did both in the same callback, and
+                        // doing the destroy first would refuse it for holding
+                        // the very bodies the transfer was about to remove.
+                        for id in domain_access
+                            .as_ref()
+                            .map(|access| access.take_doomed())
+                            .unwrap_or_default()
+                        {
+                            let inside = population
+                                .read()
+                                .map_or(0, |mobs| mobs.occupants(&id))
+                                + shared.players_in(&id);
+                            let removed = domains
+                                .write()
+                                .is_ok_and(|mut registry| registry.destroy(&id, inside).is_ok());
+                            if !removed {
+                                warn!(
+                                    domain = %id,
+                                    inside,
+                                    "a domain was not destroyed; something is still in it"
+                                );
+                                continue;
+                            }
+                            // Its chunks go with it. The registry owns the list
+                            // of domains and the world owns their contents, so
+                            // neither can do this alone.
+                            if let Err(err) = world.forget_domain(&id) {
+                                error!(domain = %id, "could not remove a destroyed domain: {err}");
+                            }
                         }
 
                         // Serve chunk requests. Bounded per tick by

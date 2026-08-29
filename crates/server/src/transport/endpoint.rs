@@ -1051,6 +1051,24 @@ impl Shared {
         bodies.get(uuid).map(|player| player.origin)
     }
 
+    /// How many connected players are in a domain.
+    ///
+    /// The other half of what `domain::Registry::destroy` asks: a mob inside is
+    /// `Population::occupants`, and a PLAYER is here, because a player's
+    /// authoritative body is not in the entity store — the mirror there is a
+    /// copy. Counting only the mirrors would let a domain be destroyed out from
+    /// under somebody standing in it in the moment before the tick refreshed
+    /// them.
+    #[must_use]
+    pub fn players_in(&self, domain: &str) -> usize {
+        self.bodies.lock().map_or(0, |bodies| {
+            bodies
+                .values()
+                .filter(|player| player.domain == domain)
+                .count()
+        })
+    }
+
     /// Which domain a player is in, and where they are in it.
     ///
     /// Read together under one lock, because a connection acts on the pair: a

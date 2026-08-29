@@ -24,6 +24,7 @@ pub mod checkmods;
 pub mod config;
 pub mod containers;
 pub mod content;
+pub mod domains;
 pub mod ent;
 pub mod fluid;
 pub mod handle;

@@ -404,6 +404,30 @@ impl Registry {
     }
 }
 
+/// Where a mod's runtime domain calls reach.
+///
+/// Registration happens in the window and freezes with everything else; this is
+/// the half that keeps working afterwards, because instances are made and
+/// unmade while the world is running. See the module documentation for why the
+/// registry could not have named them.
+pub trait Access: Send + Sync {
+    /// Makes an instance of a template, or hands back the one already there.
+    ///
+    /// Returns its id. `None` if the template is not one, or the key is
+    /// unusable — the mistakes a mod can fix.
+    fn create(&self, template: &str, key: &str) -> Option<String>;
+
+    /// Removes an instance and everything stored under it.
+    ///
+    /// Returns whether it happened. `false` covers "somebody is inside it",
+    /// which is the same defect as breaking a container somebody has open, as
+    /// well as "there is no such instance".
+    fn destroy(&self, id: &str) -> bool;
+
+    /// Whether a domain exists to be moved into.
+    fn exists(&self, id: &str) -> bool;
+}
+
 /// Whether an id is one a mod may register.
 fn check_registered_id(id: &str) -> Result<(), DomainError> {
     let bad = |reason| {
