@@ -134,6 +134,23 @@ fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
 
 /// Sends every touched chunk's light to everyone.
 ///
+/// Writes each dirty chunk of entities into the domain it belongs to.
+///
+/// **One call per `(domain, chunk)`, because that is what a row is.** A save
+/// that wrote every dirty chunk into the overworld would put a ship's mobs into
+/// the overworld's rows at the same coordinates, and delete whatever was
+/// actually there — the two are the same write.
+fn save_entities_by_domain(
+    world: &mut crate::world::World,
+    dirty: &[(String, tiamot_core::ChunkPos, Vec<tiamot_core::ent::Entity>)],
+) -> Result<usize, tiamot_core::WorldError> {
+    let mut written = 0;
+    for (domain, pos, entities) in dirty {
+        written += world.save_entities(domain, [(*pos, entities.as_slice())])?;
+    }
+    Ok(written)
+}
+
 /// Broadcast rather than aimed, the same as `BlockDelta`: interest sets live in
 /// the transport and the simulation thread does not hold them. A client filters
 /// what it is not holding, and the payload for the uniform chunks that make up
@@ -2697,11 +2714,11 @@ impl ServerHandle {
                             // and chunks arrive twice.
                             let mut mobs = population.write().expect("entity lock");
                             for pos in &arrived {
-                                if mobs.knows(*pos) {
+                                if mobs.knows(tiamot_core::domain::OVERWORLD, *pos) {
                                     continue;
                                 }
                                 match world.load_entities(tiamot_core::domain::OVERWORLD, *pos) {
-                                    Ok(entities) => mobs.chunk_loaded(*pos, entities),
+                                    Ok(entities) => mobs.chunk_loaded(tiamot_core::domain::OVERWORLD, *pos, entities),
                                     Err(err) => {
                                         // Left unread so the next arrival
                                         // retries. Treating a failed read as
@@ -3232,10 +3249,7 @@ impl ServerHandle {
 
                             let mobs = population.write().expect("entity lock").take_dirty();
                             if !mobs.is_empty()
-                                && let Err(err) = world.save_entities(
-                                    tiamot_core::domain::OVERWORLD,
-                                    mobs.iter().map(|(pos, held)| (*pos, held.as_slice())),
-                                )
+                                && let Err(err) = save_entities_by_domain(&mut world, &mobs)
                             {
                                 error!("could not save entities: {err}");
                             }
@@ -3308,8 +3322,7 @@ impl ServerHandle {
                         }
                         let mobs = population.write().expect("entity lock").take_dirty();
                         if !mobs.is_empty()
-                            && let Err(err) = world
-                                .save_entities(tiamot_core::domain::OVERWORLD, mobs.iter().map(|(pos, held)| (*pos, held.as_slice())))
+                            && let Err(err) = save_entities_by_domain(&mut world, &mobs)
                         {
                             error!("could not save entities: {err}");
                         }

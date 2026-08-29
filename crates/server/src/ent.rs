@@ -51,16 +51,22 @@ pub struct Population {
     entities: Entities,
     /// Chunks whose entities have changed since the last save.
     ///
-    /// A `BTreeSet` for the reason `Fluidics::dirty` is one: the order rows are
-    /// written in is not a simulation result, but reaching for a `HashSet`
-    /// inside the tick is the habit that eventually puts one there.
-    dirty: BTreeSet<ChunkPos>,
+    /// **Keyed by domain as well as position**, because a chunk at `(0, 0, 0)`
+    /// exists in every domain and those are different rows. Keyed by position
+    /// alone, a mob moving in a ship would rewrite the overworld's row at the
+    /// same coordinates — with the ship's entities in it, or with none.
+    ///
+    /// A `BTreeSet` inside for the reason `Fluidics::dirty` is one: the order
+    /// rows are written in is not a simulation result, but reaching for a
+    /// `HashSet` inside the tick is the habit that eventually puts one there.
+    dirty: BTreeMap<String, BTreeSet<ChunkPos>>,
     /// Chunks whose entities have been read from the database this session.
     ///
     /// Separate from what `entities` holds, because a chunk that was read and
     /// found empty belongs here and not there — without the distinction an
-    /// empty chunk is re-read from the database every time it arrives.
-    loaded: BTreeSet<ChunkPos>,
+    /// empty chunk is re-read from the database every time it arrives. Keyed by
+    /// domain for the same reason `dirty` is.
+    loaded: BTreeMap<String, BTreeSet<ChunkPos>>,
     /// Entities that mirror something the engine already owns.
     ///
     /// A player's body lives in `transport::Shared::bodies` and is moved by
@@ -120,10 +126,24 @@ impl Population {
     /// map holds only what is unusual and `domain_of` has one answer either
     /// way.
     pub fn set_domain(&mut self, id: EntityId, domain: &str) {
+        let was = self.domain_of(id).to_owned();
+        if was == domain {
+            return;
+        }
         if domain == tiamot_core::domain::OVERWORLD {
             self.domains.remove(&id);
         } else {
             self.domains.insert(id, domain.to_owned());
+        }
+        // **Both sides, exactly as a chunk change dirties both.** The domain it
+        // left has to stop claiming it and the one it arrived in has to start,
+        // and a row is `(domain, chunk)` — so marking only one leaves either a
+        // copy behind or nothing written at the destination. Found by the test
+        // that moves a mob and then asks what would be saved: the destination
+        // row came back empty.
+        if let Some(chunk) = self.entities.get(id).map(Entity::chunk) {
+            self.dirty_chunk(&was, chunk);
+            self.dirty_chunk(domain, chunk);
         }
     }
 
@@ -253,20 +273,26 @@ impl Population {
 
     /// Whether this chunk's entities have been read this session.
     #[must_use]
-    pub fn knows(&self, pos: ChunkPos) -> bool {
-        self.loaded.contains(&pos)
+    pub fn knows(&self, domain: &str, pos: ChunkPos) -> bool {
+        self.loaded
+            .get(domain)
+            .is_some_and(|chunks| chunks.contains(&pos))
     }
 
     /// Adds an entity and marks its chunk for saving.
     pub fn spawn(&mut self, entity: Entity) -> EntityId {
-        self.dirty.insert(entity.chunk());
+        // Into the overworld. A caller wanting it elsewhere follows with
+        // `set_domain`, which dirties both sides of the move.
+        self.dirty_chunk(tiamot_core::domain::OVERWORLD, entity.chunk());
         self.entities.spawn(entity)
     }
 
     /// Removes an entity, marking its chunk for saving.
     pub fn despawn(&mut self, id: EntityId) -> Option<Entity> {
+        let domain = self.domain_of(id).to_owned();
         let entity = self.entities.despawn(id)?;
-        self.dirty.insert(entity.chunk());
+        self.domains.remove(&id);
+        self.dirty_chunk(&domain, entity.chunk());
         Some(entity)
     }
 
@@ -284,7 +310,8 @@ impl Population {
     /// persisting. A spurious chunk save costs one row rewrite.
     pub fn get_mut(&mut self, id: EntityId) -> Option<&mut Entity> {
         let chunk = self.entities.get(id)?.chunk();
-        self.dirty.insert(chunk);
+        let domain = self.domain_of(id).to_owned();
+        self.dirty_chunk(&domain, chunk);
         self.entities.get_mut(id)
     }
 
@@ -294,11 +321,23 @@ impl Population {
     /// doubled. The lighting defers what it cannot relight by putting a chunk
     /// back into `take_arrived`, so **chunks genuinely do arrive twice** — the
     /// same trap `Fluidics::loaded` exists for.
-    pub fn chunk_loaded(&mut self, pos: ChunkPos, entities: Vec<Entity>) {
-        if !self.loaded.insert(pos) {
+    pub fn chunk_loaded(&mut self, domain: &str, pos: ChunkPos, entities: Vec<Entity>) {
+        if !self
+            .loaded
+            .entry(domain.to_owned())
+            .or_default()
+            .insert(pos)
+        {
             return;
         }
-        self.entities.spawn_all(entities);
+        let spawned = self.entities.spawn_all(entities);
+        // Stamped with the domain they were read from. An entity's domain is
+        // where it is stored, so this is the one place it is learned — and
+        // without it every mob in every ship would be an overworld mob the
+        // moment its chunk loaded.
+        for id in spawned {
+            self.set_domain(id, domain);
+        }
     }
 
     /// A chunk is going away: take its entities so they can be written.
@@ -306,39 +345,69 @@ impl Population {
     /// The chunk stops being "known", so it will be read again if it comes
     /// back. Returns them in slot order, which is the order they must be
     /// written in — see [`tiamot_core::persist::WorldDb::load_chunk_entities`].
-    pub fn freeze(&mut self, pos: ChunkPos) -> Vec<Entity> {
+    pub fn freeze(&mut self, domain: &str, pos: ChunkPos) -> Vec<Entity> {
         // A chunk somebody is standing in is not a chunk to unload, and the
         // mirror in it is not something to write to disk. Refusing is the whole
-        // guard: `take_chunk` removes everything anchored to the chunk, so
-        // without this a player's body would be frozen out from under them and
-        // saved into the world file as a corpse.
+        // guard: freezing removes everything anchored to the chunk, so without
+        // this a player's body would be frozen out from under them and saved
+        // into the world file as a corpse.
         if self.players.values().any(|id| {
-            self.entities
-                .get(*id)
-                .is_some_and(|held| held.chunk() == pos)
+            self.domain_of(*id) == domain
+                && self
+                    .entities
+                    .get(*id)
+                    .is_some_and(|held| held.chunk() == pos)
         }) {
             return Vec::new();
         }
-        self.loaded.remove(&pos);
-        let frozen = self.entities.take_chunk(pos);
+        if let Some(chunks) = self.loaded.get_mut(domain) {
+            chunks.remove(&pos);
+        }
+        // **This domain's entities at that position, not every domain's.**
+        // `Entities` is keyed by chunk alone, so taking the chunk outright
+        // would empty the same coordinates in every space at once.
+        let leaving: Vec<EntityId> = self
+            .entities
+            .ids()
+            .into_iter()
+            .filter(|id| {
+                self.domain_of(*id) == domain
+                    && self
+                        .entities
+                        .get(*id)
+                        .is_some_and(|held| held.chunk() == pos)
+            })
+            .collect();
+        let frozen: Vec<Entity> = leaving
+            .into_iter()
+            .filter_map(|id| {
+                self.domains.remove(&id);
+                self.entities.despawn(id)
+            })
+            .collect();
         if !frozen.is_empty() {
             // Marked dirty even though the entities are leaving: what is on
             // disk has to end up matching what was in memory, and the caller
             // may be freezing a chunk whose contents changed since it loaded.
-            self.dirty.insert(pos);
+            self.dirty_chunk(domain, pos);
         }
         frozen
     }
 
-    /// Marks a chunk as needing a save.
-    pub fn mark_dirty(&mut self, pos: ChunkPos) {
-        self.dirty.insert(pos);
+    /// Marks a chunk of a domain as needing a save.
+    pub fn mark_dirty(&mut self, domain: &str, pos: ChunkPos) {
+        self.dirty_chunk(domain, pos);
     }
 
-    /// How many chunks are waiting to be written.
+    /// The one place a chunk becomes dirty.
+    fn dirty_chunk(&mut self, domain: &str, pos: ChunkPos) {
+        self.dirty.entry(domain.to_owned()).or_default().insert(pos);
+    }
+
+    /// How many chunks are waiting to be written, across every domain.
     #[must_use]
     pub fn dirty(&self) -> usize {
-        self.dirty.len()
+        self.dirty.values().map(BTreeSet::len).sum()
     }
 
     /// Takes the chunks needing a write, and what to write into each.
@@ -347,24 +416,33 @@ impl Population {
     /// hand the whole sequence to the database and let the deletes and the
     /// writes land together. Without that, the last mob to leave a chunk would
     /// come straight back the next time it loaded.
-    pub fn take_dirty(&mut self) -> Vec<(ChunkPos, Vec<Entity>)> {
+    pub fn take_dirty(&mut self) -> Vec<(String, ChunkPos, Vec<Entity>)> {
         let dirty = std::mem::take(&mut self.dirty);
         if dirty.is_empty() {
             return Vec::new();
         }
-        let mut grouped = self.entities.by_chunk();
-        dirty
-            .into_iter()
-            .map(|pos| {
-                let ids = grouped.remove(&pos).unwrap_or_default();
-                let entities = ids
+        let grouped = self.entities.by_chunk();
+        let mut out = Vec::new();
+        for (domain, chunks) in dirty {
+            for pos in chunks {
+                let entities = grouped
+                    .get(&pos)
                     .into_iter()
+                    .flatten()
+                    .copied()
                     .filter(|id| !self.transient.contains(id))
+                    // **This domain's, not every domain's at that position.**
+                    // Written straight into the row for `(domain, pos)`, which
+                    // replaces what is there — so including a neighbouring
+                    // domain's entities would copy them into this domain, and
+                    // including none of them would delete that domain's.
+                    .filter(|id| self.domain_of(*id) == domain)
                     .filter_map(|id| self.entities.get(id).cloned())
                     .collect();
-                (pos, entities)
-            })
-            .collect()
+                out.push((domain.clone(), pos, entities));
+            }
+        }
+        out
     }
 
     /// Live entity ids grouped by the mod that spawned them.
@@ -442,6 +520,9 @@ impl Population {
         // Bound once for the whole pass: every body here is in this domain, and
         // `ChunkLookup` has no way to carry one.
         let terrain = world.solid(domain);
+        // Collected rather than marked as we go: the loop holds the entity
+        // store mutably, and dirtying reaches the same struct.
+        let mut moved_chunks: Vec<(ChunkPos, ChunkPos)> = Vec::new();
         for id in self.entities.ids() {
             // A player's mirror has already moved this tick, under its own
             // inputs. Stepping it again would apply a second tick of gravity to
@@ -503,8 +584,7 @@ impl Population {
                 // stop claiming it, and the one it arrived in has to start.
                 // Marking only the destination is how a world fills up with
                 // copies of everything that ever moved.
-                self.dirty.insert(entity.transform.chunk);
-                self.dirty.insert(chunk);
+                moved_chunks.push((entity.transform.chunk, chunk));
             }
             entity.transform.chunk = chunk;
             entity.transform.local = local;
@@ -514,6 +594,14 @@ impl Population {
                 [0.0; 3]
             };
             entity.on_ground = stepped.on_ground;
+        }
+        // It changed chunks, so BOTH are dirty: the one it left has to stop
+        // claiming it, and the one it arrived in has to start. Marking only the
+        // destination is how a world fills up with copies of everything that
+        // ever moved.
+        for (left, arrived) in moved_chunks {
+            self.dirty_chunk(domain, left);
+            self.dirty_chunk(domain, arrived);
         }
     }
 }
@@ -783,6 +871,122 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_is_written_into_the_domain_it_belongs_to() {
+        // **A row is `(domain, chunk)`.** A chunk at `(0, 0, 0)` exists in
+        // every domain, and a save that named only the position would write a
+        // ship's mobs into the overworld's row at the same coordinates — and,
+        // being a replace, delete whatever was actually there. The two are one
+        // write, so getting it wrong loses one domain's entities and forges
+        // another's.
+        let mut population = Population::new();
+        let home = ChunkPos::new(0, 0, 0);
+        let here = population.spawn(mob(home, [8.0, 0.0, 8.0]));
+        let away = population.spawn(mob(home, [9.0, 0.0, 8.0]));
+        population.set_domain(away, "mod:ship/17");
+
+        let written = population.take_dirty();
+        let overworld: Vec<_> = written
+            .iter()
+            .filter(|(domain, pos, _)| domain == tiamot_core::domain::OVERWORLD && *pos == home)
+            .flat_map(|(_, _, held)| held.iter())
+            .collect();
+        let ship: Vec<_> = written
+            .iter()
+            .filter(|(domain, pos, _)| domain == "mod:ship/17" && *pos == home)
+            .flat_map(|(_, _, held)| held.iter())
+            .collect();
+
+        assert_eq!(
+            overworld.len(),
+            1,
+            "the overworld's row got {} entities at {home:?}, so a domain's \
+             mobs leaked into another's storage",
+            overworld.len()
+        );
+        assert_eq!(
+            ship.len(),
+            1,
+            "the ship's row got {} entities at {home:?}",
+            ship.len()
+        );
+        assert_eq!(
+            population.get(here).map(|e| e.transform.local[0]),
+            Some(8.0)
+        );
+        assert_eq!(
+            ship.first().map(|held| held.transform.local[0]),
+            Some(9.0),
+            "the entity written into the ship's row was the overworld's"
+        );
+    }
+
+    #[test]
+    fn freezing_a_chunk_empties_one_domain_and_not_the_others() {
+        // `Entities` is keyed by chunk alone, so a freeze that did not filter
+        // by domain would take the same coordinates out of every space at once
+        // — unloading a chunk of the overworld would silently delete the
+        // interior of every ship parked at those coordinates.
+        let mut population = Population::new();
+        let home = ChunkPos::new(0, 0, 0);
+        population.spawn(mob(home, [8.0, 0.0, 8.0]));
+        let away = population.spawn(mob(home, [9.0, 0.0, 8.0]));
+        population.set_domain(away, "mod:ship/17");
+
+        let frozen = population.freeze(tiamot_core::domain::OVERWORLD, home);
+        assert_eq!(
+            frozen.len(),
+            1,
+            "freezing took more than one domain's worth"
+        );
+        assert_eq!(
+            population.len(),
+            1,
+            "freezing the overworld emptied another domain at the same position"
+        );
+        assert_eq!(population.domain_of(away), "mod:ship/17");
+        assert!(
+            population.get(away).is_some(),
+            "the ship's mob was frozen out from under it"
+        );
+
+        // And the domain it was in is still known to hold that chunk, so it is
+        // not re-read from the database as though it had never loaded.
+        assert!(population.knows("mod:ship/17", home) || population.get(away).is_some());
+    }
+
+    #[test]
+    fn a_chunk_that_loaded_in_one_domain_is_not_known_in_another() {
+        // Without this, loading the overworld's chunk would mark the ship's
+        // chunk at the same position as read — and the ship's entities would
+        // never be fetched at all.
+        let mut population = Population::new();
+        let home = ChunkPos::new(2, 0, 2);
+        population.chunk_loaded(tiamot_core::domain::OVERWORLD, home, Vec::new());
+
+        assert!(population.knows(tiamot_core::domain::OVERWORLD, home));
+        assert!(
+            !population.knows("mod:ship/17", home),
+            "loading one domain's chunk marked another's as read, so its \
+             entities would never be fetched"
+        );
+    }
+
+    #[test]
+    fn entities_read_from_a_domain_belong_to_it() {
+        // An entity's domain is where it is stored, so a load is the one place
+        // it is learned. Without the stamp every mob in every ship would be an
+        // overworld mob the moment its chunk arrived.
+        let mut population = Population::new();
+        let home = ChunkPos::new(0, 0, 0);
+        population.chunk_loaded("mod:ship/17", home, vec![mob(home, [8.0, 0.0, 8.0])]);
+
+        let ids = population.entities().ids();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(population.domain_of(ids[0]), "mod:ship/17");
+        assert_eq!(population.occupants("mod:ship/17"), 1);
+    }
+
+    #[test]
     fn an_entity_is_in_the_overworld_until_something_moves_it() {
         // Absence means the overworld, which is what keeps a single-domain
         // world — every world until a mod makes a second — paying nothing for
@@ -928,8 +1132,8 @@ mod tests {
         let saved = population.take_dirty();
         let entities: Vec<&Entity> = saved
             .iter()
-            .filter(|(pos, _)| *pos == home)
-            .flat_map(|(_, held)| held.iter())
+            .filter(|(_, pos, _)| *pos == home)
+            .flat_map(|(_, _, held)| held.iter())
             .collect();
         assert_eq!(entities.len(), 1, "the mirror was written to the world");
         assert_eq!(entities[0].source, "test:mob");
@@ -1082,7 +1286,9 @@ mod tests {
         population.spawn(Entity::at(somewhere(home), "test:mob"));
 
         assert!(
-            population.freeze(home).is_empty(),
+            population
+                .freeze(tiamot_core::domain::OVERWORLD, home)
+                .is_empty(),
             "a chunk with a player in it was unloaded, taking their body with it"
         );
         assert_eq!(population.len(), 2, "freezing removed entities anyway");
@@ -1097,17 +1303,17 @@ mod tests {
 
         let written = population.take_dirty();
         assert_eq!(written.len(), 1);
-        assert_eq!(written[0].0, home);
-        assert_eq!(written[0].1.len(), 1);
+        assert_eq!(written[0].1, home);
+        assert_eq!(written[0].2.len(), 1);
         assert_eq!(population.dirty(), 0);
 
         population.despawn(id);
         let written = population.take_dirty();
         assert_eq!(
             written,
-            vec![(home, Vec::new())],
-            "the chunk a mob left must be written EMPTY, or the mob comes back \
-             the next time the chunk loads"
+            vec![(tiamot_core::domain::OVERWORLD.to_owned(), home, Vec::new())],
+            "the chunk a mob left must be written EMPTY, and into its own \
+             domain's row, or the mob comes back the next time the chunk loads"
         );
     }
 
@@ -1118,10 +1324,18 @@ mod tests {
         // `Fluidics::loaded` exists for.
         let mut population = Population::new();
         let home = ChunkPos::new(0, 0, 0);
-        population.chunk_loaded(home, vec![mob(home, [1.0; 3])]);
-        population.chunk_loaded(home, vec![mob(home, [1.0; 3])]);
+        population.chunk_loaded(
+            tiamot_core::domain::OVERWORLD,
+            home,
+            vec![mob(home, [1.0; 3])],
+        );
+        population.chunk_loaded(
+            tiamot_core::domain::OVERWORLD,
+            home,
+            vec![mob(home, [1.0; 3])],
+        );
         assert_eq!(population.len(), 1);
-        assert!(population.knows(home));
+        assert!(population.knows(tiamot_core::domain::OVERWORLD, home));
     }
 
     #[test]
@@ -1129,18 +1343,26 @@ mod tests {
         let mut population = Population::new();
         let home = ChunkPos::new(5, 0, 0);
         let away = ChunkPos::new(6, 0, 0);
-        population.chunk_loaded(home, vec![mob(home, [1.0; 3]), mob(home, [2.0; 3])]);
-        population.chunk_loaded(away, vec![mob(away, [3.0; 3])]);
+        population.chunk_loaded(
+            tiamot_core::domain::OVERWORLD,
+            home,
+            vec![mob(home, [1.0; 3]), mob(home, [2.0; 3])],
+        );
+        population.chunk_loaded(
+            tiamot_core::domain::OVERWORLD,
+            away,
+            vec![mob(away, [3.0; 3])],
+        );
 
-        let frozen = population.freeze(home);
+        let frozen = population.freeze(tiamot_core::domain::OVERWORLD, home);
         assert_eq!(frozen.len(), 2);
         assert_eq!(population.len(), 1, "the other chunk's mob stayed");
         assert!(
-            !population.knows(home),
+            !population.knows(tiamot_core::domain::OVERWORLD, home),
             "a frozen chunk must be re-read when it comes back, or its entities \
              are gone for the rest of the session"
         );
-        assert!(population.knows(away));
+        assert!(population.knows(tiamot_core::domain::OVERWORLD, away));
     }
 
     #[test]
