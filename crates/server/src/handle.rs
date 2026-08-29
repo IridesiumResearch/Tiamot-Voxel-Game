@@ -204,7 +204,15 @@ fn apply_transfer(
         return;
     }
     // Step 2. Nothing has moved yet.
-    if let Err(err) = world.chunk(&request.domain, landing.chunk, source) {
+    //
+    // **Except into a domain that has no chunks to reach.** A `sparse` domain
+    // is entities and nothing else, so asking it for one is an error by design
+    // — and treating that error as "the destination is unreachable" would make
+    // every space-like domain impossible to enter. Found by the test that moves
+    // a body into one.
+    if !world.is_sparse(&request.domain)
+        && let Err(err) = world.chunk(&request.domain, landing.chunk, source)
+    {
         error!(
             domain = %request.domain,
             "a transfer was abandoned: its destination could not be reached: {err}"
@@ -1329,7 +1337,7 @@ impl ServerHandle {
                     // The seed is only used if the world has none yet — an
                     // existing world keeps the seed it was created with, or
                     // terrain beyond the explored edge would change shape.
-                    let world = match crate::world::World::open(world, new_seed) {
+                    let mut world = match crate::world::World::open(world, new_seed) {
                         Ok(world) => world,
                         Err(err) => {
                             error!("could not read the world seed: {err}");
@@ -1361,6 +1369,15 @@ impl ServerHandle {
                         registry.freeze();
                         registry
                     }));
+                    // Which domains hold no voxels, told to the world once. A
+                    // chunk read or write naming one of them is then an error
+                    // rather than an empty answer, wherever it comes from.
+                    world.set_sparse_domains(
+                        registered_domains
+                            .iter()
+                            .filter(|(_, spec)| spec.kind == tiamot_core::domain::Kind::Sparse)
+                            .map(|(id, _)| id.clone()),
+                    );
                     let mut domain_access: Option<std::sync::Arc<crate::domains::Shared>> = None;
 
                     // Light is derived and lives only in memory — see

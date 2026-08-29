@@ -675,3 +675,155 @@ fn a_mob_spawned_in_another_domain_comes_back_after_a_restart() {
     });
     second.stop();
 }
+
+#[test]
+fn a_domain_nobody_visits_costs_nothing_and_a_sparse_one_never_holds_voxels() {
+    // **Two criteria that are one observation about storage.** A registered
+    // domain is a name until somebody goes there — lazily instantiated, so it
+    // costs nothing on disk — and a `sparse` one has no voxels to store even
+    // then. `places:attic` and `places:space` are both registered by the
+    // fixture and neither is visited here.
+    let world = scratch("zero-cost-world");
+    let server = restart_at(world.clone(), write_mod("zerocost", ""));
+    block_on(async {
+        let mut bot = join(&server, "Homebody").await;
+        settle_for(&mut bot, 60).await;
+        bot.disconnect().await;
+    });
+    assert!(server.stop(), "the world should close cleanly");
+
+    let mut registry = tiamot_core::Registry::new();
+    let db = tiamot_core::persist::WorldDb::open(
+        world.join(tiamot_server::handle::WORLD_FILE),
+        &mut registry,
+    )
+    .expect("reopen the world");
+
+    let stored = db.stored_domains().expect("read");
+    assert!(
+        stored.iter().any(|domain| domain == "overworld"),
+        "the overworld stored nothing, so this cannot tell a domain that costs \
+         nothing from a world that was never written (domains: {stored:?})"
+    );
+    for empty in ["places:attic", "places:space", "places:ship"] {
+        assert!(
+            !stored.iter().any(|domain| domain == empty),
+            "`{empty}` has rows in a world nobody ever went to it in \
+             (domains: {stored:?})"
+        );
+    }
+}
+
+#[test]
+fn a_transfer_that_cannot_land_leaves_the_body_where_it_was() {
+    // **Failure atomicity.** A transfer that moved the body first and then
+    // failed would strand it in a space with no ground under it that nothing
+    // will ever stream. So the destination is reached BEFORE anything moves,
+    // and a destination that cannot be reached abandons the whole move.
+    //
+    // The reachable injection point is a position outside the world: the world
+    // is finite (charter rule 6), and `Transform::from_world` on a coordinate
+    // beyond it gives a chunk that is not in it.
+    let server = start(
+        "atomic",
+        write_mod(
+            "atomic",
+            "game.register_on_chat(function(event)\n\
+             \x20   if event.text == 'nowhere' then\n\
+             \x20       local body = game.player_entity(event.player)\n\
+             \x20       game.transfer_entity(body, 'places:attic',\n\
+             \x20           { x = 1e18, y = 1e18, z = 1e18 })\n\
+             \x20       return false\n\
+             \x20   end\n\
+             end)",
+        ),
+    );
+    block_on(async {
+        let mut bot = join(&server, "Stayer").await;
+        settle_for(&mut bot, 40).await;
+        let before = bot.settle().await.expect("settle").block();
+
+        bot.chat("nowhere").await.expect("chat");
+        settle_for(&mut bot, 80).await;
+
+        assert_eq!(
+            switched_to(&bot),
+            None,
+            "a transfer to a place outside the world moved the player anyway"
+        );
+        let after = bot.settle().await.expect("settle").block();
+        assert_eq!(
+            (after.x, after.z),
+            (before.x, before.z),
+            "the player was moved by a transfer that could not land"
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn a_sparse_domain_takes_a_body_and_never_stores_a_voxel() {
+    // **Criterion: sparse domains.** `kind = "sparse"` is entities and nothing
+    // else — the shape a space-like domain would use, which the engine does not
+    // know or care is space. So a body can be moved into it, and no chunk is
+    // ever stored for it however long somebody stands there.
+    //
+    // A body over terrain that is not loaded does not move, which is what a
+    // space with no terrain at all looks like from the physics: they float
+    // rather than falling for ever.
+    let world = scratch("sparse-world");
+    let server = restart_at(
+        world.clone(),
+        write_mod(
+            "sparse",
+            "game.register_on_chat(function(event)\n\
+             \x20   if event.text == 'space' then\n\
+             \x20       local body = game.player_entity(event.player)\n\
+             \x20       game.transfer_entity(body, 'places:space', { x = 0, y = 40, z = 0 })\n\
+             \x20       return false\n\
+             \x20   end\n\
+             end)",
+        ),
+    );
+    block_on(async {
+        let mut bot = join(&server, "Astronaut").await;
+        settle_for(&mut bot, 40).await;
+
+        bot.chat("space").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a sparse domain would not take a body, so it is not a domain"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+        assert_eq!(switched_to(&bot).as_deref(), Some("places:space"));
+
+        // Long enough that a domain which DID store chunks would have stored
+        // some: the stream asks for everything in range as soon as it arrives.
+        settle_for(&mut bot, 120).await;
+        bot.disconnect().await;
+    });
+    assert!(server.stop(), "the world should close cleanly");
+
+    let mut registry = tiamot_core::Registry::new();
+    let db = tiamot_core::persist::WorldDb::open(
+        world.join(tiamot_server::handle::WORLD_FILE),
+        &mut registry,
+    )
+    .expect("reopen the world");
+    let stored = db.stored_domains().expect("read");
+    assert!(
+        stored.iter().any(|domain| domain == "overworld"),
+        "nothing was stored at all, so this cannot tell a sparse domain from a \
+         world that was never written (domains: {stored:?})"
+    );
+    assert!(
+        !stored.iter().any(|domain| domain == "places:space"),
+        "a sparse domain stored something; it takes entities and nothing else \
+         (domains: {stored:?})"
+    );
+}

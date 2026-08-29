@@ -208,6 +208,17 @@ pub enum WorldError {
         DEFAULT_DOMAIN
     )]
     OverworldIsNotDestroyable,
+
+    /// A chunk was asked for in a domain that holds no voxels.
+    ///
+    /// A `sparse` domain is entities and nothing else. Answering with an empty
+    /// chunk would let a mod build in a space that cannot hold what it built,
+    /// and find out only when the building was not there.
+    #[error("domain `{domain}` holds no voxels; it takes entities and nothing else")]
+    NoVoxels {
+        /// The domain in question.
+        domain: String,
+    },
 }
 
 /// The same block, under a different fluid id.

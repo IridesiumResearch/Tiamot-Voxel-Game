@@ -409,6 +409,13 @@ pub struct World {
     db: WorldDb,
     /// The seed every generator is handed. Fixed for the world's lifetime.
     seed: u64,
+    /// Domains that hold no voxels at all.
+    ///
+    /// A `sparse` domain is entities and nothing else. Kept here rather than
+    /// asked of the registry per call because this is a storage question — what
+    /// this world has rows for — and because the world is behind a lease that a
+    /// mod's registry handle is not.
+    sparse: std::collections::BTreeSet<String>,
     /// The chunks of each domain anything has touched this session.
     ///
     /// Created on first use, so a registered domain nobody has visited costs
@@ -438,8 +445,26 @@ impl World {
         Ok(Self {
             db,
             seed,
+            sparse: std::collections::BTreeSet::new(),
             domains: BTreeMap::new(),
         })
+    }
+
+    /// Says which domains hold no voxels.
+    ///
+    /// Set once, after the registries freeze. A chunk read or write naming one
+    /// of these is an error rather than an empty answer: a mod building in a
+    /// space that cannot hold blocks has misunderstood something, and finding
+    /// out at the write is far cheaper than finding out when the building is
+    /// not there.
+    pub fn set_sparse_domains(&mut self, domains: impl IntoIterator<Item = String>) {
+        self.sparse = domains.into_iter().collect();
+    }
+
+    /// Whether a domain holds no voxels.
+    #[must_use]
+    pub fn is_sparse(&self, domain: &str) -> bool {
+        self.sparse.contains(domain)
     }
 
     /// The world's generation seed.
@@ -744,7 +769,14 @@ impl World {
         pos: ChunkPos,
         source: &mut dyn ChunkSource,
     ) -> Result<&mut Chunk, WorldError> {
-        let Self { db, seed, domains } = self;
+        if self.sparse.contains(domain) {
+            return Err(WorldError::NoVoxels {
+                domain: domain.to_owned(),
+            });
+        }
+        let Self {
+            db, seed, domains, ..
+        } = self;
         let seed = *seed;
         let space = Self::space_of(domains, domain);
         if !space.cache.contains_key(&pos) {
