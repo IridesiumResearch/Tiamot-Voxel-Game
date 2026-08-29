@@ -273,7 +273,14 @@ pub async fn wander(
         // instead of its real position would be refused every time it fell
         // short — and the failure would look like the reach check being broken.
         bot.move_to(x as f32, 0.0, z as f32).await?;
-        let here = bot.walk([0.0; 3], 0, 1).await?.block();
+        // **Settled, not merely arrived.** `move_to` jumps at anything that
+        // stalls it and returns as soon as it is close enough, so the position
+        // one tick later can be the top of a jump — a block higher than the
+        // ground. Everything below is computed from where the feet are, and a
+        // block chosen from a mid-air sample is air, which a dig then waits out
+        // its whole patience for. That was a red nightly, and the coordinate it
+        // reported was thirty seconds of a bot aiming at the sky.
+        let here = bot.settle().await?.block();
         // BESIDE the bot, never underneath it. Digging the block you are
         // standing on drops you into the hole, and putting it back is then
         // refused for being inside a player — the rule working, and the

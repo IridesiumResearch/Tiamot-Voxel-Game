@@ -732,3 +732,64 @@ fn the_chisel_takes_one_cell_where_a_hand_takes_the_block() {
 
     assert!(server.stop());
 }
+
+#[test]
+fn a_bot_that_has_just_jumped_digs_from_the_ground_and_not_from_the_air() {
+    // **The red nightly of 2026-08-28, pinned.** `wander` walked somewhere,
+    // sampled its position one tick later, and dug the block beside its feet.
+    // `Bot::move_to` jumps at any leg that makes no progress and returns as
+    // soon as it is close enough, so that sample could be the top of a jump —
+    // a block higher than the ground. The block "beside the feet" was then
+    // thin air, and `dig_block` spent its whole thirty-second patience waiting
+    // for an empty cell to break. Twenty bots, one of them aiming at the sky.
+    //
+    // What this asserts is the fix rather than the symptom: a sample taken one
+    // tick after a jump is off the ground, and `Bot::settle` is not.
+    let server = start_with_mods("settles-before-digging");
+    block_on(async {
+        let mut bot = join(&server).await;
+
+        // On the ground first, so "the same height" below means something.
+        let ground = bot.settle().await.expect("settle").block();
+
+        // Jump, then look while it is still in the air — the mistake, made
+        // deliberately. Sampled across the arc rather than at a guessed tick:
+        // which tick is the top of a jump is a physics constant this test has
+        // no business pinning.
+        bot.walk([0.0; 3], tiamot_core::proto::actions::JUMP, 1)
+            .await
+            .expect("jump");
+        let mut highest = ground;
+        for _ in 0..12 {
+            let sample = bot.walk([0.0; 3], 0, 1).await.expect("walk").block();
+            if sample.y > highest.y {
+                highest = sample;
+            }
+        }
+        assert!(
+            highest.y > ground.y,
+            "a jumping bot was never reported off the ground, so this test can no \
+             longer tell a settled sample from an unsettled one \
+             (ground {ground:?}, highest {highest:?})"
+        );
+
+        // And the fix: waiting for the body to stop moving brings it back down.
+        let landed = bot.settle().await.expect("settle").block();
+        assert_eq!(
+            landed.y, ground.y,
+            "settling after a jump did not come back to the ground it started on"
+        );
+
+        // The consequence that actually broke the nightly: the block beside a
+        // settled bot's feet is solid, so a dig aimed there completes. Aimed
+        // from the mid-air sample it would have been air, and this would hang
+        // for thirty seconds and fail.
+        let beside = BlockPos::new(landed.x + 1, landed.y - 1, landed.z);
+        bot.dig_block(beside)
+            .await
+            .expect("the block beside a settled bot's feet should break");
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}

@@ -867,6 +867,17 @@ impl Bot {
     /// whole-block edit — a mod's `set_block` can still send one.
     #[must_use]
     pub fn block_is_empty(&self, pos: tiamot_core::BlockPos) -> bool {
+        self.cells_broken(pos) >= tiamot_core::block::SUBNODES_PER_BLOCK
+    }
+
+    /// How many of a block's cells this bot has been told are gone.
+    ///
+    /// The count behind [`Self::block_is_empty`], separately because "none of
+    /// them" and "some of them" are different answers when a dig has not
+    /// finished: nothing at all having broken says the target was never solid,
+    /// and a partial count says the dig is merely slow.
+    #[must_use]
+    pub fn cells_broken(&self, pos: tiamot_core::BlockPos) -> usize {
         let mut gone = std::collections::BTreeSet::new();
         for message in self.received() {
             let ServerMessage::BlockDelta { edit, .. } = message else {
@@ -878,7 +889,7 @@ impl Bot {
                     material: got_material,
                 } if got == pos => {
                     if got_material == tiamot_core::MaterialId::AIR.0 {
-                        return true;
+                        return tiamot_core::block::SUBNODES_PER_BLOCK;
                     }
                     // Filled back in. Anything counted before it is stale.
                     gone.clear();
@@ -896,7 +907,7 @@ impl Bot {
                 _ => {}
             }
         }
-        gone.len() >= tiamot_core::block::SUBNODES_PER_BLOCK
+        gone.len()
     }
 
     /// Hits an entity.
@@ -952,12 +963,82 @@ impl Bot {
                     tokio::time::timeout(std::time::Duration::from_millis(100), self.recv()).await;
             }
             if tokio::time::Instant::now() >= deadline {
+                // **Say whether anything broke at all.** "Still there" is the
+                // same sentence for a block that resisted and for a target that
+                // was never solid, and the two have nothing to do with each
+                // other: the first is a tool too weak, the second is a caller
+                // aiming at air. Telling them apart in the message is what
+                // turns this from an afternoon into a glance.
+                let broken = self.cells_broken(target.block());
+                let diagnosis = if broken == 0 {
+                    "nothing broke at all, so the target was almost certainly \
+                     already empty — check what the caller aimed at"
+                } else {
+                    "the dig stopped part-way through"
+                };
                 return Err(BotError::Unexpected {
                     expected: "the dig to complete",
-                    got: format!("{target:?} was still there after {PATIENCE:?}"),
+                    got: format!(
+                        "{target:?} was still there after {PATIENCE:?}; {broken} of {} cells \
+                         had broken: {diagnosis}",
+                        tiamot_core::block::SUBNODES_PER_BLOCK
+                    ),
                 });
             }
         }
+    }
+
+    /// Waits until the body has stopped moving vertically, and says where it is.
+    ///
+    /// **A position sampled in mid-air is a position a block too high**, and
+    /// anything computed from it — "the block beside my feet", "the block I am
+    /// standing on" — is then thin air. [`Self::move_to`] jumps at a leg that
+    /// made no progress and returns the moment it is close enough, so coming
+    /// back airborne is ordinary rather than exotic.
+    ///
+    /// This cost the swarm load test a red nightly: a bot arrived mid-jump,
+    /// aimed one block high, and spent its whole digging patience waiting for a
+    /// cell that was already empty to break. Sampling one tick and believing it
+    /// is the bug; this is the fix, and callers that reason about the world
+    /// around a bot should use it rather than [`Self::walk`].
+    ///
+    /// Vertical rest is `REST` consecutive ticks at the same height. One
+    /// repeat would not do: at the top of a jump the body is turning round and
+    /// two neighbouring samples can round to the same number, which is
+    /// precisely the moment this exists to reject.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if a read or write fails. Never for failing to
+    /// settle: a body held up by something is still somewhere, and the caller
+    /// gets the last position rather than an error it could not act on.
+    pub async fn settle(&mut self) -> Result<PlayerPosition, BotError> {
+        /// Ticks at one height that count as standing still.
+        const REST: usize = 3;
+        /// How long to wait for it. A jump is about ten ticks up and ten down,
+        /// so this is room for a long fall and not an excuse for a hang.
+        const PATIENCE: usize = 60;
+
+        let mut position = self.walk([0.0; 3], 0, 1).await?;
+        let mut height = world_blocks(&position)[1];
+        let mut still = 1;
+        for _ in 0..PATIENCE {
+            if still >= REST {
+                return Ok(position);
+            }
+            position = self.walk([0.0; 3], 0, 1).await?;
+            let now = world_blocks(&position)[1];
+            // Bit-identical, not "close": a body at rest is reported at exactly
+            // the same height every tick, and a tolerance here would accept the
+            // slow part of an arc as standing.
+            if now == height {
+                still += 1;
+            } else {
+                still = 1;
+                height = now;
+            }
+        }
+        Ok(position)
     }
 
     /// Walks in a world-space direction until the server has simulated
