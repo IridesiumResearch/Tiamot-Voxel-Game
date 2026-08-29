@@ -3240,6 +3240,15 @@ impl ServerHandle {
                                         // itself sees the inside of its own
                                         // head.
                                         mobs.player_entity(uuid),
+                                        // **The other half of criterion A3.**
+                                        // Chunk interest cannot tell a mob in
+                                        // this ship from one standing at the
+                                        // same coordinates in the overworld,
+                                        // because the coordinates are the same
+                                        // — so without this a player who moved
+                                        // watches the world they left walking
+                                        // around inside the one they are in.
+                                        &|id| mobs.domain_of(id) == player.domain,
                                     );
                                     if update.is_empty() {
                                         continue;

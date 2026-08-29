@@ -268,6 +268,16 @@ impl Tracker {
     /// `exclude` is the viewer's own entity where they have one — nobody needs
     /// to be told where they are by the machine they are telling.
     ///
+    /// `shares_space` says whether an entity is in the same simulation space as
+    /// the viewer. **A predicate rather than a domain id**, because [`Entities`]
+    /// has no idea what a domain is: which space a body is in is the server's
+    /// book (`Population`), and threading the whole book through here to answer
+    /// one question per entity would put a server concept in a pure function.
+    ///
+    /// Without it a player in a ship is told about every mob standing at the
+    /// same coordinates in the overworld — chunk interest alone cannot tell
+    /// them apart, because the coordinates are identical.
+    ///
     /// # The recording happens here on purpose
     ///
     /// Splitting "decide" from "record" would leave a window where a caller
@@ -284,6 +294,7 @@ impl Tracker {
         centre: ChunkPos,
         view: ViewDistance,
         exclude: Option<EntityId>,
+        shares_space: &dyn Fn(EntityId) -> bool,
     ) -> Update {
         let mut update = Update::default();
         let mut still_visible = BTreeMap::new();
@@ -292,7 +303,7 @@ impl Tracker {
         // messages in the same order — which is what makes a replication test
         // able to assert on a sequence rather than on a set.
         for (id, entity) in entities.iter() {
-            if Some(id) == exclude || !contains(centre, view, entity.chunk()) {
+            if Some(id) == exclude || !shares_space(id) || !contains(centre, view, entity.chunk()) {
                 continue;
             }
             let now = Sent::of(entity);
@@ -375,19 +386,70 @@ mod tests {
     }
 
     #[test]
+    fn a_viewer_is_told_only_about_bodies_in_their_own_space() {
+        // **Chunk interest cannot do this on its own.** Two domains hold a
+        // chunk at each coordinate, so a mob in a ship and a mob in the
+        // overworld can stand at exactly the same position — and a viewer in
+        // one of them must see only their own.
+        let mut world = Entities::new();
+        let here = world.spawn(at(home()));
+        let elsewhere = world.spawn(at(home()));
+
+        let mut tracker = Tracker::new();
+        let update = tracker.update(&world, home(), VIEW, None, &|id| id == here);
+
+        let seen: Vec<EntityId> = update.spawned.iter().map(|spawn| spawn.id).collect();
+        assert_eq!(
+            seen,
+            vec![here],
+            "a viewer was told about a body standing at the same coordinates in \
+             another space"
+        );
+        assert_eq!(tracker.len(), 1);
+
+        // And the counter-example, so this cannot pass by seeing nothing: with
+        // both in the viewer's space, both arrive.
+        let mut everything = Tracker::new();
+        let both = everything.update(&world, home(), VIEW, None, &|_| true);
+        assert_eq!(both.spawned.len(), 2);
+        assert!(both.spawned.iter().any(|spawn| spawn.id == elsewhere));
+    }
+
+    #[test]
+    fn a_body_that_leaves_the_viewers_space_is_despawned_for_them() {
+        // Moving between domains has to look like leaving view, or the client
+        // keeps drawing a body that is no longer anywhere near it — the same
+        // rule as walking out of range, reached a different way.
+        let mut world = Entities::new();
+        let travelling = world.spawn(at(home()));
+
+        let mut tracker = Tracker::new();
+        let arrived = tracker.update(&world, home(), VIEW, None, &|_| true);
+        assert_eq!(arrived.spawned.len(), 1);
+
+        let left = tracker.update(&world, home(), VIEW, None, &|_| false);
+        assert_eq!(
+            left.despawned,
+            vec![travelling],
+            "a body that moved to another domain was left on the viewer's screen"
+        );
+        assert!(tracker.is_empty());
+    }
+
+    #[test]
     fn an_entity_in_view_is_spawned_once_and_then_left_alone() {
         let mut world = Entities::new();
         let id = world.spawn(at(home()));
         let mut tracker = Tracker::new();
 
-        let first = tracker.update(&world, home(), VIEW, None);
+        let first = tracker.update(&world, home(), VIEW, None, &|_| true);
         assert_eq!(first.spawned.len(), 1);
         assert_eq!(first.spawned[0].id, id);
         assert!(first.moved.is_empty() && first.despawned.is_empty());
 
         // Nothing changed, so nothing is sent. This is the case that decides
         // what a field of settled mobs costs.
-        let second = tracker.update(&world, home(), VIEW, None);
+        let second = tracker.update(&world, home(), VIEW, None, &|_| true);
         assert!(
             second.is_empty(),
             "a still entity produced traffic: {second:?}"
@@ -399,16 +461,18 @@ mod tests {
         let mut world = Entities::new();
         let id = world.spawn(at(home()));
         let mut tracker = Tracker::new();
-        let _ = tracker.update(&world, home(), VIEW, None);
+        let _ = tracker.update(&world, home(), VIEW, None, &|_| true);
 
         world.get_mut(id).expect("live").transform.local[0] += MOVE_EPSILON / 2.0;
         assert!(
-            tracker.update(&world, home(), VIEW, None).is_empty(),
+            tracker
+                .update(&world, home(), VIEW, None, &|_| true)
+                .is_empty(),
             "a movement under the threshold was sent"
         );
 
         world.get_mut(id).expect("live").transform.local[0] += MOVE_EPSILON * 2.0;
-        let update = tracker.update(&world, home(), VIEW, None);
+        let update = tracker.update(&world, home(), VIEW, None, &|_| true);
         assert_eq!(update.moved.len(), 1);
         assert_eq!(update.moved[0].id, id);
     }
@@ -421,10 +485,10 @@ mod tests {
         let mut world = Entities::new();
         let id = world.spawn(at(home()));
         let mut tracker = Tracker::new();
-        let _ = tracker.update(&world, home(), VIEW, None);
+        let _ = tracker.update(&world, home(), VIEW, None, &|_| true);
 
         world.get_mut(id).expect("live").anim = AnimTag::SWING;
-        let update = tracker.update(&world, home(), VIEW, None);
+        let update = tracker.update(&world, home(), VIEW, None, &|_| true);
         assert_eq!(update.moved.len(), 1);
         assert_eq!(update.moved[0].anim, AnimTag::SWING);
     }
@@ -434,16 +498,22 @@ mod tests {
         let mut world = Entities::new();
         let id = world.spawn(at(home()));
         let mut tracker = Tracker::new();
-        assert_eq!(tracker.update(&world, home(), VIEW, None).spawned.len(), 1);
+        assert_eq!(
+            tracker
+                .update(&world, home(), VIEW, None, &|_| true)
+                .spawned
+                .len(),
+            1
+        );
 
         // Out of the cylinder entirely.
         world.get_mut(id).expect("live").transform.chunk = ChunkPos::new(40, 0, 0);
-        let gone = tracker.update(&world, home(), VIEW, None);
+        let gone = tracker.update(&world, home(), VIEW, None, &|_| true);
         assert_eq!(gone.despawned, vec![id]);
         assert!(tracker.is_empty());
 
         world.get_mut(id).expect("live").transform.chunk = home();
-        let back = tracker.update(&world, home(), VIEW, None);
+        let back = tracker.update(&world, home(), VIEW, None, &|_| true);
         assert_eq!(back.spawned.len(), 1, "it did not come back");
         assert!(
             back.moved.is_empty(),
@@ -456,15 +526,19 @@ mod tests {
         let mut world = Entities::new();
         let id = world.spawn(at(home()));
         let mut tracker = Tracker::new();
-        let _ = tracker.update(&world, home(), VIEW, None);
+        let _ = tracker.update(&world, home(), VIEW, None, &|_| true);
 
         world.despawn(id);
         assert_eq!(
-            tracker.update(&world, home(), VIEW, None).despawned,
+            tracker
+                .update(&world, home(), VIEW, None, &|_| true)
+                .despawned,
             vec![id]
         );
         assert!(
-            tracker.update(&world, home(), VIEW, None).is_empty(),
+            tracker
+                .update(&world, home(), VIEW, None, &|_| true)
+                .is_empty(),
             "the despawn was sent twice"
         );
     }
@@ -476,7 +550,7 @@ mod tests {
         let theirs = world.spawn(at(home()));
         let mut tracker = Tracker::new();
 
-        let update = tracker.update(&world, home(), VIEW, Some(mine));
+        let update = tracker.update(&world, home(), VIEW, Some(mine), &|_| true);
         assert_eq!(
             update.spawned.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![theirs]
@@ -524,13 +598,13 @@ mod tests {
         let mut second = Tracker::new();
         assert_eq!(
             first
-                .update(&world, home(), VIEW, None)
+                .update(&world, home(), VIEW, None, &|_| true)
                 .spawned
                 .iter()
                 .map(|s| s.id)
                 .collect::<Vec<_>>(),
             second
-                .update(&world, home(), VIEW, None)
+                .update(&world, home(), VIEW, None, &|_| true)
                 .spawned
                 .iter()
                 .map(|s| s.id)

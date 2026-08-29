@@ -127,6 +127,16 @@ fn chunks_seen(bot: &Bot) -> usize {
         .count()
 }
 
+/// Whether this bot has been told about any entity at all.
+fn saw_a_spawn(bot: &Bot) -> bool {
+    bot.received().into_iter().any(|message| {
+        matches!(
+            message,
+            tiamot_core::proto::ServerMessage::EntitySpawn { .. }
+        )
+    })
+}
+
 /// Pumps the connection for a while, so the server's messages arrive.
 async fn settle_for(bot: &mut Bot, ticks: u64) {
     for _ in 0..ticks {
@@ -347,6 +357,87 @@ fn a_ship_is_made_at_runtime_and_is_a_domain_like_any_other() {
         );
 
         bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn a_player_who_moves_stops_seeing_the_bodies_they_left_behind() {
+    // **Criterion A3's other half.** Chunk interest cannot tell a body in this
+    // domain from one standing at the same coordinates in another, because the
+    // coordinates are identical — so a player who moved would watch the world
+    // they left walking around inside the one they are in.
+    let server = start(
+        "bodies",
+        write_mod(
+            "bodies",
+            "game.register_on_chat(function(event)\n\
+             \x20   if event.text == 'attic' then\n\
+             \x20       local body = game.player_entity(event.player)\n\
+             \x20       game.transfer_entity(body, 'places:attic', { x = 8, y = 4, z = 8 })\n\
+             \x20       return false\n\
+             \x20   end\n\
+             end)",
+        ),
+    );
+    block_on(async {
+        let mut traveller = join(&server, "Traveller").await;
+        let mut stayer = join(&server, "Stayer").await;
+        settle_for(&mut traveller, 50).await;
+        settle_for(&mut stayer, 50).await;
+
+        // Non-vacuous first: while they share a domain, the traveller is told
+        // about the other body. Without this the test passes on a server that
+        // replicates nothing at all.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !saw_a_spawn(&traveller) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the two players never saw each other, so this cannot tell \
+                 domain scoping from replication being broken outright"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(60), traveller.recv()).await;
+        }
+
+        traveller.chat("attic").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&traveller).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the traveller never moved"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(60), traveller.recv()).await;
+        }
+
+        // From here on, the one who stayed is in another space. Everything the
+        // traveller hears about them from now is a leak.
+        let before = traveller.received().len();
+        for _ in 0..40 {
+            let _ = stayer.walk([1.0, 0.0, 0.0], 0, 1).await;
+        }
+        settle_for(&mut traveller, 60).await;
+
+        let leaked: Vec<_> = traveller
+            .received()
+            .into_iter()
+            .skip(before)
+            .filter(|message| {
+                matches!(
+                    message,
+                    tiamot_core::proto::ServerMessage::EntitySpawn { .. }
+                        | tiamot_core::proto::ServerMessage::EntityState { .. }
+                )
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a player in another domain was told about {} entity message(s) \
+             from the one they left",
+            leaked.len()
+        );
+
+        traveller.disconnect().await;
+        stayer.disconnect().await;
     });
     server.stop();
 }
