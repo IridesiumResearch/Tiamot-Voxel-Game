@@ -827,3 +827,194 @@ fn a_sparse_domain_takes_a_body_and_never_stores_a_voxel() {
          (domains: {stored:?})"
     );
 }
+
+#[test]
+fn a_domain_whose_mod_was_removed_keeps_its_contents_and_gives_them_back() {
+    // **Charter rule 8's rule for materials, applied to spaces.** Data a mod
+    // cannot currently name is still that player's data. A world holding a
+    // domain nothing registers any more must open, keep its rows, and hand them
+    // back unchanged when the mod returns — the same promise
+    // `a_pond_whose_mod_was_removed_survives_and_comes_back` makes for fluid.
+    let world = scratch("forgotten-world");
+    let with_attic = write_mod(
+        "forgotten",
+        "game.register_on_chat(function(event)\n\
+         \x20   if event.text == 'attic' then\n\
+         \x20       local body = game.player_entity(event.player)\n\
+         \x20       game.transfer_entity(body, 'places:attic', { x = 8, y = 4, z = 8 })\n\
+         \x20       return false\n\
+         \x20   end\n\
+         end)",
+    );
+
+    let first = restart_at(world.clone(), with_attic.clone());
+    block_on(async {
+        let mut bot = join(&first, "Builder").await;
+        settle_for(&mut bot, 40).await;
+        bot.chat("attic").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "never moved");
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+        settle_for(&mut bot, 60).await;
+        bot.disconnect().await;
+    });
+    assert!(first.stop(), "the world should close cleanly");
+
+    let stored_before = {
+        let mut registry = tiamot_core::Registry::new();
+        let db = tiamot_core::persist::WorldDb::open(
+            world.join(tiamot_server::handle::WORLD_FILE),
+            &mut registry,
+        )
+        .expect("reopen");
+        db.stored_domains().expect("read")
+    };
+    assert!(
+        stored_before.iter().any(|domain| domain == "places:attic"),
+        "the attic stored nothing, so there is nothing for a removed mod to \
+         lose (domains: {stored_before:?})"
+    );
+
+    // **Now open the same world with a mod set that knows nothing about it.**
+    // A different mod id, so `places:attic` is a domain no registration names.
+    let stranger = {
+        let root = scratch("forgotten-stranger");
+        let dir = root.join("stranger");
+        std::fs::create_dir_all(&dir).expect("mod dir");
+        std::fs::write(
+            dir.join("mod.toml"),
+            "id = \"stranger\"\nname = \"Stranger\"\nversion = \"0.1.0\"\n\
+             license = \"GPL-3.0-only\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(dir.join("init.lua"), "-- knows nothing of the attic\n").expect("script");
+        root
+    };
+    let second = restart_at(world.clone(), stranger);
+    block_on(async {
+        let mut bot = join(&second, "Stranger").await;
+        settle_for(&mut bot, 40).await;
+        bot.disconnect().await;
+    });
+    assert!(
+        second.stop(),
+        "a world holding a domain nothing registers would not close"
+    );
+
+    let stored_after = {
+        let mut registry = tiamot_core::Registry::new();
+        let db = tiamot_core::persist::WorldDb::open(
+            world.join(tiamot_server::handle::WORLD_FILE),
+            &mut registry,
+        )
+        .expect("a world with an unregistered domain must still open");
+        db.stored_domains().expect("read")
+    };
+    assert!(
+        stored_after.iter().any(|domain| domain == "places:attic"),
+        "opening the world without the mod that made the attic dropped it \
+         (domains: {stored_after:?})"
+    );
+
+    // And it comes back: the mod returns, and the space is enterable again.
+    let third = restart_at(world, with_attic);
+    block_on(async {
+        let mut bot = join(&third, "Returner").await;
+        settle_for(&mut bot, 40).await;
+        bot.chat("attic").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the attic did not come back when its mod did"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+        bot.disconnect().await;
+    });
+    third.stop();
+}
+
+#[test]
+fn a_ship_with_somebody_in_it_is_not_scuttled() {
+    // **The same defect as breaking a container somebody has open**, which is
+    // the comparison the engine's own refusal is written against. A player is
+    // moved into a ship and the mod then tries to destroy it; the ship has to
+    // survive, and the player has to still be in it.
+    //
+    // Then they leave, it is destroyed for real, and its rows go with it.
+    let world = scratch("scuttle-world");
+    let server = restart_at(
+        world.clone(),
+        write_mod(
+            "scuttle",
+            "local id = nil\n\
+             game.register_on_chat(function(event)\n\
+             \x20   local body = game.player_entity(event.player)\n\
+             \x20   if event.text == 'aboard' then\n\
+             \x20       id = game.create_domain('places:ship', '17')\n\
+             \x20       game.transfer_entity(body, id, { x = 8, y = 4, z = 8 })\n\
+             \x20   elseif event.text == 'scuttle' then\n\
+             \x20       game.destroy_domain(id)\n\
+             \x20   elseif event.text == 'ashore' then\n\
+             \x20       game.transfer_entity(body, 'overworld', { x = 8, y = 4, z = 8 })\n\
+             \x20   end\n\
+             \x20   return false\n\
+             end)",
+        ),
+    );
+    block_on(async {
+        let mut bot = join(&server, "Captain").await;
+        settle_for(&mut bot, 40).await;
+
+        bot.chat("aboard").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).as_deref() != Some("places:ship/17") {
+            assert!(tokio::time::Instant::now() < deadline, "never boarded");
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+        settle_for(&mut bot, 60).await;
+
+        // Scuttled with the captain aboard: refused, and they are still there.
+        bot.chat("scuttle").await.expect("chat");
+        settle_for(&mut bot, 60).await;
+        assert_eq!(
+            switched_to(&bot).as_deref(),
+            Some("places:ship/17"),
+            "destroying an occupied domain moved the player out of it"
+        );
+
+        // Ashore, and then it really goes.
+        bot.chat("ashore").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).as_deref() != Some("overworld") {
+            assert!(tokio::time::Instant::now() < deadline, "never went ashore");
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+        settle_for(&mut bot, 40).await;
+        bot.chat("scuttle").await.expect("chat");
+        settle_for(&mut bot, 60).await;
+
+        bot.disconnect().await;
+    });
+    assert!(server.stop(), "the world should close cleanly");
+
+    let mut registry = tiamot_core::Registry::new();
+    let db = tiamot_core::persist::WorldDb::open(
+        world.join(tiamot_server::handle::WORLD_FILE),
+        &mut registry,
+    )
+    .expect("reopen");
+    let stored = db.stored_domains().expect("read");
+    assert!(
+        stored.iter().any(|domain| domain == "overworld"),
+        "nothing was stored at all (domains: {stored:?})"
+    );
+    assert!(
+        !stored.iter().any(|domain| domain == "places:ship/17"),
+        "an empty ship was destroyed and its rows are still there \
+         (domains: {stored:?})"
+    );
+}
