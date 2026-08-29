@@ -47,39 +47,6 @@ fn dial(listening: std::net::SocketAddr) -> std::net::SocketAddr {
     }
 }
 
-/// The discovery port, opened the way a client opens it.
-///
-/// `SO_REUSEADDR` before the bind, because the port is shared by construction
-/// and every client test that builds a front screen has one open. A broadcast
-/// is delivered to every socket bound to the port, so sharing costs this test
-/// nothing.
-fn listen_on_the_discovery_port() -> std::net::UdpSocket {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )
-    .expect("a UDP socket");
-    socket
-        .set_reuse_address(true)
-        .expect("the discovery port is shared by construction");
-    socket
-        .bind(&std::net::SocketAddr::from(([0, 0, 0, 0], tiamot_core::discover::PORT)).into())
-        .expect("the discovery port");
-    // **The copy a world hosted on this machine sends.** A limited broadcast is
-    // not handed back to the sender on every platform — macOS does not — so
-    // this is the only datagram guaranteed to arrive here, and a listener that
-    // did not join the group would be testing broadcast loopback rather than
-    // announcing. Joined here exactly as `client::discovery::bind` joins it.
-    socket
-        .join_multicast_v4(
-            &tiamot_core::discover::GROUP,
-            &std::net::Ipv4Addr::UNSPECIFIED,
-        )
-        .expect("a world hosted here should be audible here");
-    socket.into()
-}
-
 /// A world bound the way the front screen binds one.
 fn start(name: &str, bind: &str, max_players: u32) -> ServerHandle {
     ServerHandle::start(&Settings {
@@ -179,32 +146,46 @@ fn an_open_world_says_it_is_here_on_the_network() {
     // Binding to every interface makes a world reachable; this is what makes
     // it findable.
     //
-    // Listened for with a plain socket and decoded with the engine's own
-    // parser, so what is checked is the datagram that actually goes out and
-    // not a round trip through the code that sent it.
+    // # Why this does not listen on the broadcast address
+    //
+    // It used to, and it was really a test of the runner's network. A limited
+    // broadcast needs a broadcast-capable one, and CI may have none: the macOS
+    // runner answers `No route to host` to a broadcast and to a multicast send
+    // alike, so the beacon never left the machine and "an announcing world sent
+    // nothing" was true of the runner rather than of the engine. Two goes at
+    // finding a local delivery mechanism that works everywhere — the loopback
+    // broadcast, then a multicast group with `IP_MULTICAST_LOOP` — established
+    // that there is not one.
+    //
+    // Worse, before that it did not run on macOS at all: it opened the shared
+    // discovery port with a plain bind, and every client test that builds a
+    // front screen holds that port with `SO_REUSEADDR`, so the bind lost and
+    // the test skipped itself. **Skipping is not a neutral outcome.**
+    //
+    // So the announcer is pointed at a loopback port this test owns. What that
+    // covers is everything this crate is responsible for: the datagram that
+    // actually goes out, its cadence, the port and player counts it carries,
+    // and that it stops. What it does not cover is the operating system's
+    // routing of a broadcast, which is not this crate's code and which one
+    // machine cannot observe anyway.
+    const PORT: u16 = 47_896;
+
     let server = start("announced", "127.0.0.1:0", 8);
-    // **`SO_REUSEADDR`, the way the client binds it.** A plain bind here loses
-    // to whichever other test binary `cargo` is running that already holds the
-    // discovery port — and `client::front` opens one in every test that builds
-    // a front screen — so this test used to skip itself instead of running.
-    // It skipped on macOS for six CI runs while reporting nothing at all, and
-    // the moment it stopped skipping it failed: a limited broadcast is not
-    // handed back to the machine that sent it on a BSD. Skipping is not a
-    // neutral outcome, and a test that can skip on a whole platform is a test
-    // that is not run there.
-    let listening = listen_on_the_discovery_port();
+    let listening = std::net::UdpSocket::bind(std::net::SocketAddr::from(([127, 0, 0, 1], PORT)))
+        .expect("a loopback port always has a route, whatever the network is doing");
     listening
         .set_read_timeout(Some(std::time::Duration::from_millis(500)))
         .expect("a read timeout");
 
-    // A name nothing else uses. **The discovery port is shared by
-    // construction** — that is what it is for — so this listener hears every
-    // other test binary `cargo` is running at the same time, and a beacon is
-    // only this test's if it says so.
     let announcing = server
-        .announce("an announced world under test")
+        .announce_to(
+            "an announced world under test",
+            vec![std::net::SocketAddr::from(([127, 0, 0, 1], PORT))],
+        )
         .expect("a world should be able to announce itself");
 
+    // Decoded with the engine's own parser, so what is checked is the datagram
+    // that actually goes out and not a round trip through the code that sent it.
     let mut buffer = [0u8; tiamot_core::discover::MAX_DATAGRAM];
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let heard = loop {
@@ -215,9 +196,7 @@ fn an_open_world_says_it_is_here_on_the_network() {
         let Ok((read, _)) = listening.recv_from(&mut buffer) else {
             continue;
         };
-        if let Some(beacon) = tiamot_core::discover::Beacon::decode(&buffer[..read])
-            && beacon.name == "an announced world under test"
-        {
+        if let Some(beacon) = tiamot_core::discover::Beacon::decode(&buffer[..read]) {
             break beacon;
         }
     };
@@ -235,6 +214,23 @@ fn an_open_world_says_it_is_here_on_the_network() {
         "a beacon that did not say which protocol it speaks"
     );
 
+    // **And it repeats.** A host heard once and never again ages out of the
+    // list a few seconds later, so a world that announced itself exactly once
+    // would pass every assertion above and still vanish from the menu.
+    let second = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut repeats = 0;
+    while std::time::Instant::now() < second && repeats == 0 {
+        if let Ok((read, _)) = listening.recv_from(&mut buffer)
+            && tiamot_core::discover::Beacon::decode(&buffer[..read]).is_some()
+        {
+            repeats += 1;
+        }
+    }
+    assert_eq!(
+        repeats, 1,
+        "a world announced itself once and then went quiet"
+    );
+
     // **And it stops.** A beacon outliving its server advertises an address
     // nothing answers on, which is a worse experience than not being listed:
     // the player picks it and waits for a timeout.
@@ -245,9 +241,7 @@ fn an_open_world_says_it_is_here_on_the_network() {
         let Ok((read, _)) = listening.recv_from(&mut buffer) else {
             continue;
         };
-        if tiamot_core::discover::Beacon::decode(&buffer[..read])
-            .is_some_and(|beacon| beacon.name == "an announced world under test")
-        {
+        if tiamot_core::discover::Beacon::decode(&buffer[..read]).is_some() {
             last_heard = Some(std::time::Instant::now());
         }
     }
@@ -259,77 +253,4 @@ fn an_open_world_says_it_is_here_on_the_network() {
     }
 
     server.stop();
-}
-
-#[test]
-fn a_beacon_sent_to_the_group_is_heard_on_the_machine_that_sent_it() {
-    // **The property macOS needs, tested on its own.**
-    // `an_open_world_says_it_is_here_on_the_network` drives the real announcer,
-    // but on Linux it can be satisfied by the broadcast copy alone — so on the
-    // one platform where the group copy is the ONLY one that arrives, the
-    // mechanism would be untested until CI failed.
-    //
-    // This asks the narrow question directly: does a socket that has joined
-    // `discover::GROUP` hear a datagram this machine sent to it? That is what
-    // `IP_MULTICAST_LOOP` promises on all three platforms, and it is the whole
-    // reason a host announces to a group as well as to the broadcast address.
-    //
-    // A private port, because the shared one carries every other test binary's
-    // traffic and this assertion is about one socket.
-    const PORT: u16 = 47_899;
-
-    let listening = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )
-    .expect("a UDP socket");
-    listening.set_reuse_address(true).expect("a shared port");
-    listening
-        .bind(&std::net::SocketAddr::from(([0, 0, 0, 0], PORT)).into())
-        .expect("a private port");
-    listening
-        .join_multicast_v4(
-            &tiamot_core::discover::GROUP,
-            &std::net::Ipv4Addr::UNSPECIFIED,
-        )
-        .expect("joining the group");
-    let listening: std::net::UdpSocket = listening.into();
-    listening
-        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-        .expect("a read timeout");
-
-    let sending = std::net::UdpSocket::bind(std::net::SocketAddr::from((
-        std::net::Ipv4Addr::UNSPECIFIED,
-        0,
-    )))
-    .expect("a sending socket");
-    sending.set_multicast_loop_v4(true).expect("loop it back");
-    sending.set_multicast_ttl_v4(1).expect("one hop");
-
-    let beacon = tiamot_core::discover::Beacon {
-        protocol: tiamot_core::proto::PROTOCOL_VERSION,
-        port: 47_811,
-        players: 1,
-        max_players: 8,
-        name: "a world on this very machine".to_owned(),
-    };
-    let bytes = beacon.encode().expect("a valid name");
-    sending
-        .send_to(
-            &bytes,
-            std::net::SocketAddr::from((tiamot_core::discover::GROUP, PORT)),
-        )
-        .expect("sending to the group");
-
-    let mut buffer = [0u8; tiamot_core::discover::MAX_DATAGRAM];
-    let (read, _) = listening.recv_from(&mut buffer).expect(
-        "a datagram this machine sent to the group came back to nobody on it, so a client \
-         could not see a world hosted beside it",
-    );
-    assert_eq!(
-        tiamot_core::discover::Beacon::decode(&buffer[..read]),
-        Some(beacon),
-        "what came back through the group was not what went out"
-    );
 }

@@ -3475,6 +3475,25 @@ impl ServerHandle {
         crate::announce::Announcer::start(name, self.local_addr.port(), &self.shared)
     }
 
+    /// The same, to destinations of the caller's choosing.
+    ///
+    /// See [`crate::announce::Announcer::start_to`] — a host with more than one
+    /// interface names them, and a test points one at a port it owns rather
+    /// than at a broadcast address the machine may have no route for.
+    #[must_use]
+    pub fn announce_to(
+        &self,
+        name: &str,
+        destinations: Vec<std::net::SocketAddr>,
+    ) -> Option<crate::announce::Announcer> {
+        crate::announce::Announcer::start_to(
+            name,
+            self.local_addr.port(),
+            &self.shared,
+            destinations,
+        )
+    }
+
     fn shutdown(&mut self) -> bool {
         self.control.stop();
         // Wakes the accept loop. Without this the network thread is parked in

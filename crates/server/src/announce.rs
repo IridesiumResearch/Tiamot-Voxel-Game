@@ -25,18 +25,17 @@ use tracing::{debug, warn};
 use crate::sim::Control;
 use crate::transport::endpoint::Shared;
 
-/// Where a beacon goes.
+/// Where a beacon goes when nobody says otherwise.
 ///
-/// **Two destinations, because not every platform hands a machine back its own
-/// broadcast.** Linux and Windows deliver a limited broadcast to sockets on
-/// this machine that are listening on the port; the BSD under macOS does not,
-/// so a client on the hosting machine could never see the world being hosted
-/// there. The multicast copy covers that case, and costs one datagram a second.
-///
-/// The broadcast is still what other machines find a world by. Nothing about
-/// that path changes here — see [`tiamot_core::discover::GROUP`] for why the
-/// second destination is not a replacement for the first.
-const DESTINATIONS: [Ipv4Addr; 2] = [Ipv4Addr::BROADCAST, tiamot_core::discover::GROUP];
+/// The limited broadcast: every machine on this segment, and no further. It is
+/// a `Vec` of one rather than a bare address because a host with more than one
+/// interface may want to name them — see [`Announcer::start_to`].
+fn default_destinations() -> Vec<SocketAddr> {
+    vec![SocketAddr::from(SocketAddrV4::new(
+        Ipv4Addr::BROADCAST,
+        PORT,
+    ))]
+}
 
 /// A running announcer. Dropping it stops the beacon.
 pub struct Announcer {
@@ -53,6 +52,32 @@ impl Announcer {
     /// says so.
     #[must_use]
     pub fn start(name: &str, port: u16, shared: &Arc<Shared>) -> Option<Self> {
+        Self::start_to(name, port, shared, default_destinations())
+    }
+
+    /// The same, to destinations of the caller's choosing.
+    ///
+    /// **Where a beacon goes is configuration, not a constant.** A host with
+    /// more than one interface reaches only the one the default route picks,
+    /// and naming the addresses is how it reaches the rest.
+    ///
+    /// It is also the only way to test this at all. A limited broadcast needs a
+    /// broadcast-capable network, and a CI runner may have none: the macOS
+    /// runner answers `No route to host` to both a broadcast and a multicast
+    /// send, so the beacon never leaves the machine and every assertion about
+    /// hearing one is really an assertion about the runner's network. Pointing
+    /// a test announcer at a loopback port it owns tests everything this crate
+    /// is responsible for — the encoding, the cadence, the player count, the
+    /// stop — and nothing that belongs to the operating system's routing table.
+    ///
+    /// Returns `None` if no socket could be opened.
+    #[must_use]
+    pub fn start_to(
+        name: &str,
+        port: u16,
+        shared: &Arc<Shared>,
+        destinations: Vec<SocketAddr>,
+    ) -> Option<Self> {
         // Encoded ONCE, so a name the format refuses stops the announcer here
         // rather than failing silently on every tick of a thread nobody reads.
         let beacon = Beacon {
@@ -77,16 +102,6 @@ impl Announcer {
             .set_broadcast(true)
             .inspect_err(|err| warn!(%err, "could not broadcast; not announcing"))
             .ok()?;
-        // A hop, so a beacon reaches this segment and stops. Looped back on
-        // purpose: the copy this machine's own clients hear is the whole reason
-        // the group is here. Neither is worth refusing to host over — a machine
-        // that cannot do multicast still announces to the broadcast address.
-        if let Err(err) = socket.set_multicast_ttl_v4(1) {
-            debug!(%err, "the announcer could not set a multicast hop limit");
-        }
-        if let Err(err) = socket.set_multicast_loop_v4(true) {
-            debug!(%err, "a client on this machine will not hear this world");
-        }
 
         // Its own control, so stopping the announcer does not stop the world
         // and stopping the world does not have to know about the announcer.
@@ -106,16 +121,15 @@ impl Announcer {
                     // number. A failure here is nothing to say out loud once a
                     // second.
                     if let Ok(bytes) = beacon.encode() {
-                        for ip in DESTINATIONS {
+                        for to in &destinations {
                             // Each destination stands on its own: a machine
-                            // between networks may refuse the broadcast while
-                            // the loopback copy goes out perfectly, and a
-                            // platform that dislikes the loopback broadcast
-                            // still reaches the network. Ordinary either way,
-                            // and said at debug because it recurs every
-                            // interval and is not an error anybody can act on.
-                            if let Err(err) = socket.send_to(&bytes, SocketAddrV4::new(ip, PORT)) {
-                                debug!(%err, %ip, "a beacon did not go out");
+                            // between networks refuses one and delivers
+                            // another. Said at debug because it recurs every
+                            // interval and is not an error anybody can act on
+                            // — a host with no route for the broadcast is a
+                            // host whose world is still reachable by address.
+                            if let Err(err) = socket.send_to(&bytes, to) {
+                                debug!(%err, %to, "a beacon did not go out");
                             }
                         }
                     }
