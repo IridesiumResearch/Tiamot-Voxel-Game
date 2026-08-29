@@ -243,6 +243,47 @@ fn apply_transfer(
     }
 }
 
+/// Reads back the milk a domain's arriving chunks had in them.
+///
+/// **Fluid is not derived state** — there is no function from terrain back to
+/// "somebody poured here" — so a chunk arriving without its saved pond is a
+/// pond that is gone. Called ahead of the relight budget on purpose: a chunk
+/// whose relight is deferred still needs its fluid, or the deferral would
+/// decide whether the milk in it survived.
+///
+/// Only ever called for the overworld today; `Fluidics` keys its layers by
+/// position with no domain. The parameter is here so the caller reads as the
+/// per-domain loop it is, and so the day fluid IS keyed by domain this takes
+/// one line rather than a search.
+fn load_domain_fluid(
+    fluidics: &std::sync::RwLock<crate::fluid::Fluidics>,
+    world: &crate::world::World,
+    domain: &str,
+    arrived: &[tiamot_core::ChunkPos],
+) {
+    let Ok(mut fluid) = fluidics.write() else {
+        return;
+    };
+    for pos in arrived {
+        // Already read: the lighting defers what it cannot relight by putting
+        // the chunk back on the arrival list, so chunks arrive twice. Loading
+        // again would replace the live layer with the last thing written.
+        if fluid.knows(*pos) {
+            continue;
+        }
+        match world.load_fluid(domain, *pos) {
+            // Recorded as read either way — a chunk with no row is dry, which
+            // is an answer.
+            Ok(layer) => fluid.chunk_loaded(*pos, layer.unwrap_or_default()),
+            Err(err) => {
+                // Left unread so the next arrival retries. Treating a failed
+                // read as "dry" would quietly delete a pond.
+                error!(?pos, "could not load the fluid for a chunk: {err}");
+            }
+        }
+    }
+}
+
 /// Writes each dirty chunk of entities into the domain it belongs to.
 ///
 /// **One call per `(domain, chunk)`, because that is what a row is.** A save
@@ -1392,7 +1433,7 @@ impl ServerHandle {
                     // contended — both sides are this thread — and is never
                     // held across a callback, which is what would deadlock.
                     let lighting = std::sync::Arc::new(std::sync::RwLock::new(
-                        crate::light::Lighting::new(emissions),
+                        crate::light::Lights::new(emissions),
                     ));
 
                     // Behind a lock for the same reason lighting is, and not
@@ -2865,14 +2906,17 @@ impl ServerHandle {
                             // had already lit. The requester still needs the
                             // light itself, which is what the send below is.
                             if blob.is_some() {
-                                let mut light = lighting.write().expect("lighting lock");
+                                let mut lit = lighting.write().expect("lighting lock");
+                                // The requester's own domain: a chunk is lit by
+                                // the sky and the lamps of the space it is in.
+                                let light = lit.of(&request.domain);
                                 let touched = if light.holds(request.pos) {
                                     std::iter::once(request.pos).collect()
                                 } else {
                                     control.note_full_relight();
                                     light.chunk_loaded(&request.domain, &world, request.pos)
                                 };
-                                broadcast_light(&shared, tiamot_core::domain::OVERWORLD, &light, &touched);
+                                broadcast_light(&shared, &request.domain, light, &touched);
                             }
                             // Fluid travels with the chunk, and always — an
                             // empty layer is ONE byte, so telling a client
@@ -2903,12 +2947,19 @@ impl ServerHandle {
                         // work twice for two edits in the same room, and the
                         // second answer is the only one anybody sees.
                         if !relight.is_empty() {
-                            let mut light = lighting.write().expect("lighting lock");
+                            let mut lit = lighting.write().expect("lighting lock");
+                            // Every edit this tick happened in some space; each
+                            // relights its own.
                             let mut touched = std::collections::BTreeSet::new();
+                            let light = lit.of(tiamot_core::domain::OVERWORLD);
                             for pos in relight.drain(..) {
-                                touched.extend(light.edited(tiamot_core::domain::OVERWORLD, &world, pos));
+                                touched.extend(light.edited(
+                                    tiamot_core::domain::OVERWORLD,
+                                    &world,
+                                    pos,
+                                ));
                             }
-                            broadcast_light(&shared, tiamot_core::domain::OVERWORLD, &light, &touched);
+                            broadcast_light(&shared, tiamot_core::domain::OVERWORLD, light, &touched);
                         }
 
                         // Chunks that arrived this tick, whatever brought
@@ -2955,48 +3006,26 @@ impl ServerHandle {
                             }
                             drop(mobs);
 
-                            // **Fluid and light are the overworld's alone, and
-                            // that is a limitation rather than a decision.**
-                            // `Fluidics` and `Lighting` key their layers by
-                            // position with no domain, so running another
-                            // space's arrivals through them would write a
-                            // ship's light into the overworld's layer at the
-                            // same coordinates — corrupting the one that works
-                            // to half-serve the one that does not. A second
-                            // domain is dark and dry until they are keyed like
-                            // the entity store now is.
-                            if domain != tiamot_core::domain::OVERWORLD {
-                                continue;
+                            // **Fluid is the overworld's alone, and that is a
+                            // limitation rather than a decision.** `Fluidics`
+                            // keys its layers by position with no domain, so
+                            // running another space's arrivals through it would
+                            // write a ship's milk into the overworld's layer at
+                            // the same coordinates — corrupting the one that
+                            // works to half-serve the one that does not. A
+                            // second domain is DRY until it is keyed the way
+                            // light and the entity store now are.
+                            //
+                            // Light is not skipped: it is a store per domain,
+                            // so a ship is lit by its own sky and its own lamps.
+                            if domain == tiamot_core::domain::OVERWORLD {
+                                load_domain_fluid(&fluidics, &world, &domain, &arrived);
                             }
 
-                            // **The milk that was there before.** Fluid is not
-                            // derived state — there is no function from terrain
-                            // back to "somebody poured here" — so a chunk
-                            // arriving without its saved pond is a pond that is
-                            // gone. Ahead of the relight budget on purpose: a
-                            // chunk whose relight is deferred still needs its
-                            // fluid, or the deferral would decide whether the
-                            // milk in it survived.
-                            let mut fluid = fluidics.write().expect("fluid lock");
-                            for pos in &arrived {
-                                if fluid.knows(*pos) {
-                                    continue;
-                                }
-                                match world.load_fluid(&domain, *pos) {
-                                    // Recorded as read either way — a chunk with
-                                    // no row is dry, which is an answer.
-                                    Ok(layer) => fluid.chunk_loaded(*pos, layer.unwrap_or_default()),
-                                    Err(err) => {
-                                        // Left unread so the next arrival
-                                        // retries. Treating a failed read as
-                                        // "dry" would quietly delete a pond.
-                                        error!(?pos, "could not load the fluid for a chunk: {err}");
-                                    }
-                                }
-                            }
-                            drop(fluid);
 
-                            let mut light = lighting.write().expect("lighting lock");
+
+                            let mut lit = lighting.write().expect("lighting lock");
+                            let light = lit.of(&domain);
                             let mut touched = std::collections::BTreeSet::new();
                             let mut done = 0;
                             for pos in arrived {
@@ -3016,7 +3045,7 @@ impl ServerHandle {
                                 touched.extend(light.chunk_loaded(&domain, &world, pos));
                                 done += 1;
                             }
-                            broadcast_light(&shared, &domain, &light, &touched);
+                            broadcast_light(&shared, &domain, light, &touched);
                         }
                         control.note_lit_chunks(lighting.read().expect("lighting lock").len());
 

@@ -175,6 +175,19 @@ fn holds_anything(chunk: &tiamot_core::Chunk, at: tiamot_core::ChunkPos) -> bool
     })
 }
 
+/// How many chunks this bot has been sent light for.
+fn lit_chunks(bot: &Bot) -> usize {
+    bot.received()
+        .into_iter()
+        .filter(|message| {
+            matches!(
+                message,
+                tiamot_core::proto::ServerMessage::ChunkLight { .. }
+            )
+        })
+        .count()
+}
+
 /// Whether this bot has been told about any entity at all.
 fn saw_a_spawn(bot: &Bot) -> bool {
     bot.received().into_iter().any(|message| {
@@ -1268,4 +1281,73 @@ fn a_domain_is_filled_by_its_own_generator_and_not_by_the_overworlds() {
         holds_anything(&loft, tiamot_core::ChunkPos::new(0, -1, 0)),
         "a domain's own generator did not fill it"
     );
+}
+
+#[test]
+fn a_second_domain_is_lit_by_its_own_sky() {
+    // **Light is per-space, like everything else about a place.** A layer is
+    // keyed by chunk position, and the same position is different terrain in
+    // another domain — so one store shared between them would light a ship's
+    // floor with the sky above the overworld and put the overworld's caves
+    // inside somebody's hull. A store per domain is what stops that, and this
+    // is what says the store exists at all: a domain nobody lit renders black.
+    let server = start(
+        "lit",
+        write_mod(
+            "lit",
+            "game.register_on_chat(function(event)\n\
+             \x20   if event.text == 'attic' then\n\
+             \x20       local body = game.player_entity(event.player)\n\
+             \x20       game.transfer_entity(body, 'places:attic', { x = 8, y = 4, z = 8 })\n\
+             \x20       return false\n\
+             \x20   end\n\
+             end)",
+        ),
+    );
+    block_on(async {
+        let mut bot = join(&server, "Lamplighter").await;
+        settle_for(&mut bot, 60).await;
+        let in_the_overworld = lit_chunks(&bot);
+        assert!(
+            in_the_overworld > 0,
+            "the overworld was never lit, so this cannot tell an unlit domain \
+             from a server that sends no light at all"
+        );
+
+        bot.chat("attic").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "never moved");
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+
+        // Everything before the move is the overworld's light. What arrives now
+        // is the attic's, or the attic is black.
+        let before = bot.received().len();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let after: usize = bot
+                .received()
+                .into_iter()
+                .skip(before)
+                .filter(|message| {
+                    matches!(
+                        message,
+                        tiamot_core::proto::ServerMessage::ChunkLight { .. }
+                    )
+                })
+                .count();
+            if after > 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a domain with terrain in it was never lit, so it renders black"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+
+        bot.disconnect().await;
+    });
+    server.stop();
 }

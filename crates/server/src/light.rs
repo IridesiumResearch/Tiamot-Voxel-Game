@@ -55,14 +55,67 @@ use crate::world::World;
 /// emits.
 #[derive(Debug)]
 pub struct Shared {
-    lighting: std::sync::Arc<std::sync::RwLock<Lighting>>,
+    lighting: std::sync::Arc<std::sync::RwLock<Lights>>,
 }
 
 impl Shared {
     /// Wraps a store the simulation thread owns.
     #[must_use]
-    pub const fn new(lighting: std::sync::Arc<std::sync::RwLock<Lighting>>) -> Self {
+    pub const fn new(lighting: std::sync::Arc<std::sync::RwLock<Lights>>) -> Self {
         Self { lighting }
+    }
+}
+
+/// One [`Lighting`] per domain, made on first use.
+///
+/// **Light is per-space, like everything else about a place.** A layer is keyed
+/// by chunk position, and the same position is different terrain in another
+/// domain — so one store shared between them would light a ship's floor with
+/// the sky above the overworld at those coordinates, and put the overworld's
+/// caves inside somebody's hull.
+///
+/// A store per domain rather than a domain inside the store: the flood fill
+/// reaches for neighbouring layers constantly and wants a map it can index by
+/// position alone, and nothing about lighting is cross-domain.
+#[derive(Debug)]
+pub struct Lights {
+    emissions: tiamot_core::light::Emissions,
+    domains: std::collections::BTreeMap<String, Lighting>,
+}
+
+impl Lights {
+    /// A set of stores for a world whose mods emit these levels.
+    #[must_use]
+    pub fn new(emissions: tiamot_core::light::Emissions) -> Self {
+        Self {
+            emissions,
+            domains: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// One domain's light, created on first use.
+    pub fn of(&mut self, domain: &str) -> &mut Lighting {
+        self.domains
+            .entry(domain.to_owned())
+            .or_insert_with(|| Lighting::new(self.emissions.clone()))
+    }
+
+    /// One domain's light, if anything has lit it.
+    #[must_use]
+    pub fn get(&self, domain: &str) -> Option<&Lighting> {
+        self.domains.get(domain)
+    }
+
+    /// How many chunks are lit across every domain.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.domains.values().map(Lighting::len).sum()
+    }
+
+    /// Whether nothing is lit anywhere.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -71,9 +124,15 @@ impl tiamot_core::light::LightSource for Shared {
         // A poisoned lock means the simulation thread panicked, in which case
         // there is no light and no world; darkness is the honest answer and
         // panicking inside a mod callback would blame the mod.
-        self.lighting
-            .read()
-            .map_or(Light::DARK, |lighting| lighting.at(pos))
+        // **The overworld's**, because `game.get_light(position)` names a
+        // position and no domain — a mod asking about a place in a ship has no
+        // way to say which ship. Widening this needs the API to carry a domain,
+        // which is a change to what mods write and not a change here.
+        self.lighting.read().map_or(Light::DARK, |lighting| {
+            lighting
+                .get(tiamot_core::domain::OVERWORLD)
+                .map_or(Light::DARK, |lit| lit.at(pos))
+        })
     }
 }
 
