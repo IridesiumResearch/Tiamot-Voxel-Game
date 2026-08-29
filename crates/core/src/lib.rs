@@ -67,6 +67,7 @@ pub mod coords;
 pub mod detgen;
 pub mod dig;
 pub mod discover;
+pub mod domain;
 pub mod ent;
 pub mod fluid;
 pub mod hud;
