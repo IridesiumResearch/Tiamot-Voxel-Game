@@ -383,6 +383,17 @@ pub enum Event {
     /// A chunk left the interest set.
     ChunkUnload(ChunkPos),
 
+    /// The world this client is in has been replaced.
+    ///
+    /// **Everything held about the world is now wrong rather than stale.** The
+    /// same chunk positions mean different chunks, the entities being tracked
+    /// are not here, and the light belongs to terrain no longer under the
+    /// player. Everything goes, and the stream refills it.
+    DomainChanged {
+        /// What to call the place, on the screen shown while it refills.
+        domain: String,
+    },
+
     /// A block or sub-node changed.
     Edit(Edit),
 
@@ -1214,6 +1225,10 @@ async fn session(
 
             ServerMessage::ChunkUnload { pos } => {
                 let _ = events.send(Event::ChunkUnload(pos));
+            }
+
+            ServerMessage::DomainChanged { domain } => {
+                let _ = events.send(Event::DomainChanged { domain });
             }
 
             ServerMessage::BlockDelta { edit, .. } => {

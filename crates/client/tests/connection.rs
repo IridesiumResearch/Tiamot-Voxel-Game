@@ -197,6 +197,7 @@ impl Seen {
                 self.images = images;
             }
             Event::Joined { spawn, .. } => self.joined = Some(spawn),
+            Event::DomainChanged { .. } => {}
             Event::View { .. } => {}
             Event::HudValues { mod_id, values } => {
                 self.hud_values.insert(mod_id, values);

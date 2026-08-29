@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 36;
+pub const PROTOCOL_VERSION: u32 = 37;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -1583,6 +1583,28 @@ pub enum ServerMessage {
         /// The values, by name.
         values: Vec<(String, crate::hud::Value)>,
     },
+
+    /// This player is now in a different simulation space.
+    ///
+    /// **Everything the client holds about the world is now wrong**, and not
+    /// stale — wrong. Chunk positions mean something else in the new domain,
+    /// the entities it was tracking are not here, and the light it has belongs
+    /// to terrain that is no longer under it. So this says "throw the world
+    /// away and wait", and the stream refills it from nothing.
+    ///
+    /// One message rather than an unload per chunk: at the default view
+    /// distance that would be upwards of a thousand messages to say one thing,
+    /// arriving over several ticks with the player standing in a half-deleted
+    /// world while they did.
+    ///
+    /// The id is carried so a client can SAY where it is — a loading screen
+    /// that names the place is the difference between a pause and a hang. It is
+    /// a display string like any other a server sends, and is not trusted for
+    /// anything else.
+    DomainChanged {
+        /// The domain now being streamed.
+        domain: String,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -2308,6 +2330,12 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         ServerMessage::SoundTable { sounds } => check_sounds(sounds)?,
         ServerMessage::HudScripts { scripts } => check_hud_scripts(scripts)?,
         ServerMessage::HudValues { mod_id, values } => check_hud_values(mod_id, values)?,
+        // A domain id is a string a server chose, and it reaches a loading
+        // screen the client draws. Capped like every other id on the wire
+        // (charter rule 14: a server is not trusted for being the server).
+        ServerMessage::DomainChanged { domain } => {
+            check_len("domain_changed", domain.len(), MAX_ID_BYTES)?;
+        }
         ServerMessage::InventoryUpdate { stacks } => {
             for stack in stacks {
                 check_stack(stack)?;
@@ -3001,10 +3029,23 @@ mod tests {
         // Disconnect is the perennial hazard: it reads like the natural end of
         // the enum, so a new variant gets written above it. Doing exactly that
         // is what this caught during the protocol v2 change.
+        // The newest append, pinned the day it landed rather than the day
+        // something displaced it. Protocol v37.
+        let switched = encode(&ServerMessage::DomainChanged {
+            domain: String::new(),
+        })
+        .expect("encode");
+        let highest = switched[0];
+
         let disconnect = encode(&ServerMessage::Disconnect {
             reason: DisconnectReason::ServerStopping,
         })
         .expect("encode");
+        assert!(
+            highest > 10,
+            "DomainChanged must be APPENDED, after every variant that already \
+             existed; it encoded as ordinal {highest}"
+        );
         assert_eq!(
             disconnect[0], 10,
             "Disconnect must stay at ordinal 10; a variant was inserted above it"

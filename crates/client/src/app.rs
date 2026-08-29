@@ -3802,6 +3802,23 @@ impl App {
                     }
                 }
 
+                Event::DomainChanged { domain } => {
+                    // **Everything, and the meshes with it.** The store's
+                    // positions all mean different chunks now, so a mesh kept
+                    // for any of them draws terrain from a place the player has
+                    // left, standing exactly where they are. `ChunkUnload` does
+                    // this one position at a time; a switch does it for the
+                    // lot, which is why it is one message rather than a
+                    // thousand.
+                    let drawn: Vec<_> = self.store.positions().collect();
+                    for pos in drawn {
+                        self.renderer.remove_chunk(&self.drawn_at(pos));
+                    }
+                    self.store.clear();
+                    self.entities.clear();
+                    tracing::info!(%domain, "moved to another domain");
+                }
+
                 Event::Edit(edit) => {
                     self.store.apply(&edit);
                 }

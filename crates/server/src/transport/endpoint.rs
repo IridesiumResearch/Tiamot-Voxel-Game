@@ -548,6 +548,12 @@ pub fn intent_from_wire(
 
 /// A connection asking the simulation for a chunk.
 pub struct ChunkRequest {
+    /// Which domain's chunk.
+    ///
+    /// A position on its own does not name a chunk: every domain has one at
+    /// each coordinate. Answering from the wrong one hands a player terrain
+    /// from somewhere else, in a place they are standing.
+    pub domain: String,
     /// Which chunk.
     pub pos: tiamot_core::ChunkPos,
     /// Where to send the encoded blob.
@@ -1045,6 +1051,19 @@ impl Shared {
         bodies.get(uuid).map(|player| player.origin)
     }
 
+    /// Which domain a player is in, and where they are in it.
+    ///
+    /// Read together under one lock, because a connection acts on the pair: a
+    /// domain read a moment before the position it is paired with would
+    /// re-centre the new domain's stream on the old domain's chunk.
+    #[must_use]
+    pub fn player_place(&self, uuid: &PlayerUuid) -> Option<(String, tiamot_core::ChunkPos)> {
+        let bodies = self.bodies.lock().ok()?;
+        bodies
+            .get(uuid)
+            .map(|player| (player.domain.clone(), player.origin))
+    }
+
     /// Takes everything queued, leaving the queue empty.
     ///
     /// Called once per tick by the simulation.
@@ -1185,14 +1204,16 @@ impl Shared {
     /// correctness, because the interest set is recomputed every pass.
     pub fn request_chunk(
         &self,
+        domain: &str,
         pos: tiamot_core::ChunkPos,
     ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+        let domain = domain.to_owned();
         let mut queue = self.chunk_requests.lock().ok()?;
         if queue.len() >= MAX_QUEUED_CHUNK_REQUESTS {
             return None;
         }
         let (reply, receiver) = tokio::sync::oneshot::channel();
-        queue.push_back(ChunkRequest { pos, reply });
+        queue.push_back(ChunkRequest { domain, pos, reply });
         Some(receiver)
     }
 
@@ -1981,9 +2002,30 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 // Task 09 the interest set was pinned to spawn, because nothing
                 // knew where the player was.
                 if let Some(uuid) = session.uuid()
-                    && let Some(chunk) = shared.player_chunk(&uuid)
+                    && let Some((domain, chunk)) = shared.player_place(&uuid)
                     && let Some(streamer) = streamer.as_mut()
                 {
+                    // **A domain change first, and it is not an unload.** The
+                    // client's chunks all belong to the space it is leaving,
+                    // and their positions mean different chunks in the one it
+                    // is entering — so it is told once to throw the world away
+                    // rather than a thousand times to drop a position.
+                    if streamer.domain() != domain {
+                        let dropped = streamer.switch_to(&domain, chunk);
+                        debug!(
+                            player = session.display_name().unwrap_or("<unnamed>"),
+                            %domain,
+                            chunks = dropped.len(),
+                            "moved to another domain"
+                        );
+                        frame::write(
+                            &mut send,
+                            &ServerMessage::DomainChanged {
+                                domain: domain.clone(),
+                            },
+                        )
+                        .await?;
+                    }
                     for pos in streamer.recentre(chunk) {
                         frame::write(&mut send, &ServerMessage::ChunkUnload { pos }).await?;
                     }
@@ -2137,7 +2179,11 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
             // Interest starts at spawn. Task 09's physics will call
             // `recentre` as the player moves; see `stream.rs` on why the
             // client is not asked where it is.
-            streamer = Some(Streamer::new(shared.spawn.chunk(), shared.view_distance));
+            streamer = Some(Streamer::new(
+                tiamot_core::domain::OVERWORLD,
+                shared.spawn.chunk(),
+                shared.view_distance,
+            ));
             just_joined = true;
             info!(
                 player = session.display_name().unwrap_or("<unnamed>"),
@@ -2416,7 +2462,7 @@ async fn pump_chunks(
     // Then new requests, up to this client's share.
     let budget = streamer.budget(CHUNKS_IN_FLIGHT_PER_CLIENT);
     for pos in streamer.next_needed(budget) {
-        let Some(receiver) = shared.request_chunk(pos) else {
+        let Some(receiver) = shared.request_chunk(streamer.domain(), pos) else {
             // Queue full. Nothing is marked, so the next pass retries.
             break;
         };

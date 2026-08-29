@@ -33,6 +33,13 @@ use tiamot_core::interest::{self, ViewDistance};
 
 /// What one connection has been sent, and what it still needs.
 pub struct Streamer {
+    /// The domain every position in here belongs to.
+    ///
+    /// **Interest is domain-scoped**, which is not a rule enforced on top of
+    /// this but what the sets already mean: a chunk at `(0, 0, 0)` in one
+    /// domain and a chunk at `(0, 0, 0)` in another are different chunks, and
+    /// a set of positions can only be about one of them.
+    domain: String,
     centre: ChunkPos,
     view: ViewDistance,
     /// Chunks the client has, or has been sent.
@@ -55,8 +62,9 @@ pub struct Streamer {
 impl Streamer {
     /// A streamer centred on a player's spawn.
     #[must_use]
-    pub fn new(centre: ChunkPos, view: ViewDistance) -> Self {
+    pub fn new(domain: &str, centre: ChunkPos, view: ViewDistance) -> Self {
         Self {
+            domain: domain.to_owned(),
             centre,
             view,
             sent: BTreeSet::new(),
@@ -68,6 +76,40 @@ impl Streamer {
     #[must_use]
     pub const fn centre(&self) -> ChunkPos {
         self.centre
+    }
+
+    /// Which domain this connection is being streamed from.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    /// Moves this connection to another domain, returning everything to drop.
+    ///
+    /// **Everything, not what left range.** The client holds a set of chunks
+    /// belonging to the domain it was in, and none of them mean anything in the
+    /// new one — the positions are the same and the contents are not. So the
+    /// whole sent-set comes back, the in-flight requests are abandoned, and the
+    /// new domain streams in from nothing.
+    ///
+    /// The caller is expected to tell the client with a single domain-switch
+    /// message rather than to send an unload per position: at the default view
+    /// distance that is upwards of a thousand messages to say one thing.
+    ///
+    /// Switching to the domain already being streamed does nothing and returns
+    /// nothing, so a caller that checks every tick costs a string compare.
+    pub fn switch_to(&mut self, domain: &str, centre: ChunkPos) -> Vec<ChunkPos> {
+        if domain == self.domain {
+            return Vec::new();
+        }
+        self.domain = domain.to_owned();
+        self.centre = centre;
+        // Abandoned rather than awaited. A reply carrying a chunk of the domain
+        // this connection has just left would be decoded into the new one at
+        // the same coordinates, which is terrain from somewhere else appearing
+        // in a place a player is standing.
+        self.in_flight.clear();
+        std::mem::take(&mut self.sent).into_iter().collect()
     }
 
     /// How many chunks this client has been sent.
@@ -213,7 +255,73 @@ mod tests {
     const ORIGIN: ChunkPos = ChunkPos::new(0, 0, 0);
 
     fn streamer() -> Streamer {
-        Streamer::new(ORIGIN, ViewDistance::MINIMUM)
+        Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::MINIMUM,
+        )
+    }
+
+    #[test]
+    fn moving_domain_takes_back_every_chunk_and_not_just_the_ones_out_of_range() {
+        // **The whole set, because none of it means anything any more.** The
+        // client holds chunks belonging to the space it is leaving, and every
+        // one of their positions names a different chunk in the space it is
+        // entering. A switch that only returned what left range would leave
+        // terrain from somewhere else standing exactly where the player is.
+        let mut streamer = streamer();
+        let needed = streamer.next_needed(8);
+        assert!(!needed.is_empty(), "nothing to send makes this vacuous");
+        for pos in &needed {
+            streamer.requested(*pos);
+            streamer.delivered(*pos);
+        }
+        assert_eq!(streamer.sent_count(), needed.len());
+
+        let dropped = streamer.switch_to("mod:ship/17", ORIGIN);
+        assert_eq!(
+            dropped.len(),
+            needed.len(),
+            "a domain switch kept chunks the client can no longer use"
+        );
+        assert_eq!(streamer.sent_count(), 0);
+        assert_eq!(streamer.domain(), "mod:ship/17");
+    }
+
+    #[test]
+    fn a_request_outstanding_when_the_domain_changes_is_abandoned() {
+        // A reply carrying a chunk of the domain just left would be decoded
+        // into the new one at the same coordinates — terrain from somewhere
+        // else, in a place somebody is standing.
+        let mut streamer = streamer();
+        let pos = streamer.next_needed(1)[0];
+        streamer.requested(pos);
+        assert_eq!(streamer.in_flight(), 1);
+
+        streamer.switch_to("mod:ship/17", ORIGIN);
+        assert_eq!(
+            streamer.in_flight(),
+            0,
+            "a chunk of the old domain was still expected after the move"
+        );
+        assert!(
+            streamer.next_needed(usize::MAX).contains(&pos),
+            "the new domain's chunk at that position was never asked for"
+        );
+    }
+
+    #[test]
+    fn switching_to_the_domain_already_being_streamed_costs_nothing() {
+        // The connection checks every tick, so the common answer has to be
+        // cheap and has to change nothing.
+        let mut streamer = streamer();
+        let pos = streamer.next_needed(1)[0];
+        streamer.requested(pos);
+        streamer.delivered(pos);
+
+        let dropped = streamer.switch_to(tiamot_core::domain::OVERWORLD, ORIGIN);
+        assert!(dropped.is_empty(), "a no-op switch threw the world away");
+        assert_eq!(streamer.sent_count(), 1);
     }
 
     #[test]
@@ -222,7 +330,11 @@ mod tests {
         // chunks it can no longer see have to be taken off it — otherwise
         // "reduce your view distance" would free nothing on either side, which
         // is the entire reason somebody reaches for the setting.
-        let mut streamer = Streamer::new(ORIGIN, ViewDistance::DEFAULT);
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::DEFAULT,
+        );
         for pos in streamer.next_needed(usize::MAX) {
             streamer.requested(pos);
             streamer.completed(pos);
@@ -257,7 +369,11 @@ mod tests {
     fn growing_the_radius_unloads_nothing_and_asks_for_the_rest() {
         // No chunk leaves range when the range gets bigger, and the new ones
         // arrive through the ordinary pump rather than through a special path.
-        let mut streamer = Streamer::new(ORIGIN, ViewDistance::MINIMUM);
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::MINIMUM,
+        );
         for pos in streamer.next_needed(usize::MAX) {
             streamer.requested(pos);
             streamer.completed(pos);
@@ -280,7 +396,11 @@ mod tests {
     fn resizing_to_the_same_radius_is_a_no_op() {
         // A client re-sending its preference — on a reconnect, or every time a
         // settings screen closes — must not churn its whole interest set.
-        let mut streamer = Streamer::new(ORIGIN, ViewDistance::DEFAULT);
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::DEFAULT,
+        );
         for pos in streamer.next_needed(usize::MAX) {
             streamer.requested(pos);
             streamer.completed(pos);
@@ -396,7 +516,11 @@ mod tests {
     fn moving_within_range_keeps_the_overlap() {
         // A player taking one step must not be re-sent their whole
         // neighbourhood. If this failed, walking would saturate the link.
-        let mut streamer = Streamer::new(ORIGIN, ViewDistance::DEFAULT);
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::DEFAULT,
+        );
         for pos in streamer.next_needed(usize::MAX) {
             streamer.delivered(pos);
         }

@@ -2594,7 +2594,7 @@ impl ServerHandle {
                         // thread, and an unbounded drain would let one player
                         // joining stall the world for everyone.
                         for request in shared.take_chunk_requests() {
-                            let blob = match world.chunk(tiamot_core::domain::OVERWORLD, request.pos, &mut source) {
+                            let blob = match world.chunk(&request.domain, request.pos, &mut source) {
                                 Ok(chunk) => {
                                     let chunk = chunk.clone();
                                     world.db().chunk_blob(request.pos, &chunk).ok()
@@ -2626,7 +2626,7 @@ impl ServerHandle {
                                     std::iter::once(request.pos).collect()
                                 } else {
                                     control.note_full_relight();
-                                    light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, request.pos)
+                                    light.chunk_loaded(&request.domain, &world, request.pos)
                                 };
                                 broadcast_light(&shared, &light, &touched);
                             }
