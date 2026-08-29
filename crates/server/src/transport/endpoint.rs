@@ -374,6 +374,14 @@ pub type PlayerBodies = std::sync::Mutex<std::collections::BTreeMap<PlayerUuid, 
 /// One player's simulated body and the inputs waiting to move it.
 #[derive(Debug, Clone)]
 pub struct PlayerSim {
+    /// Which simulation space this player is in.
+    ///
+    /// **Authoritative, and the one place it is decided.** Everything a player
+    /// is shown or collides with is scoped by it: the terrain their body steps
+    /// against, the chunks streamed to them, the entities they are told about.
+    /// A player is in exactly one domain, and moving between them is a
+    /// deliberate handoff rather than a walk (`core::domain`).
+    pub domain: String,
     /// The chunk the body's local coordinates are relative to (charter rule 7).
     pub origin: tiamot_core::ChunkPos,
     /// Position, velocity and ground contact, in sub-node cells.
@@ -428,6 +436,10 @@ impl PlayerSim {
             (spawn.z - corner.z) as f32 * cells + cells / 2.0,
         ];
         Self {
+            // A player joins the overworld. Which domain a spawn belongs to is
+            // a mod's decision, made afterwards with a transfer — the engine
+            // has no opinion about where anybody starts (charter rule 1).
+            domain: tiamot_core::domain::OVERWORLD.to_owned(),
             origin,
             body: tiamot_core::phys::Body::at(local),
             inputs: tiamot_core::phys::InputQueue::new(tick),

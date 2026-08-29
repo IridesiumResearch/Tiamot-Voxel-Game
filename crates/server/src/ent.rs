@@ -79,6 +79,15 @@ pub struct Population {
     transient: BTreeSet<EntityId>,
     /// Which entity mirrors which player.
     players: BTreeMap<tiamot_core::PlayerUuid, EntityId>,
+    /// Which domain each entity is in, for everything but the overworld.
+    ///
+    /// **Absent means the overworld**, which is what makes this cost nothing in
+    /// a world that has only one domain — the common case, and the only case
+    /// before Task 15a. A field on `Entity` was the other option and is worse:
+    /// an entity's domain is where it is STORED, not something about the thing
+    /// itself, and putting it on the record would carry it onto the wire and
+    /// into the world file, where the row's own domain column already says it.
+    domains: BTreeMap<EntityId, String>,
 }
 
 impl Population {
@@ -92,6 +101,55 @@ impl Population {
     #[must_use]
     pub const fn entities(&self) -> &Entities {
         &self.entities
+    }
+
+    /// Which domain an entity is in.
+    ///
+    /// The overworld unless something said otherwise, so an entity nothing has
+    /// moved needs no entry and a single-domain world stores none at all.
+    #[must_use]
+    pub fn domain_of(&self, id: EntityId) -> &str {
+        self.domains
+            .get(&id)
+            .map_or(tiamot_core::domain::OVERWORLD, String::as_str)
+    }
+
+    /// Records which domain an entity is in.
+    ///
+    /// The overworld is stored as an absence rather than as a string, so the
+    /// map holds only what is unusual and `domain_of` has one answer either
+    /// way.
+    pub fn set_domain(&mut self, id: EntityId, domain: &str) {
+        if domain == tiamot_core::domain::OVERWORLD {
+            self.domains.remove(&id);
+        } else {
+            self.domains.insert(id, domain.to_owned());
+        }
+    }
+
+    /// Every domain an entity is currently in, the overworld included.
+    ///
+    /// What a tick iterates to step each domain against its own terrain.
+    #[must_use]
+    pub fn occupied_domains(&self) -> Vec<&str> {
+        let mut all: Vec<&str> = self.domains.values().map(String::as_str).collect();
+        all.push(tiamot_core::domain::OVERWORLD);
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// How many entities are in a domain, players' mirrors included.
+    ///
+    /// What `domain::Registry::destroy` is asking when it refuses to take a
+    /// room out from under somebody.
+    #[must_use]
+    pub fn occupants(&self, domain: &str) -> usize {
+        self.entities
+            .ids()
+            .into_iter()
+            .filter(|id| self.domain_of(*id) == domain)
+            .count()
     }
 
     /// How many entities are live.
@@ -390,6 +448,13 @@ impl Population {
             // a body that has had one — and the correction would arrive as the
             // other players on your screen sinking into the floor.
             if self.transient.contains(&id) {
+                continue;
+            }
+            // Somebody else's domain. Stepped when that domain's turn comes
+            // round, against its terrain — a mob in a ship must not fall
+            // through the overworld's floor because the overworld is what the
+            // lookup happened to be bound to.
+            if self.domain_of(id) != domain {
                 continue;
             }
             let Some(entity) = self.entities.get(id) else {
@@ -715,6 +780,128 @@ mod tests {
 
     fn somewhere(chunk: ChunkPos) -> Transform {
         Transform::at(chunk, [24.0, 4.0, 24.0])
+    }
+
+    #[test]
+    fn an_entity_is_in_the_overworld_until_something_moves_it() {
+        // Absence means the overworld, which is what keeps a single-domain
+        // world — every world until a mod makes a second — paying nothing for
+        // this at all.
+        let mut population = Population::new();
+        let id = population.spawn(mob(ChunkPos::new(0, 0, 0), [8.0, 0.0, 8.0]));
+        assert_eq!(population.domain_of(id), tiamot_core::domain::OVERWORLD);
+        assert_eq!(
+            population.occupied_domains(),
+            vec![tiamot_core::domain::OVERWORLD]
+        );
+
+        population.set_domain(id, "mod:ship/17");
+        assert_eq!(population.domain_of(id), "mod:ship/17");
+        assert_eq!(
+            population.occupied_domains(),
+            vec!["mod:ship/17", tiamot_core::domain::OVERWORLD],
+            "the overworld is always a domain the tick visits, occupied or not"
+        );
+
+        // And moving one back stores nothing rather than storing the default.
+        population.set_domain(id, tiamot_core::domain::OVERWORLD);
+        assert_eq!(population.domain_of(id), tiamot_core::domain::OVERWORLD);
+        assert_eq!(
+            population.occupied_domains(),
+            vec![tiamot_core::domain::OVERWORLD]
+        );
+    }
+
+    #[test]
+    fn a_mob_in_another_domain_does_not_fall_through_this_ones_floor() {
+        // **The failure this exists for.** `ChunkLookup` takes a position and
+        // no domain, so a step bound to the overworld would collide every body
+        // against the overworld's terrain wherever it actually was. A mob in a
+        // ship would then fall through the ship and land on ground a mile away
+        // that it cannot see.
+        //
+        // Staged as the case that tells the two apart: a floor in the overworld
+        // and none in the other domain, and a mob in each at the same place.
+        //
+        // The other domain has no chunks in memory at all, and a body over
+        // unloaded terrain does not move — the same rule that stops a mob
+        // walking off the edge of what is streamed in from pulling chunks into
+        // the tick. So the tell is not that it falls further; it is that it
+        // does not land on a floor belonging to a domain it is not in.
+        let mut world = world();
+        floor(&mut world, ChunkPos::new(0, 0, 0));
+        let fluid = crate::fluid::Fluidics::default();
+
+        let mut population = Population::new();
+        let here = population.spawn(mob(ChunkPos::new(0, 0, 0), [8.0, 6.0, 8.0]));
+        let away = population.spawn(mob(ChunkPos::new(0, 0, 0), [8.0, 6.0, 8.0]));
+        population.set_domain(away, "mod:elsewhere");
+
+        for _ in 0..30 {
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
+            population.tick("mod:elsewhere", &world, &fluid);
+        }
+
+        let landed = population.get(here).expect("still there").transform.local[1];
+        let elsewhere = population.get(away).expect("still there").transform.local[1];
+        assert!(
+            landed > 2.0 && landed < 6.0,
+            "the mob in the overworld did not land on its own floor (y={landed})"
+        );
+        assert!(
+            (elsewhere - 6.0).abs() < f32::EPSILON,
+            "a mob in a domain with no terrain moved, so the step was bound to \
+             somebody else's chunks: it is at y={elsewhere} and started at 6.0"
+        );
+        assert!(
+            (elsewhere - landed).abs() > 1.0,
+            "both mobs ended up at the same height, so this cannot tell a \
+             domain-scoped step from an overworld-scoped one"
+        );
+    }
+
+    #[test]
+    fn a_domain_is_only_stepped_for_the_bodies_that_are_in_it() {
+        // A pass for one domain must leave every other domain's bodies exactly
+        // as they were — otherwise gravity is applied once per domain per tick
+        // to everybody, and everything falls N times too fast.
+        let mut world = world();
+        floor(&mut world, ChunkPos::new(0, 0, 0));
+        let fluid = crate::fluid::Fluidics::default();
+
+        let mut population = Population::new();
+        let away = population.spawn(mob(ChunkPos::new(0, 0, 0), [8.0, 6.0, 8.0]));
+        population.set_domain(away, "mod:elsewhere");
+        let before = population.get(away).expect("there").transform.local[1];
+
+        for _ in 0..10 {
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
+        }
+
+        let after = population.get(away).expect("there").transform.local[1];
+        assert!(
+            (after - before).abs() < f32::EPSILON,
+            "stepping the overworld moved a body in another domain, from {before} to {after}"
+        );
+    }
+
+    #[test]
+    fn who_is_inside_a_domain_is_countable() {
+        // What `domain::Registry::destroy` asks before it refuses to take a
+        // room out from under somebody.
+        let mut population = Population::new();
+        let a = population.spawn(mob(ChunkPos::new(0, 0, 0), [8.0, 0.0, 8.0]));
+        let b = population.spawn(mob(ChunkPos::new(0, 0, 0), [9.0, 0.0, 8.0]));
+        population.set_domain(a, "mod:ship/17");
+        population.set_domain(b, "mod:ship/17");
+
+        assert_eq!(population.occupants("mod:ship/17"), 2);
+        assert_eq!(population.occupants(tiamot_core::domain::OVERWORLD), 0);
+        assert_eq!(population.occupants("mod:ship/18"), 0);
+
+        population.set_domain(b, tiamot_core::domain::OVERWORLD);
+        assert_eq!(population.occupants("mod:ship/17"), 1);
+        assert_eq!(population.occupants(tiamot_core::domain::OVERWORLD), 1);
     }
 
     #[test]

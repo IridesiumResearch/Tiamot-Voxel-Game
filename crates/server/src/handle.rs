@@ -1643,7 +1643,7 @@ impl ServerHandle {
                                 // position and no domain, so a body would
                                 // otherwise collide against whichever domain
                                 // the lookup happened to be built over.
-                                let terrain = world.solid(tiamot_core::domain::OVERWORLD);
+                                let terrain = world.solid(&player.domain);
                                 let voxels = tiamot_core::phys::Voxels::with_fluid(
                                     &terrain,
                                     &*fluid,
@@ -2978,10 +2978,21 @@ impl ServerHandle {
                         // something a player is looking straight at.
                         {
                             let fluid = fluidics.read().expect("fluid lock");
-                            population
-                                .write()
-                                .expect("entity lock")
-                                .tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
+                            let mut mobs = population.write().expect("entity lock");
+                            // **Once per domain that has anybody in it**, each
+                            // against its own terrain. A world with one domain
+                            // does one pass, which is every world until a mod
+                            // makes a second — and the entities of a domain
+                            // nobody is in are not stepped at all, because
+                            // there are none.
+                            let occupied: Vec<String> = mobs
+                                .occupied_domains()
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect();
+                            for domain in occupied {
+                                mobs.tick(&domain, &world, &fluid);
+                            }
                         }
 
                         // **What each player is told about the entities.**
