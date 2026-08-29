@@ -584,6 +584,7 @@ dependencies = [
  "serde",
  "serde_json",
  "server",
+ "socket2",
  "thiserror 2.0.19",
  "tiamot-core",
  "tokio",

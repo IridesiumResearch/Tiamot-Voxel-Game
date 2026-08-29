@@ -30,6 +30,25 @@
 /// is an address they have to type — which is the thing this exists to remove.
 pub const PORT: u16 = 47812;
 
+/// The multicast group a host also sends to, so that a client on the SAME
+/// machine hears it.
+///
+/// **A limited broadcast does not reliably come back to the machine that sent
+/// it.** Linux and Windows hand it to local sockets listening on [`PORT`]; the
+/// BSD under macOS does not, so a client on the hosting machine saw nothing at
+/// all there. Multicast is the mechanism with the same answer everywhere:
+/// `IP_MULTICAST_LOOP` is on by default on all three platforms and delivers a
+/// copy to every socket on this machine that has joined the group.
+///
+/// It is sent IN ADDITION to the broadcast rather than instead of it. Broadcast
+/// is what a home network delivers most dependably — consumer access points do
+/// drop or rate-limit multicast — so the way other machines find a world is
+/// left exactly as it was, and this covers only the case that was broken.
+///
+/// `239.255.0.0/16` is the administratively scoped IPv4 local scope of RFC
+/// 2365: routable nowhere, which is the whole intent.
+pub const GROUP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(239, 255, 78, 12);
+
 /// How often a host repeats itself.
 ///
 /// Frequent enough that a client that has just opened the screen fills in

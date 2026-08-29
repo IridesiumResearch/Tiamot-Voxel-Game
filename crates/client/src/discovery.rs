@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tiamot_core::discover::{Beacon, MAX_DATAGRAM, PORT, STALE_MS};
+use tiamot_core::discover::{Beacon, GROUP, MAX_DATAGRAM, PORT, STALE_MS};
 
 /// A world heard on the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +202,19 @@ fn bind(port: u16) -> std::io::Result<UdpSocket> {
     )?;
     socket.set_reuse_address(true)?;
     socket.bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port).into())?;
+    // **So a world hosted on THIS machine is heard.** A limited broadcast is
+    // not handed back to the machine that sent it everywhere — macOS does not
+    // — so a host also sends to `discover::GROUP`, and only a socket that has
+    // joined the group receives that copy. See the constant for why it is an
+    // addition to the broadcast rather than a replacement for it.
+    //
+    // A failure to join is not a failure to listen: a machine with no
+    // multicast still hears every other machine's broadcast, which is the
+    // common case. Refusing to open the list over it would trade the whole
+    // feature for one corner of it.
+    if let Err(err) = socket.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED) {
+        tracing::debug!(%err, "not listening for worlds hosted on this machine");
+    }
     Ok(socket.into())
 }
 

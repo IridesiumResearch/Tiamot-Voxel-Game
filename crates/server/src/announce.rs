@@ -25,6 +25,19 @@ use tracing::{debug, warn};
 use crate::sim::Control;
 use crate::transport::endpoint::Shared;
 
+/// Where a beacon goes.
+///
+/// **Two destinations, because not every platform hands a machine back its own
+/// broadcast.** Linux and Windows deliver a limited broadcast to sockets on
+/// this machine that are listening on the port; the BSD under macOS does not,
+/// so a client on the hosting machine could never see the world being hosted
+/// there. The multicast copy covers that case, and costs one datagram a second.
+///
+/// The broadcast is still what other machines find a world by. Nothing about
+/// that path changes here — see [`tiamot_core::discover::GROUP`] for why the
+/// second destination is not a replacement for the first.
+const DESTINATIONS: [Ipv4Addr; 2] = [Ipv4Addr::BROADCAST, tiamot_core::discover::GROUP];
+
 /// A running announcer. Dropping it stops the beacon.
 pub struct Announcer {
     control: Control,
@@ -64,6 +77,16 @@ impl Announcer {
             .set_broadcast(true)
             .inspect_err(|err| warn!(%err, "could not broadcast; not announcing"))
             .ok()?;
+        // A hop, so a beacon reaches this segment and stops. Looped back on
+        // purpose: the copy this machine's own clients hear is the whole reason
+        // the group is here. Neither is worth refusing to host over — a machine
+        // that cannot do multicast still announces to the broadcast address.
+        if let Err(err) = socket.set_multicast_ttl_v4(1) {
+            debug!(%err, "the announcer could not set a multicast hop limit");
+        }
+        if let Err(err) = socket.set_multicast_loop_v4(true) {
+            debug!(%err, "a client on this machine will not hear this world");
+        }
 
         // Its own control, so stopping the announcer does not stop the world
         // and stopping the world does not have to know about the announcer.
@@ -73,7 +96,6 @@ impl Announcer {
         let thread = std::thread::Builder::new()
             .name("tiamot-announce".to_owned())
             .spawn(move || {
-                let to = SocketAddrV4::new(Ipv4Addr::BROADCAST, PORT);
                 while !stopping.stopping() {
                     let beacon = Beacon {
                         players: u16::try_from(shared.players.load(Ordering::Relaxed))
@@ -83,13 +105,19 @@ impl Announcer {
                     // Checked above, and the only field that changed since is a
                     // number. A failure here is nothing to say out loud once a
                     // second.
-                    if let Ok(bytes) = beacon.encode()
-                        && let Err(err) = socket.send_to(&bytes, to)
-                    {
-                        // Ordinary on a machine between networks. Said at debug
-                        // because it recurs every interval and is not an error
-                        // anybody can act on.
-                        debug!(%err, "a beacon did not go out");
+                    if let Ok(bytes) = beacon.encode() {
+                        for ip in DESTINATIONS {
+                            // Each destination stands on its own: a machine
+                            // between networks may refuse the broadcast while
+                            // the loopback copy goes out perfectly, and a
+                            // platform that dislikes the loopback broadcast
+                            // still reaches the network. Ordinary either way,
+                            // and said at debug because it recurs every
+                            // interval and is not an error anybody can act on.
+                            if let Err(err) = socket.send_to(&bytes, SocketAddrV4::new(ip, PORT)) {
+                                debug!(%err, %ip, "a beacon did not go out");
+                            }
+                        }
                     }
                     // Slept in short steps so stopping is quick: a second-long
                     // sleep would hold up closing a world by up to a second,
