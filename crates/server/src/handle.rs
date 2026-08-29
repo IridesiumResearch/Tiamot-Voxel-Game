@@ -2056,6 +2056,14 @@ impl ServerHandle {
                         // and doing it from a connection task would make the
                         // result depend on which one woke first.
                         for (uuid, target, brush) in shared.digs_in_progress() {
+                            // **The space the digger is standing in.** Every
+                            // read below decides what to break and every write
+                            // does the breaking, and the two must be about the
+                            // same world — reading the overworld's copy of a
+                            // block while breaking a ship's is how a dig takes
+                            // two cells out and then stalls for ever, which is
+                            // what the domain persistence test found.
+                            let digging_in = shared.player_domain(&uuid);
                             // **What is being dug, which is not always the cell
                             // that was aimed at.**
                             //
@@ -2072,10 +2080,10 @@ impl ServerHandle {
                             // asks its one cell, as it always did.
                             let material = match brush {
                                 tiamot_core::dig::Brush::SubNode => world
-                                    .subnode(tiamot_core::domain::OVERWORLD, target, &mut source)
+                                    .subnode(&digging_in, target, &mut source)
                                     .unwrap_or(tiamot_core::MaterialId::AIR),
                                 tiamot_core::dig::Brush::Block => world
-                                    .block_cells(tiamot_core::domain::OVERWORLD, target.block(), &mut source)
+                                    .block_cells(&digging_in, target.block(), &mut source)
                                     .ok()
                                     .and_then(|cells| {
                                         cells.into_iter().find(|material| !material.is_air())
@@ -2123,7 +2131,7 @@ impl ServerHandle {
                                 }
                                 tiamot_core::dig::Brush::Block => {
                                     let cells = world
-                                        .block_cells(tiamot_core::domain::OVERWORLD, target.block(), &mut source)
+                                        .block_cells(&digging_in, target.block(), &mut source)
                                         .unwrap_or(tiamot_core::block::EMPTY_CELLS);
                                     shared.block_hardness_of(&tiamot_core::block::BlockView::Mixed(
                                         &cells,
@@ -2136,7 +2144,7 @@ impl ServerHandle {
                             let cells = match brush {
                                 tiamot_core::dig::Brush::SubNode => 1,
                                 tiamot_core::dig::Brush::Block => world
-                                    .block_cells(tiamot_core::domain::OVERWORLD, target.block(), &mut source)
+                                    .block_cells(&digging_in, target.block(), &mut source)
                                     .map(|cells| {
                                         cells
                                             .iter()
@@ -2240,6 +2248,7 @@ impl ServerHandle {
                                     crumble_bites(
                                         &mut world,
                                         &mut source,
+                                        &digging_in,
                                         target.block(),
                                         chips,
                                         toward,
@@ -2296,6 +2305,10 @@ impl ServerHandle {
                         // options — charter rule 2 means the client cannot work
                         // out the reason for itself, so it has to be sent one.
                         for request in shared.drain_placements() {
+                            // The space the placer is standing in, for the same
+                            // reason a dig needs it: what is checked for being
+                            // occupied and what is written have to be one world.
+                            let building_in = shared.player_domain(&request.actor);
                             let material = tiamot_core::MaterialId(request.material);
                             // **What they hold of THIS stack**, not of this
                             // material. A player with one named block and
@@ -2474,7 +2487,7 @@ impl ServerHandle {
                                                 };
                                                 world
                                                     .subnode(
-                            tiamot_core::domain::OVERWORLD,
+                                                        &building_in,
                                                         tiamot_core::SubNodePos::new(x, y, z),
                                                         &mut source,
                                                     )
@@ -2585,7 +2598,7 @@ impl ServerHandle {
                             // naming only the new cells deletes the rest.
                             let same = filled == 0
                                 || world
-                                    .block_cells(tiamot_core::domain::OVERWORLD, plan.block, &mut source)
+                                    .block_cells(&building_in, plan.block, &mut source)
                                     .is_ok_and(|held| {
                                         held.iter()
                                             .all(|cell| cell.is_air() || *cell == material)
@@ -2604,7 +2617,7 @@ impl ServerHandle {
                             let mut failure = None;
                             let mut applied = 0;
                             for edit in edits {
-                                match world.apply(tiamot_core::domain::OVERWORLD, &edit, &mut source) {
+                                match world.apply(&building_in, &edit, &mut source) {
                                     Ok(_) => {
                                         applied += tiamot_core::place::edit_units(&edit);
                                         relight.push(edited_block(&edit));
@@ -2616,10 +2629,13 @@ impl ServerHandle {
                                             .write()
                                             .expect("fluid lock")
                                             .touch(edited_block(&edit));
-                                        shared.broadcast(ServerMessage::BlockDelta {
-                                            edit,
-                                            actor: Some(*request.actor.as_bytes()),
-                                        });
+                                        shared.broadcast_in(
+                                            &building_in,
+                                            ServerMessage::BlockDelta {
+                                                edit,
+                                                actor: Some(*request.actor.as_bytes()),
+                                            },
+                                        );
                                     }
                                     Err(err) => failure = Some(err),
                                 }
@@ -4012,11 +4028,18 @@ struct Earshot {
 fn crumble_bites(
     world: &mut crate::world::World,
     source: &mut dyn crate::world::ChunkSource,
+    domain: &str,
     block: tiamot_core::BlockPos,
     count: u32,
     toward: [f64; 3],
 ) -> Vec<tiamot_core::proto::Edit> {
-    let Ok(cells) = world.block_cells(tiamot_core::domain::OVERWORLD, block, source) else {
+    // **The digger's domain, not the overworld's.** These cells decide WHICH
+    // sub-nodes to take out, and the caller applies the result to the domain
+    // the digger is in — so reading the wrong one picks cells by what a
+    // different world has in it. The symptom is a dig that removes a couple of
+    // sub-nodes and then stalls for ever, because the cells it keeps choosing
+    // are already gone in the world it is actually breaking.
+    let Ok(cells) = world.block_cells(domain, block, source) else {
         return Vec::new();
     };
     let order = tiamot_core::dig::crumble_order(world.seed(), block, toward);

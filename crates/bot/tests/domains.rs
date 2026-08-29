@@ -71,6 +71,27 @@ fn write_mod(name: &str, extra: &str) -> PathBuf {
     root
 }
 
+/// A server on a world that is NOT wiped first.
+///
+/// For the tests that restart one: `scratch` deletes what it finds, which is
+/// right for a fresh fixture and fatal for a round trip.
+fn restart_at(world: PathBuf, mods: PathBuf) -> ServerHandle {
+    ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: world,
+        max_players: 4,
+        allowlist: Allowlist::open(),
+        operators: Vec::new(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(mods),
+        enabled_mods: None,
+        seed: Some(3),
+        rcon: None,
+        materials: MATERIALS.iter().map(|name| (*name).to_owned()).collect(),
+    })
+    .expect("start")
+}
+
 fn start(name: &str, mods: PathBuf) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
@@ -440,4 +461,86 @@ fn a_player_who_moves_stops_seeing_the_bodies_they_left_behind() {
         stayer.disconnect().await;
     });
     server.stop();
+}
+
+#[test]
+fn an_edit_in_another_domain_survives_a_restart_and_the_overworld_is_untouched() {
+    // **Criterion: persistence.** A dig inside a second domain has to come back
+    // under that domain's own key — and the overworld at the same coordinates
+    // has to be exactly as it was, because a row is `(domain, position)` and
+    // getting that wrong writes one space's edits into another's.
+    let world = scratch("persist-world");
+    let mods = write_mod(
+        "persist",
+        "game.register_on_chat(function(event)\n\
+         \x20   if event.text == 'attic' then\n\
+         \x20       local body = game.player_entity(event.player)\n\
+         \x20       game.transfer_entity(body, 'places:attic', { x = 8, y = 4, z = 8 })\n\
+         \x20       return false\n\
+         \x20   end\n\
+         end)",
+    );
+
+    // The block a player digs after being moved into the attic, decided by
+    // where they land rather than assumed: the transfer puts them at (8, 4, 8),
+    // and they fall to the floor the shared generator makes.
+    let dug = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    let first = restart_at(world.clone(), mods);
+    let target = std::sync::Arc::clone(&dug);
+    block_on(async {
+        let mut bot = join(&first, "Builder").await;
+        settle_for(&mut bot, 40).await;
+        bot.chat("attic").await.expect("chat");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while switched_to(&bot).is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "never moved");
+            let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+        }
+        settle_for(&mut bot, 40).await;
+
+        let here = bot.settle().await.expect("settle").block();
+        let block = tiamot_core::BlockPos::new(here.x + 1, here.y - 1, here.z);
+        bot.dig_block(block).await.expect("dig in the attic");
+        *target.lock().expect("lock") = Some(block);
+
+        bot.disconnect().await;
+    });
+    // Stopping is what writes it: a round trip that never closed the world is a
+    // test of the cache.
+    assert!(first.stop(), "the world should close cleanly");
+
+    let block = dug.lock().expect("lock").expect("a block was dug");
+
+    // **Asked of the world file, not of a client's memory.** A second session
+    // has been told nothing about what happened in the first, so a delta-based
+    // check would pass on a world where nothing was written at all.
+    let mut registry = tiamot_core::Registry::new();
+    let db = tiamot_core::persist::WorldDb::open(
+        world.join(tiamot_server::handle::WORLD_FILE),
+        &mut registry,
+    )
+    .expect("reopen the world");
+
+    let attic = db
+        .load_chunk_in("places:attic", block.chunk())
+        .expect("read")
+        .expect("the attic chunk was written when the player dug in it");
+    assert_eq!(
+        attic.get_block(block).map(|view| view.filled_cells()),
+        Some(0),
+        "the hole dug in the attic did not survive the restart"
+    );
+
+    let overworld = db
+        .load_chunk(block.chunk())
+        .expect("read")
+        .expect("the overworld chunk was written when the player stood on it");
+    assert!(
+        overworld
+            .get_block(block)
+            .is_some_and(|view| view.filled_cells() > 0),
+        "the overworld at {block:?} was emptied by a dig in another domain, so \
+         one space's edits are landing in another's rows"
+    );
 }
