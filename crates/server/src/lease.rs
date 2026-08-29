@@ -336,7 +336,7 @@ mod tests {
     struct Empty;
 
     impl crate::world::ChunkSource for Empty {
-        fn generate(&mut self, pos: ChunkPos, _world_seed: u64) -> Chunk {
+        fn generate(&mut self, _domain: &str, pos: ChunkPos, _world_seed: u64) -> Chunk {
             Chunk::air(pos)
         }
     }

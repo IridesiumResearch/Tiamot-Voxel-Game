@@ -196,11 +196,12 @@ impl<V: ScriptVm> ModHost<V> {
     /// chunks generate without it.
     pub fn generate_chunk(
         &mut self,
+        domain: &str,
         world_seed: u64,
         pos: ChunkPos,
         fill: MaterialId,
     ) -> Result<Chunk, ScriptError> {
-        self.vm.generate_chunk(world_seed, pos, fill)
+        self.vm.generate_chunk(domain, world_seed, pos, fill)
     }
 
     /// The VM, for tests and diagnostics.

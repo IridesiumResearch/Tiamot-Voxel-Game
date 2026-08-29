@@ -105,7 +105,12 @@ fn main() {
 
     let worldgen = best_of(200, || {
         let chunk = vm
-            .generate_chunk(42, ChunkPos::new(0, 0, 0), tiamot_core::MaterialId::AIR)
+            .generate_chunk(
+                tiamot_core::domain::OVERWORLD,
+                42,
+                ChunkPos::new(0, 0, 0),
+                tiamot_core::MaterialId::AIR,
+            )
             .expect("generate");
         black_box(chunk);
     });

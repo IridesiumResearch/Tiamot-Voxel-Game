@@ -1406,7 +1406,16 @@ function game.register_fluid(spec) end
 ---  the instances with `game.create_domain`.
 ---
 ---The id is namespaced with your mod's id, like every other registration.
----@param spec { id: string, kind: string?, scale: number?, instanced: boolean? }
+---* `generator` — what fills its chunks, with the same signature as
+---  `game.register_on_generate`. **A domain fills itself or it is air**: the
+---  overworld's generators do not run in it, because a mod that never thought
+---  about domains would otherwise fill every space anybody made with ground.
+---  Air is the right default for a ship's interior — somebody builds it, and
+---  terrain arriving uninvited would be a hill through their hull. A template's
+---  generator is inherited by every instance made from it, so fifty ships are
+---  one piece of worldgen. Refused on a `sparse` domain, which has no chunks
+---  for it to fill.
+---@param spec { id: string, kind: string?, scale: number?, instanced: boolean?, generator: fun(buf: any, pos: { x: integer, y: integer, z: integer })? }
 function game.register_domain(spec) end
 
 ---Makes an instance of a template, or hands back the one already there.

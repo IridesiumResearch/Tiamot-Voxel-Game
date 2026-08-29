@@ -1469,6 +1469,7 @@ impl ServerHandle {
                             let access = std::sync::Arc::new(crate::ent::Shared::new(
                                 std::sync::Arc::clone(&population),
                                 std::sync::Arc::clone(&shared.bodies),
+                                std::sync::Arc::clone(&domains),
                             ));
                             entity_access = Some(std::sync::Arc::clone(&access));
                             host.vm_mut().set_entity_access(access);

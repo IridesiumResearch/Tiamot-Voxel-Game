@@ -82,7 +82,7 @@ pub trait ChunkSource {
     /// errors has already been disabled by the host (charter rule 10), and what
     /// this must return is *some* chunk — a hole in the world is worse than a
     /// plain one.
-    fn generate(&mut self, pos: ChunkPos, world_seed: u64) -> Chunk;
+    fn generate(&mut self, domain: &str, pos: ChunkPos, world_seed: u64) -> Chunk;
 }
 
 /// A generator that produces nothing but air.
@@ -93,7 +93,7 @@ pub trait ChunkSource {
 pub struct Air;
 
 impl ChunkSource for Air {
-    fn generate(&mut self, pos: ChunkPos, _world_seed: u64) -> Chunk {
+    fn generate(&mut self, _domain: &str, pos: ChunkPos, _world_seed: u64) -> Chunk {
         Chunk::new(pos, MaterialId::AIR)
     }
 }
@@ -118,8 +118,11 @@ impl<V: tiamot_core::script::ScriptVm> ModGenerator<V> {
 }
 
 impl<V: tiamot_core::script::ScriptVm> ChunkSource for ModGenerator<V> {
-    fn generate(&mut self, pos: ChunkPos, world_seed: u64) -> Chunk {
-        match self.host.generate_chunk(world_seed, pos, MaterialId::AIR) {
+    fn generate(&mut self, domain: &str, pos: ChunkPos, world_seed: u64) -> Chunk {
+        match self
+            .host
+            .generate_chunk(domain, world_seed, pos, MaterialId::AIR)
+        {
             Ok(chunk) => chunk,
             Err(err) => {
                 // The host has already disabled the offending mod (charter
@@ -365,10 +368,10 @@ impl Generator {
 }
 
 impl ChunkSource for Generator {
-    fn generate(&mut self, pos: ChunkPos, world_seed: u64) -> Chunk {
+    fn generate(&mut self, domain: &str, pos: ChunkPos, world_seed: u64) -> Chunk {
         match self {
-            Self::Mods(generator) => generator.generate(pos, world_seed),
-            Self::Air(air) => air.generate(pos, world_seed),
+            Self::Mods(generator) => generator.generate(domain, pos, world_seed),
+            Self::Air(air) => air.generate(domain, pos, world_seed),
         }
     }
 }
@@ -786,7 +789,7 @@ impl World {
                     // Never visited. Generate it and mark it dirty so it is
                     // written — see the module docs on why a generated chunk is
                     // stored rather than regenerated later.
-                    let generated = source.generate(pos, seed);
+                    let generated = source.generate(domain, pos, seed);
                     if !space.dirty.contains(&pos) {
                         space.dirty.push(pos);
                     }
@@ -1213,7 +1216,7 @@ mod tests {
     }
 
     impl ChunkSource for Flat {
-        fn generate(&mut self, pos: ChunkPos, _world_seed: u64) -> Chunk {
+        fn generate(&mut self, _domain: &str, pos: ChunkPos, _world_seed: u64) -> Chunk {
             self.generated.push(pos);
             if pos.y < 0 {
                 Chunk::new(pos, self.material)

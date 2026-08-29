@@ -101,7 +101,12 @@ fn the_reference_generator_produces_the_half_white_world() {
     // Chunk (0, -1, 0) covers world y in -16..0 — entirely below the surface,
     // so it is NOT uniform any more: the top layer of it is the ground.
     let below = host
-        .generate_chunk(0, ChunkPos::new(0, -1, 0), MaterialId::AIR)
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            0,
+            ChunkPos::new(0, -1, 0),
+            MaterialId::AIR,
+        )
         .expect("generate");
     assert_eq!(
         below.is_uniform(),
@@ -127,7 +132,12 @@ fn the_reference_generator_produces_the_half_white_world() {
 
     // Chunk (0, 0, 0) covers world y in 0..16 — entirely above it.
     let above = host
-        .generate_chunk(0, ChunkPos::new(0, 0, 0), MaterialId::AIR)
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            0,
+            ChunkPos::new(0, 0, 0),
+            MaterialId::AIR,
+        )
         .expect("generate");
     assert_eq!(
         above.is_uniform(),
@@ -143,10 +153,10 @@ fn generation_is_reproducible_through_the_script_path() {
 
     let pos = ChunkPos::new(3, -1, -7);
     let first = host
-        .generate_chunk(42, pos, MaterialId::AIR)
+        .generate_chunk(tiamot_core::domain::OVERWORLD, 42, pos, MaterialId::AIR)
         .expect("generate");
     let second = host
-        .generate_chunk(42, pos, MaterialId::AIR)
+        .generate_chunk(tiamot_core::domain::OVERWORLD, 42, pos, MaterialId::AIR)
         .expect("generate");
     assert_eq!(
         first, second,
@@ -269,7 +279,12 @@ fn assert_golden(host: &mut EngineHost, golden: &[(u64, i32, i32, i32, u64)], wh
     let mut mismatches = Vec::new();
     for &(seed, x, y, z, expected) in golden {
         let chunk = host
-            .generate_chunk(seed, ChunkPos::new(x, y, z), MaterialId::AIR)
+            .generate_chunk(
+                tiamot_core::domain::OVERWORLD,
+                seed,
+                ChunkPos::new(x, y, z),
+                MaterialId::AIR,
+            )
             .expect("generate");
         let actual = hash_chunk(&chunk);
         if actual != expected {
@@ -367,7 +382,12 @@ end)
     assert!(host.failed().is_empty(), "both mods should LOAD fine");
 
     // First generation hits the fault.
-    let first = host.generate_chunk(1, ChunkPos::new(0, 0, 0), MaterialId::AIR);
+    let first = host.generate_chunk(
+        tiamot_core::domain::OVERWORLD,
+        1,
+        ChunkPos::new(0, 0, 0),
+        MaterialId::AIR,
+    );
     assert!(
         first.is_err(),
         "the faulting generator should report an error"
@@ -385,7 +405,12 @@ end)
 
     // Second generation skips it and the healthy generator still runs.
     let second = host
-        .generate_chunk(1, ChunkPos::new(0, 0, 0), MaterialId::AIR)
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            1,
+            ChunkPos::new(0, 0, 0),
+            MaterialId::AIR,
+        )
         .expect("the world must keep generating once the bad mod is disabled");
     let solid = host
         .vm()
@@ -426,7 +451,12 @@ end)
 
     // Without the budget this never returns and the test suite hangs.
     let err = host
-        .generate_chunk(1, ChunkPos::new(0, 0, 0), MaterialId::AIR)
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            1,
+            ChunkPos::new(0, 0, 0),
+            MaterialId::AIR,
+        )
         .expect_err("the budget must stop this");
     assert_eq!(err.mod_id(), Some("runaway"));
     assert!(

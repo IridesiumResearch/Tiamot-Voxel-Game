@@ -318,6 +318,12 @@ impl MluaVm {
         format!("tiamot.on_generate.{mod_id}")
     }
 
+    /// Where one DOMAIN's generator callback lives. See the free function of
+    /// the same name, which is what `register_domain` writes through.
+    fn domain_generator_key(domain: &str) -> String {
+        domain_generator_key(domain)
+    }
+
     /// Builds a fresh sandboxed environment for one mod.
     fn build_environment(&self, mod_id: &str, dir: &Path) -> Result<Table, ScriptError> {
         let env = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
@@ -844,6 +850,7 @@ impl ScriptVm for MluaVm {
 
     fn generate_chunk(
         &mut self,
+        domain: &str,
         world_seed: u64,
         pos: ChunkPos,
         fill: MaterialId,
@@ -855,23 +862,55 @@ impl ScriptVm for MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
 
-        // Read from the registry, which is where registration actually wrote.
-        let generators: Vec<String> = self
-            .lua
-            .named_registry_value::<Table>("tiamot.generators")
-            .map_err(|err| self.vm_error(&err))?
-            .sequence_values::<String>()
-            .filter_map(Result::ok)
-            .collect();
+        // **Which mods fill this chunk depends on which space it is in.** The
+        // overworld gets every `register_on_generate`, as it always did; any
+        // other domain gets the one generator its `register_domain` named, and
+        // a domain that named none gets air. See `ScriptVm::generate_chunk`.
+        // Each entry is the mod to blame and the registry key holding its
+        // callback — a domain's generator is a different function from that
+        // mod's `on_generate`, so the key cannot be derived from the mod alone.
+        let generators: Vec<(String, String)> = if domain == crate::domain::OVERWORLD {
+            // Read from the registry, which is where registration actually
+            // wrote.
+            self.lua
+                .named_registry_value::<Table>("tiamot.generators")
+                .map_err(|err| self.vm_error(&err))?
+                .sequence_values::<String>()
+                .filter_map(Result::ok)
+                .map(|mod_id| {
+                    let key = Self::generator_key(&mod_id);
+                    (mod_id, key)
+                })
+                .collect()
+        } else {
+            let owners: Table = self
+                .lua
+                .named_registry_value("tiamot.domain_generators")
+                .map_err(|err| self.vm_error(&err))?;
+            // **An instance is filled by its TEMPLATE's generator.** Nobody
+            // wrote worldgen for `ship/17` — they wrote it for `ship`, once,
+            // and that is what makes fifty ships one piece of worldgen rather
+            // than fifty. The template is the half before the separator.
+            let named = domain
+                .split_once(crate::domain::INSTANCE_SEPARATOR)
+                .map_or(domain, |(template, _)| template);
+            owners
+                .get::<Option<String>>(named)
+                .ok()
+                .flatten()
+                .map(|mod_id| (mod_id, Self::domain_generator_key(named)))
+                .into_iter()
+                .collect()
+        };
 
-        for mod_id in generators {
+        for (mod_id, key) in generators {
             if self.faulted.contains(&mod_id) {
                 continue;
             }
 
             let callback: mlua::Function = self
                 .lua
-                .named_registry_value(&Self::generator_key(&mod_id))
+                .named_registry_value(&key)
                 .map_err(|err| self.vm_error(&err))?;
 
             let position = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
@@ -3982,6 +4021,10 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.tools", tools)
             .map_err(|err| self.vm_error(&err))?;
+        let domain_generators = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.domain_generators", domain_generators)
+            .map_err(|err| self.vm_error(&err))?;
         let domains = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.domains", domains)
@@ -4620,6 +4663,12 @@ fn fluid_colour(spec: &Table, qualified: &str) -> mlua::Result<[u8; 3]> {
 /// Stored raw and turned into a `domain::Spec` by `registered_domains`, exactly
 /// as fluids are: the VM's job is to collect what mods said, and the host's is
 /// to decide what it means.
+/// Where one domain's generator callback lives. Mirrors
+/// `MluaVm::domain_generator_key`, which is the reader.
+fn domain_generator_key(domain: &str) -> String {
+    format!("tiamot.domain_generate.{domain}")
+}
+
 fn register_domain(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
     if frozen {
@@ -4658,6 +4707,23 @@ fn register_domain(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
         )));
     }
     let instanced: bool = spec.get("instanced").unwrap_or(false);
+
+    // **A domain fills itself, or it is air.** Stored under the domain's own
+    // key rather than the mod's: one mod may declare several spaces and each
+    // fills itself differently — a ship is not a star. A template's generator
+    // is stored under the TEMPLATE, and every instance made from it finds it
+    // there, which is what makes fifty ships one piece of worldgen.
+    if let Ok(generator) = spec.get::<mlua::Function>("generator") {
+        if kind == "sparse" {
+            return Err(mlua::Error::external(format!(
+                "register_domain(\"{qualified}\"): a sparse domain holds no voxels, so a \
+                 generator would never run"
+            )));
+        }
+        lua.set_named_registry_value(&domain_generator_key(&qualified), generator)?;
+        let owners: Table = lua.named_registry_value("tiamot.domain_generators")?;
+        owners.set(qualified.clone(), owner.to_owned())?;
+    }
 
     let registry: Table = lua.named_registry_value("tiamot.domains")?;
     if registry.contains_key(qualified.clone())? {
@@ -5086,7 +5152,7 @@ const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "defa
 /// Checked so a typo is an error rather than a silent default — the same rule
 /// every other registration applies, and for the reason `register_fluid` gives:
 /// a misspelled field is a mod that thinks it configured something.
-const DOMAIN_FIELDS: [&str; 4] = ["id", "kind", "scale", "instanced"];
+const DOMAIN_FIELDS: [&str; 5] = ["id", "kind", "scale", "instanced", "generator"];
 
 const FLUID_FIELDS: [&str; 6] = [
     "id",

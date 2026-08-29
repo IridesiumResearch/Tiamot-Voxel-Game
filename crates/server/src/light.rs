@@ -380,7 +380,12 @@ mod tests {
     struct Empty;
 
     impl crate::world::ChunkSource for Empty {
-        fn generate(&mut self, pos: ChunkPos, _seed: u64) -> tiamot_core::chunk::Chunk {
+        fn generate(
+            &mut self,
+            _domain: &str,
+            pos: ChunkPos,
+            _seed: u64,
+        ) -> tiamot_core::chunk::Chunk {
             tiamot_core::chunk::Chunk::air(pos)
         }
     }

@@ -652,6 +652,9 @@ pub struct Shared {
     /// this after the mods have had their turn, which is also what makes
     /// asking for one mid-tick safe.
     transfers: std::sync::Mutex<Vec<TransferRequest>>,
+    /// Every domain this world has, so a move into one that does not exist is
+    /// refused where the mod can see it rather than dropped by the tick.
+    domains: std::sync::Arc<std::sync::RwLock<tiamot_core::domain::Registry>>,
     /// The players' authoritative bodies.
     ///
     /// **Not the mirrors in `population`.** A mod moving a player has to write
@@ -666,10 +669,12 @@ impl Shared {
     pub fn new(
         population: std::sync::Arc<std::sync::RwLock<Population>>,
         bodies: std::sync::Arc<crate::transport::PlayerBodies>,
+        domains: std::sync::Arc<std::sync::RwLock<tiamot_core::domain::Registry>>,
     ) -> Self {
         Self {
             population,
             transfers: std::sync::Mutex::new(Vec::new()),
+            domains,
             bodies,
         }
     }
@@ -759,6 +764,18 @@ impl tiamot_core::ent::Access for Shared {
             .read()
             .is_ok_and(|population| population.get(id).is_some());
         if !known {
+            return false;
+        }
+        // **And that there is somewhere to go.** A typo in a domain id would
+        // otherwise move a body into a space that does not exist: no chunks
+        // will ever stream, nothing is stored, and the player is nowhere. The
+        // tick could refuse it, but the mod would never hear — and this is a
+        // mistake a mod can fix.
+        if !self
+            .domains
+            .read()
+            .is_ok_and(|registry| registry.exists(domain))
+        {
             return false;
         }
         let Ok(mut queued) = self.transfers.lock() else {
@@ -894,7 +911,12 @@ mod tests {
     struct Empty;
 
     impl crate::world::ChunkSource for Empty {
-        fn generate(&mut self, pos: ChunkPos, _seed: u64) -> tiamot_core::chunk::Chunk {
+        fn generate(
+            &mut self,
+            _domain: &str,
+            pos: ChunkPos,
+            _seed: u64,
+        ) -> tiamot_core::chunk::Chunk {
             tiamot_core::chunk::Chunk::air(pos)
         }
     }
@@ -1061,9 +1083,24 @@ mod tests {
 
     /// The mod-facing handle, over a population and no player bodies.
     fn access(population: &std::sync::Arc<std::sync::RwLock<Population>>) -> Shared {
+        // A registry with the ship template in it, so a transfer into one is
+        // not refused for naming a domain that does not exist.
+        let mut registry = tiamot_core::domain::Registry::new();
+        registry
+            .register(
+                "mod:ship",
+                tiamot_core::domain::Spec {
+                    instanced: true,
+                    ..tiamot_core::domain::Spec::default()
+                },
+            )
+            .expect("register");
+        registry.create("mod:ship", "17").expect("create");
+        registry.freeze();
         Shared::new(
             std::sync::Arc::clone(population),
             std::sync::Arc::new(crate::transport::PlayerBodies::default()),
+            std::sync::Arc::new(std::sync::RwLock::new(registry)),
         )
     }
 
@@ -1098,6 +1135,33 @@ mod tests {
             "draining the queue left the request in it, so the tick would move \
              the same body every tick for ever"
         );
+    }
+
+    #[test]
+    fn transferring_into_a_domain_that_does_not_exist_is_refused_at_the_call() {
+        // A typo in a domain id would otherwise move a body into a space that
+        // does not exist: no chunks ever stream, nothing is stored, and the
+        // player is nowhere. **Found by a test whose own mod had the typo** —
+        // it named `generators:loft` for a domain registered as `places:loft`,
+        // and the transfer was accepted and carried out.
+        use tiamot_core::ent::Access as _;
+
+        let population = std::sync::Arc::new(std::sync::RwLock::new(Population::new()));
+        let id = population
+            .write()
+            .expect("lock")
+            .spawn(mob(ChunkPos::new(0, 0, 0), [8.0, 0.0, 8.0]));
+        let shared = access(&population);
+
+        assert!(
+            !shared.transfer(id, "mod:nowhere", [0.0; 3]),
+            "a move into a domain nothing registered was accepted"
+        );
+        assert!(shared.take_transfers().is_empty());
+
+        // And the counter-example, so this is not just refusing everything.
+        assert!(shared.transfer(id, "mod:ship/17", [0.0; 3]));
+        assert_eq!(shared.take_transfers().len(), 1);
     }
 
     #[test]

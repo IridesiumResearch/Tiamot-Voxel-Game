@@ -1042,8 +1042,22 @@ pub trait ScriptVm: Sized {
     ///
     /// [`ScriptError`] naming the mod that failed. A failure here disables that
     /// mod; it does not stop generation for the others.
+    ///
+    /// # Which generator runs is decided by the domain
+    ///
+    /// The overworld is filled by every `register_on_generate` callback, as it
+    /// always was. **Any other domain is filled by its own generator and by
+    /// nothing else** — the one named in its `register_domain`, if it named
+    /// one. A domain that named none is AIR, which is the right answer for a
+    /// ship's interior: somebody builds it, and terrain arriving in it uninvited
+    /// would be a hill through the middle of their hull.
+    ///
+    /// Running every mod's `on_generate` in every domain was the other option
+    /// and is worse: a mod that did not think about domains would fill every
+    /// space anybody ever made with the overworld's ground.
     fn generate_chunk(
         &mut self,
+        domain: &str,
         world_seed: u64,
         pos: ChunkPos,
         fill: MaterialId,

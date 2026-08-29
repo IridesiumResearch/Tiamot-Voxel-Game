@@ -61,8 +61,14 @@ fn write_mod(name: &str, extra: &str) -> PathBuf {
              \x20   speed_multiplier = 1.0,\n\
              \x20   default = true,\n\
              }}\n\
-             game.register_domain{{ id = \"attic\" }}\n\
-             game.register_domain{{ id = \"ship\", instanced = true }}\n\
+             game.register_domain{{ id = \"attic\", generator = function(buf, pos)\n\
+             \x20   buf:fill_below_heightmap(game.flat_heightmap(0), ground)\n\
+             end }}\n\
+             game.register_domain{{ id = \"void\" }}\n\
+             game.register_domain{{ id = \"ship\", instanced = true,\n\
+             \x20   generator = function(buf, pos)\n\
+             \x20       buf:fill_below_heightmap(game.flat_heightmap(0), ground)\n\
+             \x20   end }}\n\
              game.register_domain{{ id = \"space\", kind = \"sparse\", scale = 1000.0 }}\n\
              {extra}\n"
         ),
@@ -146,6 +152,27 @@ fn chunks_seen(bot: &Bot) -> usize {
         .into_iter()
         .filter(|message| matches!(message, tiamot_core::proto::ServerMessage::ChunkData { .. }))
         .count()
+}
+
+/// Whether a stored chunk has anything solid in it.
+///
+/// Sampled over the chunk rather than asked of a summary: a chunk is a palette
+/// and a bit array, and "is it empty" is a question about what the blocks say.
+fn holds_anything(chunk: &tiamot_core::Chunk, at: tiamot_core::ChunkPos) -> bool {
+    let corner = tiamot_core::BlockPos::from_chunk_corner(at);
+    (0..16).any(|x| {
+        (0..16).any(|y| {
+            (0..16).any(|z| {
+                chunk
+                    .get_block(tiamot_core::BlockPos::new(
+                        corner.x + x,
+                        corner.y + y,
+                        corner.z + z,
+                    ))
+                    .is_some_and(|view| view.filled_cells() > 0)
+            })
+        })
+    })
 }
 
 /// Whether this bot has been told about any entity at all.
@@ -705,7 +732,7 @@ fn a_domain_nobody_visits_costs_nothing_and_a_sparse_one_never_holds_voxels() {
         "the overworld stored nothing, so this cannot tell a domain that costs \
          nothing from a world that was never written (domains: {stored:?})"
     );
-    for empty in ["places:attic", "places:space", "places:ship"] {
+    for empty in ["places:attic", "places:space", "places:ship", "places:void"] {
         assert!(
             !stored.iter().any(|domain| domain == empty),
             "`{empty}` has rows in a world nobody ever went to it in \
@@ -1151,5 +1178,94 @@ fn a_ship_keeps_what_was_built_in_it_across_a_restart() {
             .get_block(block)
             .is_some_and(|view| view.filled_cells() > 0),
         "a dig aboard a runtime instance landed in the overworld's rows"
+    );
+}
+
+#[test]
+fn a_domain_is_filled_by_its_own_generator_and_not_by_the_overworlds() {
+    // **A domain fills itself, or it is air.** Running every mod's
+    // `on_generate` in every space would fill anything anybody ever made with
+    // the overworld's ground — a hill through the middle of somebody's hull.
+    // So the overworld gets its generators, a domain that named one gets that,
+    // and a domain that named none gets nothing.
+    //
+    // `places:void` names no generator and must be empty. `places:loft` names
+    // one, and must have what it made. `places:attic` names one too, which is
+    // what the other tests in this file stand on — a domain with no generator
+    // is a domain you fall through for ever, which is correct and is why the
+    // fixture gives the rooms people walk about in some ground.
+    let world = scratch("generators-world");
+    let server = restart_at(
+        world.clone(),
+        write_mod(
+            "generators",
+            "local slab = game.register_block{ id = 'slab' }\n\
+             game.register_domain{ id = 'loft', generator = function(buf, pos)\n\
+             \x20   buf:fill_below_heightmap(game.flat_heightmap(-4), slab)\n\
+             end }\n\
+             game.register_on_chat(function(event)\n\
+             \x20   local body = game.player_entity(event.player)\n\
+             \x20   if event.text == 'attic' then\n\
+             \x20       game.transfer_entity(body, 'places:attic', { x = 8, y = 4, z = 8 })\n\
+             \x20   elseif event.text == 'loft' then\n\
+             \x20       game.transfer_entity(body, 'places:loft', { x = 8, y = 4, z = 8 })\n\
+             \x20   end\n\
+             \x20   return false\n\
+             end)",
+        ),
+    );
+    block_on(async {
+        let mut bot = join(&server, "Surveyor").await;
+        settle_for(&mut bot, 40).await;
+        for room in ["attic", "loft"] {
+            bot.chat(room).await.expect("chat");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !switched_to(&bot).is_some_and(|domain| domain.ends_with(room)) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "never reached `{room}`"
+                );
+                let _ = tokio::time::timeout(Duration::from_millis(60), bot.recv()).await;
+            }
+            settle_for(&mut bot, 80).await;
+        }
+        bot.disconnect().await;
+    });
+    assert!(server.stop(), "the world should close cleanly");
+
+    let mut registry = tiamot_core::Registry::new();
+    let db = tiamot_core::persist::WorldDb::open(
+        world.join(tiamot_server::handle::WORLD_FILE),
+        &mut registry,
+    )
+    .expect("reopen");
+
+    // The overworld is full, which is what says the fixture's generator ran at
+    // all — without this, "the attic is empty" is also true of a broken world.
+    let ground = db
+        .load_chunk(tiamot_core::ChunkPos::new(0, -1, 0))
+        .expect("read")
+        .expect("the overworld under the player was written");
+    assert!(
+        holds_anything(&ground, tiamot_core::ChunkPos::new(0, -1, 0)),
+        "the overworld generated nothing, so this cannot tell an empty domain \
+         from an empty world"
+    );
+
+    let void = db
+        .load_chunk_in("places:void", tiamot_core::ChunkPos::new(0, -1, 0))
+        .expect("read");
+    assert!(
+        void.is_none_or(|chunk| !holds_anything(&chunk, tiamot_core::ChunkPos::new(0, -1, 0))),
+        "a domain that named no generator was filled by the overworld's"
+    );
+
+    let loft = db
+        .load_chunk_in("places:loft", tiamot_core::ChunkPos::new(0, -1, 0))
+        .expect("read")
+        .expect("a domain with its own generator was written");
+    assert!(
+        holds_anything(&loft, tiamot_core::ChunkPos::new(0, -1, 0)),
+        "a domain's own generator did not fill it"
     );
 }
