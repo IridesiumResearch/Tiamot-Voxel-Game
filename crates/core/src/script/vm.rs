@@ -1216,6 +1216,12 @@ pub trait ScriptVm: Sized {
     /// "no entry" from "default entry" is how one of them ends up unbreakable.
     fn registered_block_rules(&self) -> Vec<BlockRules>;
 
+    /// Every domain and template a mod registered, by id, sorted.
+    ///
+    /// Read once after the freeze, exactly as blocks and fluids are: the VM
+    /// collects what mods said and the host decides what it means.
+    fn registered_domains(&self) -> Vec<(String, crate::domain::Spec)>;
+
     /// Fluids registered during the loading window, ordered by fluid id.
     ///
     /// Empty for a mod set that registers none, which is most of them and is

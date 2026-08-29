@@ -1361,6 +1361,36 @@ impl ScriptVm for MluaVm {
         all.into_iter().map(|(_, rules)| rules).collect()
     }
 
+    fn registered_domains(&self) -> Vec<(String, crate::domain::Spec)> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.domains") else {
+            return Vec::new();
+        };
+        let mut domains: Vec<(String, crate::domain::Spec)> = registry
+            .pairs::<String, Table>()
+            .filter_map(Result::ok)
+            .filter_map(|(id, entry)| {
+                let kind: String = entry.get("kind").ok()?;
+                Some((
+                    id,
+                    crate::domain::Spec {
+                        kind: if kind == "sparse" {
+                            crate::domain::Kind::Sparse
+                        } else {
+                            crate::domain::Kind::Voxel
+                        },
+                        scale: entry.get("scale").ok()?,
+                        instanced: entry.get("instanced").ok()?,
+                    },
+                ))
+            })
+            .collect();
+        // Sorted, because a Lua table's pair order is not defined and which
+        // domains a world has is observable — charter rule 4 does not care that
+        // this one happens to be a registration rather than a simulation.
+        domains.sort_by(|a, b| a.0.cmp(&b.0));
+        domains
+    }
+
     fn registered_fluids(&self) -> Vec<FluidRules> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.fluids") else {
             return Vec::new();
@@ -2440,6 +2470,14 @@ impl MluaVm {
             .lua
             .create_function(move |lua, spec: Table| register_fluid(lua, &owner, &spec))
             .map_err(|err| self.vm_error(&err))?;
+        let owner = mod_id.to_owned();
+        let register_domain = self
+            .lua
+            .create_function(move |lua, spec: Table| register_domain(lua, &owner, &spec))
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_domain", register_domain)
+            .map_err(|err| self.vm_error(&err))?;
+
         game.set("register_fluid", register_fluid)
             .map_err(|err| self.vm_error(&err))?;
 
@@ -3891,6 +3929,10 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.tools", tools)
             .map_err(|err| self.vm_error(&err))?;
+        let domains = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.domains", domains)
+            .map_err(|err| self.vm_error(&err))?;
         let fluids = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.fluids", fluids)
@@ -4520,6 +4562,65 @@ fn fluid_colour(spec: &Table, qualified: &str) -> mlua::Result<[u8; 3]> {
     Ok(channels)
 }
 
+/// `game.register_domain{ id, kind, scale, instanced }`.
+///
+/// Stored raw and turned into a `domain::Spec` by `registered_domains`, exactly
+/// as fluids are: the VM's job is to collect what mods said, and the host's is
+/// to decide what it means.
+fn register_domain(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
+    let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+    if frozen {
+        return Err(mlua::Error::external(format!(
+            "mod `{owner}`: registration is closed"
+        )));
+    }
+
+    let id: String = spec
+        .get("id")
+        .map_err(|_| mlua::Error::external("register_domain: missing required field `id`"))?;
+
+    for pair in spec.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        if let Value::String(name) = key {
+            let name = name.to_string_lossy();
+            if !DOMAIN_FIELDS.contains(&name.as_ref()) {
+                return Err(mlua::Error::external(format!(
+                    "register_domain(\"{id}\"): unknown field `{name}`"
+                )));
+            }
+        }
+    }
+
+    let qualified = qualify_id(owner, &id).map_err(mlua::Error::external)?;
+    let kind: String = spec.get("kind").unwrap_or_else(|_| "voxel".to_owned());
+    if kind != "voxel" && kind != "sparse" {
+        return Err(mlua::Error::external(format!(
+            "register_domain(\"{qualified}\"): `kind` is \"voxel\" or \"sparse\", not \"{kind}\""
+        )));
+    }
+    let scale: f64 = spec.get("scale").unwrap_or(1.0);
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(mlua::Error::external(format!(
+            "register_domain(\"{qualified}\"): `scale` must be a positive number"
+        )));
+    }
+    let instanced: bool = spec.get("instanced").unwrap_or(false);
+
+    let registry: Table = lua.named_registry_value("tiamot.domains")?;
+    if registry.contains_key(qualified.clone())? {
+        return Err(mlua::Error::external(format!(
+            "register_domain(\"{qualified}\"): already registered; a second registration \
+             would silently replace the first"
+        )));
+    }
+    let entry = lua.create_table()?;
+    entry.set("kind", kind)?;
+    entry.set("scale", scale)?;
+    entry.set("instanced", instanced)?;
+    registry.set(qualified, entry)?;
+    Ok(())
+}
+
 fn register_fluid(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<()> {
     let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
     if frozen {
@@ -4927,6 +5028,13 @@ const TOOL_FIELDS: [&str; 5] = ["id", "name", "brush", "speed_multiplier", "defa
 
 /// Fields `register_fluid` accepts. Anything else is a typo, and a typo that is
 /// silently ignored is a mod whose author cannot tell why nothing happened.
+/// The fields `game.register_domain` accepts.
+///
+/// Checked so a typo is an error rather than a silent default — the same rule
+/// every other registration applies, and for the reason `register_fluid` gives:
+/// a misspelled field is a mod that thinks it configured something.
+const DOMAIN_FIELDS: [&str; 4] = ["id", "kind", "scale", "instanced"];
+
 const FLUID_FIELDS: [&str; 6] = [
     "id",
     "material",
@@ -6528,6 +6636,88 @@ mod tests {
             from: crate::domain::OVERWORLD.to_owned(),
             to: "mod:ship/17".to_owned(),
         }
+    }
+
+    #[test]
+    fn a_mod_registers_domains_and_templates() {
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "stars",
+            "game.register_domain{ id = 'space', kind = 'sparse', scale = 1000.0 }\n\
+             game.register_domain{ id = 'ship', instanced = true }",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        let registered = vm.registered_domains();
+        assert_eq!(
+            registered.len(),
+            2,
+            "a mod registered two domains and the host was told about {}",
+            registered.len()
+        );
+        // Namespaced with the mod's own id, like every other registration
+        // (charter rule 8).
+        let (space, spec) = &registered[1];
+        assert_eq!(space, "stars:space");
+        assert_eq!(spec.kind, crate::domain::Kind::Sparse);
+        assert!((spec.scale - 1000.0).abs() < f64::EPSILON);
+        assert!(!spec.instanced);
+
+        let (ship, spec) = &registered[0];
+        assert_eq!(ship, "stars:ship");
+        assert_eq!(
+            spec.kind,
+            crate::domain::Kind::Voxel,
+            "the default is voxel"
+        );
+        assert!(spec.instanced, "a template did not come back as one");
+    }
+
+    #[test]
+    fn a_domain_registration_the_engine_cannot_read_is_refused_rather_than_defaulted() {
+        // A misspelled field is a mod that thinks it configured something, and
+        // a `kind` the engine does not know is a domain nobody can say what to
+        // do with. Both are errors at load rather than surprises later.
+        for bad in [
+            "game.register_domain{ id = 'a', knid = 'sparse' }",
+            "game.register_domain{ id = 'a', kind = 'liquid' }",
+            "game.register_domain{ id = 'a', scale = 0 }",
+            "game.register_domain{ id = 'a', scale = -1 }",
+            "game.register_domain{ kind = 'voxel' }",
+        ] {
+            let mut vm = vm();
+            assert!(load(&mut vm, "stars", bad).is_err(), "`{bad}` was accepted");
+        }
+    }
+
+    #[test]
+    fn registering_one_domain_twice_is_refused() {
+        // The silent loss of the first is worse than a hard error, and it is
+        // the rule every other registration follows.
+        let mut vm = vm();
+        assert!(
+            load(
+                &mut vm,
+                "stars",
+                "game.register_domain{ id = 'space' }\n\
+                 game.register_domain{ id = 'space' }",
+            )
+            .is_err(),
+            "a second registration replaced the first"
+        );
+    }
+
+    #[test]
+    fn a_domain_registered_after_freeze_is_refused() {
+        // Charter rule 9.
+        let mut vm = vm();
+        vm.freeze().expect("freeze");
+        assert!(
+            load(&mut vm, "latecomer", "game.register_domain{ id = 'space' }").is_err(),
+            "a domain was registered after the registries froze"
+        );
     }
 
     #[test]

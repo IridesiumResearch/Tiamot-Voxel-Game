@@ -1387,6 +1387,28 @@ Fluid is BLOCK resolution, not sub-node: one volume per block, never a
 ---@param spec Tiamot.FluidSpec
 function game.register_fluid(spec) end
 
+---Registers a simulation space, or a template for making them.
+---**Registration window only.**
+---
+---A world has `overworld` to begin with; this adds more. Each has its own
+---coordinate frame, its own chunks and its own scale, and **the two frames
+---never talk**: a body is in exactly one of them, sees only that one, and moves
+---between them with `game.transfer_entity`.
+---
+---* `kind` — `"voxel"` (the default) is a normal chunked space. `"sparse"` has
+---  no voxels at all: entities only, for something like a space between worlds.
+---* `scale` — how big one of its units is against the overworld's. Carried and
+---  never interpreted; the engine converts nothing between frames.
+---* `instanced` — declares a TEMPLATE rather than a domain. No domain exists
+---  under that id and nothing is stored for it. Use this for anything a PLAYER
+---  makes: the fifty-first ship somebody welds together needs a fifty-first
+---  domain, and you could not have named it while the registry was open. Make
+---  the instances with `game.create_domain`.
+---
+---The id is namespaced with your mod's id, like every other registration.
+---@param spec { id: string, kind: string?, scale: number?, instanced: boolean? }
+function game.register_domain(spec) end
+
 ---What a block holds.
 ---
 ---`volume` is how much is in it, in CELLS of 27 — the same unit inventory
