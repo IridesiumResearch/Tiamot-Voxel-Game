@@ -1088,3 +1088,102 @@ fn saving_a_mods_storage_replaces_it_rather_than_merging() {
     );
     assert_eq!(loaded.get("kept").and_then(Value::as_number), Some(2.0));
 }
+
+// ---------------------------------------------------------------------------
+// Domains
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_domain_instances_round_trip() {
+    // Which instances exist has to survive a restart, or a ship somebody built
+    // is a domain nothing can name the next morning.
+    let path = scratch("domain-instances");
+    let saved = vec![
+        ("mod:ship/17".to_owned(), "mod:ship".to_owned()),
+        ("mod:ship/18".to_owned(), "mod:ship".to_owned()),
+    ];
+    {
+        let mut registry = registry_with(&[]);
+        let db = WorldDb::open(&path, &mut registry).expect("open");
+        db.set_domain_instances(&saved).expect("set");
+        db.close().expect("close");
+    }
+    let mut registry = registry_with(&[]);
+    let db = WorldDb::open(&path, &mut registry).expect("reopen");
+    assert_eq!(db.domain_instances().expect("read"), saved);
+}
+
+#[test]
+fn a_world_with_no_instances_reads_as_none_rather_than_failing() {
+    // Every world written before this feature existed has no such key, and
+    // every one of them must open.
+    let path = scratch("domain-instances-absent");
+    let mut registry = registry_with(&[]);
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+    assert_eq!(db.domain_instances().expect("read"), Vec::new());
+}
+
+#[test]
+fn an_unreadable_instance_line_costs_that_line_and_not_the_world() {
+    // A world that will not open because one line of a side table is malformed
+    // is worse than one that opens with a ship missing — and the ship's chunks
+    // are still there either way, as a domain nothing can name.
+    let path = scratch("domain-instances-malformed");
+    let mut registry = registry_with(&[]);
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+    db.set_meta(
+        "domain_instances",
+        b"mod:ship/17\tmod:ship\nrubbish with no tab\n\tno instance\nmod:ship/18\tmod:ship",
+    )
+    .expect("set");
+    assert_eq!(
+        db.domain_instances().expect("read"),
+        vec![
+            ("mod:ship/17".to_owned(), "mod:ship".to_owned()),
+            ("mod:ship/18".to_owned(), "mod:ship".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn every_domain_with_anything_in_it_is_found_from_the_tables() {
+    // **Read from the tables and not from a list**, because the list is the
+    // thing that can be wrong. A domain with chunks in it exists whatever any
+    // registry says, and this is how one whose mod was removed is found and
+    // kept rather than quietly orphaned (charter rule 8).
+    let path = scratch("stored-domains");
+    let mut registry = registry_with(&["test:stone"]);
+    let stone = registry.register("test:stone").expect("register");
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+
+    let pos = ChunkPos::new(0, 0, 0);
+    db.save_chunk(pos, &Chunk::new(pos, stone)).expect("save");
+    db.save_chunk_in("mod:ship/17", pos, &Chunk::new(pos, stone))
+        .expect("save");
+    db.save_chunk_in("gone:place", pos, &Chunk::new(pos, stone))
+        .expect("save");
+
+    assert_eq!(
+        db.stored_domains().expect("read"),
+        vec![
+            "gone:place".to_owned(),
+            "mod:ship/17".to_owned(),
+            DEFAULT_DOMAIN.to_owned(),
+        ],
+        "a domain with chunks in it went unlisted, so its data could be orphaned"
+    );
+}
+
+#[test]
+fn a_fresh_world_stores_nothing_under_any_domain() {
+    // Criterion: a registered but never-visited domain costs zero rows. The
+    // overworld itself is not listed until something is written to it, which is
+    // the same statement about lazy instantiation.
+    let path = scratch("stored-domains-empty");
+    let mut registry = registry_with(&[]);
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+    assert!(
+        db.stored_domains().expect("read").is_empty(),
+        "an untouched world already had storage under a domain"
+    );
+}

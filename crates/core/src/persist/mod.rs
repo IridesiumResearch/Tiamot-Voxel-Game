@@ -64,6 +64,12 @@ pub mod meta_keys {
     pub const CREATED_AT: &str = "created_at";
     /// Human-readable world name.
     pub const WORLD_NAME: &str = "world_name";
+    /// Domain instances created at runtime, as `instance\ttemplate` lines.
+    ///
+    /// Which instances exist has to survive a restart or a ship somebody built
+    /// would be a domain nothing could name the next morning. See
+    /// [`crate::domain`].
+    pub const DOMAIN_INSTANCES: &str = "domain_instances";
 }
 
 /// The format an entity blob is written in.
@@ -1328,6 +1334,76 @@ impl WorldDb {
     /// Any SQL failure.
     pub fn set_world_seed(&self, seed: u64) -> Result<(), WorldError> {
         self.set_meta(meta_keys::WORLD_SEED, &seed.to_le_bytes())
+    }
+
+    /// Reads the domain instances this world has, as `(instance, template)`.
+    ///
+    /// A line per instance, tab-separated. A text format rather than a
+    /// serialised structure because this is a list of two strings that a person
+    /// debugging a world file should be able to read, and because a format with
+    /// no versioning to get wrong cannot be got wrong.
+    ///
+    /// Anything malformed is skipped rather than failing the load. A world that
+    /// will not open because one line of a side table is unreadable is worse
+    /// than a world that opens with one ship missing — and the ship's chunks
+    /// are still there either way, as an unknown domain.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn domain_instances(&self) -> Result<Vec<(String, String)>, WorldError> {
+        let Some(bytes) = self.meta(meta_keys::DOMAIN_INSTANCES)? else {
+            return Ok(Vec::new());
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            return Ok(Vec::new());
+        };
+        Ok(text
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(instance, template)| !instance.is_empty() && !template.is_empty())
+            .map(|(instance, template)| (instance.to_owned(), template.to_owned()))
+            .collect())
+    }
+
+    /// Writes the domain instances this world has.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn set_domain_instances(&self, instances: &[(String, String)]) -> Result<(), WorldError> {
+        let text = instances
+            .iter()
+            .map(|(instance, template)| format!("{instance}\t{template}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.set_meta(meta_keys::DOMAIN_INSTANCES, text.as_bytes())
+    }
+
+    /// Every domain this world has anything stored under.
+    ///
+    /// Read from the tables themselves rather than from a list, because the
+    /// list is what can be wrong: a domain with chunks in it exists whatever
+    /// any registry says, and this is how one whose mod was removed is found
+    /// and preserved rather than quietly orphaned (charter rule 8).
+    ///
+    /// Sorted, so nothing downstream of this depends on SQLite's row order.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn stored_domains(&self) -> Result<Vec<String>, WorldError> {
+        let mut found = std::collections::BTreeSet::new();
+        for table in ["chunks", "chunk_fluid", "entities"] {
+            let mut statement = self
+                .conn
+                .prepare(&format!("SELECT DISTINCT domain FROM {table}"))?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for domain in rows {
+                found.insert(domain?);
+            }
+        }
+        Ok(found.into_iter().collect())
     }
 
     fn read_meta_i64(conn: &Connection, key: &str) -> rusqlite::Result<Option<i64>> {
