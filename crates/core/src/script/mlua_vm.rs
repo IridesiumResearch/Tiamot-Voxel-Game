@@ -84,6 +84,10 @@ const PUNCHERS: &str = "tiamot.punchers";
 const JOINERS: &str = "tiamot.joiners";
 /// Registry key for the mods listening for a departure.
 const LEAVERS: &str = "tiamot.leavers";
+/// Mods with an `on_domain_exit` handler.
+const DOMAIN_EXITERS: &str = "tiamot.domain_exiters";
+/// Mods with an `on_domain_enter` handler.
+const DOMAIN_ENTERERS: &str = "tiamot.domain_enterers";
 /// Registry table of random-tick handlers, keyed by numeric material id.
 ///
 /// **By material and not by mod**, unlike every other hook: the engine picks
@@ -100,6 +104,10 @@ const RANDOM_TICK_OWNERS: &str = "tiamot.random_tick_owners";
 const HOOK_JOIN: &str = "on_player_join";
 /// The `on_player_leave` hook's name.
 const HOOK_LEAVE: &str = "on_player_leave";
+/// The hook asked before a body leaves a domain.
+const HOOK_DOMAIN_EXIT: &str = "on_domain_exit";
+/// The hook asked before a body enters one.
+const HOOK_DOMAIN_ENTER: &str = "on_domain_enter";
 /// The registry key holding every `on_action` callback.
 const ACTORS: &str = "tiamot.actors";
 const DIALOGISTS: &str = "tiamot.dialogists";
@@ -1064,6 +1072,14 @@ impl ScriptVm for MluaVm {
         self.run_hook(HOOK_LEAVE, LEAVERS, &table)
     }
 
+    fn domain_exit(&mut self, event: &crate::script::DomainEvent) -> HookOutcome {
+        self.run_domain_hook(HOOK_DOMAIN_EXIT, DOMAIN_EXITERS, event)
+    }
+
+    fn domain_enter(&mut self, event: &crate::script::DomainEvent) -> HookOutcome {
+        self.run_domain_hook(HOOK_DOMAIN_ENTER, DOMAIN_ENTERERS, event)
+    }
+
     fn random_tick(&mut self, event: &crate::script::RandomTickEvent) -> HookOutcome {
         let mut outcome = HookOutcome::allow();
         let Ok(handlers) = self.lua.named_registry_value::<Table>(RANDOM_TICKS) else {
@@ -1620,6 +1636,18 @@ impl MluaVm {
         game.set(
             "register_on_player_leave",
             self.hook_registrar(mod_id, HOOK_LEAVE, LEAVERS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
+        // Refusable, unlike join and leave: those report a thing that has
+        // already happened and these are asked before anything moves.
+        game.set(
+            "register_on_domain_exit",
+            self.hook_registrar(mod_id, HOOK_DOMAIN_EXIT, DOMAIN_EXITERS)?,
+        )
+        .map_err(|err| self.vm_error(&err))?;
+        game.set(
+            "register_on_domain_enter",
+            self.hook_registrar(mod_id, HOOK_DOMAIN_ENTER, DOMAIN_ENTERERS)?,
         )
         .map_err(|err| self.vm_error(&err))?;
         game.set("register_random_tick", self.random_tick_registrar(mod_id)?)
@@ -3843,6 +3871,8 @@ impl MluaVm {
             FLOWERS,
             JOINERS,
             LEAVERS,
+            DOMAIN_EXITERS,
+            DOMAIN_ENTERERS,
             ACTORS,
             DIALOGISTS,
             CHATTERS,
@@ -4037,6 +4067,31 @@ impl MluaVm {
         let event = self.lua.create_table()?;
         event.set("player", hex_uuid(player))?;
         Ok(event)
+    }
+
+    /// Runs one of the two domain hooks over every mod that registered it.
+    ///
+    /// One implementation for both, because they differ only in which list
+    /// they walk — and the version with two copies is the one that drifts.
+    fn run_domain_hook(
+        &mut self,
+        hook: &str,
+        registry: &str,
+        event: &crate::script::DomainEvent,
+    ) -> HookOutcome {
+        let Ok(table) = (|| -> Result<Table, mlua::Error> {
+            let table = self.lua.create_table()?;
+            table.set("entity", event.entity)?;
+            table.set("from", event.from.as_str())?;
+            table.set("to", event.to.as_str())?;
+            Ok(table)
+        })() else {
+            // A table that could not be built is not a refusal: a mod that
+            // never ran cannot have objected, and refusing here would strand
+            // whatever was moving on a VM problem it had nothing to do with.
+            return HookOutcome::allow();
+        };
+        self.run_hook(hook, registry, &table)
     }
 
     /// Blocks registered so far, keyed by string id.
@@ -6417,6 +6472,102 @@ mod tests {
              assert(seen.name == 'Ada', 'name')",
         )
         .expect("the hook should see both");
+    }
+
+    /// A body moving from the overworld into a ship.
+    fn a_move() -> crate::script::DomainEvent {
+        crate::script::DomainEvent {
+            entity: 7,
+            from: crate::domain::OVERWORLD.to_owned(),
+            to: "mod:ship/17".to_owned(),
+        }
+    }
+
+    #[test]
+    fn either_domain_hook_can_refuse_a_move() {
+        // Unlike join and leave, these are asked BEFORE anything moves, so
+        // `false` has something to stop. A mod that owns a space is the only
+        // thing that can know whether leaving or entering it is allowed — a
+        // ship in flight, a room locked from the inside.
+        for hook in ["on_domain_exit", "on_domain_enter"] {
+            let mut vm = vm();
+            load(
+                &mut vm,
+                "warden",
+                &format!("game.register_{hook}(function() return false end)"),
+            )
+            .expect("load");
+            vm.freeze().expect("freeze");
+
+            let refused = if hook == "on_domain_exit" {
+                vm.domain_exit(&a_move())
+            } else {
+                vm.domain_enter(&a_move())
+            };
+            assert!(!refused.allowed, "`{hook}` returned false and was ignored");
+        }
+    }
+
+    #[test]
+    fn a_domain_hook_that_says_nothing_lets_the_move_happen() {
+        // The default has to be yes. A mod registering the hook to WATCH moves
+        // — logging them, counting them — must not stop them by omission.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "watcher",
+            "game.register_on_domain_exit(function() end)\n\
+             game.register_on_domain_enter(function() return true end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(vm.domain_exit(&a_move()).allowed, "a bare return refused");
+        assert!(
+            vm.domain_enter(&a_move()).allowed,
+            "a truthy return refused"
+        );
+    }
+
+    #[test]
+    fn a_domain_hook_is_told_both_ends_of_the_move() {
+        // Both, so a mod can see where something went without keeping its own
+        // record of where everything was — which it would have to rebuild
+        // after every restart.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "warden",
+            "game.register_on_domain_enter(function(event)\n\
+               return event.from == 'overworld' and event.to == 'mod:ship/17' \
+                 and event.entity == 7\n\
+             end)",
+        )
+        .expect("load");
+        vm.freeze().expect("freeze");
+
+        assert!(
+            vm.domain_enter(&a_move()).allowed,
+            "the event did not carry the entity and both domain ids"
+        );
+    }
+
+    #[test]
+    fn a_domain_hook_registered_after_freeze_is_refused() {
+        // Charter rule 9, for the two newest hooks.
+        let mut vm = vm();
+        vm.freeze().expect("freeze");
+        for hook in ["on_domain_exit", "on_domain_enter"] {
+            assert!(
+                load(
+                    &mut vm,
+                    "latecomer",
+                    &format!("game.register_{hook}(function() end)"),
+                )
+                .is_err(),
+                "`{hook}` was registered after the freeze"
+            );
+        }
     }
 
     #[test]

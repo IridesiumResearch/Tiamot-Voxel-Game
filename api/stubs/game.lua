@@ -461,6 +461,33 @@ function game.register_on_generate(callback) end
 ---@param callback fun(event: { player: string, name: string })
 function game.register_on_player_leave(callback) end
 
+---Registers what happens before a body leaves a simulation space.
+---**Registration window only.**
+---
+---Return `false` to refuse the move. Unlike `on_player_join` and
+---`on_player_leave`, which report something that has already happened, this is
+---asked BEFORE anything moves — so `false` has something to stop. A mod that
+---owns a space is the only thing that can know whether leaving it is allowed:
+---a ship in flight, a room that has to be unlocked from the inside.
+---
+---The event carries `entity`, `from` and `to`. Both ends, so you can see where
+---something went without keeping your own record of where everything was — a
+---record you would have to rebuild after every restart.
+---
+---A handler that returns nothing allows the move. Registering this to WATCH
+---moves must not stop them by omission.
+---@param callback fun(event: { entity: integer, from: string, to: string }): boolean?
+function game.register_on_domain_exit(callback) end
+
+---Registers what happens before a body enters a simulation space.
+---**Registration window only.**
+---
+---The same as `game.register_on_domain_exit`, at the other end of the move,
+---and it runs only if the exit hooks allowed it — so you never see an arrival
+---that the departure already refused.
+---@param callback fun(event: { entity: integer, from: string, to: string }): boolean?
+function game.register_on_domain_enter(callback) end
+
 ---Registers what happens when a block of yours gets a turn.
 ---**Registration window only.**
 ---

@@ -39,8 +39,8 @@ mod vm;
 pub use host::{HostError, ModHost, Phase, read_manifest};
 pub use vm::{
     ActionEvent, Backend, BlockRules, BlockTexture, Brush, ChatEvent, DialogEvent, DigEvent,
-    FluidFlowEvent, FluidRules, HookOutcome, JoinEvent, LeaveEvent, MAX_REFUSAL_BYTES, PlaceEvent,
-    PunchEvent, RandomTickEvent, ScriptError, ScriptVm, Tool, VmLimits, WorldEdit,
+    DomainEvent, FluidFlowEvent, FluidRules, HookOutcome, JoinEvent, LeaveEvent, MAX_REFUSAL_BYTES,
+    PlaceEvent, PunchEvent, RandomTickEvent, ScriptError, ScriptVm, Tool, VmLimits, WorldEdit,
 };
 
 #[cfg(feature = "script")]

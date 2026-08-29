@@ -709,6 +709,22 @@ pub struct LeaveEvent {
     pub name: String,
 }
 
+/// A body is about to move between simulation spaces.
+///
+/// Handed to `on_domain_exit` and then to `on_domain_enter`, both of which may
+/// refuse it. The pair carries the same event so a mod writing one of them can
+/// see both ends of the move without keeping its own record of where things
+/// were — which it would have to rebuild after every restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainEvent {
+    /// Which body. A player's mirror is an entity like any other here.
+    pub entity: u64,
+    /// The domain it is leaving.
+    pub from: String,
+    /// The domain it is entering.
+    pub to: String,
+}
+
 /// A player pressed or released an action their server's mod registered.
 ///
 /// **An observation, not a veto.** The player pressed a key; nothing a mod says
@@ -1102,6 +1118,20 @@ pub trait ScriptVm: Sized {
 
     /// Runs every `on_player_leave` hook.
     fn player_leave(&mut self, event: &LeaveEvent) -> HookOutcome;
+
+    /// Asks every `on_domain_exit` whether a body may leave a domain.
+    ///
+    /// Refusable, unlike the join and leave hooks: those report something that
+    /// has already happened, and this is asked before anything moves. A mod
+    /// that owns a space is the only thing that can know whether leaving it is
+    /// allowed — a ship in flight, a room that has to be unlocked from inside.
+    fn domain_exit(&mut self, event: &DomainEvent) -> HookOutcome;
+
+    /// Asks every `on_domain_enter` whether a body may enter a domain.
+    ///
+    /// Run only if the exit hooks allowed it, so a mod writing one never sees
+    /// an arrival that the departure had already refused.
+    fn domain_enter(&mut self, event: &DomainEvent) -> HookOutcome;
 
     /// Runs the handler for one randomly-chosen block.
     ///

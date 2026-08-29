@@ -237,6 +237,28 @@ impl Generator {
         }
     }
 
+    /// Asks whether a body may leave a domain.
+    pub fn domain_exited(
+        &mut self,
+        event: &tiamot_core::script::DomainEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().domain_exit(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
+    /// Asks whether a body may enter one.
+    pub fn domain_entered(
+        &mut self,
+        event: &tiamot_core::script::DomainEvent,
+    ) -> tiamot_core::script::HookOutcome {
+        match self {
+            Self::Mods(generator) => generator.host_mut().vm_mut().domain_enter(event),
+            Self::Air(_) => tiamot_core::script::HookOutcome::allow(),
+        }
+    }
+
     /// Offers one randomly-chosen block to whichever mod asked for it.
     pub fn random_ticked(
         &mut self,
