@@ -3228,6 +3228,53 @@ impl MluaVm {
         game.set("entities_in_radius", entities.within)
             .map_err(|err| self.vm_error(&err))?;
         self.install_player_lookup(game)?;
+        self.install_transfer(game)?;
+        Ok(())
+    }
+
+    /// `game.transfer_entity(id, domain, position)`.
+    ///
+    /// **Asked for, not done.** The move runs `on_domain_exit` and
+    /// `on_domain_enter`, and this call is already inside a mod's callback
+    /// inside the tick — so performing it here would re-enter the VM while a
+    /// script is running and let one mod's call run another's hook underneath
+    /// it. The tick performs it once the mods have finished, which is also what
+    /// makes asking mid-tick safe rather than merely usually safe.
+    ///
+    /// So `true` means accepted, not arrived. A mod finds out what became of it
+    /// from `on_domain_enter`, which is the only place the answer exists.
+    fn install_transfer(&self, game: &Table) -> Result<(), ScriptError> {
+        let slot = std::sync::Arc::clone(&self.entities);
+        let transfer = self
+            .lua
+            .create_function(move |_, (id, domain, position): (u64, String, Table)| {
+                let to = [
+                    position.get::<f64>("x")?,
+                    position.get::<f64>("y")?,
+                    position.get::<f64>("z")?,
+                ];
+                if to.iter().any(|axis| !axis.is_finite()) {
+                    return Err(mlua::Error::external(
+                        "game.transfer_entity was given a position that is not a number",
+                    ));
+                }
+                if domain.is_empty() {
+                    return Err(mlua::Error::external(
+                        "game.transfer_entity was given no domain to move into",
+                    ));
+                }
+                Ok(slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| {
+                        slot.as_ref()
+                            .map(|store| store.transfer(crate::ent::EntityId(id), &domain, to))
+                    })
+                    .unwrap_or(false))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("transfer_entity", transfer)
+            .map_err(|err| self.vm_error(&err))?;
         Ok(())
     }
 
@@ -7941,6 +7988,8 @@ mod entity_tests {
         shoved: std::sync::Mutex<Vec<([u8; 32], [f32; 3])>>,
         /// Whether there is a player of that name to move at all.
         connected: std::sync::Mutex<bool>,
+        /// Transfers asked for, since asking is all a mod call does.
+        transfers: std::sync::Mutex<Vec<(crate::ent::EntityId, String)>>,
     }
 
     impl crate::ent::Access for Menagerie {
@@ -7956,6 +8005,14 @@ mod entity_tests {
                 shoved.push((uuid, impulse));
             }
             self.connected.lock().is_ok_and(|there| *there)
+        }
+
+        fn transfer(&self, id: crate::ent::EntityId, domain: &str, _to: [f64; 3]) -> bool {
+            self.transfers
+                .lock()
+                .expect("transfers")
+                .push((id, domain.to_owned()));
+            true
         }
 
         fn spawn(&self, entity: crate::ent::Entity) -> Option<crate::ent::EntityId> {

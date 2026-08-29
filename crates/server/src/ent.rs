@@ -147,6 +147,19 @@ impl Population {
         }
     }
 
+    /// Whose mirror an entity is, if it is one.
+    ///
+    /// The reverse of `player_body`, and a scan of the player map rather than a
+    /// second index: there are at most fifty of them (the performance targets),
+    /// and a second map is a second thing to keep in step.
+    #[must_use]
+    pub fn player_of(&self, id: EntityId) -> Option<tiamot_core::PlayerUuid> {
+        self.players
+            .iter()
+            .find(|(_, mirror)| **mirror == id)
+            .map(|(uuid, _)| *uuid)
+    }
+
     /// Every domain an entity is currently in, the overworld included.
     ///
     /// What a tick iterates to step each domain against its own terrain.
@@ -613,8 +626,32 @@ impl Population {
 /// and cannot borrow what the tick is holding. Uncontended in practice — both
 /// sides are that one thread — and never held across a mod callback, which is
 /// the arrangement that would deadlock.
+/// A body a mod has asked to move, waiting for the tick to do it.
+///
+/// The whole request, because by the time the tick reaches it the mod that
+/// asked has long since returned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransferRequest {
+    /// Which body.
+    pub id: EntityId,
+    /// Where it is going.
+    pub domain: String,
+    /// Where in that domain, in world coordinates.
+    pub to: [f64; 3],
+}
+
+/// A handle on the entity store, for the mod API.
 pub struct Shared {
     population: std::sync::Arc<std::sync::RwLock<Population>>,
+    /// Transfers asked for and not yet performed.
+    ///
+    /// **A queue, because a transfer runs hooks.** `Access::transfer` is
+    /// called from inside a mod's callback inside the tick, so doing the move
+    /// there would re-enter the script VM while a script is running and let
+    /// one mod's call run another mod's hook underneath it. The tick drains
+    /// this after the mods have had their turn, which is also what makes
+    /// asking for one mid-tick safe.
+    transfers: std::sync::Mutex<Vec<TransferRequest>>,
     /// The players' authoritative bodies.
     ///
     /// **Not the mirrors in `population`.** A mod moving a player has to write
@@ -626,11 +663,24 @@ pub struct Shared {
 impl Shared {
     /// Wraps the stores the simulation thread owns.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         population: std::sync::Arc<std::sync::RwLock<Population>>,
         bodies: std::sync::Arc<crate::transport::PlayerBodies>,
     ) -> Self {
-        Self { population, bodies }
+        Self {
+            population,
+            transfers: std::sync::Mutex::new(Vec::new()),
+            bodies,
+        }
+    }
+
+    /// Takes every transfer asked for since the last tick.
+    #[must_use]
+    pub fn take_transfers(&self) -> Vec<TransferRequest> {
+        self.transfers
+            .lock()
+            .map(|mut queued| std::mem::take(&mut *queued))
+            .unwrap_or_default()
     }
 }
 
@@ -696,6 +746,29 @@ impl tiamot_core::ent::Access for Shared {
         // their speed arrives at the far end already moving, which reads as
         // the destination throwing them.
         player.body.velocity = [0.0; 3];
+        true
+    }
+
+    fn transfer(&self, id: EntityId, domain: &str, to: [f64; 3]) -> bool {
+        // Only the mistakes a mod can fix are reported here: an id that names
+        // nothing, and a request that could never be queued. Whether a hook
+        // refuses, and whether the far side generates, are answers the tick
+        // has and this call cannot wait for.
+        let known = self
+            .population
+            .read()
+            .is_ok_and(|population| population.get(id).is_some());
+        if !known {
+            return false;
+        }
+        let Ok(mut queued) = self.transfers.lock() else {
+            return false;
+        };
+        queued.push(TransferRequest {
+            id,
+            domain: domain.to_owned(),
+            to,
+        });
         true
     }
 
@@ -984,6 +1057,64 @@ mod tests {
         assert_eq!(ids.len(), 1);
         assert_eq!(population.domain_of(ids[0]), "mod:ship/17");
         assert_eq!(population.occupants("mod:ship/17"), 1);
+    }
+
+    /// The mod-facing handle, over a population and no player bodies.
+    fn access(population: &std::sync::Arc<std::sync::RwLock<Population>>) -> Shared {
+        Shared::new(
+            std::sync::Arc::clone(population),
+            std::sync::Arc::new(crate::transport::PlayerBodies::default()),
+        )
+    }
+
+    #[test]
+    fn a_transfer_is_queued_rather_than_done_where_it_is_asked_for() {
+        // **The reentrancy the queue exists for.** `transfer` is called from
+        // inside a mod's callback inside the tick, and the move runs two hooks
+        // — so doing it there would run one mod's hook underneath another
+        // mod's call, in a VM already executing.
+        use tiamot_core::ent::Access as _;
+
+        let population = std::sync::Arc::new(std::sync::RwLock::new(Population::new()));
+        let id = population
+            .write()
+            .expect("lock")
+            .spawn(mob(ChunkPos::new(0, 0, 0), [8.0, 0.0, 8.0]));
+        let shared = access(&population);
+
+        assert!(shared.transfer(id, "mod:ship/17", [1.0, 2.0, 3.0]));
+        assert_eq!(
+            population.read().expect("lock").domain_of(id),
+            tiamot_core::domain::OVERWORLD,
+            "the body moved where it was asked for, before any hook could refuse"
+        );
+
+        let queued = shared.take_transfers();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, id);
+        assert_eq!(queued[0].domain, "mod:ship/17");
+        assert!(
+            shared.take_transfers().is_empty(),
+            "draining the queue left the request in it, so the tick would move \
+             the same body every tick for ever"
+        );
+    }
+
+    #[test]
+    fn transferring_something_that_is_not_there_is_refused_at_the_call() {
+        // The mistakes a mod can fix are the ones worth reporting synchronously.
+        // Whether a hook refuses is not one of them: nothing can know that yet.
+        use tiamot_core::ent::Access as _;
+
+        let population = std::sync::Arc::new(std::sync::RwLock::new(Population::new()));
+        let shared = access(&population);
+        let stale = EntityId(4096);
+
+        assert!(!shared.transfer(stale, "mod:ship/17", [0.0; 3]));
+        assert!(
+            shared.take_transfers().is_empty(),
+            "a request for an entity that does not exist was queued anyway"
+        );
     }
 
     #[test]

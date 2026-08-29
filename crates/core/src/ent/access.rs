@@ -171,6 +171,22 @@ pub trait Access: Send + Sync {
     ///
     /// Returns whether the player was there to push.
     fn shove_player(&self, uuid: [u8; 32], impulse: [f32; 3]) -> bool;
+
+    /// Asks for a body to be moved into another simulation space.
+    ///
+    /// **Queued, not done here.** A transfer runs `on_domain_exit` and
+    /// `on_domain_enter`, and this call is itself inside a mod's callback
+    /// inside the tick — so performing it now would re-enter the script VM
+    /// while a script is running, and let one mod's call run another mod's
+    /// hook underneath it. The tick performs it, which is also what makes it
+    /// safe to ask for mid-tick.
+    ///
+    /// Returns whether it was ACCEPTED for transfer, which is not whether it
+    /// happened: a hook may still refuse, and the target may fail to generate.
+    /// `false` means the request was never going to go anywhere — no such
+    /// entity, or no such domain — so a mod is told about the mistakes it can
+    /// fix and finds out the rest from `on_domain_enter`.
+    fn transfer(&self, id: EntityId, domain: &str, to: [f64; 3]) -> bool;
 }
 
 #[cfg(test)]

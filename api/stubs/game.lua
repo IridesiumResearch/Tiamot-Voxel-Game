@@ -1723,6 +1723,27 @@ function game.spawn_entity(spec) end
 ---@return boolean removed
 function game.despawn_entity(id) end
 
+---Asks for a body to be moved into another simulation space.
+---
+---**Asked for, not done.** The move runs `on_domain_exit` and then
+---`on_domain_enter`, and your call is already inside a tick — so the engine
+---performs it once every mod has finished running, which is what makes asking
+---mid-tick safe. `true` therefore means ACCEPTED, not arrived: a hook may still
+---refuse, and the destination may fail to generate. You find out what became of
+---it in `on_domain_enter`, which is the only place that answer exists.
+---
+---`false` means it was never going to happen: no such entity, or no domain
+---named. Those are the mistakes you can fix.
+---
+---A player is moved body and all — their view is torn down and rebuilt from the
+---new domain, and they see a loading state while it refills. Nothing crosses
+---with them but what they are carrying.
+---@param id integer
+---@param domain string
+---@param position { x: number, y: number, z: number }
+---@return boolean accepted
+function game.transfer_entity(id, domain, position) end
+
 ---Everything the engine knows about an entity, or nil if the id is stale.
 ---
 ---A copy, not a live view. Read it, decide, and write back with `set_entity`.

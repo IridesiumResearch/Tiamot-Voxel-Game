@@ -59,11 +59,17 @@ struct Admin {
 impl Admin {
     async fn connect(addr: std::net::SocketAddr) -> Self {
         // The listener spawns on the network runtime a moment after start
-        // returns, so a first connection can beat it. Retry briefly rather
-        // than sleeping a fixed amount and hoping.
+        // returns, so a first connection can beat it. Retried against a
+        // DEADLINE rather than a count of attempts: a hundred tries twenty
+        // milliseconds apart is two seconds, which is a bet on how fast the
+        // machine is, and the ubuntu runner lost it once under a full
+        // workspace test run. Thirty seconds is not slower when the listener
+        // is up — the loop ends on the first success — and is long enough that
+        // a failure means it never came up at all.
         let stream = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             let mut attempt = None;
-            for _ in 0..100 {
+            while tokio::time::Instant::now() < deadline {
                 match TcpStream::connect(addr).await {
                     Ok(stream) => {
                         attempt = Some(stream);
@@ -72,7 +78,7 @@ impl Admin {
                     Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
                 }
             }
-            attempt.expect("RCON should be listening")
+            attempt.expect("RCON never started listening")
         };
         let (read, write) = stream.into_split();
         let mut admin = Self {

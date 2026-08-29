@@ -134,6 +134,107 @@ fn mod_set_fingerprint(mods: &[ModEntry]) -> u64 {
 
 /// Sends every touched chunk's light to everyone.
 ///
+/// Performs one transfer a mod asked for, or declines to.
+///
+/// The order is the whole of it:
+///
+/// 1. **Ask to leave, then ask to enter.** Either hook may refuse, and enter is
+///    asked only if exit allowed — so a mod writing `on_domain_enter` never
+///    sees an arrival the departure had already stopped.
+/// 2. **Reach the destination chunk BEFORE moving anything.** Generation can
+///    fail, and a body moved first and then stranded is a body in a domain with
+///    no ground under it that nothing will ever stream. Failing here leaves it
+///    exactly where it was, which is criterion "failure atomicity".
+/// 3. **Then move it**, and only then.
+///
+/// A player is moved through their authoritative body rather than their mirror,
+/// for the reason `Access::move_player` gives: the mirror is a copy the tick
+/// overwrites, so writing to it does nothing, silently.
+fn apply_transfer(
+    request: &crate::ent::TransferRequest,
+    world: &mut crate::world::World,
+    source: &mut crate::world::Generator,
+    population: &std::sync::Arc<std::sync::RwLock<crate::ent::Population>>,
+    shared: &std::sync::Arc<crate::transport::endpoint::Shared>,
+) {
+    let Ok(mobs) = population.read() else {
+        return;
+    };
+    let Some(from) = mobs
+        .get(request.id)
+        .map(|_| mobs.domain_of(request.id).to_owned())
+    else {
+        // Despawned between the asking and the doing. Not an error: a mod that
+        // kills something and then moves it has changed its mind, and the tick
+        // is the only place that could have noticed.
+        return;
+    };
+    let owner = mobs.player_of(request.id);
+    drop(mobs);
+
+    if from == request.domain {
+        return;
+    }
+
+    let event = tiamot_core::script::DomainEvent {
+        entity: request.id.index().into(),
+        from: from.clone(),
+        to: request.domain.clone(),
+    };
+    let leaving = source.domain_exited(&event);
+    for (mod_id, err) in &leaving.faults {
+        error!(mod_id = %mod_id, "mod disabled after an on_domain_exit failure: {err}");
+    }
+    if !leaving.allowed {
+        return;
+    }
+    let arriving = source.domain_entered(&event);
+    for (mod_id, err) in &arriving.faults {
+        error!(mod_id = %mod_id, "mod disabled after an on_domain_enter failure: {err}");
+    }
+    if !arriving.allowed {
+        return;
+    }
+
+    // A world position, split back into the (chunk, local) pair charter rule 7
+    // requires — the same conversion a teleport makes, and for the same reason.
+    let landing =
+        tiamot_core::ent::Transform::from_world(request.to[0], request.to[1], request.to[2]);
+    if !landing.chunk.in_world() {
+        return;
+    }
+    // Step 2. Nothing has moved yet.
+    if let Err(err) = world.chunk(&request.domain, landing.chunk, source) {
+        error!(
+            domain = %request.domain,
+            "a transfer was abandoned: its destination could not be reached: {err}"
+        );
+        return;
+    }
+
+    let Ok(mut mobs) = population.write() else {
+        return;
+    };
+    mobs.set_domain(request.id, &request.domain);
+    if let Some(entity) = mobs.get_mut(request.id) {
+        entity.transform = landing;
+        entity.velocity.0 = [0.0; 3];
+    }
+    drop(mobs);
+
+    // A player's body as well as their mirror, or the mirror is overwritten
+    // from the body a tick later and they snap back.
+    if let Some(uuid) = owner
+        && let Ok(mut bodies) = shared.bodies.lock()
+        && let Some(player) = bodies.get_mut(&uuid)
+    {
+        player.domain = request.domain.clone();
+        player.origin = landing.chunk;
+        player.body.position = landing.local;
+        player.body.velocity = [0.0; 3];
+    }
+}
+
 /// Writes each dirty chunk of entities into the domain it belongs to.
 ///
 /// **One call per `(domain, chunk)`, because that is what a row is.** A save
@@ -1226,6 +1327,11 @@ impl ServerHandle {
                     // that is the only thread that writes to it.
                     let trace = crate::trace::Trace::from_environment();
 
+                    // The handle a mod's `game.transfer_entity` queues on, kept
+                    // so the tick can drain it. `None` for a modless server,
+                    // which has nothing to queue anything.
+                    let mut entity_access: Option<std::sync::Arc<crate::ent::Shared>> = None;
+
                     // Light is derived and lives only in memory — see
                     // `crate::light`. It is built here rather than in `Shared`
                     // because only the simulation thread may touch it: every
@@ -1309,12 +1415,15 @@ impl ServerHandle {
                             // And the entities, which is the second writable
                             // handle in the frozen API and the reason
                             // `ent::Access` also takes `&self`.
-                            host.vm_mut().set_entity_access(std::sync::Arc::new(
-                                crate::ent::Shared::new(
-                                    std::sync::Arc::clone(&population),
-                                    std::sync::Arc::clone(&shared.bodies),
-                                ),
+                            // Kept as well as handed over: the tick drains the
+                            // transfers a mod asked for through this very
+                            // handle, once the mods have finished running.
+                            let access = std::sync::Arc::new(crate::ent::Shared::new(
+                                std::sync::Arc::clone(&population),
+                                std::sync::Arc::clone(&shared.bodies),
                             ));
+                            entity_access = Some(std::sync::Arc::clone(&access));
+                            host.vm_mut().set_entity_access(access);
                             // And a mod's own numbers on a mod's own HUD. The
                             // engine has no health bar and should not (charter
                             // rule 1); this is the channel it carries and does
@@ -2588,6 +2697,25 @@ impl ServerHandle {
                             }
                         });
                         world = returned;
+
+                        // **Transfers, after the mods have had their turn.**
+                        // Asked for from inside a mod callback and performed
+                        // here, so a move never runs one mod's hook underneath
+                        // another mod's call — and so a request made mid-tick
+                        // is safe by construction rather than by care.
+                        for request in entity_access
+                            .as_ref()
+                            .map(|access| access.take_transfers())
+                            .unwrap_or_default()
+                        {
+                            apply_transfer(
+                                &request,
+                                &mut world,
+                                &mut source,
+                                &population,
+                                &shared,
+                            );
+                        }
 
                         // Serve chunk requests. Bounded per tick by
                         // CHUNKS_PER_TICK: encoding is real work on this
