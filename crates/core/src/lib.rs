@@ -75,6 +75,7 @@ pub mod identity;
 pub mod interest;
 pub mod inventory;
 pub mod light;
+pub mod lod;
 pub mod material;
 pub mod model;
 pub mod modload;

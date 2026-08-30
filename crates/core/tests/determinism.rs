@@ -989,3 +989,122 @@ fn the_fluid_scenarios_actually_hold_milk() {
         "every block holds the same amount, so the gradient the golden should cover is absent"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Chunk LOD (Task 15b)
+// ---------------------------------------------------------------------------
+
+/// The summary chain of a fixed chunk, hashed.
+///
+/// **Regenerate ONLY with a deliberate change to downsampling.** The majority
+/// vote and its tie-break are integer work, so this is not guarding a float
+/// subset violation — it guards the other half of charter rule 4, that the
+/// ORDER of a computation must not vary between platforms. A majority that
+/// counted through a `HashMap`, or a tie broken by whichever value was seen
+/// first, would settle differently on one of the three CI targets and nowhere
+/// else — and the horizon would disagree between two players standing beside
+/// each other.
+const LOD_GOLDEN: u64 = 13_632_031_266_035_353_490;
+
+/// A chunk with enough shape in it that a summary has something to lose.
+///
+/// **Not a solid block and not empty sky**: either would hash the same under an
+/// implementation that did nothing at all. This has a slope, a mixed layer and
+/// a scatter of single sub-nodes, so every rule the downsample has — the
+/// per-block majority, the 2×2×2 majority, and the tie-break — is exercised.
+fn lod_scene() -> tiamot_core::Chunk {
+    use tiamot_core::coords::LocalBlock;
+    use tiamot_core::{BlockValue, CHUNK_BLOCKS, MaterialId};
+
+    let stone = MaterialId(1);
+    let dirt = MaterialId(2);
+    let mut chunk = tiamot_core::Chunk::air(ChunkPos::new(0, 0, 0));
+    for z in 0..CHUNK_BLOCKS {
+        for x in 0..CHUNK_BLOCKS {
+            // A slope, so the summary has a skyline rather than a plane.
+            let height = 2 + (x + z) / 3;
+            for y in 0..height.min(CHUNK_BLOCKS) {
+                let material = if y % 3 == 0 { dirt } else { stone };
+                chunk.set_block_local(LocalBlock::new(x, y, z), BlockValue::Uniform(material));
+            }
+            // And one chiselled cell above it, which must NOT read as solid.
+            if (x + z) % 5 == 0 && height < CHUNK_BLOCKS {
+                chunk.set_block_local(
+                    LocalBlock::new(x, height, z),
+                    BlockValue::Partial {
+                        material: stone,
+                        occupancy: 0b101,
+                    },
+                );
+            }
+        }
+    }
+    chunk
+}
+
+fn lod_fingerprint() -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tiamot:lod-golden:v1");
+    for summary in tiamot_core::lod::Summary::chain(&lod_scene()) {
+        hasher.update(&[summary.level()]);
+        for cell in summary.cells() {
+            hasher.update(&cell.0.to_le_bytes());
+        }
+    }
+    u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("BLAKE3 output is 32 bytes"),
+    )
+}
+
+#[test]
+fn a_summarised_chunk_hashes_to_its_golden() {
+    // **Task 15b's cross-platform determinism criterion.** The CI matrix runs
+    // this on Linux, Windows and macOS against the same constant: two players
+    // standing beside each other must see the same horizon.
+    assert_eq!(
+        lod_fingerprint(),
+        LOD_GOLDEN,
+        "the same chunk summarised to a different result. Do NOT update the constant to \
+         match unless downsampling changed deliberately — a difference here means the \
+         majority vote, its tie-break, or a container's iteration order varies between \
+         builds."
+    );
+}
+
+#[test]
+fn the_lod_golden_is_stable_across_repeated_calls() {
+    // The counter-example that makes the constant mean something: a summary not
+    // even reproducible in one process could not be reproducible across three
+    // platforms.
+    assert_eq!(lod_fingerprint(), lod_fingerprint());
+}
+
+#[test]
+fn the_lod_scene_is_not_trivially_uniform() {
+    // A golden over a solid chunk would pass against an implementation that
+    // returned its input, and one over empty sky against an implementation that
+    // returned nothing. This pins that the fixture has shape in it.
+    use tiamot_core::MaterialId;
+
+    let chain = tiamot_core::lod::Summary::chain(&lod_scene());
+    let finest = chain.first().expect("a chain");
+    assert!(
+        finest.cells().iter().any(|cell| cell.is_air()),
+        "the fixture is solid, so a summary that kept everything would pass"
+    );
+    assert!(
+        finest.cells().iter().any(|cell| !cell.is_air()),
+        "the fixture is empty, so a summary that dropped everything would pass"
+    );
+    // And more than one material survives to the middle of the chain, so the
+    // majority is deciding something rather than copying.
+    let middle = &chain[chain.len() / 2];
+    let kinds: std::collections::BTreeSet<MaterialId> = middle.cells().iter().copied().collect();
+    assert!(
+        kinds.len() > 1,
+        "every cell at level {} is the same material, so the vote decides nothing",
+        middle.level()
+    );
+}
