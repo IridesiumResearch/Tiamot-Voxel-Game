@@ -223,6 +223,13 @@ pub enum SummaryError {
         level: u8,
     },
 
+    /// An encoding this build does not know.
+    #[error("summary format version {found} is not one this build can read")]
+    Version {
+        /// The version byte found.
+        found: u8,
+    },
+
     /// The wrong number of cells for the level.
     #[error("a level {level} summary holds {expected} cells, not {found}")]
     Size {
@@ -274,6 +281,159 @@ fn majority(cells: &[MaterialId]) -> MaterialId {
         }
     }
     best
+}
+
+/// Turning a summary into bytes and back.
+///
+/// **A summary goes to disk AND onto the wire**, and one encoding serves both:
+/// the cache stores exactly what a client is sent, so serving a cached summary
+/// is a read rather than a re-encode.
+///
+/// # This is hostile input (charter rule 14)
+///
+/// A client decodes summaries from servers it does not trust, so the decoder
+/// refuses rather than trusts: a version it does not know, a level outside the
+/// chain, a length that disagrees with the level, and anything longer than the
+/// largest summary there can be. No allocation is sized by a number the sender
+/// chose — the cell count comes from the LEVEL, which is checked first.
+pub mod codec {
+    use super::{Summary, SummaryError, cells_per_axis};
+    use crate::material::MaterialId;
+
+    /// What every encoded summary starts with.
+    const VERSION: u8 = 1;
+
+    /// The largest an encoded summary can be, before decompression.
+    ///
+    /// The finest level is `CHUNK_BLOCKS`³ cells of two bytes, and compression
+    /// only ever makes that smaller — so anything past it is not a summary this
+    /// build could have produced.
+    pub const MAX_ENCODED: usize = 2 + (16 * 16 * 16) * 2;
+
+    /// Encodes a summary: a version, its level, then a `u16` per cell.
+    ///
+    /// Little-endian and fixed-width, so the bytes are the same on every
+    /// supported target — which is what lets the determinism gate hash them and
+    /// the cache compare them.
+    #[must_use]
+    pub fn encode(summary: &Summary) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + summary.cells().len() * 2);
+        out.push(VERSION);
+        out.push(summary.level());
+        for cell in summary.cells() {
+            out.extend_from_slice(&cell.0.to_le_bytes());
+        }
+        out
+    }
+
+    /// Reads a summary, or says why it is not one.
+    ///
+    /// # Errors
+    ///
+    /// [`SummaryError`] for an unknown version, a level outside the chain, or a
+    /// body whose length does not match the level it claims.
+    pub fn decode(bytes: &[u8]) -> Result<Summary, SummaryError> {
+        if bytes.len() > MAX_ENCODED {
+            return Err(SummaryError::Size {
+                level: 0,
+                expected: MAX_ENCODED,
+                found: bytes.len(),
+            });
+        }
+        let [version, level, body @ ..] = bytes else {
+            return Err(SummaryError::Level { level: 0 });
+        };
+        if *version != VERSION {
+            return Err(SummaryError::Version { found: *version });
+        }
+        // **The level decides the size, and it is checked first.** Sizing the
+        // allocation from the body's own length would let a sender choose it.
+        let Some(n) = cells_per_axis(*level) else {
+            return Err(SummaryError::Level { level: *level });
+        };
+        let expected = (n * n * n) as usize;
+        if body.len() != expected * 2 {
+            return Err(SummaryError::Size {
+                level: *level,
+                expected: expected * 2,
+                found: body.len(),
+            });
+        }
+        let cells = body
+            .chunks_exact(2)
+            .map(|pair| MaterialId(u16::from_le_bytes([pair[0], pair[1]])))
+            .collect();
+        Summary::from_parts(*level, cells)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{COARSEST, FINEST};
+        use super::*;
+
+        fn summary(level: u8) -> Summary {
+            let n = cells_per_axis(level).expect("a level");
+            Summary::from_parts(level, vec![MaterialId(3); (n * n * n) as usize]).expect("build")
+        }
+
+        #[test]
+        fn every_level_survives_the_wire() {
+            for level in FINEST..=COARSEST {
+                let sent = summary(level);
+                let bytes = encode(&sent);
+                assert_eq!(decode(&bytes), Ok(sent), "level {level} did not round-trip");
+            }
+        }
+
+        #[test]
+        fn anything_that_is_not_a_summary_is_refused() {
+            // A client decodes these from servers it does not trust, so every
+            // failure is a refusal rather than a guess (charter rule 14).
+            assert!(decode(&[]).is_err(), "an empty message");
+            assert!(decode(&[VERSION]).is_err(), "a header with no level");
+            assert!(
+                matches!(decode(&[9, FINEST]), Err(SummaryError::Version { .. })),
+                "a version this build does not know"
+            );
+            assert!(
+                matches!(decode(&[VERSION, 0]), Err(SummaryError::Level { .. })),
+                "level 0 is the chunk, not a summary"
+            );
+            assert!(
+                matches!(
+                    decode(&[VERSION, COARSEST + 1]),
+                    Err(SummaryError::Level { .. })
+                ),
+                "a level past the end of the chain"
+            );
+
+            // A body that disagrees with its own level, both ways round.
+            let good = encode(&summary(COARSEST));
+            let mut short = good.clone();
+            short.pop();
+            assert!(matches!(decode(&short), Err(SummaryError::Size { .. })));
+            let mut long = good;
+            long.push(0);
+            assert!(
+                matches!(decode(&long), Err(SummaryError::Size { .. })),
+                "trailing bytes were ignored, so one summary has two spellings"
+            );
+
+            // And nothing enormous, whatever it claims to be.
+            assert!(decode(&vec![VERSION; MAX_ENCODED + 1]).is_err());
+        }
+
+        #[test]
+        fn a_cut_summary_never_decodes_and_never_panics() {
+            let good = encode(&summary(FINEST));
+            for cut in 0..good.len() {
+                assert!(
+                    decode(&good[..cut]).is_err(),
+                    "a summary cut at {cut} bytes decoded anyway"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

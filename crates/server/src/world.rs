@@ -38,6 +38,7 @@ use std::collections::{BTreeMap, HashMap};
 use tiamot_core::block::{BlockView, Cells, EMPTY_CELLS};
 use tiamot_core::fluid::FluidLayer;
 use tiamot_core::inventory::{self, Stack};
+use tiamot_core::lod;
 use tiamot_core::proto::Edit;
 use tiamot_core::script::ScriptVm as _;
 use tiamot_core::{
@@ -426,6 +427,13 @@ pub struct World {
     /// because charter rule 4 forbids anything observable depending on hash
     /// order, and which domains exist is observable.
     domains: BTreeMap<String, Space>,
+    /// Summaries built this session, and summaries answered from the cache.
+    ///
+    /// Counters rather than a log: what matters is the ratio, and a horizon
+    /// that recomputes every time it is looked at is a bug with no other
+    /// symptom than a slow server.
+    computed: u64,
+    served: u64,
 }
 
 impl World {
@@ -450,6 +458,8 @@ impl World {
             seed,
             sparse: std::collections::BTreeSet::new(),
             domains: BTreeMap::new(),
+            computed: 0,
+            served: 0,
         })
     }
 
@@ -803,6 +813,96 @@ impl World {
             .cache
             .get_mut(&pos)
             .expect("just inserted if it was absent"))
+    }
+
+    /// A chunk's LOD summary at one level, computed once and cached.
+    ///
+    /// Returns the encoded bytes, which are exactly what a client is sent — a
+    /// cache hit is a read, not a re-encode.
+    ///
+    /// **Does not go through [`World::chunk`], deliberately.** The horizon is
+    /// where LOD is for, and a 32-chunk radius is tens of thousands of chunks:
+    /// putting each one into the resident cache to look at it once would cost
+    /// more memory than the whole feature saves, and each would be announced as
+    /// arrived to a streamer that has no interest in it. So a chunk that is not
+    /// already resident is loaded — or generated — read, summarised, and
+    /// dropped.
+    ///
+    /// A chunk generated this way is **not** persisted, which is the one place
+    /// this departs from "generated chunks are persisted" in the module docs.
+    /// Freezing a hundred thousand chunks a player has only ever seen from a
+    /// mile away would be a gigabyte of terrain nobody has stood on. The
+    /// summary is the artefact worth keeping. If that land is ever visited,
+    /// [`World::chunk`] generates and freezes it then — and the write forgets
+    /// these summaries in the same transaction, so a horizon computed under an
+    /// older worldgen cannot outlive the chunk it described.
+    ///
+    /// Levels coarser than the one asked for are stored too: they fall out of
+    /// the same computation and the coarsest is a single cell. Finer ones are
+    /// not, because level 1 is 4 KiB and storing it for terrain nobody has
+    /// approached is the disk cost this method exists to avoid.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the level is not a real one, the domain holds no
+    /// voxels, or the read fails.
+    pub fn summary(
+        &mut self,
+        domain: &str,
+        level: u8,
+        pos: ChunkPos,
+        source: &mut dyn ChunkSource,
+    ) -> Result<Vec<u8>, WorldError> {
+        if lod::cells_per_axis(level).is_none() {
+            return Err(WorldError::NoSuchLevel { level });
+        }
+        if self.sparse.contains(domain) {
+            return Err(WorldError::NoVoxels {
+                domain: domain.to_owned(),
+            });
+        }
+        if let Some(cached) = self.db.load_summary(domain, level, pos)? {
+            self.served += 1;
+            return Ok(cached);
+        }
+
+        // Resident first: a chunk the simulation is already holding is the
+        // authoritative one, and it may hold edits this tick that the database
+        // has not been told about yet.
+        let chain = match self.domains.get(domain).and_then(|s| s.cache.get(&pos)) {
+            Some(chunk) => lod::Summary::chain(chunk),
+            None => {
+                let chunk = match self.db.load_chunk_in(domain, pos)? {
+                    Some(chunk) => chunk,
+                    None => source.generate(domain, pos, self.seed),
+                };
+                lod::Summary::chain(&chunk)
+            }
+        };
+        self.computed += 1;
+
+        let keep: Vec<(u8, Vec<u8>)> = chain
+            .iter()
+            .filter(|summary| summary.level() >= level)
+            .map(|summary| (summary.level(), lod::codec::encode(summary)))
+            .collect();
+        let wanted = keep
+            .iter()
+            .find(|(at, _)| *at == level)
+            .map(|(_, bytes)| bytes.clone())
+            .ok_or(WorldError::NoSuchLevel { level })?;
+        self.db.save_summaries(domain, pos, &keep)?;
+        Ok(wanted)
+    }
+
+    /// How many summaries this session has computed, and how many it has served
+    /// from the cache.
+    ///
+    /// For the tests that assert an edit forces a recompute and a second look
+    /// at the same horizon does not, and for the metrics line.
+    #[must_use]
+    pub fn summary_work(&self) -> (u64, u64) {
+        (self.computed, self.served)
     }
 
     /// Applies one edit, returning the chunk it touched and what it removed.
@@ -1256,6 +1356,107 @@ mod tests {
         }
         let db = WorldDb::open(&path, &mut registry).expect("reopen");
         World::open(db, 12345).expect("reopen world")
+    }
+
+    #[test]
+    fn a_horizon_is_computed_once_and_an_edit_makes_it_be_computed_again() {
+        // **Criterion T2, at the level the server sees it.** A summary that
+        // recomputes every time it is looked at has no symptom but a slow
+        // server, and one that never recomputes shows terrain that is not
+        // there. Both directions, or neither is pinned.
+        let (mut world, ids) = world("summary-cache");
+        let mut flat = Flat::new(ids[0]);
+        let overworld = tiamot_core::domain::OVERWORLD;
+        let level = lod::FINEST;
+        let pos = ChunkPos::new(0, -1, 0);
+
+        let first = world
+            .summary(overworld, level, pos, &mut flat)
+            .expect("summary");
+        assert_eq!(world.summary_work(), (1, 0));
+
+        let again = world
+            .summary(overworld, level, pos, &mut flat)
+            .expect("summary");
+        assert_eq!(first, again, "the cache answered with different terrain");
+        assert_eq!(
+            world.summary_work(),
+            (1, 1),
+            "the second look recomputed a horizon it had already stored"
+        );
+
+        // Every coarser level came free with the first computation, so none of
+        // them costs a second one.
+        for coarser in level + 1..=lod::COARSEST {
+            world
+                .summary(overworld, coarser, pos, &mut flat)
+                .expect("summary");
+        }
+        assert_eq!(
+            world.summary_work().0,
+            1,
+            "a coarser level recomputed what the chain had already produced"
+        );
+
+        // Now change the terrain under it. The edit dirties the chunk; the save
+        // is what forgets the summary, in the same transaction as the write.
+        let edit = tiamot_core::proto::Edit::Block {
+            pos: BlockPos::new(1, -1, 1),
+            material: ids[1].0,
+        };
+        world.apply(overworld, &edit, &mut flat).expect("edit");
+        assert_eq!(world.save_dirty().expect("save"), 1);
+
+        let after = world
+            .summary(overworld, level, pos, &mut flat)
+            .expect("summary");
+        assert_eq!(
+            world.summary_work().0,
+            2,
+            "the horizon survived an edit to the chunk under it"
+        );
+        assert_ne!(
+            first, after,
+            "the recomputed horizon does not show the edit"
+        );
+    }
+
+    #[test]
+    fn a_horizon_is_read_without_the_chunk_moving_into_memory() {
+        // The whole point of not going through `World::chunk`: a 32-chunk
+        // radius is tens of thousands of chunks, and holding each one to look
+        // at it once would cost more than the feature saves.
+        let (mut world, ids) = world("summary-no-residency");
+        let mut flat = Flat::new(ids[0]);
+        let overworld = tiamot_core::domain::OVERWORLD;
+
+        world
+            .summary(overworld, lod::COARSEST, ChunkPos::new(9, -1, 9), &mut flat)
+            .expect("summary");
+        assert_eq!(world.cached(), 0, "summarising a chunk kept it resident");
+        assert_eq!(world.dirty(), 0, "summarising a chunk queued it for a save");
+        assert_eq!(
+            world.take_arrived(overworld).len(),
+            0,
+            "a chunk nobody asked for was announced as arrived"
+        );
+    }
+
+    #[test]
+    fn a_level_that_does_not_exist_is_refused() {
+        let (mut world, ids) = world("summary-bad-level");
+        let mut flat = Flat::new(ids[0]);
+        for level in [0, lod::COARSEST + 1, u8::MAX] {
+            assert!(matches!(
+                world.summary(
+                    tiamot_core::domain::OVERWORLD,
+                    level,
+                    ChunkPos::new(0, -1, 0),
+                    &mut flat
+                ),
+                Err(WorldError::NoSuchLevel { .. })
+            ));
+        }
     }
 
     #[test]

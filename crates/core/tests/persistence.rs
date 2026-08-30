@@ -1251,3 +1251,188 @@ fn the_overworld_cannot_be_destroyed() {
         "the refusal still emptied the world"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Chunk LOD summaries (Task 15b)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_edit_forgets_every_level_above_it_and_leaves_its_neighbours_alone() {
+    // **Criterion: edit invalidation.** A summary is derived state, so an edit
+    // at LOD0 makes every level of that column wrong at once — and a summary
+    // that is STALE is worse than one that is gone, because nothing downstream
+    // can tell. So the column is deleted rather than rewritten, and the chain
+    // is written back together.
+    let path = scratch("summary-invalidation");
+    let mut registry = registry_with(&["test:stone"]);
+    let stone = registry.register("test:stone").expect("register");
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+
+    let edited = ChunkPos::new(0, 0, 0);
+    let neighbour = ChunkPos::new(1, 0, 0);
+    let chunk = Chunk::new(edited, stone);
+
+    let chain: Vec<(u8, Vec<u8>)> = tiamot_core::lod::Summary::chain(&chunk)
+        .iter()
+        .map(|summary| (summary.level(), tiamot_core::lod::codec::encode(summary)))
+        .collect();
+    let levels = chain.len();
+    assert!(levels > 1, "a chain of one level cannot test a column");
+
+    db.save_summaries(DEFAULT_DOMAIN, edited, &chain)
+        .expect("save");
+    db.save_summaries(DEFAULT_DOMAIN, neighbour, &chain)
+        .expect("save");
+    assert_eq!(db.summary_rows(DEFAULT_DOMAIN).expect("count"), levels * 2);
+
+    // Every level of the edited column is present before the edit, or
+    // forgetting them would prove nothing.
+    for (level, _) in &chain {
+        assert!(
+            db.load_summary(DEFAULT_DOMAIN, *level, edited)
+                .expect("read")
+                .is_some(),
+            "level {level} was never stored"
+        );
+    }
+
+    let gone = db.forget_summaries(DEFAULT_DOMAIN, edited).expect("forget");
+    assert_eq!(gone, levels, "an edit forgot {gone} levels, not {levels}");
+
+    for (level, _) in &chain {
+        assert!(
+            db.load_summary(DEFAULT_DOMAIN, *level, edited)
+                .expect("read")
+                .is_none(),
+            "level {level} survived an edit to the chunk under it"
+        );
+        assert!(
+            db.load_summary(DEFAULT_DOMAIN, *level, neighbour)
+                .expect("read")
+                .is_some(),
+            "an edit to one chunk forgot its neighbour's level {level}"
+        );
+    }
+}
+
+#[test]
+fn a_second_domains_summaries_do_not_collide_with_the_overworlds() {
+    // **Criterion A2 for Task 15b.** A summary is keyed by chunk position, and
+    // the same position is different terrain in another domain — so a cache
+    // keyed by position alone would serve a ship's horizon to somebody standing
+    // in the overworld, and an edit in one would forget the other's.
+    let path = scratch("summary-domains");
+    let mut registry = registry_with(&["test:stone", "test:dirt"]);
+    let stone = registry.register("test:stone").expect("register");
+    let dirt = registry.register("test:dirt").expect("register");
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+
+    let at = ChunkPos::new(0, 0, 0);
+    let overworld = tiamot_core::lod::Summary::chain(&Chunk::new(at, stone));
+    let ship = tiamot_core::lod::Summary::chain(&Chunk::new(at, dirt));
+    let encode = |chain: &[tiamot_core::lod::Summary]| -> Vec<(u8, Vec<u8>)> {
+        chain
+            .iter()
+            .map(|summary| (summary.level(), tiamot_core::lod::codec::encode(summary)))
+            .collect()
+    };
+
+    db.save_summaries(DEFAULT_DOMAIN, at, &encode(&overworld))
+        .expect("save");
+    db.save_summaries("mod:ship/17", at, &encode(&ship))
+        .expect("save");
+
+    let level = tiamot_core::lod::FINEST;
+    let from_overworld = db
+        .load_summary(DEFAULT_DOMAIN, level, at)
+        .expect("read")
+        .expect("the overworld's summary");
+    let from_ship = db
+        .load_summary("mod:ship/17", level, at)
+        .expect("read")
+        .expect("the ship's summary");
+    assert_ne!(
+        from_overworld, from_ship,
+        "two domains at the same position returned the same summary"
+    );
+
+    // And an edit in one leaves the other entirely alone.
+    db.forget_summaries("mod:ship/17", at).expect("forget");
+    assert!(
+        db.load_summary(DEFAULT_DOMAIN, level, at)
+            .expect("read")
+            .is_some(),
+        "editing a ship forgot the overworld's horizon"
+    );
+    assert!(
+        db.load_summary("mod:ship/17", level, at)
+            .expect("read")
+            .is_none()
+    );
+}
+
+#[test]
+fn destroying_a_domain_takes_its_summaries_too() {
+    // A cache row outliving the domain it describes is a horizon for a place
+    // that no longer exists, and the id can be created again.
+    let path = scratch("summary-destroy");
+    let mut registry = registry_with(&["test:stone"]);
+    let stone = registry.register("test:stone").expect("register");
+    let db = WorldDb::open(&path, &mut registry).expect("open");
+
+    let at = ChunkPos::new(0, 0, 0);
+    let chain: Vec<(u8, Vec<u8>)> = tiamot_core::lod::Summary::chain(&Chunk::new(at, stone))
+        .iter()
+        .map(|summary| (summary.level(), tiamot_core::lod::codec::encode(summary)))
+        .collect();
+    db.save_summaries("mod:ship/17", at, &chain).expect("save");
+    db.save_summaries(DEFAULT_DOMAIN, at, &chain).expect("save");
+
+    db.remove_domain("mod:ship/17").expect("destroy");
+    assert_eq!(db.summary_rows("mod:ship/17").expect("count"), 0);
+    assert_eq!(
+        db.summary_rows(DEFAULT_DOMAIN).expect("count"),
+        chain.len(),
+        "destroying a ship took the overworld's horizon with it"
+    );
+}
+
+#[test]
+fn saving_a_chunk_forgets_the_summaries_that_described_it() {
+    // The invalidation nobody has to remember. A stored summary describes a
+    // stored chunk, so the write that replaces one has to take the other with
+    // it — in the SAME transaction, or a crash between them leaves a horizon
+    // showing terrain that is not there.
+    let path = scratch("summary-save-forgets");
+    let mut registry = registry_with(&["test:stone", "test:dirt"]);
+    let stone = registry.register("test:stone").expect("register");
+    let dirt = registry.register("test:dirt").expect("register");
+    let mut db = WorldDb::open(&path, &mut registry).expect("open");
+
+    let at = ChunkPos::new(2, 0, 0);
+    let batched = ChunkPos::new(3, 0, 0);
+    let chain: Vec<(u8, Vec<u8>)> = tiamot_core::lod::Summary::chain(&Chunk::new(at, stone))
+        .iter()
+        .map(|summary| (summary.level(), tiamot_core::lod::codec::encode(summary)))
+        .collect();
+    db.save_summaries(DEFAULT_DOMAIN, at, &chain).expect("save");
+    db.save_summaries(DEFAULT_DOMAIN, batched, &chain)
+        .expect("save");
+
+    db.save_chunk_in(DEFAULT_DOMAIN, at, &Chunk::new(at, dirt))
+        .expect("save chunk");
+    assert_eq!(
+        db.summary_rows(DEFAULT_DOMAIN).expect("count"),
+        chain.len(),
+        "one chunk's save should have forgotten one chunk's summaries"
+    );
+
+    let replacement = Chunk::new(batched, dirt);
+    db.save_chunks_batch_in(DEFAULT_DOMAIN, [(batched, &replacement)])
+        .expect("save batch");
+    assert_eq!(
+        db.summary_rows(DEFAULT_DOMAIN).expect("count"),
+        0,
+        "the batch save left summaries describing chunks it replaced"
+    );
+}

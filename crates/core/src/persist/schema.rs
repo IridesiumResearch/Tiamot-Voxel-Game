@@ -42,6 +42,14 @@ pub const DEFAULT_DOMAIN: &str = "overworld";
 ///
 /// **No domain logic exists yet, and none should be added here.** The column is
 /// storage readiness, not a feature.
+///
+/// # `chunk_summaries` is a cache, and is allowed to be wrong by being absent
+///
+/// Task 15b's downsampled levels. Derived state, unlike a chunk or a pond — the
+/// authoritative chunk can always rebuild one — so a missing row costs a
+/// recompute and never data. That is why an edit DELETES the column above it
+/// rather than rewriting it: a summary that is stale is worse than one that is
+/// gone, because nothing downstream can tell.
 pub const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -61,6 +69,16 @@ CREATE TABLE IF NOT EXISTS chunks (
     version INT NOT NULL,
     data    BLOB NOT NULL,
     PRIMARY KEY (domain, x, y, z)
+);
+
+CREATE TABLE IF NOT EXISTS chunk_summaries (
+    domain  TEXT NOT NULL DEFAULT 'overworld',
+    level   INT NOT NULL,
+    x       INT NOT NULL,
+    y       INT NOT NULL,
+    z       INT NOT NULL,
+    data    BLOB NOT NULL,
+    PRIMARY KEY (domain, level, x, y, z)
 );
 
 -- A pond is not derived state. Light is thrown away on shutdown and recomputed,

@@ -209,6 +209,21 @@ pub enum WorldError {
     )]
     OverworldIsNotDestroyable,
 
+    /// A summary was asked for at a level that does not exist.
+    ///
+    /// Levels run from [`crate::lod::FINEST`] to [`crate::lod::COARSEST`]; a
+    /// number outside that is a caller error or a hostile message, and both
+    /// deserve the same refusal rather than a clamp.
+    #[error(
+        "there is no LOD level {level}; levels run {}..={}",
+        crate::lod::FINEST,
+        crate::lod::COARSEST
+    )]
+    NoSuchLevel {
+        /// The level asked for.
+        level: u8,
+    },
+
     /// A chunk was asked for in a domain that holds no voxels.
     ///
     /// A `sparse` domain is entities and nothing else. Answering with an empty
@@ -401,6 +416,12 @@ impl WorldDb {
 
     /// Saves a chunk to a named domain.
     ///
+    /// **Forgets that chunk's LOD summaries in the same transaction**, because
+    /// a stored summary describes a stored chunk and the two have to move
+    /// together. Leaving it to the caller would mean every future write path
+    /// has to remember, and the failure it forgets is a horizon showing terrain
+    /// that is no longer there. See [`Self::forget_summaries`].
+    ///
     /// # Errors
     ///
     /// [`WorldError`] on a SQL failure or an unencodable chunk.
@@ -411,7 +432,8 @@ impl WorldDb {
         chunk: &Chunk,
     ) -> Result<(), WorldError> {
         let blob = self.encode(domain, pos, chunk)?;
-        self.conn.execute(
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
             "INSERT INTO chunks (domain, x, y, z, version, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(domain, x, y, z) DO UPDATE SET version = excluded.version,
                                                         data = excluded.data",
@@ -424,6 +446,11 @@ impl WorldDb {
                 blob
             ],
         )?;
+        transaction.execute(
+            "DELETE FROM chunk_summaries WHERE domain = ?1 AND x = ?2 AND y = ?3 AND z = ?4",
+            params![domain, pos.x, pos.y, pos.z],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -480,6 +507,14 @@ impl WorldDb {
                     i64::from(codec::CHUNK_FORMAT_VERSION),
                     blob
                 ])?;
+            }
+            // The summaries of everything written, for the reason given on
+            // `save_chunk_in`: a stored summary describes a stored chunk.
+            let mut forget = transaction.prepare_cached(
+                "DELETE FROM chunk_summaries WHERE domain = ?1 AND x = ?2 AND y = ?3 AND z = ?4",
+            )?;
+            for (pos, _) in &encoded {
+                forget.execute(params![domain, pos.x, pos.y, pos.z])?;
             }
         }
         transaction.commit()?;
@@ -1423,7 +1458,7 @@ impl WorldDb {
             return Err(WorldError::OverworldIsNotDestroyable);
         }
         let transaction = self.conn.unchecked_transaction()?;
-        for table in ["chunks", "chunk_fluid", "entities"] {
+        for table in ["chunks", "chunk_fluid", "entities", "chunk_summaries"] {
             transaction.execute(
                 &format!("DELETE FROM {table} WHERE domain = ?1"),
                 params![domain],
@@ -1431,6 +1466,104 @@ impl WorldDb {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Reads a cached summary, if one is stored.
+    ///
+    /// **A cache, so absence is an answer**: the authoritative chunk can always
+    /// rebuild one, and a miss costs a recompute rather than data. Bytes come
+    /// back exactly as they were written, which is exactly what a client is
+    /// sent — serving a cached summary is a read, not a re-encode.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn load_summary(
+        &self,
+        domain: &str,
+        level: u8,
+        pos: ChunkPos,
+    ) -> Result<Option<Vec<u8>>, WorldError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT data FROM chunk_summaries
+                 WHERE domain = ?1 AND level = ?2 AND x = ?3 AND y = ?4 AND z = ?5",
+                params![domain, i64::from(level), pos.x, pos.y, pos.z],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Stores a chunk's whole summary chain, replacing whatever was there.
+    ///
+    /// The chain together, because that is how it is built and how it is thrown
+    /// away: an edit invalidates every level of a column at once, so storing
+    /// them one at a time would leave a window where some levels are the new
+    /// terrain and some are the old.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure. One transaction, so a failure changes nothing.
+    pub fn save_summaries(
+        &self,
+        domain: &str,
+        pos: ChunkPos,
+        levels: &[(u8, Vec<u8>)],
+    ) -> Result<(), WorldError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        {
+            let mut write = transaction.prepare(
+                "INSERT INTO chunk_summaries (domain, level, x, y, z, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(domain, level, x, y, z) DO UPDATE SET data = excluded.data",
+            )?;
+            for (level, data) in levels {
+                write.execute(params![
+                    domain,
+                    i64::from(*level),
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    data
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Forgets every level of one chunk's summary.
+    ///
+    /// **What an edit does, and it DELETES rather than rewrites.** A summary is
+    /// derived state: one that is gone costs a recompute, and one that is stale
+    /// is wrong with nothing downstream able to tell. An edit at LOD0 changes
+    /// every level above it, so the whole column goes — which is also why
+    /// `save_summaries` writes the chain together.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn forget_summaries(&self, domain: &str, pos: ChunkPos) -> Result<usize, WorldError> {
+        Ok(self.conn.execute(
+            "DELETE FROM chunk_summaries WHERE domain = ?1 AND x = ?2 AND y = ?3 AND z = ?4",
+            params![domain, pos.x, pos.y, pos.z],
+        )?)
+    }
+
+    /// How many summary rows one domain holds, for the tests and the zero-cost
+    /// invariant.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn summary_rows(&self, domain: &str) -> Result<usize, WorldError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunk_summaries WHERE domain = ?1",
+            params![domain],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 
     /// Every domain this world has anything stored under.
