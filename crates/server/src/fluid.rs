@@ -109,13 +109,96 @@ pub fn absorbency_from_rules(
 /// are that one thread — and never held across a mod callback, which is the
 /// arrangement that would deadlock.
 pub struct Shared {
-    fluidics: std::sync::Arc<std::sync::RwLock<Fluidics>>,
+    fluidics: std::sync::Arc<std::sync::RwLock<Ponds>>,
+}
+
+/// One [`Fluidics`] per domain, made on first use.
+///
+/// **Milk is per-space, like everything else about a place.** A layer is keyed
+/// by chunk position, and the same position is different terrain in another
+/// domain — so one store shared between them would pour a ship's milk into the
+/// overworld at those coordinates, and let a pond flow through a hull it cannot
+/// see.
+///
+/// A store per domain rather than a domain inside the store, for the reason
+/// `light::Lights` gives: the solver walks neighbouring layers constantly and
+/// wants a map it can index by position alone, and nothing about fluid is
+/// cross-domain — milk does not run between worlds.
+#[derive(Debug)]
+pub struct Ponds {
+    fluids: Fluids,
+    absorbency: Absorbency,
+    domains: std::collections::BTreeMap<String, Fluidics>,
+}
+
+impl Ponds {
+    /// A set of stores for a world whose mods registered these fluids.
+    #[must_use]
+    pub fn new(fluids: Fluids, absorbency: Absorbency) -> Self {
+        Self {
+            fluids,
+            absorbency,
+            domains: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// One domain's fluid, created on first use.
+    pub fn of(&mut self, domain: &str) -> &mut Fluidics {
+        self.domains.entry(domain.to_owned()).or_insert_with(|| {
+            let mut fluidics = Fluidics::new(self.fluids.clone());
+            fluidics.set_absorbency(self.absorbency.clone());
+            fluidics
+        })
+    }
+
+    /// One domain's fluid, if anything has poured there.
+    #[must_use]
+    pub fn get(&self, domain: &str) -> Option<&Fluidics> {
+        self.domains.get(domain)
+    }
+
+    /// What the mods registered. The same table for every domain: a fluid is a
+    /// kind of thing, not a thing in a place.
+    #[must_use]
+    pub const fn fluids(&self) -> &Fluids {
+        &self.fluids
+    }
+
+    /// What a fluid is called. The same answer for every domain.
+    #[must_use]
+    pub fn name_of(&self, id: tiamot_core::fluid::FluidId) -> Option<&str> {
+        self.fluids
+            .iter_registered()
+            .find(|(registered, _)| *registered == id)
+            .map(|(_, entry)| entry.name.as_str())
+    }
+
+    /// Everything to save, as `(domain, chunk, layer)`.
+    ///
+    /// **A row is `(domain, chunk)`**, the same as a chunk's and an entity's,
+    /// so a pond in a ship is written under the ship and not into the overworld
+    /// at those coordinates.
+    pub fn take_dirty(&mut self) -> Vec<(String, ChunkPos, FluidLayer)> {
+        let mut out = Vec::new();
+        for (domain, fluid) in &mut self.domains {
+            for (pos, layer) in fluid.take_dirty() {
+                out.push((domain.clone(), pos, layer));
+            }
+        }
+        out
+    }
+
+    /// Every domain anything has poured in.
+    #[must_use]
+    pub fn wet_domains(&self) -> Vec<&str> {
+        self.domains.keys().map(String::as_str).collect()
+    }
 }
 
 impl Shared {
     /// Wraps a store the simulation thread owns.
     #[must_use]
-    pub const fn new(fluidics: std::sync::Arc<std::sync::RwLock<Fluidics>>) -> Self {
+    pub const fn new(fluidics: std::sync::Arc<std::sync::RwLock<Ponds>>) -> Self {
         Self { fluidics }
     }
 }
@@ -125,22 +208,28 @@ impl tiamot_core::fluid::Access for Shared {
         // A poisoned lock means the simulation thread panicked, in which case
         // there is no world to have milk in. Empty is the honest answer, and
         // panicking inside a mod callback would blame the mod.
-        self.fluidics
-            .read()
-            .map_or(Fluid::EMPTY, |fluidics| fluidics.at(pos))
+        // **The overworld's**, because `game.get_fluid(position)` names a
+        // position and no domain — a mod asking about a place in a ship has no
+        // way to say which ship. Widening this needs the API to carry a domain,
+        // which is a change to what mods write and not a change here.
+        self.fluidics.read().map_or(Fluid::EMPTY, |ponds| {
+            ponds
+                .get(tiamot_core::domain::OVERWORLD)
+                .map_or(Fluid::EMPTY, |fluidics| fluidics.at(pos))
+        })
     }
 
     fn set_fluid_at(&self, pos: BlockPos, value: Fluid) -> bool {
         self.fluidics
             .write()
-            .is_ok_and(|mut fluidics| fluidics.set(pos, value))
+            .is_ok_and(|mut ponds| ponds.of(tiamot_core::domain::OVERWORLD).set(pos, value))
     }
 
     fn fluid_id(&self, name: &str) -> Option<tiamot_core::fluid::FluidId> {
         self.fluidics
             .read()
             .ok()
-            .and_then(|fluidics| fluidics.fluids().id_of(name))
+            .and_then(|ponds| ponds.fluids().id_of(name))
     }
 }
 

@@ -256,14 +256,15 @@ fn apply_transfer(
 /// per-domain loop it is, and so the day fluid IS keyed by domain this takes
 /// one line rather than a search.
 fn load_domain_fluid(
-    fluidics: &std::sync::RwLock<crate::fluid::Fluidics>,
+    fluidics: &std::sync::RwLock<crate::fluid::Ponds>,
     world: &crate::world::World,
     domain: &str,
     arrived: &[tiamot_core::ChunkPos],
 ) {
-    let Ok(mut fluid) = fluidics.write() else {
+    let Ok(mut ponds) = fluidics.write() else {
         return;
     };
+    let fluid = ponds.of(domain);
     for pos in arrived {
         // Already read: the lighting defers what it cannot relight by putting
         // the chunk back on the arrival list, so chunks arrive twice. Loading
@@ -282,6 +283,26 @@ fn load_domain_fluid(
             }
         }
     }
+}
+
+/// Writes each dirty fluid layer into the domain it belongs to.
+///
+/// **A row is `(domain, chunk)`**, as it is for chunks and entities: a pond in
+/// a ship written into the overworld at those coordinates both forges a pond
+/// there and deletes whatever was in the ship.
+fn save_fluid_by_domain(
+    world: &mut crate::world::World,
+    dirty: &[(
+        String,
+        tiamot_core::ChunkPos,
+        tiamot_core::fluid::FluidLayer,
+    )],
+) -> Result<usize, tiamot_core::WorldError> {
+    let mut written = 0;
+    for (domain, pos, layer) in dirty {
+        written += world.save_fluid(domain, [(*pos, layer)])?;
+    }
+    Ok(written)
 }
 
 /// Writes each dirty chunk of entities into the domain it belongs to.
@@ -1443,9 +1464,7 @@ impl ServerHandle {
                     // held across a callback, which is what would deadlock.
                     let fluidics = std::sync::Arc::new(std::sync::RwLock::new(
                         {
-                            let mut fluidics = crate::fluid::Fluidics::new(fluids);
-                            fluidics.set_absorbency(absorbency);
-                            fluidics
+                            crate::fluid::Ponds::new(fluids, absorbency)
                         },
                     ));
                     // And the entities, behind the same kind of lock for the
@@ -1736,6 +1755,7 @@ impl ServerHandle {
                                     fluidics
                                         .write()
                                         .expect("fluid lock")
+                                        .of(tiamot_core::domain::OVERWORLD)
                                         .touch(edited_block(&edit));
                                     shared.broadcast(ServerMessage::BlockDelta {
                                         edit,
@@ -1762,6 +1782,7 @@ impl ServerHandle {
                                     fluidics
                                         .write()
                                         .expect("fluid lock")
+                                        .of(tiamot_core::domain::OVERWORLD)
                                         .touch(edited_block(&edit));
                                     // Charter rule 5: what the edit took out,
                                     // in units. 27 for a block, 1 for a
@@ -1859,7 +1880,11 @@ impl ServerHandle {
                         }
 
                         if let Ok(mut bodies) = shared.bodies.lock() {
-                            let fluid = fluidics.read().expect("fluid lock");
+                            let ponds = fluidics.read().expect("fluid lock");
+                            // A space nobody has poured in is dry, and dry is
+                            // an answer — so a domain with no store of its own
+                            // borrows an empty one rather than the overworld's.
+                            let dry = crate::fluid::Fluidics::default();
                             for player in bodies.values_mut() {
                                 let intent = player.inputs.take(tick);
                                 // Bound to the domain this body is in before
@@ -1868,9 +1893,13 @@ impl ServerHandle {
                                 // otherwise collide against whichever domain
                                 // the lookup happened to be built over.
                                 let terrain = world.solid(&player.domain);
+                                // And the milk of that same space: a body swims
+                                // in what is around it, and a pond in the
+                                // overworld is not around somebody in a ship.
+                                let wet = ponds.get(&player.domain).unwrap_or(&dry);
                                 let voxels = tiamot_core::phys::Voxels::with_fluid(
                                     &terrain,
-                                    &*fluid,
+                                    wet,
                                     player.origin,
                                 );
                                 let before = player.body;
@@ -2339,6 +2368,7 @@ impl ServerHandle {
                                         fluidics
                                             .write()
                                             .expect("fluid lock")
+                                            .of(&where_they_are)
                                             .touch(edited_block(&edit));
                                         shared.credit(uuid, removed);
                                         shared.broadcast_in(
@@ -2694,6 +2724,7 @@ impl ServerHandle {
                                         fluidics
                                             .write()
                                             .expect("fluid lock")
+                                            .of(&building_in)
                                             .touch(edited_block(&edit));
                                         shared.broadcast_in(
                                             &building_in,
@@ -2927,13 +2958,18 @@ impl ServerHandle {
                                 let layer = fluidics
                                     .read()
                                     .expect("fluid lock")
-                                    .layer(request.pos)
-                                    .cloned()
+                                    .get(&request.domain)
+                                    .and_then(|fluid| fluid.layer(request.pos).cloned())
                                     .unwrap_or_else(tiamot_core::fluid::FluidLayer::empty);
-                                shared.broadcast(ServerMessage::ChunkFluid {
-                                    pos: request.pos,
-                                    fluid: tiamot_core::fluid::codec::encode(&layer),
-                                });
+                                // To the requester's own space: the same
+                                // position is a different pond elsewhere.
+                                shared.broadcast_in(
+                                    &request.domain,
+                                    ServerMessage::ChunkFluid {
+                                        pos: request.pos,
+                                        fluid: tiamot_core::fluid::codec::encode(&layer),
+                                    },
+                                );
                             }
 
                             // A failed send means the connection went away
@@ -3290,7 +3326,8 @@ impl ServerHandle {
                         // that visibly stutters, because unlike a pond it is
                         // something a player is looking straight at.
                         {
-                            let fluid = fluidics.read().expect("fluid lock");
+                            let ponds = fluidics.read().expect("fluid lock");
+                            let dry = crate::fluid::Fluidics::default();
                             let mut mobs = population.write().expect("entity lock");
                             // **Once per domain that has anybody in it**, each
                             // against its own terrain. A world with one domain
@@ -3304,7 +3341,7 @@ impl ServerHandle {
                                 .map(str::to_owned)
                                 .collect();
                             for domain in occupied {
-                                mobs.tick(&domain, &world, &fluid);
+                                mobs.tick(&domain, &world, ponds.get(&domain).unwrap_or(&dry));
                             }
                         }
 
@@ -3376,9 +3413,23 @@ impl ServerHandle {
                         // A settled world returns here immediately: the solver
                         // checks an empty active set and allocates nothing.
                         if tick.is_multiple_of(crate::fluid::TICKS_PER_FLUID_TICK) {
-                            let mut fluid = fluidics.write().expect("fluid lock");
+                            // **Once per space that has milk in it.** A pond is
+                            // in a place, and the same coordinates are a
+                            // different place in another domain — so each
+                            // solves its own, against its own terrain, and
+                            // tells only the people standing in it.
+                            let wet: Vec<String> = fluidics
+                                .read()
+                                .expect("fluid lock")
+                                .wet_domains()
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect();
+                            for domain in wet {
+                            let mut ponds = fluidics.write().expect("fluid lock");
+                            let fluid = ponds.of(&domain);
                             let changes = fluid.tick(
-                                        tiamot_core::domain::OVERWORLD,
+                                &domain,
                                 &world,
                                 tick / crate::fluid::TICKS_PER_FLUID_TICK,
                                 world.seed(),
@@ -3394,18 +3445,24 @@ impl ServerHandle {
                                         // has no layer any more. Clients still
                                         // have to be told, or the milk they can
                                         // see never goes away.
-                                        shared.broadcast(ServerMessage::ChunkFluid {
-                                            pos,
-                                            fluid: tiamot_core::fluid::codec::encode(
-                                                &tiamot_core::fluid::FluidLayer::empty(),
-                                            ),
-                                        });
+                                        shared.broadcast_in(
+                                            &domain,
+                                            ServerMessage::ChunkFluid {
+                                                pos,
+                                                fluid: tiamot_core::fluid::codec::encode(
+                                                    &tiamot_core::fluid::FluidLayer::empty(),
+                                                ),
+                                            },
+                                        );
                                         continue;
                                     };
-                                    shared.broadcast(ServerMessage::ChunkFluid {
-                                        pos,
-                                        fluid: tiamot_core::fluid::codec::encode(layer),
-                                    });
+                                    shared.broadcast_in(
+                                        &domain,
+                                        ServerMessage::ChunkFluid {
+                                            pos,
+                                            fluid: tiamot_core::fluid::codec::encode(layer),
+                                        },
+                                    );
                                 }
                             }
 
@@ -3437,7 +3494,7 @@ impl ServerHandle {
                                     .absorbed
                                     .iter()
                                     .filter_map(|taken| {
-                                        let block = world.resident(tiamot_core::domain::OVERWORLD, taken.pos.chunk())?;
+                                        let block = world.resident(&domain, taken.pos.chunk())?;
                                         let becomes = fluid
                                             .absorbs_block(&block.get_block_local(taken.pos.local()))?
                                             .becomes?;
@@ -3445,7 +3502,7 @@ impl ServerHandle {
                                     })
                                     .collect();
                             let blocked = fluid.take_blocked();
-                            drop(fluid);
+                            drop(ponds);
 
                             for (pos, becomes) in soaked {
                                 // Whatever shape the block had, kept: a
@@ -3454,7 +3511,7 @@ impl ServerHandle {
                                     pos,
                                     material: becomes.0,
                                 };
-                                match world.apply(tiamot_core::domain::OVERWORLD, &edit, &mut source) {
+                                match world.apply(&domain, &edit, &mut source) {
                                     Ok(_) => {
                                         relight.push(pos);
                                         // The pond has to hear about it too: a
@@ -3464,11 +3521,12 @@ impl ServerHandle {
                                         fluidics
                                             .write()
                                             .expect("fluid lock")
+                                            .of(&domain)
                                             .touch(pos);
-                                        shared.broadcast(ServerMessage::BlockDelta {
-                                            edit,
-                                            actor: None,
-                                        });
+                                        shared.broadcast_in(
+                                            &domain,
+                                            ServerMessage::BlockDelta { edit, actor: None },
+                                        );
                                     }
                                     Err(err) => {
                                         warn!("a soaked block could not be written: {err}");
@@ -3487,7 +3545,7 @@ impl ServerHandle {
                                     continue;
                                 };
                                 let cells = world
-                                    .block_cells(tiamot_core::domain::OVERWORLD, event.into, &mut source)
+                                    .block_cells(&domain, event.into, &mut source)
                                     .unwrap_or(tiamot_core::block::EMPTY_CELLS);
                                 // The first non-air cell names the block: a
                                 // mixed block has no single material, and the
@@ -3520,6 +3578,7 @@ impl ServerHandle {
                                 for (mod_id, err) in &verdict.faults {
                                     error!(mod_id = %mod_id, "mod disabled after an on_fluid_flow failure: {err}");
                                 }
+                            }
                             }
                         }
 
@@ -3565,18 +3624,15 @@ impl ServerHandle {
                             // would be a database write per tick for as long as
                             // the milk was moving.
                             let dirty = fluidics.write().expect("fluid lock").take_dirty();
-                            if !dirty.is_empty()
-                                && let Err(err) =
-                                    world.save_fluid(tiamot_core::domain::OVERWORLD, dirty.iter().map(|(pos, layer)| (*pos, layer)))
-                            {
+                            if let Err(err) = save_fluid_by_domain(&mut world, &dirty) {
                                 // Put them back rather than dropping them. A
                                 // failed write that also forgot what it was
                                 // trying to write would lose the pond at the
                                 // next chunk unload, silently.
                                 error!("could not save fluid: {err}");
-                                let mut fluid = fluidics.write().expect("fluid lock");
-                                for (pos, _) in dirty {
-                                    fluid.mark_dirty(pos);
+                                let mut ponds = fluidics.write().expect("fluid lock");
+                                for (domain, pos, _) in dirty {
+                                    ponds.of(&domain).mark_dirty(pos);
                                 }
                             }
                         }
@@ -3633,8 +3689,7 @@ impl ServerHandle {
                         }
                         let dirty = fluidics.write().expect("fluid lock").take_dirty();
                         if !dirty.is_empty()
-                            && let Err(err) =
-                                world.save_fluid(tiamot_core::domain::OVERWORLD, dirty.iter().map(|(pos, layer)| (*pos, layer)))
+                            && let Err(err) = save_fluid_by_domain(&mut world, &dirty)
                         {
                             error!("could not save fluid on shutdown: {err}");
                         }
