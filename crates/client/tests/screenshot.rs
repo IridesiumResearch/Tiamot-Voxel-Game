@@ -34,7 +34,7 @@ use client::mesher::{self, Absent, Neighbours};
 use client::render::offscreen::{hash_hex, perceptual_hash};
 use client::render::{Gpu, Offscreen, Renderer};
 use client::texture::{Atlas, Image};
-use tiamot_core::proto::SkyGrade;
+use tiamot_core::proto::{MaterialDef, SkyGrade};
 use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId};
 
 /// Full daylight, so these scenes measure what they are about rather than the
@@ -3276,4 +3276,77 @@ fn a_renderer_takes_every_setting_the_config_holds() {
 
     assert_eq!(renderer.shadow_quality(), wanted.shadow_quality);
     assert_eq!(renderer.lighting_mode(), wanted.lighting_mode);
+}
+
+#[test]
+fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
+    // **Reported from the window: "everything is pink and black."** Nothing here
+    // could have caught it. Every other test in this file builds a SYNTHETIC
+    // atlas — `Atlas::build(&[None, None, Some(white)])` — so a world drawn
+    // entirely in the missing-texture placeholder satisfies "sky above, world
+    // below" and every lighting assertion beside it.
+    //
+    // So this one builds the atlas the way the client does, from a material
+    // table and decoded images, and asserts the floor is the material's colour
+    // rather than the placeholder's. What it pins is the join between three
+    // things that are each individually fine: a table indexed by material id,
+    // an image map keyed by the same id, and a mesher that writes that id into
+    // every vertex.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+
+    // The client's own path: `build_atlas` over a table and images, not a
+    // hand-placed slot array. Material 2 is what `scene()` fills with.
+    let table = vec![
+        MaterialDef {
+            step_sound: None,
+            id: 0,
+            name: "engine:air".to_owned(),
+            placeable: false,
+            texture: None,
+        },
+        MaterialDef {
+            step_sound: None,
+            id: 1,
+            name: "engine:unknown".to_owned(),
+            placeable: false,
+            texture: None,
+        },
+        MaterialDef {
+            step_sound: None,
+            id: 2,
+            name: "test:stone".to_owned(),
+            placeable: true,
+            texture: Some([7u8; 32]),
+        },
+    ];
+    let mut images = std::collections::BTreeMap::new();
+    images.insert(2u16, Image::white_with_border());
+    renderer.set_atlas(&client::app::build_atlas(&table, &images));
+
+    upload(&mut renderer, &chunks);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    let frame = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    let floor = average(&frame, 0, HEIGHT * 3 / 4, WIDTH, HEIGHT);
+
+    // The placeholder is magenta and black: red and blue high, green at zero.
+    // The reference texture is white. What separates them is GREEN, which the
+    // chequer has none of at any brightness or under any lighting mode — so
+    // this does not become a hostage to the tonemap the way a hue comparison
+    // would.
+    assert!(
+        floor[1] > 0.15,
+        "the floor has no green in it, which is what the missing-texture \
+         chequer looks like: {floor:?}. The atlas did not receive the texture, \
+         or the shader is not sampling it."
+    );
+    // And not a black frame either, which would also have no magenta in it.
+    assert!(
+        floor[0] + floor[1] + floor[2] > 0.2,
+        "the floor is black, so nothing was drawn at all: {floor:?}"
+    );
 }
