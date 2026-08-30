@@ -1,0 +1,27 @@
+# Binary assets, marked so nothing can rewrite them on the way in or out.
+#
+# Git's heuristic usually gets this right on its own, and "usually" is the
+# problem: a checkout with `core.autocrlf` set — the default on Windows, and
+# easy to inherit into a Linux config — rewrites line endings in anything Git
+# decides is text. A PNG's own signature contains a CR and an LF, and a texture
+# that is one byte different is a texture that does not decode. The symptom is
+# a world drawn entirely in the missing-texture chequer, with nothing in any log
+# to say why: the decode failure reaches a warning the console never shows.
+#
+# Marking them explicitly costs nothing and removes the heuristic from the
+# question.
+*.png   binary
+*.wav   binary
+*.ogg   binary
+*.glb   binary
+*.gltf  binary
+*.bin   binary
+*.sqlite binary
+
+# Text that must stay LF whatever the platform, because its bytes are hashed or
+# parsed by the engine rather than only read by a person.
+*.lua   text eol=lf
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.wgsl  text eol=lf
+*.sh    text eol=lf

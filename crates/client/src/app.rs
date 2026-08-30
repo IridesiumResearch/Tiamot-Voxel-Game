@@ -3131,6 +3131,27 @@ impl App {
     ) {
         self.adopt_materials(table);
         let atlas = build_atlas(table, images);
+        // **The one line that says whether the world will draw.** A texture
+        // that never arrived and a texture that arrived and would not decode
+        // both end as the missing-texture chequer, and both are silent from the
+        // console — the decode failure reaches a warning only the debug overlay
+        // shows. Reported from the window as "everything is pink and black",
+        // with nothing anywhere to say which half had gone wrong.
+        let wanted = table.iter().filter(|entry| entry.texture.is_some()).count();
+        if images.len() < wanted {
+            tracing::warn!(
+                wanted,
+                got = images.len(),
+                "textures are missing and those materials will draw as the missing-texture \
+                 chequer — the server offered more than arrived or decoded"
+            );
+        } else {
+            tracing::info!(
+                materials = table.len(),
+                textures = images.len(),
+                "atlas built"
+            );
+        }
         self.tiles = atlas.tiles_only();
         self.atlas_changed = true;
         self.renderer.set_atlas(&atlas);
