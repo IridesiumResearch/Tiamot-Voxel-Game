@@ -3827,6 +3827,14 @@ impl App {
 
                 Event::DomainChanged { domain } => {
                     self.entering = Some(domain.clone());
+                    // **The prediction goes with the chunks.** Left alone it
+                    // keeps the footing it had in the space being left, and
+                    // walks on the spot against an empty store — audibly, since
+                    // footsteps are gated on being grounded.
+                    if let Some(predictor) = self.predictor.as_mut() {
+                        predictor.adrift();
+                    }
+                    self.stride = 0.0;
                     // **Everything, and the meshes with it.** The store's
                     // positions all mean different chunks now, so a mesh kept
                     // for any of them draws terrain from a place the player has

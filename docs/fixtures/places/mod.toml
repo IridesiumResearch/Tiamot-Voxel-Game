@@ -1,4 +1,8 @@
+# Four simulation spaces, for looking at what a domain switch feels like.
+# A TEST FIXTURE, not content — see docs/fixtures/README.md.
 id = "places"
 name = "Places"
 version = "0.1.0"
+depends = ["core >=0.1"]
+description = "Four domains to walk between. Copy into game/, delete when done."
 license = "GPL-3.0-only"

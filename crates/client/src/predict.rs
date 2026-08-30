@@ -282,6 +282,37 @@ impl Predictor {
         self.origin
     }
 
+    /// Forgets the world this body was standing in.
+    ///
+    /// **A domain switch invalidates the prediction as much as it invalidates
+    /// the chunks.** The client throws away every chunk it holds, so the
+    /// predictor is left running against an empty store — which it reads as
+    /// unloaded terrain and refuses to move through, while still believing the
+    /// `on_ground` it had in the space it left.
+    ///
+    /// What that sounds like, reported from the window: **walking noises in an
+    /// empty domain.** Footsteps are paced by horizontal distance and gated on
+    /// being grounded, so a body that believes it is standing, is being pushed
+    /// by inputs, and is corrected back by the server every tick, walks on the
+    /// spot and makes a noise doing it.
+    ///
+    /// So: nothing is under us that we know of, and every unconfirmed input was
+    /// for a world that is no longer there. The next state from the server is
+    /// what re-establishes both.
+    pub fn adrift(&mut self) {
+        self.body.on_ground = false;
+        self.body.velocity = [0.0; 3];
+        // Replaying these would re-apply a walk through terrain that has been
+        // replaced, against a store that is empty.
+        self.pending.clear();
+        self.remembered.clear();
+        self.last_step = [0.0; 3];
+        self.error = [0.0; 3];
+        self.step_lag = 0.0;
+        self.step_rate = 0.0;
+        self.divergence = None;
+    }
+
     /// How many inputs are awaiting confirmation.
     #[must_use]
     pub fn pending(&self) -> usize {
@@ -1017,6 +1048,47 @@ mod tests {
 
     fn predictor() -> Predictor {
         Predictor::new(ChunkPos::new(0, 0, 0), [24.0, 0.0, 24.0], 0)
+    }
+
+    #[test]
+    fn a_body_that_has_lost_its_world_is_not_standing_on_anything() {
+        // **Reported from the window: walking noises in an empty domain.** The
+        // client throws every chunk away on a domain switch, so the predictor
+        // was left running against an empty store while still believing the
+        // `on_ground` it had in the space it left. Footsteps are gated on being
+        // grounded and paced by horizontal distance, so a body that thinks it
+        // is standing, is pushed by inputs, and is corrected back every tick,
+        // walks on the spot and makes a noise doing it.
+        let mut predictor = predictor();
+        predictor.predict(&Ground::flat(), 1, walking(), &Tuning::DEFAULT);
+        assert!(
+            predictor.body().on_ground,
+            "the fixture is not standing, so losing its footing would prove nothing"
+        );
+        assert!(
+            predictor.pending() > 0,
+            "nothing is unconfirmed, so clearing the queue would prove nothing"
+        );
+
+        predictor.adrift();
+
+        assert!(
+            !predictor.body().on_ground,
+            "a body whose world was taken away still believes it is standing"
+        );
+        assert_eq!(
+            predictor.pending(),
+            0,
+            "inputs for a world that no longer exists are still waiting to be replayed"
+        );
+        assert!(
+            predictor
+                .body()
+                .velocity
+                .iter()
+                .all(|axis| axis.abs() < f32::EPSILON),
+            "a body carried its old world's momentum into a new one"
+        );
     }
 
     #[test]
