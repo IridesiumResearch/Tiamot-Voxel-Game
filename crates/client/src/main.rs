@@ -1613,6 +1613,25 @@ fn draw_sound_attribution(app: &App, ui: &mut egui::Ui) {
 ///
 /// # Virtual pixels to real ones
 ///
+/// What the player sees while a space they have just entered arrives.
+///
+/// Deliberately plain and deliberately NAMED: a loading screen that says where
+/// you are going is a pause, and one that says nothing is a hang. The name came
+/// from the server and is a display string like any other — drawn, never
+/// trusted (charter rule 14).
+fn draw_entering(ctx: &egui::Context, domain: &str) {
+    let screen = ctx.content_rect();
+    egui::Area::new(egui::Id::new("tiamot.entering"))
+        .fixed_pos(screen.center() - egui::vec2(0.0, 24.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.heading("Entering");
+                ui.label(domain);
+            });
+        });
+}
+
 /// A script draws on a canvas [`tiamot_core::hud::VIRTUAL_HEIGHT`] tall and as
 /// wide as this window's aspect ratio makes it. Everything scales by the height
 /// alone, so a HUD is the same apparent size on every monitor and anchors take
@@ -2285,6 +2304,12 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // worth. A mod's HUD scales with it — see `draw_hud_scripts`, which
         // measures its canvas in the same points.
         let context = root.ctx().clone();
+        // **Before anything else, and over everything.** A domain switch throws
+        // the world away, and for a moment the player is standing in nothing —
+        // which looks exactly like a server that has stopped answering.
+        if let Some(domain) = app.entering() {
+            draw_entering(&context, domain);
+        }
         if menu_open {
             draw_menu(app, &context);
         }

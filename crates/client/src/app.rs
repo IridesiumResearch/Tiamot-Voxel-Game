@@ -778,6 +778,14 @@ pub struct App {
     chat: std::collections::VecDeque<String>,
     /// Whether the chat input line is open and taking keys.
     chat_open: bool,
+    /// The space being entered, while its world is still arriving.
+    ///
+    /// **A domain switch throws everything away**, so for a moment the player
+    /// is standing in nothing — and nothing looks exactly like a server that
+    /// has stopped answering. This is what says otherwise. Cleared when the
+    /// first chunk of the new space arrives, because that is the moment there
+    /// is something to look at rather than a moment chosen by a timer.
+    entering: Option<String>,
     /// Whether the input line still needs to be given keyboard focus.
     ///
     /// Set when chat opens and taken once. **Asking every frame is what broke
@@ -1151,6 +1159,7 @@ impl App {
             views: std::collections::BTreeMap::new(),
             chat: std::collections::VecDeque::new(),
             chat_open: false,
+            entering: None,
             chat_focus: false,
             chat_draft: String::new(),
             dialog_events: Vec::new(),
@@ -2674,6 +2683,14 @@ impl App {
         self.chat.iter().map(String::as_str)
     }
 
+    /// The space being entered, while its world is still on the way.
+    ///
+    /// `None` once the first chunk of it has arrived.
+    #[must_use]
+    pub fn entering(&self) -> Option<&str> {
+        self.entering.as_deref()
+    }
+
     /// Whether the chat input is open.
     #[must_use]
     pub const fn chat_open(&self) -> bool {
@@ -3757,7 +3774,13 @@ impl App {
                     ..
                 } => self.joined_world(spawn, tick, may_fly),
 
-                Event::Chunk(chunk) => self.store.insert(*chunk),
+                Event::Chunk(chunk) => {
+                    // The new space has started arriving, so there is something
+                    // to look at. Cleared here rather than on a timer: what the
+                    // player is waiting for is terrain, and this is it.
+                    self.entering = None;
+                    self.store.insert(*chunk);
+                }
 
                 Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
 
@@ -3803,6 +3826,7 @@ impl App {
                 }
 
                 Event::DomainChanged { domain } => {
+                    self.entering = Some(domain.clone());
                     // **Everything, and the meshes with it.** The store's
                     // positions all mean different chunks now, so a mesh kept
                     // for any of them draws terrain from a place the player has
