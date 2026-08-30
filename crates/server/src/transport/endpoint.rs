@@ -556,6 +556,13 @@ pub struct ChunkRequest {
     pub domain: String,
     /// Which chunk.
     pub pos: tiamot_core::ChunkPos,
+    /// The summary level wanted, or `None` for the chunk itself.
+    ///
+    /// One request type for both, because they are the same question asked at
+    /// different resolutions and they share the budget, the queue and the
+    /// in-flight accounting. A second queue would have let a horizon starve a
+    /// player's own neighbourhood, or the reverse.
+    pub level: Option<u8>,
     /// Where to send the encoded blob.
     ///
     /// A oneshot, so a connection that goes away between asking and being
@@ -1255,13 +1262,33 @@ impl Shared {
         domain: &str,
         pos: tiamot_core::ChunkPos,
     ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+        self.request_chunk_at(domain, pos, None)
+    }
+
+    /// Asks the simulation to encode a chunk, or a summary of one.
+    ///
+    /// `level` is `None` for the chunk itself and `Some(level)` for a horizon.
+    /// The two share this queue deliberately — see [`ChunkRequest::level`].
+    ///
+    /// Returns `None` if the queue is full, as [`Shared::request_chunk`] does.
+    pub fn request_chunk_at(
+        &self,
+        domain: &str,
+        pos: tiamot_core::ChunkPos,
+        level: Option<u8>,
+    ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
         let domain = domain.to_owned();
         let mut queue = self.chunk_requests.lock().ok()?;
         if queue.len() >= MAX_QUEUED_CHUNK_REQUESTS {
             return None;
         }
         let (reply, receiver) = tokio::sync::oneshot::channel();
-        queue.push_back(ChunkRequest { domain, pos, reply });
+        queue.push_back(ChunkRequest {
+            domain,
+            pos,
+            level,
+            reply,
+        });
         Some(receiver)
     }
 
@@ -2019,10 +2046,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut transfers = crate::content::Transfers::new();
     // Chunk deliveries the simulation has answered, waiting to be written.
-    let mut pending: Vec<(
-        tiamot_core::ChunkPos,
-        tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
-    )> = Vec::new();
+    let mut pending: Vec<Awaiting> = Vec::new();
 
     loop {
         // Read from the client and forward broadcasts on the same task. A
@@ -2191,6 +2215,21 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                                 .is_some_and(|streamer| streamer.domain() == domain)
                         });
                         if mine && session.phase() == tiamot_core::session::Phase::InWorld {
+                            // An edit out in the horizon is not something a
+                            // client holding a summary can apply — it has
+                            // nowhere to put one cell of twenty-seven. So the
+                            // delta is still sent (it is two dozen bytes, and
+                            // the client drops what it cannot place) and the
+                            // summary is dropped, which puts the chunk back on
+                            // the next pass's list at whatever level it is due.
+                            if let ServerMessage::BlockDelta { edit, .. } = &outbound.message
+                                && let Some(streamer) = streamer.as_mut()
+                            {
+                                let pos = chunk_of(edit);
+                                if streamer.summary_level(pos).is_some() {
+                                    streamer.resummarise(pos);
+                                }
+                            }
                             frame::write(&mut send, &outbound.message).await?;
                         }
                         continue;
@@ -2493,6 +2532,27 @@ fn unix_now() -> i64 {
         .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0))
 }
 
+/// A chunk or summary the simulation has been asked for and not yet answered.
+///
+/// The level is what was ASKED for, not what came back: the reply is a blob
+/// either way, and this is the only thing that says which message to put it in.
+type Awaiting = (
+    tiamot_core::ChunkPos,
+    Option<u8>,
+    tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
+);
+
+/// Which chunk an edit is in.
+///
+/// An [`Edit`] names a block, a sub-node or a partial block, and all three are
+/// somewhere; the chunk is what the streaming cares about.
+fn chunk_of(edit: &Edit) -> tiamot_core::ChunkPos {
+    match edit {
+        Edit::Block { pos, .. } | Edit::Partial { pos, .. } => pos.chunk(),
+        Edit::SubNode { pos, .. } => pos.chunk(),
+    }
+}
+
 /// Requests, collects, and sends chunks for one connection.
 ///
 /// Split out of the connection loop because it is the only part with an
@@ -2501,23 +2561,30 @@ fn unix_now() -> i64 {
 /// simply stops filling in.
 async fn pump_chunks(
     streamer: &mut Streamer,
-    pending: &mut Vec<(
-        tiamot_core::ChunkPos,
-        tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
-    )>,
+    pending: &mut Vec<Awaiting>,
     shared: &Shared,
     send: &mut quinn::SendStream,
 ) -> Result<(), frame::FrameError> {
     // Deliveries first, so budget freed this pass can be spent this pass.
     let mut still_waiting = Vec::with_capacity(pending.len());
-    for (pos, mut receiver) in pending.drain(..) {
+    for (pos, level, mut receiver) in pending.drain(..) {
         match receiver.try_recv() {
             Ok(Some(blob)) => {
-                frame::write(send, &ServerMessage::ChunkData { pos, blob }).await?;
+                // Whichever was asked for. Sending the wrong message for a
+                // blob would be a client decoding a summary as a chunk, which
+                // is not a thing the codec can catch — both are byte strings.
+                let message = match level {
+                    None => ServerMessage::ChunkData { pos, blob },
+                    Some(_) => ServerMessage::ChunkSummary { pos, blob },
+                };
+                frame::write(send, &message).await?;
                 // `delivered` clears the in-flight entry too, so the chunk goes
                 // straight from "requested" to "held" with no window in which
                 // it looks un-requested and gets asked for again.
-                streamer.delivered(pos);
+                match level {
+                    None => streamer.delivered(pos),
+                    Some(level) => streamer.summarised(pos, level),
+                }
             }
             Ok(None) => {
                 // The simulation could not produce it. Cleared exactly like a
@@ -2526,7 +2593,7 @@ async fn pump_chunks(
                 streamer.completed(pos);
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                still_waiting.push((pos, receiver));
+                still_waiting.push((pos, level, receiver));
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                 // The simulation dropped the request without answering. Same
@@ -2538,15 +2605,28 @@ async fn pump_chunks(
     }
     *pending = still_waiting;
 
-    // Then new requests, up to this client's share.
-    let budget = streamer.budget(CHUNKS_IN_FLIGHT_PER_CLIENT);
+    // Then new requests, up to this client's share. **Full chunks first, and
+    // they take the whole budget if they want it.** A player's own
+    // neighbourhood is the ground under their feet; the horizon is scenery, and
+    // scenery that arrives a second late is scenery. The reverse order would
+    // let a joining player's horizon delay the chunk they are standing in.
+    let mut budget = streamer.budget(CHUNKS_IN_FLIGHT_PER_CLIENT);
     for pos in streamer.next_needed(budget) {
         let Some(receiver) = shared.request_chunk(streamer.domain(), pos) else {
             // Queue full. Nothing is marked, so the next pass retries.
             break;
         };
         streamer.requested(pos);
-        pending.push((pos, receiver));
+        pending.push((pos, None, receiver));
+        budget = budget.saturating_sub(1);
+    }
+
+    for (pos, level) in streamer.next_summaries(budget) {
+        let Some(receiver) = shared.request_chunk_at(streamer.domain(), pos, Some(level)) else {
+            break;
+        };
+        streamer.requested(pos);
+        pending.push((pos, Some(level), receiver));
     }
 
     Ok(())

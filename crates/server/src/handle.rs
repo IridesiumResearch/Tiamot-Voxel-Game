@@ -2932,6 +2932,21 @@ impl ServerHandle {
                         // thread, and an unbounded drain would let one player
                         // joining stall the world for everyone.
                         for request in shared.take_chunk_requests() {
+                            // A summary is answered and nothing else happens:
+                            // no light, no fluid, no residency. It is the shape
+                            // of land a mile away, and everything below this
+                            // that travels with a chunk would be work done for
+                            // a client that cannot draw it.
+                            if let Some(level) = request.level {
+                                let summary = world
+                                    .summary(&request.domain, level, request.pos, &mut source)
+                                    .map_err(|err| {
+                                        debug!(pos = ?request.pos, level, "could not summarise: {err}");
+                                    })
+                                    .ok();
+                                let _ = request.reply.send(summary);
+                                continue;
+                            }
                             let blob = match world.chunk(&request.domain, request.pos, &mut source) {
                                 Ok(chunk) => {
                                     let chunk = chunk.clone();

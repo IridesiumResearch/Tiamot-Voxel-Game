@@ -44,6 +44,7 @@
 
 use crate::block::{BlockView, SUBNODES_PER_BLOCK};
 use crate::coords::LocalBlock;
+use crate::interest::ViewDistance;
 use crate::material::MaterialId;
 use crate::{CHUNK_BLOCKS, Chunk};
 
@@ -69,6 +70,150 @@ pub const fn cells_per_axis(level: u8) -> Option<u32> {
         return None;
     }
     Some(CHUNK_BLOCKS >> (level - FINEST))
+}
+/// How far the horizon reaches, for a given detail radius.
+///
+/// **Four times out, and twice up, capped at the maximum view.** Not a taste
+/// decision: criterion A3 wants 32 chunks of overworld view, the default detail
+/// radius is 8, and four times eight is exactly that. Vertically it stops at
+/// twice, because the vertical extent of what a player can actually see is set
+/// by the terrain and not by the view distance — a horizon 32 chunks tall is
+/// half a kilometre of empty sky above and stone below, summarised for nobody.
+///
+/// The cost is bounded by the summaries, not by this: a box this size is tens
+/// of thousands of chunks, and what makes that affordable is that the far ones
+/// are a few dozen bytes each and are paced out at the same rate as everything
+/// else.
+#[must_use]
+pub fn horizon_for(view: ViewDistance) -> ViewDistance {
+    ViewDistance::clamped(
+        view.horizontal.saturating_mul(4),
+        view.vertical.saturating_mul(2),
+    )
+}
+
+/// Which level to draw a chunk at, given how far away it is.
+///
+/// # A ring is a distance band, and the level doubles across each one
+///
+/// A cell at level `n` is `2^(n-1)` blocks across. What a player should see is
+/// roughly constant *apparent* cell size, so the level wants to grow with the
+/// logarithm of distance — twice as far away, cells twice as big. That is one
+/// integer `ilog2`, which is exact, has no libm in it, and gives the same
+/// answer on every target (charter rule 4).
+///
+/// Inside the detail radius there is no summary at all: the client has the real
+/// chunk and meshes it at sub-node resolution. That is what [`Level::Chunk`]
+/// means, and it is deliberately a different thing from "level 0" — level 0
+/// does not exist, because LOD0 is not a summary.
+///
+/// # Hysteresis is not optional
+///
+/// The bands have hard edges, and a player standing on one is a player whose
+/// chunks change level every time they step. Each change is a remesh, so a
+/// pacing camera would spend the whole frame budget rebuilding geometry that
+/// looks identical. [`Rings::stable_level`] fixes that by refusing to change a
+/// chunk's level until the *whole* margin band has crossed the boundary: the
+/// level only moves when it would still move if the player were a chunk
+/// further on. Walking through costs one rebuild; pacing across costs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rings {
+    /// Chunks nearer than this are sent and drawn in full.
+    detail: u32,
+    /// The margin, in chunks, a boundary crossing has to clear.
+    margin: u32,
+}
+
+/// What resolution one chunk should be drawn at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// The real chunk, meshed at sub-node resolution. No summary involved.
+    Chunk,
+    /// A summary at this level.
+    Summary(u8),
+}
+
+impl Rings {
+    /// The default margin: one chunk.
+    ///
+    /// Enough that a player walking about inside a chunk never crosses a
+    /// boundary twice, which is the case that produced the churn. Bigger would
+    /// mean a visible band where a chunk is drawn coarser than its neighbours
+    /// at the same distance, and a player can see that when they turn round.
+    pub const MARGIN: u32 = 1;
+
+    /// Rings around a detail radius, in chunks.
+    ///
+    /// A `detail` of zero is raised to one: a world where the chunk you are
+    /// standing in is a summary is not a view distance, it is a bug, and
+    /// clamping is kinder than dividing by zero.
+    #[must_use]
+    pub const fn new(detail: u32, margin: u32) -> Self {
+        Self {
+            detail: if detail == 0 { 1 } else { detail },
+            margin,
+        }
+    }
+
+    /// The detail radius these rings are built around.
+    #[must_use]
+    pub const fn detail(&self) -> u32 {
+        self.detail
+    }
+
+    /// The level for a chunk `distance` chunks from the centre.
+    ///
+    /// Distance is the Chebyshev distance — the box, not the sphere, matching
+    /// [`crate::interest::chunks_around`], which streams a box.
+    #[must_use]
+    pub fn level_at(&self, distance: u32) -> Level {
+        if distance <= self.detail {
+            return Level::Chunk;
+        }
+        // How many times further out than the detail radius, floored. One at
+        // the first ring, two at twice the radius, four at four times it.
+        let ratio = distance / self.detail;
+        let step = u8::try_from(ratio.ilog2()).unwrap_or(u8::MAX);
+        Level::Summary(FINEST.saturating_add(step).min(COARSEST))
+    }
+
+    /// The level to actually build, given what is already built.
+    ///
+    /// **The hysteresis.** A chunk keeps the level it has until the distance is
+    /// past the boundary by [`Rings::MARGIN`] in the direction of the change,
+    /// so a camera oscillating across a ring edge rebuilds nothing. `current`
+    /// is `None` for a chunk that has never been built, which always takes the
+    /// level it is asked for — there is nothing to churn.
+    #[must_use]
+    pub fn stable_level(&self, current: Option<Level>, distance: u32) -> Level {
+        let want = self.level_at(distance);
+        let Some(current) = current else {
+            return want;
+        };
+        if want == current {
+            return current;
+        }
+        // Both edges of the margin band have to agree, or the player is still
+        // standing on the boundary and this is the churn.
+        let nearer = self.level_at(distance.saturating_sub(self.margin));
+        let further = self.level_at(distance.saturating_add(self.margin));
+        if nearer == want && further == want {
+            want
+        } else {
+            current
+        }
+    }
+}
+
+impl Default for Rings {
+    /// The default view distance's rings.
+    ///
+    /// Written out rather than derived: a derived default has a detail radius
+    /// of zero, which `new` would clamp to one, and a horizon that started a
+    /// chunk away would be a silent disaster rather than a compile error.
+    fn default() -> Self {
+        Self::new(u32::from(ViewDistance::DEFAULT.horizontal), Self::MARGIN)
+    }
 }
 
 /// One chunk's shape at one level.
@@ -303,26 +448,52 @@ pub mod codec {
     /// What every encoded summary starts with.
     const VERSION: u8 = 1;
 
-    /// The largest an encoded summary can be, before decompression.
+    /// `zstd` level for summary blobs.
     ///
-    /// The finest level is `CHUNK_BLOCKS`³ cells of two bytes, and compression
-    /// only ever makes that smaller — so anything past it is not a summary this
-    /// build could have produced.
-    pub const MAX_ENCODED: usize = 2 + (16 * 16 * 16) * 2;
+    /// The same 3 the chunk codec uses, and for the same reason: a summary is
+    /// encoded once and sent to every player who comes near it, so the trade
+    /// is already on the right side without paying for a slower level.
+    const ZSTD_LEVEL: i32 = 3;
 
-    /// Encodes a summary: a version, its level, then a `u16` per cell.
+    /// The cells of the finest level, in bytes.
+    const FINEST_BYTES: usize = (16 * 16 * 16) * 2;
+
+    /// The largest an encoded summary can be.
     ///
-    /// Little-endian and fixed-width, so the bytes are the same on every
-    /// supported target — which is what lets the determinism gate hash them and
-    /// the cache compare them.
+    /// The finest level is `CHUNK_BLOCKS`³ cells of two bytes; the slack past
+    /// it is because `zstd` on incompressible data is slightly LARGER than its
+    /// input — a horizon of noise is not a thing this refuses.
+    pub const MAX_ENCODED: usize = 2 + FINEST_BYTES + FINEST_BYTES / 64 + 128;
+
+    /// Encodes a summary: a version, its level, then `zstd` over a `u16` per
+    /// cell.
+    ///
+    /// Little-endian and fixed-width under the compression, so the bytes are
+    /// the same on every supported target — which is what lets the determinism
+    /// gate hash them and the cache compare them.
+    ///
+    /// **Compressed, unlike an early draft of this, because an uncompressed
+    /// level-1 summary is 8 KiB and a palette-compressed chunk is a fraction of
+    /// that.** A horizon that costs more bandwidth than the terrain in front of
+    /// it is not a horizon. Most of a horizon is uniform stone or uniform air,
+    /// which is where the whole saving is.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: `zstd` over an in-memory buffer of known size fails
+    /// only on allocation failure, and the fallback stores the cells raw rather
+    /// than producing a blob nothing can read.
     #[must_use]
     pub fn encode(summary: &Summary) -> Vec<u8> {
-        let mut out = Vec::with_capacity(2 + summary.cells().len() * 2);
+        let mut cells = Vec::with_capacity(summary.cells().len() * 2);
+        for cell in summary.cells() {
+            cells.extend_from_slice(&cell.0.to_le_bytes());
+        }
+        let body = zstd::bulk::compress(&cells, ZSTD_LEVEL).unwrap_or(cells);
+        let mut out = Vec::with_capacity(2 + body.len());
         out.push(VERSION);
         out.push(summary.level());
-        for cell in summary.cells() {
-            out.extend_from_slice(&cell.0.to_le_bytes());
-        }
+        out.extend_from_slice(&body);
         out
     }
 
@@ -346,20 +517,28 @@ pub mod codec {
         if *version != VERSION {
             return Err(SummaryError::Version { found: *version });
         }
-        // **The level decides the size, and it is checked first.** Sizing the
-        // allocation from the body's own length would let a sender choose it.
+        // **The level decides the size, and it is checked first.** The
+        // decompression bound comes from the level, not from the blob — so a
+        // sender cannot choose the allocation, and a decompression bomb is a
+        // refusal rather than a gigabyte.
         let Some(n) = cells_per_axis(*level) else {
             return Err(SummaryError::Level { level: *level });
         };
         let expected = (n * n * n) as usize;
-        if body.len() != expected * 2 {
-            return Err(SummaryError::Size {
+        let cells_bytes =
+            zstd::bulk::decompress(body, expected * 2).map_err(|_| SummaryError::Size {
                 level: *level,
                 expected: expected * 2,
                 found: body.len(),
+            })?;
+        if cells_bytes.len() != expected * 2 {
+            return Err(SummaryError::Size {
+                level: *level,
+                expected: expected * 2,
+                found: cells_bytes.len(),
             });
         }
-        let cells = body
+        let cells = cells_bytes
             .chunks_exact(2)
             .map(|pair| MaterialId(u16::from_le_bytes([pair[0], pair[1]])))
             .collect();
@@ -433,6 +612,136 @@ pub mod codec {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::{COARSEST, FINEST, Level, Rings};
+
+    #[test]
+    fn what_you_are_standing_in_is_never_a_summary() {
+        let rings = Rings::new(8, Rings::MARGIN);
+        for distance in 0..=8 {
+            assert_eq!(rings.level_at(distance), Level::Chunk, "at {distance}");
+        }
+        assert_eq!(rings.level_at(9), Level::Summary(FINEST));
+    }
+
+    #[test]
+    fn the_level_climbs_with_the_logarithm_of_the_distance() {
+        // Twice as far away, cells twice as big — which is one level up, since
+        // a level doubles the cell. Anything steeper wastes bandwidth on
+        // terrain smaller than a pixel; anything shallower makes the horizon
+        // cost more than the world in front of it.
+        let rings = Rings::new(8, Rings::MARGIN);
+        assert_eq!(rings.level_at(9), Level::Summary(1));
+        assert_eq!(rings.level_at(15), Level::Summary(1));
+        assert_eq!(rings.level_at(16), Level::Summary(2));
+        assert_eq!(rings.level_at(31), Level::Summary(2));
+        assert_eq!(rings.level_at(32), Level::Summary(3));
+        assert_eq!(rings.level_at(64), Level::Summary(4));
+        assert_eq!(rings.level_at(128), Level::Summary(COARSEST));
+    }
+
+    #[test]
+    fn it_never_asks_for_a_level_that_does_not_exist() {
+        // The far end saturates rather than running off the end of the chain:
+        // a distance of four billion chunks is not reachable, but a `u32`
+        // holds it and an overflow here would be an allocation somewhere else.
+        let rings = Rings::new(1, Rings::MARGIN);
+        for distance in [2, 1_000, u32::MAX / 2, u32::MAX] {
+            let Level::Summary(level) = rings.level_at(distance) else {
+                panic!("distance {distance} came back as a full chunk");
+            };
+            assert!(
+                (FINEST..=COARSEST).contains(&level),
+                "distance {distance} asked for level {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_camera_pacing_across_a_ring_edge_rebuilds_nothing() {
+        // **Criterion T3.** The boundary between two rings is a hard edge, and
+        // a player standing on one would flip every chunk behind it between
+        // two levels — a remesh each way, every step, for geometry that looks
+        // identical. The margin band has to clear the boundary entirely before
+        // the level moves.
+        let rings = Rings::new(8, Rings::MARGIN);
+        let boundary = 16; // where level 1 becomes level 2
+
+        let mut level = rings.level_at(boundary - 2);
+        assert_eq!(level, Level::Summary(1));
+        let mut rebuilds = 0;
+        // Pace back and forth across the edge, a chunk either side, forty times.
+        for step in 0..40 {
+            let distance = if step % 2 == 0 {
+                boundary
+            } else {
+                boundary - 1
+            };
+            let next = rings.stable_level(Some(level), distance);
+            if next != level {
+                rebuilds += 1;
+                level = next;
+            }
+        }
+        assert_eq!(
+            rebuilds, 0,
+            "pacing across a ring edge rebuilt {rebuilds} times"
+        );
+    }
+
+    #[test]
+    fn walking_through_a_ring_edge_still_changes_level_exactly_once() {
+        // The other half of the same criterion, and the one that catches a
+        // hysteresis that simply never changes anything.
+        let rings = Rings::new(8, Rings::MARGIN);
+        let mut level = rings.level_at(9);
+        let mut changes = 0;
+        // Out to 33 rather than 32: the margin means a change lands one chunk
+        // PAST the boundary, which is the whole point of it.
+        for distance in 9..=33 {
+            let next = rings.stable_level(Some(level), distance);
+            if next != level {
+                changes += 1;
+                level = next;
+            }
+        }
+        assert_eq!(
+            changes, 2,
+            "walking out past two ring edges changed level {changes} times"
+        );
+        assert_eq!(level, Level::Summary(3));
+
+        // And walking back in comes back to where it started.
+        for distance in (0..=33).rev() {
+            level = rings.stable_level(Some(level), distance);
+        }
+        assert_eq!(level, Level::Chunk);
+    }
+
+    #[test]
+    fn a_chunk_that_has_never_been_built_takes_the_level_it_is_asked_for() {
+        // Hysteresis is about not rebuilding, and there is nothing to rebuild.
+        let rings = Rings::new(8, Rings::MARGIN);
+        for distance in [0, 9, 16, 17, 64] {
+            assert_eq!(
+                rings.stable_level(None, distance),
+                rings.level_at(distance),
+                "at {distance}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_detail_radius_of_zero_is_clamped_rather_than_dividing_by_zero() {
+        let rings = Rings::new(0, Rings::MARGIN);
+        assert_eq!(rings.detail(), 1);
+        assert_eq!(rings.level_at(0), Level::Chunk);
+        assert_eq!(rings.level_at(1), Level::Chunk);
+        assert_eq!(rings.level_at(2), Level::Summary(2));
     }
 }
 

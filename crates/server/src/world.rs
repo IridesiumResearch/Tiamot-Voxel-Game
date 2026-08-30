@@ -861,7 +861,17 @@ impl World {
                 domain: domain.to_owned(),
             });
         }
-        if let Some(cached) = self.db.load_summary(domain, level, pos)? {
+        // **A dirty chunk is not what the cache describes.** The cache row is
+        // deleted by the write, and the write happens at the next save — so
+        // between an edit and that save the stored summary is the terrain as
+        // it was, and serving it would show a player a hole they had just
+        // filled in. Recomputed, and deliberately not stored: the row it would
+        // write is one the imminent save deletes.
+        let unsaved = self
+            .domains
+            .get(domain)
+            .is_some_and(|space| space.dirty.contains(&pos));
+        if !unsaved && let Some(cached) = self.db.load_summary(domain, level, pos)? {
             self.served += 1;
             return Ok(cached);
         }
@@ -891,7 +901,9 @@ impl World {
             .find(|(at, _)| *at == level)
             .map(|(_, bytes)| bytes.clone())
             .ok_or(WorldError::NoSuchLevel { level })?;
-        self.db.save_summaries(domain, pos, &keep)?;
+        if !unsaved {
+            self.db.save_summaries(domain, pos, &keep)?;
+        }
         Ok(wanted)
     }
 
@@ -1398,13 +1410,22 @@ mod tests {
             "a coarser level recomputed what the chain had already produced"
         );
 
-        // Now change the terrain under it. The edit dirties the chunk; the save
-        // is what forgets the summary, in the same transaction as the write.
+        // Now change the terrain under it. The edit dirties the chunk, and the
+        // horizon has to show it BEFORE the save — a player who fills a hole
+        // in and steps back should not watch it reopen at the ring boundary.
         let edit = tiamot_core::proto::Edit::Block {
             pos: BlockPos::new(1, -1, 1),
             material: ids[1].0,
         };
         world.apply(overworld, &edit, &mut flat).expect("edit");
+        let unsaved = world
+            .summary(overworld, level, pos, &mut flat)
+            .expect("summary");
+        assert_ne!(
+            first, unsaved,
+            "an edited chunk's horizon came back from the cache the save had not \
+             cleared yet"
+        );
         assert_eq!(world.save_dirty().expect("save"), 1);
 
         let after = world
@@ -1412,12 +1433,16 @@ mod tests {
             .expect("summary");
         assert_eq!(
             world.summary_work().0,
-            2,
+            3,
             "the horizon survived an edit to the chunk under it"
         );
         assert_ne!(
             first, after,
             "the recomputed horizon does not show the edit"
+        );
+        assert_eq!(
+            unsaved, after,
+            "the horizon changed when the edit was saved"
         );
     }
 

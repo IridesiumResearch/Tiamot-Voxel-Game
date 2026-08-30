@@ -3773,6 +3773,18 @@ impl App {
         }
     }
 
+    /// Takes a summary into the store.
+    ///
+    /// Lifted out of [`App::pump_network`] because that match is at clippy's
+    /// line ceiling, and because the horizon clearing the loading screen is a
+    /// claim worth stating once rather than a line in a list.
+    fn adopt_summary(&mut self, pos: tiamot_core::ChunkPos, summary: tiamot_core::lod::Summary) {
+        // The horizon counts as terrain arriving: a player who switched domains
+        // and is looking at a mountain range a mile off is not waiting any more.
+        self.entering = None;
+        self.store.set_summary(pos, summary);
+    }
+
     /// Drains everything the network has produced since the last frame.
     ///
     /// Returns `false` once the connection has ended, which is the signal to
@@ -3813,6 +3825,8 @@ impl App {
                     self.entering = None;
                     self.store.insert(*chunk);
                 }
+
+                Event::ChunkSummary { pos, summary } => self.adopt_summary(pos, *summary),
 
                 Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
 

@@ -183,6 +183,8 @@ struct Seen {
     bindings: Vec<tiamot_core::proto::SoundBinding>,
     /// Loops currently running, by id.
     loops: Vec<String>,
+    /// Chunks the server sent a horizon for.
+    summaries: Vec<tiamot_core::ChunkPos>,
 }
 
 impl Seen {
@@ -198,6 +200,7 @@ impl Seen {
             }
             Event::Joined { spawn, .. } => self.joined = Some(spawn),
             Event::DomainChanged { .. } => {}
+            Event::ChunkSummary { pos, .. } => self.summaries.push(pos),
             Event::View { .. } => {}
             Event::HudValues { mod_id, values } => {
                 self.hud_values.insert(mod_id, values);

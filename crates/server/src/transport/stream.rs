@@ -26,10 +26,11 @@
 //! both sets and is never retried. The sent-set is self-correcting — anything
 //! missing gets picked up on the next pass, whatever went wrong.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tiamot_core::ChunkPos;
 use tiamot_core::interest::{self, ViewDistance};
+use tiamot_core::lod::{Level, Rings, horizon_for};
 
 /// What one connection has been sent, and what it still needs.
 pub struct Streamer {
@@ -57,6 +58,21 @@ pub struct Streamer {
     /// slower one the client receives the same chunk twice. CI on macOS caught
     /// exactly that.
     in_flight: BTreeSet<ChunkPos>,
+    /// How far the horizon reaches, past the detail radius.
+    ///
+    /// Chunks between `view` and this are sent as summaries. Kept separate
+    /// from `view` because they are answers to different questions: `view` is
+    /// what the client asked for and the server granted, and this is how much
+    /// further the engine is willing to draw the shape of the land for free.
+    horizon: ViewDistance,
+    /// Which level each distance band takes, and the hysteresis on the edges.
+    rings: Rings,
+    /// Summaries the client holds, and the level each was sent at.
+    ///
+    /// A position is in this OR in `sent`, never both: it is one chunk, and a
+    /// client holding a coarse copy and a fine one would draw both, with the
+    /// coarse one poking through.
+    summaries: BTreeMap<ChunkPos, u8>,
 }
 
 impl Streamer {
@@ -69,6 +85,9 @@ impl Streamer {
             view,
             sent: BTreeSet::new(),
             in_flight: BTreeSet::new(),
+            horizon: horizon_for(view),
+            rings: Rings::new(u32::from(view.horizontal), Rings::MARGIN),
+            summaries: BTreeMap::new(),
         }
     }
 
@@ -109,7 +128,9 @@ impl Streamer {
         // the same coordinates, which is terrain from somewhere else appearing
         // in a place a player is standing.
         self.in_flight.clear();
-        std::mem::take(&mut self.sent).into_iter().collect()
+        let mut dropped: Vec<ChunkPos> = std::mem::take(&mut self.sent).into_iter().collect();
+        dropped.extend(std::mem::take(&mut self.summaries).into_keys());
+        dropped
     }
 
     /// How many chunks this client has been sent.
@@ -151,19 +172,11 @@ impl Streamer {
             return Vec::new();
         }
         self.view = view;
+        self.horizon = horizon_for(view);
+        self.rings = Rings::new(u32::from(view.horizontal), Rings::MARGIN);
         self.in_flight
-            .retain(|pos| interest::contains(self.centre, view, *pos));
-
-        let departed: Vec<ChunkPos> = self
-            .sent
-            .iter()
-            .copied()
-            .filter(|pos| !interest::contains(self.centre, view, *pos))
-            .collect();
-        for pos in &departed {
-            self.sent.remove(pos);
-        }
-        departed
+            .retain(|pos| interest::contains(self.centre, self.horizon, *pos));
+        self.departed()
     }
 
     /// Moves the interest centre, returning chunks that left range.
@@ -178,19 +191,42 @@ impl Streamer {
         self.centre = centre;
         // Requests for chunks that just left range are abandoned. Keeping them
         // would deliver a chunk the client was told to unload, and hold budget
-        // that the new neighbourhood needs.
+        // that the new neighbourhood needs. Against the HORIZON rather than the
+        // detail radius: a chunk that left the detail radius has not left the
+        // client's world, it has become a summary.
         self.in_flight
-            .retain(|pos| interest::contains(centre, self.view, *pos));
+            .retain(|pos| interest::contains(centre, self.horizon, *pos));
+        self.departed()
+    }
 
-        let departed: Vec<ChunkPos> = self
+    /// Forgets everything past the horizon, and says what left.
+    ///
+    /// Shared by [`Streamer::recentre`] and [`Streamer::resize`], which differ
+    /// only in which of the two numbers moved. A chunk that fell out of the
+    /// detail radius but is still inside the horizon is NOT departed — it is
+    /// about to be re-sent as a summary, and unloading it first would blink a
+    /// hole in the world the size of a chunk.
+    fn departed(&mut self) -> Vec<ChunkPos> {
+        let horizon = self.horizon;
+        let centre = self.centre;
+        let mut departed: Vec<ChunkPos> = self
             .sent
             .iter()
             .copied()
-            .filter(|pos| !interest::contains(centre, self.view, *pos))
+            .filter(|pos| !interest::contains(centre, horizon, *pos))
             .collect();
+        departed.extend(
+            self.summaries
+                .keys()
+                .copied()
+                .filter(|pos| !interest::contains(centre, horizon, *pos)),
+        );
         for pos in &departed {
             self.sent.remove(pos);
+            self.summaries.remove(pos);
         }
+        departed.sort_unstable();
+        departed.dedup();
         departed
     }
 
@@ -233,9 +269,102 @@ impl Streamer {
     }
 
     /// Records that a chunk reached the client.
+    ///
+    /// Takes the position out of the summary set for the reason given on
+    /// [`Streamer::summarised`]: a client holds one copy of a chunk, and this
+    /// one has just replaced a coarse copy with the real thing.
     pub fn delivered(&mut self, pos: ChunkPos) {
         self.in_flight.remove(&pos);
+        self.summaries.remove(&pos);
         self.sent.insert(pos);
+    }
+
+    /// How far the horizon reaches for this connection.
+    #[must_use]
+    pub const fn horizon(&self) -> ViewDistance {
+        self.horizon
+    }
+
+    /// How many summaries this client holds.
+    #[must_use]
+    pub fn summary_count(&self) -> usize {
+        self.summaries.len()
+    }
+
+    /// The level a client holds a chunk at, if it holds a summary of it.
+    #[must_use]
+    pub fn summary_level(&self, pos: ChunkPos) -> Option<u8> {
+        self.summaries.get(&pos).copied()
+    }
+
+    /// Up to `limit` chunks in the horizon whose summary the client does not
+    /// have at the level its distance calls for, nearest first.
+    ///
+    /// **Hysteresis lives here**, not at the caller: a chunk already held at a
+    /// level keeps it until the player is a whole margin past the ring edge, so
+    /// somebody pacing across a boundary does not re-send — and the client does
+    /// not rebuild — a band of the horizon every step. See
+    /// [`tiamot_core::lod::Rings::stable_level`].
+    ///
+    /// Does not mark anything sent, for the same reason [`Streamer::next_needed`]
+    /// does not.
+    #[must_use]
+    pub fn next_summaries(&self, limit: usize) -> Vec<(ChunkPos, u8)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        interest::chunks_around(self.centre, self.horizon)
+            .into_iter()
+            .filter(|pos| !self.in_flight.contains(pos))
+            .filter_map(|pos| {
+                let held = self.summaries.get(&pos).map(|level| Level::Summary(*level));
+                // A chunk the client holds in full is at the detail level as
+                // far as the hysteresis is concerned: that is what it is
+                // drawing, and it is what a level change would replace.
+                let held = if self.sent.contains(&pos) {
+                    Some(Level::Chunk)
+                } else {
+                    held
+                };
+                match self.rings.stable_level(held, self.distance(pos)) {
+                    Level::Chunk => None,
+                    Level::Summary(level) if held == Some(Level::Summary(level)) => None,
+                    Level::Summary(level) => Some((pos, level)),
+                }
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// The Chebyshev distance from the centre, in chunks.
+    ///
+    /// Chebyshev because the interest set is a box: a sphere's distance would
+    /// put the corners of the box in a further ring than the sides, and a
+    /// player turning on the spot would watch the horizon change resolution.
+    fn distance(&self, pos: ChunkPos) -> u32 {
+        let dx = pos.x.abs_diff(self.centre.x);
+        let dy = pos.y.abs_diff(self.centre.y);
+        let dz = pos.z.abs_diff(self.centre.z);
+        dx.max(dy).max(dz)
+    }
+
+    /// Records that a summary reached the client.
+    ///
+    /// Takes the position out of the full-chunk set: it is one chunk, and the
+    /// client has just replaced what it held with a coarser copy.
+    pub fn summarised(&mut self, pos: ChunkPos, level: u8) {
+        self.in_flight.remove(&pos);
+        self.sent.remove(&pos);
+        self.summaries.insert(pos, level);
+    }
+
+    /// Forgets a summary, so the next pass sends it again.
+    ///
+    /// What an edit in a summarised chunk costs. A block delta is no use to a
+    /// client holding a summary — it has nowhere to put one cell of 27 — so the
+    /// horizon is re-sent instead.
+    pub fn resummarise(&mut self, pos: ChunkPos) {
+        self.summaries.remove(&pos);
     }
 
     /// Whether a chunk is one this client holds.
@@ -330,6 +459,10 @@ mod tests {
         // chunks it can no longer see have to be taken off it — otherwise
         // "reduce your view distance" would free nothing on either side, which
         // is the entire reason somebody reaches for the setting.
+        //
+        // **What "range" means changed with Task 15b.** A chunk that falls out
+        // of the detail radius has not left the client's world; it becomes a
+        // summary. Only the horizon unloads.
         let mut streamer = Streamer::new(
             tiamot_core::domain::OVERWORLD,
             ORIGIN,
@@ -355,14 +488,15 @@ mod tests {
         );
         assert_eq!(
             streamer.sent_count(),
-            interest::chunks_around(ORIGIN, ViewDistance::MINIMUM).len(),
-            "what is left should be exactly the smaller interest set"
+            interest::chunks_around(ORIGIN, horizon_for(ViewDistance::MINIMUM)).len(),
+            "what is left should be exactly the smaller horizon"
         );
-        assert!(
-            streamer.is_complete(),
-            "shrinking left work outstanding, so the client would be sent chunks it \
-             cannot see"
-        );
+        for pos in &departed {
+            assert!(
+                !interest::contains(ORIGIN, horizon_for(ViewDistance::MINIMUM), *pos),
+                "{pos:?} was unloaded but is still inside the horizon"
+            );
+        }
     }
 
     #[test]
@@ -464,15 +598,17 @@ mod tests {
         }
         assert!(streamer.is_complete());
 
-        // Three chunks east: the whole original neighbourhood is out of a
-        // radius-1 view.
-        let departed = streamer.recentre(ChunkPos::new(3, 0, 0));
+        // Far enough east that the whole original neighbourhood is outside the
+        // HORIZON, not merely outside the detail radius — the second only turns
+        // a chunk into a summary, which is not an unload.
+        let away = ChunkPos::new(32, 0, 0);
+        let departed = streamer.recentre(away);
 
         assert!(!departed.is_empty(), "moving away must unload something");
         for pos in &departed {
             assert!(
-                !interest::contains(ChunkPos::new(3, 0, 0), ViewDistance::MINIMUM, *pos),
-                "{pos:?} was unloaded but is still in range"
+                !interest::contains(away, streamer.horizon(), *pos),
+                "{pos:?} was unloaded but is still inside the horizon"
             );
         }
         assert!(
@@ -637,6 +773,160 @@ mod tests {
         assert!(
             !streamer.holds(ORIGIN),
             "an unloaded chunk is no longer held"
+        );
+    }
+
+    #[test]
+    fn the_horizon_starts_where_the_detail_radius_ends_and_never_overlaps_it() {
+        // A client holding a chunk AND a summary of it would draw both, and the
+        // coarse one would poke through the fine one. The two sets are disjoint
+        // by construction, and this is the assertion that keeps them so.
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::DEFAULT,
+        );
+        for pos in streamer.next_needed(usize::MAX) {
+            streamer.delivered(pos);
+        }
+        for (pos, level) in streamer.next_summaries(usize::MAX) {
+            assert!(
+                !streamer.holds(pos),
+                "{pos:?} was to be summarised while the client held it in full"
+            );
+            assert!(level >= tiamot_core::lod::FINEST);
+            streamer.summarised(pos, level);
+        }
+        assert!(streamer.summary_count() > 0, "no horizon was produced");
+        assert!(
+            streamer.next_summaries(usize::MAX).is_empty(),
+            "a horizon already sent was asked for a second time"
+        );
+    }
+
+    #[test]
+    fn walking_forward_turns_a_summary_into_a_chunk_and_back_without_an_unload() {
+        // The transition a player actually experiences. Neither direction is an
+        // unload: a summary replaced by a chunk, and a chunk replaced by a
+        // summary, are both one message about one position. Unloading first
+        // would blink a chunk-sized hole in the world.
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::DEFAULT,
+        );
+        let far = ChunkPos::new(12, 0, 0);
+        let (pos, level) = streamer
+            .next_summaries(usize::MAX)
+            .into_iter()
+            .find(|(pos, _)| *pos == far)
+            .expect("a chunk twelve out should be summarised at a default view of eight");
+        streamer.summarised(pos, level);
+        assert_eq!(streamer.summary_level(far), Some(level));
+
+        // Walk towards it until it is inside the detail radius.
+        let departed = streamer.recentre(ChunkPos::new(8, 0, 0));
+        assert!(
+            !departed.contains(&far),
+            "walking towards a chunk unloaded it"
+        );
+        assert!(
+            streamer.next_needed(usize::MAX).contains(&far),
+            "a chunk that came inside the detail radius was not asked for in full"
+        );
+        streamer.delivered(far);
+        assert_eq!(
+            streamer.summary_level(far),
+            None,
+            "the client was left holding a summary of a chunk it now has in full"
+        );
+
+        // And back out again.
+        let departed = streamer.recentre(ORIGIN);
+        assert!(!departed.contains(&far), "walking away unloaded it");
+        assert!(
+            streamer
+                .next_summaries(usize::MAX)
+                .iter()
+                .any(|(at, _)| *at == far),
+            "a chunk that left the detail radius was not re-sent as a summary"
+        );
+    }
+
+    #[test]
+    fn a_player_pacing_across_a_ring_edge_is_sent_nothing() {
+        // **Criterion T3, at the level that costs bandwidth rather than
+        // frames.** The client's rebuild count is downstream of this: a
+        // summary it is not sent is one it cannot rebuild.
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::DEFAULT,
+        );
+        for pos in streamer.next_needed(usize::MAX) {
+            streamer.delivered(pos);
+        }
+        for (pos, level) in streamer.next_summaries(usize::MAX) {
+            streamer.summarised(pos, level);
+        }
+
+        // Step back and forth across the level-1/level-2 edge, which at a
+        // detail radius of eight sits sixteen chunks out.
+        let mut sends = 0;
+        for step in 0..20 {
+            let centre = if step % 2 == 0 {
+                ChunkPos::new(0, 0, 0)
+            } else {
+                ChunkPos::new(1, 0, 0)
+            };
+            streamer.recentre(centre);
+            for (pos, level) in streamer.next_summaries(usize::MAX) {
+                // Chunks genuinely entering the horizon for the first time are
+                // not churn — count only re-sends of what is already held.
+                if streamer.summary_level(pos).is_some() {
+                    sends += 1;
+                }
+                streamer.summarised(pos, level);
+            }
+        }
+        assert_eq!(
+            sends, 0,
+            "pacing one chunk back and forth re-sent {sends} summaries the client \
+             already held"
+        );
+    }
+
+    #[test]
+    fn an_edit_in_a_summarised_chunk_re_sends_the_summary() {
+        // A block delta is no use to a client holding a summary: it has nowhere
+        // to put one cell out of twenty-seven. The horizon is re-sent instead,
+        // and this is what makes a distant explosion eventually show up.
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::DEFAULT,
+        );
+        let far = ChunkPos::new(12, 0, 0);
+        let (pos, level) = streamer
+            .next_summaries(usize::MAX)
+            .into_iter()
+            .find(|(at, _)| *at == far)
+            .expect("a summarised chunk");
+        streamer.summarised(pos, level);
+        assert!(
+            !streamer
+                .next_summaries(usize::MAX)
+                .iter()
+                .any(|(at, _)| *at == far)
+        );
+
+        streamer.resummarise(far);
+        assert!(
+            streamer
+                .next_summaries(usize::MAX)
+                .iter()
+                .any(|(at, _)| *at == far),
+            "an edited chunk's horizon was never sent again"
         );
     }
 

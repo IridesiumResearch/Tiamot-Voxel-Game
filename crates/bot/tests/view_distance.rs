@@ -177,6 +177,11 @@ fn asking_for_less_is_granted_and_costs_the_server_less() {
         // a client that shrinks the instant it joins has been sent nothing
         // outside the smaller radius yet and correctly gets no unloads — which
         // would make this test pass or fail on timing rather than on behaviour.
+        //
+        // Against the HORIZON of the smaller view, not its detail radius: since
+        // Task 15b a chunk that falls out of the detail radius is re-sent as a
+        // summary rather than unloaded, so it is only past the horizon that
+        // shrinking gives anything back.
         let spawn = bot
             .received()
             .iter()
@@ -187,9 +192,13 @@ fn asking_for_less_is_granted_and_costs_the_server_less() {
             .expect("a spawn");
         assert!(
             until(&mut bot, Duration::from_secs(20), |bot| {
-                bot.chunks_received()
-                    .iter()
-                    .any(|pos| !interest::contains(spawn, ViewDistance::MINIMUM, *pos))
+                bot.chunks_received().iter().any(|pos| {
+                    !interest::contains(
+                        spawn,
+                        tiamot_core::lod::horizon_for(ViewDistance::MINIMUM),
+                        *pos,
+                    )
+                })
             })
             .await,
             "nothing outside the minimum radius ever arrived, so there is nothing \

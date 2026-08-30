@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 37;
+pub const PROTOCOL_VERSION: u32 = 38;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -1605,6 +1605,29 @@ pub enum ServerMessage {
         /// The domain now being streamed.
         domain: String,
     },
+
+    /// A downsampled chunk, for the horizon.
+    ///
+    /// **Appended at the end** (protocol v38), for the reason in the module
+    /// docs: postcard writes a variant as its ordinal, so a new one goes last
+    /// or every message after it decodes as something else.
+    ///
+    /// Sent INSTEAD of a [`ServerMessage::ChunkData`] for a chunk outside the
+    /// detail radius — never as well as. A client that held both would draw
+    /// both, and the coarse copy would poke through the fine one.
+    ///
+    /// The level is carried rather than derived from the distance. The client
+    /// knows where it is and could work it out, but then the two ends would be
+    /// computing the same thing from different state and a disagreement would
+    /// show up as a chunk decoded at the wrong resolution — 4096 cells read as
+    /// 512. See [`crate::lod::codec`], which also carries the level inside the
+    /// blob and refuses a mismatch.
+    ChunkSummary {
+        /// Which chunk.
+        pos: ChunkPos,
+        /// The summary blob, from [`crate::lod::codec::encode`].
+        blob: Vec<u8>,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -2346,6 +2369,14 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::StopLoop { .. }) => check_cue_message(message)?,
         message @ ServerMessage::PlaySound { .. } => check_play(message)?,
 
+        // A summary blob is sized by the sender and decoded into an
+        // allocation, so the cap comes BEFORE the decode (charter rule 14).
+        // `lod::codec::decode` checks the level before it allocates too — this
+        // is the cheaper of the two refusals, not a substitute for it.
+        ServerMessage::ChunkSummary { blob, .. } => {
+            check_len("chunk_summary", blob.len(), crate::lod::codec::MAX_ENCODED)?;
+        }
+
         ServerMessage::HelloAck { .. }
         | ServerMessage::AuthChallenge { .. }
         | ServerMessage::ModManifest { .. }
@@ -3030,12 +3061,25 @@ mod tests {
         // the enum, so a new variant gets written above it. Doing exactly that
         // is what this caught during the protocol v2 change.
         // The newest append, pinned the day it landed rather than the day
-        // something displaced it. Protocol v37.
+        // something displaced it. Protocol v38.
+        let summarised = encode(&ServerMessage::ChunkSummary {
+            pos: ChunkPos::new(0, 0, 0),
+            blob: Vec::new(),
+        })
+        .expect("encode");
+        let highest = summarised[0];
+
+        // Protocol v37, and now the second-newest — which is exactly when an
+        // append displaces something, so it is pinned relative to the new one.
         let switched = encode(&ServerMessage::DomainChanged {
             domain: String::new(),
         })
         .expect("encode");
-        let highest = switched[0];
+        assert_eq!(
+            switched[0] + 1,
+            highest,
+            "ChunkSummary must be appended directly after DomainChanged"
+        );
 
         let disconnect = encode(&ServerMessage::Disconnect {
             reason: DisconnectReason::ServerStopping,
@@ -3043,7 +3087,7 @@ mod tests {
         .expect("encode");
         assert!(
             highest > 10,
-            "DomainChanged must be APPENDED, after every variant that already \
+            "ChunkSummary must be APPENDED, after every variant that already \
              existed; it encoded as ordinal {highest}"
         );
         assert_eq!(
@@ -3494,6 +3538,36 @@ mod tests {
         let bytes = encode(&message).expect("encode");
         let decoded: ServerMessage = decode(&bytes).expect("decode");
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn a_summary_survives_the_wire_and_an_oversized_one_does_not() {
+        // Both halves in one test, because they are the same claim: a summary
+        // is a blob a server sized, and the cap has to be a refusal rather
+        // than a truncation. `MAX_ENCODED` is the largest a real one can be —
+        // level 1, every cell — so a blob past it is not a big summary, it is
+        // not a summary.
+        let real = crate::lod::codec::encode(&crate::lod::Summary::of(&crate::Chunk::new(
+            ChunkPos::new(0, 0, 0),
+            crate::MaterialId::AIR,
+        )));
+        let message = ServerMessage::ChunkSummary {
+            pos: ChunkPos::new(-3, 1, 7),
+            blob: real.clone(),
+        };
+        assert!(validate_server_message(&message).is_ok());
+        let bytes = encode(&message).expect("encode");
+        let back: ServerMessage = decode(&bytes).expect("decode");
+        assert_eq!(back, message);
+
+        let huge = ServerMessage::ChunkSummary {
+            pos: ChunkPos::new(0, 0, 0),
+            blob: vec![0; crate::lod::codec::MAX_ENCODED + 1],
+        };
+        assert!(
+            validate_server_message(&huge).is_err(),
+            "a blob larger than any summary can be was accepted"
+        );
     }
 
     #[test]

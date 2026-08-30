@@ -304,6 +304,18 @@ pub enum Event {
     /// one would make the whole queue pay for it.
     Chunk(Box<Chunk>),
 
+    /// A downsampled chunk, for the horizon.
+    ///
+    /// Arrives INSTEAD of an [`Event::Chunk`] for a position outside the detail
+    /// radius, and replaces one that was there — the two are the same chunk at
+    /// different resolutions, and holding both would draw both.
+    ChunkSummary {
+        /// Which chunk.
+        pos: tiamot_core::ChunkPos,
+        /// The summary, at whatever level the distance called for.
+        summary: Box<tiamot_core::lod::Summary>,
+    },
+
     /// A chunk's light levels, initial or updated.
     ///
     /// Boxed for the same reason [`Event::Chunk`] is, if less dramatically: a
@@ -1158,6 +1170,24 @@ async fn session(
                     }
                     Err(err) => say(format!(
                         "the server sent a chunk at {pos:?} that would not decode: {err}"
+                    )),
+                }
+            }
+
+            ServerMessage::ChunkSummary { pos, blob } => {
+                // Hostile input like everything else a server sends: the
+                // decoder takes its allocation from the level in the header,
+                // which it checks first, so a blob cannot choose how much
+                // memory it costs. A refusal loses one chunk of horizon.
+                match tiamot_core::lod::codec::decode(&blob) {
+                    Ok(summary) => {
+                        let _ = events.send(Event::ChunkSummary {
+                            pos,
+                            summary: Box::new(summary),
+                        });
+                    }
+                    Err(err) => say(format!(
+                        "the server sent a horizon at {pos:?} that would not decode: {err}"
                     )),
                 }
             }

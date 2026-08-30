@@ -127,6 +127,20 @@ pub struct ChunkStore {
     /// same `set_sky` they are — a fluid tinted in a different space would be a
     /// different colour on screen from the one the mod chose.
     fluid_colours: [[f32; 3]; tiamot_core::fluid::MAX_FLUIDS + 1],
+    /// Summaries of chunks too far away to be sent in full.
+    ///
+    /// **Disjoint from `chunks` by construction**, because they are the same
+    /// chunk at two resolutions: holding both would draw both, and the coarse
+    /// copy would poke through the fine one. Every path that adds to one takes
+    /// the position out of the other.
+    summaries: BTreeMap<ChunkPos, tiamot_core::lod::Summary>,
+    /// Summaries whose mesh needs rebuilding.
+    ///
+    /// Its own set rather than `dirty`, because the two are rebuilt by
+    /// different code against different budgets — a summary is a hundredth of
+    /// the work of a chunk, and sharing the queue would make a horizon refill
+    /// compete with the ground under the player's feet.
+    stale: BTreeSet<ChunkPos>,
 }
 
 impl ChunkStore {
@@ -346,16 +360,62 @@ impl ChunkStore {
     /// meshed while this one was absent, and hid the faces it shares with it.
     pub fn insert(&mut self, chunk: Chunk) {
         let pos = chunk.pos();
+        // The real chunk replaces the horizon's copy of it. Not "as well as":
+        // see the note on `summaries`.
+        if self.summaries.remove(&pos).is_some() {
+            self.stale.insert(pos);
+        }
         self.chunks.insert(pos, chunk);
         self.mark(pos);
         self.mark_neighbours(pos);
+    }
+
+    /// Stores a summary, marking it for a horizon rebuild.
+    ///
+    /// Drops any full chunk at that position, for the reason on `summaries`:
+    /// the server sends one or the other, and this is the client walking away
+    /// from terrain it used to be standing in.
+    pub fn set_summary(&mut self, pos: ChunkPos, summary: tiamot_core::lod::Summary) {
+        if self.chunks.remove(&pos).is_some() {
+            // Its light and its dirty mark go with it, exactly as `remove`
+            // does — a summary is not lit, and a mesh queued for a chunk that
+            // is no longer held would rebuild nothing.
+            self.light.remove(&pos);
+            self.dirty.remove(&pos);
+            self.urgent.remove(&pos);
+            self.mark_neighbours(pos);
+        }
+        self.summaries.insert(pos, summary);
+        self.stale.insert(pos);
+    }
+
+    /// The summary held for a chunk, if there is one.
+    #[must_use]
+    pub fn summary(&self, pos: ChunkPos) -> Option<&tiamot_core::lod::Summary> {
+        self.summaries.get(&pos)
+    }
+
+    /// How many summaries the horizon holds.
+    #[must_use]
+    pub fn summary_len(&self) -> usize {
+        self.summaries.len()
+    }
+
+    /// Summaries whose mesh has not been built since they changed.
+    pub fn take_stale(&mut self, budget: usize) -> Vec<ChunkPos> {
+        let taken: Vec<ChunkPos> = self.stale.iter().copied().take(budget).collect();
+        for pos in &taken {
+            self.stale.remove(pos);
+        }
+        taken
     }
 
     /// Drops a chunk, marking its neighbours for remeshing.
     ///
     /// Returns whether anything was held there.
     pub fn remove(&mut self, pos: ChunkPos) -> bool {
-        let held = self.chunks.remove(&pos).is_some();
+        let held = self.chunks.remove(&pos).is_some() | self.summaries.remove(&pos).is_some();
+        self.stale.insert(pos);
         // Light goes with the chunk. Keeping it would be a slow leak across a
         // session of walking, and stale light for a chunk that comes back is
         // worse than none — the server sends fresh light with it.
@@ -377,6 +437,8 @@ impl ChunkStore {
         self.dirty.clear();
         self.urgent.clear();
         self.light.clear();
+        self.summaries.clear();
+        self.stale.clear();
     }
 
     /// Applies a server edit to the local copy.
