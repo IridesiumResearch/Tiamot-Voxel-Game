@@ -778,6 +778,8 @@ pub struct App {
     chat: std::collections::VecDeque<String>,
     /// Whether the chat input line is open and taking keys.
     chat_open: bool,
+    /// How many materials the atlas holds a texture for.
+    textured: usize,
     /// The space being entered, while its world is still arriving.
     ///
     /// **A domain switch throws everything away**, so for a moment the player
@@ -1159,6 +1161,7 @@ impl App {
             views: std::collections::BTreeMap::new(),
             chat: std::collections::VecDeque::new(),
             chat_open: false,
+            textured: 0,
             entering: None,
             chat_focus: false,
             chat_draft: String::new(),
@@ -2681,6 +2684,14 @@ impl App {
     /// The chat lines to show, oldest first.
     pub fn chat(&self) -> impl Iterator<Item = &str> {
         self.chat.iter().map(String::as_str)
+    }
+
+    /// How many materials the atlas actually holds a texture for.
+    ///
+    /// Kept so the debug overlay can say it — see where it is drawn.
+    #[must_use]
+    pub const fn textured(&self) -> usize {
+        self.textured
     }
 
     /// The space being entered, while its world is still on the way.
@@ -4890,8 +4901,16 @@ impl App {
                 self.store.dirty_len()
             ),
             format!(
-                "{} of meshes, {material_count} materials",
-                human_bytes(self.renderer.mesh_bytes())
+                "{} of meshes, {material_count} materials, {} textured",
+                human_bytes(self.renderer.mesh_bytes()),
+                // **On the overlay because that is where somebody looking at a
+                // wrong-looking world already is.** A world drawn entirely in
+                // the missing-texture chequer has exactly two causes — the
+                // atlas never got the textures, or it got them and the shader
+                // is not sampling them — and they need opposite fixes. The
+                // count says which without a round trip: 0 is the first, the
+                // material count is the second.
+                self.textured
             ),
             // Vsync sits here because a worst-frame figure cannot be read
             // without it. An unsynchronised loop is back-pressured by the
