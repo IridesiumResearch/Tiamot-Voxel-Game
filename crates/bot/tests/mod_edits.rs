@@ -331,6 +331,16 @@ fn a_mod_can_move_a_player_and_the_client_is_told() {
         //
         // Counted from BEFORE the request, so nothing the earlier half of this
         // test did — a teleport, and the landing after it — can satisfy it.
+        //
+        // **Settled first, and that is the whole of the second bug here.** The
+        // teleport above puts the body at y = 6 and it FALLS; the loop that
+        // waits for x to arrive can finish on the first state after the
+        // teleport, while it is still on the way down. A shove of +2 added to a
+        // downward velocity is still downward, so `> 0.5` was never true and
+        // the test failed on whichever runner happened to be slow — ubuntu
+        // once, then windows. The same mistake the swarm load test made, which
+        // is what `Bot::settle` exists for.
+        bot.settle().await.expect("settle before shoving");
         let already = bot.received().len();
         let mut left_the_ground = false;
         bot.chat("up").await.expect("chat");
