@@ -862,6 +862,27 @@ impl ServerHandle {
                         content_bytes = content_index.total_bytes(),
                         "mods loaded and registries frozen"
                     );
+                    // **A world with no mods is not a world** (charter rule 1).
+                    // The engine ships no blocks, no terrain and no tools, so a
+                    // host that loaded nothing produces empty sky for a new
+                    // world — and, for one saved when mods DID load, every
+                    // stored block decoding to `engine:unknown`: terrain in the
+                    // right shape with every surface the missing-texture
+                    // chequer.
+                    //
+                    // Reported from the window as "everything is pink and
+                    // black". Nothing said so: a `game/` that is not there is
+                    // not an error for a client that only joins other people's
+                    // servers, and that silence followed it into hosting.
+                    if loaded.resolved().order.is_empty() {
+                        warn!(
+                            path = %mods_path.display(),
+                            "no mods loaded — this world will have no terrain, no tools, and \
+                             anything already saved in it will draw as the missing-texture \
+                             chequer. Check that the mod directory is beside the working \
+                             directory and that the mods are not all disabled."
+                        );
+                    }
                     host = Some(loaded);
                 }
                 Err(err) => return Err(StartError::Mods(Box::new(err))),

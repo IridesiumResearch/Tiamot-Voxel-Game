@@ -412,3 +412,87 @@ fn a_selection_that_breaks_a_dependency_refuses_to_start() {
         "a selection missing a dependency started anyway"
     );
 }
+
+#[test]
+fn a_mod_directory_that_is_not_there_is_refused_rather_than_hosted_empty() {
+    // The engine ships no blocks, no terrain and no tools (charter rule 1), so
+    // a world that loaded nothing is not a world. Refusing to start is the
+    // right answer and this pins it: the alternative is a player standing in
+    // empty sky wondering what happened.
+    let dir = scratch("mods-not-there");
+    let missing = dir.join("a-directory-that-is-not-there");
+    let started = ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: dir,
+        max_players: 4,
+        allowlist: Allowlist::open(),
+        operators: Vec::new(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(missing),
+        enabled_mods: None,
+        seed: Some(1),
+        rcon: None,
+        materials: Vec::new(),
+    });
+    assert!(
+        started.is_err(),
+        "a world was hosted from a mod directory that does not exist"
+    );
+}
+
+#[test]
+fn a_world_with_every_mod_disabled_starts_empty_and_says_so() {
+    // **Reported from the window: "everything is pink and black".** This is the
+    // path that is genuinely silent — the directory is there and the scan
+    // succeeds, so nothing errors; there is simply nothing in the world.
+    //
+    // A NEW world is then empty sky. A world saved when mods DID load is worse:
+    // the terrain is still there and every stored id decodes to
+    // `engine:unknown`, so it draws in the right shape with every surface the
+    // missing-texture chequer.
+    //
+    // Starting is correct — a bare server is a legitimate thing to run — so
+    // what this pins is that it starts, that it is visibly empty, and that the
+    // log says why, which is the part that was missing.
+    let dir = scratch("all-mods-off");
+    let server = ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: dir,
+        max_players: 4,
+        allowlist: Allowlist::open(),
+        operators: Vec::new(),
+        view_distance: ViewDistance::MINIMUM,
+        mods_path: Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../game")
+                .canonicalize()
+                .expect("the game/ directory should exist"),
+        ),
+        // Every mod off. The front screen can produce exactly this.
+        enabled_mods: Some(Vec::new()),
+        seed: Some(1),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("a world with no mods enabled should still start");
+
+    block_on(async {
+        let mut bot = Bot::connect_trusting(server.local_addr(), Identity::generate().expect("id"))
+            .await
+            .expect("a modless server should still take a connection");
+        bot.join("Nobody").await.expect("and still admit a player");
+
+        // Nothing to draw with, because nothing registered a block. The
+        // engine's own entries — air and the unknown placeholder — carry no
+        // texture, which is exactly why a saved world drawn through them is
+        // the missing-texture chequer from edge to edge.
+        let table = bot.material_table().unwrap_or_default();
+        assert!(
+            table.iter().all(|entry| entry.texture.is_none()),
+            "a world with every mod disabled has a texture from somewhere: {table:?}"
+        );
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}

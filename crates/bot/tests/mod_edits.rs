@@ -26,7 +26,15 @@ use tiamot_core::identity::{Allowlist, Identity};
 use tiamot_core::interest::ViewDistance;
 use tiamot_server::{ServerHandle, Settings};
 
-const PATIENCE: Duration = Duration::from_secs(10);
+/// How long to wait for something the server has to tick before it is true.
+///
+/// **Thirty seconds, not ten.** Nothing here is slower for it — every wait ends
+/// on the condition it is watching, not on the clock — and ten was a bet on how
+/// fast the machine is that `a_mod_can_read_the_world_it_writes_to` lost under
+/// a full parallel workspace run, where a mod's tick shares the machine with
+/// every other test binary. The same bet `containers.rs` lost, widened the same
+/// way.
+const PATIENCE: Duration = Duration::from_secs(30);
 
 /// Where the mod builds. Inside the spawn chunk and well above the ground, so
 /// nothing generated can be mistaken for what the mod put there.
