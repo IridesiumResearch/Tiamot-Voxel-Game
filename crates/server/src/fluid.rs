@@ -204,25 +204,22 @@ impl Shared {
 }
 
 impl tiamot_core::fluid::Access for Shared {
-    fn fluid_at(&self, pos: BlockPos) -> Fluid {
+    fn fluid_at(&self, domain: &str, pos: BlockPos) -> Fluid {
         // A poisoned lock means the simulation thread panicked, in which case
         // there is no world to have milk in. Empty is the honest answer, and
         // panicking inside a mod callback would blame the mod.
-        // **The overworld's**, because `game.get_fluid(position)` names a
-        // position and no domain — a mod asking about a place in a ship has no
-        // way to say which ship. Widening this needs the API to carry a domain,
-        // which is a change to what mods write and not a change here.
+        // A space nobody has poured in is dry, which is an answer.
         self.fluidics.read().map_or(Fluid::EMPTY, |ponds| {
             ponds
-                .get(tiamot_core::domain::OVERWORLD)
+                .get(domain)
                 .map_or(Fluid::EMPTY, |fluidics| fluidics.at(pos))
         })
     }
 
-    fn set_fluid_at(&self, pos: BlockPos, value: Fluid) -> bool {
+    fn set_fluid_at(&self, domain: &str, pos: BlockPos, value: Fluid) -> bool {
         self.fluidics
             .write()
-            .is_ok_and(|mut ponds| ponds.of(tiamot_core::domain::OVERWORLD).set(pos, value))
+            .is_ok_and(|mut ponds| ponds.of(domain).set(pos, value))
     }
 
     fn fluid_id(&self, name: &str) -> Option<tiamot_core::fluid::FluidId> {
@@ -261,13 +258,13 @@ impl Edits {
 }
 
 impl tiamot_core::script::WorldEdit for Edits {
-    fn set_block(&self, pos: BlockPos, block: &str) -> bool {
+    fn set_block(&self, domain: &str, pos: BlockPos, block: &str) -> bool {
         let Some(&material) = self.by_name.get(block) else {
             tracing::debug!(block, "a mod asked to place a block nothing registered");
             return false;
         };
         self.shared
-            .queue_seed(tiamot_core::proto::Edit::Block { pos, material })
+            .queue_seed(domain, tiamot_core::proto::Edit::Block { pos, material })
     }
 }
 

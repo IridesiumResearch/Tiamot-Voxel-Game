@@ -109,7 +109,7 @@ pub trait LightSource: Send + Sync {
     /// Dark rather than an error for somewhere nobody is: a mod asking about
     /// unloaded terrain gets the honest answer that there is no light there to
     /// speak of, and an `Option` would push that judgement onto every caller.
-    fn light_at(&self, pos: crate::BlockPos) -> Light;
+    fn light_at(&self, domain: &str, pos: crate::BlockPos) -> Light;
 }
 
 /// A light level: sunlight plus a colour, packed into 16 bits.

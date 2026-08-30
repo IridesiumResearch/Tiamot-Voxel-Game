@@ -120,18 +120,13 @@ impl Lights {
 }
 
 impl tiamot_core::light::LightSource for Shared {
-    fn light_at(&self, pos: BlockPos) -> Light {
+    fn light_at(&self, domain: &str, pos: BlockPos) -> Light {
         // A poisoned lock means the simulation thread panicked, in which case
         // there is no light and no world; darkness is the honest answer and
         // panicking inside a mod callback would blame the mod.
-        // **The overworld's**, because `game.get_light(position)` names a
-        // position and no domain — a mod asking about a place in a ship has no
-        // way to say which ship. Widening this needs the API to carry a domain,
-        // which is a change to what mods write and not a change here.
+        // A space nothing has lit is dark, which is an answer.
         self.lighting.read().map_or(Light::DARK, |lighting| {
-            lighting
-                .get(tiamot_core::domain::OVERWORLD)
-                .map_or(Light::DARK, |lit| lit.at(pos))
+            lighting.get(domain).map_or(Light::DARK, |lit| lit.at(pos))
         })
     }
 }

@@ -295,7 +295,7 @@ pub trait Access: Send + Sync {
     /// answers dark: a mod asking about unloaded terrain gets the honest answer
     /// that there is no milk there, and an `Option` would push that judgement
     /// onto every caller.
-    fn fluid_at(&self, pos: crate::BlockPos) -> Fluid;
+    fn fluid_at(&self, domain: &str, pos: crate::BlockPos) -> Fluid;
 
     /// Records what a block holds and wakes the flow around it.
     ///
@@ -303,7 +303,7 @@ pub trait Access: Send + Sync {
     /// fluid is not refused here — the next fluid tick clears it, which is the
     /// same answer the solver gives when somebody builds in a pond, and having
     /// one rule rather than two is worth more than the early error.
-    fn set_fluid_at(&self, pos: crate::BlockPos, value: Fluid) -> bool;
+    fn set_fluid_at(&self, domain: &str, pos: crate::BlockPos, value: Fluid) -> bool;
 
     /// The id registered under a string name, or `None`.
     ///

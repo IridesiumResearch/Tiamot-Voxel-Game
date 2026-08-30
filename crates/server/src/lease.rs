@@ -143,7 +143,7 @@ pub struct Shared {
 }
 
 impl sight::Access for Shared {
-    fn line_of_sight(&self, from: [f64; 3], to: [f64; 3]) -> Sighting {
+    fn line_of_sight(&self, domain: &str, from: [f64; 3], to: [f64; 3]) -> Sighting {
         // A poisoned lease means the simulation thread panicked while the world
         // was lent, which is not something a mod should be told about with an
         // error it would have to handle.
@@ -157,14 +157,14 @@ impl sight::Access for Shared {
         // Bound to a domain before the trait sees it: sight is cast through
         // the terrain of the space the looker is in, and `ChunkLookup` cannot
         // carry which that is.
-        if sight::between(&world.solid(tiamot_core::domain::OVERWORLD), from, to) {
+        if sight::between(&world.solid(domain), from, to) {
             Sighting::Clear
         } else {
             Sighting::Blocked
         }
     }
 
-    fn block_at(&self, pos: tiamot_core::BlockPos) -> sight::Reading {
+    fn block_at(&self, domain: &str, pos: tiamot_core::BlockPos) -> sight::Reading {
         let Ok(slot) = self.slot.lock() else {
             return sight::Reading::Unavailable;
         };
@@ -175,7 +175,7 @@ impl sight::Access for Shared {
         // missing; a mod asking about somewhere far away must not be able to
         // make the server generate a chunk inside the tick budget, one call at
         // a time, for nobody. `Solid::resident` is the half that cannot.
-        let terrain = world.solid(tiamot_core::domain::OVERWORLD);
+        let terrain = world.solid(domain);
         let Some(chunk) = terrain.resident(pos.chunk()) else {
             return sight::Reading::Absent;
         };
@@ -229,22 +229,29 @@ impl sight::Access for Shared {
 }
 
 impl path::Access for Shared {
-    fn steer(&self, from: [f64; 3], to: [f64; 3], height: i32) -> Option<path::Steer> {
+    fn steer(
+        &self,
+        domain: &str,
+        from: [f64; 3],
+        to: [f64; 3],
+        height: i32,
+    ) -> Option<path::Steer> {
         let slot = self.slot.lock().ok()?;
         let world = slot.as_ref()?;
         // Unmetered, unlike `find_path`: a steer is two block lookups, not a
         // search, so there is nothing here worth taking out of the tick's
         // pathfinding budget — and a mob that could not steer because somebody
         // else had searched would stop walking for no reason it could see.
-        Some(path::steer(
-            &world.solid(tiamot_core::domain::OVERWORLD),
-            from,
-            to,
-            height.max(1),
-        ))
+        Some(path::steer(&world.solid(domain), from, to, height.max(1)))
     }
 
-    fn find_path(&self, from: [f64; 3], to: [f64; 3], options: path::Options) -> path::Route {
+    fn find_path(
+        &self,
+        domain: &str,
+        from: [f64; 3],
+        to: [f64; 3],
+        options: path::Options,
+    ) -> path::Route {
         let Ok(slot) = self.slot.lock() else {
             return path::Route::Unavailable;
         };
@@ -276,12 +283,7 @@ impl path::Access for Shared {
             ..options
         };
 
-        let (route, spent) = path::search_counted(
-            &world.solid(tiamot_core::domain::OVERWORLD),
-            from,
-            to,
-            &options,
-        );
+        let (route, spent) = path::search_counted(&world.solid(domain), from, to, &options);
         // A saturating subtract, spelled out. `fetch_update` says this in one
         // call and is deprecated on nightly in favour of a `try_update` that
         // stable does not have yet — and the fuzz job builds this crate on
@@ -346,7 +348,7 @@ mod tests {
         let lease = Lease::new();
         let handle = lease.handle();
         assert_eq!(
-            handle.line_of_sight([0.0; 3], [1.0, 0.0, 0.0]),
+            handle.line_of_sight(tiamot_core::domain::OVERWORLD, [0.0; 3], [1.0, 0.0, 0.0]),
             Sighting::Unavailable
         );
     }
@@ -366,7 +368,11 @@ mod tests {
             .expect("the chunk loads");
 
         let (world, seen) = lease.lending(world, || {
-            handle.line_of_sight([0.5, 0.5, 0.5], [2.5, 0.5, 0.5])
+            handle.line_of_sight(
+                tiamot_core::domain::OVERWORLD,
+                [0.5, 0.5, 0.5],
+                [2.5, 0.5, 0.5],
+            )
         });
 
         assert_eq!(seen, Sighting::Clear);
@@ -375,7 +381,7 @@ mod tests {
         // And the slot is empty again, so the next mod call outside a lend is
         // told so rather than reading a world the tick has moved on from.
         assert_eq!(
-            handle.line_of_sight([0.0; 3], [1.0, 0.0, 0.0]),
+            handle.line_of_sight(tiamot_core::domain::OVERWORLD, [0.0; 3], [1.0, 0.0, 0.0]),
             Sighting::Unavailable
         );
     }
@@ -438,7 +444,12 @@ mod tests {
         // One search over the whole room, to prove the fixture is a search and
         // not an early refusal.
         let (returned, first) = lease.lending(world, || {
-            handle.find_path(FLOOR, PILLAR_TOP, path::Options::default())
+            handle.find_path(
+                tiamot_core::domain::OVERWORLD,
+                FLOOR,
+                PILLAR_TOP,
+                path::Options::default(),
+            )
         });
         world = returned;
         assert_eq!(
@@ -450,13 +461,23 @@ mod tests {
         // Drain the rest of the pool.
         let (returned, ()) = lease.lending(world, || {
             for _ in 0..path::TICK_BUDGET.div_ceil(64) {
-                let _ = handle.find_path(FLOOR, PILLAR_TOP, path::Options::default());
+                let _ = handle.find_path(
+                    tiamot_core::domain::OVERWORLD,
+                    FLOOR,
+                    PILLAR_TOP,
+                    path::Options::default(),
+                );
             }
         });
         world = returned;
 
         let (returned, drained) = lease.lending(world, || {
-            handle.find_path(FLOOR, PILLAR_TOP, path::Options::default())
+            handle.find_path(
+                tiamot_core::domain::OVERWORLD,
+                FLOOR,
+                PILLAR_TOP,
+                path::Options::default(),
+            )
         });
         world = returned;
         assert_eq!(
@@ -468,7 +489,12 @@ mod tests {
         // And a new tick gets a fresh one.
         lease.open_tick();
         let (_world, refilled) = lease.lending(world, || {
-            handle.find_path(FLOOR, PILLAR_TOP, path::Options::default())
+            handle.find_path(
+                tiamot_core::domain::OVERWORLD,
+                FLOOR,
+                PILLAR_TOP,
+                path::Options::default(),
+            )
         });
         assert_eq!(
             refilled,
@@ -487,7 +513,11 @@ mod tests {
         let handle = lease.handle();
 
         let (_world, seen) = lease.lending(world(), || {
-            handle.line_of_sight([0.5, 0.5, 0.5], [2.5, 0.5, 0.5])
+            handle.line_of_sight(
+                tiamot_core::domain::OVERWORLD,
+                [0.5, 0.5, 0.5],
+                [2.5, 0.5, 0.5],
+            )
         });
         assert_eq!(seen, Sighting::Blocked);
     }

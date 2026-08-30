@@ -1744,8 +1744,9 @@ impl ServerHandle {
                         // did it. A test arranging a world before a player acts
                         // is the whole use, and it goes first so the player's
                         // own actions this tick see the arranged world.
-                        for edit in shared.drain_seeds() {
-                            match world.apply(tiamot_core::domain::OVERWORLD, &edit, &mut source) {
+                        // A mod's `game.set_block` names the space it meant.
+                        for (seeded_in, edit) in shared.drain_seeds() {
+                            match world.apply(&seeded_in, &edit, &mut source) {
                                 Ok(_) => {
                                     relight.push(edited_block(&edit));
                                     // What the block will ACCEPT has changed,
@@ -1755,12 +1756,12 @@ impl ServerHandle {
                                     fluidics
                                         .write()
                                         .expect("fluid lock")
-                                        .of(tiamot_core::domain::OVERWORLD)
+                                        .of(&seeded_in)
                                         .touch(edited_block(&edit));
-                                    shared.broadcast(ServerMessage::BlockDelta {
-                                        edit,
-                                        actor: None,
-                                    });
+                                    shared.broadcast_in(
+                                        &seeded_in,
+                                        ServerMessage::BlockDelta { edit, actor: None },
+                                    );
                                 }
                                 Err(err) => {
                                     debug!("an operator edit would not apply: {err}");
@@ -3772,14 +3773,18 @@ impl ServerHandle {
     /// Applied on the next tick and broadcast like any other edit, so a
     /// connected client sees it arrive. Returns whether it was queued.
     pub fn seed_block(&self, pos: tiamot_core::BlockPos, material: u16) -> bool {
-        self.shared
-            .queue_seed(tiamot_core::proto::Edit::Block { pos, material })
+        self.shared.queue_seed(
+            tiamot_core::domain::OVERWORLD,
+            tiamot_core::proto::Edit::Block { pos, material },
+        )
     }
 
     /// The same, for one sub-node cell.
     pub fn seed_subnode(&self, pos: tiamot_core::SubNodePos, material: u16) -> bool {
-        self.shared
-            .queue_seed(tiamot_core::proto::Edit::SubNode { pos, material })
+        self.shared.queue_seed(
+            tiamot_core::domain::OVERWORLD,
+            tiamot_core::proto::Edit::SubNode { pos, material },
+        )
     }
 
     /// The same, for a block that is only partly filled.
@@ -3787,11 +3792,14 @@ impl ServerHandle {
     /// For arranging the carved block a test is about to act on, without
     /// mining one cell at a time to get there.
     pub fn seed_partial(&self, pos: tiamot_core::BlockPos, material: u16, occupancy: u32) -> bool {
-        self.shared.queue_seed(tiamot_core::proto::Edit::Partial {
-            pos,
-            material,
-            occupancy,
-        })
+        self.shared.queue_seed(
+            tiamot_core::domain::OVERWORLD,
+            tiamot_core::proto::Edit::Partial {
+                pos,
+                material,
+                occupancy,
+            },
+        )
     }
 
     /// The address the server is actually listening on.

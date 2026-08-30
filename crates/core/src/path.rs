@@ -150,7 +150,7 @@ pub enum Route {
 /// thing: the world, during the part of the tick that runs mod callbacks.
 pub trait Access: Send + Sync {
     /// A route between two world points, in world blocks.
-    fn find_path(&self, from: [f64; 3], to: [f64; 3], options: Options) -> Route;
+    fn find_path(&self, domain: &str, from: [f64; 3], to: [f64; 3], options: Options) -> Route;
 
     /// The drive that takes a body from `from` toward `to` this tick.
     ///
@@ -158,7 +158,7 @@ pub trait Access: Send + Sync {
     /// answer `find_path` gives as [`Route::Unavailable`], and deliberately not
     /// a stationary drive: a mob told to stand still is different from a mob
     /// nobody could answer for.
-    fn steer(&self, from: [f64; 3], to: [f64; 3], height: i32) -> Option<Steer>;
+    fn steer(&self, domain: &str, from: [f64; 3], to: [f64; 3], height: i32) -> Option<Steer>;
 }
 
 /// What a mob should do this tick to get where it is going.

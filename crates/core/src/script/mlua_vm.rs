@@ -2596,6 +2596,7 @@ impl MluaVm {
                 let x: i32 = position.get("x")?;
                 let y: i32 = position.get("y")?;
                 let z: i32 = position.get("z")?;
+                let domain = domain_of(&position)?;
 
                 let level = light
                     .lock()
@@ -2610,7 +2611,7 @@ impl MluaVm {
                     // mod that had to handle an error here would be a mod
                     // written around the engine's startup order.
                     .map_or(crate::light::Light::DARK, |source| {
-                        source.light_at(crate::BlockPos::new(x, y, z))
+                        source.light_at(&domain, crate::BlockPos::new(x, y, z))
                     });
 
                 let out = lua.create_table()?;
@@ -2640,6 +2641,7 @@ impl MluaVm {
                 let x: i32 = position.get("x")?;
                 let y: i32 = position.get("y")?;
                 let z: i32 = position.get("z")?;
+                let domain = domain_of(&position)?;
 
                 let reading = sight
                     .lock()
@@ -2650,7 +2652,7 @@ impl MluaVm {
                     })?
                     .as_ref()
                     .map_or(crate::sight::Reading::Unavailable, |access| {
-                        access.block_at(crate::BlockPos::new(x, y, z))
+                        access.block_at(&domain, crate::BlockPos::new(x, y, z))
                     });
 
                 match reading {
@@ -2712,6 +2714,10 @@ impl MluaVm {
                 let point = |table: &Table| -> mlua::Result<[f64; 3]> {
                     Ok([table.get("x")?, table.get("y")?, table.get("z")?])
                 };
+                // The domain is taken from where the look STARTS: sight is
+                // cast through the space the looker is in, and a line between
+                // two spaces is not a line.
+                let domain = domain_of(&from)?;
                 let from = point(&from)?;
                 let to = point(&to)?;
 
@@ -2723,7 +2729,7 @@ impl MluaVm {
                 let answer = guard
                     .as_ref()
                     .map_or(crate::sight::Sighting::Unavailable, |access| {
-                        access.line_of_sight(from, to)
+                        access.line_of_sight(&domain, from, to)
                     });
 
                 Ok(match answer {
@@ -2765,6 +2771,9 @@ impl MluaVm {
         let paths = std::sync::Arc::clone(&self.paths);
         self.lua
             .create_function(move |_, (id, target, gait): (u64, Table, Option<String>)| {
+                // From the TARGET, because a mob does not walk between spaces:
+                // wherever it is being sent is the space it is already in.
+                let domain = domain_of(&target)?;
                 let to: [f64; 3] = [target.get("x")?, target.get("y")?, target.get("z")?];
                 // The same three names `set_entity`'s drive takes, so a mod
                 // that knows one knows the other. An unknown one walks rather
@@ -2805,7 +2814,7 @@ impl MluaVm {
                 let Some(paths) = path_slot.as_ref() else {
                     return Ok(mlua::Value::Nil);
                 };
-                let Some(steer) = paths.steer(from, to, height) else {
+                let Some(steer) = paths.steer(&domain, from, to, height) else {
                     return Ok(mlua::Value::Nil);
                 };
 
@@ -2851,6 +2860,9 @@ impl MluaVm {
                     let point = |table: &Table| -> mlua::Result<[f64; 3]> {
                         Ok([table.get("x")?, table.get("y")?, table.get("z")?])
                     };
+                    // Where the route STARTS decides which world it is
+                    // through: a path between two spaces is not a path.
+                    let domain = domain_of(&from)?;
                     let from = point(&from)?;
                     let to = point(&to)?;
 
@@ -2875,7 +2887,7 @@ impl MluaVm {
                     let route = guard
                         .as_ref()
                         .map_or(crate::path::Route::Unavailable, |access| {
-                            access.find_path(from, to, options)
+                            access.find_path(&domain, from, to, options)
                         });
 
                     let refusal = |reason: &'static str| -> mlua::Result<mlua::MultiValue> {
@@ -2924,6 +2936,7 @@ impl MluaVm {
                 let x: i32 = position.get("x")?;
                 let y: i32 = position.get("y")?;
                 let z: i32 = position.get("z")?;
+                let domain = domain_of(&position)?;
                 let guard = edits.lock().map_err(|_| {
                     mlua::Error::external(
                         "the edit queue is poisoned; the simulation thread panicked",
@@ -2936,7 +2949,7 @@ impl MluaVm {
                 let Some(edits) = guard.as_ref() else {
                     return Ok(false);
                 };
-                Ok(edits.set_block(crate::BlockPos::new(x, y, z), &block))
+                Ok(edits.set_block(&domain, crate::BlockPos::new(x, y, z), &block))
             })
             .map_err(|err| self.vm_error(&err))
     }
@@ -2954,6 +2967,7 @@ impl MluaVm {
                 let x: i32 = position.get("x")?;
                 let y: i32 = position.get("y")?;
                 let z: i32 = position.get("z")?;
+                let domain = domain_of(&position)?;
 
                 let value = reader
                     .lock()
@@ -2966,7 +2980,7 @@ impl MluaVm {
                     // No world yet — during worldgen, or in a test with no
                     // server behind the VM. Nothing is the honest answer.
                     .map_or(crate::fluid::Fluid::EMPTY, |source| {
-                        source.fluid_at(crate::BlockPos::new(x, y, z))
+                        source.fluid_at(&domain, crate::BlockPos::new(x, y, z))
                     });
 
                 let out = lua.create_table()?;
@@ -2992,6 +3006,7 @@ impl MluaVm {
                 let x: i32 = position.get("x")?;
                 let y: i32 = position.get("y")?;
                 let z: i32 = position.get("z")?;
+                let domain = domain_of(&position)?;
 
                 let guard = writer.lock().map_err(|_| {
                     mlua::Error::external(
@@ -3036,7 +3051,7 @@ impl MluaVm {
                     };
                     crate::fluid::Fluid::new(id, volume)
                 };
-                Ok(store.set_fluid_at(crate::BlockPos::new(x, y, z), value))
+                Ok(store.set_fluid_at(&domain, crate::BlockPos::new(x, y, z), value))
             })
             .map_err(|err| self.vm_error(&err))?;
 
@@ -5641,6 +5656,22 @@ const STYLE_FIELDS: [&str; 5] = [
     "text_size",
 ];
 
+/// The domain a mod named on a position, or the overworld.
+///
+/// **A position names a place only with a domain**, because every space has a
+/// block at each coordinate. Optional rather than required so that every mod
+/// written before domains existed still means what it said: the overworld.
+///
+/// Read off the position table rather than passed separately, because the
+/// domain is part of what makes a position a place — splitting them would let a
+/// mod pass one position's domain with another position's coordinates.
+fn domain_of(position: &Table) -> mlua::Result<String> {
+    Ok(position
+        .get::<Option<String>>("domain")?
+        .filter(|domain| !domain.is_empty())
+        .unwrap_or_else(|| crate::domain::OVERWORLD.to_owned()))
+}
+
 fn qualify_id(mod_id: &str, id: &str) -> Result<String, String> {
     match id.split_once(':') {
         None => Ok(format!("{mod_id}:{id}")),
@@ -5986,7 +6017,7 @@ mod tests {
     }
 
     impl crate::fluid::Access for Bucket {
-        fn fluid_at(&self, pos: crate::BlockPos) -> crate::fluid::Fluid {
+        fn fluid_at(&self, _domain: &str, pos: crate::BlockPos) -> crate::fluid::Fluid {
             self.held
                 .lock()
                 .ok()
@@ -5994,7 +6025,12 @@ mod tests {
                 .unwrap_or(crate::fluid::Fluid::EMPTY)
         }
 
-        fn set_fluid_at(&self, pos: crate::BlockPos, value: crate::fluid::Fluid) -> bool {
+        fn set_fluid_at(
+            &self,
+            _domain: &str,
+            pos: crate::BlockPos,
+            value: crate::fluid::Fluid,
+        ) -> bool {
             let Ok(mut held) = self.held.lock() else {
                 return false;
             };
@@ -6023,7 +6059,12 @@ mod tests {
     }
 
     impl crate::sight::Access for Eye {
-        fn line_of_sight(&self, from: [f64; 3], to: [f64; 3]) -> crate::sight::Sighting {
+        fn line_of_sight(
+            &self,
+            _domain: &str,
+            from: [f64; 3],
+            to: [f64; 3],
+        ) -> crate::sight::Sighting {
             if let Ok(mut asked) = self.asked.lock() {
                 asked.push((from, to));
             }
@@ -6034,7 +6075,7 @@ mod tests {
                 .unwrap_or(crate::sight::Sighting::Unavailable)
         }
 
-        fn block_at(&self, pos: crate::BlockPos) -> crate::sight::Reading {
+        fn block_at(&self, _domain: &str, pos: crate::BlockPos) -> crate::sight::Reading {
             if let Ok(mut asked) = self.blocks_asked.lock() {
                 asked.push(pos);
             }
@@ -6054,7 +6095,13 @@ mod tests {
     }
 
     impl crate::path::Access for Map {
-        fn steer(&self, from: [f64; 3], to: [f64; 3], _height: i32) -> Option<crate::path::Steer> {
+        fn steer(
+            &self,
+            _domain: &str,
+            from: [f64; 3],
+            to: [f64; 3],
+            _height: i32,
+        ) -> Option<crate::path::Steer> {
             // No world here, so the direction is all this fixture can answer.
             // Jumping is what needs terrain, and the tests that care about it
             // drive a real server.
@@ -6073,6 +6120,7 @@ mod tests {
 
         fn find_path(
             &self,
+            _domain: &str,
             _from: [f64; 3],
             _to: [f64; 3],
             options: crate::path::Options,
@@ -6095,7 +6143,7 @@ mod tests {
     }
 
     impl crate::script::WorldEdit for Slate {
-        fn set_block(&self, pos: crate::BlockPos, block: &str) -> bool {
+        fn set_block(&self, _domain: &str, pos: crate::BlockPos, block: &str) -> bool {
             // Refuses one name, so the test can see a rejection travel back to
             // Lua rather than assuming it does.
             if block == "nobody:registered" {
@@ -6179,14 +6227,14 @@ mod tests {
         assert!(faults.is_empty(), "pouring raised: {faults:?}");
         let at = crate::BlockPos::new(1, 2, 3);
         assert!(
-            !crate::fluid::Access::fluid_at(&*bucket, at).is_empty(),
+            !crate::fluid::Access::fluid_at(&*bucket, crate::domain::OVERWORLD, at).is_empty(),
             "the pour did not land, so the clear below would prove nothing"
         );
 
         // And now the call the stubs promise works.
         let faults = vm.tick(1).expect("tick");
         assert!(
-            crate::fluid::Access::fluid_at(&*bucket, at).is_empty(),
+            crate::fluid::Access::fluid_at(&*bucket, crate::domain::OVERWORLD, at).is_empty(),
             "clearing without naming a fluid did nothing, which is the bug"
         );
         assert!(

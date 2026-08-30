@@ -93,7 +93,7 @@ pub enum Sighting {
 /// asking about, and any answer would be about a world that does not exist yet.
 pub trait Access: Send + Sync {
     /// Whether `from` can see `to`. Both in world blocks, as a mod speaks them.
-    fn line_of_sight(&self, from: [f64; 3], to: [f64; 3]) -> Sighting;
+    fn line_of_sight(&self, domain: &str, from: [f64; 3], to: [f64; 3]) -> Sighting;
 
     /// What one block holds.
     ///
@@ -101,7 +101,10 @@ pub trait Access: Send + Sync {
     /// a crop, a door, a wire: each of them begins with "what is at this
     /// position", and until this existed a mod could WRITE a block and never
     /// read one back.
-    fn block_at(&self, pos: crate::coords::BlockPos) -> Reading;
+    /// **A position names a place only with a domain.** Every space has a
+    /// block at each coordinate, so a reading without one is a reading of
+    /// whichever space the implementation happened to be looking at.
+    fn block_at(&self, domain: &str, pos: crate::coords::BlockPos) -> Reading;
 }
 
 /// What the engine can tell a mod about one block.

@@ -586,6 +586,14 @@ function game.register_on_tick(callback) end
 ---```
 ---@param position Tiamot.BlockPos
 ---@return { material: integer|nil, occupancy: integer, cells: integer[]|nil }|nil
+---
+---**Every position may name a domain.** `{ x, y, z, domain = "mod:ship/17" }`
+---asks about that space; leaving `domain` out asks about the overworld, which
+---is what every mod written before domains existed meant. The same field works
+---on `game.set_block`, `game.get_light`, `game.get_fluid`, `game.set_fluid`,
+---`game.line_of_sight`, `game.find_path` and `game.steer_entity` — a position
+---names a place only with a space to be in, because every domain has a block at
+---each coordinate.
 function game.get_block(position) end
 
 ---The light at a block, right now.

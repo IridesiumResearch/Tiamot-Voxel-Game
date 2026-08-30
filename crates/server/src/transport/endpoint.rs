@@ -203,7 +203,7 @@ pub struct Shared {
     /// carries a `PlayerUuid` because a player is answerable for what it does;
     /// this one has no actor, and giving it a synthetic one would mean every
     /// consumer had to remember which uuids were real.
-    pub seeds: std::sync::Mutex<std::collections::VecDeque<Edit>>,
+    pub seeds: std::sync::Mutex<std::collections::VecDeque<(String, Edit)>>,
 
     /// Placements waiting for the tick that will decide them.
     ///
@@ -694,20 +694,20 @@ impl Shared {
     /// Queues an operator edit, bypassing every player-facing rule.
     ///
     /// Returns whether it was accepted; the queue is bounded like the others.
-    pub fn queue_seed(&self, edit: Edit) -> bool {
+    pub fn queue_seed(&self, domain: &str, edit: Edit) -> bool {
         let Ok(mut queue) = self.seeds.lock() else {
             return false;
         };
         if queue.len() >= MAX_QUEUED_EDITS {
             return false;
         }
-        queue.push_back(edit);
+        queue.push_back((domain.to_owned(), edit));
         true
     }
 
     /// Takes every queued operator edit, leaving the queue empty.
     #[must_use]
-    pub fn drain_seeds(&self) -> Vec<Edit> {
+    pub fn drain_seeds(&self) -> Vec<(String, Edit)> {
         self.seeds
             .lock()
             .map(|mut queue| queue.drain(..).collect())

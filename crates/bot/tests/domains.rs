@@ -1351,3 +1351,65 @@ fn a_second_domain_is_lit_by_its_own_sky() {
     });
     server.stop();
 }
+
+#[test]
+fn a_mod_writes_the_space_it_names() {
+    // **A position names a place only with a domain.** Every space has a block
+    // at each coordinate, so `game.set_block{ x, y, z }` without one writes to
+    // whichever space the engine happened to be looking at. Naming it writes
+    // there; leaving it out writes to the overworld, which is what every mod
+    // written before domains existed meant.
+    //
+    // `places:void` names no generator, so it is empty — which makes it the
+    // one place where "something is here" can only have come from this write.
+    let world = scratch("named-writes-world");
+    let server = restart_at(
+        world.clone(),
+        write_mod(
+            "writes",
+            "game.register_on_chat(function(event)\n\
+             \x20   if event.text == 'build' then\n\
+             \x20       game.set_block({ x = 0, y = -1, z = 0,\n\
+             \x20           domain = 'places:void' }, 'places:ground')\n\
+             \x20       return false\n\
+             \x20   end\n\
+             end)",
+        ),
+    );
+    block_on(async {
+        let mut bot = join(&server, "Builder").await;
+        settle_for(&mut bot, 60).await;
+        bot.chat("build").await.expect("chat");
+        settle_for(&mut bot, 80).await;
+        bot.disconnect().await;
+    });
+    assert!(server.stop(), "the world should close cleanly");
+
+    let mut registry = tiamot_core::Registry::new();
+    let db = tiamot_core::persist::WorldDb::open(
+        world.join(tiamot_server::handle::WORLD_FILE),
+        &mut registry,
+    )
+    .expect("reopen");
+
+    let at = tiamot_core::ChunkPos::new(0, -1, 0);
+    let void = db
+        .load_chunk_in("places:void", at)
+        .expect("read")
+        .expect("a block written into the void made a chunk there");
+    assert!(
+        holds_anything(&void, at),
+        "a mod named `places:void` and the block went somewhere else"
+    );
+
+    // And the overworld is untouched at those coordinates — it was solid
+    // already, so what this rules out is the write landing in BOTH.
+    let overworld = db
+        .load_chunk(at)
+        .expect("read")
+        .expect("the overworld was written when the player stood on it");
+    assert!(
+        holds_anything(&overworld, at),
+        "the overworld lost its ground to a write meant for another space"
+    );
+}

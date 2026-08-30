@@ -339,7 +339,7 @@ pub trait WorldEdit: Send + Sync {
     /// Returns whether the edit was accepted onto the queue — NOT whether it
     /// landed, which the caller finds out by looking next tick. `false` means
     /// the queue is full or the block name is not registered.
-    fn set_block(&self, pos: crate::BlockPos, block: &str) -> bool;
+    fn set_block(&self, domain: &str, pos: crate::BlockPos, block: &str) -> bool;
 }
 
 /// What a mod said about a fluid.
