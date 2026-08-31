@@ -1932,6 +1932,125 @@ pub mod reference {
 }
 
 #[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use tiamot_core::MaterialId;
+    use tiamot_core::lod::{FINEST, Summary};
+
+    /// A summary at `level` whose bottom `height` layers of cells are solid.
+    ///
+    /// A staircase in one number: the whole point of the skirt test is two
+    /// chunks whose surfaces sit at different heights because they were
+    /// summarised at different levels.
+    fn slab(level: u8, height: u32, material: u16) -> Summary {
+        let n = tiamot_core::lod::cells_per_axis(level).expect("a level");
+        let mut cells = vec![MaterialId::AIR; (n * n * n) as usize];
+        for z in 0..n {
+            for y in 0..height.min(n) {
+                for x in 0..n {
+                    cells[((z * n + y) * n + x) as usize] = MaterialId(material);
+                }
+            }
+        }
+        Summary::from_parts(level, cells).expect("build")
+    }
+
+    #[test]
+    fn an_empty_summary_draws_nothing() {
+        let n = tiamot_core::lod::cells_per_axis(FINEST).expect("a level");
+        let empty = Summary::from_parts(FINEST, vec![MaterialId::AIR; (n * n * n) as usize])
+            .expect("build");
+        assert!(mesh_summary(&empty).quads.is_empty());
+    }
+
+    #[test]
+    fn a_solid_summary_is_a_box_and_nothing_inside_it() {
+        // Six faces of a chunk, at whatever the level's cell size is — and
+        // crucially the INTERIOR faces are culled, or a level-1 summary would
+        // be 4096 cubes rather than a shell.
+        for level in FINEST..=tiamot_core::lod::COARSEST {
+            let n = tiamot_core::lod::cells_per_axis(level).expect("a level");
+            let solid = Summary::from_parts(level, vec![MaterialId(1); (n * n * n) as usize])
+                .expect("build");
+            let mesh = mesh_summary(&solid);
+            assert_eq!(
+                mesh.quads.len(),
+                (6 * n * n) as usize,
+                "level {level} drew {} quads for a solid chunk, not six faces of {n}²",
+                mesh.quads.len()
+            );
+        }
+    }
+
+    #[test]
+    fn the_boundary_between_two_levels_has_no_gap_in_it() {
+        // **Criterion T4.** Two chunks side by side, summarised at different
+        // levels, with their surfaces at different heights. Sample the boundary
+        // COLUMN — for every height along the shared plane, something has to
+        // cover it, or a player sees through the world to the sky.
+        //
+        // Done against the quads rather than a rendered frame deliberately: a
+        // screenshot answers "was there a hole in this one frame from this one
+        // angle", and the claim is about every angle.
+        let coarse = mesh_summary(&slab(3, 2, 1)); // cells 4 blocks tall: surface at 8
+        let fine = mesh_summary(&slab(FINEST, 5, 1)); // cells 1 block tall: surface at 5
+
+        // The +x plane of the coarse chunk and the -x plane of the fine one.
+        // In sub-nodes, the shared plane is at 48 for one and 0 for the other.
+        let plane = u8::try_from(CHUNK_SUBNODES).expect("fits");
+        let covered = |mesh: &Mesh, at: u8, positive: bool| -> Vec<(u8, u8)> {
+            let mut spans = Vec::new();
+            for quad in &mesh.quads {
+                if quad.axis == 0 && quad.positive == positive && quad.w == at {
+                    spans.push((quad.v, quad.dv));
+                }
+            }
+            spans
+        };
+
+        // Everything either chunk has at the shared plane.
+        let mut walls = covered(&coarse, plane, true);
+        walls.extend(covered(&fine, 0, false));
+        assert!(!walls.is_empty(), "neither side hung a wall at the seam");
+
+        // The taller side is solid up to sub-node 24 (two four-block cells);
+        // the shorter to 15. Every height either one reaches has to be walled,
+        // and in particular the 15..24 band — which is exactly the crack.
+        for height in 0..24u8 {
+            let sealed = walls
+                .iter()
+                .any(|(v, dv)| *v <= height && height < v.saturating_add(*dv));
+            assert!(
+                sealed,
+                "nothing covers the seam at sub-node height {height}; that is a hole \
+                 through the world to the sky"
+            );
+        }
+    }
+
+    #[test]
+    fn a_buried_boundary_cell_still_hangs_its_wall() {
+        // The skirt is not "the top cell of the edge" — it is every cell on the
+        // boundary plane, buried ones included. A mesher that culled the buried
+        // ones against its own neighbours would leave the wall with a hole in
+        // it exactly where the neighbouring chunk's surface happened to dip.
+        let mesh = mesh_summary(&slab(FINEST, 16, 1));
+        let plane = u8::try_from(CHUNK_SUBNODES).expect("fits");
+        let wall = mesh
+            .quads
+            .iter()
+            .filter(|quad| quad.axis == 0 && quad.positive && quad.w == plane)
+            .count();
+        let n = tiamot_core::lod::cells_per_axis(FINEST).expect("a level") as usize;
+        assert_eq!(
+            wall,
+            n * n,
+            "a fully solid chunk hung {wall} quads on its +x boundary, not {n}²"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     /// Full daylight everywhere.
     ///
@@ -2813,5 +2932,115 @@ mod tests {
         let mesh = mesh_chunk(&empty(), &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
         assert!(mesh.is_empty());
         assert_eq!(mesh.gpu_bytes(), 0);
+    }
+}
+
+/// Meshes a summary: the horizon, one quad per exposed cell face.
+///
+/// # Skirts, and why cubic voxels do not need stitching
+///
+/// The prompt's word for the fix is "skirts", and the reasoning is worth
+/// writing down once because it is not what the terrain-LOD literature will
+/// tell you. Transvoxel and dual contouring are ISOSURFACE techniques: they
+/// exist because a smooth surface extracted at two resolutions does not meet
+/// along the boundary, and they stitch the two together with transition cells.
+/// None of that applies here. A summary is cubes, and a cube's faces are axis
+/// aligned.
+///
+/// What DOES happen at a boundary between two levels is that one side's surface
+/// is a staircase at four blocks and the other's at two, so their tops sit at
+/// different heights and you can see between them. The fix is that **a face on
+/// the chunk boundary is never culled**. Every solid cell touching the boundary
+/// plane emits its outward face, whatever is on the other side — so each chunk
+/// hangs a full-height wall down its own edge, and the union of the two walls
+/// covers any height difference between them completely. That wall IS the
+/// skirt; it just falls out of not culling rather than being extra geometry
+/// bolted on afterwards.
+///
+/// It costs a ring of quads per chunk that are usually hidden inside rock. At
+/// level 2 that is at most 6 × 8 × 8 = 384 quads for a chunk that would
+/// otherwise be tens, and it is the price of a horizon with no holes in it.
+///
+/// # Light
+///
+/// Full daylight, flat. A summary has no light layer — the server does not send
+/// one, because propagating light through terrain nobody can walk on would cost
+/// the tick budget for something a mile away. The horizon is therefore lit as
+/// if the sun were straight on it, which at that distance is a shade rather
+/// than a shape.
+#[must_use]
+pub fn mesh_summary(summary: &tiamot_core::lod::Summary) -> Mesh {
+    let width = summary.width() as usize;
+    // How many sub-nodes one cell spans. The whole chunk is `CHUNK_SUBNODES`
+    // across at every level, so this is exact and never a remainder.
+    let Some(step) = (CHUNK_SUBNODES as usize).checked_div(width) else {
+        return Mesh::default();
+    };
+    let step = u8::try_from(step).unwrap_or(u8::MAX);
+
+    let solid = |x: isize, y: isize, z: isize| -> Option<u16> {
+        let bound = width as isize;
+        if x < 0 || y < 0 || z < 0 || x >= bound || y >= bound || z >= bound {
+            return None;
+        }
+        let index = (z as usize * width + y as usize) * width + x as usize;
+        let material = summary.cells().get(index)?;
+        (material.0 != tiamot_core::MaterialId::AIR.0).then_some(material.0)
+    };
+
+    let mut quads = Vec::new();
+    for z in 0..width as isize {
+        for y in 0..width as isize {
+            for x in 0..width as isize {
+                let Some(material) = solid(x, y, z) else {
+                    continue;
+                };
+                for (axis, positive, delta) in [
+                    (0u8, false, [-1isize, 0, 0]),
+                    (0, true, [1, 0, 0]),
+                    (1, false, [0, -1, 0]),
+                    (1, true, [0, 1, 0]),
+                    (2, false, [0, 0, -1]),
+                    (2, true, [0, 0, 1]),
+                ] {
+                    let (nx, ny, nz) = (x + delta[0], y + delta[1], z + delta[2]);
+                    let outside = nx < 0
+                        || ny < 0
+                        || nz < 0
+                        || nx >= width as isize
+                        || ny >= width as isize
+                        || nz >= width as isize;
+                    // The skirt: a boundary face is emitted whatever is beyond
+                    // it, because this chunk does not know what level the chunk
+                    // beyond it is drawn at. See the function docs.
+                    if !outside && solid(nx, ny, nz).is_some() {
+                        continue;
+                    }
+                    let cell = [x, y, z].map(|n| u8::try_from(n).unwrap_or(0) * step);
+                    let (u, v) = match axis {
+                        0 => (cell[1], cell[2]),
+                        1 => (cell[0], cell[2]),
+                        _ => (cell[0], cell[1]),
+                    };
+                    let w = cell[usize::from(axis)] + if positive { step } else { 0 };
+                    quads.push(Quad {
+                        axis,
+                        positive,
+                        w,
+                        u,
+                        v,
+                        du: step,
+                        dv: step,
+                        material,
+                        shade: crate::shade::Shade::flat(tiamot_core::light::Light::DAYLIGHT),
+                    });
+                }
+            }
+        }
+    }
+
+    Mesh {
+        quads,
+        ..Mesh::default()
     }
 }

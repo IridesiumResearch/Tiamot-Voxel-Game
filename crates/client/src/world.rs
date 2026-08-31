@@ -401,6 +401,11 @@ impl ChunkStore {
         self.summaries.len()
     }
 
+    /// Puts summaries back on the queue, for a frame that ran out of budget.
+    pub fn requeue_stale(&mut self, positions: &[ChunkPos]) {
+        self.stale.extend(positions.iter().copied());
+    }
+
     /// Summaries whose mesh has not been built since they changed.
     pub fn take_stale(&mut self, budget: usize) -> Vec<ChunkPos> {
         let taken: Vec<ChunkPos> = self.stale.iter().copied().take(budget).collect();
@@ -1162,5 +1167,83 @@ mod tests {
             due.positions.contains(&ChunkPos::new(0, 0, 0)),
             "the chunk whose light changed was not remeshed either: {due:?}"
         );
+    }
+    /// A summary whose cells are all one material.
+    fn summary(level: u8, material: u16) -> tiamot_core::lod::Summary {
+        let n = tiamot_core::lod::cells_per_axis(level).expect("a level");
+        tiamot_core::lod::Summary::from_parts(
+            level,
+            vec![tiamot_core::MaterialId(material); (n * n * n) as usize],
+        )
+        .expect("build")
+    }
+
+    #[test]
+    fn a_position_holds_a_chunk_or_a_summary_and_never_both() {
+        // The invariant the whole horizon rests on. A client holding both would
+        // draw both, and the coarse copy would poke through the fine one — from
+        // inside, which is the worst place to see it from.
+        let mut store = ChunkStore::new();
+        let pos = ChunkPos::new(3, 0, 0);
+
+        store.set_summary(pos, summary(tiamot_core::lod::FINEST, 1));
+        assert!(store.summary(pos).is_some());
+        assert!(store.get(pos).is_none());
+
+        store.insert(Chunk::new(pos, tiamot_core::MaterialId(1)));
+        assert!(store.get(pos).is_some());
+        assert!(
+            store.summary(pos).is_none(),
+            "the real chunk arrived and the summary of it stayed"
+        );
+
+        store.set_summary(pos, summary(2, 1));
+        assert!(
+            store.get(pos).is_none(),
+            "the player walked away and the client kept the full chunk as well"
+        );
+        assert_eq!(store.summary_len(), 1);
+    }
+
+    #[test]
+    fn a_summary_that_replaces_a_chunk_takes_its_light_and_its_queued_mesh() {
+        // Otherwise the store leaks a light layer per chunk walked away from,
+        // and the remesh queue holds a position whose chunk is gone — which
+        // costs a queue slot every frame and rebuilds nothing.
+        let mut store = ChunkStore::new();
+        let pos = ChunkPos::new(0, 0, 0);
+        store.insert(Chunk::new(pos, tiamot_core::MaterialId(1)));
+        store.set_light(pos, LightLayer::dark());
+        assert!(store.has_light(pos));
+
+        store.set_summary(pos, summary(tiamot_core::lod::FINEST, 1));
+        assert!(
+            !store.has_light(pos),
+            "light for a chunk the client no longer holds was kept"
+        );
+        let due = store.take_dirty(pos, 16);
+        assert!(
+            !due.positions.contains(&pos),
+            "a mesh was still queued for a chunk that has been replaced by a summary"
+        );
+    }
+
+    #[test]
+    fn the_stale_queue_is_drained_in_bounded_bites() {
+        // **Criterion T5's store half.** A player crossing a chunk boundary
+        // re-levels a whole ring of the horizon at once; a queue that handed
+        // all of it to one frame would be the burst the budget exists to stop.
+        let mut store = ChunkStore::new();
+        for x in 0..40 {
+            store.set_summary(ChunkPos::new(x, 0, 0), summary(3, 1));
+        }
+        assert_eq!(store.take_stale(16).len(), 16);
+        assert_eq!(store.take_stale(16).len(), 16);
+        assert_eq!(store.take_stale(16).len(), 8);
+        assert_eq!(store.take_stale(16).len(), 0);
+
+        // And what a frame could not afford goes back, rather than being lost.
+        store.requeue_stale(&[ChunkPos::new(0, 0, 0)]);
+        assert_eq!(store.take_stale(16).len(), 1);
     }
 }

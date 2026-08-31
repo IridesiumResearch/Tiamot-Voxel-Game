@@ -93,6 +93,22 @@ pub const REMESH_BUDGET: usize = 4;
 /// rule 18 names, and deliberately not an average-throughput one.
 pub const REMESH_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// Summaries meshed per frame.
+///
+/// Higher than [`REMESH_BUDGET`] because a summary is a fraction of the work: a
+/// chunk mesher scans 110,592 sub-node cells and a level-2 summary scans 512.
+/// The horizon is also the part a player can wait for — it is a mile away — so
+/// this exists to stop it arriving in a burst, not to make it arrive quickly.
+pub const HORIZON_BUDGET: usize = 16;
+
+/// How long a frame may spend building the horizon.
+///
+/// **Its own budget, spent after the chunks have had theirs**, so a horizon
+/// refilling cannot delay the ground under a player's feet. A quarter of the
+/// remesh budget: the work is smaller, and what it must not do is turn a frame
+/// that was going to be 16 ms into one that is 20.
+pub const HORIZON_TIME_BUDGET: std::time::Duration = std::time::Duration::from_micros(500);
+
 /// How far the debug teleport jumps, in blocks.
 ///
 /// The number in Task 08's acceptance criteria. Far enough that a world-space
@@ -4049,6 +4065,49 @@ impl App {
         rebuilt
     }
 
+    /// How many summaries the client is holding.
+    ///
+    /// For the HUD and for the session test: a horizon that never arrives and a
+    /// horizon that arrives and is never drawn look identical from outside.
+    #[must_use]
+    pub fn summaries_held(&self) -> usize {
+        self.store.summary_len()
+    }
+
+    /// Builds meshes for summaries that have changed, within one frame's share.
+    ///
+    /// Returns how many were built. Separate from [`App::remesh`] and called
+    /// after it, so a horizon refilling — which happens in bursts, a whole ring
+    /// at a time when a player crosses a chunk boundary — cannot delay the
+    /// chunk a player is standing in. See [`HORIZON_TIME_BUDGET`].
+    ///
+    /// A position whose summary has since been replaced by the real chunk is
+    /// skipped rather than cleared: the chunk pass owns that position now and
+    /// is about to draw over it.
+    pub fn build_horizon(&mut self) -> usize {
+        let due = self.store.take_stale(HORIZON_BUDGET);
+        if due.is_empty() {
+            return 0;
+        }
+        let started = std::time::Instant::now();
+        let mut built = 0;
+        for (index, pos) in due.iter().enumerate() {
+            if let Some(summary) = self.store.summary(*pos) {
+                let mesh = mesher::mesh_summary(summary);
+                self.renderer.set_chunk(self.drawn_at(*pos), &mesh);
+                built += 1;
+            }
+            // At least one goes through, for the reason the remesh budget says:
+            // a budget that can build nothing lets a slow frame stop the
+            // horizon filling in for ever.
+            if started.elapsed() >= HORIZON_TIME_BUDGET && index + 1 < due.len() {
+                self.store.requeue_stale(&due[index + 1..]);
+                break;
+            }
+        }
+        built
+    }
+
     /// Moves the camera and records the frame time.
     pub fn advance(&mut self, mut input: Input, dt: f32) {
         // **Whether the server allows it, not whether a key is down.** The
@@ -4095,9 +4154,15 @@ impl App {
         // through the surface is milk, not sky.
         let (sky, far) = match self.submerged_in() {
             Some(fluid) => (self.store.fluid_colour(fluid), UNDERWATER_VISIBILITY),
+            // **The HORIZON, not the detail radius.** Since Task 15b the world
+            // carries on past the chunks a client is sent in full, drawn from
+            // summaries — and fog at the detail radius would hide every one of
+            // them behind haze, which is a horizon streamed, meshed, drawn, and
+            // then painted over.
             None => (
                 moment.sky,
-                f32::from(self.granted_view.horizontal) * tiamot_core::CHUNK_BLOCKS as f32,
+                f32::from(tiamot_core::lod::horizon_for(self.granted_view).horizontal)
+                    * tiamot_core::CHUNK_BLOCKS as f32,
             ),
         };
         self.renderer.set_sky(sky, far);

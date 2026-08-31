@@ -147,6 +147,7 @@ fn run_frames(app: &mut App, done: impl Fn(&App) -> bool) -> bool {
             app.warnings()
         );
         app.remesh();
+        app.build_horizon();
         app.advance(Input::default(), 1.0 / 60.0);
         if done(app) {
             return true;
@@ -2337,4 +2338,62 @@ fn a_broken_block_does_not_hand_the_dig_straight_to_the_one_behind_it() {
     }
 
     app.stop_digging();
+}
+
+#[test]
+fn the_horizon_arrives_and_is_built_a_bounded_amount_at_a_time() {
+    // **Criteria T5 and the end of the chain for T1..T4.** Everything below the
+    // frame loop is unit tested — the ring maths, the cache, the codec, the
+    // skirts — and this is the one place the whole thing runs: a real server
+    // summarising real terrain, over a real connection, into real geometry.
+    //
+    // The budget half is the assertion that matters. A player crossing a chunk
+    // boundary re-levels a whole ring of the horizon at once, and a frame that
+    // took all of it would be a hitch exactly when the player is moving, which
+    // is the worst moment for one.
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let server = embedded("horizon");
+    let mut app = client("horizon", &server, gpu);
+
+    assert!(
+        run_frames(&mut app, |app| app.summaries_held() > 0),
+        "no horizon ever arrived: {:?}",
+        app.warnings()
+    );
+
+    // Now fly, so the rings move under the camera and summaries re-level.
+    let mut worst_built = 0;
+    let mut worst = Duration::ZERO;
+    for step in 0..120 {
+        assert!(app.pump_network(), "the connection ended");
+        app.remesh();
+        let started = Instant::now();
+        let built = app.build_horizon();
+        worst = worst.max(started.elapsed());
+        worst_built = worst_built.max(built);
+
+        let input = Input {
+            forward: if step % 40 < 20 { 1.0 } else { -1.0 },
+            ..Input::default()
+        };
+        app.advance(input, 1.0 / 60.0);
+    }
+
+    assert!(
+        worst_built <= client::app::HORIZON_BUDGET,
+        "a frame built {worst_built} summaries, past the budget of {}",
+        client::app::HORIZON_BUDGET
+    );
+    // The time bound is checked AFTER an item, so one summary may overshoot it
+    // — that is deliberate, since a budget that can build nothing would let a
+    // slow frame stop the horizon filling in for ever. What must not happen is
+    // the queue draining in one go: four times the budget is generous room for
+    // one summary and still an order of magnitude under a frame.
+    assert!(
+        worst <= client::app::HORIZON_TIME_BUDGET * 4,
+        "a frame spent {worst:?} on the horizon, past four times its {:?} budget",
+        client::app::HORIZON_TIME_BUDGET
+    );
 }

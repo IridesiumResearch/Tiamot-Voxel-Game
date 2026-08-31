@@ -1500,6 +1500,11 @@ impl Client {
 
         let phase = std::time::Instant::now();
         app.remesh();
+        // The horizon after the chunks, inside the same measured phase: it is
+        // the same kind of work against the same frame, and a player reading
+        // the pacing readout wants to know what geometry cost, not which queue
+        // it came from.
+        app.build_horizon();
         phases.remesh = elapsed_ms(phase);
 
         // `advance` reports the input itself, once per simulation tick rather
