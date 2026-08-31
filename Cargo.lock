@@ -781,6 +781,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bytemuck",
+ "criterion",
  "egui",
  "egui-wgpu",
  "egui-winit",
