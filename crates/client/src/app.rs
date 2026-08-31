@@ -2702,6 +2702,16 @@ impl App {
         self.chat.iter().map(String::as_str)
     }
 
+    /// How many materials this client knows about.
+    ///
+    /// For the overlay and for the session test that asks whether the atlas
+    /// ever got anything — a table with materials in it and an atlas with no
+    /// textures is the magenta world, and telling them apart needs both counts.
+    #[must_use]
+    pub fn materials(&self) -> usize {
+        self.materials.len()
+    }
+
     /// How many materials the atlas actually holds a texture for.
     ///
     /// Kept so the debug overlay can say it — see where it is drawn.

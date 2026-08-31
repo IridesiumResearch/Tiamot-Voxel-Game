@@ -98,10 +98,20 @@ fn embedded_with_view(name: &str, view: ViewDistance) -> ServerHandle {
 
 /// Starts an embedded server exactly as `server = "embedded"` does.
 fn embedded(name: &str) -> ServerHandle {
+    embedded_for(name, 1)
+}
+
+/// The same, with room for more than one client.
+///
+/// **Not because two play at once** — for the tests that connect twice in
+/// sequence. A slot is not freed the instant a client stops reading, so a
+/// second connection to a one-player server is refused as full, which looks
+/// exactly like whatever the test was actually about.
+fn embedded_for(name: &str, max_players: u32) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: scratch(&format!("{name}-world")),
-        max_players: 1,
+        max_players,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
         view_distance: ViewDistance::MINIMUM,
@@ -116,7 +126,17 @@ fn embedded(name: &str) -> ServerHandle {
 
 /// Builds the client the way `main.rs` does, without the window.
 fn client(name: &str, server: &ServerHandle, gpu: Gpu) -> App {
-    let home = scratch(&format!("{name}-home"));
+    client_in(&scratch(&format!("{name}-home")), name, server, gpu)
+}
+
+/// The same, against a home directory the caller owns.
+///
+/// **For the second connection**, which is the one a player actually makes:
+/// the first fetches every texture and writes them to the content cache, and
+/// every run after that reads them back. A test that only ever ran the first
+/// case would pass on a pipeline that could not load its own cache.
+fn client_in(home: &Path, name: &str, server: &ServerHandle, gpu: Gpu) -> App {
+    let home = home.to_path_buf();
     let config = Config {
         display_name: format!("Viewer-{name}"),
         ..Config::default()
@@ -2396,4 +2416,89 @@ fn the_horizon_arrives_and_is_built_a_bounded_amount_at_a_time() {
         "a frame spent {worst:?} on the horizon, past four times its {:?} budget",
         client::app::HORIZON_TIME_BUDGET
     );
+}
+
+#[test]
+fn a_real_server_gives_the_client_an_atlas_with_textures_in_it() {
+    // **The magenta world, asked as a test.** Reported from the window as every
+    // surface drawn in the missing-texture chequer, against a server whose own
+    // log said it had resolved eleven textures. Nothing in the client test
+    // suite asked whether the atlas ended up with any: the session tests draw
+    // frames and assert they are not uniform, which a chequer passes.
+    //
+    // This is the whole path — mod load, content offer, fetch, decode, atlas —
+    // over a real connection, and it asserts the one thing at the end of it.
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let server = embedded("atlas");
+    let mut app = client("atlas", &server, gpu);
+
+    assert!(
+        run_frames(&mut app, |app| app.materials() > 1),
+        "the material table never arrived: {:?}",
+        app.warnings()
+    );
+    // The table is not the atlas. Textures are fetched as content after it, so
+    // give them their own wait rather than assuming they came together.
+    let arrived = run_frames(&mut app, |app| app.textured() > 0);
+    assert!(
+        arrived,
+        "the server offered {} materials and not one texture reached the atlas, so \
+         every surface will draw as the missing-texture chequer. Warnings: {:?}",
+        app.materials(),
+        app.warnings()
+    );
+    println!(
+        "atlas: {} of {} materials textured",
+        app.textured(),
+        app.materials()
+    );
+}
+
+#[test]
+fn a_second_run_gets_its_textures_back_out_of_the_cache() {
+    // **The half of the texture path a fresh scratch directory never runs.**
+    // The first connection fetches every texture from the server and writes it
+    // to the content cache; every connection after that reads them back, which
+    // is what a player does on every launch but the first. A cache that stored
+    // something it could not load again would be a world drawn entirely in the
+    // missing-texture chequer, on every run except the very first one.
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let home = scratch("cache-reuse-home");
+    let server = embedded_for("cache-reuse", 2);
+
+    let first = {
+        let mut app = client_in(&home, "cache-reuse", &server, gpu.clone());
+        assert!(
+            run_frames(&mut app, |app| app.textured() > 0),
+            "the first run never got any textures: {:?}",
+            app.warnings()
+        );
+        let count = app.textured();
+        app.shutdown();
+        count
+    };
+
+    // A second client over the same home, so the cache is warm. A different
+    // display name because the first one is claimed: this harness generates a
+    // fresh identity per client where a real player keeps theirs, and the name
+    // is bound to the identity that claimed it. The cache is keyed by content
+    // hash, not by who is asking, so this changes nothing about what is tested.
+    let mut app = client_in(&home, "cache-reuse-again", &server, gpu);
+    assert!(
+        run_frames(&mut app, |app| app.textured() > 0),
+        "a second run against a warm cache got NO textures where the first got \
+         {first}: everything will draw as the missing-texture chequer. Warnings: {:?}",
+        app.warnings()
+    );
+    assert_eq!(
+        app.textured(),
+        first,
+        "the cache gave back a different number of textures than the fetch did"
+    );
+    app.shutdown();
+    assert!(server.stop());
 }
