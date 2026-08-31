@@ -71,6 +71,18 @@ pub const fn cells_per_axis(level: u8) -> Option<u32> {
     }
     Some(CHUNK_BLOCKS >> (level - FINEST))
 }
+/// The furthest the horizon ever reaches, in chunks.
+///
+/// **Its own number rather than [`ViewDistance::MAXIMUM`]**, which it happens
+/// to equal today. That ceiling is about the cost of streaming full chunks —
+/// "32 is sixteen times the work of 8" — and the horizon's cost is a different
+/// function of a different thing. Inheriting it by accident would mean a change
+/// to one silently moved the other.
+///
+/// 32 chunks is 512 blocks, a little under a third of a mile, and it is the
+/// figure Task 15b's acceptance criteria name.
+pub const MAX_HORIZON: u8 = 32;
+
 /// How far the horizon reaches, for a given detail radius.
 ///
 /// **Four times out, and no taller.** Not a taste decision on either axis.
@@ -87,9 +99,21 @@ pub const fn cells_per_axis(level: u8) -> Option<u32> {
 /// are cached after the first look, are paced at the same rate as everything
 /// else, and — for the great majority, which are open sky or the inside of a
 /// hill — are never meshed at all.
+///
+/// # The 32-chunk ceiling is deliberate, and it means the number stops moving
+///
+/// Four times a view of 8 is 32, and four times a view of 16 is also 32,
+/// because [`MAX_HORIZON`] stops it there. So every view distance from 8 upward
+/// reports the same horizon, which looks from the outside like the setting
+/// doing nothing. It is not: the DETAIL radius still grows, and that is where
+/// the cost and the sub-node fidelity are. Anything reporting a horizon should
+/// report the detail radius beside it, or a player has no way to tell.
 #[must_use]
 pub fn horizon_for(view: ViewDistance) -> ViewDistance {
-    ViewDistance::clamped(view.horizontal.saturating_mul(4), view.vertical)
+    ViewDistance::clamped(
+        view.horizontal.saturating_mul(4).min(MAX_HORIZON),
+        view.vertical,
+    )
 }
 
 /// Which level to draw a chunk at, given how far away it is.
@@ -764,11 +788,28 @@ mod ring_tests {
             "the horizon grew upwards"
         );
 
-        // And it never asks for more than a view distance is allowed to be.
-        let most = super::horizon_for(crate::interest::ViewDistance::MAXIMUM);
+        // And it stops at the ceiling rather than running away, which is why
+        // every view from 8 upward reports the same horizon. That is the thing
+        // that looks like a broken setting from inside the game, so it is
+        // pinned here on purpose rather than discovered again.
+        for view in [
+            8u8,
+            12,
+            16,
+            24,
+            crate::interest::ViewDistance::MAXIMUM.horizontal,
+        ] {
+            let reach = super::horizon_for(crate::interest::ViewDistance::clamped(view, 4));
+            assert_eq!(
+                reach.horizontal,
+                super::MAX_HORIZON,
+                "a view of {view} should still reach the ceiling"
+            );
+        }
+        // Below it, the horizon does move with the setting.
         assert_eq!(
-            most.horizontal,
-            crate::interest::ViewDistance::MAXIMUM.horizontal
+            super::horizon_for(crate::interest::ViewDistance::clamped(4, 4)).horizontal,
+            16
         );
     }
 

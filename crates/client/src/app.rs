@@ -4075,8 +4075,14 @@ impl App {
     ///
     /// Its own method because `hud` is at clippy's line ceiling.
     fn horizon_line(&self) -> String {
+        // **The detail radius is on this line too, and it has to be.** The
+        // horizon stops growing at 32 chunks, so every view distance from 8
+        // upward reports the same 32 and the setting looks broken — reported
+        // from the window as "setting view distance does not change anything at
+        // all, not even the horizon". What moves is the number beside it.
         format!(
-            "horizon {} chunks: {} held, {} queued",
+            "view {} chunks, horizon {}: {} held, {} queued",
+            self.granted_view.horizontal,
             tiamot_core::lod::horizon_for(self.granted_view).horizontal,
             self.store.summary_len(),
             self.store.stale_len()
