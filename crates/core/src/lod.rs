@@ -73,23 +73,23 @@ pub const fn cells_per_axis(level: u8) -> Option<u32> {
 }
 /// How far the horizon reaches, for a given detail radius.
 ///
-/// **Four times out, and twice up, capped at the maximum view.** Not a taste
-/// decision: criterion A3 wants 32 chunks of overworld view, the default detail
-/// radius is 8, and four times eight is exactly that. Vertically it stops at
-/// twice, because the vertical extent of what a player can actually see is set
-/// by the terrain and not by the view distance — a horizon 32 chunks tall is
-/// half a kilometre of empty sky above and stone below, summarised for nobody.
+/// **Four times out, and no taller.** Not a taste decision on either axis.
+/// Horizontally, criterion A3 wants 32 chunks of overworld view and the default
+/// detail radius is 8. Vertically it does not grow at all, because **a horizon
+/// is a surface, not a volume**: the box already grows as the square of the
+/// horizontal radius, and multiplying the height in as well turns 38,000 chunks
+/// into 76,000 — every one of which has to be generated once to discover that
+/// it is empty sky or buried stone. What a player sees a mile away is the shape
+/// of the land, and the land is thin.
 ///
-/// The cost is bounded by the summaries, not by this: a box this size is tens
-/// of thousands of chunks, and what makes that affordable is that the far ones
-/// are a few dozen bytes each and are paced out at the same rate as everything
-/// else.
+/// The cost is worth stating: at the default view this is a 65 x 65 x 9 box.
+/// What keeps it affordable is that the far chunks are a few dozen bytes each,
+/// are cached after the first look, are paced at the same rate as everything
+/// else, and — for the great majority, which are open sky or the inside of a
+/// hill — are never meshed at all.
 #[must_use]
 pub fn horizon_for(view: ViewDistance) -> ViewDistance {
-    ViewDistance::clamped(
-        view.horizontal.saturating_mul(4),
-        view.vertical.saturating_mul(2),
-    )
+    ViewDistance::clamped(view.horizontal.saturating_mul(4), view.vertical)
 }
 
 /// Which level to draw a chunk at, given how far away it is.
@@ -333,6 +333,16 @@ impl Summary {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.cells.iter().all(|material| material.is_air())
+    }
+
+    /// Whether every cell is solid, so nothing inside can ever be seen.
+    ///
+    /// What lets a client skip meshing the inside of a hill. A summary this
+    /// answers `true` for, all of whose neighbours also answer `true`, has no
+    /// visible face anywhere on it — see the client's horizon builder.
+    #[must_use]
+    pub fn is_solid(&self) -> bool {
+        self.cells.iter().all(|material| !material.is_air())
     }
 
     /// Rebuilds a summary from parts, for the codec and the cache.
@@ -733,6 +743,33 @@ mod ring_tests {
                 "at {distance}"
             );
         }
+    }
+
+    #[test]
+    fn the_horizon_reaches_out_and_not_up() {
+        // **A horizon is a surface, not a volume.** The box already grows as
+        // the square of the horizontal radius; multiplying the height in as
+        // well doubles a number that is already tens of thousands, and every
+        // one of those chunks has to be generated once to discover it is empty
+        // sky. This is the assertion that stops a later "make it symmetrical"
+        // tidy-up from quietly doing that.
+        let horizon = super::horizon_for(crate::interest::ViewDistance::DEFAULT);
+        assert_eq!(
+            horizon.horizontal, 32,
+            "criterion A3 wants 32 chunks of overworld view"
+        );
+        assert_eq!(
+            horizon.vertical,
+            crate::interest::ViewDistance::DEFAULT.vertical,
+            "the horizon grew upwards"
+        );
+
+        // And it never asks for more than a view distance is allowed to be.
+        let most = super::horizon_for(crate::interest::ViewDistance::MAXIMUM);
+        assert_eq!(
+            most.horizontal,
+            crate::interest::ViewDistance::MAXIMUM.horizontal
+        );
     }
 
     #[test]

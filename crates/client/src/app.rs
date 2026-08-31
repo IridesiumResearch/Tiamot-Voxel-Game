@@ -4093,8 +4093,17 @@ impl App {
         let mut built = 0;
         for (index, pos) in due.iter().enumerate() {
             if let Some(summary) = self.store.summary(*pos) {
-                let mesh = mesher::mesh_summary(summary);
-                self.renderer.set_chunk(self.drawn_at(*pos), &mesh);
+                // Nothing to draw: open sky, or the inside of a hill. Both are
+                // the common case at a horizon's distance, and both are a
+                // REMOVAL rather than an empty upload — a renderer holding a
+                // mesh with no quads in it still holds a buffer and still
+                // walks it every frame.
+                if summary.is_empty() || self.store.horizon_is_buried(*pos) {
+                    self.renderer.remove_chunk(&self.drawn_at(*pos));
+                } else {
+                    let mesh = mesher::mesh_summary(summary);
+                    self.renderer.set_chunk(self.drawn_at(*pos), &mesh);
+                }
                 built += 1;
             }
             // At least one goes through, for the reason the remesh budget says:

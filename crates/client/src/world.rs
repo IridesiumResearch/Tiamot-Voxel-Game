@@ -387,12 +387,59 @@ impl ChunkStore {
         }
         self.summaries.insert(pos, summary);
         self.stale.insert(pos);
+        // Its neighbours too. Whether a summary is buried depends on what is
+        // beside it, so the arrival of one can bury — or expose — six others,
+        // and a neighbour meshed while this one was absent hid nothing.
+        for at in [
+            ChunkPos::new(pos.x - 1, pos.y, pos.z),
+            ChunkPos::new(pos.x + 1, pos.y, pos.z),
+            ChunkPos::new(pos.x, pos.y - 1, pos.z),
+            ChunkPos::new(pos.x, pos.y + 1, pos.z),
+            ChunkPos::new(pos.x, pos.y, pos.z - 1),
+            ChunkPos::new(pos.x, pos.y, pos.z + 1),
+        ] {
+            if self.summaries.contains_key(&at) {
+                self.stale.insert(at);
+            }
+        }
     }
 
     /// The summary held for a chunk, if there is one.
     #[must_use]
     pub fn summary(&self, pos: ChunkPos) -> Option<&tiamot_core::lod::Summary> {
         self.summaries.get(&pos)
+    }
+
+    /// Whether a summary is buried: solid, with solid on all six sides.
+    ///
+    /// **The horizon's answer to "why is the inside of a hill 12,000 draw
+    /// calls".** A summary that is solid throughout, every one of whose
+    /// neighbours is also solid throughout, has no face any camera outside it
+    /// can reach — the neighbour between it and the player is opaque. Meshing
+    /// it would produce a boundary wall (the skirt hangs one from every solid
+    /// cell on the plane, by design) that is inside rock for ever.
+    ///
+    /// A neighbour that has not arrived yet is NOT treated as solid. Guessing
+    /// the other way would leave a hole until it did, and a hole in the horizon
+    /// is a window to the sky.
+    #[must_use]
+    pub fn horizon_is_buried(&self, pos: ChunkPos) -> bool {
+        let solid = |at: ChunkPos| {
+            self.summaries
+                .get(&at)
+                .is_some_and(tiamot_core::lod::Summary::is_solid)
+        };
+        solid(pos)
+            && [
+                ChunkPos::new(pos.x - 1, pos.y, pos.z),
+                ChunkPos::new(pos.x + 1, pos.y, pos.z),
+                ChunkPos::new(pos.x, pos.y - 1, pos.z),
+                ChunkPos::new(pos.x, pos.y + 1, pos.z),
+                ChunkPos::new(pos.x, pos.y, pos.z - 1),
+                ChunkPos::new(pos.x, pos.y, pos.z + 1),
+            ]
+            .into_iter()
+            .all(solid)
     }
 
     /// How many summaries the horizon holds.
@@ -1225,6 +1272,64 @@ mod tests {
         assert!(
             !due.positions.contains(&pos),
             "a mesh was still queued for a chunk that has been replaced by a summary"
+        );
+    }
+
+    #[test]
+    fn the_inside_of_a_hill_is_not_drawn_and_its_surface_is() {
+        // The rule that keeps a horizon from being twelve thousand draw calls
+        // of rock nobody can see — and the caution that keeps it from putting a
+        // hole in the sky: a neighbour that has not arrived is not solid.
+        let mut store = ChunkStore::new();
+        let buried = ChunkPos::new(0, 0, 0);
+
+        store.set_summary(buried, summary(3, 1));
+        assert!(
+            !store.horizon_is_buried(buried),
+            "a summary with no neighbours at all was called buried"
+        );
+
+        for at in [
+            ChunkPos::new(-1, 0, 0),
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(0, -1, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, 0, -1),
+            ChunkPos::new(0, 0, 1),
+        ] {
+            store.set_summary(at, summary(3, 1));
+        }
+        assert!(store.horizon_is_buried(buried));
+
+        // Open the sky above it, and it is the surface again.
+        let n = tiamot_core::lod::cells_per_axis(3).expect("a level");
+        let air = tiamot_core::lod::Summary::from_parts(
+            3,
+            vec![tiamot_core::MaterialId::AIR; (n * n * n) as usize],
+        )
+        .expect("build");
+        store.set_summary(ChunkPos::new(0, 1, 0), air);
+        assert!(
+            !store.horizon_is_buried(buried),
+            "a hill with the sky above it is a hillside"
+        );
+    }
+
+    #[test]
+    fn a_summary_arriving_restales_the_neighbours_it_might_have_buried() {
+        // Otherwise the sixth neighbour to arrive buries the middle one and
+        // nothing rebuilds it, so a wall of rock stays drawn inside a hill for
+        // the rest of the session.
+        let mut store = ChunkStore::new();
+        let middle = ChunkPos::new(0, 0, 0);
+        store.set_summary(middle, summary(3, 1));
+        let _ = store.take_stale(64);
+
+        store.set_summary(ChunkPos::new(1, 0, 0), summary(3, 1));
+        let stale = store.take_stale(64);
+        assert!(
+            stale.contains(&middle),
+            "the neighbour of an arriving summary was not re-queued: {stale:?}"
         );
     }
 
