@@ -252,6 +252,43 @@ fn a_mod_that_throws_while_vetoing_does_not_stop_the_dig() {
     assert!(server.stop());
 }
 
+/// The inventory, once it has stopped changing.
+///
+/// **Sampling after the first update is a bet on how fast the machine is.** A
+/// dig credits as it breaks, so the first `InventoryUpdate` to arrive is not
+/// necessarily the last, and a reading taken there differs from one taken a
+/// moment later — which a test comparing before with after then reports as the
+/// server having charged somebody. That is what went red on Windows CI, and on
+/// macOS before it, in `a_mod_can_refuse_a_placement_and_the_player_keeps_their_material`.
+///
+/// Waits for a quiet beat rather than a fixed sleep: quiet is the condition
+/// that actually matters, and a sleep long enough for a loaded runner is dead
+/// time on every other one.
+async fn settled_inventory(bot: &mut Bot) -> Vec<tiamot_core::proto::StackDef> {
+    fn updates(bot: &Bot) -> usize {
+        bot.received()
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    tiamot_core::proto::ServerMessage::InventoryUpdate { .. }
+                )
+            })
+            .count()
+    }
+
+    let mut seen = updates(bot);
+    for _ in 0..25 {
+        bot.sleep_ticks(4).await;
+        let now = updates(bot);
+        if now == seen {
+            break;
+        }
+        seen = now;
+    }
+    bot.inventory()
+}
+
 #[test]
 fn a_mod_can_refuse_a_placement_and_the_player_keeps_their_material() {
     let server = start(
@@ -276,7 +313,7 @@ fn a_mod_can_refuse_a_placement_and_the_player_keeps_their_material() {
         bot.await_inventory(Duration::from_secs(10))
             .await
             .expect("the dig should credit");
-        let before = bot.inventory();
+        let before = settled_inventory(&mut bot).await;
         assert!(!before.is_empty(), "nothing was credited to place with");
 
         let target = BlockPos::new(-2, 0, 0);
@@ -294,7 +331,7 @@ fn a_mod_can_refuse_a_placement_and_the_player_keeps_their_material() {
             bot.notices()
         );
         assert_eq!(
-            bot.inventory(),
+            settled_inventory(&mut bot).await,
             before,
             "a refused placement charged the player anyway"
         );
