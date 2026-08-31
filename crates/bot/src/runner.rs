@@ -201,7 +201,12 @@ impl SwarmStats {
 /// material — a swarm is easier to reason about when its bots are not each
 /// making a different arbitrary choice.
 async fn carrying(bot: &mut Bot) -> Option<u16> {
-    let stacks = bot.await_inventory(Duration::from_millis(200)).await.ok()?;
+    // **Two seconds, not two hundred milliseconds.** The wait is only paid when
+    // no inventory update arrives at all, and under twenty bots that is exactly
+    // when it matters: a credit that lands late reads as "carrying nothing", the
+    // place-back is skipped, and the hole is still there when the wander comes
+    // back round. Paying a bounded wait once beats leaving a trap in the world.
+    let stacks = bot.await_inventory(Duration::from_secs(2)).await.ok()?;
     stacks
         .into_iter()
         .filter(|stack| stack.units > 0)
@@ -293,6 +298,27 @@ pub async fn wander(
         // player's does: take it out, put it back — which also keeps the world
         // from growing without bound, which was the original reason for the
         // pairing.
+        // **Never dig a hole that is already a hole.** A dig at an empty block
+        // has nothing to broadcast, so the bot waits out its whole patience for
+        // a delta that will never come and the run fails thirty seconds later
+        // with "nothing broke at all". The bot gets there honestly: a previous
+        // round dug this block and the place-back did not happen — because the
+        // credit had not arrived yet — and the wander brought it back to the
+        // same spot. Four consecutive red nightlies, and the message was
+        // telling the truth every time.
+        if bot.block_is_empty(pos) {
+            // Fill it in if this bot is carrying anything, so the strip does
+            // not slowly turn into holes; otherwise leave it and move on.
+            if let Some(material) = carrying(&mut bot).await
+                && bot.place(pos, material).await.is_ok()
+            {
+                stats.edits += 1;
+                stats.confirmed += 1;
+            }
+            bot.sleep_ticks(2).await;
+            continue;
+        }
+
         let started = tokio::time::Instant::now();
         bot.dig_block(pos).await?;
         stats.edits += 1;

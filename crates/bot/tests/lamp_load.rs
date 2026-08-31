@@ -194,6 +194,43 @@ fn twenty_bots_churning_lamps_keep_the_tick_inside_its_budget() {
     assert!(server.stop());
 }
 
+/// Walks until the bot can actually reach `pos`, or says it could not.
+///
+/// **`move_to` is best effort and does not promise arrival** — it gives up
+/// after forty legs or five stalled ones and returns `Ok` from wherever it got
+/// to, which is the right contract for a caller that just wants to move. A
+/// caller that has to be within reach must check, or every edit it makes is
+/// refused and the first dig reports "nothing broke at all" thirty seconds
+/// later, naming a block that was solid the whole time.
+///
+/// Returns quickly when the bot is already there, so calling it every round
+/// costs a settle.
+async fn stand_beside(bot: &mut Bot, pos: BlockPos) -> Result<(), String> {
+    /// Comfortably inside `phys::ray::REACH`, in blocks. The server measures
+    /// from the eye to the target cell; this measures block centres, so the
+    /// margin covers the difference rather than pretending to model it.
+    const CLOSE: f64 = 3.0;
+
+    for _ in 0..5 {
+        let here = bot.settle().await.map_err(|err| err.to_string())?.block();
+        let (dx, dy, dz) = (
+            f64::from(here.x - pos.x),
+            f64::from(here.y - pos.y),
+            f64::from(here.z - pos.z),
+        );
+        if (dx * dx + dy * dy + dz * dz).sqrt() <= CLOSE {
+            return Ok(());
+        }
+        bot.move_to(pos.x as f32, 0.0, (pos.z + 2) as f32)
+            .await
+            .map_err(|err| err.to_string())?;
+    }
+    let here = bot.settle().await.map_err(|err| err.to_string())?.block();
+    Err(format!(
+        "could not get within reach of {pos:?}; gave up at {here:?}"
+    ))
+}
+
 /// One bot: dig its lamp out and put it straight back, for the duration.
 ///
 /// Returns how many edits it landed, so the test can tell a churn from a bot
@@ -210,22 +247,46 @@ async fn churn(addr: std::net::SocketAddr, index: u32, lamp: u16) -> Result<u64,
     let x = i32::try_from(index).unwrap_or(0) * SPACING;
     let pos = BlockPos::new(x, GROUND, 0);
 
-    // Stand next to it. The server bounds digging and placing by reach, and a
-    // bot that never walked would be refused every edit from spawn onward.
-    bot.move_to(x as f32, 0.0, 2.0)
-        .await
-        .map_err(|err| err.to_string())?;
+    // Stand next to it, and CHECK. The server bounds digging and placing by
+    // reach, and a bot that never walked would be refused every edit from spawn
+    // onward — which is how this failed: `move_to` is best effort and says so,
+    // giving up after forty legs or five stalled ones and returning `Ok` from
+    // wherever it got to. `churn` called it once and then dug for thirty
+    // seconds from a place that could not reach the lamp. It was always the
+    // last bots to join that failed, which is exactly the ones whose walk
+    // competes with nineteen others spawning.
+    stand_beside(&mut bot, pos).await?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(SECONDS);
     let mut edits = 0;
+    // Re-checked every round below, because nothing pins a body in place: the
+    // ground it is standing on is the block it keeps digging out.
     while tokio::time::Instant::now() < deadline {
-        bot.dig_block(pos).await.map_err(|err| err.to_string())?;
-        edits += 1;
-        // A lamp only goes back if the dig credited one. It always should — the
-        // reference lamp drops itself — and asking rather than assuming means a
-        // mod set with different drops fails the assertion below rather than
-        // hanging here for ten seconds a round.
-        if bot.units_of(lamp) >= tiamot_core::UNITS_PER_BLOCK {
+        // **The lamp goes back before the next dig, or there is nothing to
+        // dig.** A dig at an empty block has nothing to broadcast, so the bot
+        // waits out its whole patience for a delta that will never come and
+        // fails thirty seconds later with "nothing broke at all". That is what
+        // four consecutive red nightlies were: the dig credited a lamp, the
+        // credit had not been RECEIVED when `units_of` was asked, the place was
+        // skipped, and the next round dug a hole that was already a hole.
+        stand_beside(&mut bot, pos).await?;
+        if !bot.block_is_empty(pos) {
+            bot.dig_block(pos).await.map_err(|err| err.to_string())?;
+            edits += 1;
+        }
+
+        // Waited for rather than sampled. The reference lamp drops itself, so
+        // the credit is coming; what varies under twenty bots is when. Asking
+        // once and moving on is what left the hole.
+        let held = bot
+            .await_inventory(Duration::from_secs(2))
+            .await
+            .map_err(|err| err.to_string())?
+            .into_iter()
+            .filter(|stack| stack.material == lamp)
+            .map(|stack| stack.units)
+            .sum::<u32>();
+        if held >= tiamot_core::UNITS_PER_BLOCK {
             bot.place(pos, lamp).await.map_err(|err| err.to_string())?;
             edits += 1;
         }
