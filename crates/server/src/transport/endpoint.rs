@@ -630,6 +630,15 @@ pub const CHUNKS_PER_TICK: usize = 16;
 /// starve everyone else's updates while its 1800-chunk interest set drains.
 pub const CHUNKS_IN_FLIGHT_PER_CLIENT: usize = 4;
 
+/// How many of a tick's chunk budget the horizon may take.
+///
+/// A quarter. The horizon is scenery, it is allowed to arrive late, and the
+/// ground under somebody's feet is not — see [`Shared::take_chunk_requests`],
+/// which is where the split is enforced. Small enough that a fresh horizon
+/// fills over a couple of minutes rather than instantly, which is the trade the
+/// tick budget is worth.
+pub const SUMMARIES_PER_TICK: usize = CHUNKS_PER_TICK / 4;
+
 /// Most chunk requests that may be queued before new ones are refused.
 use tiamot_core::inventory::{PLAYER_HOTBAR_SLOTS, PLAYER_MAIN};
 
@@ -1293,13 +1302,42 @@ impl Shared {
     }
 
     /// Takes up to [`CHUNKS_PER_TICK`] requests for the simulation to serve.
+    ///
+    /// **Chunks first, and at most [`SUMMARIES_PER_TICK`] summaries.** A
+    /// summary costs the simulation what a chunk costs — an unvisited one has
+    /// to be GENERATED before it can be summarised — and the difference is that
+    /// a detail radius is hundreds of chunks and a horizon is tens of
+    /// thousands. Sharing one budget, a single player standing still would keep
+    /// the tick generating terrain for as long as they were connected, where
+    /// before it went quiet once their neighbourhood had arrived.
+    ///
+    /// Charter rule 18: 50 ms is shared by all simulation for all players.
+    /// Scenery a mile away does not get to spend it. What is not taken stays
+    /// queued in order, so nothing is dropped and nothing has to be re-asked.
     #[must_use]
     pub fn take_chunk_requests(&self) -> Vec<ChunkRequest> {
         self.chunk_requests
             .lock()
             .map(|mut queue| {
-                let take = queue.len().min(CHUNKS_PER_TICK);
-                queue.drain(..take).collect()
+                let mut taken = Vec::with_capacity(CHUNKS_PER_TICK);
+                let mut deferred = std::collections::VecDeque::new();
+                let mut summaries = 0;
+                while let Some(request) = queue.pop_front() {
+                    if taken.len() >= CHUNKS_PER_TICK {
+                        deferred.push_back(request);
+                        continue;
+                    }
+                    if request.level.is_some() {
+                        if summaries >= SUMMARIES_PER_TICK {
+                            deferred.push_back(request);
+                            continue;
+                        }
+                        summaries += 1;
+                    }
+                    taken.push(request);
+                }
+                *queue = deferred;
+                taken
             })
             .unwrap_or_default()
     }
@@ -2807,6 +2845,51 @@ mod tests {
         assert!(
             shared.online_players().is_empty(),
             "nor leave a ghost on the roster"
+        );
+    }
+
+    #[test]
+    fn the_horizon_never_takes_more_than_its_quarter_of_a_tick() {
+        // **The regression this exists for**: before the split, a player
+        // standing still kept the simulation generating horizon terrain for as
+        // long as they stayed connected, because a summary request and a chunk
+        // request came out of one queue and looked identical. The tick went
+        // from quiet-once-arrived to permanently busy.
+        let shared = shared();
+        // Far more summaries than a tick may serve, and a couple of chunks
+        // behind them — which is the ordering that matters, since the chunks
+        // are the ones a player is standing on.
+        for n in 0..64 {
+            let _ = shared.request_chunk_at(
+                tiamot_core::domain::OVERWORLD,
+                tiamot_core::ChunkPos::new(n, 0, 0),
+                Some(tiamot_core::lod::FINEST),
+            );
+        }
+        for n in 0..4 {
+            let _ = shared.request_chunk(
+                tiamot_core::domain::OVERWORLD,
+                tiamot_core::ChunkPos::new(0, n, 0),
+            );
+        }
+
+        let taken = shared.take_chunk_requests();
+        let summaries = taken.iter().filter(|r| r.level.is_some()).count();
+        let chunks = taken.len() - summaries;
+        assert_eq!(
+            summaries, SUMMARIES_PER_TICK,
+            "the horizon took {summaries} of a tick, not its {SUMMARIES_PER_TICK}"
+        );
+        assert_eq!(
+            chunks, 4,
+            "chunks queued BEHIND a wall of summaries were not served this tick"
+        );
+
+        // And nothing was dropped: the rest are still there, next tick.
+        let next = shared.take_chunk_requests();
+        assert_eq!(
+            next.iter().filter(|r| r.level.is_some()).count(),
+            SUMMARIES_PER_TICK
         );
     }
 
