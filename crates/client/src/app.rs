@@ -3158,6 +3158,14 @@ impl App {
     ) {
         self.adopt_materials(table);
         let atlas = build_atlas(table, images);
+        // **Set here, and it was not.** The field existed, the accessor existed
+        // and the overlay drew it, and nothing ever wrote it — so the line read
+        // "0 textured" on a working atlas as readily as on a broken one, and
+        // the one number that was supposed to separate "the textures never
+        // arrived" from "they arrived and the shader is not sampling them" said
+        // the same thing either way. Counted from the atlas rather than from
+        // `images`, because a slot is what a mesh actually samples.
+        self.textured = atlas.filled();
         // **The one line that says whether the world will draw.** A texture
         // that never arrived and a texture that arrived and would not decode
         // both end as the missing-texture chequer, and both are silent from the

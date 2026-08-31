@@ -228,7 +228,15 @@ fn asking_for_less_is_granted_and_costs_the_server_less() {
         // and streamed the same neighbourhood would be worse than no feature at
         // all: the player would be told their machine was doing less work while
         // it did exactly as much.
-        let held: std::collections::BTreeSet<_> = bot.chunks_received().into_iter().collect();
+        // **Summaries count as held.** A position the client was sent a horizon
+        // for is one it is drawing, so an unload for it is correct — and since
+        // Task 15b those actually arrive, which is what turned this assertion
+        // red: `chunks_received` is ChunkData only.
+        let mut held: std::collections::BTreeSet<_> = bot.chunks_received().into_iter().collect();
+        held.extend(bot.received().iter().filter_map(|message| match message {
+            ServerMessage::ChunkSummary { pos, .. } => Some(*pos),
+            _ => None,
+        }));
         let unloaded: std::collections::BTreeSet<_> = bot
             .received()
             .iter()

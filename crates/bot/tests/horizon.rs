@@ -35,6 +35,12 @@ fn reference_mods() -> PathBuf {
         .expect("the reference mods live at the repo root")
 }
 
+/// A server at the DEFAULT view, where the detail radius takes minutes to
+/// stream — which is the condition the starvation bug needed.
+fn start_wide(name: &str) -> ServerHandle {
+    start(name, ViewDistance::DEFAULT)
+}
+
 fn start(name: &str, view: ViewDistance) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
@@ -179,6 +185,45 @@ fn a_horizon_costs_a_fraction_of_what_the_terrain_costs() {
             average < 1024,
             "a summary averaged {average} bytes over {summaries} of them; the horizon \
              is meant to be cheap, and a level-1 summary uncompressed is 8 KiB"
+        );
+    });
+}
+
+#[test]
+fn the_horizon_arrives_while_the_detail_radius_is_still_streaming() {
+    // **The bug this exists for.** The horizon was asked for with whatever
+    // in-flight budget the chunks had left, which on a real view distance is
+    // nothing — a joining player has thousands of chunks to fetch and takes the
+    // whole allowance every pass for as long as that lasts. Reported from the
+    // window at view 17 as "horizon 32: 0 held" after a thousand ticks, on a
+    // client that was otherwise streaming perfectly well.
+    //
+    // At the DEFAULT view the detail radius cannot possibly finish inside this
+    // test, which is what makes the assertion mean something: any summary at
+    // all proves the horizon is not waiting for it.
+    let server = start_wide("horizon-not-starved");
+
+    block_on(async {
+        let mut alice = join(&server, "Alice").await;
+        let seen = watch(&mut alice, Duration::from_secs(30), 4).await;
+
+        assert!(
+            !seen.chunks.is_empty(),
+            "no terrain arrived at all, so this proves nothing about priority"
+        );
+        assert!(
+            !seen.summaries.is_empty(),
+            "{} chunks arrived and not one summary: the horizon is starved by the \
+             detail radius",
+            seen.chunks.len()
+        );
+        // And the ground still comes first. Not a ratio — that would be a bet
+        // on how fast the machine is — just the ordering that matters.
+        assert!(
+            seen.chunks.len() > seen.summaries.len(),
+            "the horizon outpaced the terrain: {} chunks to {} summaries",
+            seen.chunks.len(),
+            seen.summaries.len()
         );
     });
 }

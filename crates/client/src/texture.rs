@@ -425,6 +425,8 @@ pub struct Atlas {
     pub image: Image,
     /// Which tile each material occupies, indexed by material id.
     slots: Vec<u32>,
+    /// How many slots hold a real texture rather than the chequer.
+    filled: usize,
 }
 
 impl Atlas {
@@ -447,14 +449,33 @@ impl Atlas {
         let mut image = Image::solid(side, side, [0, 0, 0, 0]);
         let mut slots = Vec::with_capacity(textures.len());
 
+        let mut filled = 0;
         for (index, texture) in textures.iter().enumerate() {
             let slot = u32::try_from(index).unwrap_or(0);
             let tile = texture.as_ref().map_or_else(Image::missing, Image::to_tile);
+            filled += usize::from(texture.is_some());
             blit_padded(&mut image, &tile, slot % grid, slot / grid);
             slots.push(slot);
         }
 
-        Self { grid, image, slots }
+        Self {
+            grid,
+            image,
+            slots,
+            filled,
+        }
+    }
+
+    /// How many slots hold a real texture rather than the missing-texture
+    /// chequer.
+    ///
+    /// **The number that says whether a world will draw.** A texture that never
+    /// arrived and a texture that arrived and would not decode both end as the
+    /// chequer, and this is the only thing that separates them from an atlas
+    /// that is simply small.
+    #[must_use]
+    pub const fn filled(&self) -> usize {
+        self.filled
     }
 
     /// The tile a material uses.
@@ -1021,6 +1042,28 @@ mod tests {
         let atlas = Atlas::build(&[]);
         assert!(atlas.side() > 0);
         assert_eq!(atlas.slot_of(0), 0);
+    }
+
+    #[test]
+    fn an_atlas_counts_the_slots_that_hold_a_real_texture() {
+        // **The number a player is shown when their world is drawn entirely in
+        // the missing-texture chequer**, and the reason it has to come from the
+        // atlas rather than from whatever was passed in: a slot is what a mesh
+        // samples. An earlier version of this reading was a field on `App` that
+        // nothing ever wrote, so it said "0 textured" on a working atlas as
+        // readily as on a broken one — and it was the one number being used to
+        // tell the two apart.
+        let none = Atlas::build(&[None, None, None]);
+        assert_eq!(none.filled(), 0);
+
+        let some = Atlas::build(&[None, Some(Image::solid(4, 4, [255, 0, 0, 255])), None]);
+        assert_eq!(some.filled(), 1);
+
+        let all = Atlas::build(&[
+            Some(Image::solid(4, 4, [1, 2, 3, 255])),
+            Some(Image::solid(4, 4, [4, 5, 6, 255])),
+        ]);
+        assert_eq!(all.filled(), 2);
     }
 
     #[test]

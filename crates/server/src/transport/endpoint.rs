@@ -630,6 +630,15 @@ pub const CHUNKS_PER_TICK: usize = 16;
 /// starve everyone else's updates while its 1800-chunk interest set drains.
 pub const CHUNKS_IN_FLIGHT_PER_CLIENT: usize = 4;
 
+/// How many horizon summaries one connection may have outstanding at once.
+///
+/// **Its own allowance rather than what the chunks leave**, which is what it
+/// was: a client streaming a large view has thousands of chunks to fetch, takes
+/// the whole in-flight budget every pass for as long as that lasts, and the
+/// horizon never begins. The ground under somebody's feet still goes first —
+/// this is one slot beside four, not equal footing.
+pub const SUMMARIES_IN_FLIGHT_PER_CLIENT: usize = 1;
+
 /// How many of a tick's chunk budget the horizon may take.
 ///
 /// A quarter. The horizon is scenery, it is allowed to arrive late, and the
@@ -2648,7 +2657,7 @@ async fn pump_chunks(
     // neighbourhood is the ground under their feet; the horizon is scenery, and
     // scenery that arrives a second late is scenery. The reverse order would
     // let a joining player's horizon delay the chunk they are standing in.
-    let mut budget = streamer.budget(CHUNKS_IN_FLIGHT_PER_CLIENT);
+    let budget = streamer.budget(CHUNKS_IN_FLIGHT_PER_CLIENT);
     for pos in streamer.next_needed(budget) {
         let Some(receiver) = shared.request_chunk(streamer.domain(), pos) else {
             // Queue full. Nothing is marked, so the next pass retries.
@@ -2656,10 +2665,24 @@ async fn pump_chunks(
         };
         streamer.requested(pos);
         pending.push((pos, None, receiver));
-        budget = budget.saturating_sub(1);
     }
 
-    for (pos, level) in streamer.next_summaries(budget) {
+    // **The horizon's own allowance, not the chunks' leftovers.** It had the
+    // leftovers, and that is a priority that becomes a starvation: a client
+    // streaming a view of 17 has thousands of chunks to fetch and takes the
+    // whole in-flight budget every pass for as long as that lasts, so the
+    // horizon never started. Reported from the window as "0 held" after a
+    // thousand ticks.
+    //
+    // One slot is enough. The simulation serves at most SUMMARIES_PER_TICK of
+    // them anyway, so a bigger number here would only queue work the tick has
+    // already decided not to do.
+    let outstanding = pending
+        .iter()
+        .filter(|(_, level, _)| level.is_some())
+        .count();
+    let horizon = SUMMARIES_IN_FLIGHT_PER_CLIENT.saturating_sub(outstanding);
+    for (pos, level) in streamer.next_summaries(horizon) {
         let Some(receiver) = shared.request_chunk_at(streamer.domain(), pos, Some(level)) else {
             break;
         };

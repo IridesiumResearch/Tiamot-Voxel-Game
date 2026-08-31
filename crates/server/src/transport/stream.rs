@@ -73,13 +73,35 @@ pub struct Streamer {
     /// client holding a coarse copy and a fine one would draw both, with the
     /// coarse one poking through.
     summaries: BTreeMap<ChunkPos, u8>,
+    /// Every position in the horizon, nearest first.
+    ///
+    /// **Cached, because it is 38,000 positions at the default view and
+    /// computing it means sorting all of them.** The detail radius can afford
+    /// that per pass; the horizon cannot, and it only changes when the player
+    /// crosses a chunk boundary or the view distance moves.
+    horizon_order: Vec<ChunkPos>,
+    /// How far through `horizon_order` the last pass looked.
+    ///
+    /// A rotating cursor rather than a scan from the start: the pass is looking
+    /// for one position out of tens of thousands, nearly all of which are
+    /// already held, and starting over each time would spend the whole scan
+    /// re-testing the same held entries. Wraps, so everything gets a turn.
+    horizon_cursor: usize,
 }
+
+/// How many horizon positions one pass will look at before giving up.
+///
+/// The scan is cheap per position — two set lookups and some integer
+/// arithmetic — but the horizon is tens of thousands of them and this runs on
+/// the connection task every pass. A bounded look with a cursor that wraps
+/// covers everything within a few passes and costs a fixed amount each time.
+const HORIZON_SCAN: usize = 2048;
 
 impl Streamer {
     /// A streamer centred on a player's spawn.
     #[must_use]
     pub fn new(domain: &str, centre: ChunkPos, view: ViewDistance) -> Self {
-        Self {
+        let mut streamer = Self {
             domain: domain.to_owned(),
             centre,
             view,
@@ -88,7 +110,11 @@ impl Streamer {
             horizon: horizon_for(view),
             rings: Rings::new(u32::from(view.horizontal), Rings::MARGIN),
             summaries: BTreeMap::new(),
-        }
+            horizon_order: Vec::new(),
+            horizon_cursor: 0,
+        };
+        streamer.reorder_horizon();
+        streamer
     }
 
     /// The current interest centre.
@@ -123,6 +149,7 @@ impl Streamer {
         }
         self.domain = domain.to_owned();
         self.centre = centre;
+        self.reorder_horizon();
         // Abandoned rather than awaited. A reply carrying a chunk of the domain
         // this connection has just left would be decoded into the new one at
         // the same coordinates, which is terrain from somewhere else appearing
@@ -174,6 +201,7 @@ impl Streamer {
         self.view = view;
         self.horizon = horizon_for(view);
         self.rings = Rings::new(u32::from(view.horizontal), Rings::MARGIN);
+        self.reorder_horizon();
         self.in_flight
             .retain(|pos| interest::contains(self.centre, self.horizon, *pos));
         self.departed()
@@ -189,6 +217,7 @@ impl Streamer {
             return Vec::new();
         }
         self.centre = centre;
+        self.reorder_horizon();
         // Requests for chunks that just left range are abandoned. Keeping them
         // would deliver a chunk the client was told to unload, and hold budget
         // that the new neighbourhood needs. Against the HORIZON rather than the
@@ -309,31 +338,57 @@ impl Streamer {
     /// Does not mark anything sent, for the same reason [`Streamer::next_needed`]
     /// does not.
     #[must_use]
-    pub fn next_summaries(&self, limit: usize) -> Vec<(ChunkPos, u8)> {
-        if limit == 0 {
+    pub fn next_summaries(&mut self, limit: usize) -> Vec<(ChunkPos, u8)> {
+        if limit == 0 || self.horizon_order.is_empty() {
             return Vec::new();
         }
-        interest::chunks_around(self.centre, self.horizon)
-            .into_iter()
-            .filter(|pos| !self.in_flight.contains(pos))
-            .filter_map(|pos| {
-                let held = self.summaries.get(&pos).map(|level| Level::Summary(*level));
+        let mut found = Vec::with_capacity(limit.min(HORIZON_SCAN));
+        let total = self.horizon_order.len();
+        for step in 0..HORIZON_SCAN.min(total) {
+            let index = (self.horizon_cursor + step) % total;
+            let pos = self.horizon_order[index];
+            if self.in_flight.contains(&pos) {
+                continue;
+            }
+            let held = if self.sent.contains(&pos) {
                 // A chunk the client holds in full is at the detail level as
                 // far as the hysteresis is concerned: that is what it is
                 // drawing, and it is what a level change would replace.
-                let held = if self.sent.contains(&pos) {
-                    Some(Level::Chunk)
-                } else {
-                    held
-                };
-                match self.rings.stable_level(held, self.distance(pos)) {
-                    Level::Chunk => None,
-                    Level::Summary(level) if held == Some(Level::Summary(level)) => None,
-                    Level::Summary(level) => Some((pos, level)),
+                Some(Level::Chunk)
+            } else {
+                self.summaries.get(&pos).map(|level| Level::Summary(*level))
+            };
+            match self.rings.stable_level(held, self.distance(pos)) {
+                Level::Chunk => continue,
+                Level::Summary(level) if held == Some(Level::Summary(level)) => continue,
+                Level::Summary(level) => {
+                    found.push((pos, level));
+                    if found.len() >= limit {
+                        self.horizon_cursor = (index + 1) % total;
+                        return found;
+                    }
                 }
-            })
-            .take(limit)
-            .collect()
+            }
+        }
+        self.horizon_cursor = (self.horizon_cursor + HORIZON_SCAN.min(total)) % total;
+        found
+    }
+
+    /// Recomputes the horizon's order around the current centre.
+    ///
+    /// Called when the centre, the view or the domain moves — never per pass.
+    fn reorder_horizon(&mut self) {
+        // **Without the detail radius in it.** Those positions can never be a
+        // summary, and they are the NEAREST ones — so a scan that included them
+        // spent its whole window rejecting the same 2,601 chunks and came back
+        // empty, which is a horizon that starts several passes late for no
+        // reason. Every position in this list is a candidate.
+        let (centre, view) = (self.centre, self.view);
+        self.horizon_order = interest::chunks_around(centre, self.horizon)
+            .into_iter()
+            .filter(|pos| !interest::contains(centre, view, *pos))
+            .collect();
+        self.horizon_cursor = 0;
     }
 
     /// The Chebyshev distance from the centre, in chunks.
@@ -382,6 +437,29 @@ mod tests {
     use super::*;
 
     const ORIGIN: ChunkPos = ChunkPos::new(0, 0, 0);
+
+    /// Every summary the streamer will ask for, sending each as it goes.
+    ///
+    /// **A loop, because one call is bounded.** `next_summaries` looks at a
+    /// fixed slice of the horizon per call and rotates — the horizon is tens of
+    /// thousands of positions and this runs on the connection task every pass,
+    /// so a call that scanned all of them would be the cost the cursor exists
+    /// to avoid.
+    fn drain_horizon(streamer: &mut Streamer) -> Vec<(ChunkPos, u8)> {
+        // **Never stops at the first empty batch.** The cursor rotates, so a
+        // window with nothing in it says nothing about the rest of the horizon
+        // — stopping there is how this helper first missed a chunk that was
+        // waiting a few thousand positions further round.
+        let mut all = Vec::new();
+        for _ in 0..64 {
+            let batch = streamer.next_summaries(usize::MAX);
+            for (pos, level) in &batch {
+                streamer.summarised(*pos, *level);
+            }
+            all.extend(batch);
+        }
+        all
+    }
 
     fn streamer() -> Streamer {
         Streamer::new(
@@ -789,13 +867,12 @@ mod tests {
         for pos in streamer.next_needed(usize::MAX) {
             streamer.delivered(pos);
         }
-        for (pos, level) in streamer.next_summaries(usize::MAX) {
+        for (pos, level) in drain_horizon(&mut streamer) {
             assert!(
                 !streamer.holds(pos),
                 "{pos:?} was to be summarised while the client held it in full"
             );
             assert!(level >= tiamot_core::lod::FINEST);
-            streamer.summarised(pos, level);
         }
         assert!(streamer.summary_count() > 0, "no horizon was produced");
         assert!(
@@ -816,12 +893,10 @@ mod tests {
             ViewDistance::DEFAULT,
         );
         let far = ChunkPos::new(12, 0, 0);
-        let (pos, level) = streamer
-            .next_summaries(usize::MAX)
+        let level = drain_horizon(&mut streamer)
             .into_iter()
-            .find(|(pos, _)| *pos == far)
+            .find_map(|(pos, level)| (pos == far).then_some(level))
             .expect("a chunk twelve out should be summarised at a default view of eight");
-        streamer.summarised(pos, level);
         assert_eq!(streamer.summary_level(far), Some(level));
 
         // Walk towards it until it is inside the detail radius.
@@ -845,8 +920,7 @@ mod tests {
         let departed = streamer.recentre(ORIGIN);
         assert!(!departed.contains(&far), "walking away unloaded it");
         assert!(
-            streamer
-                .next_summaries(usize::MAX)
+            drain_horizon(&mut streamer)
                 .iter()
                 .any(|(at, _)| *at == far),
             "a chunk that left the detail radius was not re-sent as a summary"
@@ -866,9 +940,7 @@ mod tests {
         for pos in streamer.next_needed(usize::MAX) {
             streamer.delivered(pos);
         }
-        for (pos, level) in streamer.next_summaries(usize::MAX) {
-            streamer.summarised(pos, level);
-        }
+        drain_horizon(&mut streamer);
 
         // Step back and forth across the level-1/level-2 edge, which at a
         // detail radius of eight sits sixteen chunks out.
@@ -880,13 +952,16 @@ mod tests {
                 ChunkPos::new(1, 0, 0)
             };
             streamer.recentre(centre);
-            for (pos, level) in streamer.next_summaries(usize::MAX) {
-                // Chunks genuinely entering the horizon for the first time are
-                // not churn — count only re-sends of what is already held.
-                if streamer.summary_level(pos).is_some() {
-                    sends += 1;
+            for _ in 0..64 {
+                let batch = streamer.next_summaries(usize::MAX);
+                for (pos, level) in batch {
+                    // Chunks genuinely entering the horizon for the first time
+                    // are not churn — count only re-sends of what is held.
+                    if streamer.summary_level(pos).is_some() {
+                        sends += 1;
+                    }
+                    streamer.summarised(pos, level);
                 }
-                streamer.summarised(pos, level);
             }
         }
         assert_eq!(
@@ -907,26 +982,83 @@ mod tests {
             ViewDistance::DEFAULT,
         );
         let far = ChunkPos::new(12, 0, 0);
-        let (pos, level) = streamer
-            .next_summaries(usize::MAX)
-            .into_iter()
-            .find(|(at, _)| *at == far)
-            .expect("a summarised chunk");
-        streamer.summarised(pos, level);
         assert!(
-            !streamer
-                .next_summaries(usize::MAX)
+            drain_horizon(&mut streamer)
+                .iter()
+                .any(|(at, _)| *at == far),
+            "a summarised chunk"
+        );
+        assert!(
+            !drain_horizon(&mut streamer)
                 .iter()
                 .any(|(at, _)| *at == far)
         );
 
         streamer.resummarise(far);
         assert!(
-            streamer
-                .next_summaries(usize::MAX)
+            drain_horizon(&mut streamer)
                 .iter()
                 .any(|(at, _)| *at == far),
             "an edited chunk's horizon was never sent again"
+        );
+    }
+
+    #[test]
+    fn the_horizon_starts_before_the_detail_radius_has_finished_arriving() {
+        // **The bug this exists for.** The horizon used to be asked for with
+        // whatever in-flight budget the chunks had left, which on any real view
+        // distance is nothing: a client streaming thousands of chunks takes the
+        // whole allowance every pass for as long as that lasts. Reported from
+        // the window at view 17 as "horizon 32: 0 held" after a thousand ticks.
+        //
+        // Priority is still the point — the ground under somebody's feet is not
+        // scenery — so this asserts only that the horizon is not starved to
+        // zero, not that it competes.
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::DEFAULT,
+        );
+        // Nothing delivered: every chunk of the detail radius is still to come,
+        // which is exactly the state a joining player is in for minutes.
+        assert!(
+            !streamer.next_needed(usize::MAX).is_empty(),
+            "the detail radius should still be outstanding"
+        );
+        assert!(
+            !streamer.next_summaries(1).is_empty(),
+            "the horizon was starved while the detail radius streamed"
+        );
+    }
+
+    #[test]
+    fn one_pass_over_the_horizon_looks_at_a_bounded_number_of_positions() {
+        // The horizon is 38,000 positions at the default view, and this runs on
+        // the connection task every pass. A scan that walked all of them — or,
+        // worse, rebuilt and re-sorted them — would cost more than the feature
+        // saves. The cursor rotates instead, so everything gets a turn without
+        // any single pass paying for all of it.
+        let mut streamer = Streamer::new(
+            tiamot_core::domain::OVERWORLD,
+            ORIGIN,
+            ViewDistance::DEFAULT,
+        );
+        let total = interest::chunks_around(ORIGIN, streamer.horizon()).len();
+        assert!(
+            total > HORIZON_SCAN,
+            "the default horizon should be bigger than one scan, got {total}"
+        );
+
+        // Asking for everything cannot return everything, because one pass does
+        // not look at everything.
+        assert!(streamer.next_summaries(usize::MAX).len() <= HORIZON_SCAN);
+
+        // But the cursor comes round: enough passes cover the whole horizon.
+        let found = drain_horizon(&mut streamer);
+        assert!(
+            found.len() > HORIZON_SCAN,
+            "rotating the cursor should reach past one scan's worth, got {}",
+            found.len()
         );
     }
 
