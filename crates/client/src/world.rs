@@ -448,6 +448,12 @@ impl ChunkStore {
         self.summaries.len()
     }
 
+    /// How many summaries are waiting to be meshed.
+    #[must_use]
+    pub fn stale_len(&self) -> usize {
+        self.stale.len()
+    }
+
     /// Puts summaries back on the queue, for a frame that ran out of budget.
     pub fn requeue_stale(&mut self, positions: &[ChunkPos]) {
         self.stale.extend(positions.iter().copied());

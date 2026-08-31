@@ -1975,8 +1975,9 @@ mod summary_tests {
             let mesh = mesh_summary(&solid);
             assert_eq!(
                 mesh.quads.len(),
-                (6 * n * n) as usize,
-                "level {level} drew {} quads for a solid chunk, not six faces of {n}²",
+                6,
+                "level {level} drew {} quads for a solid chunk; merged, a face of \
+                 {n}² identical cells is one quad",
                 mesh.quads.len()
             );
         }
@@ -2038,16 +2039,23 @@ mod summary_tests {
         // it exactly where the neighbouring chunk's surface happened to dip.
         let mesh = mesh_summary(&slab(FINEST, 16, 1));
         let plane = u8::try_from(CHUNK_SUBNODES - 1).expect("fits");
-        let wall = mesh
+        let wall: Vec<&Quad> = mesh
             .quads
             .iter()
             .filter(|quad| quad.axis == 0 && quad.positive && quad.w == plane)
-            .count();
-        let n = tiamot_core::lod::cells_per_axis(FINEST).expect("a level") as usize;
+            .collect();
         assert_eq!(
-            wall,
-            n * n,
-            "a fully solid chunk hung {wall} quads on its +x boundary, not {n}²"
+            wall.len(),
+            1,
+            "a fully solid chunk should hang ONE merged quad on its +x boundary, \
+             not {}",
+            wall.len()
+        );
+        let full = u8::try_from(CHUNK_SUBNODES).expect("fits");
+        assert_eq!(
+            (wall[0].du, wall[0].dv),
+            (full, full),
+            "the merged wall does not cover the whole boundary plane"
         );
     }
 }
@@ -2978,70 +2986,103 @@ pub fn mesh_summary(summary: &tiamot_core::lod::Summary) -> Mesh {
     let Some(step) = (CHUNK_SUBNODES as usize).checked_div(width) else {
         return Mesh::default();
     };
-    let step = u8::try_from(step).unwrap_or(u8::MAX);
-
-    let solid = |x: isize, y: isize, z: isize| -> Option<u16> {
-        let bound = width as isize;
-        if x < 0 || y < 0 || z < 0 || x >= bound || y >= bound || z >= bound {
-            return None;
-        }
-        let index = (z as usize * width + y as usize) * width + x as usize;
-        let material = summary.cells().get(index)?;
-        (material.0 != tiamot_core::MaterialId::AIR.0).then_some(material.0)
-    };
+    let cells = summary.cells();
+    let at = |x: usize, y: usize, z: usize| -> u16 { cells[(z * width + y) * width + x].0 };
+    let air = tiamot_core::MaterialId::AIR.0;
 
     let mut quads = Vec::new();
-    for z in 0..width as isize {
-        for y in 0..width as isize {
-            for x in 0..width as isize {
-                let Some(material) = solid(x, y, z) else {
-                    continue;
-                };
-                for (axis, positive, delta) in [
-                    (0u8, false, [-1isize, 0, 0]),
-                    (0, true, [1, 0, 0]),
-                    (1, false, [0, -1, 0]),
-                    (1, true, [0, 1, 0]),
-                    (2, false, [0, 0, -1]),
-                    (2, true, [0, 0, 1]),
-                ] {
-                    let (nx, ny, nz) = (x + delta[0], y + delta[1], z + delta[2]);
-                    let outside = nx < 0
-                        || ny < 0
-                        || nz < 0
-                        || nx >= width as isize
-                        || ny >= width as isize
-                        || nz >= width as isize;
-                    // The skirt: a boundary face is emitted whatever is beyond
-                    // it, because this chunk does not know what level the chunk
-                    // beyond it is drawn at. See the function docs.
-                    if !outside && solid(nx, ny, nz).is_some() {
+    // One plane at a time, greedily merged within it — the same shape as the
+    // chunk mesher's binary pass, without the bitset: a summary plane is at
+    // most 16 x 16 cells, and a `Vec<u16>` of that is smaller than the masks
+    // would be. Merging matters even so: an unmerged solid chunk face is 256
+    // quads at level 1, and a horizon is thousands of chunks.
+    for (axis, positive) in [
+        (0usize, false),
+        (0, true),
+        (1, false),
+        (1, true),
+        (2, false),
+        (2, true),
+    ] {
+        for w in 0..width {
+            // The faces on this plane, by (u, v), or `air` for none. A face
+            // exists where the cell is solid and what is beyond it is not —
+            // and, on the chunk boundary, always: that is the skirt.
+            let mut plane = vec![air; width * width];
+            for v in 0..width {
+                for u in 0..width {
+                    let cell = match axis {
+                        0 => (w, u, v),
+                        1 => (u, w, v),
+                        _ => (u, v, w),
+                    };
+                    let material = at(cell.0, cell.1, cell.2);
+                    if material == air {
                         continue;
                     }
-                    let cell = [x, y, z].map(|n| u8::try_from(n).unwrap_or(0) * step);
-                    let (u, v) = match axis {
-                        0 => (cell[1], cell[2]),
-                        1 => (cell[0], cell[2]),
-                        _ => (cell[0], cell[1]),
+                    let beyond = if positive { w + 1 } else { w.wrapping_sub(1) };
+                    let at_boundary = if positive { beyond >= width } else { w == 0 };
+                    // Parenthesised deliberately: `if ... {} else {} || x` is
+                    // the kind of expression a reader has to look up.
+                    let exposed = at_boundary || {
+                        let n = match axis {
+                            0 => (beyond, u, v),
+                            1 => (u, beyond, v),
+                            _ => (u, v, beyond),
+                        };
+                        at(n.0, n.1, n.2) == air
                     };
+                    if exposed {
+                        plane[v * width + u] = material;
+                    }
+                }
+            }
+
+            // Greedy: run along u, then extend along v while whole rows match.
+            for v in 0..width {
+                let mut u = 0;
+                while u < width {
+                    let material = plane[v * width + u];
+                    if material == air {
+                        u += 1;
+                        continue;
+                    }
+                    let mut du = 1;
+                    while u + du < width && plane[v * width + u + du] == material {
+                        du += 1;
+                    }
+                    let mut dv = 1;
+                    while v + dv < width
+                        && (0..du).all(|offset| plane[(v + dv) * width + u + offset] == material)
+                    {
+                        dv += 1;
+                    }
+                    for cleared in 0..dv {
+                        for offset in 0..du {
+                            plane[(v + cleared) * width + u + offset] = air;
+                        }
+                    }
+
                     // **`Quad::w` is the CELL slice, not the plane.**
                     // `quad_corners` adds one for a positive face to get from
                     // one to the other, so a positive face names the LAST cell
                     // it covers rather than the plane beyond it. Writing the
                     // plane here put every positive face a third of a block
-                    // outside the chunk.
-                    let w = cell[usize::from(axis)] + if positive { step - 1 } else { 0 };
+                    // outside the chunk, and made the boundary walls — the
+                    // skirts themselves — not draw at all.
+                    let slice = w * step + if positive { step - 1 } else { 0 };
                     quads.push(Quad {
-                        axis,
+                        axis: u8::try_from(axis).unwrap_or(0),
                         positive,
-                        w,
-                        u,
-                        v,
-                        du: step,
-                        dv: step,
+                        w: u8::try_from(slice).unwrap_or(0),
+                        u: u8::try_from(u * step).unwrap_or(0),
+                        v: u8::try_from(v * step).unwrap_or(0),
+                        du: u8::try_from(du * step).unwrap_or(1),
+                        dv: u8::try_from(dv * step).unwrap_or(1),
                         material,
                         shade: crate::shade::Shade::flat(tiamot_core::light::Light::DAYLIGHT),
                     });
+                    u += du;
                 }
             }
         }

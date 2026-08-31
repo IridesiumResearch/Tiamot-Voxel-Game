@@ -4065,6 +4065,24 @@ impl App {
         rebuilt
     }
 
+    /// The overlay's horizon line.
+    ///
+    /// **The line criterion A3 is read from**: "32 chunks of view" is a claim
+    /// about how far the world goes, and there is no way to check it from
+    /// inside the game other than a number that says so. The held count beside
+    /// it says whether the horizon is still filling in, which is the difference
+    /// between a frame rate taken mid-stream and one taken on a settled world.
+    ///
+    /// Its own method because `hud` is at clippy's line ceiling.
+    fn horizon_line(&self) -> String {
+        format!(
+            "horizon {} chunks: {} held, {} queued",
+            tiamot_core::lod::horizon_for(self.granted_view).horizontal,
+            self.store.summary_len(),
+            self.store.stale_len()
+        )
+    }
+
     /// How many summaries the client is holding.
     ///
     /// For the HUD and for the session test: a horizon that never arrives and a
@@ -4988,6 +5006,7 @@ impl App {
                 self.renderer.drawn(),
                 self.store.dirty_len()
             ),
+            self.horizon_line(),
             format!(
                 "{} of meshes, {material_count} materials, {} textured",
                 human_bytes(self.renderer.mesh_bytes()),
