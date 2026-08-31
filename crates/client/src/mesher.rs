@@ -1996,8 +1996,10 @@ mod summary_tests {
         let fine = mesh_summary(&slab(FINEST, 5, 1)); // cells 1 block tall: surface at 5
 
         // The +x plane of the coarse chunk and the -x plane of the fine one.
-        // In sub-nodes, the shared plane is at 48 for one and 0 for the other.
-        let plane = u8::try_from(CHUNK_SUBNODES).expect("fits");
+        // **A quad's `w` is the last CELL it covers, not the plane** — see
+        // `quad_corners`, which adds one for a positive face — so the chunk's
+        // far boundary is the cell at 47 and its near one is the cell at 0.
+        let plane = u8::try_from(CHUNK_SUBNODES - 1).expect("fits");
         let covered = |mesh: &Mesh, at: u8, positive: bool| -> Vec<(u8, u8)> {
             let mut spans = Vec::new();
             for quad in &mesh.quads {
@@ -2035,7 +2037,7 @@ mod summary_tests {
         // ones against its own neighbours would leave the wall with a hole in
         // it exactly where the neighbouring chunk's surface happened to dip.
         let mesh = mesh_summary(&slab(FINEST, 16, 1));
-        let plane = u8::try_from(CHUNK_SUBNODES).expect("fits");
+        let plane = u8::try_from(CHUNK_SUBNODES - 1).expect("fits");
         let wall = mesh
             .quads
             .iter()
@@ -3022,7 +3024,13 @@ pub fn mesh_summary(summary: &tiamot_core::lod::Summary) -> Mesh {
                         1 => (cell[0], cell[2]),
                         _ => (cell[0], cell[1]),
                     };
-                    let w = cell[usize::from(axis)] + if positive { step } else { 0 };
+                    // **`Quad::w` is the CELL slice, not the plane.**
+                    // `quad_corners` adds one for a positive face to get from
+                    // one to the other, so a positive face names the LAST cell
+                    // it covers rather than the plane beyond it. Writing the
+                    // plane here put every positive face a third of a block
+                    // outside the chunk.
+                    let w = cell[usize::from(axis)] + if positive { step - 1 } else { 0 };
                     quads.push(Quad {
                         axis,
                         positive,

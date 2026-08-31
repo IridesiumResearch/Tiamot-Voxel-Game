@@ -2833,7 +2833,17 @@ fn an_entity_is_drawn_where_the_server_put_it() {
     let chunks = scene();
     let mut renderer = prepare(gpu, &chunks, RenderMode::Textured);
     let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
-    let camera = viewpoint();
+    // Beyond the coarse chunk, looking back along -x and slightly down, so the
+    // step between the two tops FACES the camera. From overhead it does not:
+    // the two tops are adjacent in screen space and a missing wall between them
+    // has no projected area, which is a version of this test that passes with
+    // the skirts deleted. Default yaw looks along +z, and a growing yaw swings
+    // toward -x, so a quarter turn faces the seam.
+    let mut camera = Camera {
+        position: Position::from_world(40.0, 10.0, 24.0),
+        ..Camera::default()
+    };
+    camera.look(std::f32::consts::FRAC_PI_2, -0.25);
 
     let bare = target.capture(&mut renderer, &camera).expect("capture");
     let before = average(&bare, WIDTH / 4, HEIGHT / 4, WIDTH * 3 / 4, HEIGHT * 3 / 4);
@@ -3349,4 +3359,105 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
         floor[0] + floor[1] + floor[2] > 0.2,
         "the floor is black, so nothing was drawn at all: {floor:?}"
     );
+}
+
+/// A summary whose bottom `height` cells are solid stone.
+fn slab_summary(level: u8, height: u32) -> tiamot_core::lod::Summary {
+    let n = tiamot_core::lod::cells_per_axis(level).expect("a level");
+    let mut cells = vec![MaterialId::AIR; (n * n * n) as usize];
+    for z in 0..n {
+        for y in 0..height.min(n) {
+            for x in 0..n {
+                cells[((z * n + y) * n + x) as usize] = STONE;
+            }
+        }
+    }
+    tiamot_core::lod::Summary::from_parts(level, cells).expect("build")
+}
+
+#[test]
+fn no_sky_shows_through_the_seam_between_two_lod_levels() {
+    // **Criterion T4, in the frame rather than in the quad list.** The mesher's
+    // own tests prove the two chunks' walls cover each other's height
+    // difference; this proves the picture agrees, which is the claim a player
+    // can actually check.
+    //
+    // The scene is the failure case exactly: a fine chunk six blocks tall
+    // beside a coarse one four blocks tall, seen from the low side so the step
+    // between them faces the camera. If the fine chunk did not hang a wall down
+    // its own boundary, that step would render as whatever is behind it — the
+    // sky — because a voxel mesher draws no faces inside solid rock.
+    //
+    // # Two things this test got wrong first, both of which made it pass
+    //
+    // It looked down from above, where the two tops are adjacent in screen
+    // space and a missing wall between them has no projected area at all. And
+    // it decided "is this pixel geometry" by hue, which `session.rs` documents
+    // at length as the trap it is: a side face at full daylight renders dim and
+    // sky-tinted, and `is_sky` called it sky. Both versions passed with the
+    // skirts deleted from the mesher, which is the only way to find out that a
+    // green test was proving nothing.
+    //
+    // So the background is now an actual capture of the same camera with no
+    // geometry at all, and "covered" means "differs from that". No hue is
+    // consulted, and a dim face counts exactly as much as a bright one.
+    let Some(gpu) = gpu() else {
+        return;
+    };
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+    renderer.set_atlas(&Atlas::build(&[
+        None,
+        None,
+        Some(Image::white_with_border()),
+    ]));
+
+    // Beyond the coarse chunk, looking back along -x and slightly down, so the
+    // step faces the camera. Default yaw looks along +z and a growing yaw
+    // swings toward -x, so a quarter turn faces the seam.
+    let mut camera = Camera {
+        position: Position::from_world(40.0, 10.0, 24.0),
+        ..Camera::default()
+    };
+    camera.look(std::f32::consts::FRAC_PI_2, -0.25);
+
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    let empty = target.capture(&mut renderer, &camera).expect("capture");
+
+    // Fine on the left, coarse on the right, the seam at x = 16. Three chunks
+    // deep so the frame has ground either side of it.
+    let fine = mesher::mesh_summary(&slab_summary(tiamot_core::lod::FINEST, 6));
+    let coarse = mesher::mesh_summary(&slab_summary(3, 1));
+    for cz in 0..3 {
+        renderer.set_chunk(ChunkPos::new(0, 0, cz), &fine);
+        renderer.set_chunk(ChunkPos::new(1, 0, cz), &coarse);
+    }
+    let full = target.capture(&mut renderer, &camera).expect("capture");
+
+    // A row is covered if the middle of it changed when the terrain arrived.
+    let covered = |row: u32| -> bool {
+        let (x0, x1) = (WIDTH / 2 - 8, WIDTH / 2 + 8);
+        (x0..x1).any(|x| match (empty.pixel(x, row), full.pixel(x, row)) {
+            (Some(before), Some(after)) => {
+                (0..3).any(|channel| before[channel].abs_diff(after[channel]) > 4)
+            }
+            _ => false,
+        })
+    };
+
+    let first = (0..HEIGHT)
+        .find(|row| covered(*row))
+        .expect("nothing was drawn at all, so this test proves nothing about seams");
+    let last = (0..HEIGHT).rev().find(|row| covered(*row)).expect("a row");
+    assert!(
+        last > first + 20,
+        "only rows {first}..={last} changed; the scene is not framed as a seam"
+    );
+
+    for row in first..=last {
+        assert!(
+            covered(row),
+            "row {row} is untouched sky, between covered rows {first} and {last}: \
+             that is a hole through the seam between two LOD levels"
+        );
+    }
 }

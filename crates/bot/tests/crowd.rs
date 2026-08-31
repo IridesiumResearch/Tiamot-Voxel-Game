@@ -123,10 +123,27 @@ fn two_players_on_one_spot_lean_apart() {
         let end_b = stand(&mut second, 2).await;
         let at_last = flat_distance(end_a, end_b);
 
+        // **Not "they gained 0.2 since the first reading".** That was a bet on
+        // how fast the machine is. The push starts the moment the second body
+        // exists, which is before the first measurement can be taken, so on a
+        // slow runner most of the separation has already happened by then —
+        // macOS CI read 1.808 then 1.993 and failed a 0.2 threshold having done
+        // exactly the right thing.
+        //
+        // What is true on every machine is where they END UP. Two bodies that
+        // spawned on one spot come to rest a snug body-width apart, which is
+        // the distance `phys::crowd::separate` pushes to and then stops at.
+        let resting =
+            f64::from(tiamot_core::phys::PLAYER_WIDTH * tiamot_core::phys::crowd::SNUGNESS);
         assert!(
-            at_last > at_first + 0.2,
+            at_last >= resting - 0.05,
             "two players standing on one spot did not make room for each other: \
-             {at_first:.3} cells apart, then {at_last:.3}"
+             {at_first:.3} cells apart, then {at_last:.3}, which is inside the \
+             resting distance of {resting:.3}"
+        );
+        assert!(
+            at_last >= at_first - 0.05,
+            "the pair drifted back together: {at_first:.3} cells apart, then {at_last:.3}"
         );
 
         // **Subtle, which was the requirement.** Sixty ticks is three seconds;
