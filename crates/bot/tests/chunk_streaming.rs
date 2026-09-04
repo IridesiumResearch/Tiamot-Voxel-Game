@@ -176,10 +176,12 @@ fn the_chunk_under_the_player_arrives_first() {
             "the spawn chunk must arrive first, got {received:?}"
         );
 
-        // And the rest must be weakly increasing in distance.
+        // And the rest must be weakly increasing in STREAM distance, which
+        // weights the vertical — the band a player looks along is filled
+        // before the sky above them. See `interest::VERTICAL_WEIGHT`.
         let mut previous = 0;
         for pos in &received {
-            let distance = interest::squared_distance(spawn_chunk, *pos);
+            let distance = interest::stream_distance(spawn_chunk, *pos);
             assert!(
                 distance >= previous,
                 "chunk {pos:?} at distance {distance} arrived after {previous}"

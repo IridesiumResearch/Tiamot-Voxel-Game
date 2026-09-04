@@ -31,6 +31,25 @@
 //! allowed in the deterministic subset but pointless here since the ordering is
 //! identical either way — with a deterministic tie-break so two servers stream
 //! in the same order and a test can assert on it.
+//!
+//! # The vertical counts for more than the horizontal, and it has to
+//!
+//! "Nearest" was the plain 3D distance until 2026-09-04, and at a high view
+//! distance that spends almost the whole budget on sky. Reported from the
+//! window as holes between the terrain around you and the terrain on the
+//! horizon: at a view distance of 24 with a vertical of 12, **41,073 of the
+//! 44,825 chunks in range are served before the player's own layer is finished
+//! out to the view edge** — 128 seconds of a 140-second fill spent on chunks
+//! above and below, nearly all of them air, while the band actually being
+//! looked along still has gaps in it.
+//!
+//! So the sort weights `dy` by [`VERTICAL_WEIGHT`], past a free allowance of
+//! [`VERTICAL_FREE`] layers that keeps the ground under a player's feet as
+//! urgent as the ground beside them. **The SET does not change** — it is still
+//! the cylinder, and every chunk in it is still sent — only the order does. A
+//! player sees the band they are looking along close first, from near to far,
+//! instead of holes appearing at random heights all around them. At view 24
+//! that is 41 seconds to the view edge rather than 128.
 
 use crate::coords::ChunkPos;
 
@@ -155,7 +174,14 @@ pub fn chunks_around(centre: ChunkPos, view: ViewDistance) -> Vec<ChunkPos> {
 
     chunks.sort_by_key(|pos| {
         (
-            squared_distance(centre, *pos),
+            stream_distance(centre, *pos),
+            // **Then by how far up or down.** The free allowance in
+            // `stream_distance` puts the layer above and below a player at the
+            // same distance as their own, and the coordinate tie-break alone
+            // then sorts the chunk BELOW the centre ahead of the centre itself
+            // — a player would be sent the ground before the air they are
+            // standing in. Within a tie, nearer the player's own height first.
+            (i64::from(pos.y) - i64::from(centre.y)).abs(),
             // Deterministic tie-break. Without it the order among equidistant
             // chunks depends on iteration order, which makes a "nearest first"
             // test assert on something that is only accidentally true.
@@ -178,6 +204,51 @@ pub fn contains(centre: ChunkPos, view: ViewDistance, pos: ChunkPos) -> bool {
     let dz = i64::from(pos.z) - i64::from(centre.z);
     let radius = i64::from(view.horizontal);
     dx * dx + dz * dz <= radius * radius
+}
+
+/// How much a chunk of vertical separation counts for, in chunks of horizontal,
+/// once it is more than [`VERTICAL_FREE`] layers away.
+///
+/// Six. A chunk three layers up is ordered as though it were twelve chunks away
+/// along the ground, so the streaming budget goes on the band a player is
+/// looking along before it goes on the sky.
+///
+/// **Why six and not more.** The vertical reach at the edge of the view is
+/// `view / VERTICAL_WEIGHT + VERTICAL_FREE` chunks — five layers, 80 blocks, at
+/// a view distance of 24. That has to cover the height of the terrain, or the
+/// tops of distant hills sort behind the sky above the player's head and arrive
+/// last, which is the failure this exists to fix wearing a different hat.
+///
+/// **Order only.** This never decides membership — [`contains`] is the cylinder
+/// and does not consult it — so nothing is dropped from a player's interest set
+/// by being high or low, it merely comes later.
+pub const VERTICAL_WEIGHT: i64 = 6;
+
+/// How many layers either side of a player are as urgent as the ground beside
+/// them.
+///
+/// One, and it is not a tuning knob. The chunk directly below a player is the
+/// ground under their feet and the chunk directly above is the ceiling over
+/// their head; both are as immediate as anything at the same height, and a
+/// weight applied from zero puts them behind ~50 chunks of the player's own
+/// layer. That is not theoretical: `a_mod_can_read_the_world_it_writes_to`
+/// went red on the first version of this, because a mod read the terrain at
+/// `y = -1` on join and the chunk holding it had not arrived.
+pub const VERTICAL_FREE: i64 = 1;
+
+/// The distance chunks are STREAMED in the order of: horizontal distance, with
+/// the vertical weighted by [`VERTICAL_WEIGHT`] past [`VERTICAL_FREE`] layers.
+///
+/// Squared, like [`squared_distance`], because the ordering is identical and it
+/// avoids a `sqrt`. Not a metric anybody should measure range with — that is
+/// [`contains`] — only the one they should fill in.
+#[must_use]
+pub fn stream_distance(centre: ChunkPos, pos: ChunkPos) -> i64 {
+    let dx = i64::from(pos.x) - i64::from(centre.x);
+    let dz = i64::from(pos.z) - i64::from(centre.z);
+    let layers = (i64::from(pos.y) - i64::from(centre.y)).abs();
+    let dy = (layers - VERTICAL_FREE).max(0) * VERTICAL_WEIGHT;
+    dx * dx + dy * dy + dz * dz
 }
 
 /// Squared distance between two chunk positions.
@@ -207,15 +278,80 @@ mod tests {
 
     #[test]
     fn chunks_arrive_nearest_first() {
+        // **`stream_distance`, which weights the vertical.** Asserting the
+        // plain 3D distance here is asserting that the sky is as urgent as the
+        // ground, which is the thing that put holes in a high view distance.
         let chunks = chunks_around(ORIGIN, ViewDistance::DEFAULT);
         let mut previous = 0;
         for pos in &chunks {
-            let distance = squared_distance(ORIGIN, *pos);
+            let distance = stream_distance(ORIGIN, *pos);
             assert!(
                 distance >= previous,
                 "chunk {pos:?} at {distance} came after {previous}"
             );
             previous = distance;
+        }
+    }
+
+    #[test]
+    fn the_band_a_player_looks_along_is_filled_before_the_sky() {
+        // **The property the weight exists for**, at the view distance that
+        // showed the problem rather than at the default. Reported from the
+        // window as holes between the near terrain and the horizon: with a
+        // plain 3D order, 41,073 of the 44,825 chunks in range are served
+        // before the player's own layer reaches the view edge — the budget
+        // goes on sky while the ground still has gaps in it.
+        //
+        // Asserted as a RATIO rather than an exact count, because the exact
+        // count is a fact about one view distance and the property is not.
+        let view = ViewDistance::clamped(24, 12);
+        let chunks = chunks_around(ORIGIN, view);
+        let edge = i64::from(view.horizontal) * i64::from(view.horizontal);
+
+        let before_the_edge = chunks
+            .iter()
+            .take_while(|pos| stream_distance(ORIGIN, **pos) <= edge)
+            .count();
+        assert!(
+            before_the_edge * 2 < chunks.len(),
+            "{before_the_edge} of {} chunks are served before the player's own \
+             layer reaches the view edge; the vertical weight is not biting",
+            chunks.len()
+        );
+
+        // And the whole of the player's own layer is in that prefix — it is
+        // the layer with the terrain and the eyes in it.
+        let own_layer = chunks
+            .iter()
+            .filter(|pos| pos.y == ORIGIN.y)
+            .copied()
+            .collect::<Vec<_>>();
+        let last_of_own = chunks
+            .iter()
+            .position(|pos| *pos == *own_layer.last().expect("a layer"))
+            .expect("in the set");
+        assert!(
+            last_of_own < before_the_edge,
+            "the player's own layer is not finished by the time the view edge \
+             is reached: last at {last_of_own}, edge at {before_the_edge}"
+        );
+    }
+
+    #[test]
+    fn the_vertical_weight_changes_the_order_and_not_the_set() {
+        // The weight must never drop a chunk. A player whose interest set
+        // shrank because they were high up would watch the world end.
+        for (h, v) in [(4u8, 4u8), (8, 4), (24, 12)] {
+            let view = ViewDistance::clamped(h, v);
+            let mut got = chunks_around(ORIGIN, view);
+            got.sort_by_key(|pos| (pos.x, pos.y, pos.z));
+            let mut want: Vec<ChunkPos> = got
+                .iter()
+                .copied()
+                .filter(|pos| contains(ORIGIN, view, *pos))
+                .collect();
+            want.sort_by_key(|pos| (pos.x, pos.y, pos.z));
+            assert_eq!(got, want, "at view {h}/{v} the set is not the cylinder");
         }
     }
 

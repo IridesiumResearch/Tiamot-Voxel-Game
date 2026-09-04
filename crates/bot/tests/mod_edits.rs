@@ -168,37 +168,49 @@ end)
 -- Put something down, then read the world back: the block it placed, a block
 -- of the terrain under it, empty space beside it, and somewhere nobody has
 -- loaded.
-local reported = false
-game.register_on_tick(function()
-    game.set_block({ x = 2, y = 9, z = 2 }, "reader:brick")
-    if reported then
+-- **Latched per marker, not once for the lot.** This used to set one
+-- `reported` flag on the first tick the brick read back and do all four reads
+-- inside it — so a tick where the brick's chunk was loaded and the chunk below
+-- it was not lost `saw_ground` for ever, and the test failed thirty seconds
+-- later having asked once. Chunks arrive over several ticks and a mod reading
+-- four of them has no reason to assume they arrive together. Each answer now
+-- retries until it comes.
+local seen = {}
+local function once(marker, at)
+    if seen[marker] then
         return
     end
+    seen[marker] = true
+    game.set_block(at, marker)
+end
+
+game.register_on_tick(function()
+    game.set_block({ x = 2, y = 9, z = 2 }, "reader:brick")
+
     local placed = game.get_block({ x = 2, y = 9, z = 2 })
     if placed == nil or placed.material ~= brick then
         return
     end
-    reported = true
 
     if placed.occupancy == game.OCCUPANCY_FULL then
-        game.set_block({ x = 4, y = 9, z = 2 }, "reader:saw_brick")
+        once("reader:saw_brick", { x = 4, y = 9, z = 2 })
     end
 
     local under = game.get_block({ x = 2, y = -1, z = 2 })
     if under ~= nil and under.material == ground then
-        game.set_block({ x = 5, y = 9, z = 2 }, "reader:saw_ground")
+        once("reader:saw_ground", { x = 5, y = 9, z = 2 })
     end
 
     -- **Air is an answer**, and this is the assertion that matters most:
     -- nothing there reads as air, not as nil.
     local beside = game.get_block({ x = 2, y = 9, z = 3 })
     if beside ~= nil and beside.material == game.AIR and beside.occupancy == 0 then
-        game.set_block({ x = 6, y = 9, z = 2 }, "reader:saw_air")
+        once("reader:saw_air", { x = 6, y = 9, z = 2 })
     end
 
     -- And somewhere nobody is standing, which must NOT be generated to answer.
     if game.get_block({ x = 40000, y = 9, z = 40000 }) == nil then
-        game.set_block({ x = 7, y = 9, z = 2 }, "reader:saw_nothing")
+        once("reader:saw_nothing", { x = 7, y = 9, z = 2 })
     end
 end)
 "#,
