@@ -66,6 +66,10 @@
 *.sqlite-wal
 *.sqlite-shm
 
+# Local client state. `client.example.toml` is the tracked one; this is the
+# live config a run writes, and it carries a display name and a world path.
+/client.toml
+
 # Editors and OS
 .idea/
 *.swp
