@@ -134,13 +134,16 @@ fn land_past_the_detail_radius_arrives_as_a_summary() {
         // inside it. A position in both sets would be a client drawing the
         // same chunk twice, once coarse and once fine.
         for (pos, level) in &seen.summaries {
-            let distance = pos
-                .x
-                .abs_diff(spawn.x)
-                .max(pos.y.abs_diff(spawn.y))
-                .max(pos.z.abs_diff(spawn.z));
+            // **`contains`, not a distance computed here.** This asked whether
+            // the Chebyshev distance cleared the view distance, which is the
+            // box the interest set is not — it is a cylinder, `dx² + dz²`
+            // against the radius with the vertical a separate bound. Asserting
+            // against a hand-rolled second definition is how a test meant to
+            // catch a shape mismatch came to encode one: the streamer measured
+            // a box, this measured a box, and the 41% of the horizon that fell
+            // between the box and the cylinder was invisible to both.
             assert!(
-                distance > u32::from(view.horizontal) || distance > u32::from(view.vertical),
+                !tiamot_core::interest::contains(spawn, view, *pos),
                 "{pos:?} was summarised but is inside the detail radius"
             );
             assert!(

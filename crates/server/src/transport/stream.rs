@@ -391,16 +391,39 @@ impl Streamer {
         self.horizon_cursor = 0;
     }
 
-    /// The Chebyshev distance from the centre, in chunks.
+    /// The horizontal distance from the centre, in chunks, rounded up.
     ///
-    /// Chebyshev because the interest set is a box: a sphere's distance would
-    /// put the corners of the box in a further ring than the sides, and a
-    /// player turning on the spot would watch the horizon change resolution.
+    /// **The same shape as the interest set, which is a CYLINDER.**
+    /// [`interest::contains`] admits a chunk when `dx² + dz²` is within the
+    /// radius squared and `dy` is within the vertical bound, so the vertical
+    /// takes no part in the radius and the horizontal is Euclidean, not
+    /// Chebyshev. Rounding up makes `self.distance(pos) <= view.horizontal`
+    /// agree with `contains` exactly, which is the property that matters: a
+    /// position is either inside the detail radius or gets a summary, never
+    /// both and never neither.
+    ///
+    /// This was the Chebyshev distance until 2026-09-04, justified by an
+    /// interest set that was a box. It has been a cylinder for as long as
+    /// `chunks_around` has existed, and the disagreement left a band that
+    /// [`Streamer::next_needed`] never sent in full — outside the cylinder —
+    /// and `next_summaries` never summarised either, because
+    /// [`Rings::level_at`] called it detail. Four lobes on the diagonals,
+    /// 41% of the horizon at a view distance of 24 and only 2% at 8, which is
+    /// why it went unseen until somebody set the view distance high.
     fn distance(&self, pos: ChunkPos) -> u32 {
-        let dx = pos.x.abs_diff(self.centre.x);
-        let dy = pos.y.abs_diff(self.centre.y);
-        let dz = pos.z.abs_diff(self.centre.z);
-        dx.max(dy).max(dz)
+        // Saturating throughout: this is a general method, and a caller asking
+        // about a chunk on the far side of the world should get a very large
+        // distance rather than a wrapped one that reads as "nearby".
+        let dx = u64::from(pos.x.abs_diff(self.centre.x));
+        let dz = u64::from(pos.z.abs_diff(self.centre.z));
+        let squared = dx.saturating_mul(dx).saturating_add(dz.saturating_mul(dz));
+        let root = squared.isqrt();
+        let rounded = if root.saturating_mul(root) == squared {
+            root
+        } else {
+            root.saturating_add(1)
+        };
+        u32::try_from(rounded).unwrap_or(u32::MAX)
     }
 
     /// Records that a summary reached the client.
@@ -459,6 +482,69 @@ mod tests {
             all.extend(batch);
         }
         all
+    }
+
+    /// Every chunk on the horizon is eventually summarised — nothing falls
+    /// down the gap between the detail radius and the rings.
+    ///
+    /// **Written after the window showed a ring of nothing.** The interest set
+    /// is a cylinder and [`Rings::level_at`] measured a box, so a chunk out
+    /// past the detail cylinder but still inside the detail box was sent by
+    /// neither path: too far for a full chunk, too near for a summary. It read
+    /// from inside the game as a gap between the terrain around you and the
+    /// terrain on the horizon, in four lobes on the diagonals.
+    ///
+    /// **At a view distance of 24, not the default.** The hole was 41% of the
+    /// horizon at 24 and 2% at 8 — the corners of a box grow on the circle
+    /// inside it — so every test written at the default view distance passed
+    /// through it. A test for a shape mismatch has to be run at the distance
+    /// that makes the shapes differ.
+    #[test]
+    fn the_horizon_leaves_no_ring_uncovered() {
+        let view = ViewDistance::clamped(24, 12);
+        let mut streamer = Streamer::new(tiamot_core::domain::OVERWORLD, ORIGIN, view);
+        let covered: BTreeSet<ChunkPos> = drain_horizon(&mut streamer)
+            .into_iter()
+            .map(|(pos, _)| pos)
+            .collect();
+
+        let wanted: Vec<ChunkPos> = interest::chunks_around(ORIGIN, horizon_for(view))
+            .into_iter()
+            .filter(|pos| !interest::contains(ORIGIN, view, *pos))
+            .collect();
+        let missing: Vec<ChunkPos> = wanted
+            .iter()
+            .copied()
+            .filter(|pos| !covered.contains(pos))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "{} of {} horizon chunks were never summarised, e.g. {:?}",
+            missing.len(),
+            wanted.len(),
+            &missing[..missing.len().min(5)]
+        );
+    }
+
+    /// The ring metric and the interest set agree on where the detail ends.
+    ///
+    /// The property the test above catches by construction, asserted directly
+    /// so a failure names the disagreement rather than a count of holes.
+    #[test]
+    fn a_chunk_is_detail_exactly_when_the_interest_set_holds_it() {
+        for horizontal in [2u8, 4, 8, 16, 24] {
+            let view = ViewDistance::clamped(horizontal, 12);
+            let streamer = Streamer::new(tiamot_core::domain::OVERWORLD, ORIGIN, view);
+            let rings = Rings::new(u32::from(view.horizontal), Rings::MARGIN);
+            for pos in interest::chunks_around(ORIGIN, horizon_for(view)) {
+                assert_eq!(
+                    rings.level_at(streamer.distance(pos)) == Level::Chunk,
+                    interest::contains(ORIGIN, view, pos),
+                    "at view {horizontal}, {pos:?} is claimed as detail by one and not the other"
+                );
+            }
+        }
     }
 
     fn streamer() -> Streamer {

@@ -187,8 +187,21 @@ impl Rings {
 
     /// The level for a chunk `distance` chunks from the centre.
     ///
-    /// Distance is the Chebyshev distance — the box, not the sphere, matching
-    /// [`crate::interest::chunks_around`], which streams a box.
+    /// Distance is the HORIZONTAL distance, rounded up, matching the cylinder
+    /// [`crate::interest::chunks_around`] streams — `dx² + dz²` against the
+    /// radius squared, with the vertical extent a separate bound rather than
+    /// part of the radius.
+    ///
+    /// **It must be the same shape as the interest set, or chunks fall down
+    /// the gap between them.** This said Chebyshev until 2026-09-04, on the
+    /// stated grounds that the interest set was a box. It is not, and the
+    /// difference is not cosmetic: a chunk outside the detail cylinder but
+    /// inside the detail *box* is never sent in full, because
+    /// `chunks_around` does not reach it, and never summarised either,
+    /// because this returned [`Level::Chunk`] for it. At a view distance of
+    /// 24 that was 41% of the horizon missing, in four lobes on the
+    /// diagonals. See [`Rings::level_at`]'s test and
+    /// `Streamer::distance`.
     #[must_use]
     pub fn level_at(&self, distance: u32) -> Level {
         if distance <= self.detail {
