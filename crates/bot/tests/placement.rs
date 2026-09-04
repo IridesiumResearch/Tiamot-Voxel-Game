@@ -578,16 +578,20 @@ fn topping_up_a_half_mined_block_fills_its_gaps_and_keeps_what_was_left() {
 }
 
 #[test]
-fn a_different_material_steps_to_the_next_block_rather_than_mixing() {
-    // **Reported from the window**: "when right clicking on a partially empty
-    // block with a different material it should place the block in the next
-    // slot over or up or whatever, even if that leaves an empty space."
+fn a_block_brush_tops_up_a_carved_block_with_a_different_material() {
+    // **Reverted from the window, 2026-09-04**: "if you have a material you
+    // should just be able to dump it on top of any other material."
     //
-    // A block brush tops up its own material — that is what makes carving
-    // reversible — but somebody building a dirt wall against a chiselled stone
-    // one is not asking to mix the two. The stone keeps its gaps and the dirt
-    // goes next door.
-    let server = start("step-off");
+    // This asserted the opposite from Task 09 until then — a block brush that
+    // topped up its own material and stepped to the next block along the face
+    // for anything else, which was also a window report. Sub-Node Contract
+    // §7.1 carries both halves of that history.
+    //
+    // What has not changed, and what the second half of this test is for: the
+    // stone that was already there is still there. A placement fills air and
+    // never displaces anything, because material that vanished when something
+    // was put beside it would be a conservation hole.
+    let server = start("top-up-mixed");
     block_on(async {
         let mut bot = join(&server, "Mason").await;
         let stone = stone();
@@ -616,39 +620,61 @@ fn a_different_material_steps_to_the_next_block_rather_than_mixing() {
             .expect("the carved block should land");
 
         // Aimed into the hollow, against the top face of the stone that is
-        // left — which is the gesture the report describes.
+        // left — the same gesture the old test made, now with the opposite
+        // expectation.
         let gap = SubNodePos::new(carved.x * 3 + 1, carved.y * 3 + 2, carved.z * 3 + 1);
         bot.place_shape_against(gap, dirt, 0, [0, 1, 0])
             .await
             .expect("send");
 
-        // The dirt is in the block ABOVE, whole.
-        if bot
-            .expect_block(above, dirt, Duration::from_secs(10))
-            .await
-            .is_err()
-        {
-            panic!(
-                "the dirt did not land in the next block up; the server said {:?}",
+        // **Eighteen SubNode edits, not one Partial.** A `Partial` SETS a
+        // block from a single material, so one naming the new cells would
+        // delete the stone beside them — `place::writes` sends a mixed fill
+        // cell by cell for exactly that reason, and asserting on a `Partial`
+        // here is asserting the conservation hole.
+        let gaps: Vec<SubNodePos> = tiamot_core::inventory::fill_order()
+            .skip(9)
+            .map(|index| {
+                let (ox, oy, oz) = tiamot_core::block::subnode_offset(index);
+                SubNodePos::new(
+                    carved.x * 3 + ox as i32,
+                    carved.y * 3 + oy as i32,
+                    carved.z * 3 + oz as i32,
+                )
+            })
+            .collect();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !gaps.iter().all(|cell| bot.saw_subnode(*cell, dirt)) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the dirt did not fill the carved block's gaps ({} of {} cells); \
+                 the server said {:?}",
+                gaps.iter()
+                    .filter(|cell| bot.saw_subnode(**cell, dirt))
+                    .count(),
+                gaps.len(),
                 bot.notices()
             );
+            bot.recv().await.expect("recv");
         }
 
-        // And the stone is untouched: still nine cells, still stone. Anything
-        // else is material destroyed by placing something beside it.
+        // **And the next block up is still empty.** The old rule would have
+        // put a whole block of dirt there, so this is what tells a real pass
+        // apart from the step-off happening to look right.
         assert!(
-            !bot.received().into_iter().any(|message| matches!(
-                message,
-                tiamot_core::proto::ServerMessage::BlockDelta {
-                    edit: tiamot_core::proto::Edit::Partial { pos, material, .. },
-                    ..
-                } if pos == carved && material == dirt
-            )),
-            "the carved stone block was written with dirt"
+            bot.expect_block(above, dirt, Duration::from_secs(2))
+                .await
+                .is_err(),
+            "the dirt stepped to the next block instead of filling the one aimed at"
         );
-        bot.expect_partial(carved, stone, 9, Duration::from_secs(2))
-            .await
-            .expect("the stone that was there should still be there");
+
+        // Charged for the eighteen it filled and no more. The stone was never
+        // paid for and was never written over.
+        assert_eq!(
+            held(&bot, dirt),
+            9,
+            "eighteen gaps filled should cost eighteen units of the twenty-seven held"
+        );
 
         bot.disconnect().await;
     });
@@ -684,9 +710,10 @@ fn one_block_can_hold_two_materials_at_once() {
             .await
             .expect("the carved block should land");
 
-        // A chisel, so each placement is one cell. A BLOCK brush would step
-        // around the stone instead — which is the other half of this pair, and
-        // deliberate: see `place::landing`.
+        // A chisel, so each placement is one cell. A block brush would fill
+        // every gap at once with the material in hand, which is a different
+        // (and since 2026-09-04 also supported) way to make a mixed block —
+        // this test wants the cell-by-cell one.
         bot.hold_brush(tiamot_core::dig::Brush::SubNode.name())
             .await
             .expect("the reference mods register a chisel");

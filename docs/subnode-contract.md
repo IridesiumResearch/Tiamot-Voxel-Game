@@ -415,17 +415,27 @@ own; the tool the player holds carries one, and a mod says which.
   against a half-mined block doing nothing and saying something was already
   there. The gaps are taken in `placement_mask`'s bottom-up order, so a partial
   payment still fills deterministically.
-- **A block brush tops up its OWN material and steps around anything else.**
-  Filling the gaps in a carved block is what makes carving reversible; it is
-  not an invitation to mix. A block brush aimed at a block holding a different
-  material lands in the next block along the face instead, leaving the gaps
-  empty — reported from the window, and `place::landing` is the rule. With no
-  face to step along it is refused rather than guessed at.
-  **Mixing is still possible and still deliberate**: a sub-node brush places
-  one cell of anything into any block with room, which is how a block of
-  twenty-two stone and five gold gets made. The distinction is the point — a
-  brush that addresses whole blocks should not produce a block nobody could
-  have asked for.
+- **A block brush tops up whatever it is aimed at, whosever material is
+  already in there.** Filling the gaps in a carved block is what makes carving
+  reversible, and it does not matter whether the carving was yours: if you hold
+  a material and a block in reach has room, the material goes in the room.
+  Nothing steps aside and nothing is refused for a material mismatch.
+
+  **This reverses the rule that stood from Task 09 to 2026-09-04**, which was
+  that a block brush topped up its own material only and a different one landed
+  in the next block along the face (`place::landing`). That came from the
+  window and was reverted from the window: mixing is what a player expects to
+  be able to do, the step-off surprised more often than it protected, and a
+  block nobody could have asked for turns out to be a block plenty of people
+  ask for. Anything relying on the old behaviour — including the guarantee that
+  a block-brush placement lands in the block that was aimed at only when the
+  materials agree — no longer holds.
+
+  What has NOT changed is that a placement only ever writes into **air**
+  (§7.2). Material already in a cell is never displaced, overwritten or
+  destroyed: that would be a conservation hole, and charter rule 5 does not
+  have an exception for convenience. "On top of" means into the gaps, not
+  instead of.
 
 **A stack cut to a shape places its cut, whatever brush is held.** The cut *is*
 the thing being carried: a chisel does not get to spend a whole crafted stair to

@@ -2524,65 +2524,36 @@ impl ServerHandle {
                             });
 
                             // **What a block already holds**, as a mask of
-                            // occupied cells and whether any of it is somebody
-                            // else's material.
+                            // occupied cells.
                             let contents = |at: tiamot_core::BlockPos,
                                                 world: &mut crate::world::World,
                                                 source: &mut dyn crate::world::ChunkSource| {
-                                world.block_cells(tiamot_core::domain::OVERWORLD, at, source).map_or((0, false), |cells| {
+                                world.block_cells(tiamot_core::domain::OVERWORLD, at, source).map_or(0, |cells| {
                                     let mut mask = 0;
-                                    let mut other = false;
                                     for (index, cell) in cells.iter().enumerate() {
-                                        if cell.is_air() {
-                                            continue;
+                                        if !cell.is_air() {
+                                            mask |= 1 << index;
                                         }
-                                        mask |= 1 << index;
-                                        other |= *cell != material;
                                     }
-                                    (mask, other)
+                                    mask
                                 })
                             };
 
-                            // **A block brush tops up its OWN material.** A
-                            // block brush fills the gaps in a partly-mined
-                            // block rather than colliding with what is left of
-                            // it — reported from the window — but somebody
-                            // building a dirt wall against a chiselled stone
-                            // one is not asking to mix the two, so a different
-                            // material steps to the next block along the face.
-                            // Reported from the window as well; the two halves
-                            // are Sub-Node Contract §7.1.
+                            // **A block brush tops up whatever it is aimed
+                            // at**, Sub-Node Contract §7.1. It used to top up
+                            // its own material only and step to the next block
+                            // along the face for anything else — both halves
+                            // reported from the window, and the step-off
+                            // reverted from the window on 2026-09-04: mixing is
+                            // what a player expects to be able to do, and being
+                            // moved somewhere they did not point surprised more
+                            // often than it protected.
                             //
-                            // A sub-node brush is exempt: placing one cell of
-                            // anything into a block with room is how a mixed
-                            // block gets made on purpose.
-                            let (there, holds_other) =
-                                contents(request.target.block(), &mut world, &mut source);
-                            let target = if matches!(brush, tiamot_core::dig::Brush::Block)
-                                && placed_shape.is_none()
-                            {
-                                match tiamot_core::place::landing(
-                                    request.target,
-                                    holds_other && there != 0,
-                                    request.face,
-                                ) {
-                                    Some(target) => target,
-                                    None => {
-                                        shared.tell(
-                                            &request.actor,
-                                            tiamot_core::place::Refusal::Occupied.to_string(),
-                                        );
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                request.target
-                            };
-                            let filled = if target == request.target {
-                                there
-                            } else {
-                                contents(target.block(), &mut world, &mut source).0
-                            };
+                            // Nothing is displaced by this. The per-cell air
+                            // check below is what keeps a placement additive,
+                            // and it is unchanged.
+                            let target = request.target;
+                            let filled = contents(target.block(), &mut world, &mut source);
 
                             let outcome =
                                 tiamot_core::place::plan(target, held, placed_shape, brush, filled)
