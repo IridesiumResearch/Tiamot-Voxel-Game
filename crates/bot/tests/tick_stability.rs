@@ -55,6 +55,17 @@ const TICKS: u64 = 200;
 /// number.
 const HARD_LIMIT: u32 = if cfg!(debug_assertions) { 15 } else { 5 };
 
+/// The single-tick limit past which no amount of scheduling noise explains it.
+///
+/// **Generously above [`HARD_LIMIT`], and deliberately.** A single worst sample
+/// is the wrong thing to gate on — the sustained over-budget count beside it is
+/// what tells a slow server from a shared machine — but a tick that takes most
+/// of a second is worth stopping on whatever the count says. The Windows runner
+/// produced 1.68 s on 2026-09-04 in an otherwise healthy run, so this sits
+/// above that: a gate that fires on runner noise gets muted, and a muted gate
+/// catches nothing.
+const CATASTROPHE: u32 = 60;
+
 fn stone_id() -> u16 {
     let mut registry = tiamot_core::Registry::new();
     let mut id = MaterialId::AIR;
@@ -265,6 +276,7 @@ fn worldgen_under_a_joining_player_stays_inside_the_tick_budget() {
         .build()
         .expect("runtime")
         .block_on(async {
+            let started = control.tick();
             let mut alice =
                 Bot::connect(addr, Identity::generate().expect("identity"), fingerprint)
                     .await
@@ -279,14 +291,15 @@ fn worldgen_under_a_joining_player_stays_inside_the_tick_budget() {
                 .await
                 .expect("collect");
 
+            let ran = control.tick() - started;
             let slowest = Duration::from_micros(control.slowest_tick_micros());
+            let over_budget = control.over_budget_ticks();
             let share = slowest.as_secs_f64() / TICK_DURATION.as_secs_f64() * 100.0;
             println!(
-                "worldgen load: {} chunks streamed, slowest tick {slowest:?} \
-                 ({share:.1}% of the {TICK_DURATION:?} budget), \
-                 over_budget={} dropped={}",
+                "worldgen load: {} chunks streamed over {ran} ticks, slowest tick \
+                 {slowest:?} ({share:.1}% of the {TICK_DURATION:?} budget), \
+                 over_budget={over_budget} dropped={}",
                 received.len(),
-                control.over_budget_ticks(),
                 control.dropped(),
             );
 
@@ -295,11 +308,37 @@ fn worldgen_under_a_joining_player_stays_inside_the_tick_budget() {
                 "expected {target} chunks, got {}",
                 received.len()
             );
+
+            // **The sustained check, which is the one that means something.**
+            // This test used to fail on the single worst tick against a flat
+            // 5x, and on 2026-09-04 the Windows runner produced a 1.68 s tick
+            // — 33x — in a run with **3 ticks over budget out of the whole
+            // thing and all 400 chunks delivered**. That is a runner losing
+            // the CPU, not a server that cannot generate terrain, and the
+            // failure message asserting otherwise was simply wrong.
+            //
+            // The gate its sibling above already uses, for the reasons written
+            // at the top of this file: a tenth of a run over budget is a
+            // server not keeping up, and a handful is a shared machine. The
+            // worst runner noise recorded in this file is 2 of 228.
             assert!(
-                slowest < TICK_DURATION * 5,
-                "a tick took {slowest:?} ({share:.1}% of budget) generating terrain — \
-                 over 5x is the server's own fault, not scheduling noise"
+                over_budget * 10 < ran.max(1),
+                "{over_budget} of {ran} ticks ran over the {TICK_DURATION:?} budget while \
+                 generating terrain. A tenth of a run over budget is a server that cannot \
+                 keep up, not a noisy runner."
             );
+
+            // And the catastrophe check, at the same limit the sibling uses so
+            // there is one number in this file rather than two. Past this it
+            // is not scheduling noise however few ticks it happened on.
+            assert!(
+                slowest < TICK_DURATION * CATASTROPHE,
+                "a tick took {slowest:?} ({share:.1}% of budget) generating terrain, over \
+                 {CATASTROPHE}x — {over_budget} of {ran} ticks were over budget, which is \
+                 the number to read next: a handful is a slow runner, and hundreds is a \
+                 server that stopped keeping up."
+            );
+
             if slowest > TICK_DURATION * 2 {
                 println!("NOTE: slowest tick {slowest:?} exceeded 2x budget under generation load");
             }
