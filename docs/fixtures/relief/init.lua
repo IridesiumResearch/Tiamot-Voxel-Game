@@ -24,18 +24,28 @@
 local white = game.get_block_id("core:white")
 local ground = game.get_block_id("core:ground")
 
--- Broad enough to read at the 32-chunk horizon and detailed enough to change
--- as you walk. `frequency` is inverse feature size, so 0.004 puts a hill about
--- 250 blocks across — two hundred and fifty blocks being roughly what a
--- 16-chunk view covers, a player should see a whole hill and not a slope.
-local SHAPE = { octaves = 5, frequency = 0.004, amplitude = 24.0 }
-
--- The same two fills as `core_worldgen`, for the same reason: `core:ground`
--- drinks and `core:white` does not, so one absorbing layer on top stops milk
--- pooling for ever. `base` shifts the identical field down by one block, which
--- is what makes the second fill leave exactly one layer behind.
-local SURFACE = { octaves = 5, frequency = 0.004, amplitude = 24.0, base = 0 }
-local BELOW = { octaves = 5, frequency = 0.004, amplitude = 24.0, base = -1 }
+-- **Measured, not guessed.** `amplitude` is not the peak-to-trough height its
+-- name suggests: the fractal it scales runs to roughly +/-0.42, so an amplitude
+-- of 24 buys about 20 blocks of relief in total and reads as a plain with a
+-- slight lean. That is what the first draft of this file shipped, and it is
+-- exactly what the fixture exists to avoid. Probed against the real generator
+-- over a 768-block window:
+--
+--     freq 0.004, amp  24  ->  20 blocks of spread   (reads as flat)
+--     freq 0.020, amp  24  ->  21 blocks             (flat, busier)
+--     freq 0.010, amp  60  ->  49 blocks
+--     freq 0.008, amp 110  ->  91 blocks, -49 .. +42  <- these
+--
+-- `frequency` is inverse feature size, so 0.008 puts a hill about 125 blocks
+-- across: four of them across the 512-block horizon, which is the scale that
+-- makes a level change something you can watch happen rather than a pop.
+--
+-- The two fills are `core_worldgen`'s, for its reason: `core:ground` drinks and
+-- `core:white` does not, so one absorbing layer on top stops milk pooling for
+-- ever. `base` shifts the identical field down by one block, which is what
+-- makes the second fill leave exactly one layer behind.
+local SURFACE = { octaves = 5, frequency = 0.008, amplitude = 110.0, base = 0 }
+local BELOW = { octaves = 5, frequency = 0.008, amplitude = 110.0, base = -1 }
 
 game.register_domain{ id = "hills", generator = function(buf, pos)
     buf:fill_below_heightmap(game.noise_heightmap(pos, SURFACE), ground)
@@ -56,11 +66,11 @@ game.register_on_chat(function(event)
     if to == nil then
         return
     end
-    -- **Well above the highest peak.** An amplitude of 24 summed over five
-    -- octaves cannot reach 96, so this always drops into open air rather than
-    -- into the inside of a hill. There is no fall damage in the engine — it is
-    -- a mod's rule (see `crates/core/src/path.rs`) and no mod here implements
-    -- one — so the fall costs nothing but the time.
+    -- **Well above the highest peak.** The probe above put the highest ground
+    -- at y = +49, so 96 always drops into open air rather than into the inside
+    -- of a hill. There is no fall damage in the engine — it is a mod's rule
+    -- (see `crates/core/src/path.rs`) and no mod here implements one — so the
+    -- fall costs nothing but the time.
     if not game.transfer_entity(body, to, { x = 8, y = 96, z = 8 }) then
         game.log("nowhere called " .. tostring(to))
     end
