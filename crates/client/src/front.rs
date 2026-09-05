@@ -561,6 +561,17 @@ impl Front {
                     .text("vertical view distance"),
                 )
                 .changed();
+            // **A look, not a budget.** Nothing is drawn any cheaper for being
+            // fogged; this decides how much of the far horizon is hidden behind
+            // haze, and therefore how much chunk loading a player can watch
+            // happen. See `config::FOG_DISTANCE_RANGE` for why it stops short
+            // of 1.0 at one end and of the detail radius at the other.
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut config.fog_distance, crate::config::FOG_DISTANCE_RANGE)
+                        .text("fog distance"),
+                )
+                .changed();
             ui.separator();
 
             ui.heading("Interface");

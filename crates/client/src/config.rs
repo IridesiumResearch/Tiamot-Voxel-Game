@@ -313,6 +313,17 @@ impl ShadowQuality {
 /// rather than a clamp.
 pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.75..=1.25;
 
+/// What [`Config::fog_distance`] may be set to.
+///
+/// **Never 1.0.** Fog fades from three quarters of where it becomes total, so
+/// at 1.0 full sky lands exactly on the far edge and everything just inside it
+/// is only partly hazed — which is a chunk arriving in clear air at the end of
+/// the world, the thing fog is here to hide. The bottom of the range keeps
+/// clear of the detail radius: at 0.5 of a horizon of 32 the fade still begins
+/// at 12 chunks, and Task 15b's rule is that fog must not paint over the
+/// horizon it just streamed.
+pub const FOG_DISTANCE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=0.95;
+
 /// The smallest change the interface-scale slider makes.
 ///
 /// **Reported from the window as "waaay too sensitive".** A continuous slider
@@ -432,6 +443,18 @@ pub struct Config {
     #[serde(default = "Config::default_ui_scale")]
     pub ui_scale: f32,
 
+    /// Where fog becomes total, as a share of the render distance.
+    ///
+    /// The render distance here is the HORIZON — since Task 15b the world
+    /// carries on past the chunks a client is sent in full — so this is a share
+    /// of how far the world is drawn, not of the detail radius.
+    ///
+    /// Bounded by [`FOG_DISTANCE_RANGE`]. Lower means more haze and less world;
+    /// it is a look rather than a performance setting, and nothing is drawn any
+    /// cheaper for being fogged.
+    #[serde(default = "Config::default_fog_distance")]
+    pub fog_distance: f32,
+
     /// Whether the HUD is drawn at all.
     ///
     /// Covers the crosshair and everything a mod's HUD script draws. **Not
@@ -487,6 +510,10 @@ impl Config {
 
     const fn default_debug_overlay() -> bool {
         true
+    }
+
+    const fn default_fog_distance() -> f32 {
+        0.85
     }
 
     const fn default_ui_scale() -> f32 {
@@ -614,6 +641,14 @@ impl Config {
                 self.ui_scale
             )));
         }
+        if !self.fog_distance.is_finite() || !(FOG_DISTANCE_RANGE).contains(&self.fog_distance) {
+            return Err(invalid(format!(
+                "fog_distance must be between {} and {}, not {}",
+                FOG_DISTANCE_RANGE.start(),
+                FOG_DISTANCE_RANGE.end(),
+                self.fog_distance
+            )));
+        }
         if !self.mouse_sensitivity.is_finite() || self.mouse_sensitivity <= 0.0 {
             return Err(invalid(format!(
                 "mouse_sensitivity must be positive, not {}",
@@ -660,6 +695,7 @@ impl Default for Config {
             shadow_quality: ShadowQuality::default(),
             vsync: Self::default_vsync(),
             debug_overlay: Self::default_debug_overlay(),
+            fog_distance: Self::default_fog_distance(),
             ui_scale: Self::default_ui_scale(),
             hud_visible: Self::default_hud_visible(),
             fov_degrees: Self::default_fov_degrees(),

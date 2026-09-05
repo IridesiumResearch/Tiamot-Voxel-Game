@@ -101,22 +101,6 @@ pub const REMESH_TIME_BUDGET: std::time::Duration = std::time::Duration::from_mi
 /// this exists to stop it arriving in a burst, not to make it arrive quickly.
 pub const HORIZON_BUDGET: usize = 16;
 
-/// Where fog becomes total, as a share of the horizon.
-///
-/// **Fog has to end before the world does.** `set_sky` fades from three
-/// quarters of this distance to all of it, so passing the horizon itself put
-/// full sky exactly at the far edge and left everything just inside it only
-/// partly hazed — which is a chunk arriving in clear air at the end of the
-/// world, seen from the window and reported as chunk loading you can watch.
-///
-/// At 0.85 the outermost 15% of the horizon is pure sky and nothing that
-/// arrives out there is visible arriving. The cost is that the last ring or two
-/// of summaries is never seen, which is the trade fog always is: Task 15b's
-/// rule was that fog must not start at the DETAIL radius and hide the whole
-/// horizon, and this keeps well clear of that — at a view distance of 8 the
-/// fade still begins at 20 chunks, two and a half times the detail radius.
-pub const FOG_HORIZON_FRACTION: f32 = 0.85;
-
 /// How long a frame may spend building the horizon.
 ///
 /// **Its own budget, spent after the chunks have had theirs**, so a horizon
@@ -3325,6 +3309,32 @@ impl App {
         self.config.debug_overlay
     }
 
+    /// Where fog becomes total, as a share of the render distance.
+    #[must_use]
+    pub const fn fog_distance(&self) -> f32 {
+        self.config.fog_distance
+    }
+
+    /// Moves the fog, live.
+    ///
+    /// **Live, and it has to be.** Fog is a look, and a look set from a menu
+    /// that cannot show it is set blind — this is the one setting where the
+    /// world being visible behind the slider is the point. `advance` reads
+    /// `config.fog_distance` every frame, so there is nothing to apply.
+    pub fn set_fog_distance(&mut self, share: f32) {
+        let clamped = share.clamp(
+            *crate::config::FOG_DISTANCE_RANGE.start(),
+            *crate::config::FOG_DISTANCE_RANGE.end(),
+        );
+        if (self.config.fog_distance - clamped).abs() < f32::EPSILON {
+            return;
+        }
+        self.config.fog_distance = clamped;
+        // The same flag the volume sliders use: the `App` says the settings
+        // changed and the window, which is what knows the path, writes them.
+        self.volumes_dirty = true;
+    }
+
     /// Turns the debug overlay on or off, and remembers the choice.
     pub fn set_debug_overlay(&mut self, on: bool) {
         if self.config.debug_overlay == on {
@@ -3752,12 +3762,29 @@ impl App {
     pub fn leave(self) -> (Renderer, crate::input::Bindings, crate::config::Config) {
         let Self {
             connection,
-            renderer,
+            mut renderer,
             bindings,
             config,
             ..
         } = self;
         connection.shutdown();
+        // **The meshes go with the world that made them.** The renderer is
+        // PARKED and handed to the next world — that is what makes a second
+        // Play fast — and every chunk mesh in it is terrain from a place that
+        // no longer exists, at coordinates the next world will use for its own.
+        // Reported from the window: start a world, then make a different one,
+        // and the old world's hills are standing there, unloading as the new
+        // world's chunks arrive over them.
+        //
+        // The same reasoning as a domain switch, which has cleared per-position
+        // meshes since Task 15a for exactly this reason. `Renderer::clear` was
+        // written for it and documented "for a reconnection", and had no caller
+        // at all until this.
+        //
+        // Here rather than in the window's `leave_world`, so the invariant
+        // belongs to the thing that knows what the renderer holds, and so a
+        // second caller cannot forget it.
+        renderer.clear();
         // **The config comes back too.** A world holds its own copy so that a
         // setting changed in it takes effect immediately, and the window kept
         // the copy it started with — so a scale or a volume set in game was
@@ -4233,7 +4260,7 @@ impl App {
                 moment.sky,
                 f32::from(tiamot_core::lod::horizon_for(self.granted_view).horizontal)
                     * tiamot_core::CHUNK_BLOCKS as f32
-                    * FOG_HORIZON_FRACTION,
+                    * self.config.fog_distance,
             ),
         };
         self.renderer.set_sky(sky, far);

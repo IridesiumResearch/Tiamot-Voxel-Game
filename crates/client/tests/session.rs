@@ -220,6 +220,50 @@ fn shows_a_world(frame: &client::texture::Image) -> bool {
 }
 
 #[test]
+fn leaving_a_world_hands_back_a_renderer_holding_none_of_it() {
+    // **Reported from the window**: play a world, leave it, make a DIFFERENT
+    // one, and the first world's hills are standing there — unloading only as
+    // the new world's chunks arrive over them.
+    //
+    // The renderer is parked on leaving and handed to the next world, which is
+    // what makes a second Play fast. Every chunk mesh in it is terrain from a
+    // place that no longer exists, at coordinates the next world will use for
+    // its own. A domain switch has cleared per-position meshes since Task 15a
+    // for exactly this reason; leaving a world never did, and
+    // `Renderer::clear` sat there documented "for a reconnection" with no
+    // caller at all.
+    //
+    // Asserted on the RENDERER that comes back rather than on a second join,
+    // because that is the object the next world inherits — and a test that
+    // joined twice would pass the moment the new world's chunks happened to
+    // land on the old one's coordinates, which is the case that already looked
+    // fine.
+    let Some(gpu) = gpu() else { return };
+    let server = embedded("leave-clears");
+    let mut app = client("leave-clears", &server, gpu);
+
+    assert!(
+        run_frames(&mut app, |app| app.joined() && app.meshed_chunks() >= 4),
+        "expected to join and mesh chunks; warnings: {:?}",
+        app.warnings()
+    );
+    let held = app.renderer().chunk_count();
+    assert!(
+        held >= 4,
+        "the test needs meshes to leave behind, got {held}"
+    );
+
+    let (renderer, _, _) = app.leave();
+    assert_eq!(
+        renderer.chunk_count(),
+        0,
+        "{held} chunk meshes from the world that ended were parked for the next one"
+    );
+
+    server.stop();
+}
+
+#[test]
 fn singleplayer_joins_its_own_server_and_draws_the_world() {
     // Everything Task 08 asks for except the window: an embedded server, a real
     // join over loopback, streamed chunks, meshes on the GPU, and a frame with

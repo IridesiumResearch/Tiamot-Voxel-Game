@@ -2136,6 +2136,21 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
 
             ui.separator();
             ui.heading("display");
+            // **Here as well as on the front screen**, unlike view distance and
+            // field of view, because this one is a look: a haze setting chosen
+            // from a menu with no world behind it is chosen blind. It applies
+            // as the slider moves.
+            let mut fog = app.fog_distance();
+            if ui
+                .add(
+                    egui::Slider::new(&mut fog, client::config::FOG_DISTANCE_RANGE)
+                        .text("fog distance"),
+                )
+                .changed()
+            {
+                app.set_fog_distance(fog);
+            }
+
             // **The debug overlay ships, and lives here.** Charter rule 18
             // makes frame pacing the metric, and every pacing question so far
             // was answered by somebody reading these numbers off their own
@@ -2383,8 +2398,8 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         .egui_state
         .handle_platform_output(&surface.window, output.platform_output);
 
-    // Volumes and the debug-overlay toggle live in `client.toml` beside the
-    // other settings. Saved on the same "the App raises a flag, the window
+    // Volumes, the debug-overlay toggle and the fog distance live in
+    // `client.toml` beside the other settings. Saved on the same "the App raises a flag, the window
     // knows the path" split as the bindings below. One flag for both: they are
     // the same file, and a second flag would be a second chance to forget one.
     if app.take_volumes_dirty() {
