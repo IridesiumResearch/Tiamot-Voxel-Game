@@ -568,10 +568,10 @@ const SAVE_INTERVAL_TICKS: u64 = 40;
 ///
 /// **Four, from a measurement rather than an estimate.** This was 32, on the
 /// strength of Task 02b's spike putting a full-chunk relight at about 30 µs.
-/// The real thing costs **1.38 ms** for the case that dominates a join — a
+/// The real thing costs **1.47 ms** for the case that dominates a join — a
 /// chunk of air under open sky, with its neighbours resident — so the old
-/// number was not a cap on anything: 32 of them is 44 ms of a 50 ms tick.
-/// Four is 5.5 ms, 11% of the budget, which is a bound worth having.
+/// number was not a cap on anything: 32 of them is 47 ms of a 50 ms tick.
+/// Four is 5.9 ms, 12% of the budget, which is a bound worth having.
 ///
 /// Honest about what this did and did not fix: the macro benchmark's 22 ms
 /// ticks were **not** this. Setting the cap to 4 and back to 32 moves its p99
@@ -2937,7 +2937,7 @@ impl ServerHandle {
                             // **Only if it is not already lit.** A chunk's
                             // light is kept current by every edit, so relighting
                             // one that has a layer produces the answer it
-                            // already had — at 1.38 ms a chunk (measured, see
+                            // already had — at 1.47 ms a chunk (measured, see
                             // `light::Lit`). It is not a rare case either: the
                             // players who join together are the ones who ask for
                             // the same chunks, so the second and third of them

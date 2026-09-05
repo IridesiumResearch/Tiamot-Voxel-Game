@@ -14,12 +14,21 @@
 //!
 //! # What that costs, measured
 //!
-//! **1.38 ms** for the case that dominates a join — a chunk of air under open
-//! sky with its neighbours resident — and 0.24 ms for solid rock, on the
-//! reference machine. Task 02b's spike said 30 µs, which was the number the
-//! tick's cap was sized on until this was written down; see
-//! `handle::RELIGHTS_PER_TICK`. Charter rule 18 wants the share of a 50 ms
-//! tick, and one relight is 2.8% of one.
+//! **1.47 ms** for the case that dominates a join — a chunk of air under open
+//! sky with its neighbours resident — on the reference machine, down from
+//! **2.14 ms** before the terrain reads were cached (see `Lit::blocks`). Task
+//! 02b's spike said 30 µs, which was the number the tick's cap was sized on
+//! until this was written down; see `handle::RELIGHTS_PER_TICK`. Charter rule
+//! 18 wants the share of a 50 ms tick, and one relight is 2.9% of one.
+//!
+//! **Re-measure rather than trusting this line**: `tests::measure_chunk_loaded`
+//! prints it, and the 30 µs above is what happens when a number in a doc
+//! comment outlives the code it described. The 2.14 → 1.47 figures are an A/B
+//! on one machine in one sitting, which is the only comparison worth making.
+//!
+//! Where it goes, measured the same way: **the flood is ~76% of it** and the
+//! seeding passes are the rest. Nothing else is close, so an optimisation that
+//! does not make the flood cheaper is not worth the risk.
 //!
 //! Relighting a chunk that already has light is therefore never free and never
 //! useful: the tick skips it, and `bot`'s
@@ -276,13 +285,20 @@ impl Lighting {
     ) {
         let held = self.layers.remove(&centre);
         let lit_here = held.is_some();
+        let terrain = world.solid(domain);
+        // Resolved BEFORE the struct takes ownership of the accessor: the
+        // reference outlives it either way (`Solid::resident` is tied to the
+        // world), but the borrow checker needs the read to happen first.
+        let centre_blocks = terrain.resident(centre);
         let mut lit = Lit {
-            terrain: world.solid(domain),
+            terrain,
             lighting: self,
             touched,
             centre,
             lit_here,
             layer: held.unwrap_or_else(LightLayer::dark),
+            centre_blocks,
+            memo: std::cell::Cell::new(None),
         };
         pass(&mut lit);
         let layer = lit.layer;
@@ -327,8 +343,22 @@ struct Touched {
 /// Measured on the reference machine, relighting a chunk of air under open sky
 /// with its neighbours resident: **1.56 ms before, 1.38 ms after**. Worth
 /// keeping and not the win it looks like it should be — the lookups are 12% of
-/// this, and the propagation itself is the rest. Memoising the *world* chunk
-/// the same way was measured first and bought 3%, so it was not kept.
+/// this, and the propagation itself is the rest.
+///
+/// # The terrain memo was rejected once, on a measurement that was right
+///
+/// This comment used to end "memoising the *world* chunk the same way was
+/// measured first and bought 3%, so it was not kept." That was true when it
+/// was written, and it is not true now: measured 2026-09-05, the same memo is
+/// **1.98 ms → 1.44 ms, about 28%** (three runs either side, no overlap).
+///
+/// **The order the two were tried in is the whole explanation.** The terrain
+/// memo was measured while the light-layer lookups above were still there and
+/// dominating; with those gone, the terrain lookups became the top cost and
+/// the same change is worth ten times what it was. An optimisation correctly
+/// rejected on a measurement can become the right one once something else is
+/// removed — so re-measure a rejected idea after changing what it competed
+/// with, rather than trusting the note that rejected it. This one cost a year.
 struct Lit<'a> {
     terrain: crate::world::Solid<'a>,
     lighting: &'a mut Lighting,
@@ -343,6 +373,38 @@ struct Lit<'a> {
     lit_here: bool,
     /// Its light. Owned here, so reaching it costs nothing.
     layer: LightLayer,
+    /// The centre's BLOCKS, resolved once.
+    ///
+    /// **The same trick as `layer`, for the other half of what a pass reads.**
+    /// A relight asks `faces` about 76,000 times for one chunk — eighteen times
+    /// per block, because a flood revisits — and every one of those was a
+    /// `ChunkPos` division and a `HashMap` probe before reaching the blocks.
+    /// The overwhelming majority are inside the centre, so resolving it once
+    /// turns the probe into a comparison.
+    centre_blocks: Option<&'a tiamot_core::chunk::Chunk>,
+    /// The last non-centre chunk looked up, and it.
+    ///
+    /// One entry, because the rest of what a pass touches is the ring of
+    /// neighbours it floods into and it works along one at a time. A bigger
+    /// cache would be a second copy of the map it is standing in front of.
+    memo: std::cell::Cell<Option<(ChunkPos, &'a tiamot_core::chunk::Chunk)>>,
+}
+
+impl<'a> Lit<'a> {
+    /// The blocks of whatever chunk `pos` is in, if it is resident.
+    fn blocks(&self, pos: ChunkPos) -> Option<&'a tiamot_core::chunk::Chunk> {
+        if pos == self.centre {
+            return self.centre_blocks;
+        }
+        if let Some((at, chunk)) = self.memo.get()
+            && at == pos
+        {
+            return Some(chunk);
+        }
+        let chunk = self.terrain.resident(pos)?;
+        self.memo.set(Some((pos, chunk)));
+        Some(chunk)
+    }
 }
 
 impl Lit<'_> {
@@ -363,13 +425,14 @@ impl Neighbourhood for Lit<'_> {
         // `resident` rather than `chunk`: propagation must never generate a
         // chunk. A flood reaching unexplored terrain would otherwise turn a
         // lamp into unbounded worldgen inside the tick, which is the same trap
-        // collision documents at `World::resident`.
-        let chunk = self.terrain.resident(pos.chunk())?;
+        // collision documents at `World::resident`. `blocks` preserves that —
+        // it caches what `resident` returned and never asks for more.
+        let chunk = self.blocks(pos.chunk())?;
         Some(chunk.faces(pos.local()))
     }
 
     fn emission(&self, pos: BlockPos) -> Light {
-        let Some(chunk) = self.terrain.resident(pos.chunk()) else {
+        let Some(chunk) = self.blocks(pos.chunk()) else {
             return Light::DARK;
         };
         self.lighting
@@ -725,5 +788,47 @@ mod tests {
             touched.contains(&next),
             "the neighbour went dark and was not reported: {touched:?}"
         );
+    }
+
+    /// What relighting one chunk costs, for the case that dominates a join.
+    ///
+    /// **Ignored: it measures rather than asserts.** A timing assertion here
+    /// would be a gate on shared silicon, which this repository has learned
+    /// twice not to write. Run it by hand — `cargo test -p server
+    /// measure_chunk_loaded -- --ignored --nocapture` — when changing anything
+    /// on the relight path, and put the number in the module docs.
+    ///
+    /// The module docs quoted 1.38 ms from Task 10 and nothing re-measured it;
+    /// Task 02b's 30 µs went stale the same way and `RELIGHTS_PER_TICK` was
+    /// sized on it. This exists so the next number does not have to be
+    /// archaeology.
+    #[test]
+    #[ignore = "measures rather than asserts; run by hand"]
+    fn measure_chunk_loaded() {
+        // **The case the module docs quote**: a chunk of air under OPEN SKY —
+        // nothing resident above it — with its neighbours resident.
+        let mut world = world();
+        let mut light = lighting();
+        for x in -1..=1 {
+            for z in -1..=1 {
+                for y in -1..=0 {
+                    resident(&mut world, ChunkPos::new(x, y, z));
+                }
+            }
+        }
+        let centre = ChunkPos::new(0, 0, 0);
+        for _ in 0..20 {
+            light.forget(centre);
+            light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, centre);
+        }
+        let mut total = std::time::Duration::ZERO;
+        const N: u32 = 200;
+        for _ in 0..N {
+            light.forget(centre);
+            let t = std::time::Instant::now();
+            light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, centre);
+            total += t.elapsed();
+        }
+        println!("chunk_loaded (air, open sky): mean {:?}", total / N);
     }
 }

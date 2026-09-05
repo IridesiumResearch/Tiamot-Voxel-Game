@@ -1285,14 +1285,18 @@ pub struct Solid<'a> {
     space: Option<&'a Space>,
 }
 
-impl Solid<'_> {
+impl<'a> Solid<'a> {
     /// One of this domain's chunks, if it is in memory.
     ///
     /// Never loads and never generates: a caller holding one of these is inside
     /// a tick, and pulling a chunk off the disk there is how a body walking
     /// into unexplored ground stalls the whole server.
+    ///
+    /// **The reference is tied to the world, not to the borrow of `self`**, so
+    /// a caller can resolve one chunk and hold it across many reads. Lighting
+    /// does exactly that, tens of thousands of times per relight.
     #[must_use]
-    pub fn resident(&self, pos: ChunkPos) -> Option<&Chunk> {
+    pub fn resident(&self, pos: ChunkPos) -> Option<&'a Chunk> {
         self.space?.cache.get(&pos)
     }
 }
