@@ -550,8 +550,15 @@ impl Front {
                 .changed();
             changed |= ui
                 .add(
-                    egui::Slider::new(&mut config.vertical_view_distance, 1..=12)
-                        .text("vertical view distance"),
+                    // To the engine's own ceiling, not to the default. The
+                    // top of this was 12, which became the default on
+                    // 2026-09-05 — a slider that cannot be moved up from
+                    // where it starts is a setting that looks broken.
+                    egui::Slider::new(
+                        &mut config.vertical_view_distance,
+                        1..=tiamot_core::interest::ViewDistance::MAXIMUM.vertical,
+                    )
+                    .text("vertical view distance"),
                 )
                 .changed();
             ui.separator();

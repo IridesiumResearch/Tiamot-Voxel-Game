@@ -54,10 +54,11 @@ world_path = "singleplayer"
 # request and the limit are the same number and you always get what you ask.
 view_distance = 8
 
-# How far to render vertically, in chunks. Smaller than the horizontal radius
-# on purpose: players move horizontally far more than vertically. Requested and
-# capped exactly as the horizontal radius is.
-vertical_view_distance = 4
+# How far to render vertically, in chunks. LARGER than the horizontal radius,
+# at one and a half times it: the surface a player is looking at goes up and
+# down, and a hilltop puts the valley floor a hundred blocks below them.
+# Requested and capped exactly as the horizontal radius is.
+vertical_view_distance = 12
 
 # How the world is drawn. A debugging aid, not a lighting setting — see
 # `lighting_mode` below for that.

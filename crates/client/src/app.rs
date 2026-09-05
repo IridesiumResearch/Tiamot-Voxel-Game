@@ -101,6 +101,22 @@ pub const REMESH_TIME_BUDGET: std::time::Duration = std::time::Duration::from_mi
 /// this exists to stop it arriving in a burst, not to make it arrive quickly.
 pub const HORIZON_BUDGET: usize = 16;
 
+/// Where fog becomes total, as a share of the horizon.
+///
+/// **Fog has to end before the world does.** `set_sky` fades from three
+/// quarters of this distance to all of it, so passing the horizon itself put
+/// full sky exactly at the far edge and left everything just inside it only
+/// partly hazed — which is a chunk arriving in clear air at the end of the
+/// world, seen from the window and reported as chunk loading you can watch.
+///
+/// At 0.85 the outermost 15% of the horizon is pure sky and nothing that
+/// arrives out there is visible arriving. The cost is that the last ring or two
+/// of summaries is never seen, which is the trade fog always is: Task 15b's
+/// rule was that fog must not start at the DETAIL radius and hide the whole
+/// horizon, and this keeps well clear of that — at a view distance of 8 the
+/// fade still begins at 20 chunks, two and a half times the detail radius.
+pub const FOG_HORIZON_FRACTION: f32 = 0.85;
+
 /// How long a frame may spend building the horizon.
 ///
 /// **Its own budget, spent after the chunks have had theirs**, so a horizon
@@ -4205,15 +4221,19 @@ impl App {
         // through the surface is milk, not sky.
         let (sky, far) = match self.submerged_in() {
             Some(fluid) => (self.store.fluid_colour(fluid), UNDERWATER_VISIBILITY),
-            // **The HORIZON, not the detail radius.** Since Task 15b the world
-            // carries on past the chunks a client is sent in full, drawn from
-            // summaries — and fog at the detail radius would hide every one of
-            // them behind haze, which is a horizon streamed, meshed, drawn, and
-            // then painted over.
+            // **The HORIZON, not the detail radius, and inside it.** Since
+            // Task 15b the world carries on past the chunks a client is sent
+            // in full, drawn from summaries — and fog at the detail radius
+            // would hide every one of them behind haze, which is a horizon
+            // streamed, meshed, drawn and then painted over. But fog that
+            // becomes total exactly AT the far edge hides nothing arriving
+            // there, which is what a chunk popping into clear air at the end
+            // of the world looks like. See [`FOG_HORIZON_FRACTION`].
             None => (
                 moment.sky,
                 f32::from(tiamot_core::lod::horizon_for(self.granted_view).horizontal)
-                    * tiamot_core::CHUNK_BLOCKS as f32,
+                    * tiamot_core::CHUNK_BLOCKS as f32
+                    * FOG_HORIZON_FRACTION,
             ),
         };
         self.renderer.set_sky(sky, far);

@@ -60,10 +60,12 @@ view_distance = 8
 # How far players can see vertically, in chunks. Clamped to 1..=16, and a
 # ceiling on what clients may ask for exactly as the horizontal radius is.
 #
-# Smaller than the horizontal radius on purpose: players move horizontally far
-# more than vertically, and the interesting content is a thin shell around the
-# surface.
-vertical_view_distance = 4
+# LARGER than the horizontal radius, at one and a half times it. The interesting
+# content is a thin shell around the surface, but that surface goes up and down:
+# a player on a hilltop is looking at a valley floor a hundred blocks below, and
+# a vertical radius of 4 leaves it outside the world. Twelve chunks is 192
+# blocks either way.
+vertical_view_distance = 12
 
 # Remote administration over loopback TCP. Absent means NO admin port is open,
 # which is the right default for something carrying `stop` and `rebind`.

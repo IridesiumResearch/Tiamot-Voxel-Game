@@ -69,14 +69,28 @@ impl Default for ViewDistance {
 }
 
 impl ViewDistance {
-    /// The default: 8 chunks out, 4 up and down.
+    /// The default: 8 chunks out, 12 up and down.
     ///
     /// 8 chunks is 128 blocks, which at 1 block = 1 yard is a horizon a little
     /// over a tenth of a mile away. Far enough to feel like a landscape, close
     /// enough that 50 players' interest sets fit in the tick budget.
+    ///
+    /// **The vertical is 1.5x the horizontal, not half of it.** It was 4 — 64
+    /// blocks — until 2026-09-05, which is less relief than a landscape has.
+    /// Reported from the window: standing on a hilltop with a valley floor 90
+    /// blocks below, the floor is outside the interest set and the world has a
+    /// hole where the ground should be. The module's own argument for a
+    /// cylinder is that content is a thin shell around the SURFACE, and a
+    /// surface that moves up and down is exactly what a vertical of 4 fails to
+    /// hold.
+    ///
+    /// It costs: 1,773 chunks becomes 4,925, so a default view fills in ~15 s
+    /// rather than ~6 at 16 chunks a tick. The per-tick cost is unchanged —
+    /// that is capped by `CHUNKS_PER_TICK`, not by the size of the set — so
+    /// what this spends is time-to-fill and memory, not tick budget.
     pub const DEFAULT: Self = Self {
         horizontal: 8,
-        vertical: 4,
+        vertical: 12,
     };
 
     /// The smallest useful view: the chunk you are in and its neighbours.
@@ -209,32 +223,46 @@ pub fn contains(centre: ChunkPos, view: ViewDistance, pos: ChunkPos) -> bool {
 /// How much a chunk of vertical separation counts for, in chunks of horizontal,
 /// once it is more than [`VERTICAL_FREE`] layers away.
 ///
-/// Six. A chunk three layers up is ordered as though it were twelve chunks away
+/// Four. A chunk four layers up is ordered as though it were eight chunks away
 /// along the ground, so the streaming budget goes on the band a player is
 /// looking along before it goes on the sky.
 ///
-/// **Why six and not more.** The vertical reach at the edge of the view is
-/// `view / VERTICAL_WEIGHT + VERTICAL_FREE` chunks — five layers, 80 blocks, at
-/// a view distance of 24. That has to cover the height of the terrain, or the
-/// tops of distant hills sort behind the sky above the player's head and arrive
-/// last, which is the failure this exists to fix wearing a different hat.
+/// **Why four, and why it was six for a day.** The vertical reach at the edge
+/// of the view is `view / VERTICAL_WEIGHT + VERTICAL_FREE` chunks — eight
+/// layers, 128 blocks, at a view distance of 24. **That has to cover the height
+/// of the terrain.** At six it covered five layers, and the failure this exists
+/// to fix simply put its hat on the other way round: reported from the window
+/// as the bottoms of valleys vanishing. Standing on a hilltop with 98 blocks of
+/// relief below, a valley floor five layers down and five chunks away sorted at
+/// 601 against a view edge of 576 — behind every chunk at eye level all the way
+/// out to 24.
+///
+/// The trade, measured over the whole set at view 24 / vertical 12: an
+/// unweighted order serves 92% of it before the player's own layer reaches the
+/// view edge, six served 29%, and four serves 48%. Most of the win, and it
+/// reaches deep enough to hold a landscape.
 ///
 /// **Order only.** This never decides membership — [`contains`] is the cylinder
 /// and does not consult it — so nothing is dropped from a player's interest set
 /// by being high or low, it merely comes later.
-pub const VERTICAL_WEIGHT: i64 = 6;
+pub const VERTICAL_WEIGHT: i64 = 4;
 
 /// How many layers either side of a player are as urgent as the ground beside
 /// them.
 ///
-/// One, and it is not a tuning knob. The chunk directly below a player is the
-/// ground under their feet and the chunk directly above is the ceiling over
-/// their head; both are as immediate as anything at the same height, and a
-/// weight applied from zero puts them behind ~50 chunks of the player's own
-/// layer. That is not theoretical: `a_mod_can_read_the_world_it_writes_to`
-/// went red on the first version of this, because a mod read the terrain at
-/// `y = -1` on join and the chunk holding it had not arrived.
-pub const VERTICAL_FREE: i64 = 1;
+/// Two. The chunk directly below a player is the ground under their feet and
+/// the chunk directly above is the ceiling over their head; both are as
+/// immediate as anything at the same height, and a weight applied from zero
+/// puts them behind ~50 chunks of the player's own layer. That is not
+/// theoretical: `a_mod_can_read_the_world_it_writes_to` went red on the first
+/// version of this, because a mod read the terrain at `y = -1` on join and the
+/// chunk holding it had not arrived.
+///
+/// **At least one is load-bearing; the second is for standing on things.** A
+/// player is rarely level with what they are looking at — they are on a ridge,
+/// a roof, or a stair — and the two layers either side of them are the ones a
+/// step in any direction makes immediate.
+pub const VERTICAL_FREE: i64 = 2;
 
 /// The distance chunks are STREAMED in the order of: horizontal distance, with
 /// the vertical weighted by [`VERTICAL_WEIGHT`] past [`VERTICAL_FREE`] layers.
@@ -335,6 +363,43 @@ mod tests {
             "the player's own layer is not finished by the time the view edge \
              is reached: last at {last_of_own}, edge at {before_the_edge}"
         );
+    }
+
+    #[test]
+    fn a_valley_floor_nearby_comes_before_the_horizon_at_eye_level() {
+        // **Reported from the window**: "the bottoms of valleys vanish."
+        //
+        // The vertical weight exists so the budget is not spent on sky, and
+        // the way it goes wrong is the same failure upside down — a player
+        // standing on a hilltop is looking DOWN at the terrain they care
+        // about, and weighting it away puts the valley behind every chunk at
+        // their own height out to the edge of the view. At a weight of 6 a
+        // floor five layers down and five chunks away sorted at 601 against a
+        // view edge of 576; it lost to terrain twenty-four chunks off.
+        //
+        // Asserted as an ORDER between two positions rather than against a
+        // threshold, because the threshold is a fact about one view distance
+        // and the property is not.
+        let view = ViewDistance::clamped(24, 12);
+        let chunks = chunks_around(ORIGIN, view);
+        let index = |pos: ChunkPos| {
+            chunks
+                .iter()
+                .position(|got| *got == pos)
+                .unwrap_or_else(|| panic!("{pos:?} should be in the interest set"))
+        };
+
+        // Relief a landscape actually has: the `relief` fixture spans 98
+        // blocks, which is six chunk layers.
+        for layers in 1..=6 {
+            let valley = ChunkPos::new(5, -layers, 0);
+            let far_horizon = ChunkPos::new(20, 0, 0);
+            assert!(
+                index(valley) < index(far_horizon),
+                "a valley floor {layers} layers down and 5 chunks away is streamed after \
+                 terrain 20 chunks away at eye level"
+            );
+        }
     }
 
     #[test]
@@ -466,7 +531,7 @@ mod tests {
         assert_eq!(ViewDistance::clamped(200, 200), ViewDistance::MAXIMUM);
         assert_eq!(ViewDistance::clamped(0, 0), ViewDistance::MINIMUM);
         assert_eq!(
-            ViewDistance::clamped(8, 4),
+            ViewDistance::clamped(8, 12),
             ViewDistance::DEFAULT,
             "a value already in range passes through"
         );
@@ -488,9 +553,16 @@ mod tests {
     fn the_default_view_is_a_sane_number_of_chunks() {
         // A number worth knowing rather than discovering under load: this is
         // what one player costs at 50 players a server.
+        //
+        // **Widened on 2026-09-05 when the vertical went from 4 to 12**, which
+        // took the default from 1,773 chunks to 4,925. The bound is here to
+        // catch a default nobody meant to change, so it moves when somebody
+        // means to — and the number it is guarding is time-to-fill and memory,
+        // not tick budget, which `CHUNKS_PER_TICK` caps regardless of how big
+        // the set is.
         let chunks = chunks_around(ORIGIN, ViewDistance::DEFAULT);
         assert!(
-            (1500..2200).contains(&chunks.len()),
+            (4000..5500).contains(&chunks.len()),
             "the default view is {} chunks, which is outside the range this \
              engine's budgets were sized for",
             chunks.len()
