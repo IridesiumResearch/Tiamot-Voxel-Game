@@ -7,12 +7,28 @@
 which is GPL-3.0-only. Everything under this directory carries the SPDX header
 `MIT`, and CI enforces that.
 
-This directory is empty for now. It will hold the things a mod author needs to
-copy into their own project:
+What a mod author needs to copy into their own project.
 
-- Lua API stubs and type definitions, for editor completion and type checking
-- Mod API reference documentation
-- The mod template (Task 16)
+## What is here now
+
+**[`stubs/game.lua`](stubs/game.lua)** — the whole mod API as LuaLS `---@meta`
+annotations: every function, every options table, every field, with the reason
+each behaves the way it does. Point your editor at it and you get completion,
+signatures and type checking against the real API.
+
+**It is complete, and CI keeps it that way.** `scripts/check-stubs.sh` fails the
+build if the engine registers a `game.*` function this file does not document,
+so it cannot quietly fall behind the engine the way hand-written API docs do.
+That makes it the one file worth reading end to end before writing a mod — and
+the one worth handing to a tool that is going to write one with you.
+
+## What is not here yet
+
+- The mod template (Task 16).
+- Prose documentation. Until it exists, the stubs carry the reference material
+  in their doc comments, and [`../game/`](../game/) holds worked examples —
+  every mod in it is written through this API and nothing else, which is a rule
+  the build enforces rather than an intention.
 
 ## Why MIT and not GPL
 
