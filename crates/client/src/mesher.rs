@@ -89,13 +89,30 @@ pub const NEIGHBOUR_COUNT: usize = 6;
 pub struct Neighbours<'a> {
     /// −x, +x, −y, +y, −z, +z.
     pub sides: [Option<&'a Chunk>; NEIGHBOUR_COUNT],
+    /// Whether a side with no chunk is nonetheless DRAWN, coarsely.
+    ///
+    /// **The difference between "the world stops here" and "the world carries
+    /// on at a lower resolution".** Past the detail radius a client holds
+    /// summaries rather than chunks, so `sides` is `None` there and always
+    /// will be — that position is never going to arrive in full. Walling
+    /// against it under [`Absent::Air`] puts a permanent ring of faces around
+    /// the detail radius, in front of the horizon it was streamed to show.
+    ///
+    /// Reported from the window as a ring of chunks about eight out. Absent
+    /// AND uncovered is the streaming frontier and gets a wall; absent but
+    /// covered is the LOD boundary and gets nothing, because the summary
+    /// beyond it is already drawing that terrain.
+    pub summarised: [bool; NEIGHBOUR_COUNT],
 }
 
 impl<'a> Neighbours<'a> {
-    /// No neighbours loaded.
+    /// No neighbours loaded, and nothing drawn beyond them.
     #[must_use]
     pub const fn none() -> Self {
-        Self { sides: [None; 6] }
+        Self {
+            sides: [None; 6],
+            summarised: [false; 6],
+        }
     }
 
     /// Every neighbour absent, treated as **air** rather than solid.
@@ -104,11 +121,21 @@ impl<'a> Neighbours<'a> {
     /// boundary faces would hide the geometry under test.
     #[must_use]
     pub const fn open() -> Self {
-        Self { sides: [None; 6] }
+        Self {
+            sides: [None; 6],
+            summarised: [false; 6],
+        }
     }
 
     fn side(&self, axis: usize, positive: bool) -> Option<&'a Chunk> {
         self.sides[axis * 2 + usize::from(positive)]
+    }
+
+    /// Whether an absent side should be treated as solid, given the policy.
+    ///
+    /// A summarised side always is: something is drawing that terrain already.
+    fn absent_is_solid(&self, axis: usize, positive: bool, absent: Absent) -> bool {
+        absent == Absent::Solid || self.summarised[axis * 2 + usize::from(positive)]
     }
 }
 
@@ -369,12 +396,12 @@ impl SubNodeGrid {
 
     /// Fills bit 0 and bit 49 of every column from the adjacent chunk.
     fn seed_padding(&mut self, neighbours: &Neighbours<'_>, absent: Absent) {
-        let solid_when_absent = absent == Absent::Solid;
         let per_axis = SUBNODES_PER_AXIS as usize;
         let last = tiamot_core::CHUNK_BLOCKS as i32;
 
         for (axis, positive) in FACES {
             let neighbour = neighbours.side(axis, positive);
+            let solid_when_absent = neighbours.absent_is_solid(axis, positive, absent);
             // The bit this side writes: 0 for the −1 neighbour, 49 for the +48.
             let bit = if positive { FIRST + N as u32 } else { 0 };
             // The plane of the NEIGHBOUR that touches us: its last cell if it
@@ -1923,7 +1950,7 @@ pub mod reference {
         cell: [usize; 3],
     ) -> bool {
         let Some(neighbour) = neighbours.sides[axis * 2 + usize::from(positive)] else {
-            return absent == Absent::Solid;
+            return neighbours.absent_is_solid(axis, positive, absent);
         };
         let mut probe = cell;
         probe[axis] = if positive { 0 } else { N - 1 };

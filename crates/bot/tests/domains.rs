@@ -206,6 +206,84 @@ async fn settle_for(bot: &mut Bot, ticks: u64) {
 }
 
 #[test]
+fn a_block_can_be_placed_in_a_domain_where_the_overworld_is_solid() {
+    // **Reported from the window**: in a mod's domain with hills either side of
+    // zero, nothing could be placed on half the terrain, and digging was fine.
+    //
+    // The placement path read what a block already holds from `OVERWORLD`
+    // while every other line in it used the domain the player was in. The mask
+    // came back describing terrain from somewhere else, and `place::plan`
+    // refused a block brush wherever the overworld happened to be solid at
+    // those coordinates — for the reference generator, everything below y = 0.
+    // Digging never asks that question, which is why only half the report
+    // looked broken.
+    //
+    // So: a domain whose floor is at y = -16, and a placement at y = -8. There
+    // the domain is air and the overworld is solid rock, which is exactly the
+    // disagreement.
+    let server = start(
+        "place-in-domain",
+        write_mod(
+            "place-in-domain",
+            "game.register_domain{ id = 'cellar', generator = function(buf, pos)\n\
+             \x20   buf:fill_below_heightmap(game.flat_heightmap(-16), ground)\n\
+             end }\n\
+             game.register_on_chat(function(event)\n\
+             \x20   if event.text == 'cellar' then\n\
+             \x20       local body = game.player_entity(event.player)\n\
+             \x20       game.transfer_entity(body, 'places:cellar', { x = 8, y = -8, z = 8 })\n\
+             \x20       game.give(event.player, { material = 'places:ground', units = 27 })\n\
+             \x20       return false\n\
+             \x20   end\n\
+             end)",
+        ),
+    );
+    block_on(async {
+        let mut bot = join(&server, "Mason").await;
+        settle_for(&mut bot, 40).await;
+        bot.chat("cellar").await.expect("chat");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while switched_to(&bot).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never moved to the cellar"
+            );
+            bot.recv().await.expect("recv");
+        }
+        settle_for(&mut bot, 60).await;
+
+        let ground = bot
+            .material_table()
+            .expect("a material table")
+            .iter()
+            .find(|entry| entry.name == "places:ground")
+            .map(|entry| entry.id)
+            .expect("the mod registers places:ground");
+
+        // Beside the player, in open air well above the cellar's floor and
+        // well below the overworld's surface.
+        let at = tiamot_core::BlockPos::new(10, -8, 8);
+        let cell = tiamot_core::SubNodePos::new(at.x * 3 + 1, at.y * 3 + 1, at.z * 3 + 1);
+        bot.place_from_inventory(cell, ground).await.expect("send");
+
+        if bot
+            .expect_block(at, ground, Duration::from_secs(15))
+            .await
+            .is_err()
+        {
+            panic!(
+                "nothing was placed in the cellar; the server said {:?}",
+                bot.notices()
+            );
+        }
+
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
 fn a_player_moved_to_another_domain_is_told_and_starts_again() {
     // The end-to-end shape of a transfer: a mod asks, the engine performs it,
     // and the client is told once that everything it holds is now wrong.

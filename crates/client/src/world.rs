@@ -674,12 +674,17 @@ impl ChunkStore {
     #[must_use]
     pub fn neighbours(&self, pos: ChunkPos) -> Neighbours<'_> {
         let mut sides = [None; 6];
+        let mut summarised = [false; 6];
         for (index, (dx, dy, dz)) in NEIGHBOUR_OFFSETS.iter().enumerate() {
-            sides[index] = self
-                .chunks
-                .get(&ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz));
+            let at = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+            sides[index] = self.chunks.get(&at);
+            // **A side past the detail radius is never going to arrive in
+            // full.** It holds a summary and the horizon pass draws it, so
+            // walling against it would hide the terrain it is drawing. See
+            // `Neighbours::summarised`.
+            summarised[index] = sides[index].is_none() && self.summaries.contains_key(&at);
         }
-        Neighbours { sides }
+        Neighbours { sides, summarised }
     }
 
     /// Takes up to `budget` chunks to remesh, nearest to `centre` first.
@@ -1182,6 +1187,41 @@ mod tests {
                 "side {index} pointed at the wrong chunk"
             );
         }
+    }
+
+    #[test]
+    fn a_summarised_neighbour_is_not_walled_against() {
+        // **The other half of [`ABSENT_POLICY`], and the regression that made
+        // it exist.** Past the detail radius a client holds summaries rather
+        // than chunks, so `neighbours` finds nothing there and never will —
+        // that position is not going to arrive in full. Walling against it put
+        // a PERMANENT ring of faces around the detail radius, standing in
+        // front of the horizon it was streamed to show. Reported from the
+        // window as a ring of chunks about eight out.
+        //
+        // Absent and uncovered is the streaming frontier and gets a wall;
+        // absent but summarised is the LOD boundary and gets nothing, because
+        // the horizon pass is already drawing that terrain.
+        let mut store = ChunkStore::new();
+        store.insert(solid_at(0, 0, 0));
+        for (dx, dy, dz) in NEIGHBOUR_OFFSETS {
+            store.set_summary(ChunkPos::new(dx, dy, dz), summary(1, STONE.0));
+        }
+
+        let chunk = store.get(ChunkPos::new(0, 0, 0)).expect("just inserted");
+        let mesh = crate::mesher::mesh_chunk(
+            chunk,
+            &store.neighbours(ChunkPos::new(0, 0, 0)),
+            ABSENT_POLICY,
+            &crate::shade::Uniform(Light::DAYLIGHT),
+            &crate::mesher::NoFluid,
+        );
+        assert!(
+            mesh.is_empty(),
+            "a chunk whose neighbours are all summarised drew {} quads — that is a wall \
+             in front of the horizon",
+            mesh.quads.len()
+        );
     }
 
     #[test]

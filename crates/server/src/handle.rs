@@ -2524,11 +2524,26 @@ impl ServerHandle {
                             });
 
                             // **What a block already holds**, as a mask of
-                            // occupied cells.
+                            // occupied cells, IN THE DOMAIN THE PLAYER IS IN.
+                            //
+                            // This read `OVERWORLD` until 2026-09-06, while
+                            // every other line in the placement path used
+                            // `building_in`. In any other space the mask came
+                            // back describing terrain from somewhere else, and
+                            // `place::plan` refused a block brush wherever the
+                            // OVERWORLD happened to be solid at those
+                            // coordinates — which for the reference generator
+                            // is everything below y = 0.
+                            //
+                            // Reported from the window: in a mod's domain with
+                            // hills either side of zero, nothing could be
+                            // placed on half the terrain and digging was fine.
+                            // Digging never asks this question.
                             let contents = |at: tiamot_core::BlockPos,
+                                                domain: &str,
                                                 world: &mut crate::world::World,
                                                 source: &mut dyn crate::world::ChunkSource| {
-                                world.block_cells(tiamot_core::domain::OVERWORLD, at, source).map_or(0, |cells| {
+                                world.block_cells(domain, at, source).map_or(0, |cells| {
                                     let mut mask = 0;
                                     for (index, cell) in cells.iter().enumerate() {
                                         if !cell.is_air() {
@@ -2553,7 +2568,8 @@ impl ServerHandle {
                             // check below is what keeps a placement additive,
                             // and it is unchanged.
                             let target = request.target;
-                            let filled = contents(target.block(), &mut world, &mut source);
+                            let filled =
+                                contents(target.block(), &building_in, &mut world, &mut source);
 
                             let outcome =
                                 tiamot_core::place::plan(target, held, placed_shape, brush, filled)

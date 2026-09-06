@@ -226,7 +226,10 @@ fn one_body_of_milk_crossing_a_chunk_seam_draws_nothing_there() {
 
     let mesh = mesher::mesh_chunk(
         &chunk,
-        &Neighbours { sides },
+        &Neighbours {
+            sides,
+            summarised: [false; 6],
+        },
         Absent::Solid,
         &DAY,
         &Everywhere,
