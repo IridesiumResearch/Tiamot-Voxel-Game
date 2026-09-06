@@ -11,6 +11,12 @@ What a mod author needs to copy into their own project.
 
 ## What is here now
 
+**[`AGENTS.md`](AGENTS.md)** — how to write a mod, written for an AI coding
+assistant and the person supervising it. Copy it to the root of a mod project
+under that name and most assistants load it on their own. It is mostly about the
+five rules an assistant carrying habits from other voxel engines breaks without
+noticing, four of which fail quietly.
+
 **[`stubs/game.lua`](stubs/game.lua)** — the whole mod API as LuaLS `---@meta`
 annotations: every function, every options table, every field, with the reason
 each behaves the way it does. Point your editor at it and you get completion,

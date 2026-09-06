@@ -52,6 +52,11 @@ Two more directories sit outside the workspace: [`game/`](game/) holds reference
 mods and test fixtures, and [`api/`](api/) holds the MIT-licensed mod-facing
 stubs and documentation.
 
+**Writing a mod?** Start at [`api/AGENTS.md`](api/AGENTS.md) — a brief written
+for an AI coding assistant and whoever is supervising it — and keep
+[`api/stubs/game.lua`](api/stubs/game.lua) open, which is the whole API and
+which CI will not let fall behind the engine.
+
 ## Supported targets
 
 **x86_64** (SSE2 baseline) and **aarch64**, on Linux, Windows, and macOS.
