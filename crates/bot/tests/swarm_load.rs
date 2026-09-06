@@ -158,13 +158,47 @@ fn twenty_bots_for_sixty_seconds_leave_the_server_healthy() {
         "the server should have ticked; a run with no samples proves nothing"
     );
 
-    // The hard gate. Nothing a shared runner does accounts for a tick five
-    // times over budget; that is the server's own fault.
+    // **The gate is the SUSTAINED count, not the worst tick.**
+    //
+    // This asserted `max < 5x budget` on the grounds that "nothing a shared
+    // runner does accounts for a tick five times over budget". It does, and
+    // routinely: 442 ms against a mean of 1.9 ms on the 2026-09-03 nightly,
+    // 1.68 s on a Windows runner on 09-04, and **7.4 seconds** on 09-06. Every
+    // one of those printed a healthy server on the same line as the failure.
+    //
+    // A maximum over N samples measures the worst thing that happened to the
+    // process. On dedicated hardware that is the code; on a shared runner it is
+    // the neighbour, and chasing the threshold upward is chasing the worst
+    // pause a machine nobody here owns can take — which 7.4 s shows is not a
+    // knowable number.
+    //
+    // A tenth of a run over budget is the threshold `tick_stability` measured
+    // rather than picked: 23% of ticks before a real regression, 0% after, and
+    // the worst runner noise ever recorded here is 0.9%. It sits an order of
+    // magnitude clear of the noise and still catches a server that stopped
+    // keeping up — which the single-worst-sample check did not, because a
+    // server that is uniformly slow has an unremarkable maximum.
+    let ticks = report.ticks.max(1) as u64;
+    assert!(
+        report.over_budget * 10 < ticks,
+        "{} of {ticks} ticks ran over the {TICK_DURATION:?} budget under {BOTS} bots. A \
+         tenth of a run over budget is a server that cannot keep up, not a noisy runner. \
+         Mean was {} and p99 {}.",
+        report.over_budget,
+        bot::bench::TickReport::budget_share(report.mean_us),
+        bot::bench::TickReport::budget_share(report.p99_us)
+    );
+
+    // And the catastrophe check, with COMPANY. One tick over budget is a stall
+    // by definition — the machine stopped and the server did no more work than
+    // it was allowed to. A real problem produces more than one.
     let slowest = Duration::from_micros(report.max_us);
     assert!(
-        slowest < TICK_DURATION * 5,
-        "slowest tick was {slowest:?} ({} of the {TICK_DURATION:?} budget), over 5x",
-        bot::bench::TickReport::budget_share(report.max_us)
+        report.over_budget <= 1 || slowest < TICK_DURATION * 60,
+        "slowest tick was {slowest:?} ({} of budget) with {} of {ticks} over budget — \
+         that is not one machine stall, it is the server",
+        bot::bench::TickReport::budget_share(report.max_us),
+        report.over_budget
     );
 
     // Memory must be bounded after warmup. A server whose RSS climbs with

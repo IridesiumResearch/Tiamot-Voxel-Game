@@ -622,13 +622,42 @@ pub struct PlacementRequest {
 /// happens on the single simulation thread, and it comes out of the same 50 ms
 /// every other system spends. Serving requests oldest-first shares it fairly
 /// without needing per-client accounting.
-pub const CHUNKS_PER_TICK: usize = 16;
-
-/// How many chunks one connection may have outstanding at once.
 ///
-/// Caps a single player's share of the queue so one client joining cannot
-/// starve everyone else's updates while its 1800-chunk interest set drains.
-pub const CHUNKS_IN_FLIGHT_PER_CLIENT: usize = 4;
+/// # The number is arithmetic, not caution
+///
+/// Serving one chunk costs, measured on the reference machine:
+///
+/// | | |
+/// |---|---|
+/// | worldgen through a mod's `on_generate` | ~170–320 µs |
+/// | encode and compress | ~10 µs |
+/// | **lighting it** | **1.44 ms** |
+///
+/// So this many chunks is `n × ~1.5 ms` of a 50 ms tick, and **lighting is
+/// four fifths of it**. Anything that changes what a chunk costs changes what
+/// this number should be, and the two have to move together or the budget
+/// stops meaning anything — which is the whole argument for writing the
+/// arithmetic down here rather than the conclusion.
+///
+/// **Raised from 16 to 22 on 2026-09-07.** Caching the terrain a relight reads
+/// (`cb52915`) took lighting from 1.98 ms to 1.44 ms, so sixteen chunks fell
+/// from 63% of a tick to 46%. Twenty-two restores the share the server was
+/// already running at, for tick time that was already being spent, and fills a
+/// world about 37% faster. Charter rule 18 owns that 50 ms and the decision to
+/// spend it back was the copyright holder's, not a tidy-up.
+///
+/// What it does NOT do is make room for more: 63% is the ceiling this has been
+/// tested at, and the next increase needs lighting to get cheaper again rather
+/// than a bigger appetite.
+pub const CHUNKS_PER_TICK: usize = 22;
+
+/// The fewest chunks one connection may have outstanding, however busy.
+///
+/// A player's share is [`CHUNKS_PER_TICK`] divided by how many players there
+/// are — see [`Shared::chunks_in_flight_per_client`] — and this is the floor
+/// under that division, so a full server still streams for everybody rather
+/// than stopping for the last one to join.
+pub const MIN_CHUNKS_IN_FLIGHT: usize = 2;
 
 /// How many horizon summaries one connection may have outstanding at once.
 ///
@@ -838,6 +867,42 @@ impl Shared {
         if let Ok(mut bodies) = self.bodies.lock() {
             bodies.insert(uuid, PlayerSim::spawned_at(spawn, self.tick()));
         }
+    }
+
+    /// How many chunks one connection may have outstanding, right now.
+    ///
+    /// **A share of [`CHUNKS_PER_TICK`], not a constant.** It was a flat 4,
+    /// with the reasoning that one client joining must not starve everyone
+    /// else while its interest set drains — which is right, and which a fixed
+    /// number can only approximate for one particular player count. At four it
+    /// throttled a SINGLEPLAYER world to four chunks in flight against a
+    /// server willing to serve twenty-two, so eighteen of every twenty-two were
+    /// left unused with nobody to be fair to.
+    ///
+    /// Dividing says the same thing exactly: with one player half the budget,
+    /// with five a tenth each, never below [`MIN_CHUNKS_IN_FLIGHT`] so a full
+    /// server still streams for everybody.
+    ///
+    /// **HALF the budget, not all of it, and the half is measured.** Handing
+    /// one client the whole of `CHUNKS_PER_TICK` took the worldgen load test
+    /// from 100 ticks to 26 — and the slowest tick from 18 ms to 50, which is
+    /// the entire budget spent on one player's terrain with nothing left for
+    /// the simulation it is terrain for. Half gets most of the speed and
+    /// leaves the tick room to be a tick.
+    ///
+    /// It also says what the flat 4 could not: serving a chunk costs more than
+    /// lighting it. `CHUNKS_PER_TICK`'s arithmetic put 22 chunks at 63% of a
+    /// tick from the 1.44 ms relight; measured end to end, with worldgen,
+    /// fluid, entities and encoding, 22 is the whole of it. **The true cost is
+    /// nearer 2.3 ms a chunk.**
+    ///
+    /// Counted from the simulated bodies rather than the connections, because
+    /// that is the set that has an interest volume — somebody at the front
+    /// screen or still handshaking is not streaming anything.
+    #[must_use]
+    pub fn chunks_in_flight_per_client(&self) -> usize {
+        let players = self.bodies.lock().map_or(1, |bodies| bodies.len().max(1));
+        (CHUNKS_PER_TICK / 2 / players).max(MIN_CHUNKS_IN_FLIGHT)
     }
 
     /// Stops simulating a player.
@@ -2673,7 +2738,7 @@ async fn pump_chunks(
     // neighbourhood is the ground under their feet; the horizon is scenery, and
     // scenery that arrives a second late is scenery. The reverse order would
     // let a joining player's horizon delay the chunk they are standing in.
-    let budget = streamer.budget(CHUNKS_IN_FLIGHT_PER_CLIENT);
+    let budget = streamer.budget(shared.chunks_in_flight_per_client());
     for pos in streamer.next_needed(budget) {
         let Some(receiver) = shared.request_chunk(streamer.domain(), pos) else {
             // Queue full. Nothing is marked, so the next pass retries.
