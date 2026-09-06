@@ -31,7 +31,7 @@ struct Globals {
     lighting_mode: u32,
     sun_intensity: f32,
     ambient: f32,
-    fog_start: f32,
+    fog_curve: f32,
     sun_colour: vec4<f32>,
     sky_colour: vec4<f32>,
     light_view_projection: array<mat4x4<f32>, 3>,
@@ -151,7 +151,7 @@ fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
 
     let far = globals.sky_colour.w;
     let haze = clamp(
-        (input.distance - globals.fog_start) / max(far - globals.fog_start, 0.001),
+        pow(clamp(input.distance / max(far, 0.001), 0.0, 1.0), globals.fog_curve),
         0.0,
         1.0,
     );

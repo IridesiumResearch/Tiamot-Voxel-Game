@@ -110,7 +110,7 @@ pub struct Frame {
     /// Which way its light travels.
     pub sun_direction: [f32; 3],
     /// Where fog begins, in blocks.
-    pub fog_start: f32,
+    pub fog_curve: f32,
     /// Where it is total, in blocks.
     pub fog_end: f32,
     /// How the finished frame is graded, already interpolated and sanitised by
@@ -687,7 +687,7 @@ impl Post {
                     frame.sun_direction[0],
                     frame.sun_direction[1],
                     frame.sun_direction[2],
-                    frame.fog_start,
+                    frame.fog_curve,
                 ],
                 texel,
                 params,

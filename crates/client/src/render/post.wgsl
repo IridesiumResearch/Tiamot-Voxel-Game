@@ -259,8 +259,11 @@ fn composite_main(input: VertexOut) -> @location(0) vec4<f32> {
     // the world shader's own fog is per-surface and cannot do either. The world
     // shader skips its fog in this mode so the two do not stack.
     let distance = scene_distance(vec2<i32>(input.clip.xy), input.uv);
-    let start = post.sun_direction.w;
-    let haze = clamp((distance - start) / max(post.sky.w - start, 0.001), 0.0, 1.0);
+    // The same power curve `world.wgsl` uses, and it has to be the same or a
+    // player switching lighting mode would watch the weather change with it.
+    // `sun_direction.w` carries the exponent; `sky.w` carries the far distance.
+    let curve = post.sun_direction.w;
+    let haze = pow(clamp(distance / max(post.sky.w, 0.001), 0.0, 1.0), curve);
     let fogged = mix(lit, scattered_fog(input.uv), haze);
 
     // Graded last, on the display-referred result. The table's domain is 0..1

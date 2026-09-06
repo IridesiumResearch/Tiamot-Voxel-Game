@@ -36,7 +36,7 @@ struct Globals {
     sun_intensity: f32,
     ambient: f32,
     // Where fog starts, in blocks. It becomes total at `sky_colour.w`.
-    fog_start: f32,
+    fog_curve: f32,
     // The three words of padding the Rust side spells out are implicit here:
     // WGSL aligns a vec4 to 16 bytes, so this lands at offset 112 either way.
     sun_colour: vec4<f32>,
@@ -224,13 +224,19 @@ fn vertex_main(input: VertexIn) -> VertexOut {
 
 // How much of the sky has taken over at this distance, 0 to 1.
 //
-// Linear between the two distances rather than exponential. Exponential fog is
-// prettier in the middle distance and never quite reaches the sky colour, which
-// leaves a faint edge exactly where the loaded world stops — the one place this
-// fog exists to hide.
+// **A power curve from the eye, not a ramp near the far plane.** Fog begins
+// immediately and accelerates, which is what weather does and what the window
+// asked for — the old shape started three quarters of the way out and was
+// reported as awkwardly abrupt.
+//
+// Not exponential, though that is the obvious choice: exponential fog is
+// prettier in the middle distance and never quite reaches the sky colour,
+// leaving a faint edge exactly where the loaded world stops — the one place
+// this fog exists to hide. `t^k` reaches exactly 1 at the far distance and
+// keeps that guarantee.
 fn fog_amount(distance: f32) -> f32 {
-    let far = globals.sky_colour.w;
-    return clamp((distance - globals.fog_start) / max(far - globals.fog_start, 0.001), 0.0, 1.0);
+    let far = max(globals.sky_colour.w, 0.001);
+    return pow(clamp(distance / far, 0.0, 1.0), globals.fog_curve);
 }
 
 // What one fragment's light comes to, as a colour multiplier.

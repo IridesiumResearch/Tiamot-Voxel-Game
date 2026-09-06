@@ -3309,10 +3309,10 @@ impl App {
         self.config.debug_overlay
     }
 
-    /// Where fog becomes total, as a share of the render distance.
+    /// How far away fog becomes total, in chunks.
     #[must_use]
-    pub const fn fog_distance(&self) -> f32 {
-        self.config.fog_distance
+    pub const fn fog_chunks(&self) -> u8 {
+        self.config.fog_chunks
     }
 
     /// Moves the fog, live.
@@ -3321,15 +3321,15 @@ impl App {
     /// that cannot show it is set blind — this is the one setting where the
     /// world being visible behind the slider is the point. `advance` reads
     /// `config.fog_distance` every frame, so there is nothing to apply.
-    pub fn set_fog_distance(&mut self, share: f32) {
-        let clamped = share.clamp(
-            *crate::config::FOG_DISTANCE_RANGE.start(),
-            *crate::config::FOG_DISTANCE_RANGE.end(),
+    pub fn set_fog_chunks(&mut self, chunks: u8) {
+        let clamped = chunks.clamp(
+            *crate::config::FOG_CHUNKS_RANGE.start(),
+            *crate::config::FOG_CHUNKS_RANGE.end(),
         );
-        if (self.config.fog_distance - clamped).abs() < f32::EPSILON {
+        if self.config.fog_chunks == clamped {
             return;
         }
-        self.config.fog_distance = clamped;
+        self.config.fog_chunks = clamped;
         // The same flag the volume sliders use: the `App` says the settings
         // changed and the window, which is what knows the path, writes them.
         self.volumes_dirty = true;
@@ -4258,9 +4258,10 @@ impl App {
             // of the world looks like. See [`FOG_HORIZON_FRACTION`].
             None => (
                 moment.sky,
-                f32::from(tiamot_core::lod::horizon_for(self.granted_view).horizontal)
-                    * tiamot_core::CHUNK_BLOCKS as f32
-                    * self.config.fog_distance,
+                // **Straight from the setting, in chunks.** It used to be a
+                // share of the horizon, which made the number three
+                // indirections away from anything a player could see.
+                f32::from(self.config.fog_chunks) * tiamot_core::CHUNK_BLOCKS as f32,
             ),
         };
         self.renderer.set_sky(sky, far);

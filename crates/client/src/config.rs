@@ -313,30 +313,20 @@ impl ShadowQuality {
 /// rather than a clamp.
 pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.75..=1.25;
 
-/// What [`Config::fog_distance`] may be set to.
+/// How far fog may be set to reach, in CHUNKS.
 ///
-/// **Never 1.0.** Fog fades from three quarters of where it becomes total, so
-/// at 1.0 full sky lands exactly on the far edge and everything just inside it
-/// is only partly hazed — which is a chunk arriving in clear air at the end of
-/// the world, the thing fog is here to hide.
+/// **Chunks, not a fraction of the render distance.** It was a fraction, and
+/// reported from the window as an arbitrary number that is very hard to
+/// understand — which it was: 0.85 of a horizon that is itself four times a
+/// view distance capped at 32 is three indirections away from anything a player
+/// can see. A chunk is 16 blocks and the debug overlay already counts in them.
 ///
-/// **The bottom was 0.5 and is now an eighth of that**, asked for from the
-/// window: "it needs to be able to get way closer, maybe eight times". Against
-/// a horizon of 32 chunks the range is now
-///
-/// | setting | fog total at |
-/// |---|---|
-/// | 0.95 | 486 blocks, 30 chunks |
-/// | 0.5 | 256 blocks, 16 chunks |
-/// | 0.125 | 64 blocks, 4 chunks |
-/// | 0.0625 | 32 blocks, 2 chunks |
-///
-/// Task 15b's rule was that fog must not start at the DETAIL radius and paint
-/// over the horizon it just streamed. Below about 0.25 it plainly does — that
-/// is what a player asking for thick weather is asking for, and it is theirs
-/// to ask. The bound stays off zero because fog total at the eye is a white
-/// screen with no way back except this slider.
-pub const FOG_DISTANCE_RANGE: std::ops::RangeInclusive<f32> = 0.0625..=0.95;
+/// The top is [`tiamot_core::lod::MAX_HORIZON`], because that is as far as the
+/// world is ever drawn and fog that becomes total past the last chunk hides
+/// nothing. The bottom is two chunks — 32 blocks — which is weather thick
+/// enough to lose a building in and still leaves a player able to see their
+/// own feet.
+pub const FOG_CHUNKS_RANGE: std::ops::RangeInclusive<u8> = 2..=tiamot_core::lod::MAX_HORIZON;
 
 /// The smallest change the interface-scale slider makes.
 ///
@@ -457,17 +447,19 @@ pub struct Config {
     #[serde(default = "Config::default_ui_scale")]
     pub ui_scale: f32,
 
-    /// Where fog becomes total, as a share of the render distance.
+    /// How far away fog becomes total, in chunks.
     ///
-    /// The render distance here is the HORIZON — since Task 15b the world
-    /// carries on past the chunks a client is sent in full — so this is a share
-    /// of how far the world is drawn, not of the detail radius.
-    ///
-    /// Bounded by [`FOG_DISTANCE_RANGE`]. Lower means more haze and less world;
+    /// Bounded by [`FOG_CHUNKS_RANGE`]. Lower means more haze and less world;
     /// it is a look rather than a performance setting, and nothing is drawn any
     /// cheaper for being fogged.
-    #[serde(default = "Config::default_fog_distance")]
-    pub fog_distance: f32,
+    ///
+    /// **The default sits inside the horizon, not on it.** Fog builds as a
+    /// power curve from the eye, so at the distance it becomes total the last
+    /// stretch before it is already nearly gone — but only nearly. Twenty-four
+    /// of a horizon of thirty-two leaves eight chunks of pure sky beyond, and
+    /// nothing arriving out there is visible arriving.
+    #[serde(default = "Config::default_fog_chunks")]
+    pub fog_chunks: u8,
 
     /// Whether the HUD is drawn at all.
     ///
@@ -526,8 +518,8 @@ impl Config {
         true
     }
 
-    const fn default_fog_distance() -> f32 {
-        0.85
+    const fn default_fog_chunks() -> u8 {
+        24
     }
 
     const fn default_ui_scale() -> f32 {
@@ -655,12 +647,12 @@ impl Config {
                 self.ui_scale
             )));
         }
-        if !self.fog_distance.is_finite() || !(FOG_DISTANCE_RANGE).contains(&self.fog_distance) {
+        if !FOG_CHUNKS_RANGE.contains(&self.fog_chunks) {
             return Err(invalid(format!(
-                "fog_distance must be between {} and {}, not {}",
-                FOG_DISTANCE_RANGE.start(),
-                FOG_DISTANCE_RANGE.end(),
-                self.fog_distance
+                "fog_chunks must be between {} and {}, not {}",
+                FOG_CHUNKS_RANGE.start(),
+                FOG_CHUNKS_RANGE.end(),
+                self.fog_chunks
             )));
         }
         if !self.mouse_sensitivity.is_finite() || self.mouse_sensitivity <= 0.0 {
@@ -709,7 +701,7 @@ impl Default for Config {
             shadow_quality: ShadowQuality::default(),
             vsync: Self::default_vsync(),
             debug_overlay: Self::default_debug_overlay(),
-            fog_distance: Self::default_fog_distance(),
+            fog_chunks: Self::default_fog_chunks(),
             ui_scale: Self::default_ui_scale(),
             hud_visible: Self::default_hud_visible(),
             fov_degrees: Self::default_fov_degrees(),

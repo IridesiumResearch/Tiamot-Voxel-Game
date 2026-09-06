@@ -581,12 +581,13 @@ impl Front {
             // **A look, not a budget.** Nothing is drawn any cheaper for being
             // fogged; this decides how much of the far horizon is hidden behind
             // haze, and therefore how much chunk loading a player can watch
-            // happen. See `config::FOG_DISTANCE_RANGE` for why it stops short
-            // of 1.0 at one end and of the detail radius at the other.
+            // happen. In CHUNKS, because a share of a horizon that is itself
+            // four times a capped view distance is three indirections away from
+            // anything a player can see — see `config::FOG_CHUNKS_RANGE`.
             changed |= ui
                 .add(
-                    egui::Slider::new(&mut config.fog_distance, crate::config::FOG_DISTANCE_RANGE)
-                        .text("fog distance"),
+                    egui::Slider::new(&mut config.fog_chunks, crate::config::FOG_CHUNKS_RANGE)
+                        .text("fog distance (chunks)"),
                 )
                 .changed();
             ui.separator();

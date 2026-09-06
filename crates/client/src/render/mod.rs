@@ -140,7 +140,7 @@ struct Globals {
     /// pitch black. Presentation only — the stored light really is zero there.
     ambient: f32,
     /// Where fog starts, in blocks from the camera.
-    fog_start: f32,
+    fog_curve: f32,
     /// Padding to the 16-byte boundary the `vec4`s below sit on.
     ///
     /// Not decorative. WGSL aligns a `vec4<f32>` to 16 bytes, so the shader
@@ -204,11 +204,21 @@ struct Globals {
 /// light really is zero down there, and `game.get_light` tells a mod so.
 const AMBIENT_FLOOR: f32 = 0.03;
 
-/// How far out fog begins, as a fraction of where it becomes total.
+/// How sharply fog builds with distance.
 ///
-/// Three quarters leaves a band deep enough to hide a chunk arriving without
-/// washing out the middle distance a player is actually looking at.
-const FOG_START_FRACTION: f32 = 0.75;
+/// **Fog begins at the eye and accelerates**, rather than starting three
+/// quarters of the way out and ramping hard. Reported from the window: the old
+/// shape was "awkwardly abrupt", and real weather "starts right away and things
+/// disappear slowly until the distance".
+///
+/// The haze is `(distance / far)^FOG_CURVE`, so at two is a quarter of the way
+/// gone at half the distance, four fifths at nine tenths, and **exactly total
+/// at `far`** — which is the property the old two-distance ramp existed to
+/// guarantee and the reason this is a power curve rather than the exponential
+/// fog that would be the obvious choice. Exponential is prettier in the middle
+/// distance and never quite reaches the sky colour, leaving a faint edge
+/// exactly where the loaded world stops.
+const FOG_CURVE: f32 = 2.0;
 
 /// The default sky, as the shader wants it.
 ///
@@ -658,7 +668,7 @@ pub struct Renderer {
     /// this is the six numbers it was baked from.
     grade: tiamot_core::proto::SkyGrade,
     /// Where fog begins and where it is total, in blocks.
-    fog_start: f32,
+    fog_curve: f32,
     fog_end: f32,
     /// How many chunks the last frame actually drew.
     drawn: usize,
@@ -847,7 +857,7 @@ impl Renderer {
             // Far enough that nothing fogs until a view distance is set. A
             // client that fogged by default would hide geometry the Task 08
             // scenes assert on.
-            fog_start: f32::MAX,
+            fog_curve: FOG_CURVE,
             fog_end: f32::MAX,
             drawn: 0,
             cast: 0,
@@ -889,7 +899,7 @@ impl Renderer {
     pub fn set_sky(&mut self, colour: [f32; 3], far: f32) {
         self.sky_colour = colour;
         self.fog_end = far.max(1.0);
-        self.fog_start = self.fog_end * FOG_START_FRACTION;
+        self.fog_curve = FOG_CURVE;
     }
 
     /// Sets how the finished frame is graded, for the frames that follow.
@@ -1390,7 +1400,7 @@ impl Renderer {
             lighting_mode: self.lighting.code(),
             sun_intensity: self.sun_intensity,
             ambient: AMBIENT_FLOOR,
-            fog_start: self.fog_start,
+            fog_curve: self.fog_curve,
             _pad: [0; 3],
             sun_colour: self.sun_colour,
             // Fog's far distance rides in the sky colour's unused fourth
@@ -1633,7 +1643,7 @@ impl Renderer {
                 sky: self.sky_colour,
                 sun: [self.sun_colour[0], self.sun_colour[1], self.sun_colour[2]],
                 sun_direction: self.sun_direction,
-                fog_start: self.fog_start,
+                fog_curve: self.fog_curve,
                 fog_end: self.fog_end,
                 grade: self.grade,
             },
@@ -3264,6 +3274,46 @@ mod blob_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The fog curve reaches the sky exactly at the far distance.
+    ///
+    /// **The property the shape was chosen for.** Exponential fog is prettier
+    /// in the middle distance and never quite arrives, which leaves a faint
+    /// edge exactly where the loaded world stops — the one place this fog
+    /// exists to hide. A power curve is thin near the eye, thickens with
+    /// distance, and still lands on 1 at the end.
+    ///
+    /// Asserted here rather than in a shader because it is arithmetic, and the
+    /// shaders all compute the same expression from the same two uniforms.
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "charter rule 4 exempts rendering from the deterministic float subset, and \
+                  clippy.toml says so: presentation carries an allow at the use site. This is \
+                  the fog curve the shaders compute, asserted in Rust because it is arithmetic \
+                  and no value from it reaches the simulation"
+    )]
+    fn fog_is_thin_nearby_thick_far_off_and_total_at_the_end() {
+        let haze = |t: f32| t.clamp(0.0, 1.0).powf(super::FOG_CURVE);
+
+        assert!((haze(0.0) - 0.0).abs() < 1e-6, "fog at the eye");
+        assert!(
+            (haze(1.0) - 1.0).abs() < 1e-6,
+            "fog must ARRIVE at the far distance"
+        );
+        assert!((haze(2.0) - 1.0).abs() < 1e-6, "and stay arrived past it");
+
+        // Thin close by, and building rather than switching on: the old shape
+        // was flat zero until three quarters of the way out and then ramped,
+        // which was reported as awkwardly abrupt.
+        assert!(haze(0.25) < 0.1, "too thick close by: {}", haze(0.25));
+        assert!(
+            haze(0.5) > 0.15 && haze(0.5) < 0.35,
+            "half way: {}",
+            haze(0.5)
+        );
+        assert!(haze(0.9) > 0.7, "nearly gone by nine tenths: {}", haze(0.9));
+    }
+
     use super::*;
 
     /// A joint sitting three cells to the figure's own right, at rest.

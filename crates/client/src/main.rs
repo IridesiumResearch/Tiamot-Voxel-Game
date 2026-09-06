@@ -2109,15 +2109,15 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
             // field of view, because this one is a look: a haze setting chosen
             // from a menu with no world behind it is chosen blind. It applies
             // as the slider moves.
-            let mut fog = app.fog_distance();
+            let mut fog = app.fog_chunks();
             if ui
                 .add(
-                    egui::Slider::new(&mut fog, client::config::FOG_DISTANCE_RANGE)
-                        .text("fog distance"),
+                    egui::Slider::new(&mut fog, client::config::FOG_CHUNKS_RANGE)
+                        .text("fog distance (chunks)"),
                 )
                 .changed()
             {
-                app.set_fog_distance(fog);
+                app.set_fog_chunks(fog);
             }
 
             // **The debug overlay ships, and lives here.** Charter rule 18
