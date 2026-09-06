@@ -218,15 +218,22 @@ fn a_block_can_be_placed_in_a_domain_where_the_overworld_is_solid() {
     // Digging never asks that question, which is why only half the report
     // looked broken.
     //
-    // So: a domain whose floor is at y = -16, and a placement at y = -8. There
+    // So: a domain floored at y = -9 with the player standing at y = -8. There
     // the domain is air and the overworld is solid rock, which is exactly the
     // disagreement.
+    //
+    // **The floor is one block under the spawn so nobody falls.** It was at
+    // y = -16, which meant the player dropped eight blocks while the test
+    // settled and the placement went out from wherever they had got to —
+    // passing here and failing on macOS CI with "that is too far away", which
+    // is a reach check rather than the bug under test. A test that has to be
+    // quick enough is a test about the machine.
     let server = start(
         "place-in-domain",
         write_mod(
             "place-in-domain",
             "game.register_domain{ id = 'cellar', generator = function(buf, pos)\n\
-             \x20   buf:fill_below_heightmap(game.flat_heightmap(-16), ground)\n\
+             \x20   buf:fill_below_heightmap(game.flat_heightmap(-9), ground)\n\
              end }\n\
              game.register_on_chat(function(event)\n\
              \x20   if event.text == 'cellar' then\n\
