@@ -175,10 +175,27 @@ impl Front {
                 ui.separator();
             }
 
-            match self.tab {
-                Tab::Play => action = self.play_tab(ui),
-                Tab::Mods => self.mods_tab(ui),
-                Tab::Settings => self.settings_tab(ui, config),
+            // **First decided wins.** `Tab::Play` assigned straight into
+            // `action`, which overwrote a Quit pressed higher up the same frame
+            // with the `Action::None` a tab returns when nothing in it was
+            // clicked — so the button did nothing on the tab a player lands on.
+            // Reported from the window as the quit button not quitting.
+            //
+            // One thing can be acted on per frame and Quit is above the tabs,
+            // so the rule is that a decision already made stands.
+            let picked = match self.tab {
+                Tab::Play => self.play_tab(ui),
+                Tab::Mods => {
+                    self.mods_tab(ui);
+                    Action::None
+                }
+                Tab::Settings => {
+                    self.settings_tab(ui, config);
+                    Action::None
+                }
+            };
+            if matches!(action, Action::None) {
+                action = picked;
             }
         });
 
@@ -895,6 +912,47 @@ mod tests {
         assert!(
             !screen.take_catalogue_dirty(),
             "the same change was handed back twice"
+        );
+    }
+
+    #[test]
+    fn quit_quits_from_the_tab_a_player_lands_on() {
+        // **Reported from the window**: the quit button on the main menu does
+        // not quit.
+        //
+        // Quit is drawn above the tabs and set `action`; then `Tab::Play`
+        // assigned straight into the same variable, overwriting it with the
+        // `Action::None` a tab returns when nothing in it was clicked. Play is
+        // the default tab, so the button never worked where anybody would
+        // press it.
+        //
+        // **`quit_sits_on_the_row_above_the_tabs` sweeps for this button and
+        // did not catch it**, because it sets `screen.tab = Tab::Mods` before
+        // every click and Mods does not assign `action`. A test that changes
+        // the state it is testing under can only answer about the state it
+        // chose. This one stays on the default.
+        let ctx = egui::Context::default();
+        let mut screen = front(vec![world("Home", &[])]);
+        frame(&mut screen, &ctx, Vec::new());
+        assert_eq!(
+            screen.tab,
+            Tab::Play,
+            "the default tab moved; this test assumes it"
+        );
+
+        let mut quit = None;
+        'sweep: for y in (0..720).step_by(4) {
+            for x in (200..1100).step_by(6) {
+                let point = egui::pos2(x as f32, y as f32);
+                if matches!(click(&mut screen, &ctx, point), Action::Quit) {
+                    quit = Some(point);
+                    break 'sweep;
+                }
+            }
+        }
+        assert!(
+            quit.is_some(),
+            "nothing on the Play tab quit, so the button a player sees does nothing"
         );
     }
 
