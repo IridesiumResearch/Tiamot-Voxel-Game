@@ -67,9 +67,10 @@ vertical_view_distance = 12
 # Never 1.0: fog fades in from three quarters of wherever it becomes total, so
 # at 1.0 full sky lands exactly on the far edge and everything just inside is
 # only partly hazed, which is a chunk arriving in clear air at the end of the
-# world. Lower means more haze and less world. Clamped to 0.5..=0.95, and there
-# is a slider for it on the settings screen and in the in-game menu, where the
-# world behind it shows what the number does.
+# world. Lower means more haze and less world. Clamped to 0.0625..=0.95 — the
+# bottom is thick weather a few chunks deep, which is a look rather than a
+# mistake. There is a slider on the settings screen and in the in-game menu,
+# where the world behind it shows what the number does.
 fog_distance = 0.85
 
 # How the world is drawn. A debugging aid, not a lighting setting — see

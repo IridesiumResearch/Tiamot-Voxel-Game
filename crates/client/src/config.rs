@@ -318,11 +318,25 @@ pub const UI_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.75..=1.25;
 /// **Never 1.0.** Fog fades from three quarters of where it becomes total, so
 /// at 1.0 full sky lands exactly on the far edge and everything just inside it
 /// is only partly hazed — which is a chunk arriving in clear air at the end of
-/// the world, the thing fog is here to hide. The bottom of the range keeps
-/// clear of the detail radius: at 0.5 of a horizon of 32 the fade still begins
-/// at 12 chunks, and Task 15b's rule is that fog must not paint over the
-/// horizon it just streamed.
-pub const FOG_DISTANCE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=0.95;
+/// the world, the thing fog is here to hide.
+///
+/// **The bottom was 0.5 and is now an eighth of that**, asked for from the
+/// window: "it needs to be able to get way closer, maybe eight times". Against
+/// a horizon of 32 chunks the range is now
+///
+/// | setting | fog total at |
+/// |---|---|
+/// | 0.95 | 486 blocks, 30 chunks |
+/// | 0.5 | 256 blocks, 16 chunks |
+/// | 0.125 | 64 blocks, 4 chunks |
+/// | 0.0625 | 32 blocks, 2 chunks |
+///
+/// Task 15b's rule was that fog must not start at the DETAIL radius and paint
+/// over the horizon it just streamed. Below about 0.25 it plainly does — that
+/// is what a player asking for thick weather is asking for, and it is theirs
+/// to ask. The bound stays off zero because fog total at the eye is a white
+/// screen with no way back except this slider.
+pub const FOG_DISTANCE_RANGE: std::ops::RangeInclusive<f32> = 0.0625..=0.95;
 
 /// The smallest change the interface-scale slider makes.
 ///

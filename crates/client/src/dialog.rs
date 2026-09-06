@@ -526,9 +526,35 @@ struct Paint<'a> {
     colour: egui::Color32,
     /// Text font, resolved from the node's style.
     font: egui::FontId,
+    /// The mod's fill, if it named one.
+    ///
+    /// **`paint_background` is not enough on its own.** It paints
+    /// `style.background` under every widget, and then any widget with a fill
+    /// of its own — a button, a slot, a dropdown, a slider track — painted an
+    /// unconditional grey straight over it. Reported from the window as slots
+    /// and buttons painting grey over the colours a mod supplied.
+    ///
+    /// So a painter asks for its fill through [`Paint::fill`] rather than
+    /// reaching for a constant, and the mod wins where it said something.
+    fill: Option<egui::Color32>,
+    /// The mod's border colour, if it named one. Same reasoning as `fill`.
+    edge: Option<egui::Color32>,
 }
 
 impl Paint<'_> {
+    /// The fill to use, preferring what the mod asked for.
+    ///
+    /// `default` is the shade this widget uses when nothing was said, which is
+    /// most of the time — the engine still has a look of its own.
+    fn fill(&self, default: u8) -> egui::Color32 {
+        or_grey(self.fill, default)
+    }
+
+    /// The border to use, preferring what the mod asked for.
+    fn edge(&self, default: u8) -> egui::Color32 {
+        or_grey(self.edge, default)
+    }
+
     /// Queues an event against this dialog.
     fn raise(&self, raised: &mut Vec<Raised>, event: DialogEvent) {
         raised.push(Raised {
@@ -565,6 +591,14 @@ fn paint_widget(
         font: egui::FontId::proportional(
             f32::from(node.style.text_size.unwrap_or(14)).clamp(8.0, 48.0),
         ),
+        fill: node
+            .style
+            .background
+            .map(|c| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])),
+        edge: node
+            .style
+            .border
+            .map(|c| egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])),
     };
 
     match &node.widget {
@@ -592,8 +626,7 @@ fn paint_widget(
             placeholder,
         } => paint_text_input(ui, rect, node, initial, placeholder, &paint, local, raised),
         Widget::Progress { permille } => {
-            ui.painter()
-                .rect_filled(rect, 2.0, egui::Color32::from_gray(40));
+            ui.painter().rect_filled(rect, 2.0, paint.fill(40));
             let mut bar = rect;
             bar.set_width(rect.width() * f32::from(*permille) / 1000.0);
             ui.painter()
@@ -884,6 +917,39 @@ pub fn paint_cell_face(
     }
 }
 
+/// What a mod named, or the engine's own shade.
+///
+/// A free function so the decision is testable without an egui context: what
+/// went wrong was never the painting, it was a widget reaching for a constant
+/// when the style had an answer.
+fn or_grey(named: Option<egui::Color32>, default: u8) -> egui::Color32 {
+    named.unwrap_or_else(|| egui::Color32::from_gray(default))
+}
+
+/// A colour a step brighter, for a hovered control.
+///
+/// 1.4 is what takes the button's resting `from_gray(64)` to the
+/// `from_gray(90)` it used to hover at, so nothing about the engine's own look
+/// moved when mod colours started reaching these widgets.
+fn lighter(base: egui::Color32) -> egui::Color32 {
+    let channel = |value: u8| {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a scaled colour channel, clamped into a byte"
+        )]
+        {
+            (f32::from(value) * 1.4).clamp(0.0, 255.0) as u8
+        }
+    };
+    egui::Color32::from_rgba_unmultiplied(
+        channel(base.r()),
+        channel(base.g()),
+        channel(base.b()),
+        base.a(),
+    )
+}
+
 /// How light one face of a cell is.
 ///
 /// Three fixed levels rather than a light calculation: the point is that the
@@ -943,10 +1009,15 @@ fn paint_button(
     raised: &mut Vec<Raised>,
 ) {
     let response = ui.allocate_rect(rect, egui::Sense::click());
+    // **Lightened rather than a second constant.** The hover was `from_gray(90)`
+    // against a base of `from_gray(64)`, which is this scale applied to that
+    // grey — so a mod's colour keeps the cue instead of losing it to a shade of
+    // grey, and the default looks exactly as it did.
+    let base = paint.fill(64);
     let fill = if response.hovered() {
-        egui::Color32::from_gray(90)
+        lighter(base)
     } else {
-        egui::Color32::from_gray(64)
+        base
     };
     ui.painter().rect_filled(rect, 3.0, fill);
     ui.painter().text(
@@ -1050,8 +1121,7 @@ fn paint_slider(
         let picked = i64::from(min) + (f64::from(t) * span as f64) as i64;
         *current = i32::try_from(picked).unwrap_or(min).clamp(min, max);
     }
-    ui.painter()
-        .rect_filled(rect, 2.0, egui::Color32::from_gray(48));
+    ui.painter().rect_filled(rect, 2.0, paint.fill(48));
     let filled = if max > min {
         (f64::from(*current - min) / f64::from(max - min)) as f32
     } else {
@@ -1115,8 +1185,7 @@ fn paint_dropdown(
     let shown = options
         .get(usize::from(*current))
         .map_or("", String::as_str);
-    ui.painter()
-        .rect_filled(rect, 3.0, egui::Color32::from_gray(48));
+    ui.painter().rect_filled(rect, 3.0, paint.fill(48));
     ui.painter().text(
         rect.left_center() + egui::vec2(6.0, 0.0),
         egui::Align2::LEFT_CENTER,
@@ -1219,12 +1288,11 @@ fn paint_slot(
 ) {
     let inner = rect.shrink(2.0);
     let response = ui.allocate_rect(inner, egui::Sense::click());
-    ui.painter()
-        .rect_filled(inner, 2.0, egui::Color32::from_gray(52));
+    ui.painter().rect_filled(inner, 2.0, paint.fill(52));
     ui.painter().rect_stroke(
         inner,
         2.0,
-        egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+        egui::Stroke::new(1.0, paint.edge(80)),
         egui::StrokeKind::Inside,
     );
 
@@ -1272,6 +1340,42 @@ mod tests {
     use tiamot_core::ui::{Align, Direction};
 
     use super::*;
+
+    #[test]
+    fn a_widgets_own_fill_defers_to_what_the_mod_asked_for() {
+        // **Reported from the window**: inventory slots and buttons painting
+        // grey over the colours a mod supplied.
+        //
+        // `paint_background` drew `style.background` under every widget, and
+        // then any widget with a fill of its own — a button, a slot, a
+        // dropdown, a slider track, a progress bar — painted an unconditional
+        // grey straight over it. The mod's colour was on screen for the length
+        // of one draw call.
+        let mods_own = egui::Color32::from_rgb(200, 40, 40);
+        assert_eq!(
+            or_grey(Some(mods_own), 52),
+            mods_own,
+            "a widget reached for its constant with a style in hand"
+        );
+        assert_eq!(
+            or_grey(None, 52),
+            egui::Color32::from_gray(52),
+            "the engine still has a look of its own where nothing was said"
+        );
+
+        // And a hovered button lightens whatever it is rather than becoming a
+        // shade of grey — 1.4 is exactly what took the old resting 64 to the
+        // old hover 90, so the default is unmoved.
+        assert_eq!(
+            lighter(egui::Color32::from_gray(64)),
+            egui::Color32::from_gray(89)
+        );
+        let hot = lighter(mods_own);
+        assert!(
+            hot.r() > mods_own.r() && hot.g() > mods_own.g(),
+            "a mod-coloured button lost its hover cue: {mods_own:?} -> {hot:?}"
+        );
+    }
 
     #[test]
     fn a_prompt_is_its_own_size_and_never_larger_than_the_sheet() {
