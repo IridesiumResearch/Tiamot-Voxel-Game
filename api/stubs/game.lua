@@ -1839,6 +1839,115 @@ function Density:len() end
 ---@return Tiamot.Density
 function game.density(spec) end
 
+---A persistent 2D field over a region of the world.
+---
+---Fetched by name, not created: the first run builds it, every run after gets
+---the one stored with the world. See `game.map`.
+---@class Tiamot.Map
+local Map = {}
+
+---Samples along one side.
+---@return integer
+function Map:side() end
+
+---Blocks per sample.
+---@return integer
+function Map:scale() end
+
+---Fills the whole map with fractal noise, in WORLD coordinates.
+---
+---Same options as a density `noise` node, plus `seed`.
+---@param options { seed: integer?, octaves: integer?, frequency: number?, lacunarity: number?, gain: number?, amplitude: number? }
+function Map:noise(options) end
+
+---Adds a constant to every sample.
+---@param by number
+function Map:offset(by) end
+
+---Multiplies every sample by a constant.
+---@param by number
+function Map:scale_by(by) end
+
+---Bounds every sample to a range.
+---@param low number
+---@param high number
+function Map:clamp(low, high) end
+
+---Smooths the map with a box blur.
+---
+---**The primitive erosion is built from.** There is no `erode` in this API and
+---there will not be one: what erosion looks like is an opinion about what a
+---landscape is, and that belongs in your mod. A cheap one is a copy of the map,
+---blurred, combined back with `"min"` — the low ground stays and the peaks come
+---down. Repeat for more.
+---@param radius integer
+function Map:blur(radius) end
+
+---Combines another map into this one, sample for sample.
+---
+---`how` is `"add"`, `"mul"`, `"min"` or `"max"`. The two maps must be the same
+---shape, and a map cannot be combined with itself — `scale_by` says "twice
+---this" without the aliasing.
+---@param other Tiamot.Map
+---@param how string
+function Map:combine(other, how) end
+
+---One chunk's worth of heights, sampled from this map.
+---
+---**This is how a map reaches the world**, and why it is a map rather than a
+---table of numbers: it produces all 256 columns natively, in the order
+---`buf:fill_below_heightmap` consumes. Reading samples one at a time from Lua
+---is the per-sample loop charter rule 4 forbids.
+---@param pos Tiamot.ChunkPos
+---@return Tiamot.Heightmap
+function Map:heightmap(pos) end
+
+---Fetches this mod's map by name, building an empty one the first time.
+---
+---**Fetch-or-create, so the same call works on every run.** The first time a
+---world runs there is nothing and you get an empty field to fill; every time
+---after, the server has already loaded the one it stored. Change `side`,
+---`scale` or `origin_x`/`origin_z` and you get a fresh field instead of old
+---numbers read against a new geometry — a landscape that had silently moved.
+---
+---At most 1,024 samples a side. One sample a block over a 120,000-block world
+---would be 1.4e10 values, which is not a map but a second world; a map covers a
+---REGION, and sampling outside it gives the nearest edge value rather than a
+---hole.
+---
+---```lua
+---local function field()
+---    return game.map{ name = "height", side = 256, scale = 16 }
+---end
+---
+---game.register_on_world_init(function()
+---    local map = field()
+---    map:noise{ seed = 7, frequency = 0.01, octaves = 4, amplitude = 40.0 }
+---    map:offset(20.0)
+---end)
+---
+---game.register_on_generate(function(buf, pos)
+---    buf:fill_below_heightmap(field():heightmap(pos), stone)
+---end)
+---```
+---@param spec { name: string, side: integer?, scale: integer?, origin_x: integer?, origin_z: integer? }
+---@return Tiamot.Map
+function game.map(spec) end
+
+---Runs ONCE in a world's life, before the first chunk is generated.
+---
+---**The world pre-pass.** A `game.density` field is a function of one position,
+---which is enough for terrain and caves and cannot express erosion or a river:
+---where water goes depends on where the land is everywhere else. Those need a
+---whole field computed in passes that see all of it, which is what this is for.
+---
+---Whatever maps you build here are stored with the world, so the next run reads
+---them back and this does not run again. If your mod faults in here it is
+---disabled and the world still generates — a world that refuses to open would
+---be worse than one missing your rivers.
+---@param callback fun()
+function game.register_on_world_init(callback) end
+
 ---A heightmap with the same height in every column.
 ---@param height integer World block height.
 ---@return Tiamot.Heightmap

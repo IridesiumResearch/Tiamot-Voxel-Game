@@ -1136,6 +1136,56 @@ impl ServerHandle {
             loaded.vm_mut().set_fluid_ids(&ids);
         }
 
+        // **The world pre-pass, and the maps it reads and writes.**
+        //
+        // Order matters and there is only one that works: install what the
+        // world already had, run the pre-pass for a world that has never had
+        // one, then store whatever the mods are holding. Running it before the
+        // load would compute over an empty field every start; storing before
+        // the run would save the field the mod had not filled in yet.
+        //
+        // All of it is before the first chunk is generated, because a
+        // generator reading a map that is about to change would produce
+        // terrain from a field nothing else agrees with.
+        const INITIALISED: &str = "world_pre_pass_done";
+        if let Some(loaded) = host.as_mut() {
+            let saved = world.all_maps().unwrap_or_else(|err| {
+                error!("could not read this world's maps: {err}");
+                Vec::new()
+            });
+            loaded.vm_mut().load_maps(saved);
+
+            // **Once in a world's life, recorded in the world.** A pre-pass
+            // that ran every start would recompute a landscape the terrain on
+            // disk was already generated from, and the two would disagree
+            // wherever the mod had been changed since.
+            let done = world
+                .meta(INITIALISED)
+                .unwrap_or_default()
+                .is_some_and(|value| value.first() == Some(&1));
+            if !done {
+                match loaded.vm_mut().world_init() {
+                    Ok(faults) => {
+                        for (mod_id, err) in &faults {
+                            error!(mod_id = %mod_id, "mod disabled after a world pre-pass failure: {err}");
+                        }
+                    }
+                    Err(err) => error!("the world pre-pass could not run: {err}"),
+                }
+                for (mod_id, name, map) in loaded.vm_mut().take_maps() {
+                    if let Err(err) = world.save_map(&mod_id, &name, &map) {
+                        error!(%mod_id, %name, "could not store a map: {err}");
+                    }
+                }
+                if let Err(err) = world.set_meta(INITIALISED, &[1]) {
+                    // **Logged and carried on.** Failing to record it means
+                    // the pre-pass runs again next start, which is wasteful
+                    // and correct; refusing to open the world would not be.
+                    error!("could not record that the world pre-pass ran: {err}");
+                }
+            }
+        }
+
         // Which materials drink, keyed by world id for the same reason
         // emissions are — and with the SUCCESSOR resolved through the same
         // table, so `becomes = "damp_dirt"` names the same block on a world

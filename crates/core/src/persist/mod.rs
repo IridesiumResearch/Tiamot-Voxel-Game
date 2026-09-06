@@ -1134,6 +1134,72 @@ impl WorldDb {
         Ok(Some(map))
     }
 
+    /// Every map every mod has stored, for installing at startup.
+    ///
+    /// **Whole rather than by name.** A mod asks for its maps by name during
+    /// its pre-pass, which is too late to go to the disk — the callback is
+    /// inside a script VM with no database in reach. So the server reads the
+    /// lot once and hands them over before anything runs.
+    ///
+    /// A row whose shape or size will not decode is skipped with a log rather
+    /// than failing the open: the map can be recomputed, and a world that
+    /// refuses to start is worse than one missing a mod's rivers.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the table cannot be read at all.
+    pub fn all_maps(&self) -> Result<Vec<(String, String, crate::detgen::Map)>, WorldError> {
+        let mut statement = self.conn.prepare(
+            "SELECT mod_id, name, side, scale, origin_x, origin_z, samples FROM mod_maps",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+            ))
+        })?;
+
+        let mut maps = Vec::new();
+        for row in rows {
+            let (mod_id, name, side, scale, origin_x, origin_z, blob) = row?;
+            let shape = u32::try_from(side).ok().zip(u32::try_from(scale).ok()).zip(
+                i32::try_from(origin_x)
+                    .ok()
+                    .zip(i32::try_from(origin_z).ok()),
+            );
+            let Some(((side, scale), (origin_x, origin_z))) = shape else {
+                tracing::warn!(%mod_id, %name, "skipping a map whose shape will not fit");
+                continue;
+            };
+            let Ok(mut map) = crate::detgen::Map::new(side, scale, [origin_x, origin_z]) else {
+                tracing::warn!(%mod_id, %name, "skipping a map with an impossible shape");
+                continue;
+            };
+            let Ok(raw) = zstd::bulk::decompress(&blob, MAP_MAX_BYTES) else {
+                tracing::warn!(%mod_id, %name, "skipping a map that will not decompress");
+                continue;
+            };
+            if raw.len() != map.values().len() * 4 {
+                tracing::warn!(%mod_id, %name, "skipping a map of the wrong length");
+                continue;
+            }
+            let values: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .collect();
+            if map.set_values(values).is_err() {
+                continue;
+            }
+            maps.push((mod_id, name, map));
+        }
+        Ok(maps)
+    }
+
     /// Writes a mod's map, replacing whatever was there.
     ///
     /// # Errors

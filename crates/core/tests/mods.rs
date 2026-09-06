@@ -777,3 +777,99 @@ end)
     let air = fluid.get(tiamot_core::coords::LocalBlock::new(8, 14, 8));
     assert_eq!(air.volume(), 0, "water above the level it was filled to");
 }
+
+#[test]
+fn a_world_pre_pass_computes_a_map_that_generation_then_reads() {
+    // **The shape a river needs and a density field cannot have.** Where water
+    // goes depends on where the land is everywhere else, so it cannot be a
+    // function of one position — it has to be a whole field, computed once,
+    // in passes that see all of it. The mod says which passes; the engine
+    // holds the array and does the arithmetic, because charter rule 4 forbids
+    // a script doing it per sample.
+    let root = scratch("prepass");
+    write_mod(
+        &root,
+        "land",
+        "",
+        r#"
+local stone = game.register_block{ id = "stone" }
+
+local function field()
+    return game.map{ name = "height", side = 64, scale = 16 }
+end
+
+game.register_on_world_init(function()
+    local map = field()
+    map:noise{ seed = 99, frequency = 0.01, octaves = 4, amplitude = 40.0 }
+    map:offset(20.0)
+    -- Erosion, such as it is: smooth it and keep the lower of the two, which
+    -- is a valley being cut rather than a hill being averaged away.
+    local smooth = game.map{ name = "smoothed", side = 64, scale = 16 }
+    smooth:noise{ seed = 99, frequency = 0.01, octaves = 4, amplitude = 40.0 }
+    smooth:offset(20.0)
+    smooth:blur(3)
+    map:combine(smooth, "min")
+end)
+
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(field():heightmap(pos), stone)
+end)
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+
+    // Nothing has run the pre-pass yet, so the map is flat and the world is
+    // one height everywhere. This is the control: without it, a test that saw
+    // terrain could not tell the pre-pass from the noise.
+    let flat = host
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            1,
+            ChunkPos::new(0, 0, 0),
+            MaterialId::AIR,
+        )
+        .expect("generate");
+
+    let faults = host.vm_mut().world_init().expect("pre-pass");
+    assert!(faults.is_empty(), "the pre-pass faulted: {faults:?}");
+
+    let shaped = host
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            1,
+            ChunkPos::new(0, 0, 0),
+            MaterialId::AIR,
+        )
+        .expect("generate");
+    assert_ne!(
+        flat.is_uniform(),
+        None,
+        "the control should be uniform before the pre-pass ran"
+    );
+    assert_ne!(
+        shaped.is_uniform(),
+        flat.is_uniform(),
+        "generation produced the same chunk before and after the pre-pass, so it is \
+         not reading the map"
+    );
+
+    // And the map came out for the caller that stores it, under the mod and
+    // name the script asked for.
+    let maps = host.vm_mut().take_maps();
+    let names: Vec<&str> = maps.iter().map(|(_, name, _)| name.as_str()).collect();
+    assert!(
+        names.contains(&"height") && names.contains(&"smoothed"),
+        "the pre-pass built maps the server cannot save: {names:?}"
+    );
+    assert!(
+        maps.iter().all(|(mod_id, _, _)| mod_id == "land"),
+        "a map came back under the wrong mod"
+    );
+}

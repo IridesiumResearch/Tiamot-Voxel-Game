@@ -167,6 +167,109 @@ impl mlua::UserData for DensityHandle {
     }
 }
 
+/// A mod's map, exposed to Lua as a handle onto one the VM holds.
+///
+/// **Shared rather than copied.** A mod fetches its map, runs a dozen
+/// operations on it and lets the handle go; the values have to still be there
+/// when the server collects them to save. So the handle and the VM's registry
+/// point at the same field.
+#[derive(Clone)]
+struct MapHandle {
+    map: std::sync::Arc<std::sync::Mutex<crate::detgen::Map>>,
+}
+
+impl MapHandle {
+    /// The field, or a script error if another hold on it panicked.
+    ///
+    /// **Poisoning is reported rather than unwrapped.** A map is shared between
+    /// the handle a mod holds and the registry the server collects from, so a
+    /// panic while one is locked must disable the mod (charter rule 10) rather
+    /// than take the tick with it.
+    fn locked(&self) -> mlua::Result<std::sync::MutexGuard<'_, crate::detgen::Map>> {
+        self.map
+            .lock()
+            .map_err(|_| mlua::Error::external("this map was poisoned by an earlier error"))
+    }
+}
+
+impl mlua::UserData for MapHandle {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("side", |_, this, ()| Ok(this.locked()?.side()));
+        methods.add_method("scale", |_, this, ()| Ok(this.locked()?.scale()));
+
+        methods.add_method_mut("noise", |_, this, options: Table| {
+            let params = density_noise_params(&options);
+            let amplitude: f32 = options.get("amplitude").unwrap_or(1.0);
+            let seed: u64 = options.get("seed").unwrap_or(0);
+            this.locked()?.noise(seed, &params, amplitude);
+            Ok(())
+        });
+
+        methods.add_method_mut("offset", |_, this, by: f32| {
+            this.locked()?.offset(by);
+            Ok(())
+        });
+
+        methods.add_method_mut("scale_by", |_, this, by: f32| {
+            this.locked()?.scale_by(by);
+            Ok(())
+        });
+
+        methods.add_method_mut("clamp", |_, this, (low, high): (f32, f32)| {
+            this.locked()?.clamp(low, high);
+            Ok(())
+        });
+
+        methods.add_method_mut("blur", |_, this, radius: u32| {
+            this.locked()?
+                .blur(radius)
+                .map_err(|err| mlua::Error::external(err.to_string()))
+        });
+
+        methods.add_method_mut(
+            "combine",
+            |_, this, (other, how): (mlua::AnyUserData, String)| {
+                let how = match how.as_str() {
+                    "add" => crate::detgen::Combine::Add,
+                    "mul" => crate::detgen::Combine::Multiply,
+                    "min" => crate::detgen::Combine::Minimum,
+                    "max" => crate::detgen::Combine::Maximum,
+                    other => {
+                        return Err(mlua::Error::external(format!(
+                            "`{other}` is not a way to combine two maps. The list is: add, mul, \
+                         min, max."
+                        )));
+                    }
+                };
+                let other = other.borrow::<Self>()?;
+                // **Refused rather than allowed.** Combining a map with itself
+                // would be a double borrow, and it is also never what anybody
+                // means — `scale_by(2)` says "twice this" without the aliasing.
+                if std::sync::Arc::ptr_eq(&this.map, &other.map) {
+                    return Err(mlua::Error::external(
+                        "a map cannot be combined with itself; use scale_by or offset",
+                    ));
+                }
+                let source = other.locked()?.clone();
+                this.locked()?
+                    .combine(&source, how)
+                    .map_err(|err| mlua::Error::external(err.to_string()))
+            },
+        );
+
+        // **A whole chunk's heights, natively.** Sampling one at a time from
+        // Lua is the per-sample loop charter rule 4 forbids, and this is the
+        // reason a map is worth having rather than a table of numbers.
+        methods.add_method("heightmap", |_, this, position: Table| {
+            let chunk_x: i32 = position.get("x")?;
+            let chunk_z: i32 = position.get("z")?;
+            Ok(Heightmap {
+                heights: this.locked()?.heightmap(chunk_x, chunk_z),
+            })
+        });
+    }
+}
+
 /// A chunk being generated, exposed to Lua as userdata.
 ///
 /// Every operation is a whole-buffer or whole-block one. There is no per-sample
@@ -1030,6 +1133,79 @@ impl ScriptVm for MluaVm {
             .borrow::<BufferHandle>()
             .map_err(|err| self.vm_error(&err))?;
         Ok((buffer.buffer.to_chunk(), buffer.buffer.fluid().clone()))
+    }
+
+    fn world_init(&mut self) -> Result<Vec<(String, ScriptError)>, ScriptError> {
+        let owners: Vec<String> = self
+            .lua
+            .named_registry_value::<Table>("tiamot.world_init")
+            .map_err(|err| self.vm_error(&err))?
+            .sequence_values::<String>()
+            .filter_map(Result::ok)
+            .collect();
+
+        let mut faults = Vec::new();
+        for mod_id in owners {
+            if self.faulted.contains(&mod_id) {
+                continue;
+            }
+            let callback: mlua::Function = self
+                .lua
+                .named_registry_value(&Self::hook_key("on_world_init", &mod_id))
+                .map_err(|err| self.vm_error(&err))?;
+
+            // **A whole budget, not a tick's worth.** A pre-pass blurs a
+            // million samples a pass and runs once in a world's life; holding
+            // it to the per-call instruction cap would refuse the only thing
+            // it is for. The native operations are where the work happens and
+            // they are bounded by the map's size.
+            self.arm_budget(self.limits.instructions_per_call.saturating_mul(1024))?;
+            let result = callback.call::<()>(());
+            self.disarm_budget();
+
+            if let Err(err) = result {
+                let error = Self::classify(&err, &mod_id, "on_world_init");
+                self.faulted.insert(mod_id.clone());
+                tracing::error!(mod_id = %mod_id, error = %error, "disabling mod after a world pre-pass failure");
+                faults.push((mod_id, error));
+            }
+        }
+        Ok(faults)
+    }
+
+    fn load_maps(&mut self, maps: Vec<(String, String, crate::detgen::Map)>) {
+        let Ok(held) = self.lua.named_registry_value::<Table>("tiamot.maps") else {
+            return;
+        };
+        for (mod_id, name, map) in maps {
+            let handle = MapHandle {
+                map: std::sync::Arc::new(std::sync::Mutex::new(map)),
+            };
+            if let Err(err) = held.set(format!("{mod_id}\u{1f}{name}"), handle) {
+                tracing::error!(%mod_id, %name, "could not install a saved map: {err}");
+            }
+        }
+    }
+
+    fn take_maps(&mut self) -> Vec<(String, String, crate::detgen::Map)> {
+        let Ok(held) = self.lua.named_registry_value::<Table>("tiamot.maps") else {
+            return Vec::new();
+        };
+        let mut maps = Vec::new();
+        for entry in held.pairs::<String, mlua::AnyUserData>() {
+            let Ok((key, value)) = entry else { continue };
+            let Ok(handle) = value.borrow::<MapHandle>() else {
+                continue;
+            };
+            let Ok(map) = handle.map.lock() else { continue };
+            // The key is `mod\u{1f}name`; a separator no id can contain, so the
+            // split is exact rather than a guess about where a name starts.
+            let Some((mod_id, name)) = key.split_once('\u{1f}') else {
+                continue;
+            };
+            maps.push((mod_id.to_owned(), name.to_owned(), map.clone()));
+        }
+        maps
     }
 
     fn tick(&mut self, dt_ticks: u32) -> Result<Vec<(String, ScriptError)>, ScriptError> {
@@ -2650,6 +2826,7 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
 
         self.install_entity_step_hook(mod_id, game)?;
+        self.install_world_init_hook(mod_id, game)?;
         self.install_tools(game)?;
         self.install_inventory(game)?;
         self.install_sound(mod_id, game)?;
@@ -3863,6 +4040,39 @@ impl MluaVm {
         Ok(())
     }
 
+    /// Puts `game.register_on_world_init` on the `game` table.
+    ///
+    /// The same shape as `register_on_tick`, deliberately — a mod author has
+    /// one shape to learn rather than several.
+    fn install_world_init_hook(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let owner = mod_id.to_owned();
+        let key = Self::hook_key("on_world_init", mod_id);
+        let register = self
+            .lua
+            .create_function(move |lua, callback: mlua::Function| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                lua.set_named_registry_value(&key, callback)?;
+                let owners: Table = lua.named_registry_value("tiamot.world_init")?;
+                let already = owners
+                    .sequence_values::<String>()
+                    .filter_map(Result::ok)
+                    .any(|existing| existing == owner);
+                if !already {
+                    owners.set(owners.raw_len() + 1, owner.clone())?;
+                }
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_on_world_init", register)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// Puts `game.register_on_entity_step` on the `game` table.
     ///
     /// Its own method only because `install_registration` had outgrown the line
@@ -3967,6 +4177,80 @@ impl MluaVm {
     }
 
     /// Everything callable after freeze: lookups, bulk noise, streams, constants.
+    /// Creates the registry tables the world pre-pass uses.
+    ///
+    /// Its own method because `install_registry` is at the line limit. Held in
+    /// the Lua registry rather than in Rust fields for the reason that registry
+    /// exists at all: a `create_function` closure cannot borrow `self`, and
+    /// registration state having two homes is what once made `generate_chunk`
+    /// read a list nothing ever wrote to.
+    fn install_map_registry(&mut self) -> Result<(), ScriptError> {
+        // Mods with an `on_world_init`, in load order.
+        let world_init = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.world_init", world_init)
+            .map_err(|err| self.vm_error(&err))?;
+        // Maps a mod has asked for, by `mod\u{1f}name` — a separator no id can
+        // contain, so splitting the key back apart is exact rather than a
+        // guess about where a name starts.
+        let maps = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.maps", maps)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
+    /// Installs `game.map`.
+    ///
+    /// **Fetch-or-create, never just create.** A mod asks for its map by name
+    /// every run; the first time there is nothing and it computes one, and
+    /// every time after the server has already put the saved one here. So the
+    /// same call has to answer both, or a mod would need to know which run it
+    /// was on.
+    fn install_map(&self, owner: &str, game: &Table) -> Result<(), ScriptError> {
+        let owner = owner.to_owned();
+        let map = self
+            .lua
+            .create_function(move |lua, spec: Table| {
+                let name: String = spec.get("name").map_err(|_| {
+                    mlua::Error::external("game.map: missing required field `name`")
+                })?;
+                let side: u32 = spec.get("side").unwrap_or(256);
+                let scale: u32 = spec.get("scale").unwrap_or(16);
+                let origin_x: i32 = spec.get("origin_x").unwrap_or(0);
+                let origin_z: i32 = spec.get("origin_z").unwrap_or(0);
+
+                let held: Table = lua.named_registry_value("tiamot.maps")?;
+                let key = format!("{owner}\u{1f}{name}");
+                if let Ok(existing) = held.get::<mlua::AnyUserData>(key.clone()) {
+                    let handle = existing.borrow::<MapHandle>()?;
+                    let shape = {
+                        let map = handle.locked()?;
+                        map.side() == side
+                            && map.scale() == scale
+                            && map.origin() == [origin_x, origin_z]
+                    };
+                    if shape {
+                        return Ok(handle.clone());
+                    }
+                    // A mod that changed the shape gets a fresh field rather
+                    // than its old numbers read against a new geometry, which
+                    // is the same rule `WorldDb::load_map` applies.
+                }
+
+                let fresh = crate::detgen::Map::new(side, scale, [origin_x, origin_z])
+                    .map_err(|err| mlua::Error::external(err.to_string()))?;
+                let handle = MapHandle {
+                    map: std::sync::Arc::new(std::sync::Mutex::new(fresh)),
+                };
+                held.set(key, handle.clone())?;
+                Ok(handle)
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("map", map).map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// Installs `game.density`.
     ///
     /// Its own method because `install_frozen_api` sits at the line limit and
@@ -4068,6 +4352,7 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
 
         self.install_density(game)?;
+        self.install_map(mod_id, game)?;
 
         // A flat heightmap, for generators that want a constant surface.
         let flat_heightmap = self
@@ -4165,6 +4450,7 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.skies", skies)
             .map_err(|err| self.vm_error(&err))?;
+        self.install_map_registry()?;
         let tickers = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.tickers", tickers)
@@ -5801,7 +6087,12 @@ fn qualify_id(mod_id: &str, id: &str) -> Result<String, String> {
 /// Its own function because every field is optional with a documented default,
 /// which is a dozen lines of nothing happening — and inline it took the parse
 /// past the line limit, which is a fair thing for a lint to object to.
-fn density_noise(spec: &Table) -> crate::detgen::Op {
+/// The fractal shape a table describes, with every field optional.
+///
+/// Shared by the density DSL's `noise` node and by `Map:noise`, so the two
+/// spell the same options the same way — a mod that learns one has learned the
+/// other, and neither can drift.
+fn density_noise_params(spec: &Table) -> crate::detgen::FractalParams {
     let mut params = crate::detgen::default_params();
     if let Ok(octaves) = spec.get::<u32>("octaves") {
         params.octaves = octaves;
@@ -5815,6 +6106,11 @@ fn density_noise(spec: &Table) -> crate::detgen::Op {
     if let Ok(gain) = spec.get::<f32>("gain") {
         params.gain = gain;
     }
+    params
+}
+
+fn density_noise(spec: &Table) -> crate::detgen::Op {
+    let params = density_noise_params(spec);
     // **The stream is a NAME, hashed.** A number would invite two mods to pick
     // 1, and a field that silently equals somebody else's is the hardest kind
     // of worldgen bug to see.

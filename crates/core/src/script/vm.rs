@@ -1092,6 +1092,37 @@ pub trait ScriptVm: Sized {
     /// The `Result` is for a VM-level failure that affects everything.
     fn tick(&mut self, dt_ticks: u32) -> Result<Vec<(String, ScriptError)>, ScriptError>;
 
+    /// Runs every mod's `on_world_init`, once in a world's life.
+    ///
+    /// **The pre-pass.** A field that erosion or a river needs is computed from
+    /// all of itself, not per chunk, so it has to happen before the first chunk
+    /// is generated and exactly once — the result is stored with the world and
+    /// every later run reads it back.
+    ///
+    /// Faults are returned rather than propagated, like [`Self::tick`]: a mod
+    /// whose pre-pass failed is disabled and the world still generates,
+    /// because a world that refuses to open is worse than one missing a
+    /// mod's rivers.
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError`] only if the VM itself is unusable.
+    fn world_init(&mut self) -> Result<Vec<(String, ScriptError)>, ScriptError> {
+        Ok(Vec::new())
+    }
+
+    /// Installs the maps a world already had, before anything asks for one.
+    ///
+    /// Keyed by mod id and name. A mod's `game.map` call finds these rather
+    /// than building a fresh field, which is what makes the same call work on
+    /// the first run and on every one after.
+    fn load_maps(&mut self, _maps: Vec<(String, String, crate::detgen::Map)>) {}
+
+    /// Every map a mod is holding, for the caller that stores them.
+    fn take_maps(&mut self) -> Vec<(String, String, crate::detgen::Map)> {
+        Vec::new()
+    }
+
     /// Runs one mod's per-entity step callback over the entities it owns.
     ///
     /// Called once per tick per mod, with the ids of every live entity whose

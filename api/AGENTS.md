@@ -146,6 +146,35 @@ operation list is in the stubs, and it is short on purpose: every operation is
 in the deterministic subset, so there is no `pow`, `sin` or `sqrt` and asking
 for one is asking to break the cross-platform guarantee.
 
+**Erosion and rivers need a pre-pass, not a density field.** A density field is
+a function of one position. Where water goes depends on where the land is
+everywhere else, so it cannot be one — it needs a whole field computed once, in
+passes that see all of it:
+
+```lua
+local function field()
+    return game.map{ name = "height", side = 256, scale = 16 }
+end
+
+game.register_on_world_init(function()          -- ONCE in a world's life
+    local map = field()
+    map:noise{ seed = 7, frequency = 0.01, octaves = 4, amplitude = 40.0 }
+    local worn = game.map{ name = "worn", side = 256, scale = 16 }
+    worn:noise{ seed = 7, frequency = 0.01, octaves = 4, amplitude = 40.0 }
+    worn:blur(3)
+    map:combine(worn, "min")                    -- valleys cut, peaks kept
+end)
+
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(field():heightmap(pos), stone)
+end)
+```
+
+The map is stored with the world, so the pre-pass runs once and every later run
+reads it back. **There is no `erode` and there will not be one** — what erosion
+looks like is an opinion about what a landscape is, and that is yours. Blur and
+`combine("min")` are the primitives it is built from.
+
 **Water is placed at generation or not at all.** The fluid solver conserves
 volume — it moves what exists and creates nothing — so there are no sources and
 nothing pours a sea into being later:
