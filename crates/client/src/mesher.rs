@@ -679,6 +679,16 @@ pub trait FluidFill {
     /// unloaded chunk — answers `None` and gets what it always did.
     fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)>;
 
+    /// Whether this chunk, or the ring of blocks around it, holds any fluid.
+    ///
+    /// **Defaults to yes, which is the safe answer.** It exists so
+    /// [`mesh_chunk`] can skip a chunk of pure air without scanning it, and a
+    /// caller that does not know must not let that happen — a pond in an air
+    /// chunk that answered wrongly would simply stop being drawn.
+    fn any(&self) -> bool {
+        true
+    }
+
     /// Whether a DRY block is something the fluid is held in by.
     ///
     /// # Why the fluid source answers a question about terrain
@@ -710,11 +720,28 @@ impl FluidFill for NoFluid {
     fn fill(&self, _x: i32, _y: i32, _z: i32) -> Option<(u16, u8)> {
         None
     }
+
+    /// None, which is the whole point of this type.
+    ///
+    /// Without saying so it inherited the trait's default of "assume fluid",
+    /// and `mesh_chunk`'s fast path never fired for the caller that most
+    /// obviously qualifies.
+    fn any(&self) -> bool {
+        false
+    }
 }
 
 impl<T: FluidFill + ?Sized> FluidFill for &T {
     fn fill(&self, x: i32, y: i32, z: i32) -> Option<(u16, u8)> {
         (**self).fill(x, y, z)
+    }
+
+    /// **Forwarded, and it has to be.** A blanket impl that forwards some
+    /// methods and lets the rest fall back to their defaults is a reference
+    /// that answers differently from the thing it points at — here, a
+    /// `&NoFluid` that claimed to hold fluid.
+    fn any(&self) -> bool {
+        (**self).any()
     }
 }
 
@@ -1636,6 +1663,20 @@ pub fn mesh_chunk(
     light: &impl BlockLight,
     fluid: &impl FluidFill,
 ) -> Mesh {
+    // **A chunk of nothing costs nothing.** Meshing scans all 110,592 sub-node
+    // cells whatever the chunk holds — the cost is the scan, not the geometry
+    // it produces — so a chunk of pure air spent the full price to produce an
+    // empty mesh. Most of the sky is exactly that, and on charter rule 18's
+    // minimum spec one chunk is milliseconds.
+    //
+    // **Air only, and only when it is dry.** A solid chunk still draws
+    // wherever a neighbour is not solid, which is a question about six other
+    // chunks; air draws nothing on its own account, full stop. The fluid guard
+    // is not optional — a pond sits in blocks that are air, and skipping the
+    // scan without asking would stop drawing it.
+    if chunk.is_uniform() == Some(tiamot_core::MaterialId::AIR) && !fluid.any() {
+        return Mesh::default();
+    }
     mesh(
         &SubNodeGrid::from_chunk_with_fluid(chunk, neighbours, absent, fluid),
         light,
@@ -2143,6 +2184,59 @@ mod tests {
             (x == self.block.x as i32 && y == self.block.y as i32 && z == self.block.z as i32)
                 .then_some((self.material, self.depth))
         }
+    }
+
+    #[test]
+    fn an_air_chunk_with_a_pond_in_it_is_still_meshed() {
+        // **The guard on the fast path, and the reason it is not optional.**
+        // `mesh_chunk` skips a chunk of pure air without scanning it, because
+        // most of the sky is exactly that and scanning 110,592 cells to produce
+        // nothing is the cost of a frame on a slow machine. But a pond sits in
+        // blocks that ARE air, so a `FluidFill` that answered `any()` wrongly
+        // would stop drawing water without stopping anything else.
+        //
+        // `Pond` inherits the trait's default of "yes, assume fluid", which is
+        // the safe answer for every caller that does not know — and this is
+        // what proves the default is doing its job.
+        let chunk = empty();
+        assert_eq!(
+            chunk.is_uniform(),
+            Some(tiamot_core::MaterialId::AIR),
+            "the fixture must be the case the fast path would skip"
+        );
+        let pond = Pond {
+            block: LocalBlock::new(8, 8, 8),
+            material: 2,
+            depth: 20,
+        };
+        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &pond);
+        assert!(
+            !mesh.is_empty(),
+            "an air chunk holding milk drew nothing: the fast path skipped a pond"
+        );
+    }
+
+    #[test]
+    fn an_empty_dry_chunk_is_skipped_without_scanning_it() {
+        // **The mesh being empty proves nothing** — an air chunk draws nothing
+        // whether it was scanned or skipped, so that assertion passed before
+        // the fast path existed and would pass again if it stopped working.
+        // What decides it is whether the caller reports itself dry, and
+        // `NoFluid` inherited the trait's default of "assume fluid" until this
+        // was measured: the benchmark read 63 us for a chunk of nothing, which
+        // is the scan, and 4.9 ns once it answered.
+        assert!(
+            !NoFluid.any(),
+            "NoFluid claims to hold fluid, so the fast path never fires for it"
+        );
+        assert!(
+            !FluidFill::any(&&NoFluid),
+            "the blanket impl for a reference did not forward `any`, so a \
+             `&NoFluid` answers differently from the thing it points at"
+        );
+
+        let mesh = mesh_chunk(&empty(), &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        assert!(mesh.is_empty());
     }
 
     /// A three-by-three pond with open air on one side and a wall on the other.

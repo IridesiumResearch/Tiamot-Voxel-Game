@@ -23,6 +23,8 @@
 //! in how much *geometry* they produce rather than in how much they scan, which
 //! is what separates the scan cost from the merge and shading cost.
 //!
+//! - `air` — nothing at all, which is most of the sky and most of a world.
+//!   `mesh_chunk` skips it without scanning, so this measures the skip.
 //! - `uniform` — solid stone. The scan, with almost nothing to emit.
 //! - `terrain` — the shape a real chunk has: ground, air above, a hole.
 //! - `chiselled` — every block partial. The sub-node worst case, and the one
@@ -45,6 +47,11 @@ const STONE: MaterialId = MaterialId(2);
 /// Solid stone, corner to corner.
 fn uniform() -> Chunk {
     Chunk::new(ChunkPos::new(0, 0, 0), STONE)
+}
+
+/// Nothing at all — the sky, and the majority of any world's chunks.
+fn air() -> Chunk {
+    Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR)
 }
 
 /// The shape a chunk of real terrain has: ground below, air above, one hole.
@@ -87,6 +94,7 @@ fn chiselled() -> Chunk {
 fn meshing(c: &mut Criterion) {
     let mut group = c.benchmark_group("mesh_chunk");
     for (name, chunk) in [
+        ("air", air()),
         ("uniform", uniform()),
         ("terrain", terrain()),
         ("chiselled", chiselled()),

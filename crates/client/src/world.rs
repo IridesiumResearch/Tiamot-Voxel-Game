@@ -350,6 +350,16 @@ impl ChunkStore {
         !self.fluid.is_empty()
     }
 
+    /// Whether one chunk holds any fluid.
+    ///
+    /// Per position rather than the whole store, because a world with an ocean
+    /// in it has fluid SOMEWHERE and that says nothing about the sky. See
+    /// `mesher::FluidFill::any`.
+    #[must_use]
+    pub fn chunk_has_fluid(&self, pos: ChunkPos) -> bool {
+        self.fluid.get(&pos).is_some_and(|layer| !layer.is_empty())
+    }
+
     /// The light level at a block, or [`Light::DARK`] where nothing is held.
     ///
     /// Dark rather than daylight for the absent case, and it matters which:
@@ -832,6 +842,30 @@ impl crate::mesher::FluidFill for ChunkFluid<'_> {
     /// tapered into terrain that simply has not arrived would rise back up the
     /// moment it did, which is a visible flicker along the edge of the streamed
     /// world.
+    fn any(&self) -> bool {
+        // **The ring too, not just this chunk.** `fill` is asked about
+        // `-1..=CHUNK_BLOCKS`, so milk in a neighbour reaches this chunk's
+        // surface — answering from this layer alone would drop the far side of
+        // a pond that straddles a seam.
+        let neighbourhood = [
+            (0, 0, 0),
+            (-1, 0, 0),
+            (1, 0, 0),
+            (0, -1, 0),
+            (0, 1, 0),
+            (0, 0, -1),
+            (0, 0, 1),
+        ];
+        neighbourhood.into_iter().any(|(dx, dy, dz)| {
+            self.store.chunk_has_fluid(ChunkPos::new(
+                self.pos.x + dx,
+                self.pos.y + dy,
+                self.pos.z + dz,
+            ))
+        })
+    }
+
+    /// Whether a dry block is terrain the milk is held in by.
     fn solid(&self, x: i32, y: i32, z: i32) -> bool {
         let span = tiamot_core::CHUNK_BLOCKS as i32;
         let at = tiamot_core::BlockPos::new(
