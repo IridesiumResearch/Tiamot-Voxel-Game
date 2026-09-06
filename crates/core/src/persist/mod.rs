@@ -42,6 +42,19 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+/// The largest map blob that will be decompressed.
+///
+/// `detgen::Map::MAX_SIDE` squared at four bytes a sample, and a little over. A
+/// bound before allocation rather than after, because the row is on disk and
+/// disks are things people edit.
+const MAP_MAX_BYTES: usize = (1024 * 1024 * 4) + 1024;
+
+/// `zstd` level for a map blob.
+///
+/// The same as a chunk's, [`codec::ZSTD_LEVEL`]. A heightfield is smooth and
+/// compresses well, and this is written once per world rather than per save.
+const MAP_ZSTD_LEVEL: i32 = codec::ZSTD_LEVEL;
+
 use crate::chunk::Chunk;
 use crate::coords::ChunkPos;
 use crate::fluid::FluidLayer;
@@ -1054,6 +1067,112 @@ impl WorldDb {
         Ok(())
     }
 
+    // -- maps -------------------------------------------------------------
+
+    /// Loads a mod's map, if it has one under that name.
+    ///
+    /// **Returns `None` for a shape that no longer matches**, rather than the
+    /// old values: side, scale and origin decide what a sample MEANS, so a mod
+    /// that changed them between runs and got its old numbers back would read
+    /// a landscape that had moved. A `None` says "compute it again", which is
+    /// what a pre-pass is for.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the row will not read or decompress.
+    pub fn load_map(
+        &self,
+        mod_id: &str,
+        name: &str,
+        want: &crate::detgen::Map,
+    ) -> Result<Option<crate::detgen::Map>, WorldError> {
+        let mut statement = self.conn.prepare(
+            "SELECT side, scale, origin_x, origin_z, samples FROM mod_maps \
+             WHERE mod_id = ?1 AND name = ?2",
+        )?;
+        let mut rows = statement.query(params![mod_id, name])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let side: i64 = row.get(0)?;
+        let scale: i64 = row.get(1)?;
+        let origin_x: i64 = row.get(2)?;
+        let origin_z: i64 = row.get(3)?;
+        let blob: Vec<u8> = row.get(4)?;
+
+        let shape_agrees = u32::try_from(side).is_ok_and(|s| s == want.side())
+            && u32::try_from(scale).is_ok_and(|s| s == want.scale())
+            && i32::try_from(origin_x).is_ok_and(|x| x == want.origin()[0])
+            && i32::try_from(origin_z).is_ok_and(|z| z == want.origin()[1]);
+        if !shape_agrees {
+            return Ok(None);
+        }
+
+        let raw = zstd::bulk::decompress(&blob, MAP_MAX_BYTES).map_err(|source| {
+            WorldError::ModStorage {
+                mod_id: mod_id.to_owned(),
+                key: name.to_owned(),
+                reason: source.to_string(),
+            }
+        })?;
+        // Four bytes a sample, little-endian, in the order the map stores them.
+        // A length that does not divide is a corrupt row, not a short map.
+        if raw.len() != want.values().len() * 4 {
+            return Ok(None);
+        }
+        let values: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect();
+        let mut map = want.clone();
+        map.set_values(values)
+            .map_err(|source| WorldError::ModStorage {
+                mod_id: mod_id.to_owned(),
+                key: name.to_owned(),
+                reason: source.to_string(),
+            })?;
+        Ok(Some(map))
+    }
+
+    /// Writes a mod's map, replacing whatever was there.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if the write fails.
+    pub fn save_map(
+        &self,
+        mod_id: &str,
+        name: &str,
+        map: &crate::detgen::Map,
+    ) -> Result<(), WorldError> {
+        let mut raw = Vec::with_capacity(map.values().len() * 4);
+        for value in map.values() {
+            raw.extend_from_slice(&value.to_le_bytes());
+        }
+        let blob = zstd::bulk::compress(&raw, MAP_ZSTD_LEVEL).map_err(|source| {
+            WorldError::ModStorage {
+                mod_id: mod_id.to_owned(),
+                key: name.to_owned(),
+                reason: source.to_string(),
+            }
+        })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO mod_maps \
+             (mod_id, name, side, scale, origin_x, origin_z, samples) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                mod_id,
+                name,
+                i64::from(map.side()),
+                i64::from(map.scale()),
+                i64::from(map.origin()[0]),
+                i64::from(map.origin()[1]),
+                blob
+            ],
+        )?;
+        Ok(())
+    }
+
     // -- players ----------------------------------------------------------
 
     /// Loads a player's opaque state blob.
@@ -1687,6 +1806,60 @@ pub struct StoredPlayerKey {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_map_round_trips_and_a_changed_shape_reads_as_absent() {
+        use crate::detgen::Map;
+
+        let mut registry = Registry::new();
+        let db = WorldDb::open_in_memory(&mut registry).expect("open");
+
+        let mut map = Map::new(32, 16, [0, 0]).expect("map");
+        map.offset(12.5);
+        db.save_map("terrain", "world", &map).expect("save");
+
+        let blank = Map::new(32, 16, [0, 0]).expect("map");
+        let back = db
+            .load_map("terrain", "world", &blank)
+            .expect("load")
+            .expect("a map was saved under that name");
+        assert_eq!(back.values(), map.values(), "the values did not survive");
+
+        // **A different shape reads as absent, not as the old numbers.** Side,
+        // scale and origin decide what a sample MEANS, so a mod that changed
+        // them and got its old values back would read a landscape that had
+        // moved. `None` says "compute it again", which is what a pre-pass is
+        // for.
+        let moved = Map::new(32, 16, [4096, 0]).expect("map");
+        assert!(
+            db.load_map("terrain", "world", &moved)
+                .expect("load")
+                .is_none(),
+            "a map at a different origin came back as the old one"
+        );
+        let coarser = Map::new(32, 64, [0, 0]).expect("map");
+        assert!(
+            db.load_map("terrain", "world", &coarser)
+                .expect("load")
+                .is_none(),
+            "a map at a different scale came back as the old one"
+        );
+        let bigger = Map::new(64, 16, [0, 0]).expect("map");
+        assert!(
+            db.load_map("terrain", "world", &bigger)
+                .expect("load")
+                .is_none(),
+            "a map of a different size came back as the old one"
+        );
+
+        // And one mod cannot read another's, which is the primary key doing
+        // its job rather than anybody's good behaviour.
+        assert!(
+            db.load_map("someone_else", "world", &blank)
+                .expect("load")
+                .is_none()
+        );
+    }
     use super::*;
 
     #[test]

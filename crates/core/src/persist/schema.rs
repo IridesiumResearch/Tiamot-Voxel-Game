@@ -172,6 +172,30 @@ CREATE TABLE IF NOT EXISTS mod_storage (
     PRIMARY KEY (mod_id, key)
 );
 
+-- Maps: the persistent 2D fields a mod's world pre-pass computes once.
+--
+-- Additive, like `mod_storage`. Its own table rather than a blob in that one
+-- because a map has a SHAPE the engine has to agree with — side, scale and
+-- origin decide what a sample means, and a mod that changed them between runs
+-- would read its old values against a new geometry and get a landscape that
+-- moved. Storing them beside the values is what lets a load be checked.
+--
+-- The samples are raw little-endian `f32`, zstd'd like a chunk: a 1,024-sided
+-- map is four megabytes uncompressed and a heightfield compresses well.
+--
+-- The column is `samples` and not `values` because VALUES is a SQLite keyword,
+-- which `CREATE TABLE` reports as a syntax error pointing at the line after it.
+CREATE TABLE IF NOT EXISTS mod_maps (
+    mod_id   TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    side     INTEGER NOT NULL,
+    scale    INTEGER NOT NULL,
+    origin_x INTEGER NOT NULL,
+    origin_z INTEGER NOT NULL,
+    samples  BLOB NOT NULL,
+    PRIMARY KEY (mod_id, name)
+);
+
 -- Inventories that belong to the WORLD rather than to a player: a chest, a
 -- furnace, a hopper. Named by the mod that made them, which is how one is
 -- found again when somebody opens the block it belongs to.
