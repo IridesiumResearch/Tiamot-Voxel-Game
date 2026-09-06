@@ -51,10 +51,37 @@ const NEIGHBOUR_OFFSETS: [(i32, i32, i32); 6] = [
 
 /// How an unloaded neighbour is treated when meshing.
 ///
-/// [`Absent::Solid`]: a chunk that has not arrived is almost always a chunk
-/// that exists, so drawing a wall of faces against it produces a shell around
-/// the loaded region that pops away a moment later.
-pub const ABSENT_POLICY: Absent = Absent::Solid;
+/// [`Absent::Air`]: a chunk that has not arrived is DRAWN AGAINST, so the
+/// loaded region ends in a wall of faces rather than in a hole.
+///
+/// # It was `Solid` until 2026-09-06, and that was an X-ray
+///
+/// The argument for `Solid` was that a chunk which has not arrived is almost
+/// always a chunk that exists, so walling against it produces a shell around
+/// the loaded region that pops away a moment later. True, and it costs more
+/// than it saves.
+///
+/// `Solid` culls the face pointing at the missing chunk. Nothing is drawn where
+/// that chunk should be, and nothing is drawn on the near side of the gap
+/// either — so there is a **see-through hole in the terrain at the streaming
+/// frontier**, and through it a player sees the interior faces of whatever
+/// loaded further out. Those faces are a cross-section of the ground.
+/// Reported from the window: standing underground, about six chunks off,
+/// a clean slice through the rock showing where the ore is.
+///
+/// That is a fairness problem and the shell is a cosmetic one, so the shell
+/// wins. Two things have also made it cheaper than it was when this was
+/// decided: fog now becomes total inside the horizon rather than at it
+/// (`config::FOG_DISTANCE_RANGE`), and the streaming order fills the band a
+/// player is looking along first (`interest::VERTICAL_WEIGHT`), so the
+/// frontier spends less time in front of them.
+///
+/// **A wall inside rock is invisible; a hole inside rock is a window.** That
+/// asymmetry is the whole argument, and it is why the horizon's own
+/// `ChunkStore::horizon_is_buried` reached the same conclusion independently
+/// for summaries — an unarrived neighbour is not treated as solid there
+/// either.
+pub const ABSENT_POLICY: Absent = Absent::Air;
 
 /// What one frame should rebuild, and how much of it cannot wait.
 ///
@@ -1153,10 +1180,16 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_neighbour_hides_the_border_rather_than_walling_it_off() {
-        // The policy this module fixes, checked against the mesher rather than
-        // asserted in a comment: a lone chunk with no neighbours loaded must
-        // draw nothing, so the loaded region has no shell around it.
+    fn a_missing_neighbour_is_walled_off_rather_than_left_see_through() {
+        // **The inverse of what this asserted until 2026-09-06**, and the
+        // reversal is the point: a solid chunk at the streaming frontier must
+        // draw its outward faces, so the loaded region ends in a wall.
+        //
+        // `Absent::Solid` culled those faces, which left a see-through hole in
+        // the ground at the frontier — and through it, the interior faces of
+        // chunks that had loaded further out, which is a cross-section showing
+        // where the ore is. Reported from the window. See [`ABSENT_POLICY`] for
+        // why a wall that pops is the cheaper of the two.
         let mut store = ChunkStore::new();
         store.insert(solid_at(0, 0, 0));
 
@@ -1169,9 +1202,8 @@ mod tests {
             &crate::mesher::NoFluid,
         );
         assert!(
-            mesh.is_empty(),
-            "a solid chunk with nothing loaded around it should draw no shell, got {} quads",
-            mesh.quads.len()
+            !mesh.is_empty(),
+            "a solid chunk with nothing loaded around it must draw a wall, not a hole"
         );
     }
 

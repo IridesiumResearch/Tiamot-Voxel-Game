@@ -309,6 +309,57 @@ fn a_tab_strip_answers_the_tab_that_was_clicked() {
 }
 
 #[test]
+fn fog_past_its_far_distance_leaves_nothing_of_the_terrain() {
+    // **Reported from the window**: "fog does not render over the ground at
+    // 100% opacity. I can still see lines from the blocks in the distance, as
+    // though the opacity only goes to 80%."
+    //
+    // `distant_terrain_fades_into_the_sky` asserts fog moves the colour TOWARD
+    // the sky, which is true of a fog that stops at four fifths — so it could
+    // never answer this. This asserts arrival: with the far distance pulled in
+    // front of every surface in the scene, the frame must be the sky and
+    // nothing else, in both fog paths.
+    //
+    // Both, because they are different code. Modes 1 and 2 fog per-surface in
+    // `world.wgsl`; mode 3 skips that and fogs in the post chain from the depth
+    // buffer, before the tonemap — and a fog applied before a tonemap is
+    // exactly how "fully fogged" comes back with contrast in it.
+    let Some(gpu) = gpu() else { return };
+    let chunks = scene();
+
+    for mode in [
+        client::config::LightingMode::Simple,
+        client::config::LightingMode::Classic,
+        client::config::LightingMode::Beautiful,
+    ] {
+        let mut renderer = prepare(gpu.clone(), &chunks, RenderMode::Textured);
+        renderer.set_lighting_mode(mode);
+        let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+        // Two blocks: closer than anything the viewpoint can see, so every
+        // surface in the frame is past the point fog becomes total.
+        renderer.set_sky(client::render::sky_colour(), 2.0);
+        let frame = target
+            .capture(&mut renderer, &viewpoint())
+            .expect("capture");
+
+        // The ground fills the bottom of the frame; the top is sky that never
+        // had geometry in it. Fully fogged, they must be the same colour.
+        let ground = average(&frame, 0, HEIGHT * 3 / 4, WIDTH, HEIGHT);
+        let sky = average(&frame, 0, 0, WIDTH, HEIGHT / 8);
+        let gap = (0..3)
+            .map(|c| (ground[c] - sky[c]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            gap < 0.02,
+            "in {mode:?}, ground past the fog's far distance is {ground:?} \
+             against a sky of {sky:?} — a gap of {gap:.3}. Fog that stops short \
+             leaves the block edges it exists to hide."
+        );
+    }
+}
+
+#[test]
 fn distant_terrain_fades_into_the_sky() {
     // **Fog exists to hide the edge of the loaded world.** Without it, the far
     // chunk boundary is a hard line between terrain and sky and every chunk
