@@ -83,6 +83,29 @@ pub const fn cells_per_axis(level: u8) -> Option<u32> {
 /// figure Task 15b's acceptance criteria name.
 pub const MAX_HORIZON: u8 = 32;
 
+/// How many chunk layers are worth SUMMARISING above and below the player.
+///
+/// **A horizon is a surface, and this is what stops it being a volume.** The
+/// horizon's EXTENT still matches the view's vertical and has to — a chunk
+/// inside the detail radius but outside the horizon is a chunk
+/// `Streamer::departed` calls out of range, which unloaded 3,152 of 4,925 on
+/// one step when this was tried as a cap on [`horizon_for`]. This bounds which
+/// positions inside that extent are worth asking for a summary of.
+///
+/// The default vertical went 4 to 12 on 2026-09-05 so a player on a hilltop
+/// could see the valley floor, and the horizon followed it: **27,108 candidate
+/// summaries became 75,300**, nearly three times the work for terrain nobody
+/// can see from the ground. Reported from the window a day later as a horizon
+/// of isolated slabs with gaps between them, which is what almost none of it
+/// having arrived looks like.
+///
+/// Four layers is 64 blocks either side of the player, which holds the surface
+/// of anything a landscape does at the distance a summary is drawn at. Terrain
+/// outside it is not summarised, and is drawn in full when the player comes
+/// close enough for the detail radius — which is the trade the whole mechanism
+/// is.
+pub const MAX_HORIZON_VERTICAL: u8 = 4;
+
 /// How far the horizon reaches, for a given detail radius.
 ///
 /// **Four times out, and no taller.** Not a taste decision on either axis.
@@ -795,11 +818,32 @@ mod ring_tests {
             horizon.horizontal, 32,
             "criterion A3 wants 32 chunks of overworld view"
         );
-        assert_eq!(
-            horizon.vertical,
-            crate::interest::ViewDistance::DEFAULT.vertical,
-            "the horizon grew upwards"
-        );
+        // **Against the CAP, not against the view's own vertical.** This
+        // compared the two and passed for a year — because the default vertical
+        // was 4 and so was the cap, so "does not grow upwards" and "equals the
+        // view" were the same assertion. Raising the default to 12 on
+        // 2026-09-05 made them different, and this test then asserted that the
+        // horizon SHOULD be 12 tall, which is the opposite of what its own
+        // comment says. Reported from the window a day later as a horizon of
+        // isolated slabs: 27,108 summaries had become 75,300.
+        //
+        // A test that compares two things which happen to be equal is a test
+        // that changes meaning when one of them moves.
+        for vertical in [1u8, 4, 12, 16] {
+            let taller = crate::interest::ViewDistance::clamped(8, vertical);
+            let reach = super::horizon_for(taller).vertical;
+            // **The horizon must CONTAIN the detail set.** `Streamer::departed`
+            // decides what left range by testing the sent chunks against the
+            // horizon, so a horizon shorter than the view declares chunks
+            // inside the detail radius to be gone — 3,152 of 4,925 unloaded on
+            // a single step when this was tried as a cap here. What is bounded
+            // instead is which positions are worth SUMMARISING, in
+            // `Streamer::reorder_horizon`, where it costs nothing but work.
+            assert_eq!(
+                reach, taller.vertical,
+                "the horizon no longer contains the detail set it belongs to"
+            );
+        }
 
         // And it stops at the ceiling rather than running away, which is why
         // every view from 8 upward reports the same horizon. That is the thing

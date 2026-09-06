@@ -34,7 +34,13 @@ local ground = game.get_block_id("core:ground")
 --     freq 0.004, amp  24  ->  20 blocks of spread   (reads as flat)
 --     freq 0.020, amp  24  ->  21 blocks             (flat, busier)
 --     freq 0.010, amp  60  ->  49 blocks
---     freq 0.008, amp 110  ->  91 blocks, -49 .. +42  <- these
+--     freq 0.008, amp 110  ->  91 blocks, -49 .. +42  (too strong to walk)
+--     freq 0.008, amp  11  ->   9 blocks              <- these
+--
+-- **Dropped to a tenth on 2026-09-06**, asked for from the window: at 91 blocks
+-- of spread the hills were a wall to climb rather than a landscape to cross.
+-- Nine blocks is a gentle roll that still shows the horizon doing its work,
+-- which is the whole reason this fixture exists.
 --
 -- `frequency` is inverse feature size, so 0.008 puts a hill about 125 blocks
 -- across: four of them across the 512-block horizon, which is the scale that
@@ -44,8 +50,8 @@ local ground = game.get_block_id("core:ground")
 -- `core:white` does not, so one absorbing layer on top stops milk pooling for
 -- ever. `base` shifts the identical field down by one block, which is what
 -- makes the second fill leave exactly one layer behind.
-local SURFACE = { octaves = 5, frequency = 0.008, amplitude = 110.0, base = 0 }
-local BELOW = { octaves = 5, frequency = 0.008, amplitude = 110.0, base = -1 }
+local SURFACE = { octaves = 5, frequency = 0.008, amplitude = 11.0, base = 0 }
+local BELOW = { octaves = 5, frequency = 0.008, amplitude = 11.0, base = -1 }
 
 game.register_domain{ id = "hills", generator = function(buf, pos)
     buf:fill_below_heightmap(game.noise_heightmap(pos, SURFACE), ground)
@@ -66,12 +72,12 @@ game.register_on_chat(function(event)
     if to == nil then
         return
     end
-    -- **Well above the highest peak.** The probe above put the highest ground
-    -- at y = +49, so 96 always drops into open air rather than into the inside
-    -- of a hill. There is no fall damage in the engine — it is a mod's rule
-    -- (see `crates/core/src/path.rs`) and no mod here implements one — so the
-    -- fall costs nothing but the time.
-    if not game.transfer_entity(body, to, { x = 8, y = 96, z = 8 }) then
+    -- **Just above the highest peak.** A tenth of the old amplitude puts the
+    -- highest ground near y = +5, so 24 drops into open air without the long
+    -- fall the old y = 96 needed. There is no fall damage in the engine — it is
+    -- a mod's rule (see `crates/core/src/path.rs`) and no mod here implements
+    -- one — so the drop costs nothing but the time.
+    if not game.transfer_entity(body, to, { x = 8, y = 24, z = 8 }) then
         game.log("nowhere called " .. tostring(to))
     end
     return false

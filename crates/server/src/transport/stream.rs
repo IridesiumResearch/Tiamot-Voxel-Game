@@ -383,10 +383,18 @@ impl Streamer {
         // spent its whole window rejecting the same 2,601 chunks and came back
         // empty, which is a horizon that starts several passes late for no
         // reason. Every position in this list is a candidate.
+        // **And no taller than the surface needs.** The horizon's EXTENT has to
+        // contain the detail set — `departed` tests the sent chunks against it
+        // — but almost none of that extent is worth summarising. At a view of 8
+        // with the vertical of 12 that became the default on 2026-09-05, the
+        // annulus is 75,300 positions where it was 27,108, and the difference
+        // is sky and buried rock. See `lod::MAX_HORIZON_VERTICAL`.
         let (centre, view) = (self.centre, self.view);
+        let layers = i32::from(tiamot_core::lod::MAX_HORIZON_VERTICAL);
         self.horizon_order = interest::chunks_around(centre, self.horizon)
             .into_iter()
             .filter(|pos| !interest::contains(centre, view, *pos))
+            .filter(|pos| (pos.y - centre.y).abs() <= layers)
             .collect();
         self.horizon_cursor = 0;
     }
@@ -508,9 +516,16 @@ mod tests {
             .map(|(pos, _)| pos)
             .collect();
 
+        // **The annulus, bounded vertically.** Positions more than
+        // `lod::MAX_HORIZON_VERTICAL` layers from the player are deliberately
+        // not summarised — sky and buried rock, three quarters of the extent at
+        // the default vertical. What this test is about is that nothing INSIDE
+        // the band is skipped, which is the shape-mismatch bug it caught.
+        let layers = i32::from(tiamot_core::lod::MAX_HORIZON_VERTICAL);
         let wanted: Vec<ChunkPos> = interest::chunks_around(ORIGIN, horizon_for(view))
             .into_iter()
             .filter(|pos| !interest::contains(ORIGIN, view, *pos))
+            .filter(|pos| (pos.y - ORIGIN.y).abs() <= layers)
             .collect();
         let missing: Vec<ChunkPos> = wanted
             .iter()

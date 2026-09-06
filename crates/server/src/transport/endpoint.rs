@@ -635,9 +635,25 @@ pub const CHUNKS_IN_FLIGHT_PER_CLIENT: usize = 4;
 /// **Its own allowance rather than what the chunks leave**, which is what it
 /// was: a client streaming a large view has thousands of chunks to fetch, takes
 /// the whole in-flight budget every pass for as long as that lasts, and the
-/// horizon never begins. The ground under somebody's feet still goes first —
-/// this is one slot beside four, not equal footing.
-pub const SUMMARIES_IN_FLIGHT_PER_CLIENT: usize = 1;
+/// horizon never begins.
+///
+/// # Two, not one, and not four
+///
+/// This was **one**, and one outstanding request means one summary per round
+/// trip whatever the tick is willing to serve — so the rate was a quarter of
+/// the budget beside it and could never reach it. Reported from the window as a
+/// horizon of isolated slabs with gaps between them, which is what almost none
+/// of it having arrived looks like.
+///
+/// Not four either, which is what chunks get: the ground under somebody's feet
+/// goes first, and
+/// `the_horizon_arrives_while_the_detail_radius_is_still_streaming` holds that
+/// line by asserting more chunks than summaries arrive. At four they tie in the
+/// opening pass, because both allowances fill at once.
+///
+/// Two doubles the horizon's rate and keeps it behind the terrain, which is the
+/// whole shape of the trade.
+pub const SUMMARIES_IN_FLIGHT_PER_CLIENT: usize = 2;
 
 /// How many of a tick's chunk budget the horizon may take.
 ///

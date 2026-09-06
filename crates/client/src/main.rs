@@ -2071,42 +2071,11 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
                 }
                 ui.separator();
             }
-            {
-                for (source, rows) in &groups {
-                    // **The attribution.** A player can see which mod wants
-                    // every binding they are being offered.
-                    ui.heading(source);
-                    for row in rows {
-                        ui.horizontal(|ui| {
-                            let label = if row.description.is_empty() {
-                                row.id.clone()
-                            } else {
-                                row.description.clone()
-                            };
-                            ui.add_sized([300.0, 18.0], egui::Label::new(label).truncate());
-                            let text = egui::RichText::new(&row.binding);
-                            let text = if row.conflicted {
-                                text.color(egui::Color32::LIGHT_RED)
-                            } else {
-                                text
-                            };
-                            if ui
-                                .add_sized([120.0, 18.0], egui::Button::new(text))
-                                .clicked()
-                            {
-                                rebind = Some(row.id.clone());
-                            }
-                            // Only where there is something to undo, so the row
-                            // says at a glance which bindings are the player's.
-                            if row.custom && ui.small_button("reset").clicked() {
-                                reset = Some(row.id.clone());
-                            }
-                        });
-                    }
-                    ui.separator();
-                }
-            }
-            ui.separator();
+            // **What a player came here to change goes first.** The bindings
+            // below are a reference list as much as a control — one row per
+            // action per mod, so they run to a screenful on their own — and
+            // putting them above the sliders meant the fog control was found
+            // by scrolling past everything else, or reported as missing.
             ui.heading("volume");
             // **Live, not on close.** A slider you cannot hear while dragging
             // is a slider you have to guess at, so every change goes straight
@@ -2168,6 +2137,42 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
                 app.set_debug_overlay(overlay);
             }
 
+            ui.separator();
+            {
+                for (source, rows) in &groups {
+                    // **The attribution.** A player can see which mod wants
+                    // every binding they are being offered.
+                    ui.heading(source);
+                    for row in rows {
+                        ui.horizontal(|ui| {
+                            let label = if row.description.is_empty() {
+                                row.id.clone()
+                            } else {
+                                row.description.clone()
+                            };
+                            ui.add_sized([300.0, 18.0], egui::Label::new(label).truncate());
+                            let text = egui::RichText::new(&row.binding);
+                            let text = if row.conflicted {
+                                text.color(egui::Color32::LIGHT_RED)
+                            } else {
+                                text
+                            };
+                            if ui
+                                .add_sized([120.0, 18.0], egui::Button::new(text))
+                                .clicked()
+                            {
+                                rebind = Some(row.id.clone());
+                            }
+                            // Only where there is something to undo, so the row
+                            // says at a glance which bindings are the player's.
+                            if row.custom && ui.small_button("reset").clicked() {
+                                reset = Some(row.id.clone());
+                            }
+                        });
+                    }
+                    ui.separator();
+                }
+            }
             ui.separator();
             // No "Close" here: the top bar's Back is the way out of every
             // screen, and a second one further down is a second thing to learn.
