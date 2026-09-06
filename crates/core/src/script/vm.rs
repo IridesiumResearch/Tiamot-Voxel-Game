@@ -1061,7 +1061,17 @@ pub trait ScriptVm: Sized {
         world_seed: u64,
         pos: ChunkPos,
         fill: MaterialId,
-    ) -> Result<Chunk, ScriptError>;
+    ) -> Result<(Chunk, crate::fluid::FluidLayer), ScriptError>;
+
+    /// Tells the VM which numeric id each registered fluid was given.
+    ///
+    /// **Called once, after the registries freeze and before anything
+    /// generates.** A mod names a fluid with a string, as it names everything
+    /// (charter rule 8), but a chunk's fluid layer stores the number — and the
+    /// numbers are assigned outside the VM, by whoever built the fluid
+    /// registry. Without this a generator can describe an ocean and has no way
+    /// to say which liquid it is made of.
+    fn set_fluid_ids(&mut self, _ids: &[(String, crate::fluid::FluidId)]) {}
 
     /// Runs every registered `on_tick` callback once.
     ///

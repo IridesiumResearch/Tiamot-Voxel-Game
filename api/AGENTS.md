@@ -146,6 +146,20 @@ operation list is in the stubs, and it is short on purpose: every operation is
 in the deterministic subset, so there is no `pow`, `sin` or `sqrt` and asking
 for one is asking to break the cross-platform guarantee.
 
+**Water is placed at generation or not at all.** The fluid solver conserves
+volume — it moves what exists and creates nothing — so there are no sources and
+nothing pours a sea into being later:
+
+```lua
+game.register_fluid{ id = "water", material = "my_mod:water_block" }
+-- ...then, inside on_generate, after the terrain:
+buf:fill_fluid_below(0, "my_mod:water")      -- sea level at y = 0
+```
+
+Fluid is a layer over the same blocks, not a material. How much goes into a
+block is the room the terrain leaves it, out of 27 cells, so a shoreline falls
+out of the terrain rather than having to be described.
+
 **Heightmaps still exist and are still right** when a heightmap is what you
 mean. `game.noise_heightmap` + `buf:fill_below_heightmap` is 52 us a chunk
 against 719 us for terrain-with-caves — fourteen times cheaper, and worldgen

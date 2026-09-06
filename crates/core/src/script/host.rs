@@ -201,6 +201,28 @@ impl<V: ScriptVm> ModHost<V> {
         pos: ChunkPos,
         fill: MaterialId,
     ) -> Result<Chunk, ScriptError> {
+        self.generate_chunk_with_fluid(domain, world_seed, pos, fill)
+            .map(|(chunk, _)| chunk)
+    }
+
+    /// The same, keeping any fluid the generator placed.
+    ///
+    /// **The terrain-only call above is the common one** — a caller asking
+    /// what a generator produced almost always means the blocks, and every
+    /// test in the workspace does. This is for the one caller that has
+    /// somewhere to put an ocean.
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError`] if a generator faulted; the mod is disabled and the
+    /// chunks generate without it.
+    pub fn generate_chunk_with_fluid(
+        &mut self,
+        domain: &str,
+        world_seed: u64,
+        pos: ChunkPos,
+        fill: MaterialId,
+    ) -> Result<(Chunk, crate::fluid::FluidLayer), ScriptError> {
         self.vm.generate_chunk(domain, world_seed, pos, fill)
     }
 

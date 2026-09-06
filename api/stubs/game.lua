@@ -90,6 +90,37 @@ function ChunkBuffer:fill_below_heightmap(heightmap, material) end
 ---@param material integer
 function ChunkBuffer:fill_density(density, material) end
 
+---Fills every block below `level` with a fluid, around the terrain.
+---
+---**This is the only place an ocean can come from.** The fluid solver conserves
+---volume — it moves what exists and creates nothing — so there are no sources
+---and nothing pours a sea into being at runtime. A world with standing water is
+---a world whose generator placed it.
+---
+---Fluid is a LAYER over the same blocks, not a material: how much goes into a
+---block is the room the terrain leaves it, out of 27 cells. A solid block takes
+---nothing, an empty one takes all 27, a half-carved one takes what is left — so
+---a shoreline falls out of the terrain rather than having to be described.
+---
+---`level` is a WORLD height, like a heightmap's, so a sea level is one number
+---for the whole world and does not restart at every chunk.
+---
+---```lua
+---game.register_fluid{ id = "water", material = "my_mod:water_block" }
+---
+---game.register_on_generate(function(buf, pos)
+---    buf:fill_below_heightmap(game.noise_heightmap(pos, SHAPE), stone)
+---    buf:fill_fluid_below(0, "my_mod:water")   -- sea level at y = 0
+---end)
+---```
+---
+---The fluid is named in full, `"your_mod:its_id"`, and must have been
+---registered with `game.register_fluid`. An unknown name is an error naming it
+---rather than a silently dry world.
+---@param level integer World height to fill up to, exclusive.
+---@param fluid string The qualified fluid id.
+function ChunkBuffer:fill_fluid_below(level, fluid) end
+
 ---Sets one whole block. Coordinates are chunk-local, 0..15.
 ---@param x integer
 ---@param y integer

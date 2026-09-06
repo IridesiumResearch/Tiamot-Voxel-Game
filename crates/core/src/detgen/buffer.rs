@@ -44,6 +44,15 @@ enum Storage {
 pub struct ChunkBuffer {
     pos: ChunkPos,
     storage: Storage,
+    /// Fluid placed during generation, if the generator placed any.
+    ///
+    /// **Beside the terrain rather than in it.** A block holds a material and,
+    /// separately, a volume of one fluid — see `fluid::Fluid` — so an ocean is
+    /// not a material a generator fills with, it is a layer over the same
+    /// blocks. Kept empty until something asks for it, because the great
+    /// majority of chunks have no fluid at all and an empty layer costs
+    /// nothing.
+    fluid: crate::fluid::FluidLayer,
 }
 
 impl ChunkBuffer {
@@ -53,6 +62,7 @@ impl ChunkBuffer {
         Self {
             pos,
             storage: Storage::Blocks(vec![fill; BLOCKS_PER_CHUNK]),
+            fluid: crate::fluid::FluidLayer::default(),
         }
     }
 
@@ -300,6 +310,76 @@ impl ChunkBuffer {
                 }
             }
         }
+    }
+
+    /// Fills every block below `level` with `fluid`, around the terrain.
+    ///
+    /// **An ocean is a layer, not a material.** A block holds a material and,
+    /// separately, a volume of one fluid, so filling a sea is not a matter of
+    /// setting blocks to water — it is putting a volume into the space the
+    /// ground leaves. Sub-Node Contract §4.
+    ///
+    /// How much goes in a block is what `Fluid::room_in` says the terrain
+    /// leaves it: a solid block takes nothing, an empty one takes all 27 cells,
+    /// and a half-carved one takes what is left. So a shoreline comes out of
+    /// the terrain rather than having to be described.
+    ///
+    /// `level` is a WORLD height, like a heightmap's, so a sea level is one
+    /// number for the whole world and does not restart at every chunk.
+    ///
+    /// **Placed, not simulated.** The conserved solver moves what exists and
+    /// creates nothing (see `docs/subnode-contract.md` §4), so worldgen is the
+    /// only place an ocean can come from. It settles from here like any other
+    /// volume.
+    pub fn fill_fluid_below(&mut self, level: i32, fluid: crate::fluid::FluidId) {
+        let base_y = self.pos.y * CHUNK_BLOCKS as i32;
+        for y in 0..CHUNK_BLOCKS {
+            if base_y + y as i32 >= level {
+                break;
+            }
+            for z in 0..CHUNK_BLOCKS {
+                for x in 0..CHUNK_BLOCKS {
+                    let local = LocalBlock::new(x, y, z);
+                    let room = crate::fluid::MAX_VOLUME.saturating_sub(self.filled_cells(local));
+                    if room > 0 {
+                        self.fluid.set(local, crate::fluid::Fluid::new(fluid, room));
+                    }
+                }
+            }
+        }
+    }
+
+    /// How many of a block's 27 cells hold terrain.
+    ///
+    /// **Whole-block first.** A buffer that has never been chiselled stores one
+    /// material a block, so the answer is 0 or 27 without touching a cell —
+    /// which is every block of a heightmap or density world. The per-cell count
+    /// is for the expanded case and costs 27 reads only there.
+    fn filled_cells(&self, local: LocalBlock) -> u32 {
+        if !self.is_expanded() {
+            return if self.get_block(local).is_air() {
+                0
+            } else {
+                crate::fluid::MAX_VOLUME
+            };
+        }
+        let mut filled = 0;
+        for z in 0..SUBNODES_PER_AXIS {
+            for y in 0..SUBNODES_PER_AXIS {
+                for x in 0..SUBNODES_PER_AXIS {
+                    if !self.get_subnode(local, x, y, z).is_air() {
+                        filled += 1;
+                    }
+                }
+            }
+        }
+        filled
+    }
+
+    /// The fluid this buffer holds, for the caller that stores it.
+    #[must_use]
+    pub const fn fluid(&self) -> &crate::fluid::FluidLayer {
+        &self.fluid
     }
 
     // -- conversion --------------------------------------------------------

@@ -1120,6 +1120,22 @@ impl ServerHandle {
             },
         );
 
+        // **And the VM is told what the numbers came out as.** A mod names a
+        // fluid with a string, as it names everything (charter rule 8), but a
+        // chunk's fluid layer stores the number — and the numbers are assigned
+        // right here, outside the VM. Without this a generator could describe
+        // an ocean and have no way to say which liquid it was made of.
+        //
+        // After the registry is built and before anything generates, which is
+        // the only window where both are true.
+        if let Some(loaded) = host.as_mut() {
+            let ids: Vec<(String, tiamot_core::fluid::FluidId)> = fluids
+                .iter()
+                .map(|(id, registered)| (registered.name.clone(), id))
+                .collect();
+            loaded.vm_mut().set_fluid_ids(&ids);
+        }
+
         // Which materials drink, keyed by world id for the same reason
         // emissions are — and with the SUCCESSOR resolved through the same
         // table, so `becomes = "damp_dirt"` names the same block on a world

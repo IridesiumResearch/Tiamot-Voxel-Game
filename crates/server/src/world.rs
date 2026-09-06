@@ -84,6 +84,25 @@ pub trait ChunkSource {
     /// this must return is *some* chunk — a hole in the world is worse than a
     /// plain one.
     fn generate(&mut self, domain: &str, pos: ChunkPos, world_seed: u64) -> Chunk;
+
+    /// The same, plus any fluid the generator placed.
+    ///
+    /// **Defaulted, because almost nothing places fluid.** Only the mod
+    /// generator can — an ocean comes from `buf:fill_fluid_below` and nowhere
+    /// else, since the conserved solver moves what exists and creates nothing
+    /// (Sub-Node Contract §4). Every other source, including every test double,
+    /// wants exactly the old behaviour and gets it without being touched.
+    fn generate_with_fluid(
+        &mut self,
+        domain: &str,
+        pos: ChunkPos,
+        world_seed: u64,
+    ) -> (Chunk, tiamot_core::fluid::FluidLayer) {
+        (
+            self.generate(domain, pos, world_seed),
+            tiamot_core::fluid::FluidLayer::default(),
+        )
+    }
 }
 
 /// A generator that produces nothing but air.
@@ -120,11 +139,20 @@ impl<V: tiamot_core::script::ScriptVm> ModGenerator<V> {
 
 impl<V: tiamot_core::script::ScriptVm> ChunkSource for ModGenerator<V> {
     fn generate(&mut self, domain: &str, pos: ChunkPos, world_seed: u64) -> Chunk {
+        self.generate_with_fluid(domain, pos, world_seed).0
+    }
+
+    fn generate_with_fluid(
+        &mut self,
+        domain: &str,
+        pos: ChunkPos,
+        world_seed: u64,
+    ) -> (Chunk, tiamot_core::fluid::FluidLayer) {
         match self
             .host
-            .generate_chunk(domain, world_seed, pos, MaterialId::AIR)
+            .generate_chunk_with_fluid(domain, world_seed, pos, MaterialId::AIR)
         {
-            Ok(chunk) => chunk,
+            Ok(generated) => generated,
             Err(err) => {
                 // The host has already disabled the offending mod (charter
                 // rule 10). Air is the honest result: the mods that would have
@@ -132,7 +160,10 @@ impl<V: tiamot_core::script::ScriptVm> ChunkSource for ModGenerator<V> {
                 // wrong — and the player sees a hole they can report, not
                 // terrain that quietly differs from everyone else's.
                 warn!(?pos, "chunk generation failed, falling back to air: {err}");
-                Chunk::new(pos, MaterialId::AIR)
+                (
+                    Chunk::new(pos, MaterialId::AIR),
+                    tiamot_core::fluid::FluidLayer::default(),
+                )
             }
         }
     }
@@ -370,9 +401,18 @@ impl Generator {
 
 impl ChunkSource for Generator {
     fn generate(&mut self, domain: &str, pos: ChunkPos, world_seed: u64) -> Chunk {
+        self.generate_with_fluid(domain, pos, world_seed).0
+    }
+
+    fn generate_with_fluid(
+        &mut self,
+        domain: &str,
+        pos: ChunkPos,
+        world_seed: u64,
+    ) -> (Chunk, tiamot_core::fluid::FluidLayer) {
         match self {
-            Self::Mods(generator) => generator.generate(domain, pos, world_seed),
-            Self::Air(air) => air.generate(domain, pos, world_seed),
+            Self::Mods(generator) => generator.generate_with_fluid(domain, pos, world_seed),
+            Self::Air(air) => air.generate_with_fluid(domain, pos, world_seed),
         }
     }
 }
@@ -799,9 +839,24 @@ impl World {
                     // Never visited. Generate it and mark it dirty so it is
                     // written — see the module docs on why a generated chunk is
                     // stored rather than regenerated later.
-                    let generated = source.generate(domain, pos, seed);
+                    let (generated, fluid) = source.generate_with_fluid(domain, pos, seed);
                     if !space.dirty.contains(&pos) {
                         space.dirty.push(pos);
+                    }
+                    // **Written here rather than handed to the caller.** A
+                    // chunk's fluid reaches the simulation by being loaded
+                    // (`handle.rs` asks `load_fluid` for every chunk that
+                    // arrives), so an ocean placed at generation only has to
+                    // land in the same row that path already reads. Nothing
+                    // downstream changes, and a generated sea survives a
+                    // restart for the same reason the terrain does.
+                    //
+                    // Empty layers are skipped: almost every chunk has one, and
+                    // a row saying "no fluid" is a row to read back for nothing.
+                    if !fluid.is_empty()
+                        && let Err(err) = db.save_chunk_fluid_in(domain, pos, &fluid)
+                    {
+                        tracing::error!(?pos, "could not store generated fluid: {err}");
                     }
                     generated
                 }

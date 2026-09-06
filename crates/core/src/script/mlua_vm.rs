@@ -173,6 +173,11 @@ impl mlua::UserData for DensityHandle {
 /// entry point, by design.
 struct BufferHandle {
     buffer: ChunkBuffer,
+    /// Which numeric id each registered fluid has, for `fill_fluid_below`.
+    ///
+    /// A mod names a fluid with a string and the layer stores a number; the
+    /// numbers are assigned outside the VM. See `ScriptVm::set_fluid_ids`.
+    fluids: BTreeMap<String, u8>,
     /// The world seed, carried so `fill_density` needs no argument for it.
     ///
     /// A generator already receives the seed on its `pos`, but a density field
@@ -196,6 +201,21 @@ impl mlua::UserData for BufferHandle {
                 this.buffer
                     .fill_below_heightmap(&heightmap.heights, MaterialId(material))
                     .map_err(|err| mlua::Error::external(err.to_string()))?;
+                Ok(())
+            },
+        );
+
+        methods.add_method_mut(
+            "fill_fluid_below",
+            |_, this, (level, fluid): (i32, String)| {
+                let Some(id) = this.fluids.get(&fluid).copied() else {
+                    return Err(mlua::Error::external(format!(
+                        "no fluid called `{fluid}` — register it with game.register_fluid, \
+                         and name it in full, as \"your_mod:its_id\""
+                    )));
+                };
+                this.buffer
+                    .fill_fluid_below(level, crate::fluid::FluidId(id));
                 Ok(())
             },
         );
@@ -885,18 +905,46 @@ impl ScriptVm for MluaVm {
         self.frozen
     }
 
+    fn set_fluid_ids(&mut self, ids: &[(String, crate::fluid::FluidId)]) {
+        let table = match self.lua.create_table() {
+            Ok(table) => table,
+            Err(err) => {
+                tracing::error!("could not record the fluid ids: {err}");
+                return;
+            }
+        };
+        for (name, id) in ids {
+            if let Err(err) = table.set(name.as_str(), id.0) {
+                tracing::error!(%name, "could not record a fluid id: {err}");
+            }
+        }
+        if let Err(err) = self.lua.set_named_registry_value("tiamot.fluid_ids", table) {
+            tracing::error!("could not install the fluid ids: {err}");
+        }
+    }
+
     fn generate_chunk(
         &mut self,
         domain: &str,
         world_seed: u64,
         pos: ChunkPos,
         fill: MaterialId,
-    ) -> Result<Chunk, ScriptError> {
+    ) -> Result<(Chunk, crate::fluid::FluidLayer), ScriptError> {
+        // **Read once per chunk, not per call from the script.** The map is
+        // tiny and a generator that places fluid calls `fill_fluid_below` once,
+        // so this is a clone of a few strings against a chunk's worth of work.
+        let fluids: BTreeMap<String, u8> = self
+            .lua
+            .named_registry_value::<Table>("tiamot.fluid_ids")
+            .ok()
+            .map(|table| table.pairs::<String, u8>().filter_map(Result::ok).collect())
+            .unwrap_or_default();
         let handle = self
             .lua
             .create_userdata(BufferHandle {
                 buffer: ChunkBuffer::new(pos, fill),
                 world_seed,
+                fluids,
             })
             .map_err(|err| self.vm_error(&err))?;
 
@@ -981,7 +1029,7 @@ impl ScriptVm for MluaVm {
         let buffer = handle
             .borrow::<BufferHandle>()
             .map_err(|err| self.vm_error(&err))?;
-        Ok(buffer.buffer.to_chunk())
+        Ok((buffer.buffer.to_chunk(), buffer.buffer.fluid().clone()))
     }
 
     fn tick(&mut self, dt_ticks: u32) -> Result<Vec<(String, ScriptError)>, ScriptError> {

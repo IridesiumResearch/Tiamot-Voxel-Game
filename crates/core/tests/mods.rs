@@ -706,3 +706,74 @@ end)
          and a heightmap would have done"
     );
 }
+
+#[test]
+fn a_generator_can_fill_a_sea_around_its_terrain() {
+    // **The only place an ocean can come from.** The conserved solver moves
+    // what exists and creates nothing (Sub-Node Contract §4), so a sea is not
+    // something a mod can pour — it has to be placed while the chunk is being
+    // generated, or the world has no standing water in it at all. Asked for by
+    // a mod author's assistant: "there is no fill_fluid yet".
+    //
+    // Fluid is a LAYER over the same blocks, not a material, so what this
+    // asserts is that the sea went into the room the terrain left: nothing in
+    // the solid part, and a full block's worth in the empty part.
+    let root = scratch("sea");
+    write_mod(
+        &root,
+        "ocean",
+        "",
+        r#"
+local stone = game.register_block{ id = "stone" }
+game.register_fluid{ id = "water", material = "ocean:stone" }
+
+game.register_on_generate(function(buf, pos)
+    -- Ground at y = 4, sea level at y = 12: eight blocks of water over it.
+    buf:fill_below_heightmap(game.flat_heightmap(4), stone)
+    buf:fill_fluid_below(12, "ocean:water")
+end)
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+    // The ids the server would have assigned. Generation cannot resolve a name
+    // without them, which is the seam this test also covers.
+    host.vm_mut()
+        .set_fluid_ids(&[("ocean:water".to_owned(), tiamot_core::fluid::FluidId(1))]);
+
+    let (chunk, fluid) = host
+        .generate_chunk_with_fluid(
+            tiamot_core::domain::OVERWORLD,
+            9,
+            ChunkPos::new(0, 0, 0),
+            MaterialId::AIR,
+        )
+        .expect("generate");
+    assert!(!chunk.is_uniform().is_some_and(|m| m == MaterialId::AIR));
+
+    // Under the ground: solid, and no room for water.
+    let below = fluid.get(tiamot_core::coords::LocalBlock::new(8, 2, 8));
+    assert_eq!(
+        below.volume(),
+        0,
+        "water was put inside the ground, which is room the terrain does not have"
+    );
+
+    // Between the ground and the sea level: a full block of it.
+    let sea = fluid.get(tiamot_core::coords::LocalBlock::new(8, 8, 8));
+    assert_eq!(
+        sea.volume(),
+        tiamot_core::fluid::MAX_VOLUME,
+        "the sea did not fill the empty space below its level"
+    );
+
+    // Above the sea level: dry.
+    let air = fluid.get(tiamot_core::coords::LocalBlock::new(8, 14, 8));
+    assert_eq!(air.volume(), 0, "water above the level it was filled to");
+}
