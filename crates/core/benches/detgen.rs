@@ -161,6 +161,72 @@ fn bench_subnode_path(c: &mut Criterion) {
     group.finish();
 }
 
+/// What a mod's density field costs per chunk, against the tick budget.
+///
+/// **The number that decides whether 3D terrain is affordable at all.** A
+/// density program is evaluated once per chunk generated, on the tick, beside
+/// everything else `CHUNKS_PER_TICK` chunks have to pay for.
+fn bench_density(c: &mut Criterion) {
+    use tiamot_core::detgen::{Axis, Density, Op, default_params};
+
+    let region = tiamot_core::detgen::Region3d {
+        origin_x: 0.0,
+        origin_y: 0.0,
+        origin_z: 0.0,
+        step: 1.0,
+        width: 16,
+        height: 16,
+        depth: 16,
+    };
+
+    // Terrain with caves cut out of it, which is the shape the mechanism
+    // exists for and about as much as a first real generator asks:
+    //   (noise - y * 0.05)  min  (0.4 - abs(cave noise))
+    let program = vec![
+        Op::Noise {
+            params: default_params(),
+            amplitude: 1.0,
+            stream: 1,
+        },
+        Op::Coordinate(Axis::Y),
+        Op::Constant(0.05),
+        Op::Multiply,
+        Op::Subtract,
+        Op::Constant(0.4),
+        Op::Noise {
+            params: default_params(),
+            amplitude: 1.0,
+            stream: 2,
+        },
+        Op::Absolute,
+        Op::Subtract,
+        Op::Minimum,
+    ];
+
+    let mut group = c.benchmark_group("density");
+    for (name, ops) in [
+        (
+            "one_noise",
+            vec![Op::Noise {
+                params: default_params(),
+                amplitude: 1.0,
+                stream: 1,
+            }],
+        ),
+        ("terrain_with_caves", program),
+    ] {
+        let density = Density::compile(ops).expect("compile");
+        let mut out = vec![0.0f32; region.len()];
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                density.evaluate(42, &region, &mut out).expect("evaluate");
+                black_box(out[0])
+            });
+        });
+    }
+    group.finish();
+}
+
 /// Per-octave cost, so a mod author can reason about what they are asking for.
 fn bench_noise_shapes(c: &mut Criterion) {
     let mut group = c.benchmark_group("noise");
@@ -231,6 +297,7 @@ criterion_group!(
     bench_subnode_path,
     bench_noise_shapes,
     bench_fingerprint,
-    bench_rng
+    bench_rng,
+    bench_density
 );
 criterion_main!(benches);

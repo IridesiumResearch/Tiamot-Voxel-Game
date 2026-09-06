@@ -167,6 +167,59 @@ impl ChunkBuffer {
         Ok(())
     }
 
+    /// Fills every block where a density field is POSITIVE.
+    ///
+    /// The one rule, and it is deliberately the only one: **greater than zero
+    /// is solid**. A threshold parameter would be a second way to say what
+    /// subtracting a constant already says, and a mod that wants a different
+    /// cut-off subtracts it inside the field where the rest of the arithmetic
+    /// lives.
+    ///
+    /// Evaluated at BLOCK resolution — one sample per block, at the block's
+    /// own corner. Sub-node resolution is 27 times the samples and, measured,
+    /// 2.66 ms a chunk for a single octave against a 50 ms tick shared by all
+    /// simulation for all players; see `docs/worldgen-density.md`. A mod
+    /// wanting sub-node detail carves it with `set_subnode` afterwards, where
+    /// the cost is proportional to what it actually changes.
+    ///
+    /// # Errors
+    ///
+    /// [`BufferError::Density`] if the program will not evaluate over a chunk.
+    pub fn fill_density(
+        &mut self,
+        density: &super::density::Density,
+        seed: u64,
+        material: MaterialId,
+    ) -> Result<(), BufferError> {
+        let side = CHUNK_BLOCKS as usize;
+        let region = super::noise::Region3d {
+            origin_x: (self.pos.x * CHUNK_BLOCKS as i32) as f32,
+            origin_y: (self.pos.y * CHUNK_BLOCKS as i32) as f32,
+            origin_z: (self.pos.z * CHUNK_BLOCKS as i32) as f32,
+            step: 1.0,
+            width: side,
+            height: side,
+            depth: side,
+        };
+        let mut field = vec![0.0f32; region.len()];
+        density.evaluate(seed, &region, &mut field)?;
+
+        // x-fastest, matching `fill_3d`'s layout and `LocalBlock::index`, so
+        // no transpose and no chance of a transposed one.
+        let mut index = 0;
+        for z in 0..CHUNK_BLOCKS {
+            for y in 0..CHUNK_BLOCKS {
+                for x in 0..CHUNK_BLOCKS {
+                    if field[index] > 0.0 {
+                        self.set_block(LocalBlock::new(x, y, z), material);
+                    }
+                    index += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // -- sub-node operations (the opt-in path) -----------------------------
 
     /// The material of one sub-node cell.
@@ -349,6 +402,9 @@ pub enum BufferError {
         /// Columns supplied.
         found: usize,
     },
+    /// A density program could not be evaluated over this chunk.
+    #[error(transparent)]
+    Density(#[from] super::density::DensityError),
 }
 
 #[cfg(test)]

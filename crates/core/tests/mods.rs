@@ -610,3 +610,99 @@ fn a_mod_cannot_register_one_hook_twice() {
         "one registration must still work, or this test proves nothing"
     );
 }
+
+#[test]
+fn a_mod_can_generate_three_dimensional_terrain_with_caves() {
+    // **The gap a heightmap cannot cross.** A height per column cannot describe
+    // an overhang, an arch or a cave: those need a value at a point in space,
+    // and a mod may not compute one itself (charter rule 4). So the mod
+    // describes the field and the engine evaluates it.
+    //
+    // Asserted as a SHAPE rather than against a golden hash — the hash gate
+    // covers reproducibility and this covers the thing a hash cannot say: that
+    // the field is genuinely three-dimensional. Solid with air above it is what
+    // a heightmap already did; what proves the mechanism is solid ABOVE air in
+    // the same column somewhere in the chunk.
+    let root = scratch("density");
+    write_mod(
+        &root,
+        "caves",
+        "",
+        r#"
+local stone = game.register_block{ id = "stone" }
+
+-- Terrain that falls off with height, with tunnels cut out of it:
+--   min(noise - y*0.06, 0.35 - abs(cave))
+local field = game.density{
+    op = "min",
+    a = {
+        op = "sub",
+        a = { op = "noise", stream = "terrain", frequency = 0.03, octaves = 3 },
+        b = { op = "mul", a = { op = "y" }, b = { op = "const", value = 0.06 } },
+    },
+    b = {
+        op = "sub",
+        a = { op = "const", value = 0.35 },
+        b = { op = "abs", a = { op = "noise", stream = "caves", frequency = 0.05 } },
+    },
+}
+
+game.register_on_generate(function(buf, pos)
+    buf:fill_density(field, stone)
+end)
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+    let stone = *host
+        .vm()
+        .block_ids()
+        .get("caves:stone")
+        .expect("the mod registers caves:stone");
+
+    // Somewhere in the region there must be a column with solid ABOVE air —
+    // an overhang or a cave roof. A heightmap cannot produce one.
+    let mut overhangs = 0;
+    for cx in -2..=2 {
+        for cz in -2..=2 {
+            let chunk = host
+                .generate_chunk(
+                    tiamot_core::domain::OVERWORLD,
+                    4242,
+                    ChunkPos::new(cx, -1, cz),
+                    MaterialId::AIR,
+                )
+                .expect("generate");
+            for x in 0..BLOCKS_PER_CHUNK.min(16) {
+                for z in 0..16 {
+                    let mut seen_air_above_solid = false;
+                    let mut solid_below = false;
+                    for y in 0..16 {
+                        let solid = chunk
+                            .get_block_local(LocalBlock::new(x as u32, y, z))
+                            .subnode(0)
+                            == stone;
+                        if solid_below && !solid {
+                            seen_air_above_solid = true;
+                        }
+                        if seen_air_above_solid && solid {
+                            overhangs += 1;
+                        }
+                        solid_below = solid;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        overhangs > 0,
+        "no column anywhere held solid above air, so the field is not three-dimensional \
+         and a heightmap would have done"
+    );
+}

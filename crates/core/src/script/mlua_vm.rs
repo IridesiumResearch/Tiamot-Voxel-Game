@@ -33,7 +33,7 @@ use mlua::{Lua, Table, Value};
 use crate::CHUNK_BLOCKS;
 use crate::chunk::Chunk;
 use crate::coords::{ChunkPos, LocalBlock};
-use crate::detgen::{ChunkBuffer, FractalParams, Region2d, StreamRng, fill_2d};
+use crate::detgen::{ChunkBuffer, Density, FractalParams, Region2d, StreamRng, fill_2d};
 use crate::material::MaterialId;
 use crate::script::vm::{
     Backend, BlockRules, BlockTexture, Brush, FluidRules, HookOutcome, ScriptError, ScriptVm, Sky,
@@ -149,12 +149,37 @@ impl mlua::UserData for Heightmap {
     }
 }
 
+/// A compiled density program, exposed to Lua as an opaque handle.
+///
+/// **Opaque for the same reason [`Heightmap`] is.** A script that could read
+/// the field back would be one sample away from looping over it, which is the
+/// thing the whole mechanism exists to make unnecessary — see
+/// `detgen::density`'s module docs.
+struct DensityHandle {
+    density: Density,
+}
+
+impl mlua::UserData for DensityHandle {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // How many operations it compiled to, so a mod can see that its table
+        // became what it meant. Nothing else: there is nothing else to know.
+        methods.add_method("len", |_, this, ()| Ok(this.density.len()));
+    }
+}
+
 /// A chunk being generated, exposed to Lua as userdata.
 ///
 /// Every operation is a whole-buffer or whole-block one. There is no per-sample
 /// entry point, by design.
 struct BufferHandle {
     buffer: ChunkBuffer,
+    /// The world seed, carried so `fill_density` needs no argument for it.
+    ///
+    /// A generator already receives the seed on its `pos`, but a density field
+    /// must be seeded identically in every chunk it spans or it is not one
+    /// field — so taking it from the script would be one more thing to get
+    /// wrong for no gain.
+    world_seed: u64,
 }
 
 impl mlua::UserData for BufferHandle {
@@ -170,6 +195,18 @@ impl mlua::UserData for BufferHandle {
                 let heightmap = heightmap.borrow::<Heightmap>()?;
                 this.buffer
                     .fill_below_heightmap(&heightmap.heights, MaterialId(material))
+                    .map_err(|err| mlua::Error::external(err.to_string()))?;
+                Ok(())
+            },
+        );
+
+        methods.add_method_mut(
+            "fill_density",
+            |_, this, (density, material): (mlua::AnyUserData, u16)| {
+                let density = density.borrow::<DensityHandle>()?;
+                let seed = this.world_seed;
+                this.buffer
+                    .fill_density(&density.density, seed, MaterialId(material))
                     .map_err(|err| mlua::Error::external(err.to_string()))?;
                 Ok(())
             },
@@ -859,6 +896,7 @@ impl ScriptVm for MluaVm {
             .lua
             .create_userdata(BufferHandle {
                 buffer: ChunkBuffer::new(pos, fill),
+                world_seed,
             })
             .map_err(|err| self.vm_error(&err))?;
 
@@ -3881,6 +3919,31 @@ impl MluaVm {
     }
 
     /// Everything callable after freeze: lookups, bulk noise, streams, constants.
+    /// Installs `game.density`.
+    ///
+    /// Its own method because `install_frozen_api` sits at the line limit and
+    /// this is self-contained: one constructor for one opaque handle.
+    ///
+    /// **Compiled once, evaluated per chunk.** A mod builds one of these in its
+    /// registration and captures it in the closure it gives
+    /// `register_on_generate`; re-walking the table per chunk would put
+    /// Lua-side work back into the hot path the mechanism exists to empty.
+    fn install_density(&self, game: &Table) -> Result<(), ScriptError> {
+        let density = self
+            .lua
+            .create_function(|_, spec: Table| {
+                let mut ops = Vec::new();
+                compile_density(&spec, &mut ops, 0)?;
+                let density =
+                    Density::compile(ops).map_err(|err| mlua::Error::external(err.to_string()))?;
+                Ok(DensityHandle { density })
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("density", density)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- frozen-phase API ---------------------------------------------
         self.install_material_lookups(game)?;
@@ -3955,6 +4018,8 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         game.set("noise_heightmap", noise_heightmap)
             .map_err(|err| self.vm_error(&err))?;
+
+        self.install_density(game)?;
 
         // A flat heightmap, for generators that want a constant surface.
         let flat_heightmap = self
@@ -5681,6 +5746,114 @@ fn qualify_id(mod_id: &str, id: &str) -> Result<String, String> {
              own id as a namespace"
         )),
     }
+}
+
+/// Reads a `noise` node's options into an operation.
+///
+/// Its own function because every field is optional with a documented default,
+/// which is a dozen lines of nothing happening — and inline it took the parse
+/// past the line limit, which is a fair thing for a lint to object to.
+fn density_noise(spec: &Table) -> crate::detgen::Op {
+    let mut params = crate::detgen::default_params();
+    if let Ok(octaves) = spec.get::<u32>("octaves") {
+        params.octaves = octaves;
+    }
+    if let Ok(frequency) = spec.get::<f32>("frequency") {
+        params.frequency = frequency;
+    }
+    if let Ok(lacunarity) = spec.get::<f32>("lacunarity") {
+        params.lacunarity = lacunarity;
+    }
+    if let Ok(gain) = spec.get::<f32>("gain") {
+        params.gain = gain;
+    }
+    // **The stream is a NAME, hashed.** A number would invite two mods to pick
+    // 1, and a field that silently equals somebody else's is the hardest kind
+    // of worldgen bug to see.
+    let stream: String = spec.get("stream").unwrap_or_else(|_| "default".to_owned());
+    crate::detgen::Op::Noise {
+        params,
+        amplitude: spec.get::<f32>("amplitude").unwrap_or(1.0),
+        stream: crate::detgen::fnv1a(stream.as_bytes()),
+    }
+}
+
+/// How deep a density table may nest before it is refused.
+///
+/// A table arrives from a script and this walk is recursive, so the bound is
+/// what stops a cyclic or absurd one taking the stack with it. Well above any
+/// field a person writes: `detgen::density::MAX_DEPTH` bounds the buffers, and
+/// this bounds only the parse.
+const MAX_DENSITY_NESTING: usize = 64;
+
+/// Turns a mod's density table into postfix operations.
+///
+/// **Children first, then the operation** — the order
+/// [`tiamot_core::detgen::Density`] evaluates in. A binary node compiles `a`
+/// before `b`, so `{ op = "sub", a = x, b = y }` is `x - y` and reads the way
+/// it is written.
+fn compile_density(
+    spec: &Table,
+    ops: &mut Vec<crate::detgen::Op>,
+    nesting: usize,
+) -> mlua::Result<()> {
+    use crate::detgen::{Axis, Op};
+
+    if nesting > MAX_DENSITY_NESTING {
+        return Err(mlua::Error::external(format!(
+            "a density table may not nest more than {MAX_DENSITY_NESTING} deep"
+        )));
+    }
+    let op: String = spec
+        .get("op")
+        .map_err(|_| mlua::Error::external("every node in a density table needs an `op` field"))?;
+
+    let child = |name: &str, ops: &mut Vec<Op>| -> mlua::Result<()> {
+        let table: Table = spec
+            .get(name)
+            .map_err(|_| mlua::Error::external(format!("a `{op}` node needs a `{name}` field")))?;
+        compile_density(&table, ops, nesting + 1)
+    };
+
+    match op.as_str() {
+        "const" => ops.push(Op::Constant(spec.get("value")?)),
+        "x" => ops.push(Op::Coordinate(Axis::X)),
+        "y" => ops.push(Op::Coordinate(Axis::Y)),
+        "z" => ops.push(Op::Coordinate(Axis::Z)),
+        "noise" => ops.push(density_noise(spec)),
+        "abs" => {
+            child("a", ops)?;
+            ops.push(Op::Absolute);
+        }
+        "clamp" => {
+            child("a", ops)?;
+            ops.push(Op::Clamp {
+                low: spec.get::<f32>("low").unwrap_or(-1.0),
+                high: spec.get::<f32>("high").unwrap_or(1.0),
+            });
+        }
+        "add" | "sub" | "mul" | "div" | "min" | "max" => {
+            child("a", ops)?;
+            child("b", ops)?;
+            ops.push(match op.as_str() {
+                "add" => Op::Add,
+                "sub" => Op::Subtract,
+                "mul" => Op::Multiply,
+                "div" => Op::Divide,
+                "min" => Op::Minimum,
+                "max" => Op::Maximum,
+                _ => unreachable!("the outer arm lists these exactly"),
+            });
+        }
+        other => {
+            return Err(mlua::Error::external(format!(
+                "`{other}` is not a density operation. The list is: const, x, y, z, noise, \
+                 abs, clamp, add, sub, mul, div, min, max — and it is short on purpose, \
+                 because every one of them has to be in the deterministic float subset."
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

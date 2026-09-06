@@ -53,10 +53,10 @@ server down.
 
 ---
 
-## The five things an assistant gets wrong
+## The six things an assistant gets wrong
 
 These are unusual. An assistant carrying habits from other voxel engines will
-violate all five without noticing, and four of them fail quietly.
+violate all six without noticing, and most of them fail quietly.
 
 ### 1. Never compute simulation values in Lua
 
@@ -114,12 +114,83 @@ Hooks (`register_on_tick`, `register_on_chat`, `register_on_place`,
 `register_on_dig_complete`, `register_on_generate`, …) are registered in the
 window and called for ever after.
 
-### 5. Mods register named actions; the engine owns the keys
+### 5. Worldgen: describe the field, never sample it
+
+The rule above says no per-sample maths. That does not mean no 3D terrain — it
+means you describe the expression and the engine evaluates it:
+
+```lua
+-- ONCE, in init.lua. Not per chunk.
+local field = game.density{
+    op = "min",
+    a = {                                    -- terrain: noise falling off with height
+        op = "sub",
+        a = { op = "noise", stream = "terrain", frequency = 0.03, octaves = 3 },
+        b = { op = "mul", a = { op = "y" }, b = { op = "const", value = 0.06 } },
+    },
+    b = {                                    -- caves: tunnels where the noise is near zero
+        op = "sub",
+        a = { op = "const", value = 0.35 },
+        b = { op = "abs", a = { op = "noise", stream = "caves", frequency = 0.05 } },
+    },
+}
+
+game.register_on_generate(function(buf, pos)
+    buf:fill_density(field, stone)           -- solid wherever the field is > 0
+end)
+```
+
+That is overhangs, arches and caves in one mechanism. Give each noise node a
+different `stream` name or your caves will follow your hills exactly. The full
+operation list is in the stubs, and it is short on purpose: every operation is
+in the deterministic subset, so there is no `pow`, `sin` or `sqrt` and asking
+for one is asking to break the cross-platform guarantee.
+
+**Heightmaps still exist and are still right** when a heightmap is what you
+mean. `game.noise_heightmap` + `buf:fill_below_heightmap` is 52 us a chunk
+against 719 us for terrain-with-caves — fourteen times cheaper, and worldgen
+runs on the simulation tick.
+
+### 6. Mods register named actions; the engine owns the keys
 
 A mod never reads a key. It declares an action with `game.register_action` and
 responds to `register_on_action`; the player binds it in the settings screen.
 There is no key code anywhere in the mod API, and asking for one is asking for
 the wrong thing.
+
+---
+
+## What belongs in your mod, not in the engine
+
+The engine is deliberately small and holds no opinion about what a world is.
+Three things assistants routinely ask the engine for that are yours:
+
+**Biomes are a Lua table.** A registry of names to parameters needs nothing
+from the engine. Pick the biome from a value you already have — a `game.density`
+field sampled at block resolution, or a heightmap — and index your own table.
+
+**Ore placement is already possible, and is NOT per-sample work.** This is the
+distinction to get right: the forbidden thing is O(volume) arithmetic in Lua.
+Scattering ore is O(ores) — a few dozen `set_block` calls a chunk, chosen from a
+seeded stream — and that is ordinary mod code:
+
+```lua
+game.register_on_generate(function(buf, pos)
+    local rng = game.rng_stream(pos, "ore")
+    for _ = 1, 12 do
+        local x, y, z = rng:below(16), rng:below(16), rng:below(16)
+        buf:set_block(x, y, z, iron)
+    end
+end)
+```
+
+Reading terrain to decide where ore may go is the same shape: bounded, and
+proportional to what you place rather than to the volume you place it in.
+
+**Erosion, rivers and biome blending are compositions**, not engine features.
+Build them from `game.density`'s arithmetic. If a shape genuinely cannot be
+expressed with the operations that exist, that is a finding worth reporting —
+the answer is a new operation with a determinism argument, not a loop in Lua.
 
 ---
 
@@ -181,7 +252,8 @@ the whole generation path), `core_tools` (118, tools and actions), `core_gear`
 
 - `--check-mods` passes and your mod is listed.
 - No `math.sin`, `math.atan`, `^` or any other float maths on a value that
-  reaches the world.
+  reaches the world. A density table instead.
+- A `game.density` field compiled ONCE at load, not rebuilt per chunk.
 - No numeric block id stored, compared to a literal, or written anywhere.
 - Nothing registered outside `init.lua`'s first run.
 - Quantities in units, and `count` never confused with `units`.

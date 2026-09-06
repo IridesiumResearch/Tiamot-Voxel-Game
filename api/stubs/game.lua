@@ -69,6 +69,27 @@ function ChunkBuffer:fill_all(material) end
 ---@param material integer
 function ChunkBuffer:fill_below_heightmap(heightmap, material) end
 
+---Fills every block where a density field is POSITIVE.
+---
+---**Greater than zero is solid, and that is the only rule.** A threshold
+---argument would be a second way to say what subtracting a constant already
+---says inside the field, where the rest of the arithmetic lives.
+---
+---This is how you get terrain a heightmap cannot describe: overhangs, arches,
+---and caves. See `game.density`.
+---
+---Evaluated at BLOCK resolution — one sample per block. Sub-node resolution is
+---27 times the samples and is not offered; carve detail afterwards with
+---`set_subnode`, where the cost is proportional to what you actually change.
+---
+---Measured on the reference machine, per chunk: **358 us** for a single noise
+---node, **719 us** for terrain with caves cut out of it. For comparison a
+---heightmap generator is 52 us and lighting the same chunk is 1.44 ms. It runs
+---once, when the chunk is first generated, and never again.
+---@param density Tiamot.Density
+---@param material integer
+function ChunkBuffer:fill_density(density, material) end
+
 ---Sets one whole block. Coordinates are chunk-local, 0..15.
 ---@param x integer
 ---@param y integer
@@ -1717,6 +1738,75 @@ function game.block_of(material) end
 ---@param options Tiamot.NoiseOptions
 ---@return Tiamot.Heightmap
 function game.noise_heightmap(pos, options) end
+
+---A compiled density field. Opaque, like `Tiamot.Heightmap`, and for the same
+---reason: a script that could read it back would be one sample away from
+---looping over it.
+---@class Tiamot.Density
+local Density = {}
+
+---How many operations it compiled to. For checking your table became what you
+---meant; there is nothing else to know about it.
+---@return integer
+function Density:len() end
+
+---Compiles a density field from a table of nested operations.
+---
+---**This is how a mod gets 3D terrain and caves.** A heightmap gives one
+---height per column and cannot describe an overhang; a density field gives a
+---value at every point in space. You may not compute one yourself — charter
+---rule 4 means per-sample maths in Lua would break the cross-platform
+---guarantee — so you describe the expression and the engine evaluates it
+---natively, whole arrays at a time.
+---
+---**Compile ONCE and capture it.** Building one per chunk puts the table walk
+---back into the hot path this exists to empty:
+---
+---```lua
+---local field = game.density{
+---    op = "min",
+---    -- Terrain: noise that falls off as you go up.
+---    a = {
+---        op = "sub",
+---        a = { op = "noise", stream = "terrain", frequency = 0.03, octaves = 3 },
+---        b = { op = "mul", a = { op = "y" }, b = { op = "const", value = 0.06 } },
+---    },
+---    -- Caves: a tunnel wherever the noise is near zero.
+---    b = {
+---        op = "sub",
+---        a = { op = "const", value = 0.35 },
+---        b = { op = "abs", a = { op = "noise", stream = "caves", frequency = 0.05 } },
+---    },
+---}
+---
+---game.register_on_generate(function(buf, pos)
+---    buf:fill_density(field, stone)
+---end)
+---```
+---
+---The operations, and the list is short ON PURPOSE — every one of them is in
+---the deterministic float subset, and there is no `pow`, `sin`, `exp` or
+---`sqrt` node because those differ between platforms:
+---
+---- `{ op = "const", value = n }`
+---- `{ op = "x" }`, `{ op = "y" }`, `{ op = "z" }` — the sample's WORLD
+---  coordinate, so a field is continuous across chunk boundaries.
+---- `{ op = "noise", stream = "name", octaves = 4, frequency = 0.02,
+---  lacunarity = 2.0, gain = 0.5, amplitude = 1.0 }` — 3D fractal noise. Only
+---  `stream` really matters: it is a NAME, hashed into the world seed, and two
+---  nodes with different names give independent fields. Give your terrain and
+---  your caves different streams or the caves will follow the hills exactly.
+---- `{ op = "abs", a = ... }`
+---- `{ op = "clamp", a = ..., low = -1, high = 1 }`
+---- `{ op = "add" | "sub" | "mul" | "div" | "min" | "max", a = ..., b = ... }`
+---  — `sub` is `a - b` and `div` is `a / b`, in the order written.
+---
+---Refused, with the reason, if the table is malformed, nests more than 64
+---deep, needs more than 8 buffers at once, or compiles to more than 256
+---operations. A field a person writes is a dozen.
+---@param spec table
+---@return Tiamot.Density
+function game.density(spec) end
 
 ---A heightmap with the same height in every column.
 ---@param height integer World block height.
