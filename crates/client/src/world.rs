@@ -76,6 +76,11 @@ const NEIGHBOUR_OFFSETS: [(i32, i32, i32); 6] = [
 /// player is looking along first (`interest::VERTICAL_WEIGHT`), so the
 /// frontier spends less time in front of them.
 ///
+/// **The shell is cheap, measured.** A 3x3x3 of solid chunks meshes 0 quads
+/// under `Solid` and 54 under `Air` — greedy meshing merges each frontier face
+/// into one quad per chunk side, so the wall is two triangles a face and not a
+/// per-cell surface. Whatever this costs, it is not geometry.
+///
 /// **A wall inside rock is invisible; a hole inside rock is a window.** That
 /// asymmetry is the whole argument, and it is why the horizon's own
 /// `ChunkStore::horizon_is_buried` reached the same conclusion independently
