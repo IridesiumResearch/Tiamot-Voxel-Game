@@ -42,6 +42,30 @@ use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId};
 /// Full daylight everywhere, so the bench measures geometry rather than light.
 const DAY: Uniform = Uniform(tiamot_core::light::Light::DAYLIGHT);
 
+/// Light that varies from block to block, the way propagated light does.
+///
+/// **Why a second light source is worth benchmarking.** The mesher may only
+/// merge two faces whose corner light AGREES, so real light splits quads along
+/// every shadow edge — and a constant, which agrees with itself everywhere,
+/// measures a merge rate no lit world ever achieves. The client meshes with
+/// `ChunkStore::light_for` in every mode that propagates light, so the constant
+/// case is the floor and this is nearer the bill.
+///
+/// Cheap to evaluate on purpose: the cost being measured is the collapse in
+/// merging, not the cost of the lookup, and mixing the two would leave no way
+/// to tell which had grown.
+struct Dappled;
+
+impl client::shade::BlockLight for Dappled {
+    fn at(&self, x: i32, y: i32, z: i32) -> tiamot_core::light::Light {
+        // A coarse checker rather than noise: deterministic, no allocation, and
+        // it changes often enough to break merges without being so busy that
+        // every single face becomes its own quad.
+        let step = u8::try_from((x.abs() / 2 + y.abs() / 2 + z.abs() / 2) % 4).unwrap_or(0);
+        tiamot_core::light::Light::new(tiamot_core::light::MAX_LEVEL - step, 0, 0, 0)
+    }
+}
+
 const STONE: MaterialId = MaterialId(2);
 
 /// Solid stone, corner to corner.
@@ -107,6 +131,20 @@ fn meshing(c: &mut Criterion) {
                     &neighbours,
                     Absent::Air,
                     &DAY,
+                    &NoFluid,
+                ))
+            });
+        });
+        // The same chunk under light that varies, which is what the client
+        // actually meshes with. See `Dappled`.
+        group.bench_function(format!("{name}_lit"), |b| {
+            b.iter(|| {
+                let neighbours = Neighbours::none();
+                std::hint::black_box(mesher::mesh_chunk(
+                    std::hint::black_box(&chunk),
+                    &neighbours,
+                    Absent::Air,
+                    &Dappled,
                     &NoFluid,
                 ))
             });

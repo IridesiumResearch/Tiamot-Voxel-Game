@@ -91,6 +91,28 @@ pub const REMESH_BUDGET: usize = 4;
 /// 2 ms leaves room for the rest of a 16 ms frame while still draining a
 /// streaming queue quickly. It is a *pacing* bound, which is the metric charter
 /// rule 18 names, and deliberately not an average-throughput one.
+///
+/// # This budget cannot preempt a single chunk, and one chunk can exceed it
+///
+/// **The 0.124 ms above was measured under a CONSTANT light**, and that is not
+/// what the client meshes with. The mesher may only merge two faces whose
+/// corner light agrees, so real light splits quads along every shadow edge; a
+/// constant agrees with itself everywhere and measures a merge rate no lit
+/// world achieves. `mesh_chunk/*_lit` in `benches/mesher.rs` is the same
+/// geometry under light that varies, and it costs **about three times as
+/// much** — 751 us for terrain and **2.96 ms for a chiselled chunk**.
+///
+/// So a single lit chiselled chunk is already over this whole budget, on a
+/// developer machine, before the minimum spec is considered. The budget is
+/// checked BETWEEN chunks and nothing splits one, so such a chunk overruns by
+/// however long it takes and the frame wears all of it.
+///
+/// Reported from the window on an integrated-graphics laptop, in RELEASE:
+/// `worst remesh 34.9 ms over 1 chunks`. Whatever else is slow there, the shape
+/// of it is this — one chunk, one overrun, no preemption available.
+///
+/// Raising the number would not help; splitting a chunk's mesh across frames
+/// would, and is not attempted here.
 pub const REMESH_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Summaries meshed per frame.
