@@ -1623,12 +1623,6 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
 /// against — measured at 2.3× the mesh time on realistic content, which is most
 /// of the way to the Task 02b gate for no reason. The fluid's merge keys ride
 /// the same pass for the same reason, and only the fluid pass asks for them.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the slice, its two scratch buffers, and which face of which slice \
-              it is; grouping them would move the argument list rather than \
-              shorten it"
-)]
 fn shade_and_merge(
     grid: &SubNodeGrid,
     light: &impl BlockLight,
