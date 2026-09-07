@@ -230,6 +230,33 @@ end)
 Reading terrain to decide where ore may go is the same shape: bounded, and
 proportional to what you place rather than to the volume you place it in.
 
+**Glass is a flag, not a shader.** `register_block{ transparent = true }` and
+the block's own texture alpha decides how see-through it is. That one flag
+changes three things and leaves the rest alone (Sub-Node Contract §8.1):
+
+```lua
+game.register_block{
+    id = "glass",
+    transparent = true,                       -- see through it, and light does
+    textures = { all = "textures/glass.png" }, -- the PNG's alpha IS the opacity
+}
+```
+
+- A face draws where exactly ONE side of it is transparent, so a wall behind a
+  window is not a hole and two panes touching do not double up.
+- It is drawn in a blended pass after the opaque world.
+- Light passes through a whole block of it, so a glass roof does not make a dark
+  room.
+
+**Collision does not change — glass is solid.** You cannot walk through a
+window, and it holds fluid in.
+
+Two limits worth knowing before you file them as bugs. Panes seen through one
+another at an angle are not sorted against each other, which is a deliberate
+trade: sorting per quad is per-frame work proportional to the geometry. And only
+a WHOLE block of one transparent material passes light — a chiselled or mixed
+block holding glass falls back to the ordinary cell rule.
+
 **Erosion, rivers and biome blending are compositions**, not engine features.
 Build them from `game.density`'s arithmetic. If a shape genuinely cannot be
 expressed with the operations that exist, that is a finding worth reporting —
