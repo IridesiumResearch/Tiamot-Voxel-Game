@@ -132,7 +132,7 @@ impl Home {
             Identity::generate().expect("identity"),
             name.to_owned(),
             self.cache(),
-            &self.trust(),
+            client::net::Pinning::Remembered(&self.trust()),
         )
         .expect("connect")
     }
@@ -448,7 +448,7 @@ fn a_pinned_fingerprint_that_no_longer_matches_refuses_the_connection() {
         Identity::generate().expect("identity"),
         "Viewer".to_owned(),
         home.cache(),
-        &home.trust(),
+        client::net::Pinning::Remembered(&home.trust()),
     )
     .expect_err("a changed fingerprint must refuse the connection");
 
@@ -456,6 +456,74 @@ fn a_pinned_fingerprint_that_no_longer_matches_refuses_the_connection() {
     assert!(
         text.contains("has CHANGED") && text.contains("remove this address"),
         "the refusal has to tell the player what to do about it: {text}"
+    );
+
+    assert!(server.stop());
+}
+
+#[test]
+fn a_world_this_client_started_is_not_refused_by_a_stale_pin() {
+    // **Reported from the window**: opening a world to the LAN failed with "the
+    // certificate for 127.0.0.1:47811 has CHANGED", and the host could not join
+    // their own world on their own machine.
+    //
+    // The pin keys on the ADDRESS. A hosted world binds `127.0.0.1:0` — an
+    // ephemeral port the OS picks fresh every launch — while its certificate is
+    // `load_or_create`d per WORLD and persists. So `known-hosts` gained a dead
+    // entry per launch, and the first time the OS recycled a port to a
+    // DIFFERENT world, the stale entry named the old world's fingerprint and
+    // the new one was refused as an impostor.
+    //
+    // This is the exact shape of that: a pin on this address naming a
+    // certificate this server cannot present.
+    let server = start("own-server-pin");
+    let home = Home::new("own-server-pin");
+
+    let mut store = client::trust::TrustStore::load(&home.trust());
+    store.remember(&server.local_addr().to_string(), [0x5Au8; 32]);
+    store.save().expect("save");
+
+    // `OwnServer` is a server this process started, over loopback, where there
+    // is nowhere for anyone to sit in the middle — so the stale pin is not
+    // consulted and the connection stands.
+    let connection = Connection::open(
+        server.local_addr(),
+        Identity::generate().expect("identity"),
+        "Host".to_owned(),
+        home.cache(),
+        client::net::Pinning::OwnServer,
+    )
+    .expect("a client must be able to join a world it started itself");
+    connection.shutdown();
+
+    // And the pin is still enforced for a server this client did NOT start, on
+    // the very same address — otherwise this would have bought the fix by
+    // disabling the protection rather than by scoping it.
+    let refused = Connection::open(
+        server.local_addr(),
+        Identity::generate().expect("identity"),
+        "Visitor".to_owned(),
+        home.cache(),
+        client::net::Pinning::Remembered(&home.trust()),
+    )
+    .expect_err("a stale pin must still refuse a server this client did not start");
+    assert!(
+        refused.to_string().contains("has CHANGED"),
+        "the refusal should still be the fingerprint one: {refused}"
+    );
+
+    // Nothing was written for the own-server connection: filling `known-hosts`
+    // with one dead ephemeral port per launch is what set the trap.
+    let recorded = std::fs::read_to_string(home.trust()).expect("known-hosts");
+    let pins: Vec<&str> = recorded
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert_eq!(
+        pins.len(),
+        1,
+        "an own-server connection must not add a pin: {pins:?}"
     );
 
     assert!(server.stop());
@@ -608,7 +676,7 @@ fn connecting_to_nothing_fails_with_an_address_rather_than_hanging() {
         Identity::generate().expect("identity"),
         "Viewer".to_owned(),
         home.cache(),
-        &home.trust(),
+        client::net::Pinning::Remembered(&home.trust()),
     )
     .expect_err("nothing is listening there");
 

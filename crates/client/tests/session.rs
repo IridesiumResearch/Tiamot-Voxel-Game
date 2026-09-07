@@ -146,7 +146,7 @@ fn client_in(home: &Path, name: &str, server: &ServerHandle, gpu: Gpu) -> App {
         Identity::generate().expect("identity"),
         config.display_name.clone(),
         ContentCache::open(&home.join("content")).expect("cache"),
-        &home.join("known-hosts"),
+        client::net::Pinning::Remembered(&home.join("known-hosts")),
     )
     .expect("connect");
 

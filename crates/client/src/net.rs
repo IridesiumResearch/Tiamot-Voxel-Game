@@ -598,14 +598,14 @@ impl Connection {
         identity: Identity,
         display_name: String,
         cache: ContentCache,
-        trust_path: &std::path::Path,
+        pinning: Pinning<'_>,
     ) -> Result<Self, NetError> {
         Self::open_impaired(
             address,
             identity,
             display_name,
             cache,
-            trust_path,
+            pinning,
             tiamot_server::transport::Impairment::default(),
         )
     }
@@ -626,7 +626,7 @@ impl Connection {
         identity: Identity,
         display_name: String,
         cache: ContentCache,
-        trust_path: &std::path::Path,
+        pinning: Pinning<'_>,
         impairment: tiamot_server::transport::Impairment,
     ) -> Result<Self, NetError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -642,7 +642,7 @@ impl Connection {
         // Connect on the runtime and wait for it, so a bad address or a changed
         // fingerprint is an error from `open` rather than a `Disconnected`
         // event a caller might not be listening for yet.
-        let connected = runtime.block_on(connect(address, trust_path))?;
+        let connected = runtime.block_on(connect(address, pinning))?;
 
         runtime.spawn(session(
             connected,
@@ -684,6 +684,35 @@ impl Connection {
     }
 }
 
+/// Whether a connection's certificate is pinned, and against what.
+///
+/// # Why a server you started yourself is not pinned
+///
+/// Trust-on-first-use keys on the ADDRESS, and a world hosted by this client
+/// binds `127.0.0.1:0` — an ephemeral port the OS picks fresh each launch —
+/// while its certificate is `load_or_create`d per WORLD and persists. So the
+/// pin key changes every run and the thing it identifies does not, which gets
+/// the pairing backwards in both directions: `known-hosts` grows an entry per
+/// launch, and the moment the OS recycles a port to a DIFFERENT world, that
+/// stale entry names the old world's fingerprint and the new world is refused
+/// as an impostor.
+///
+/// Reported from the window as opening a world to the LAN failing with "the
+/// certificate for 127.0.0.1:47811 has CHANGED" — the host being unable to
+/// join their own world, on their own machine, having changed nothing.
+///
+/// The right answer is not a better key. It is that there is no question here
+/// to answer: this process spawned that server, over loopback, and there is
+/// nowhere for anyone to sit in the middle of a connection to your own child
+/// process. Pinning it protected nothing and eventually locked people out.
+pub enum Pinning<'a> {
+    /// Trust-on-first-use against the store at this path. Every server this
+    /// client did not start.
+    Remembered(&'a std::path::Path),
+    /// Not pinned: a server this client started itself, over loopback.
+    OwnServer,
+}
+
 /// What [`connect`] hands to the session task.
 struct Connected {
     endpoint: quinn::Endpoint,
@@ -696,10 +725,13 @@ struct Connected {
 }
 
 /// Establishes the QUIC connection and settles the trust question.
-async fn connect(address: SocketAddr, trust_path: &std::path::Path) -> Result<Connected, NetError> {
+async fn connect(address: SocketAddr, pinning: Pinning<'_>) -> Result<Connected, NetError> {
     let label = address.to_string();
-    let mut store = TrustStore::load(trust_path);
-    let pinned = store.pinned(&label);
+    let mut store = match pinning {
+        Pinning::Remembered(path) => Some(TrustStore::load(path)),
+        Pinning::OwnServer => None,
+    };
+    let pinned = store.as_ref().and_then(|store| store.pinned(&label));
 
     // The verifier records what the server presented. On a repeat visit it also
     // enforces the pin, so a mismatch fails during the TLS handshake rather
@@ -755,7 +787,12 @@ async fn connect(address: SocketAddr, trust_path: &std::path::Path) -> Result<Co
                         address: label.clone(),
                         expected: to_hex(&expected),
                         actual: to_hex(&actual),
-                        store: trust_path.display().to_string(),
+                        store: match pinning {
+                            Pinning::Remembered(path) => path.display().to_string(),
+                            // Unreachable: nothing is pinned for an own server,
+                            // so `pinned` is None and this arm needs a match.
+                            Pinning::OwnServer => String::new(),
+                        },
                     }
                 }
                 _ => fail(err.to_string()),
@@ -769,16 +806,25 @@ async fn connect(address: SocketAddr, trust_path: &std::path::Path) -> Result<Co
         .or(pinned)
         .unwrap_or([0u8; 32]);
 
-    if pinned.is_none() {
-        // First use: remember it. A failure to write is a warning rather than a
-        // refusal — a read-only data directory should not stop someone playing,
-        // it should stop them being protected, and they should hear about it.
+    // First use: remember it. A failure to write is a warning rather than a
+    // refusal — a read-only data directory should not stop someone playing, it
+    // should stop them being protected, and they should hear about it.
+    //
+    // Skipped entirely for an own server: there is nothing to remember, and
+    // remembering it is what filled `known-hosts` with one dead ephemeral port
+    // per launch. See [`Pinning`].
+    if let Some(store) = store.as_mut()
+        && pinned.is_none()
+    {
         store.remember(&label, fingerprint);
         if let Err(err) = store.save() {
             tracing::warn!("could not record the server's fingerprint: {err}");
         }
     }
-    let first_use = pinned.is_none();
+    // An own server is never a "first connection", because it is never a
+    // connection to anybody: saying so would put a trust notice on the screen
+    // for a world the player just made.
+    let first_use = store.is_some() && pinned.is_none();
 
     let (send, recv) = connection
         .open_bi()

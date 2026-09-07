@@ -100,7 +100,7 @@ fn client(name: &str, server: &ServerHandle, gpu: Gpu, impairment: Impairment) -
         Identity::generate().expect("identity"),
         config.display_name.clone(),
         ContentCache::open(&home.join("content")).expect("cache"),
-        &home.join("known-hosts"),
+        client::net::Pinning::Remembered(&home.join("known-hosts")),
         impairment,
     )
     .expect("connect");

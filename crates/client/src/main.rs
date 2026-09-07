@@ -194,12 +194,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 (handle.local_addr(), Some(handle))
             }
         };
+        let hosts = data.join("known-hosts");
         let connection = Connection::open(
             address,
             identity,
             config.display_name.clone(),
             ContentCache::open(&data.join("content"))?,
-            &data.join("known-hosts"),
+            // A server this process started is not pinned — see `net::Pinning`.
+            if embedded.is_some() {
+                client::net::Pinning::OwnServer
+            } else {
+                client::net::Pinning::Remembered(&hosts)
+            },
         )?;
         (Some(connection), embedded)
     };
@@ -1295,12 +1301,20 @@ impl Client {
 
         let cache = ContentCache::open(&self.data.join("content"))
             .map_err(|err| format!("the content cache could not be opened: {err}"))?;
+        let hosts = self.data.join("known-hosts");
         let connection = Connection::open(
             address,
             identity,
             self.config.display_name.clone(),
             cache,
-            &self.data.join("known-hosts"),
+            // A world this client just started is its own server, on loopback,
+            // and is not pinned — see `net::Pinning`. A `Remote` entry is
+            // somebody else's and is.
+            if matches!(entry.kind, client::launcher::Kind::Local { .. }) {
+                client::net::Pinning::OwnServer
+            } else {
+                client::net::Pinning::Remembered(&hosts)
+            },
         )
         .map_err(|err| {
             // The server this failed to reach is stopped again, or a second
