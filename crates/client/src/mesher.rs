@@ -1475,144 +1475,305 @@ impl PackedVertex {
 
 /// Meshes a chunk that has already been expanded.
 #[must_use]
-pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
-    let mut mesh = Mesh::default();
-    // A plane of faces for one slice: N rows of an N-bit mask.
-    let mut plane = vec![0u64; N * N];
-    // The same for the fluid faces, which merge into their own quad list and
-    // are drawn in their own pass. Allocated only for a chunk that has fluid.
-    let mut wet_plane = if grid.fluid.is_some() {
-        vec![0u64; N * N]
-    } else {
-        Vec::new()
-    };
-    // One slice's worth of corner light, reused across every slice and
-    // direction. Entries for cells with no face are never read.
-    let mut shades = vec![Shade::default(); N * N];
-    // And the same for the fluid surface's merge keys, which only the fluid
-    // pass fills and only a chunk with fluid in it allocates.
-    let mut keys = if grid.fluid.is_some() {
-        vec![0u32; N * N]
-    } else {
-        Vec::new()
-    };
-    // Merged into a local list and expanded at the end, once, against the grid.
-    let mut fluid: Vec<Quad> = Vec::new();
+/// The working state one chunk's mesh is built in.
+///
+/// Split out of [`mesh`] so the same work can be done in one call or spread
+/// across frames — see [`MeshJob`]. Every field was a local of that function;
+/// nothing here is new state, it is the same state given a name so it can
+/// outlive a frame.
+struct Scratch {
+    /// A plane of faces for one slice: N rows of an N-bit mask.
+    plane: Vec<u64>,
+    /// The same for the fluid faces, which merge into their own quad list and
+    /// are drawn in their own pass. Allocated only for a chunk that has fluid.
+    wet_plane: Vec<u64>,
+    /// One slice's worth of corner light, reused across every slice and
+    /// direction. Entries for cells with no face are never read.
+    shades: Vec<Shade>,
+    /// The fluid surface's merge keys, which only the fluid pass fills and only
+    /// a chunk with fluid in it allocates.
+    keys: Vec<u32>,
+    /// Merged into a local list and expanded at the end, once, against the grid.
+    fluid: Vec<Quad>,
+    /// What has been emitted so far.
+    mesh: Mesh,
+}
 
-    for (axis, positive) in FACES {
-        // Face culling, a whole column at a time. This is the entire reason for
-        // the bitmask representation: one shift and one AND-NOT decides 48
-        // cells at once — including the two padding bits, which is what makes
-        // border culling free rather than a special case.
-        let columns = &grid.columns[axis];
-        let wet = grid.fluid.as_ref().map(|fluid| &fluid[axis]);
-        plane.fill(0);
-        wet_plane.fill(0);
-
-        for u in 0..N {
-            for v in 0..N {
-                let column = columns[u * N + v];
-                // **Terrain is culled against terrain, fluid against
-                // everything**, and the asymmetry is the whole point.
-                //
-                // While the two shared one occupancy set, a face between milk
-                // and stone was interior and neither side drew it — so the
-                // stone behind a pond did not exist. Opaque milk hides that
-                // from outside and it is a hole straight through the world from
-                // inside, which is what "under water I just see through the
-                // world" was.
-                //
-                // The milk's face against the stone is the one that goes, since
-                // the stone's is the one a swimmer can end up looking at. The
-                // cost is drawing terrain a pond covers; it is behind opaque
-                // geometry, so it is overdraw rather than anything visible.
-                //
-                // The two masks are disjoint by construction — a cell holds
-                // terrain or fluid, never both, because terrain wins the cell in
-                // `fill_fluid` — so OR-ing them is exactly the set of faces to
-                // draw, and everything downstream reads the material per cell as
-                // it always did.
-                let solid = match wet {
-                    Some(wet) => column & !wet[u * N + v],
-                    None => column,
-                };
-                let faces = if positive {
-                    solid & !(solid >> 1)
-                } else {
-                    solid & !(solid << 1)
-                };
-                // **The fluid's own faces go to their own plane**, rather than
-                // being OR-ed into the terrain's as they were. They are drawn in
-                // a separate, blended pass so that a pond can be seen through,
-                // and a transparent surface cannot share a draw call with the
-                // opaque world behind it.
-                //
-                // The two sets are disjoint by construction — a cell holds
-                // terrain or fluid, never both, because terrain wins the cell in
-                // `fill_fluid` — so this is the same faces sorted into two
-                // buckets and not any extra work.
-                let wet_faces = match wet {
-                    Some(wet) => {
-                        let wet = wet[u * N + v];
-                        if positive {
-                            wet & !(column >> 1)
-                        } else {
-                            wet & !(column << 1)
-                        }
-                    }
-                    None => 0,
-                };
-                // Scatter the column's faces into per-slice planes.
-                let mut remaining = faces >> FIRST;
-                while remaining != 0 {
-                    let w = remaining.trailing_zeros() as usize;
-                    remaining &= remaining - 1;
-                    if w < N {
-                        plane[w * N + u] |= 1 << v;
-                    }
-                }
-                let mut remaining = wet_faces >> FIRST;
-                while remaining != 0 {
-                    let w = remaining.trailing_zeros() as usize;
-                    remaining &= remaining - 1;
-                    if w < N {
-                        wet_plane[w * N + u] |= 1 << v;
-                    }
-                }
-            }
-        }
-
-        for w in 0..N {
-            shade_and_merge(
-                grid,
-                light,
-                &mut plane[w * N..(w + 1) * N],
-                &mut shades,
-                None,
-                (axis, positive, w),
-                &mut mesh.quads,
-            );
-
-            if wet_plane.is_empty() {
-                continue;
-            }
-            shade_and_merge(
-                grid,
-                light,
-                &mut wet_plane[w * N..(w + 1) * N],
-                &mut shades,
-                Some(&mut keys),
-                (axis, positive, w),
-                &mut fluid,
-            );
+impl Scratch {
+    fn new(grid: &SubNodeGrid) -> Self {
+        let wet = grid.fluid.is_some();
+        Self {
+            plane: vec![0u64; N * N],
+            wet_plane: if wet { vec![0u64; N * N] } else { Vec::new() },
+            shades: vec![Shade::default(); N * N],
+            keys: if wet { vec![0u32; N * N] } else { Vec::new() },
+            fluid: Vec::new(),
+            mesh: Mesh::default(),
         }
     }
 
-    // Resolved here rather than carried as quads: see `Mesh::fluid_vertices`.
-    let (vertices, indices) = fluid_buffers(&fluid, grid);
-    mesh.fluid_vertices = vertices;
-    mesh.fluid_indices = indices;
-    mesh
+    /// Resolves the fluid quads and hands back the finished mesh.
+    fn finish(mut self, grid: &SubNodeGrid) -> Mesh {
+        // Resolved here rather than carried as quads: see `Mesh::fluid_vertices`.
+        let (vertices, indices) = fluid_buffers(&self.fluid, grid);
+        self.mesh.fluid_vertices = vertices;
+        self.mesh.fluid_indices = indices;
+        self.mesh
+    }
+}
+
+/// Culls one face direction's columns into the per-slice planes.
+///
+/// The cheap half of meshing and the half that does not touch light: one shift
+/// and one AND-NOT decides 48 cells at once.
+fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut Scratch) {
+    // Face culling, a whole column at a time. This is the entire reason for
+    // the bitmask representation: one shift and one AND-NOT decides 48
+    // cells at once — including the two padding bits, which is what makes
+    // border culling free rather than a special case.
+    let columns = &grid.columns[axis];
+    let wet = grid.fluid.as_ref().map(|fluid| &fluid[axis]);
+    scratch.plane.fill(0);
+    scratch.wet_plane.fill(0);
+
+    for u in 0..N {
+        for v in 0..N {
+            let column = columns[u * N + v];
+            // **Terrain is culled against terrain, fluid against
+            // everything**, and the asymmetry is the whole point.
+            //
+            // While the two shared one occupancy set, a face between milk
+            // and stone was interior and neither side drew it — so the
+            // stone behind a pond did not exist. Opaque milk hides that
+            // from outside and it is a hole straight through the world from
+            // inside, which is what "under water I just see through the
+            // world" was.
+            //
+            // The milk's face against the stone is the one that goes, since
+            // the stone's is the one a swimmer can end up looking at. The
+            // cost is drawing terrain a pond covers; it is behind opaque
+            // geometry, so it is overdraw rather than anything visible.
+            //
+            // The two masks are disjoint by construction — a cell holds
+            // terrain or fluid, never both, because terrain wins the cell in
+            // `fill_fluid` — so OR-ing them is exactly the set of faces to
+            // draw, and everything downstream reads the material per cell as
+            // it always did.
+            let solid = match wet {
+                Some(wet) => column & !wet[u * N + v],
+                None => column,
+            };
+            let faces = if positive {
+                solid & !(solid >> 1)
+            } else {
+                solid & !(solid << 1)
+            };
+            // **The fluid's own faces go to their own plane**, rather than
+            // being OR-ed into the terrain's as they were. They are drawn in
+            // a separate, blended pass so that a pond can be seen through,
+            // and a transparent surface cannot share a draw call with the
+            // opaque world behind it.
+            //
+            // The two sets are disjoint by construction — a cell holds
+            // terrain or fluid, never both, because terrain wins the cell in
+            // `fill_fluid` — so this is the same faces sorted into two
+            // buckets and not any extra work.
+            let wet_faces = match wet {
+                Some(wet) => {
+                    let wet = wet[u * N + v];
+                    if positive {
+                        wet & !(column >> 1)
+                    } else {
+                        wet & !(column << 1)
+                    }
+                }
+                None => 0,
+            };
+            // Scatter the column's faces into per-slice planes.
+            let mut remaining = faces >> FIRST;
+            while remaining != 0 {
+                let w = remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
+                if w < N {
+                    scratch.plane[w * N + u] |= 1 << v;
+                }
+            }
+            let mut remaining = wet_faces >> FIRST;
+            while remaining != 0 {
+                let w = remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
+                if w < N {
+                    scratch.wet_plane[w * N + u] |= 1 << v;
+                }
+            }
+        }
+    }
+}
+
+/// Shades and merges one slice of one face direction.
+///
+/// The expensive half, and the one that scales with light: `shade_at` is called
+/// per faced cell, and every call is a light lookup.
+fn merge_slice(
+    grid: &SubNodeGrid,
+    light: &impl BlockLight,
+    (axis, positive, w): (usize, bool, usize),
+    scratch: &mut Scratch,
+) {
+    shade_and_merge(
+        grid,
+        light,
+        &mut scratch.plane[w * N..(w + 1) * N],
+        &mut scratch.shades,
+        None,
+        (axis, positive, w),
+        &mut scratch.mesh.quads,
+    );
+
+    if scratch.wet_plane.is_empty() {
+        return;
+    }
+    shade_and_merge(
+        grid,
+        light,
+        &mut scratch.wet_plane[w * N..(w + 1) * N],
+        &mut scratch.shades,
+        Some(&mut scratch.keys),
+        (axis, positive, w),
+        &mut scratch.fluid,
+    );
+}
+
+/// One chunk's mesh, built a piece at a time.
+///
+/// # Why meshing has to be interruptible
+///
+/// [`crate::app::REMESH_TIME_BUDGET`] is checked BETWEEN chunks, so it can stop
+/// the client starting another one and can do nothing about the one already
+/// running. That was survivable while a chunk was thought to cost 0.124 ms. It
+/// is not: `mesh_chunk/chiselled_lit` in `benches/mesher.rs` is **2.96 ms on a
+/// developer machine**, over the whole 2 ms budget by itself, and a chunk that
+/// costs more than the budget overruns by however long it takes while the frame
+/// wears all of it. Reported from the window on integrated graphics, in
+/// release: `worst remesh 34.9 ms over 1 chunks`.
+///
+/// So the budget needs something it can interrupt, which is this.
+///
+/// # The unit of work
+///
+/// One [`step`](MeshJob::step) is either culling one face direction's columns
+/// or shading and merging one slice of one — 6 culls and 6 x 48 slices, 294
+/// steps for a chunk. Fine enough that the longest single step is a small
+/// fraction of a frame even on slow hardware, and coarse enough that the
+/// bookkeeping costs nothing measurable against the work it guards.
+///
+/// The grid is built once, in [`start`](MeshJob::start), and is NOT splittable:
+/// it is a single scan of 110,592 cells. Against the lit benchmarks it is about
+/// a third of the total, so the floor a step cannot go below is that scan.
+///
+/// # It holds a snapshot, so an edit invalidates it
+///
+/// The grid is expanded from the chunk at `start` and the job never looks at
+/// the chunk again. That is what lets it outlive a frame — but it means a job
+/// in flight when its chunk is edited is building the mesh of a world that has
+/// moved on. The caller owns that: drop the job and start again. Nothing here
+/// can detect it, and pretending otherwise would be worse than saying so.
+pub struct MeshJob {
+    grid: SubNodeGrid,
+    scratch: Scratch,
+    /// Which of [`FACES`] is being worked on. `FACES.len()` means finished.
+    face: usize,
+    /// The next slice of that face, or `N` when its slices are done.
+    slice: usize,
+    /// Whether [`cull_face`] has run for the current face.
+    culled: bool,
+}
+
+impl MeshJob {
+    /// Expands a chunk and prepares to mesh it.
+    ///
+    /// `None` when there is provably nothing to draw, which is the same
+    /// uniform-air fast path [`mesh_chunk`] takes and for the same reason: most
+    /// of the sky is empty, and building a grid to discover that costs the full
+    /// scan. A caller that gets `None` has an empty mesh and no work.
+    #[must_use]
+    pub fn start(
+        chunk: &Chunk,
+        neighbours: &Neighbours<'_>,
+        absent: Absent,
+        fluid: &impl FluidFill,
+    ) -> Option<Self> {
+        if chunk.is_uniform() == Some(tiamot_core::MaterialId::AIR) && !fluid.any() {
+            return None;
+        }
+        let grid = SubNodeGrid::from_chunk_with_fluid(chunk, neighbours, absent, fluid);
+        let scratch = Scratch::new(&grid);
+        Some(Self {
+            grid,
+            scratch,
+            face: 0,
+            slice: 0,
+            culled: false,
+        })
+    }
+
+    /// Whether every step has been taken and [`finish`](MeshJob::finish) is due.
+    #[must_use]
+    pub const fn done(&self) -> bool {
+        self.face >= FACES.len()
+    }
+
+    /// Does one unit of work. Returns whether the job is now finished.
+    ///
+    /// Calling this on a finished job does nothing and reports `true`, so a
+    /// caller may drain on a deadline without checking first.
+    pub fn step(&mut self, light: &impl BlockLight) -> bool {
+        if self.done() {
+            return true;
+        }
+        let (axis, positive) = FACES[self.face];
+        if !self.culled {
+            cull_face(&self.grid, (axis, positive), &mut self.scratch);
+            self.culled = true;
+            return false;
+        }
+        merge_slice(
+            &self.grid,
+            light,
+            (axis, positive, self.slice),
+            &mut self.scratch,
+        );
+        self.slice += 1;
+        if self.slice >= N {
+            self.slice = 0;
+            self.culled = false;
+            self.face += 1;
+        }
+        self.done()
+    }
+
+    /// The finished mesh.
+    ///
+    /// Taking `self` rather than `&self` because a job is spent once: the fluid
+    /// quads are resolved into buffers here, and doing it twice would build
+    /// them twice from state that has already been consumed.
+    #[must_use]
+    pub fn finish(self) -> Mesh {
+        let Self { grid, scratch, .. } = self;
+        scratch.finish(&grid)
+    }
+}
+
+/// Meshes a grid in one call.
+pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
+    let mut scratch = Scratch::new(grid);
+    for face in FACES {
+        cull_face(grid, face, &mut scratch);
+        for w in 0..N {
+            merge_slice(grid, light, (face.0, face.1, w), &mut scratch);
+        }
+    }
+    scratch.finish(grid)
 }
 
 /// Shades one slice's faces, then merges them.
@@ -2602,6 +2763,85 @@ mod tests {
             dry.quads.len(),
             6,
             "two stacked blocks should still merge to six quads"
+        );
+    }
+
+    #[test]
+    fn a_job_stepped_a_piece_at_a_time_builds_exactly_the_one_shot_mesh() {
+        // **The whole correctness claim of `MeshJob`.** Spreading the work over
+        // frames is only worth having if it produces the same mesh; a split
+        // that quietly changed the merge — by resetting a plane, or by carrying
+        // a shade across a slice boundary — would show up as seams in the
+        // world and as nothing at all in a test that only counted quads.
+        //
+        // Content chosen so every one of the six face directions has work and
+        // the merge has something to do: a slab, a pillar on it, and a hole
+        // through the slab so faces exist in both directions on every axis.
+        let mut chunk = empty();
+        for x in 0..8 {
+            for z in 0..8 {
+                for y in 0..2 {
+                    chunk
+                        .set_block(BlockPos::new(x, y, z), BlockValue::Uniform(STONE))
+                        .expect("in chunk");
+                }
+            }
+        }
+        for y in 2..6 {
+            chunk
+                .set_block(BlockPos::new(3, y, 3), BlockValue::Uniform(WOOD))
+                .expect("in chunk");
+        }
+        chunk
+            .set_block(BlockPos::new(5, 0, 5), BlockValue::Uniform(MaterialId::AIR))
+            .expect("in chunk");
+        chunk
+            .set_block(BlockPos::new(5, 1, 5), BlockValue::Uniform(MaterialId::AIR))
+            .expect("in chunk");
+
+        let one_shot = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        // Guards the comparison below from passing as `[] == []`.
+        assert!(
+            !one_shot.quads.is_empty(),
+            "the fixture should produce geometry to compare"
+        );
+
+        let mut job = MeshJob::start(&chunk, &Neighbours::open(), Absent::Air, &NoFluid)
+            .expect("this chunk is not empty air");
+        let mut steps = 0;
+        while !job.step(&DAY) {
+            steps += 1;
+            assert!(steps < 10_000, "the job did not terminate");
+        }
+        let stepped = job.finish();
+
+        // Identical, not merely equivalent: same quads, same order. Order is
+        // what the index buffer is built from, so "the same set in a different
+        // order" is a different mesh on the GPU.
+        assert_eq!(
+            stepped.quads, one_shot.quads,
+            "stepping changed the geometry"
+        );
+        assert_eq!(stepped.fluid_vertices, one_shot.fluid_vertices);
+        assert_eq!(stepped.fluid_indices, one_shot.fluid_indices);
+
+        // And it really was spread out rather than done in one go — otherwise
+        // this would pass with `step` doing everything on its first call, which
+        // is exactly the bug that would make the budget useless again.
+        assert!(
+            steps > 100,
+            "the work should be split into many steps, took {steps}"
+        );
+    }
+
+    #[test]
+    fn empty_air_needs_no_job_at_all() {
+        // The fast path `mesh_chunk` already had, kept: building a grid to
+        // discover a chunk is empty costs the full 110,592-cell scan, and most
+        // of the sky is exactly that.
+        assert!(
+            MeshJob::start(&empty(), &Neighbours::open(), Absent::Air, &NoFluid).is_none(),
+            "a chunk of dry air should need no work"
         );
     }
 

@@ -369,6 +369,20 @@ const fn flight_line(may_fly: bool, flying: bool) -> &'static str {
     }
 }
 
+/// A chunk's mesh, part-built, waiting for the next frame.
+///
+/// **What makes the remesh budget a budget.** `REMESH_TIME_BUDGET` is checked
+/// between chunks, so before this it could stop the client starting another
+/// chunk and could do nothing about the one already running — and a single lit
+/// chiselled chunk costs 2.96 ms on a developer machine, over the whole budget
+/// by itself. See `mesher::MeshJob`.
+struct InFlight {
+    /// Which chunk, so a later edit to it can be noticed.
+    pos: ChunkPos,
+    /// The work so far.
+    job: mesher::MeshJob,
+}
+
 /// Where one frame's time went, in milliseconds.
 ///
 /// **Measured for every frame, kept for the worst one.** Independent per-phase
@@ -1057,6 +1071,13 @@ pub struct App {
     flying: bool,
     /// What the connection reported about the server's certificate.
     server_label: String,
+    /// A chunk being meshed across frames, if one is part-built.
+    ///
+    /// At most one: the budget is spent depth-first, so a second chunk is not
+    /// begun until this one is finished. Holding several would multiply the
+    /// memory a snapshot costs (a `SubNodeGrid` is about 280 KiB) to buy
+    /// nothing — the frame has one budget however many jobs share it.
+    meshing: Option<InFlight>,
     /// The locally predicted body, once the world has been joined.
     ///
     /// `None` before the join, and until then the camera free-flies — there is
@@ -1222,6 +1243,7 @@ impl App {
             step_sounds: std::collections::BTreeMap::new(),
             items: std::collections::BTreeSet::new(),
             hosting: None,
+            meshing: None,
             may_fly: false,
             flying: false,
             world_paused: false,
@@ -4086,6 +4108,37 @@ impl App {
         true
     }
 
+    /// Steps one chunk's mesh until it is finished or the frame is out of time.
+    ///
+    /// `Ok` is a finished mesh; `Err` gives the job back to be parked for the
+    /// next frame. A `None` deadline means "finish it now, whatever it costs",
+    /// which is what an urgent chunk gets — see the call site.
+    ///
+    /// Associated rather than a method because the caller is holding a borrow
+    /// of `self.store` for the light while this runs.
+    fn drive(
+        flight: InFlight,
+        light: &impl crate::shade::BlockLight,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(ChunkPos, mesher::Mesh), Box<InFlight>> {
+        let InFlight { pos, mut job } = flight;
+        loop {
+            if job.step(light) {
+                return Ok((pos, job.finish()));
+            }
+            // Checked AFTER a step, so every visit does some work: a deadline
+            // already past when the job arrives would otherwise park it again
+            // untouched, for ever, and the chunk would never be drawn.
+            if let Some(started) = deadline
+                && started.elapsed() >= REMESH_TIME_BUDGET
+            {
+                // Boxed: the job owns a `SubNodeGrid`, so an unboxed `Err` would
+                // make every `Ok` return carry its size too.
+                return Err(Box::new(InFlight { pos, job }));
+            }
+        }
+    }
+
     /// Remeshes chunks nearest the camera, within [`REMESH_BUDGET`] and
     /// [`REMESH_TIME_BUDGET`].
     ///
@@ -4111,6 +4164,47 @@ impl App {
         let mut meshing = std::time::Duration::ZERO;
         let mut rebuilt = 0;
 
+        // **A job the last frame ran out of time on is finished first.**
+        //
+        // It is not in `due` — the requeue puts back the chunks AFTER it, not
+        // it — so nothing else would ever pick it up, and without this the
+        // chunk that was hardest to mesh is the one that never gets drawn.
+        //
+        // Unless its chunk is due again, in which case the snapshot it holds is
+        // of a world that has moved on: an edit landed while it was parked, and
+        // finishing it would draw the block that was just dug. Dropped, and the
+        // loop below builds it afresh.
+        if let Some(flight) = self.meshing.take()
+            && !due.positions.contains(&flight.pos)
+        {
+            let mesh_started = std::time::Instant::now();
+            let outcome = if self.config.lighting_mode.uses_propagated_light() {
+                let light = self.store.light_for(flight.pos);
+                Self::drive(flight, &light, Some(started))
+            } else {
+                Self::drive(flight, &FLAT_DAYLIGHT, Some(started))
+            };
+            meshing += mesh_started.elapsed();
+            match outcome {
+                Ok((at, mesh)) => {
+                    self.renderer.set_chunk(self.drawn_at(at), &mesh);
+                    rebuilt += 1;
+                }
+                // Still not done. Put back everything this frame was going to
+                // do — none of it has been started — and try again next frame.
+                Err(parked) => {
+                    self.meshing = Some(*parked);
+                    self.store.requeue(&due.positions);
+                    self.pacing.remesh(
+                        started.elapsed().as_secs_f32() * 1000.0,
+                        meshing.as_secs_f32() * 1000.0,
+                        0,
+                    );
+                    return 0;
+                }
+            }
+        }
+
         for (index, pos) in due.positions.iter().enumerate() {
             let Some(chunk) = self.store.get(*pos) else {
                 continue;
@@ -4132,14 +4226,43 @@ impl App {
             // `LightingMode::Simple`.
             let fluid = self.store.fluid_for(*pos);
             let light = self.store.light_for(*pos);
-            let mesh = if self.config.lighting_mode.uses_propagated_light() {
-                mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &light, &fluid)
-            } else {
-                mesher::mesh_chunk(chunk, &neighbours, ABSENT_POLICY, &FLAT_DAYLIGHT, &fluid)
+
+            // **An urgent chunk is finished here, whatever it costs.** Those
+            // are what one frame's edits touched, and a chunk drawn without the
+            // neighbour whose face its edit exposed is a hole through the
+            // world — the report the urgent set exists for. Parking one to save
+            // a millisecond would show that hole until a later frame took it
+            // up. Everything after them is streaming, whose old mesh is still
+            // right, so those may be interrupted.
+            let deadline = (index >= due.urgent).then_some(started);
+            let flight = match mesher::MeshJob::start(chunk, &neighbours, ABSENT_POLICY, &fluid) {
+                // Empty air: no job, no work, and the empty mesh still has to be
+                // set so a chunk that was emptied stops drawing what it was.
+                None => Ok((*pos, mesher::Mesh::default())),
+                Some(job) => {
+                    let flight = InFlight { pos: *pos, job };
+                    if self.config.lighting_mode.uses_propagated_light() {
+                        Self::drive(flight, &light, deadline)
+                    } else {
+                        Self::drive(flight, &FLAT_DAYLIGHT, deadline)
+                    }
+                }
             };
             meshing += mesh_started.elapsed();
 
-            self.renderer.set_chunk(self.drawn_at(*pos), &mesh);
+            let (at, mesh) = match flight {
+                Ok(finished) => finished,
+                // Out of time part-way through. Park it, put the chunks after
+                // this one back, and let the next frame resume rather than
+                // start again — restarting would spend the whole budget
+                // re-treading the same chunk and never reach the end of it.
+                Err(parked) => {
+                    self.meshing = Some(*parked);
+                    self.store.requeue(&due.positions[index + 1..]);
+                    break;
+                }
+            };
+            self.renderer.set_chunk(self.drawn_at(at), &mesh);
             rebuilt += 1;
 
             // A count is not a budget on a machine you have not measured.
@@ -5707,6 +5830,69 @@ mod dig_lock_tests {
 mod tests {
     use super::*;
     use tiamot_core::proto::MaterialDef;
+
+    #[test]
+    fn a_job_makes_progress_even_when_the_budget_is_already_spent() {
+        // **The invariant that stops a parked job parking for ever.** `drive`
+        // checks the deadline AFTER a step, not before. Checked first, a chunk
+        // that arrived in a frame whose budget was already gone would be handed
+        // straight back untouched — every frame, for ever — and the chunk that
+        // is hardest to mesh would be the one never drawn.
+        //
+        // This is that case exactly: a deadline already long past.
+        use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId};
+
+        let mut chunk = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+        for x in 0..6 {
+            for z in 0..6 {
+                chunk
+                    .set_block(BlockPos::new(x, 0, z), BlockValue::Uniform(MaterialId(2)))
+                    .expect("in chunk");
+            }
+        }
+
+        let job = mesher::MeshJob::start(
+            &chunk,
+            &mesher::Neighbours::open(),
+            ABSENT_POLICY,
+            &mesher::NoFluid,
+        )
+        .expect("this chunk is not empty air");
+
+        // `checked_sub` because an `Instant` near the start of the process
+        // clock cannot go back four budgets; the fallback is now, which still
+        // reads as expired by the time the first step returns.
+        let expired = std::time::Instant::now()
+            .checked_sub(REMESH_TIME_BUDGET * 4)
+            .unwrap_or_else(std::time::Instant::now);
+        let mut flight = InFlight {
+            pos: ChunkPos::new(0, 0, 0),
+            job,
+        };
+        let mut visits = 0;
+        let mesh = loop {
+            visits += 1;
+            assert!(
+                visits < 10_000,
+                "the job never finished: it is not progressing"
+            );
+            match App::drive(flight, &FLAT_DAYLIGHT, Some(expired)) {
+                Ok((_, mesh)) => break mesh,
+                Err(parked) => flight = *parked,
+            }
+        };
+
+        // It really did have to be driven many times — otherwise the deadline
+        // was not being honoured at all and this proves nothing about parking.
+        assert!(
+            visits > 10,
+            "an expired deadline should yield after each step, took {visits} visits"
+        );
+        assert!(
+            !mesh.quads.is_empty(),
+            "and the mesh it eventually produced should be the real one"
+        );
+    }
 
     #[test]
     fn the_overlay_says_whether_flight_is_on() {
