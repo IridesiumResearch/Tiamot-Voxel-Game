@@ -1251,6 +1251,128 @@ fn mode_one_is_dark_where_the_sun_never_reaches_and_dims_as_the_day_ends() {
 }
 
 #[test]
+fn glass_lets_the_floor_beneath_it_show_through() {
+    // **Contract §8.1, at the only place it can actually be checked.** The
+    // mesher tests prove the right faces exist and the lighting tests prove
+    // light passes; neither can tell whether the blended pass draws, because
+    // that is a pipeline and a draw call rather than a data structure.
+    //
+    // The assertion that cannot be argued with is whether what is UNDER the
+    // glass can change the picture. Two floors of different colours, the same
+    // pane over each: if the glass is opaque the two frames are identical, and
+    // if it is transparent they are not. No absolute colour is asserted, so no
+    // driver's filtering can decide it.
+    let Some(gpu) = gpu() else { return };
+
+    const DARK: MaterialId = MaterialId(2);
+    const PALE: MaterialId = MaterialId(3);
+    /// The pane's own material, which has to differ from both floors — a pane
+    /// the colour of the floor would look the same whatever it did.
+    const PANE: MaterialId = MaterialId(4);
+
+    /// A world in which exactly one material is glass.
+    struct Panes;
+    impl client::mesher::Transparency for Panes {
+        fn is_transparent(&self, material: u16) -> bool {
+            material == PANE.get()
+        }
+    }
+
+    // A floor of `material`, and a sheet of glass one block above it.
+    let scene = |material: MaterialId, glazed: bool| {
+        let mut chunk = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+        for x in 0..16 {
+            for z in 0..16 {
+                chunk
+                    .set_block(BlockPos::new(x, 8, z), BlockValue::Uniform(material))
+                    .expect("in chunk");
+                if glazed {
+                    chunk
+                        .set_block(BlockPos::new(x, 10, z), BlockValue::Uniform(PANE))
+                        .expect("in chunk");
+                }
+            }
+        }
+        chunk
+    };
+
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+    // Slot indices are material ids, and the pane's texture is HALF opaque —
+    // what a transparent block looks like is its texture's own alpha, which is
+    // the whole reason the flag is a flag and not an opacity number.
+    let atlas = Atlas::build(&[
+        None,
+        None,
+        Some(Image::solid(16, 16, [40, 40, 40, 255])),
+        Some(Image::solid(16, 16, [230, 230, 230, 255])),
+        Some(Image::solid(16, 16, [120, 200, 160, 128])),
+    ]);
+    renderer.set_atlas(&atlas);
+
+    let mut camera = Camera {
+        position: Position::from_world(8.0, 16.0, 8.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -1.2);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    let through = |renderer: &mut Renderer, material: MaterialId, glazed: bool| {
+        let chunk = scene(material, glazed);
+        let mesh = mesher::mesh_chunk(
+            &chunk,
+            &Neighbours::none(),
+            Absent::Solid,
+            &DAY,
+            &mesher::NoFluid,
+            &Panes,
+        );
+        renderer.set_chunk(ChunkPos::new(0, 0, 0), &mesh);
+        let frame = target.capture(renderer, &camera).expect("capture");
+        average(&frame, WIDTH / 4, HEIGHT / 4, WIDTH * 3 / 4, HEIGHT * 3 / 4)
+    };
+
+    let over_dark = through(&mut renderer, DARK, true);
+    let over_pale = through(&mut renderer, PALE, true);
+    let difference = (0..3)
+        .map(|channel| (over_pale[channel] - over_dark[channel]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        difference > 0.05,
+        "glass over a dark floor came out {over_dark:?} and over a pale one {over_pale:?} — \
+         the floor beneath does not change what is on screen, so the pane is opaque"
+    );
+
+    // **And it is glass rather than nothing at all.** "Transparent" implemented
+    // as "not drawn" would satisfy everything above, so the pane has to be
+    // doing SOMETHING to the colour: the same floor with and without it.
+    let bare = through(&mut renderer, PALE, false);
+    let tinted = (0..3)
+        .map(|channel| (bare[channel] - over_pale[channel]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        tinted > 0.02,
+        "a pale floor came out {bare:?} bare and {over_pale:?} under glass — the pane is not \
+         being drawn at all"
+    );
+
+    // **And mode 3 draws it too**, which is a different pipeline: the post
+    // chain compiles its own copy for the float target, and a chain that failed
+    // to would drop every window in the world silently.
+    renderer.set_lighting_mode(LightingMode::Beautiful);
+    let beautiful_dark = through(&mut renderer, DARK, true);
+    let beautiful_pale = through(&mut renderer, PALE, true);
+    let beautiful = (0..3)
+        .map(|channel| (beautiful_pale[channel] - beautiful_dark[channel]).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        beautiful > 0.05,
+        "in mode 3 glass over a dark floor came out {beautiful_dark:?} and over a pale one \
+         {beautiful_pale:?} — the post chain's glass pipeline is not drawing"
+    );
+    renderer.set_lighting_mode(LightingMode::Classic);
+}
+
+#[test]
 fn a_pond_can_be_seen_through() {
     // **Reported from the window: "water should be semi transparent when inside
     // and out. right now I just see out to the rest of the world and from the

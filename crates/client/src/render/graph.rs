@@ -392,6 +392,8 @@ pub struct Post {
     /// two `Option`s that had to be kept in step would eventually not be.
     world: wgpu::RenderPipeline,
     fluid: wgpu::RenderPipeline,
+    /// The blended pass for glass, compiled for the float target.
+    glass: wgpu::RenderPipeline,
     selection: wgpu::RenderPipeline,
     /// Figures, for the float target. Compiled here for the reason the others
     /// are: a pipeline is compiled against one output format.
@@ -495,6 +497,13 @@ impl Post {
                 &[Some(world_layout)],
                 HDR_FORMAT,
             ),
+            glass: super::glass_pipeline_for(
+                gpu,
+                world_shader,
+                world_layout,
+                shadows.as_ref(),
+                mode,
+            ),
             skinned: super::skinned::colour_pipeline(
                 gpu,
                 skinned_model,
@@ -556,6 +565,12 @@ impl Post {
     #[must_use]
     pub const fn world_pipeline(&self) -> &wgpu::RenderPipeline {
         &self.world
+    }
+
+    /// The blended glass pipeline, compiled for the float target.
+    #[must_use]
+    pub const fn glass_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.glass
     }
 
     /// The blended fluid pipeline, compiled for the float target.

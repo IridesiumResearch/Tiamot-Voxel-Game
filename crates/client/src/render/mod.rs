@@ -254,12 +254,48 @@ struct ChunkMesh {
     /// opaque geometry. `None` for the overwhelming majority of chunks, which
     /// have no milk in them and pay nothing for this.
     fluid: Option<FluidMesh>,
+    /// The transparent half: glass. Drawn in the same blended pass as fluid,
+    /// after every chunk's opaque geometry. `None` for the overwhelming
+    /// majority of chunks, which have no windows in them.
+    ///
+    /// Its own buffers rather than a range inside the opaque ones, because the
+    /// two are drawn by different pipelines — one writes depth and one does
+    /// not — and a draw call takes a whole buffer.
+    glass: Option<GlassMesh>,
     /// Bytes actually written, as opposed to the pooled buffers' capacity.
     used_bytes: u64,
 }
 
 /// One chunk's transparent fluid geometry.
 struct FluidMesh {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
+}
+
+/// Where the world pass draws, and with which pipelines.
+///
+/// **A struct rather than the tuple this was.** Five of its seven fields are
+/// `&RenderPipeline`, and a positional tuple of five same-typed references is a
+/// swap nobody would notice until the world drew in the wrong pass — which is
+/// exactly what nearly happened when glass made it a seventh element.
+struct WorldPass<'a> {
+    colour: &'a wgpu::TextureView,
+    depth: &'a wgpu::TextureView,
+    world: &'a wgpu::RenderPipeline,
+    glass: &'a wgpu::RenderPipeline,
+    fluid: &'a wgpu::RenderPipeline,
+    selection: &'a wgpu::RenderPipeline,
+    skinned: &'a wgpu::RenderPipeline,
+}
+
+/// One chunk's transparent block geometry: glass.
+///
+/// The same fields as [`FluidMesh`] and deliberately not the same type: these
+/// hold `PackedVertex`, the ordinary world vertex, where fluid holds its own
+/// format. Sharing a struct would invite sharing a draw call, and the vertex
+/// layouts do not match.
+struct GlassMesh {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
@@ -425,6 +461,13 @@ impl BufferPool {
             self.give(BufferKind::Vertex, fluid.vertices);
             self.give(BufferKind::Index, fluid.indices);
         }
+        // **And the glass, or a window leaks two buffers every time its chunk
+        // is remeshed** — which is every dig nearby, so it would leak steadily
+        // rather than once.
+        if let Some(glass) = mesh.glass {
+            self.give(BufferKind::Vertex, glass.vertices);
+            self.give(BufferKind::Index, glass.indices);
+        }
     }
 }
 
@@ -582,6 +625,8 @@ pub struct Renderer {
     /// The blended pass that draws milk, over the direct target. Mode 3 uses
     /// the post chain's own copy, compiled for the float target instead.
     fluid_pipeline: wgpu::RenderPipeline,
+    /// The blended pass for glass. See [`build_glass_pipeline`].
+    glass_pipeline: wgpu::RenderPipeline,
     /// Seconds of animation, for the fluid scroll. See `advance_clock`.
     elapsed: f32,
     globals: wgpu::Buffer,
@@ -764,6 +809,14 @@ impl Renderer {
         let target = gpu.surface_format();
         let pipeline = build_pipeline(&gpu, &shader, &bind_layout, mode, target);
         let fluid_pipeline = build_fluid_pipeline(&gpu, &shader, &[Some(&bind_layout)], target);
+        let glass_pipeline = build_glass_pipeline(
+            &gpu,
+            &shader,
+            &[Some(&bind_layout)],
+            "fragment_main",
+            mode,
+            target,
+        );
 
         let (blob_pipeline, blob_pipeline_hdr, blobs) = build_blobs(&gpu, &bind_layout);
         let (prop_pipeline, prop_pipeline_hdr, props) = build_props(&gpu, &bind_layout);
@@ -807,6 +860,7 @@ impl Renderer {
             skinned_shadow: None,
             pipeline,
             fluid_pipeline,
+            glass_pipeline,
             elapsed: 0.0,
             globals,
             bind_layout,
@@ -1140,6 +1194,32 @@ impl Renderer {
             });
         }
 
+        // The transparent half, on exactly the fluid pattern above and for the
+        // same reason: a chunk with no glass allocates nothing, and the
+        // `Option` says so rather than a zero-length buffer the draw loop would
+        // skip every frame.
+        let mut glass = None;
+        let mut glass_bytes = 0;
+        if !mesh.has_no_glass() {
+            let (glass_vertices, glass_indices) = mesh.glass_buffers();
+            let vertex_bytes: &[u8] = bytemuck::cast_slice(&glass_vertices);
+            let index_bytes: &[u8] = bytemuck::cast_slice(&glass_indices);
+            let vertices = self
+                .pool
+                .take(&self.gpu, BufferKind::Vertex, vertex_bytes.len() as u64);
+            let indices = self
+                .pool
+                .take(&self.gpu, BufferKind::Index, index_bytes.len() as u64);
+            self.gpu.queue.write_buffer(&vertices, 0, vertex_bytes);
+            self.gpu.queue.write_buffer(&indices, 0, index_bytes);
+            glass_bytes = (vertex_bytes.len() + index_bytes.len()) as u64;
+            glass = Some(GlassMesh {
+                vertices,
+                indices,
+                index_count: u32::try_from(glass_indices.len()).unwrap_or(0),
+            });
+        }
+
         self.chunks.insert(
             pos,
             ChunkMesh {
@@ -1147,7 +1227,10 @@ impl Renderer {
                 indices: index_buffer,
                 index_count: u32::try_from(indices.len()).unwrap_or(0),
                 fluid,
-                used_bytes: (vertex_bytes.len() + index_bytes.len()) as u64 + fluid_bytes,
+                glass,
+                used_bytes: (vertex_bytes.len() + index_bytes.len()) as u64
+                    + fluid_bytes
+                    + glass_bytes,
             },
         );
     }
@@ -1654,37 +1737,65 @@ impl Renderer {
     ///
     /// Straight to the target in modes 1 and 2, and into the float scene texture
     /// in mode 3 so the post chain has something with headroom in it to read.
-    fn world_pass_target<'a>(
-        &'a self,
-        target: &'a wgpu::TextureView,
-    ) -> (
-        &'a wgpu::TextureView,
-        &'a wgpu::TextureView,
-        &'a wgpu::RenderPipeline,
-        &'a wgpu::RenderPipeline,
-        &'a wgpu::RenderPipeline,
-        &'a wgpu::RenderPipeline,
-    ) {
+    fn world_pass_target<'a>(&'a self, target: &'a wgpu::TextureView) -> WorldPass<'a> {
         match self.post.as_ref() {
             Some(post) => {
-                let (scene, depth) = post.scene_target();
-                (
-                    scene,
+                let (colour, depth) = post.scene_target();
+                WorldPass {
+                    colour,
                     depth,
-                    post.world_pipeline(),
-                    post.fluid_pipeline(),
-                    post.selection_pipeline(),
-                    post.skinned_pipeline(),
-                )
+                    world: post.world_pipeline(),
+                    glass: post.glass_pipeline(),
+                    fluid: post.fluid_pipeline(),
+                    selection: post.selection_pipeline(),
+                    skinned: post.skinned_pipeline(),
+                }
             }
-            None => (
-                target,
-                &self.depth,
-                &self.pipeline,
-                &self.fluid_pipeline,
-                &self.selection_pipeline,
-                &self.skinned_pipeline,
-            ),
+            None => WorldPass {
+                colour: target,
+                depth: &self.depth,
+                world: &self.pipeline,
+                glass: &self.glass_pipeline,
+                fluid: &self.fluid_pipeline,
+                selection: &self.selection_pipeline,
+                skinned: &self.skinned_pipeline,
+            },
+        }
+    }
+
+    /// Draws every visible chunk's glass, after all of the opaque geometry.
+    ///
+    /// **Before the fluid, and after everything solid.** Transparency
+    /// composites against what is already in the target, so the opaque world
+    /// has to be complete first — the same reason `draw_fluid` sweeps rather
+    /// than interleaving. Glass goes first of the two only because it is the
+    /// more likely to have something behind it worth seeing.
+    ///
+    /// The pipeline does not write depth, so glass behind glass is not occluded
+    /// by glass in front of it, and Contract §8.1 records what that costs: two
+    /// panes seen through one another at an angle are not sorted against each
+    /// other. Sorting per quad is per-frame work proportional to the geometry
+    /// and the artefact is far cheaper to accept than to pay for every frame.
+    fn draw_glass(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pipeline: &wgpu::RenderPipeline,
+        visible: &[(ChunkPos, u32)],
+    ) {
+        let mut any = false;
+        for (pos, instance) in visible {
+            let Some(glass) = self.chunks.get(pos).and_then(|mesh| mesh.glass.as_ref()) else {
+                continue;
+            };
+            if !any {
+                // Set once, and only when there is glass in view at all: a world
+                // with no windows must not pay a pipeline switch every frame.
+                pass.set_pipeline(pipeline);
+                any = true;
+            }
+            pass.set_vertex_buffer(0, glass.vertices.slice(..));
+            pass.set_index_buffer(glass.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..glass.index_count, 0, *instance..*instance + 1);
         }
     }
 
@@ -1874,14 +1985,13 @@ impl Renderer {
 
         self.fill_cascades(&mut encoder, &culled);
 
-        let (colour, depth, world_pipeline, fluid_pipeline, selection_pipeline, skinned_pipeline) =
-            self.world_pass_target(target);
+        let pass_targets = self.world_pass_target(target);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: colour,
+                    view: pass_targets.colour,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -1890,7 +2000,7 @@ impl Renderer {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth,
+                    view: pass_targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -1902,7 +2012,7 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            pass.set_pipeline(world_pipeline);
+            pass.set_pipeline(pass_targets.world);
             pass.set_bind_group(0, &self.bind_group, &[]);
             if let Some(shadows) = self.post.as_ref().and_then(graph::Post::shadows) {
                 pass.set_bind_group(1, shadows.sample_bind(), &[]);
@@ -1930,7 +2040,7 @@ impl Renderer {
             // are opaque and depth-tested either way, and before the fluid
             // because the fluid is blended and has to come last.
             if self.skinned.drawn() > 0 {
-                pass.set_pipeline(skinned_pipeline);
+                pass.set_pipeline(pass_targets.skinned);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 self.skinned
                     .draw_first(&mut pass, self.visible_figures(self.skinned.drawn()));
@@ -1949,20 +2059,25 @@ impl Renderer {
             // depth-tested, after the terrain and before the blended fluid.
             self.draw_props(&mut pass);
 
-            self.draw_fluid(&mut pass, fluid_pipeline, &culled.visible);
+            // Glass first of the two blended passes, then the milk. Both
+            // inherit slot 1 from the chunk loop above, which is what the
+            // instance rebind just before this comment protects.
+            self.draw_glass(&mut pass, pass_targets.glass, &culled.visible);
+
+            self.draw_fluid(&mut pass, pass_targets.fluid, &culled.visible);
 
             // Last, so it draws over the world it outlines. Its pipeline does
             // not write depth, so the order within the pass is what decides
             // this rather than the depth buffer.
             if self.selection_vertices > 0 {
-                pass.set_pipeline(selection_pipeline);
+                pass.set_pipeline(pass_targets.selection);
                 pass.set_vertex_buffer(0, self.selection.slice(..));
                 pass.draw(0..self.selection_vertices, 0..1);
             }
 
             // And the chunk cage over that, when it is asked for.
             if self.border_vertices > 0 {
-                pass.set_pipeline(selection_pipeline);
+                pass.set_pipeline(pass_targets.selection);
                 pass.set_vertex_buffer(0, self.borders.slice(..));
                 pass.draw(0..self.border_vertices, 0..1);
             }
@@ -2798,6 +2913,7 @@ fn build_shadowed_pipeline(
         "fragment_shadowed",
         mode,
         format,
+        false,
     )
 }
 
@@ -2823,6 +2939,67 @@ fn build_pipeline(
         "fragment_main",
         mode,
         format,
+        false,
+    )
+}
+
+/// The glass pipeline for mode 3, which has shadow bindings or does not.
+///
+/// Mirrors `graph::world_pipeline_for`: glass is lit by the same shader as the
+/// opaque world, so it needs the same bind groups and the same fragment entry —
+/// a pane lit differently from the wall it sits in would read as a bug in the
+/// lighting rather than in the pass.
+pub(crate) fn glass_pipeline_for(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+    shadows: Option<&shadow::Shadows>,
+    mode: RenderMode,
+) -> wgpu::RenderPipeline {
+    match shadows {
+        Some(shadows) => build_glass_pipeline(
+            gpu,
+            shader,
+            &[Some(layout), Some(shadows.sample_layout())],
+            "fragment_shadowed",
+            mode,
+            graph::HDR_FORMAT,
+        ),
+        None => build_glass_pipeline(
+            gpu,
+            shader,
+            &[Some(layout)],
+            "fragment_main",
+            mode,
+            graph::HDR_FORMAT,
+        ),
+    }
+}
+
+/// The glass pipeline: the same world shader and the same vertex, blended.
+///
+/// **Not the fluid pipeline**, which shares the blend state and nothing else:
+/// fluid has its own vertex format and its own entry points, because where a
+/// fluid quad's corners sit depends on a surface height field. Glass is
+/// ordinary block geometry that happens to be see-through, so it wants the
+/// world's vertex, the world's shader, and only the blend and depth-write
+/// changed.
+fn build_glass_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    bind_layouts: &[Option<&wgpu::BindGroupLayout>],
+    fragment_entry: &str,
+    mode: RenderMode,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    build_world_pipeline(
+        gpu,
+        shader,
+        bind_layouts,
+        fragment_entry,
+        mode,
+        format,
+        true,
     )
 }
 
@@ -2913,6 +3090,10 @@ fn build_world_pipeline(
     fragment_entry: &str,
     mode: RenderMode,
     format: wgpu::TextureFormat,
+    // Glass: alpha blending on and depth writes OFF. The second matters as much
+    // as the first — a pane that wrote depth would occlude the pane behind it
+    // and the world would show through the join. See `build_glass_pipeline`.
+    blended: bool,
 ) -> wgpu::RenderPipeline {
     let layout = gpu
         .device
@@ -2947,7 +3128,7 @@ fn build_world_pipeline(
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: None,
+                    blend: blended.then_some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -2975,7 +3156,12 @@ fn build_world_pipeline(
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
+                // **Off for glass**, on for everything else. A blended
+                // surface that wrote depth would occlude whatever is behind it
+                // — including other panes — and the world would show through
+                // the join. Contract §8.1 accepts that transparent quads are
+                // therefore not sorted against each other.
+                depth_write_enabled: Some(!blended),
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),

@@ -1034,6 +1034,17 @@ fn fill_fluid(
 pub struct Mesh {
     /// The merged opaque quads.
     pub quads: Vec<Quad>,
+    /// The merged transparent quads: glass.
+    ///
+    /// **A separate list because they are a separate draw.** A blended surface
+    /// cannot share a draw call with the opaque world behind it — it has to go
+    /// after it, with depth writes off — which is the same reason fluid has its
+    /// own. Same vertex format as [`Mesh::quads`], unlike fluid: glass is
+    /// ordinary block geometry that happens to be see-through, so nothing about
+    /// how a quad describes itself changes.
+    ///
+    /// Empty for a chunk with no glass in it, which is nearly all of them.
+    pub glass_quads: Vec<Quad>,
     /// The fluid half, **already expanded to vertices**.
     ///
     /// Terrain stays as quads because a quad is self-describing: its four
@@ -1090,7 +1101,11 @@ impl Mesh {
     /// Whether the mesh has nothing to draw **at all**, fluid included.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.quads.is_empty() && self.fluid_vertices.is_empty()
+        // **Glass counts.** Without it a chunk of nothing but windows reports
+        // itself empty, `Renderer::set_chunk` drops it, and a greenhouse
+        // vanishes — the same shape of bug a pond hanging in the air had before
+        // `fluid_vertices` was counted here.
+        self.quads.is_empty() && self.fluid_vertices.is_empty() && self.glass_quads.is_empty()
     }
 
     /// Whether there is no opaque geometry. A pond hanging in the air has none.
@@ -1103,6 +1118,12 @@ impl Mesh {
     #[must_use]
     pub fn has_no_fluid(&self) -> bool {
         self.fluid_vertices.is_empty()
+    }
+
+    /// Whether there is no transparent geometry, which is nearly every chunk.
+    #[must_use]
+    pub fn has_no_glass(&self) -> bool {
+        self.glass_quads.is_empty()
     }
 
     /// Expands to the vertex and index buffers a renderer uploads.
@@ -1133,10 +1154,26 @@ impl Mesh {
     /// plausible one.
     #[must_use]
     pub fn to_buffers(&self) -> (Vec<PackedVertex>, Vec<u32>) {
-        let mut vertices = Vec::with_capacity(self.vertex_count());
-        let mut indices = Vec::with_capacity(self.index_count());
+        Self::buffers_of(&self.quads)
+    }
 
-        for quad in &self.quads {
+    /// The same, for the transparent quads.
+    ///
+    /// Its own call rather than a second return from [`Mesh::to_buffers`]:
+    /// nearly every chunk has no glass in it and would be handed two empty
+    /// vectors to allocate and throw away.
+    #[must_use]
+    pub fn glass_buffers(&self) -> (Vec<PackedVertex>, Vec<u32>) {
+        Self::buffers_of(&self.glass_quads)
+    }
+
+    /// Expands any list of quads. Shared by both of the above, so the opaque
+    /// and transparent halves cannot wind differently.
+    fn buffers_of(quads: &[Quad]) -> (Vec<PackedVertex>, Vec<u32>) {
+        let mut vertices = Vec::with_capacity(quads.len() * 4);
+        let mut indices = Vec::with_capacity(quads.len() * 6);
+
+        for quad in quads {
             let base = u32::try_from(vertices.len()).unwrap_or(0);
             for (corner, (x, y, z)) in quad_corners(quad).into_iter().enumerate() {
                 // Corner `n` of the shade is vertex `n` here: both walk
@@ -1577,6 +1614,9 @@ struct Scratch {
     /// The same for the fluid faces, which merge into their own quad list and
     /// are drawn in their own pass. Allocated only for a chunk that has fluid.
     wet_plane: Vec<u64>,
+    /// And for the transparent faces, for the same reason. Allocated only for a
+    /// chunk that has glass in it.
+    glass_plane: Vec<u64>,
     /// One slice's worth of corner light, reused across every slice and
     /// direction. Entries for cells with no face are never read.
     shades: Vec<Shade>,
@@ -1592,9 +1632,11 @@ struct Scratch {
 impl Scratch {
     fn new(grid: &SubNodeGrid) -> Self {
         let wet = grid.fluid.is_some();
+        let panes = grid.glass.is_some();
         Self {
             plane: vec![0u64; N * N],
             wet_plane: if wet { vec![0u64; N * N] } else { Vec::new() },
+            glass_plane: if panes { vec![0u64; N * N] } else { Vec::new() },
             shades: vec![Shade::default(); N * N],
             keys: if wet { vec![0u32; N * N] } else { Vec::new() },
             fluid: Vec::new(),
@@ -1626,6 +1668,7 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
     let glass = grid.glass.as_ref().map(|glass| &glass[axis]);
     scratch.plane.fill(0);
     scratch.wet_plane.fill(0);
+    scratch.glass_plane.fill(0);
 
     for u in 0..N {
         for v in 0..N {
@@ -1669,10 +1712,10 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
             // inside. The same fault milk had against terrain, in §4.
             let panes = glass.map_or(0, |glass| glass[u * N + v]);
             let opaque = solid & !panes;
-            let faces = if positive {
-                (opaque & !(opaque >> 1)) | (panes & !(panes >> 1))
+            let (faces, glass_faces) = if positive {
+                (opaque & !(opaque >> 1), panes & !(panes >> 1))
             } else {
-                (opaque & !(opaque << 1)) | (panes & !(panes << 1))
+                (opaque & !(opaque << 1), panes & !(panes << 1))
             };
             // **The fluid's own faces go to their own plane**, rather than
             // being OR-ed into the terrain's as they were. They are drawn in
@@ -1712,6 +1755,19 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
                     scratch.wet_plane[w * N + u] |= 1 << v;
                 }
             }
+            // **Glass into its own plane**, for the reason fluid has one: a
+            // blended surface cannot share a draw call with the opaque world
+            // behind it. Same sorting into buckets as fluid, and no extra work
+            // — the two sets are disjoint by construction, because a cell is
+            // one material and that material is transparent or it is not.
+            let mut remaining = glass_faces >> FIRST;
+            while remaining != 0 {
+                let w = remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
+                if w < N {
+                    scratch.glass_plane[w * N + u] |= 1 << v;
+                }
+            }
         }
     }
 }
@@ -1735,6 +1791,18 @@ fn merge_slice(
         (axis, positive, w),
         &mut scratch.mesh.quads,
     );
+
+    if !scratch.glass_plane.is_empty() {
+        shade_and_merge(
+            grid,
+            light,
+            &mut scratch.glass_plane[w * N..(w + 1) * N],
+            &mut scratch.shades,
+            None,
+            (axis, positive, w),
+            &mut scratch.mesh.glass_quads,
+        );
+    }
 
     if scratch.wet_plane.is_empty() {
         return;
@@ -3115,11 +3183,24 @@ mod tests {
         // Two blocks that touch merge into ten quads when both are opaque: the
         // interior faces are culled. Treating one as glass brings those two
         // faces back, so the count rises rather than falls.
+        // Counted across BOTH lists: the faces are the same faces, sorted into
+        // an opaque draw and a blended one.
+        let total = with_glass.quads.len() + with_glass.glass_quads.len();
         assert!(
-            with_glass.quads.len() > opaque_pair.quads.len(),
-            "the face between stone and glass was still culled: {} vs {}",
-            with_glass.quads.len(),
+            total > opaque_pair.quads.len(),
+            "the face between stone and glass was still culled: {total} vs {}",
             opaque_pair.quads.len()
+        );
+        // And they really are sorted, rather than all landing in one list — the
+        // blended pass draws `glass_quads` and nothing else, so a glass face
+        // left among the opaque ones would simply never be see-through.
+        assert!(
+            !with_glass.glass_quads.is_empty(),
+            "the pane's own faces did not reach the transparent list"
+        );
+        assert!(
+            !with_glass.quads.is_empty(),
+            "the wall's faces should stay in the opaque list"
         );
 
         // 2. Glass against glass: NEITHER interior face is drawn. Drawing them
@@ -3161,9 +3242,13 @@ mod tests {
             &NoGlass,
         );
         assert_eq!(
-            two_panes.quads.len(),
+            two_panes.glass_quads.len(),
             two_stones.quads.len(),
             "two panes together should cull between them exactly as two stones do"
+        );
+        assert!(
+            two_panes.quads.is_empty(),
+            "a chunk of nothing but glass drew opaque geometry"
         );
 
         // 3. A lone pane against air draws every face, like any block.
@@ -3179,7 +3264,7 @@ mod tests {
             &see_through,
         );
         assert_eq!(
-            single.quads.len(),
+            single.glass_quads.len(),
             6,
             "a glass block in open air should draw six faces like anything else"
         );
