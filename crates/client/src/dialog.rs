@@ -1287,7 +1287,7 @@ fn paint_slot(
     raised: &mut Vec<Raised>,
 ) {
     let inner = rect.shrink(2.0);
-    let response = ui.allocate_rect(inner, egui::Sense::click());
+    let mut response = ui.allocate_rect(inner, egui::Sense::click());
     ui.painter().rect_filled(inner, 2.0, paint.fill(52));
     ui.painter().rect_stroke(
         inner,
@@ -1313,6 +1313,17 @@ fn paint_slot(
             egui::FontId::proportional(11.0),
             paint.colour,
         );
+
+        // **What it is, on hover.** A slot showed a picture and a count and
+        // never its name, so telling two greys apart meant placing one. Asked
+        // for from the window.
+        //
+        // Only when the name table has arrived: a tooltip reading `#7` is worse
+        // than no tooltip at all, because it looks like the name.
+        if let Some(name) = paint.icons.name_of(material) {
+            let (blocks, spares) = tiamot_core::inventory::display(units);
+            response = response.on_hover_text(format!("{name}\n{blocks} blocks + {spares} nodes"));
+        }
     }
 
     let click = if response.clicked() {

@@ -170,6 +170,33 @@ end
 local function digging(_state)
 end
 
+--- What the selected slot holds, named, above the hotbar.
+---
+--- **A picture is not a name.** Two greys, two stones, or the same material cut
+--- two ways look alike at fifty-two pixels, and the only way to find out which
+--- one was selected was to place it. Asked for from the window.
+---
+--- `slot.name` is the engine's own registered name for the material — the same
+--- string `state.looking_at.name` uses — so this costs no table of our own and
+--- cannot drift from what the block actually is.
+---
+--- Drawn only when something is there: an empty selected slot already says so
+--- through the "carrying nothing" line, and a second label reading nothing
+--- would just be a gap that moved.
+local function selection(state)
+    local slot = state.carried[state.selected]
+    if not slot then
+        return
+    end
+
+    -- Centred on the hotbar, above the panel and below the target line, so the
+    -- three readouts stack instead of colliding.
+    hud.text{
+        anchor = "bottom", x = -60, y = SLOT + 64,
+        text = slot.name, size = 20, colour = WHITE,
+    }
+end
+
 --- What the crosshair is on, and what is in hand to do it with.
 local function target(state)
     local line = state.tool and (state.tool.name .. " · " .. state.tool.brush .. " brush")
@@ -182,6 +209,7 @@ end
 
 hud.on_draw(function(state)
     hotbar(state)
+    selection(state)
     offhand(state)
     digging(state)
     target(state)

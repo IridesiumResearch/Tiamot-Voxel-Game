@@ -42,6 +42,11 @@ pub struct Icons<'a> {
     /// wrapping that picture around three faces makes three swords at three
     /// angles. Reported from the window, of exactly that.
     items: Option<&'a std::collections::BTreeSet<u16>>,
+    /// What each material is called, for anything that has to say so.
+    ///
+    /// The engine's own name table, so a mod does not have to send names it
+    /// already registered a second time to label its own inventory.
+    names: Option<&'a std::collections::BTreeMap<u16, String>>,
 }
 
 impl<'a> Icons<'a> {
@@ -52,6 +57,7 @@ impl<'a> Icons<'a> {
             texture,
             tiles,
             items: None,
+            names: None,
         }
     }
 
@@ -64,6 +70,26 @@ impl<'a> Icons<'a> {
     pub const fn with_items(mut self, items: &'a std::collections::BTreeSet<u16>) -> Self {
         self.items = Some(items);
         self
+    }
+
+    /// The same, told what each material is called.
+    ///
+    /// Separate for the same reason [`Icons::with_items`] is: the frames before
+    /// the material table arrives have no names to give.
+    #[must_use]
+    pub const fn with_names(mut self, names: &'a std::collections::BTreeMap<u16, String>) -> Self {
+        self.names = Some(names);
+        self
+    }
+
+    /// What this material is called, if the table has arrived.
+    ///
+    /// `None` rather than a placeholder, so a caller can decide between showing
+    /// an id and showing nothing at all — a tooltip reading `#7` is worse than
+    /// no tooltip, and a debug line reading nothing is worse than `#7`.
+    #[must_use]
+    pub fn name_of(&self, material: u16) -> Option<&'a str> {
+        self.names?.get(&material).map(String::as_str)
     }
 
     /// Whether this material is an item rather than a block.
@@ -193,6 +219,32 @@ fn square(rect: egui::Rect) -> egui::Rect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_material_is_named_only_once_the_table_has_arrived() {
+        // **A tooltip reading `#7` is worse than no tooltip**, because it looks
+        // like the name. So this is an Option and not a placeholder: the caller
+        // decides, and a slot chooses to say nothing during the frames before
+        // the material table lands.
+        use std::collections::BTreeMap;
+
+        let mut names = BTreeMap::new();
+        names.insert(3u16, "core:stone".to_owned());
+
+        let blank = super::Icons::new(None, None);
+        assert_eq!(
+            blank.name_of(3),
+            None,
+            "with no table there is no name to give"
+        );
+
+        let table = super::Icons::new(None, None).with_names(&names);
+        assert_eq!(table.name_of(3), Some("core:stone"));
+        assert_eq!(
+            table.name_of(4),
+            None,
+            "a material the table does not mention has no name either"
+        );
+    }
     use super::*;
     use crate::texture::Atlas;
 

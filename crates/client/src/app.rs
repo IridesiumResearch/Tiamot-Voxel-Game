@@ -3234,6 +3234,16 @@ impl App {
         &self.items
     }
 
+    /// What each material is called, by runtime id.
+    ///
+    /// Read by whatever has to SAY what something is — a slot's tooltip, the
+    /// hotbar's label — rather than draw it. Empty until the material table
+    /// arrives, which is why callers show nothing rather than an id.
+    #[must_use]
+    pub const fn material_names(&self) -> &BTreeMap<u16, String> {
+        &self.materials
+    }
+
     /// Whether the atlas texture is new and needs registering with egui.
     ///
     /// True exactly once per atlas. The material table arrives mid-session,
