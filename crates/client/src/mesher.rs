@@ -1672,9 +1672,11 @@ fn merge_slice(
 /// below however fine the steps are — and it is small. `mesh_start/*` measures
 /// it against the lit totals:
 ///
-///     uniform      87 us  of  1.07 ms   —   8%
-///     terrain      59 us  of   759 us   —   8%
-///     chiselled   221 us  of  2.96 ms   —   7%
+/// ```text
+/// uniform      87 us  of  1.07 ms   —   8%
+/// terrain      59 us  of   759 us   —   8%
+/// chiselled   221 us  of  2.96 ms   —   7%
+/// ```
 ///
 /// So splitting reaches about 92% of the work. An earlier version of this
 /// comment guessed "about a third", reasoning from the gap between the lit and
