@@ -35,12 +35,6 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 /// The config file, relative to the working directory.
 const CONFIG_FILE: &str = "client.toml";
 
-/// Where mods are installed, beside the executable.
-///
-/// The same directory a dedicated server is pointed at, so a world a player
-/// makes here and a world they host run the same content.
-const MODS_DIR: &str = "game";
-
 /// The address to dial a server this process just started.
 ///
 /// A listener bound to the unspecified address reports it back, and the
@@ -135,8 +129,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::warn!("{err}");
             client::launcher::Library::default()
         });
-    let catalogue =
-        client::launcher::Catalogue::scan(std::path::Path::new(MODS_DIR), &data.join("mods.toml"));
+    let catalogue = client::launcher::Catalogue::scan(&config.mods_path, &data.join("mods.toml"));
 
     // **The world somebody already had, before there was a list to put it in.**
     // Without this the first run after the front screen landed would show an
@@ -191,6 +184,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     false,
                     // Likewise nowhere to have typed a seed.
                     None,
+                    &config.mods_path,
                 )?;
                 tracing::info!(addr = %handle.local_addr(), "embedded server listening");
                 (handle.local_addr(), Some(handle))
@@ -431,6 +425,9 @@ fn start_local_world(
     // NEW: an existing one keeps the seed it was created with, or terrain
     // beyond the explored edge would change shape under the player.
     seed: Option<u64>,
+    // Where installed mods are read from. Configurable so a mod author can
+    // keep their work outside the engine's own checkout.
+    mods_path: &std::path::Path,
 ) -> Result<tiamot_server::ServerHandle, Box<dyn std::error::Error>> {
     Ok(tiamot_server::ServerHandle::start(
         &tiamot_server::Settings {
@@ -457,7 +454,7 @@ fn start_local_world(
             // hosts decides for itself, and says so at join.
             operators: vec![operator.to_hex()],
             view_distance: view,
-            mods_path: Some(std::path::PathBuf::from(MODS_DIR)),
+            mods_path: Some(mods_path.to_path_buf()),
             enabled_mods: Some(enabled_mods),
             seed,
             rcon: None,
@@ -1276,6 +1273,7 @@ impl Client {
                     &identity.uuid_as_root(),
                     lan,
                     seed,
+                    &self.config.mods_path,
                 )
                 .map_err(|err| err.to_string())?;
                 // **Loopback when the world listens on everything.** A server

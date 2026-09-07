@@ -384,6 +384,19 @@ pub struct Config {
     #[serde(default = "Config::default_world_path")]
     pub world_path: PathBuf,
 
+    /// Where installed mods are read from.
+    ///
+    /// **`game/` is a default, not a rule.** It was a `const` in `main.rs`,
+    /// which meant a mod author had to put their work inside the engine's own
+    /// checkout beside the reference mods to run it at all — and then pick it
+    /// back out again to package it. Pointing this somewhere else is the
+    /// difference between a mods folder and a source tree.
+    ///
+    /// Relative paths resolve against the working directory, so the default
+    /// keeps behaving exactly as it did.
+    #[serde(default = "Config::default_mods_path")]
+    pub mods_path: PathBuf,
+
     /// How far to render, in chunks (horizontal radius).
     ///
     /// Clamped into the engine's supported range rather than obeyed literally.
@@ -500,6 +513,10 @@ impl Config {
 
     fn default_world_path() -> PathBuf {
         PathBuf::from("singleplayer")
+    }
+
+    fn default_mods_path() -> PathBuf {
+        PathBuf::from("game")
     }
 
     fn default_view_distance() -> u8 {
@@ -694,6 +711,7 @@ impl Default for Config {
             server: ServerChoice::default(),
             display_name: Self::default_display_name(),
             world_path: Self::default_world_path(),
+            mods_path: Self::default_mods_path(),
             view_distance: Self::default_view_distance(),
             vertical_view_distance: Self::default_vertical_view_distance(),
             render_mode: RenderMode::default(),

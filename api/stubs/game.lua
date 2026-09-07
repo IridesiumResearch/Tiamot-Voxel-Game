@@ -2134,6 +2134,37 @@ function game.set_entity(id, spec) end
 ---@return boolean moved
 function game.move_player(player, position) end
 
+---Selects one of a player's hotbar slots.
+---
+---**The one direction the hotbar did not travel.** Which slot somebody holds is
+---the client's own UI state and only ever came inward — `game.held` could read
+---it and nothing could change it. The thing a mod most wants to do about a slot
+---is move a player off one that has just emptied: a tool that broke, a stack
+---placed to its last unit, a hand emptied by a recipe. Each of those leaves
+---somebody pressing a key that does nothing.
+---
+---Slots are zero-based, matching `state.selected` in a HUD script. A slot the
+---player does not have is IGNORED by the client rather than clamped — clamping
+---would silently select a slot you did not name, which looks almost right and
+---is worse for it.
+---
+---`false` means the player is not connected. A `true` means it was sent, not
+---that the client acted on it.
+---
+---```lua
+------ Move somebody off a slot their last block just left.
+---game.register_on_place(function(event)
+---    local held = game.held(event.player)
+---    if held == nil then
+---        game.select_slot(event.player, 0)
+---    end
+---end)
+---```
+---@param player string The player's UUID, in hex.
+---@param slot integer Which slot, zero-based.
+---@return boolean sent
+function game.select_slot(player, slot) end
+
 ---Adds to a connected player's velocity, in cells per tick. Returns whether the
 ---player was there to push.
 ---

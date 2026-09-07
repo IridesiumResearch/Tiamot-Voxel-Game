@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 39;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -82,6 +82,14 @@ pub const PROTOCOL_VERSION: u32 = 38;
 // stream. They are also PER PLAYER rather than broadcast — which entities
 // somebody can see is their own interest set, and sending everyone every mob
 // would make a populated world cost the square of the people watching it.
+// v39 (post-15b): appended `ServerMessage::SelectSlot`, the mirror of the
+// client message below. Which slot is held only ever travelled client-to-server,
+// so a mod could READ what somebody held and never change it — and the thing a
+// mod most wants to do about a slot is move the player off one that has just
+// emptied. A tool that breaks, a stack placed to its last unit, a hand emptied
+// by a recipe: each leaves a player pressing a key that does nothing. Appended
+// rather than paired with the existing variant because the two directions carry
+// different authority: one is a report and one is a request.
 // v30 (post-14): appended `ClientMessage::SelectSlot`. Which slot a player is
 // holding was known only to the client — the hotbar keys are handled locally
 // and nothing but a `Place` ever told the server what was in hand. That is
@@ -1628,6 +1636,28 @@ pub enum ServerMessage {
         /// The summary blob, from [`crate::lod::codec::encode`].
         blob: Vec<u8>,
     },
+
+    /// Selects one of the player's hotbar slots, at a mod's request.
+    ///
+    /// **Appended at the end** (protocol v39).
+    ///
+    /// The mirror of [`ClientMessage::SelectSlot`], which the client sends when
+    /// a player presses a number key. Which slot is held was the client's own
+    /// UI state and only ever travelled in that direction, so a mod could see
+    /// what somebody held and never change it — and the thing a mod most wants
+    /// to do about an empty slot is move the player off it. A tool that breaks,
+    /// a stack placed to its last unit, a hand emptied by a recipe: all of them
+    /// leave a player holding nothing and pressing a key that does nothing.
+    ///
+    /// A request rather than a fact, like every other inventory gesture: the
+    /// client applies it to its own hotbar and tells the server which slot it
+    /// now holds, through the ordinary path. Out-of-range is ignored rather
+    /// than clamped — clamping would silently select a slot the mod did not
+    /// name, which is worse than doing nothing.
+    SelectSlot {
+        /// Which slot, zero-based.
+        slot: u16,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -2392,6 +2422,10 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         | ServerMessage::FluidTable { .. }
         | ServerMessage::SkyTable { .. }
         | ServerMessage::ViewDistance { .. }
+        // A `u16` slot needs no cap: every value it can hold is either a slot
+        // the player has or one they do not, and the client ignores the second
+        // rather than clamping into the first.
+        | ServerMessage::SelectSlot { .. }
         | ServerMessage::TimeOfDay { .. } => {}
     }
     Ok(())

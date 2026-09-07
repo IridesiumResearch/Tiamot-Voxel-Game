@@ -146,6 +146,8 @@ impl Home {
 #[derive(Default)]
 struct Seen {
     connected: Option<(String, bool)>,
+    /// The last hotbar slot a mod asked for, if any.
+    selected: Option<u16>,
     table: Vec<MaterialDef>,
     images: BTreeMap<u16, client::texture::Image>,
     joined: Option<BlockPos>,
@@ -193,6 +195,7 @@ impl Seen {
             Event::Connected {
                 address, first_use, ..
             } => self.connected = Some((address, first_use)),
+            Event::SelectSlot { slot } => self.selected = Some(slot),
             Event::Materials { table, images } => {
                 self.table_before_join = Some(self.joined.is_none());
                 self.table = table;

@@ -2947,6 +2947,26 @@ impl ServerHandle {
                             );
                         }
 
+                        // **Hotbar selections, likewise after the mods.**
+                        // Queued rather than sent from inside the call because
+                        // `ent::Shared` holds the simulation's stores and the
+                        // transport's `Shared` already reaches into those —
+                        // pointing them at each other to send one `u16` would
+                        // be a cycle bought for nothing. Here both are in
+                        // scope.
+                        for (uuid, slot) in entity_access
+                            .as_ref()
+                            .map(|access| access.take_selections())
+                            .unwrap_or_default()
+                        {
+                            shared.push_entity_messages(
+                                &uuid,
+                                std::iter::once(
+                                    tiamot_core::proto::ServerMessage::SelectSlot { slot },
+                                ),
+                            );
+                        }
+
                         // **Destroys, after the transfers.** In that order on
                         // purpose: a mod that moves everybody out of a ship and
                         // then scuttles it did both in the same callback, and

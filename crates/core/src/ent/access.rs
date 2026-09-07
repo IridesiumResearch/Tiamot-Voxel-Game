@@ -162,6 +162,26 @@ pub trait Access: Send + Sync {
     /// or the position is outside the world.
     fn move_player(&self, uuid: [u8; 32], to: [f64; 3]) -> bool;
 
+    /// Selects one of a connected player's hotbar slots.
+    ///
+    /// **The one direction the hotbar did not travel.** Which slot is held is
+    /// the client's own UI state and only ever came inward, so a mod could see
+    /// what somebody was holding and never change it. The thing a mod most
+    /// wants to do about a slot is move a player off one that has just emptied
+    /// — a tool that broke, a stack placed to its last unit, a hand emptied by
+    /// a recipe — each of which leaves somebody pressing a key that does
+    /// nothing.
+    ///
+    /// A request, like every other inventory gesture: it reaches the client,
+    /// which applies it to its own hotbar and reports the selection back
+    /// through the ordinary path. Returns whether it was SENT, not whether the
+    /// client acted on it — a slot the player does not have is ignored there
+    /// rather than clamped, because clamping would silently select a slot the
+    /// mod did not name.
+    ///
+    /// `false` means the player is not connected.
+    fn select_slot(&self, uuid: [u8; 32], slot: u16) -> bool;
+
     /// Adds to a connected player's velocity, in cells per tick.
     ///
     /// Knockback, an explosion, a jump pad. Added rather than set, because

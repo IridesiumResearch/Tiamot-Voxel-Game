@@ -4053,6 +4053,8 @@ impl App {
 
                 Event::Warning(text) => self.warn(text),
 
+                // Through `select_slot`, not the field: see `Event::SelectSlot`.
+                Event::SelectSlot { slot } => self.select_slot(usize::from(slot)),
                 Event::Disconnected { reason } => {
                     self.warn(format!("disconnected: {reason}"));
                     return false;

@@ -661,6 +661,15 @@ pub struct Shared {
     /// the body the tick steps, because the mirror is a copy of it that is
     /// overwritten every tick — see `Access::move_player`.
     bodies: std::sync::Arc<crate::transport::PlayerBodies>,
+    /// Hotbar selections asked for and not yet sent.
+    ///
+    /// **A queue, for the reason `transfers` is one** — though a different
+    /// reason from re-entrancy. This struct holds the stores the SIMULATION
+    /// thread owns, and reaching a client means the transport's `Shared`,
+    /// which already holds things reached from here. Pointing the two at each
+    /// other to send one `u16` would be a cycle bought for nothing. The tick
+    /// drains this where it can see both.
+    selections: std::sync::Mutex<Vec<(tiamot_core::PlayerUuid, u16)>>,
 }
 
 impl Shared {
@@ -676,7 +685,19 @@ impl Shared {
             transfers: std::sync::Mutex::new(Vec::new()),
             domains,
             bodies,
+            selections: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Takes every hotbar selection asked for since the last tick.
+    ///
+    /// Drained by the tick, which sends each one to the player it names.
+    #[must_use]
+    pub fn take_selections(&self) -> Vec<(tiamot_core::PlayerUuid, u16)> {
+        self.selections
+            .lock()
+            .map(|mut queued| std::mem::take(&mut *queued))
+            .unwrap_or_default()
     }
 
     /// Takes every transfer asked for since the last tick.
@@ -751,6 +772,25 @@ impl tiamot_core::ent::Access for Shared {
         // their speed arrives at the far end already moving, which reads as
         // the destination throwing them.
         player.body.velocity = [0.0; 3];
+        true
+    }
+
+    fn select_slot(&self, uuid: [u8; 32], slot: u16) -> bool {
+        let uuid = tiamot_core::PlayerUuid::from_bytes(uuid);
+        // Connected, checked here rather than at the far end: a mod naming
+        // somebody who left should hear `false` now, not have a message queued
+        // for nobody.
+        let Ok(bodies) = self.bodies.lock() else {
+            return false;
+        };
+        if !bodies.contains_key(&uuid) {
+            return false;
+        }
+        drop(bodies);
+        let Ok(mut queued) = self.selections.lock() else {
+            return false;
+        };
+        queued.push((uuid, slot));
         true
     }
 

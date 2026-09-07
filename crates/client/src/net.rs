@@ -109,6 +109,18 @@ pub enum NetError {
 /// renderer; nothing here needs interpreting beyond that.
 #[derive(Debug)]
 pub enum Event {
+    /// A mod asked for a hotbar slot to be selected.
+    ///
+    /// Applied through `App::select_slot` rather than by writing the field,
+    /// which is what makes it identical to a number key: the same bounds check,
+    /// and the same report back to the server — so a mod moving somebody off an
+    /// emptied slot leaves the server knowing what they now hold. Everything
+    /// downstream of holding a slot (the viewmodel, what a placement uses)
+    /// follows from that.
+    SelectSlot {
+        /// Which slot, zero-based. Ignored if the player does not have it.
+        slot: u16,
+    },
     /// The connection is up and the certificate has been accepted.
     Connected {
         /// The address connected to.
@@ -1350,6 +1362,10 @@ async fn session(
 
             ServerMessage::InventoryUpdate { stacks } => {
                 let _ = events.send(Event::Inventory { stacks });
+            }
+
+            ServerMessage::SelectSlot { slot } => {
+                let _ = events.send(Event::SelectSlot { slot });
             }
 
             ServerMessage::ToolTable { tools } => {

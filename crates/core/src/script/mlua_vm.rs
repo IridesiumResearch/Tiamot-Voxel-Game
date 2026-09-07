@@ -3743,6 +3743,34 @@ impl MluaVm {
         game.set("move_player", send)
             .map_err(|err| self.vm_error(&err))?;
 
+        // **The one direction the hotbar did not travel.** Which slot is held
+        // came inward only, so a mod could read it and never change it — and
+        // the thing a mod most wants to do about a slot is move somebody off
+        // one that has just emptied.
+        let slot_store = std::sync::Arc::clone(&self.entities);
+        let select = self
+            .lua
+            .create_function(move |_, (uuid, index): (String, i64)| {
+                let player = player_of(&uuid, "select_slot")?;
+                // Refused rather than clamped, and refused HERE where the error
+                // names the mod: a negative or enormous index is a mod's
+                // mistake, and silently selecting slot 0 instead would hide it
+                // behind behaviour that looks almost right.
+                let index = u16::try_from(index).map_err(|_| {
+                    mlua::Error::external(format!(
+                        "game.select_slot: slot must be 0 or more and fit in a u16, got {index}"
+                    ))
+                })?;
+                Ok(slot_store
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|store| store.select_slot(player, index)))
+                    .unwrap_or(false))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("select_slot", select)
+            .map_err(|err| self.vm_error(&err))?;
+
         let slot = std::sync::Arc::clone(&self.entities);
         let shove = self
             .lua
@@ -8864,9 +8892,16 @@ mod entity_tests {
         connected: std::sync::Mutex<bool>,
         /// Transfers asked for, since asking is all a mod call does.
         transfers: std::sync::Mutex<Vec<(crate::ent::EntityId, String)>>,
+        /// Hotbar selections asked for, likewise.
+        selected: std::sync::Mutex<Vec<([u8; 32], u16)>>,
     }
 
     impl crate::ent::Access for Menagerie {
+        fn select_slot(&self, uuid: [u8; 32], slot: u16) -> bool {
+            self.selected.lock().expect("selected").push((uuid, slot));
+            true
+        }
+
         fn move_player(&self, uuid: [u8; 32], to: [f64; 3]) -> bool {
             if let Ok(mut moved) = self.moved.lock() {
                 moved.push((uuid, to));
@@ -8951,6 +8986,43 @@ mod entity_tests {
             std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::ent::Access>
         );
         (vm, store)
+    }
+
+    #[test]
+    fn a_mod_can_select_a_hotbar_slot_and_a_bad_index_is_refused_not_clamped() {
+        // Which slot is held only ever travelled client-to-server, so a mod
+        // could read it and never change it. The case this exists for is a slot
+        // that has just emptied — a tool that broke, a stack down to its last
+        // unit — where the player is left pressing a key that does nothing.
+        let (mut vm, store) = vm_with_entities();
+        let uuid = "cd".repeat(32);
+        *store.connected.lock().expect("connected") = true;
+
+        load(
+            &mut vm,
+            "picker",
+            &format!(
+                "game.register_on_tick(function()\n\
+                   game.select_slot('{uuid}', 4)\n\
+                   -- Refused where the error names the mod, rather than\n\
+                   -- clamped: silently selecting slot 0 for a mod that asked\n\
+                   -- for -1 hides the mistake behind an almost-right result.\n\
+                   local ok = pcall(game.select_slot, '{uuid}', -1)\n\
+                   if ok then error('a negative slot should have been refused') end\n\
+                 end)\n"
+            ),
+        )
+        .expect("load");
+        let _ = vm.freeze();
+        assert!(vm.tick(1).expect("tick").is_empty());
+
+        let asked = store.selected.lock().expect("selected").clone();
+        assert_eq!(
+            asked.len(),
+            1,
+            "exactly the valid call should have reached the store: {asked:?}"
+        );
+        assert_eq!(asked[0].1, 4, "and carried the slot the mod named");
     }
 
     #[test]
