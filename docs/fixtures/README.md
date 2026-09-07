@@ -13,6 +13,11 @@ cp -r docs/fixtures/places game/places
 
 and delete it again when you are finished.
 
+Leaving one in place does not break the test suite: the exhaustive assertion in
+`crates/core/tests/mods.rs` subtracts the names it finds in this directory, so a
+copied fixture is ignored while a genuinely new reference mod in `game/` still
+fails it.
+
 ## `places` — four simulation spaces (Task 15b's human gate)
 
 Registers `places:attic` (its own floor), `places:ship` (an instanced template
@@ -53,6 +58,11 @@ mod set can tell it is loaded: `core_worldgen` keeps the overworld's
 for the same callback. That it also exercises the per-domain summary cache is a
 bonus rather than the reason.
 
-Spawns you at y = 96, which is above the highest peak the shape can reach, so
-you arrive in open air and fall. Tune `SHAPE` in `init.lua` for bigger or
-smaller country.
+Spawns you at y = 24, just above the highest ground the shape can reach, so you
+arrive in open air and drop a few blocks rather than falling for a long time.
+
+Tune `SURFACE` and `BELOW` in `init.lua` for bigger or smaller country. Note
+that `amplitude` is not the peak-to-trough height its name suggests — the
+fractal it scales runs to roughly +/-0.42, so the measured table in `init.lua`
+is the thing to read before changing it. Amplitude 11 gives about 9 blocks of
+relief, which is walkable; 110 gives 91 and is not.

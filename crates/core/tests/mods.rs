@@ -21,6 +21,32 @@ fn game_dir() -> PathBuf {
         .expect("the game/ directory should exist at the repo root")
 }
 
+/// The fixture mods a developer is invited to copy into `game/` by hand.
+///
+/// `docs/fixtures/README.md` says to `cp -r docs/fixtures/relief game/relief`
+/// and delete it afterwards, so a checkout with one sitting in `game/` is a
+/// DOCUMENTED state, not a mistake — and before this existed it turned
+/// `the_reference_mods_load_in_dependency_order` red, which reads exactly like
+/// a regression in mod loading.
+///
+/// Read from the directory rather than hard-coded so the list cannot drift
+/// from what is actually offered. Subtracting only these names is what keeps
+/// the exhaustive assertion honest: a genuinely new reference mod in `game/`
+/// is not in `docs/fixtures/`, so it still fails the test.
+fn known_fixtures() -> Vec<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/fixtures");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().join("mod.toml").is_file())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    names
+}
+
 /// A scratch directory holding hand-written mods for one test.
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tiamot-mods-{name}"));
@@ -52,12 +78,20 @@ fn host_for(root: &Path) -> EngineHost {
 #[test]
 fn the_reference_mods_load_in_dependency_order() {
     let host = host_for(&game_dir());
-    // Every mod in `game/`, in load order. Listed exhaustively rather than
-    // spot-checked: this is the test that notices a reference mod being added
-    // or removed, which is exactly the change most likely to be made without
-    // thinking about load order.
+    // Every mod in `game/`, in load order, minus any fixture copied in by hand
+    // — see `known_fixtures`. Listed exhaustively rather than spot-checked:
+    // this is the test that notices a reference mod being added or removed,
+    // which is exactly the change most likely to be made without thinking
+    // about load order.
+    let fixtures = known_fixtures();
+    let loaded: Vec<&str> = host
+        .resolved()
+        .ids()
+        .into_iter()
+        .filter(|id| !fixtures.iter().any(|fixture| fixture == id))
+        .collect();
     assert_eq!(
-        host.resolved().ids(),
+        loaded,
         vec![
             "core",
             "core_gear",
