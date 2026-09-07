@@ -83,6 +83,7 @@ fn embedded_with_view(name: &str, view: ViewDistance) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: scratch(&format!("{name}-world")),
+        identity_path: None,
         max_players: 1,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -111,6 +112,7 @@ fn embedded_for(name: &str, max_players: u32) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: scratch(&format!("{name}-world")),
+        identity_path: None,
         max_players,
         allowlist: Allowlist::open(),
         operators: Vec::new(),

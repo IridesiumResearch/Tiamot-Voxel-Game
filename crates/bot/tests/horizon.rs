@@ -45,6 +45,7 @@ fn start(name: &str, view: ViewDistance) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: world_dir(name),
+        identity_path: None,
         max_players: 8,
         allowlist: Allowlist::open(),
         operators: Vec::new(),

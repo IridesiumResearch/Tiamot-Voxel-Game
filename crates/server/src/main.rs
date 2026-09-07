@@ -127,6 +127,9 @@ fn run(cli: &Cli) -> Result<(), ServerError> {
     let server = ServerHandle::start(&Settings {
         bind_addr: config.bind_addr,
         world_path: config.world_path.clone(),
+        // A dedicated server is one world on one address, so its identity
+        // travelling with the world is right — see `Settings::identity_path`.
+        identity_path: None,
         max_players: config.max_players,
         allowlist: Allowlist::open(),
         operators: config.operators.clone(),

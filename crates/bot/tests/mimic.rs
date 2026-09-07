@@ -50,6 +50,7 @@ fn start_in(world: &Path) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: world.to_path_buf(),
+        identity_path: None,
         max_players: 8,
         allowlist: Allowlist::open(),
         operators: Vec::new(),

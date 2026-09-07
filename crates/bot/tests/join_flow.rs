@@ -46,6 +46,7 @@ fn settings(dir: &std::path::Path, allowlist: Allowlist) -> Settings {
     Settings {
         bind_addr: "127.0.0.1:0".parse().expect("valid loopback address"),
         world_path: dir.to_path_buf(),
+        identity_path: None,
         max_players: 8,
         allowlist,
         operators: Vec::new(),

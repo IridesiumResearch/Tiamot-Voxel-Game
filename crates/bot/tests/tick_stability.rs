@@ -87,6 +87,7 @@ fn two_hundred_ticks_under_four_bots_stays_within_budget() {
     let server = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("valid loopback address"),
         world_path: dir.clone(),
+        identity_path: None,
         max_players: 16,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -257,6 +258,7 @@ fn worldgen_under_a_joining_player_stays_inside_the_tick_budget() {
     let server = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: dir,
+        identity_path: None,
         max_players: 16,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -373,6 +375,7 @@ fn four_bots_all_see_a_fourth_bots_edit() {
     let server = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("valid loopback address"),
         world_path: dir,
+        identity_path: None,
         max_players: 16,
         allowlist: Allowlist::open(),
         operators: Vec::new(),

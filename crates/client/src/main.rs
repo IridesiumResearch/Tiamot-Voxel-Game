@@ -174,7 +174,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ServerChoice::Remote(address) => (address, None),
             ServerChoice::Embedded => {
                 let handle = start_local_world(
-                    &config.world_path,
+                    &WorldPaths {
+                        world: &config.world_path,
+                        mods: &config.mods_path,
+                        identity: &data,
+                    },
                     config.view(),
                     catalogue.enabled(),
                     &identity.uuid_as_root(),
@@ -184,7 +188,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     false,
                     // Likewise nowhere to have typed a seed.
                     None,
-                    &config.mods_path,
                 )?;
                 tracing::info!(addr = %handle.local_addr(), "embedded server listening");
                 (handle.local_addr(), Some(handle))
@@ -415,8 +418,27 @@ fn clear(gpu: &Gpu, view: &wgpu::TextureView) {
 ///
 /// **Loopback only.** An embedded server is this player's world, and binding it
 /// to every interface would silently publish it.
+/// The three directories a hosted world needs, which are three different
+/// things that happen to be paths.
+///
+/// Grouped rather than passed one by one because they are not
+/// interchangeable and an argument list of eight would let two of them be
+/// swapped silently — the world would be served from the mods folder and
+/// nobody would find out until it was empty.
+struct WorldPaths<'a> {
+    /// The world's own directory: chunks, entities, its database.
+    world: &'a std::path::Path,
+    /// Where installed mods are read from. Configurable so a mod author can
+    /// keep their work outside the engine's own checkout.
+    mods: &'a std::path::Path,
+    /// This installation's data directory, which is where the server's TLS
+    /// identity lives. One identity per machine rather than per world — see
+    /// `Settings::identity_path`.
+    identity: &'a std::path::Path,
+}
+
 fn start_local_world(
-    world_path: &std::path::Path,
+    paths: &WorldPaths<'_>,
     view: tiamot_core::interest::ViewDistance,
     enabled_mods: Vec<String>,
     operator: &tiamot_core::identity::PlayerUuid,
@@ -425,9 +447,6 @@ fn start_local_world(
     // NEW: an existing one keeps the seed it was created with, or terrain
     // beyond the explored edge would change shape under the player.
     seed: Option<u64>,
-    // Where installed mods are read from. Configurable so a mod author can
-    // keep their work outside the engine's own checkout.
-    mods_path: &std::path::Path,
 ) -> Result<tiamot_server::ServerHandle, Box<dyn std::error::Error>> {
     Ok(tiamot_server::ServerHandle::start(
         &tiamot_server::Settings {
@@ -443,7 +462,12 @@ fn start_local_world(
             } else {
                 "127.0.0.1:0".parse()?
             },
-            world_path: world_path.to_path_buf(),
+            world_path: paths.world.to_path_buf(),
+            // **One identity for this machine, across every world it hosts.**
+            // LAN worlds all bind the same fixed port, so a per-world
+            // certificate made one address present a different identity per
+            // save file and got the second world refused as an impostor.
+            identity_path: Some(paths.identity.to_path_buf()),
             // One is right for a world nobody else can reach, and would be a
             // baffling refusal for one they can.
             max_players: if lan { 8 } else { 1 },
@@ -454,7 +478,7 @@ fn start_local_world(
             // hosts decides for itself, and says so at join.
             operators: vec![operator.to_hex()],
             view_distance: view,
-            mods_path: Some(mods_path.to_path_buf()),
+            mods_path: Some(paths.mods.to_path_buf()),
             enabled_mods: Some(enabled_mods),
             seed,
             rcon: None,
@@ -1267,13 +1291,16 @@ impl Client {
         let address = match &entry.kind {
             client::launcher::Kind::Local { path } => {
                 let handle = start_local_world(
-                    &self.data.join(path),
+                    &WorldPaths {
+                        world: &self.data.join(path),
+                        mods: &self.config.mods_path,
+                        identity: &self.data,
+                    },
                     self.config.view(),
                     self.catalogue.enabled(),
                     &identity.uuid_as_root(),
                     lan,
                     seed,
-                    &self.config.mods_path,
                 )
                 .map_err(|err| err.to_string())?;
                 // **Loopback when the world listens on everything.** A server

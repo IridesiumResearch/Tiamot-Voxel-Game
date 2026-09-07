@@ -70,6 +70,7 @@ fn twenty_bots_for_sixty_seconds_leave_the_server_healthy() {
     let server = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: dir,
+        identity_path: None,
         max_players: 64,
         allowlist: Allowlist::open(),
         operators: Vec::new(),

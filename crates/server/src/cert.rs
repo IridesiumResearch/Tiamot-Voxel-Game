@@ -318,6 +318,42 @@ mod tests {
     }
 
     #[test]
+    fn two_worlds_hosted_from_one_installation_present_one_identity() {
+        // **Reported from the window**: joining a LAN world from another
+        // machine failed with "the certificate for 192.168.1.162:47811 has
+        // CHANGED" after the host opened a different world.
+        //
+        // A client pins a certificate against an ADDRESS, and a client hosting
+        // to the LAN binds a FIXED port for every world it opens. With the
+        // certificate living in the world directory, one address presented a
+        // different identity per save file, so the second world a host opened
+        // was refused as an impostor by everyone who had joined the first.
+        //
+        // SSH has the same shape and the same answer: a host key identifies the
+        // machine, not the directory being served. This is that property —
+        // whatever the world, the identity is the installation's.
+        let installation = scratch("one-host");
+
+        let first = ServerCert::load_or_create(&installation).expect("generate");
+        let second = ServerCert::load_or_create(&installation).expect("reload");
+        assert_eq!(
+            first.fingerprint_hex(),
+            second.fingerprint_hex(),
+            "one installation must keep one identity across the worlds it hosts"
+        );
+
+        // And the guard against fixing this by making every server identical:
+        // two INSTALLATIONS are still two hosts, which is what makes pinning
+        // worth doing at all.
+        let elsewhere = ServerCert::load_or_create(&scratch("other-host")).expect("generate");
+        assert_ne!(
+            first.fingerprint_hex(),
+            elsewhere.fingerprint_hex(),
+            "two machines must not share an identity"
+        );
+    }
+
+    #[test]
     fn the_key_file_is_not_world_readable() {
         let dir = scratch("perms");
         ServerCert::load_or_create(&dir).expect("generate");

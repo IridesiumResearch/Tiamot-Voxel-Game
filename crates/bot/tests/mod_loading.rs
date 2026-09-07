@@ -44,6 +44,7 @@ fn start(world: &Path, mods: Option<PathBuf>) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: world.to_path_buf(),
+        identity_path: None,
         max_players: 8,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -241,6 +242,7 @@ fn an_unresolvable_mod_set_refuses_to_start() {
     let result = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: world,
+        identity_path: None,
         max_players: 8,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -352,6 +354,7 @@ fn a_mod_left_out_of_the_selection_does_not_load() {
     let server = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: world,
+        identity_path: None,
         max_players: 8,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -397,6 +400,7 @@ fn a_selection_that_breaks_a_dependency_refuses_to_start() {
     let result = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: world,
+        identity_path: None,
         max_players: 8,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -424,6 +428,7 @@ fn a_mod_directory_that_is_not_there_is_refused_rather_than_hosted_empty() {
     let started = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: dir,
+        identity_path: None,
         max_players: 4,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -458,6 +463,7 @@ fn a_world_with_every_mod_disabled_starts_empty_and_says_so() {
     let server = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: dir,
+        identity_path: None,
         max_players: 4,
         allowlist: Allowlist::open(),
         operators: Vec::new(),

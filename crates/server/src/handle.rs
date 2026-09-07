@@ -672,6 +672,19 @@ pub struct Settings {
     pub bind_addr: SocketAddr,
     /// Directory holding the world database and server certificate.
     pub world_path: PathBuf,
+
+    /// Where the server's TLS identity lives, if not beside the world.
+    ///
+    /// **A host is a machine, not a save file.** Clients pin a certificate
+    /// against an address (`client::trust`), so every world a host opens on one
+    /// address has to present one identity or the second is refused as an
+    /// impostor. A client hosting to the LAN binds a FIXED port, which makes
+    /// that certain rather than possible.
+    ///
+    /// `None` keeps the certificate in the world directory, which is right for
+    /// a dedicated server: one world, one address, and an operator who moves
+    /// the world expects its identity to travel with it.
+    pub identity_path: Option<PathBuf>,
     /// Maximum simultaneous players.
     pub max_players: u32,
     /// Who is permitted to join.
@@ -1307,7 +1320,26 @@ impl ServerHandle {
             "breaking rules built"
         );
 
-        let cert = ServerCert::load_or_create(&settings.world_path)?;
+        // **The host's identity, not the world's.** A client pins a
+        // certificate against an ADDRESS, and a client hosting worlds to the
+        // LAN binds all of them to the same fixed port — so a per-world
+        // certificate meant one address presenting a different identity
+        // depending on which save file was open, and the second world a host
+        // opened was refused by everyone who had joined the first.
+        //
+        // Reported from the window as "the certificate for 192.168.1.162:47811
+        // has CHANGED" on a machine that had changed nothing.
+        //
+        // SSH has the same shape and the same answer: a host key identifies the
+        // MACHINE, not the directory it is serving. `identity_path` is where
+        // that lives; falling back to the world directory keeps a dedicated
+        // server — one world, one address — behaving exactly as it did.
+        let cert = ServerCert::load_or_create(
+            settings
+                .identity_path
+                .as_deref()
+                .unwrap_or(&settings.world_path),
+        )?;
         let cert_fingerprint = cert.fingerprint;
         info!(
             fingerprint = %cert.fingerprint_hex(),
@@ -3851,6 +3883,7 @@ impl ServerHandle {
         Self::start(&Settings {
             bind_addr: "127.0.0.1:0".parse().expect("a valid loopback address"),
             world_path: world_path.to_path_buf(),
+            identity_path: None,
             max_players,
             allowlist: Allowlist::open(),
             operators: Vec::new(),

@@ -55,6 +55,7 @@ fn start_with_mods(name: &str) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: dir,
+        identity_path: None,
         max_players: 8,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
@@ -76,6 +77,7 @@ fn start(name: &str) -> ServerHandle {
     ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: dir,
+        identity_path: None,
         max_players: 8,
         allowlist: Allowlist::open(),
         operators: Vec::new(),

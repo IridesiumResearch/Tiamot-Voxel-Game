@@ -88,6 +88,7 @@ fn twenty_bots_churning_lamps_keep_the_tick_inside_its_budget() {
     let server = ServerHandle::start(&Settings {
         bind_addr: "127.0.0.1:0".parse().expect("loopback"),
         world_path: dir,
+        identity_path: None,
         max_players: 64,
         allowlist: Allowlist::open(),
         operators: Vec::new(),
