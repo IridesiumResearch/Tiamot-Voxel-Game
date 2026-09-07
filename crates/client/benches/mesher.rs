@@ -151,6 +151,31 @@ fn meshing(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    // **The floor a step cannot go below.** `MeshJob` splits the shading and
+    // merging into 294 steps, but the grid is expanded once and in one go — a
+    // single scan of 110,592 cells. Whatever the budget, a chunk costs at least
+    // this before any of it can be interrupted, so this is the number that says
+    // whether splitting the rest was enough.
+    let mut group = c.benchmark_group("mesh_start");
+    for (name, chunk) in [
+        ("uniform", uniform()),
+        ("terrain", terrain()),
+        ("chiselled", chiselled()),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let neighbours = Neighbours::none();
+                std::hint::black_box(mesher::MeshJob::start(
+                    std::hint::black_box(&chunk),
+                    &neighbours,
+                    Absent::Air,
+                    &NoFluid,
+                ))
+            });
+        });
+    }
+    group.finish();
 }
 
 criterion_group!(benches, meshing);

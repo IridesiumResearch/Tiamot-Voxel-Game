@@ -1668,8 +1668,19 @@ fn merge_slice(
 /// bookkeeping costs nothing measurable against the work it guards.
 ///
 /// The grid is built once, in [`start`](MeshJob::start), and is NOT splittable:
-/// it is a single scan of 110,592 cells. Against the lit benchmarks it is about
-/// a third of the total, so the floor a step cannot go below is that scan.
+/// it is a single scan of 110,592 cells. That is the floor a chunk cannot go
+/// below however fine the steps are — and it is small. `mesh_start/*` measures
+/// it against the lit totals:
+///
+///     uniform      87 us  of  1.07 ms   —   8%
+///     terrain      59 us  of   759 us   —   8%
+///     chiselled   221 us  of  2.96 ms   —   7%
+///
+/// So splitting reaches about 92% of the work. An earlier version of this
+/// comment guessed "about a third", reasoning from the gap between the lit and
+/// unlit benchmarks — which was wrong, because the unlit case still does all
+/// the culling and merging, and those split. Hence `mesh_start`: the number is
+/// measured rather than inferred from two others.
 ///
 /// # It holds a snapshot, so an edit invalidates it
 ///
