@@ -189,6 +189,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // nowhere to have ticked the box. A config-driven start is
                     // the bot harness and a test rig, which want loopback.
                     false,
+                    // Likewise nowhere to have typed a seed.
+                    None,
                 )?;
                 tracing::info!(addr = %handle.local_addr(), "embedded server listening");
                 (handle.local_addr(), Some(handle))
@@ -425,6 +427,10 @@ fn start_local_world(
     enabled_mods: Vec<String>,
     operator: &tiamot_core::identity::PlayerUuid,
     lan: bool,
+    // The world seed, or `None` for a random one. Used only when the world is
+    // NEW: an existing one keeps the seed it was created with, or terrain
+    // beyond the explored edge would change shape under the player.
+    seed: Option<u64>,
 ) -> Result<tiamot_server::ServerHandle, Box<dyn std::error::Error>> {
     Ok(tiamot_server::ServerHandle::start(
         &tiamot_server::Settings {
@@ -453,7 +459,7 @@ fn start_local_world(
             view_distance: view,
             mods_path: Some(std::path::PathBuf::from(MODS_DIR)),
             enabled_mods: Some(enabled_mods),
-            seed: None,
+            seed,
             rcon: None,
             materials: Vec::new(),
         },
@@ -1183,8 +1189,10 @@ impl Client {
         match action {
             client::front::Action::None => true,
             client::front::Action::Quit => false,
-            client::front::Action::Open(entry) => self.open(&entry, lan),
-            client::front::Action::Create(name) => self.create(&name, lan),
+            // No seed: an existing world keeps the one it was made with, and
+            // handing it another would be ignored anyway.
+            client::front::Action::Open(entry) => self.open(&entry, lan, None),
+            client::front::Action::Create { name, seed } => self.create(&name, lan, seed),
             client::front::Action::Remember(entry) => {
                 self.library.add(*entry);
                 self.save_library();
@@ -1203,8 +1211,8 @@ impl Client {
     /// A failure is reported ON the front screen rather than to the terminal: a
     /// player who typed an address wrong is looking at the menu, and a log line
     /// they never see is the same as no message at all.
-    fn open(&mut self, entry: &client::launcher::Entry, lan: bool) -> bool {
-        match self.connect(entry, lan) {
+    fn open(&mut self, entry: &client::launcher::Entry, lan: bool, seed: Option<u64>) -> bool {
+        match self.connect(entry, lan, seed) {
             Ok(()) => {
                 self.library.add(client::launcher::Entry {
                     // The mods it is being played with NOW, so the next visit
@@ -1238,7 +1246,7 @@ impl Client {
     }
 
     /// Makes a world and opens it.
-    fn create(&mut self, name: &str, lan: bool) -> bool {
+    fn create(&mut self, name: &str, lan: bool, seed: Option<u64>) -> bool {
         let entry = client::launcher::Entry {
             name: name.to_owned(),
             kind: client::launcher::Kind::Local {
@@ -1247,11 +1255,16 @@ impl Client {
             mods: self.catalogue.enabled(),
             last_played: client::launcher::now_seconds(),
         };
-        self.open(&entry, lan)
+        self.open(&entry, lan, seed)
     }
 
     /// Starts whatever `entry` names and swaps the window into it.
-    fn connect(&mut self, entry: &client::launcher::Entry, lan: bool) -> Result<(), String> {
+    fn connect(
+        &mut self,
+        entry: &client::launcher::Entry,
+        lan: bool,
+        seed: Option<u64>,
+    ) -> Result<(), String> {
         let identity = Identity::load_or_create(&self.identity_path)
             .map_err(|err| format!("this machine's identity could not be read: {err}"))?;
         let address = match &entry.kind {
@@ -1262,6 +1275,7 @@ impl Client {
                     self.catalogue.enabled(),
                     &identity.uuid_as_root(),
                     lan,
+                    seed,
                 )
                 .map_err(|err| err.to_string())?;
                 // **Loopback when the world listens on everything.** A server

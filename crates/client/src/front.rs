@@ -43,8 +43,16 @@ pub enum Action {
     None,
     /// Open this world or server.
     Open(Entry),
-    /// Make a world with this name and the mods that are ticked.
-    Create(String),
+    /// Make a world with this name, the mods that are ticked, and this seed.
+    ///
+    /// `None` asks the server for a random one, which is what an empty seed box
+    /// means. See [`crate::launcher::seed_from`].
+    Create {
+        /// What to call it.
+        name: String,
+        /// The world seed, or `None` for a fresh random one.
+        seed: Option<u64>,
+    },
     /// Keep this entry in the list. A server somebody typed an address for.
     ///
     /// Same reason as [`Action::Forget`]: a server added to this screen's copy
@@ -73,6 +81,8 @@ pub struct Front {
     selected: Option<usize>,
     /// What is typed into the new-world box.
     name: String,
+    /// What is typed into the seed box. Empty means a random world.
+    seed: String,
     /// What is typed into the address box.
     address: String,
     /// The mod-set warning waiting to be answered, and which world it is about.
@@ -114,6 +124,7 @@ impl Front {
             notice: catalogue.problem.clone(),
             catalogue,
             name,
+            seed: String::new(),
             address: String::new(),
             confirming: None,
             network: Discovery::start(),
@@ -319,8 +330,29 @@ impl Front {
             ui.text_edit_singleline(&mut self.name);
             if ui.button("Create").clicked() {
                 let name = self.library.unused_name(self.name.trim());
-                action = Action::Create(name);
+                action = Action::Create {
+                    name,
+                    seed: crate::launcher::seed_from(&self.seed),
+                };
             }
+        });
+        ui.horizontal(|ui| {
+            // **Optional, and last.** A player who does not care types nothing
+            // and gets a random world, which is what happened before this box
+            // existed; a player who does can type a number to reproduce one, or
+            // a word to name one.
+            //
+            // Reading a seed BACK is not offered here, and deliberately not
+            // claimed: the server picks the random one and never tells the
+            // client, so the only place it appears is the server's own log
+            // (`world seed` at startup). Saying otherwise on the hover would
+            // send someone hunting an overlay line that does not exist.
+            ui.label("Seed");
+            ui.text_edit_singleline(&mut self.seed).on_hover_text(
+                "Optional. A number is used as-is; any other text is hashed into one, so \
+                     the same word always makes the same world. Leave it empty for a random \
+                     one. Only used when the world is NEW — an existing world keeps its own.",
+            );
         });
         ui.horizontal(|ui| {
             ui.label("Server");

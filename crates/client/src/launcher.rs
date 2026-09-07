@@ -46,6 +46,33 @@ pub enum Kind {
     },
 }
 
+/// Turns what a player typed in the seed box into a world seed.
+///
+/// `None` for an empty box, which is what asks the server for a random one.
+///
+/// **A number is itself and anything else is hashed**, which is the convention
+/// every voxel game uses and the one people arrive expecting: typing `12345`
+/// gets you that seed exactly, so a seed read off this screen can be typed back
+/// in, and typing `hello` gets you a world that is always the same world.
+///
+/// BLAKE3 rather than a `DefaultHasher` because the latter is randomly seeded
+/// per process — the same word would give a different world every launch, which
+/// is precisely what a named seed exists to prevent.
+#[must_use]
+pub fn seed_from(typed: &str) -> Option<u64> {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        return None;
+    }
+    if let Ok(number) = typed.parse::<u64>() {
+        return Some(number);
+    }
+    let digest = blake3::hash(typed.as_bytes());
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest.as_bytes()[..8]);
+    Some(u64::from_le_bytes(bytes))
+}
+
 /// One line of the world list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -371,6 +398,37 @@ impl Catalogue {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_typed_seed_is_a_number_if_it_can_be_and_a_hash_otherwise() {
+        use super::seed_from;
+
+        // Empty means "surprise me", which is what the server already did.
+        assert_eq!(seed_from(""), None);
+        assert_eq!(seed_from("   "), None, "whitespace is an empty box");
+
+        // A number is ITSELF, so a seed can be written down and typed back in.
+        // If this hashed instead, a shared seed would make a different world
+        // for everybody who typed it.
+        assert_eq!(seed_from("12345"), Some(12_345));
+        assert_eq!(seed_from("  12345  "), Some(12_345), "trimmed, not refused");
+        assert_eq!(seed_from("0"), Some(0));
+
+        // Anything else is hashed, and the SAME text must give the same world
+        // every time — the whole point of naming a seed. A `DefaultHasher` is
+        // randomly seeded per process and would fail exactly this.
+        let once = seed_from("hello").expect("a word is a seed");
+        assert_eq!(seed_from("hello"), Some(once));
+        assert_ne!(
+            seed_from("hello"),
+            seed_from("hellp"),
+            "two different words should not name one world"
+        );
+
+        // A number too big to be a u64 is text, not an error: refusing it would
+        // be a dialog about integer widths in a seed box.
+        assert!(seed_from("99999999999999999999999999").is_some());
+    }
+
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
