@@ -3,6 +3,11 @@
 
 //! Density fields: 3D terrain and caves, described by a mod and evaluated here.
 //!
+//! Implements `docs/subnode-contract.md` §5: a density field writes at BLOCK
+//! resolution. It never expands a buffer to sub-nodes, so a generator that uses
+//! one pays nothing for sub-nodes existing — the opt-in the section describes
+//! stays a separate, deliberate act.
+//!
 //! # Why this exists
 //!
 //! A mod may not compute simulation values itself. Charter rule 4 guarantees

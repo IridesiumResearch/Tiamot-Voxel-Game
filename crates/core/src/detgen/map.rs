@@ -3,6 +3,10 @@
 
 //! Persistent 2D fields: the pre-pass a mod computes once and samples for ever.
 //!
+//! Implements `docs/subnode-contract.md` §5, at one remove: a map holds no
+//! blocks at all. It is the input a generator reads before it writes, and what
+//! it writes is block resolution unless that generator opts in itself.
+//!
 //! # Why this exists, and why a density field could not do it
 //!
 //! [`super::density`] evaluates an expression at a point. That is enough for

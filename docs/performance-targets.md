@@ -197,6 +197,20 @@ At 50 players all chiselling continuously, the delta stream is roughly
 
 - **Frame pacing at full sub-node detail** — Task 08 human gate, on a discrete
   card.
-- **Whether view distance 12 is the shipping target.** Raising it to 32 scales
-  geometry roughly 7×; 172 MiB becomes ~1.2 GiB. Comfortable on a discrete card,
-  which is now the target. Decide before Task 15b's LOD design.
+
+## Decided
+
+- **View distance — settled by Task 15b's LOD, 2026-09-06.** The question was
+  whether to ship 12 and how far up it could go. LOD changed the shape of the
+  answer: the detail radius and the horizon are now separate numbers, so reach
+  no longer costs full-resolution geometry.
+
+  What ships is `ViewDistance::DEFAULT` = **8 horizontal, 12 vertical**, with a
+  summary horizon at `horizon_for` = 4× horizontal capped at `MAX_HORIZON` 32.
+  So the default player sees 8 chunks of full sub-node detail and 32 chunks of
+  terrain. `MAXIMUM` is 32/16 for an operator who wants it, and the geometry
+  bound that worried this entry applies only to the detail radius.
+
+  Vertical is 1.5× horizontal rather than equal to it, at the user's call: a
+  voxel world is looked *along* far more than it is looked *down*, but 4 was too
+  few to see a valley floor from a ridge.
