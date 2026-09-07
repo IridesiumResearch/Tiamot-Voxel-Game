@@ -35,7 +35,7 @@
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use client::mesher::{self, Absent, Neighbours, NoFluid};
+use client::mesher::{self, Absent, Neighbours, NoFluid, NoGlass};
 use client::shade::Uniform;
 use tiamot_core::{BlockPos, BlockValue, Chunk, ChunkPos, MaterialId};
 
@@ -132,6 +132,7 @@ fn meshing(c: &mut Criterion) {
                     Absent::Air,
                     &DAY,
                     &NoFluid,
+                    &NoGlass,
                 ))
             });
         });
@@ -146,6 +147,7 @@ fn meshing(c: &mut Criterion) {
                     Absent::Air,
                     &Dappled,
                     &NoFluid,
+                    &NoGlass,
                 ))
             });
         });
@@ -171,6 +173,7 @@ fn meshing(c: &mut Criterion) {
                     &neighbours,
                     Absent::Air,
                     &NoFluid,
+                    &NoGlass,
                 ))
             });
         });

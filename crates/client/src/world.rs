@@ -1249,6 +1249,7 @@ mod tests {
             ABSENT_POLICY,
             &crate::shade::Uniform(Light::DAYLIGHT),
             &crate::mesher::NoFluid,
+            &crate::mesher::NoGlass,
         );
         assert!(
             mesh.is_empty(),
@@ -1279,6 +1280,7 @@ mod tests {
             ABSENT_POLICY,
             &crate::shade::Uniform(Light::DAYLIGHT),
             &crate::mesher::NoFluid,
+            &crate::mesher::NoGlass,
         );
         assert!(
             !mesh.is_empty(),

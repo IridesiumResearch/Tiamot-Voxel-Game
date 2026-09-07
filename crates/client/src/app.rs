@@ -1071,6 +1071,12 @@ pub struct App {
     flying: bool,
     /// What the connection reported about the server's certificate.
     server_label: String,
+    /// Materials that can be seen through: glass.
+    ///
+    /// Read by the mesher, which culls and buckets faces by it. Empty until the
+    /// material table arrives, which is the same state as a world with no glass
+    /// in it — and a world with no glass pays nothing for glass existing.
+    transparent: std::collections::BTreeSet<u16>,
     /// A chunk being meshed across frames, if one is part-built.
     ///
     /// At most one: the budget is spent depth-first, so a second chunk is not
@@ -1243,6 +1249,7 @@ impl App {
             step_sounds: std::collections::BTreeMap::new(),
             items: std::collections::BTreeSet::new(),
             hosting: None,
+            transparent: std::collections::BTreeSet::new(),
             meshing: None,
             may_fly: false,
             flying: false,
@@ -2339,6 +2346,15 @@ impl App {
         self.items = table
             .iter()
             .filter(|entry| !entry.placeable)
+            .map(|entry| entry.id)
+            .collect();
+        // **What can be seen through.** Baked into the geometry rather than
+        // decided when drawing — transparency changes which faces exist at all
+        // (Contract §8.1) — so this has to be settled before anything meshes.
+        // It arrives with the material table, which is before the join.
+        self.transparent = table
+            .iter()
+            .filter(|entry| entry.transparent)
             .map(|entry| entry.id)
             .collect();
     }
@@ -4235,7 +4251,13 @@ impl App {
             // up. Everything after them is streaming, whose old mesh is still
             // right, so those may be interrupted.
             let deadline = (index >= due.urgent).then_some(started);
-            let flight = match mesher::MeshJob::start(chunk, &neighbours, ABSENT_POLICY, &fluid) {
+            let flight = match mesher::MeshJob::start(
+                chunk,
+                &neighbours,
+                ABSENT_POLICY,
+                &fluid,
+                &self.transparent,
+            ) {
                 // Empty air: no job, no work, and the empty mesh still has to be
                 // set so a chunk that was emptied stops drawing what it was.
                 None => Ok((*pos, mesher::Mesh::default())),
@@ -5856,6 +5878,7 @@ mod tests {
             &mesher::Neighbours::open(),
             ABSENT_POLICY,
             &mesher::NoFluid,
+            &mesher::NoGlass,
         )
         .expect("this chunk is not empty air");
 

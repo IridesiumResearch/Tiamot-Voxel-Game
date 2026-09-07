@@ -173,6 +173,23 @@ pub struct SubNodeGrid {
     /// of them: it skips both the allocation and the second mask per column,
     /// so a world with no milk in it meshes exactly as it did.
     fluid: Option<[Vec<u64>; 3]>,
+    /// The transparent half of the terrain occupancy, or `None` for a chunk
+    /// with no glass in it.
+    ///
+    /// # Why this is separable for the same reason fluid is
+    ///
+    /// Face culling is "occupied next to not-occupied". While glass and stone
+    /// shared one occupancy set, the stone face behind a window did not exist —
+    /// invisible from outside, and a hole straight through the world when you
+    /// looked through the glass. Exactly the fault fluid had, and fixed the same
+    /// way: each set is culled against ITSELF, so glass draws where it meets
+    /// stone, stone draws where it meets glass, and two panes together draw
+    /// neither interior face. Contract §8.1.
+    ///
+    /// `None` rather than zeroed columns for a chunk with no glass, which is
+    /// nearly all of them: it skips both the allocation and the second mask per
+    /// column, so a world without windows meshes exactly as it did.
+    glass: Option<[Vec<u64>; 3]>,
     /// Each block's fluid surface height, in sixteenths of a cell, `0` for dry.
     ///
     /// **This is what makes the surface smooth rather than a staircase.** The
@@ -253,7 +270,7 @@ impl SubNodeGrid {
     /// is where the two disagree and a seam appears.
     #[must_use]
     pub fn from_chunk(chunk: &Chunk, neighbours: &Neighbours<'_>, absent: Absent) -> Self {
-        Self::from_chunk_with_fluid(chunk, neighbours, absent, &NoFluid)
+        Self::from_chunk_with_fluid(chunk, neighbours, absent, &NoFluid, &NoGlass)
     }
 
     /// The same, with fluid filled in.
@@ -279,6 +296,7 @@ impl SubNodeGrid {
         neighbours: &Neighbours<'_>,
         absent: Absent,
         fluid: &impl FluidFill,
+        transparent: &impl Transparency,
     ) -> Self {
         let mut materials = vec![0u16; CELLS];
         let mut columns = [vec![0u64; N * N], vec![0u64; N * N], vec![0u64; N * N]];
@@ -383,10 +401,19 @@ impl SubNodeGrid {
             fill_skirt(&mut materials, &mut columns, &mut wet, &mut heights, skirt);
         }
 
+        // **Derived from the cells, and only when there is glass to find.**
+        //
+        // A pass over 110,592 cells is not free, and nearly every chunk in a
+        // world has no glass in it — so `Transparency::any` gates it exactly as
+        // `FluidFill::any` gates the fluid columns. A world without windows
+        // meshes as it always did.
+        let glass = glass_columns(&materials, transparent);
+
         let mut grid = Self {
             materials,
             columns,
             fluid: wet,
+            glass,
             heights,
             walls,
         };
@@ -710,6 +737,69 @@ pub trait FluidFill {
     /// and the safer guess.
     fn solid(&self, _x: i32, _y: i32, _z: i32) -> bool {
         false
+    }
+}
+
+/// Where a mesher asks whether a material can be seen through.
+///
+/// A trait rather than a set, for the reason [`FluidFill`] is one: the mesher
+/// does not have to know how a client stores its material table, and a test can
+/// declare one material transparent without building a registry.
+pub trait Transparency {
+    /// Whether this material is glass — see `docs/subnode-contract.md` §8.1.
+    fn is_transparent(&self, material: u16) -> bool;
+
+    /// Whether ANY material in play is transparent.
+    ///
+    /// **Defaults to yes, which is the safe answer**, and every implementation
+    /// that can answer better should. A world with no glass in it must pay
+    /// nothing for glass existing: the occupancy mask below is only built when
+    /// this says it might be needed, exactly as a dry chunk allocates no fluid
+    /// columns. `NoFluid` inheriting this default is what stopped `mesh_chunk`'s
+    /// air fast path firing once before, so it is worth saying out loud.
+    fn any(&self) -> bool {
+        true
+    }
+}
+
+/// A world with no glass in it.
+pub struct NoGlass;
+
+impl Transparency for NoGlass {
+    fn is_transparent(&self, _material: u16) -> bool {
+        false
+    }
+
+    /// None, which is the whole point of this type. See [`Transparency::any`].
+    fn any(&self) -> bool {
+        false
+    }
+}
+
+impl<T: Transparency + ?Sized> Transparency for &T {
+    fn is_transparent(&self, material: u16) -> bool {
+        (*self).is_transparent(material)
+    }
+
+    /// **Forwarded, not defaulted.** A blanket impl that took the trait's
+    /// default would answer "yes there is glass" for a `&NoGlass`, which is how
+    /// the same mistake was made with `FluidFill` — and there it cost the air
+    /// fast path silently.
+    fn any(&self) -> bool {
+        (*self).any()
+    }
+}
+
+impl Transparency for std::collections::BTreeSet<u16> {
+    fn is_transparent(&self, material: u16) -> bool {
+        self.contains(&material)
+    }
+
+    /// **Empty means none**, which is both the honest answer and the one that
+    /// keeps a world without glass meshing exactly as it did — including every
+    /// frame before the material table has arrived.
+    fn any(&self) -> bool {
+        !self.is_empty()
     }
 }
 
@@ -1533,6 +1623,7 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
     // border culling free rather than a special case.
     let columns = &grid.columns[axis];
     let wet = grid.fluid.as_ref().map(|fluid| &fluid[axis]);
+    let glass = grid.glass.as_ref().map(|glass| &glass[axis]);
     scratch.plane.fill(0);
     scratch.wet_plane.fill(0);
 
@@ -1563,10 +1654,25 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
                 Some(wet) => column & !wet[u * N + v],
                 None => column,
             };
+            // **Glass is culled against glass, and opaque against opaque.**
+            //
+            // Contract §8.1: a face draws where exactly ONE side of it is
+            // transparent. Splitting the occupancy and culling each half
+            // against itself is that rule, and it falls out rather than being
+            // enforced — the stone behind a window keeps its face because its
+            // neighbour is not in the opaque set, the window keeps its own
+            // because its neighbour is not in the glass set, and two panes
+            // together lose both because each IS in the other's set.
+            //
+            // Without it the stone behind glass had no face at all: invisible
+            // from outside, and a hole straight through the world seen from
+            // inside. The same fault milk had against terrain, in §4.
+            let panes = glass.map_or(0, |glass| glass[u * N + v]);
+            let opaque = solid & !panes;
             let faces = if positive {
-                solid & !(solid >> 1)
+                (opaque & !(opaque >> 1)) | (panes & !(panes >> 1))
             } else {
-                solid & !(solid << 1)
+                (opaque & !(opaque << 1)) | (panes & !(panes << 1))
             };
             // **The fluid's own faces go to their own plane**, rather than
             // being OR-ed into the terrain's as they were. They are drawn in
@@ -1715,11 +1821,13 @@ impl MeshJob {
         neighbours: &Neighbours<'_>,
         absent: Absent,
         fluid: &impl FluidFill,
+        transparent: &impl Transparency,
     ) -> Option<Self> {
         if chunk.is_uniform() == Some(tiamot_core::MaterialId::AIR) && !fluid.any() {
             return None;
         }
-        let grid = SubNodeGrid::from_chunk_with_fluid(chunk, neighbours, absent, fluid);
+        let grid =
+            SubNodeGrid::from_chunk_with_fluid(chunk, neighbours, absent, fluid, transparent);
         let scratch = Scratch::new(&grid);
         Some(Self {
             grid,
@@ -1830,6 +1938,7 @@ pub fn mesh_chunk(
     absent: Absent,
     light: &impl BlockLight,
     fluid: &impl FluidFill,
+    transparent: &impl Transparency,
 ) -> Mesh {
     // **A chunk of nothing costs nothing.** Meshing scans all 110,592 sub-node
     // cells whatever the chunk holds — the cost is the scan, not the geometry
@@ -1846,9 +1955,41 @@ pub fn mesh_chunk(
         return Mesh::default();
     }
     mesh(
-        &SubNodeGrid::from_chunk_with_fluid(chunk, neighbours, absent, fluid),
+        &SubNodeGrid::from_chunk_with_fluid(chunk, neighbours, absent, fluid, transparent),
         light,
     )
+}
+
+/// The occupancy columns of every transparent cell, or `None` if there are none.
+///
+/// Walks the materials once rather than being filled as blocks are laid down:
+/// the transparency question is per CELL and the block writers work a whole
+/// block at a time, so asking there would mean asking per cell anyway — in
+/// three places instead of one, and inside the loops that were measured.
+fn glass_columns(materials: &[u16], transparent: &impl Transparency) -> Option<[Vec<u64>; 3]> {
+    if !transparent.any() {
+        return None;
+    }
+    let mut columns = [vec![0u64; N * N], vec![0u64; N * N], vec![0u64; N * N]];
+    let mut found = false;
+    for z in 0..N {
+        for y in 0..N {
+            for x in 0..N {
+                let material = materials[x + N * y + N * N * z];
+                if material == 0 || !transparent.is_transparent(material) {
+                    continue;
+                }
+                found = true;
+                columns[0][y * N + z] |= 1 << (x as u32 + FIRST);
+                columns[1][x * N + z] |= 1 << (y as u32 + FIRST);
+                columns[2][x * N + y] |= 1 << (z as u32 + FIRST);
+            }
+        }
+    }
+    // `None` rather than a zeroed set, so a chunk that COULD have held glass
+    // and does not costs the same as one that could not — the culling below
+    // then takes its original path rather than an extra mask per column.
+    found.then_some(columns)
 }
 
 /// Lays one block's terrain into the grid.
@@ -2377,7 +2518,14 @@ mod tests {
             material: 2,
             depth: 20,
         };
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &pond);
+        let mesh = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &pond,
+            &NoGlass,
+        );
         assert!(
             !mesh.is_empty(),
             "an air chunk holding milk drew nothing: the fast path skipped a pond"
@@ -2403,7 +2551,14 @@ mod tests {
              `&NoFluid` answers differently from the thing it points at"
         );
 
-        let mesh = mesh_chunk(&empty(), &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let mesh = mesh_chunk(
+            &empty(),
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         assert!(mesh.is_empty());
     }
 
@@ -2443,7 +2598,14 @@ mod tests {
         // mesh rather than on `surface_at` because that is where the previous
         // one could not see the bug: it is the drop on a real vertex, in the
         // buffer that reaches the GPU.
-        let mesh = mesh_chunk(&empty(), &Neighbours::open(), Absent::Air, &DAY, &Shore);
+        let mesh = mesh_chunk(
+            &empty(),
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &Shore,
+            &NoGlass,
+        );
         let per_axis = SUBNODES_PER_AXIS as usize;
 
         // The pond fills blocks 3..=5, and block 6 is its wall. So the milk's
@@ -2503,8 +2665,13 @@ mod tests {
         // left out when it is a wall — because milk poured against stone should
         // meet the stone rather than pull away from it. Both cases here, in one
         // pond, so a fix that just made everything taper fails the second half.
-        let grid =
-            SubNodeGrid::from_chunk_with_fluid(&empty(), &Neighbours::none(), Absent::Air, &Shore);
+        let grid = SubNodeGrid::from_chunk_with_fluid(
+            &empty(),
+            &Neighbours::none(),
+            Absent::Air,
+            &Shore,
+            &NoGlass,
+        );
 
         let per_axis = SUBNODES_PER_AXIS as usize;
         // The corner at (4, 4): all four blocks around it are milk.
@@ -2547,7 +2714,14 @@ mod tests {
             material: MILK,
         };
 
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &pond);
+        let mesh = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &pond,
+            &NoGlass,
+        );
         let faces = faces(&mesh.quads);
 
         // The stone block is cells y 0..=2, the milk cells y 3..=4.
@@ -2650,7 +2824,14 @@ mod tests {
         /// The fixtures below run the full width of the chunk in `z`, so the
         /// interior is the middle column in `x` and nothing else.
         fn drops(chunk: &Chunk, fill: &impl FluidFill) -> Vec<u16> {
-            let mesh = mesh_chunk(chunk, &Neighbours::open(), Absent::Air, &DAY, fill);
+            let mesh = mesh_chunk(
+                chunk,
+                &Neighbours::open(),
+                Absent::Air,
+                &DAY,
+                fill,
+                &NoGlass,
+            );
             // Both fixtures fill blocks 4..=6 in `x` and the whole chunk in
             // `z`, so their shorelines are the corners at `x = 4` and `x = 7`
             // and their interior is the two corners between.
@@ -2717,7 +2898,14 @@ mod tests {
         }
 
         fn flows(chunk: &Chunk, fill: &impl FluidFill) -> Vec<(i8, i8)> {
-            let mesh = mesh_chunk(chunk, &Neighbours::open(), Absent::Air, &DAY, fill);
+            let mesh = mesh_chunk(
+                chunk,
+                &Neighbours::open(),
+                Absent::Air,
+                &DAY,
+                fill,
+                &NoGlass,
+            );
             mesh.fluid_vertices
                 .iter()
                 .map(super::FluidVertex::flow)
@@ -2771,7 +2959,14 @@ mod tests {
             "a dry chunk allocated fluid occupancy columns"
         );
 
-        let dry = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let dry = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         assert_eq!(
             dry.quads.len(),
             6,
@@ -2812,14 +3007,21 @@ mod tests {
             .set_block(BlockPos::new(5, 1, 5), BlockValue::Uniform(MaterialId::AIR))
             .expect("in chunk");
 
-        let one_shot = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let one_shot = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         // Guards the comparison below from passing as `[] == []`.
         assert!(
             !one_shot.quads.is_empty(),
             "the fixture should produce geometry to compare"
         );
 
-        let mut job = MeshJob::start(&chunk, &Neighbours::open(), Absent::Air, &NoFluid)
+        let mut job = MeshJob::start(&chunk, &Neighbours::open(), Absent::Air, &NoFluid, &NoGlass)
             .expect("this chunk is not empty air");
         let mut steps = 0;
         while !job.step(&DAY) {
@@ -2853,8 +3055,161 @@ mod tests {
         // discover a chunk is empty costs the full 110,592-cell scan, and most
         // of the sky is exactly that.
         assert!(
-            MeshJob::start(&empty(), &Neighbours::open(), Absent::Air, &NoFluid).is_none(),
+            MeshJob::start(
+                &empty(),
+                &Neighbours::open(),
+                Absent::Air,
+                &NoFluid,
+                &NoGlass
+            )
+            .is_none(),
             "a chunk of dry air should need no work"
+        );
+    }
+
+    /// A material table in which exactly one material is glass.
+    struct Glass(MaterialId);
+
+    impl Transparency for Glass {
+        fn is_transparent(&self, material: u16) -> bool {
+            material == self.0.get()
+        }
+    }
+
+    #[test]
+    fn a_wall_behind_a_window_keeps_its_face() {
+        // **Contract §8.1, and the fault it exists to prevent.** Face culling
+        // is "occupied next to not-occupied", so while glass and stone shared
+        // one occupancy set the stone face behind a pane did not exist — which
+        // is invisible from outside and a hole straight through the world from
+        // inside. Exactly what milk did to terrain before §4 separated them.
+        //
+        // Three cases, and all three have to hold at once or the rule is only
+        // half implemented.
+        let pane = MaterialId(7);
+        let see_through = Glass(pane);
+
+        // 1. Glass against stone: BOTH faces survive.
+        let mut wall = empty();
+        wall.set_block(BlockPos::new(4, 4, 4), BlockValue::Uniform(STONE))
+            .expect("in chunk");
+        wall.set_block(BlockPos::new(5, 4, 4), BlockValue::Uniform(pane))
+            .expect("in chunk");
+
+        let opaque_pair = mesh_chunk(
+            &wall,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
+        let with_glass = mesh_chunk(
+            &wall,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &see_through,
+        );
+        // Two blocks that touch merge into ten quads when both are opaque: the
+        // interior faces are culled. Treating one as glass brings those two
+        // faces back, so the count rises rather than falls.
+        assert!(
+            with_glass.quads.len() > opaque_pair.quads.len(),
+            "the face between stone and glass was still culled: {} vs {}",
+            with_glass.quads.len(),
+            opaque_pair.quads.len()
+        );
+
+        // 2. Glass against glass: NEITHER interior face is drawn. Drawing them
+        // would stack two blended surfaces and darken a window in proportion
+        // to its thickness.
+        let mut panes = empty();
+        panes
+            .set_block(BlockPos::new(4, 4, 4), BlockValue::Uniform(pane))
+            .expect("in chunk");
+        panes
+            .set_block(BlockPos::new(5, 4, 4), BlockValue::Uniform(pane))
+            .expect("in chunk");
+        let two_panes = mesh_chunk(
+            &panes,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &see_through,
+        );
+        // Against two blocks of ONE opaque material, not the mixed pair above:
+        // quads may not merge across a material boundary (§8), so stone beside
+        // glass is ten quads where stone beside stone is six. Comparing against
+        // the mixed pair measured the merge rule, not the culling rule — which
+        // is what the first version of this assertion actually did.
+        let mut solid = empty();
+        solid
+            .set_block(BlockPos::new(4, 4, 4), BlockValue::Uniform(STONE))
+            .expect("in chunk");
+        solid
+            .set_block(BlockPos::new(5, 4, 4), BlockValue::Uniform(STONE))
+            .expect("in chunk");
+        let two_stones = mesh_chunk(
+            &solid,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
+        assert_eq!(
+            two_panes.quads.len(),
+            two_stones.quads.len(),
+            "two panes together should cull between them exactly as two stones do"
+        );
+
+        // 3. A lone pane against air draws every face, like any block.
+        let mut lone = empty();
+        lone.set_block(BlockPos::new(4, 4, 4), BlockValue::Uniform(pane))
+            .expect("in chunk");
+        let single = mesh_chunk(
+            &lone,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &see_through,
+        );
+        assert_eq!(
+            single.quads.len(),
+            6,
+            "a glass block in open air should draw six faces like anything else"
+        );
+    }
+
+    #[test]
+    fn a_chunk_with_no_glass_meshes_exactly_as_it_did() {
+        // The other half: a world without windows must pay nothing for glass
+        // existing, in faces or in allocation. Nearly every chunk is this one.
+        let mut chunk = empty();
+        chunk
+            .set_block(BlockPos::new(2, 2, 2), BlockValue::Uniform(STONE))
+            .expect("in chunk");
+        chunk
+            .set_block(BlockPos::new(2, 3, 2), BlockValue::Uniform(STONE))
+            .expect("in chunk");
+
+        let grid = SubNodeGrid::from_chunk_with_fluid(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &NoFluid,
+            // Says there IS glass in the world, but this chunk holds none —
+            // the mask must still come out `None` rather than zeroed, or every
+            // chunk in a world with one window pays for it.
+            &Glass(MaterialId(99)),
+        );
+        assert!(
+            grid.glass.is_none(),
+            "a chunk with no glass in it allocated glass occupancy columns"
         );
     }
 
@@ -2867,7 +3222,14 @@ mod tests {
             .set_block(BlockPos::new(5, 5, 5), BlockValue::Uniform(STONE))
             .expect("in chunk");
 
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let mesh = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         assert_eq!(mesh.quads.len(), 6, "one block should merge to six quads");
 
         // And each covers a full 3x3 block face.
@@ -2886,7 +3248,14 @@ mod tests {
             .set_block(BlockPos::new(6, 5, 5), BlockValue::Uniform(STONE))
             .expect("in chunk");
 
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let mesh = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         let expanded = faces(&mesh.quads);
 
         // Two blocks: 2 * 27 = 54 cells. The shared plane is 3x3 = 9 cells,
@@ -2904,8 +3273,17 @@ mod tests {
         solid
             .set_block(BlockPos::new(5, 5, 5), BlockValue::Uniform(STONE))
             .expect("in chunk");
-        let before =
-            faces(&mesh_chunk(&solid, &Neighbours::open(), Absent::Air, &DAY, &NoFluid).quads);
+        let before = faces(
+            &mesh_chunk(
+                &solid,
+                &Neighbours::open(),
+                Absent::Air,
+                &DAY,
+                &NoFluid,
+                &NoGlass,
+            )
+            .quads,
+        );
 
         let mut chiselled = solid.clone();
         // A corner cell of the block: removing it exposes three inward faces
@@ -2913,8 +3291,17 @@ mod tests {
         chiselled
             .set_subnode(SubNodePos::new(15, 15, 15), MaterialId::AIR)
             .expect("in chunk");
-        let after =
-            faces(&mesh_chunk(&chiselled, &Neighbours::open(), Absent::Air, &DAY, &NoFluid).quads);
+        let after = faces(
+            &mesh_chunk(
+                &chiselled,
+                &Neighbours::open(),
+                Absent::Air,
+                &DAY,
+                &NoFluid,
+                &NoGlass,
+            )
+            .quads,
+        );
 
         assert_ne!(before, after, "chiselling must change the surface");
         assert_eq!(
@@ -2937,7 +3324,14 @@ mod tests {
             }
         }
 
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let mesh = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         let top = mesh
             .quads
             .iter()
@@ -2961,7 +3355,14 @@ mod tests {
             }
         }
 
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let mesh = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         let top: Vec<_> = mesh
             .quads
             .iter()
@@ -2985,7 +3386,14 @@ mod tests {
             .set_subnode(SubNodePos::new(8, 8, 8), STONE)
             .expect("in chunk");
 
-        let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let merged = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         let reference = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
         assert_eq!(
@@ -3017,8 +3425,22 @@ mod tests {
             }
         }
 
-        let open = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
-        let closed = mesh_chunk(&chunk, &Neighbours::none(), Absent::Solid, &DAY, &NoFluid);
+        let open = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
+        let closed = mesh_chunk(
+            &chunk,
+            &Neighbours::none(),
+            Absent::Solid,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
 
         assert_eq!(open.quads.len(), 6, "a solid chunk in the open is a cube");
         assert!(
@@ -3053,8 +3475,22 @@ mod tests {
         let mut right_neighbours = Neighbours::none();
         right_neighbours.sides[0] = Some(&left); // -x
 
-        let left_mesh = mesh_chunk(&left, &left_neighbours, Absent::Air, &DAY, &NoFluid);
-        let right_mesh = mesh_chunk(&right, &right_neighbours, Absent::Air, &DAY, &NoFluid);
+        let left_mesh = mesh_chunk(
+            &left,
+            &left_neighbours,
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
+        let right_mesh = mesh_chunk(
+            &right,
+            &right_neighbours,
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
 
         // Neither chunk may emit a face on the shared plane.
         let left_border = left_mesh
@@ -3076,7 +3512,14 @@ mod tests {
 
         // And without the neighbour, it WOULD have — proving the test is
         // testing the culling rather than an accident of the geometry.
-        let unaware = mesh_chunk(&left, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let unaware = mesh_chunk(
+            &left,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         assert!(
             unaware
                 .quads
@@ -3147,6 +3590,7 @@ mod tests {
             Absent::Air,
             &OneLitBlock,
             &NoFluid,
+            &NoGlass,
         );
 
         // Top faces only: the sides look sideways into darkness.
@@ -3239,8 +3683,22 @@ mod tests {
             }
         }
 
-        let split = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &HalfLit, &NoFluid);
-        let uniform = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let split = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &HalfLit,
+            &NoFluid,
+            &NoGlass,
+        );
+        let uniform = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
 
         let tops = |mesh: &Mesh| {
             mesh.quads
@@ -3292,7 +3750,14 @@ mod tests {
         chunk
             .set_block(BlockPos::new(5, 5, 5), BlockValue::Uniform(STONE))
             .expect("in chunk");
-        let mesh = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let mesh = mesh_chunk(
+            &chunk,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         let (vertices, indices) = mesh.to_buffers();
 
         assert_eq!(vertices.len(), mesh.quads.len() * 4);
@@ -3307,7 +3772,14 @@ mod tests {
 
     #[test]
     fn an_empty_chunk_meshes_to_nothing() {
-        let mesh = mesh_chunk(&empty(), &Neighbours::open(), Absent::Air, &DAY, &NoFluid);
+        let mesh = mesh_chunk(
+            &empty(),
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
         assert!(mesh.is_empty());
         assert_eq!(mesh.gpu_bytes(), 0);
     }

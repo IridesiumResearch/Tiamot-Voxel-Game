@@ -206,7 +206,14 @@ fn upload_lit(renderer: &mut Renderer, chunks: &[Chunk], light: &impl client::sh
                 .get(&ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz))
                 .copied();
         }
-        let mesh = mesher::mesh_chunk(chunk, &neighbours, Absent::Air, light, &mesher::NoFluid);
+        let mesh = mesher::mesh_chunk(
+            chunk,
+            &neighbours,
+            Absent::Air,
+            light,
+            &mesher::NoFluid,
+            &mesher::NoGlass,
+        );
         renderer.set_chunk(pos, &mesh);
     }
 }
@@ -1068,7 +1075,14 @@ fn a_surface_brighter_than_white_bleeds_light_past_its_edge() {
         }
         renderer.set_chunk(
             pos,
-            &mesher::mesh_chunk(chunk, &neighbours, Absent::Air, &Lamplit, &mesher::NoFluid),
+            &mesher::mesh_chunk(
+                chunk,
+                &neighbours,
+                Absent::Air,
+                &Lamplit,
+                &mesher::NoFluid,
+                &mesher::NoGlass,
+            ),
         );
     }
 
@@ -1308,7 +1322,14 @@ fn a_pond_can_be_seen_through() {
 
     let through = |renderer: &mut Renderer, material: MaterialId| {
         let chunk = floor(material);
-        let mesh = mesher::mesh_chunk(&chunk, &Neighbours::none(), Absent::Solid, &DAY, &Pond);
+        let mesh = mesher::mesh_chunk(
+            &chunk,
+            &Neighbours::none(),
+            Absent::Solid,
+            &DAY,
+            &Pond,
+            &mesher::NoGlass,
+        );
         renderer.set_chunk(ChunkPos::new(0, 0, 0), &mesh);
         let frame = target.capture(renderer, &camera).expect("capture");
         average(&frame, WIDTH / 4, HEIGHT / 4, WIDTH * 3 / 4, HEIGHT * 3 / 4)
@@ -1352,6 +1373,7 @@ fn a_pond_can_be_seen_through() {
             Absent::Solid,
             &DAY,
             &mesher::NoFluid,
+            &mesher::NoGlass,
         );
         renderer.set_chunk(ChunkPos::new(0, 0, 0), &mesh);
         let frame = target.capture(&mut renderer, &camera).expect("capture");
@@ -2054,6 +2076,7 @@ fn an_occluded_corner_loses_its_colour_rather_than_keeping_it_dimly() {
                 Absent::Air,
                 &WarmLamps,
                 &mesher::NoFluid,
+                &mesher::NoGlass,
             ),
         );
     }
@@ -3085,7 +3108,14 @@ fn a_figure_in_the_frame_does_not_move_the_milk() {
                 .expect("in chunk");
         }
     }
-    let mesh = mesher::mesh_chunk(&chunk, &Neighbours::none(), Absent::Solid, &DAY, &Pond);
+    let mesh = mesher::mesh_chunk(
+        &chunk,
+        &Neighbours::none(),
+        Absent::Solid,
+        &DAY,
+        &Pond,
+        &mesher::NoGlass,
+    );
     renderer.set_chunk(ChunkPos::new(0, 0, 0), &mesh);
 
     let mut camera = Camera {

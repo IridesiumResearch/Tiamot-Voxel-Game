@@ -130,7 +130,14 @@ impl mesher::FluidFill for Everywhere {
 }
 
 fn splat() -> Mesh {
-    mesher::mesh_chunk(&floor(), &Neighbours::none(), Absent::Solid, &DAY, &Splat)
+    mesher::mesh_chunk(
+        &floor(),
+        &Neighbours::none(),
+        Absent::Solid,
+        &DAY,
+        &Splat,
+        &mesher::NoGlass,
+    )
 }
 
 /// A fluid quad, as the mesh stores it: four vertices in winding order.
@@ -233,6 +240,7 @@ fn one_body_of_milk_crossing_a_chunk_seam_draws_nothing_there() {
         Absent::Solid,
         &DAY,
         &Everywhere,
+        &mesher::NoGlass,
     );
 
     let on_seam = quads(&mesh)

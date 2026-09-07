@@ -109,7 +109,7 @@ proptest! {
     ) {
         let chunk = build(&blocks, &cells);
         let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
-        &client::mesher::NoFluid,
+        &client::mesher::NoFluid, &client::mesher::NoGlass,
     );
         let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
@@ -130,7 +130,7 @@ proptest! {
     ) {
         let chunk = build(&blocks, &cells);
         let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
-        &client::mesher::NoFluid,
+        &client::mesher::NoFluid, &client::mesher::NoGlass,
     );
         let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
@@ -153,7 +153,7 @@ proptest! {
     ) {
         let chunk = build(&blocks, &cells);
         let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
-        &client::mesher::NoFluid,
+        &client::mesher::NoFluid, &client::mesher::NoGlass,
     );
         let naive = reference::mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY);
 
@@ -174,7 +174,7 @@ proptest! {
     ) {
         let chunk = build(&blocks, &cells);
         let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
-        &client::mesher::NoFluid,
+        &client::mesher::NoFluid, &client::mesher::NoGlass,
     );
 
         for quad in &merged.quads {
@@ -205,7 +205,7 @@ proptest! {
             neighbours.sides[side] = Some(&neighbour);
 
             let merged = mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY,
-        &client::mesher::NoFluid,
+        &client::mesher::NoFluid, &client::mesher::NoGlass,
     );
             let naive = reference::mesh_chunk(&chunk, &neighbours, Absent::Air, &DAY);
 
@@ -226,7 +226,7 @@ proptest! {
     ) {
         let chunk = build(&blocks, &cells);
         let merged = mesh_chunk(&chunk, &Neighbours::open(), Absent::Air, &DAY,
-        &client::mesher::NoFluid,
+        &client::mesher::NoFluid, &client::mesher::NoGlass,
     );
         let (vertices, indices) = merged.to_buffers();
 

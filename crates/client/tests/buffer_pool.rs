@@ -87,6 +87,7 @@ fn streaming_chunks_reuses_buffers_instead_of_allocating_new_ones() {
             Absent::Air,
             &DAY,
             &client::mesher::NoFluid,
+            &client::mesher::NoGlass,
         )
     };
 
@@ -158,6 +159,7 @@ fn remeshing_a_chunk_in_place_allocates_nothing() {
             Absent::Air,
             &DAY,
             &client::mesher::NoFluid,
+            &client::mesher::NoGlass,
         ),
     );
     let (baseline, _) = renderer.buffer_stats();
@@ -172,6 +174,7 @@ fn remeshing_a_chunk_in_place_allocates_nothing() {
                 Absent::Air,
                 &DAY,
                 &client::mesher::NoFluid,
+                &client::mesher::NoGlass,
             ),
         );
     }
@@ -215,6 +218,7 @@ fn a_mesh_that_outgrows_its_buffer_gets_a_bigger_one() {
         Absent::Air,
         &DAY,
         &client::mesher::NoFluid,
+        &client::mesher::NoGlass,
     );
     let large_mesh = mesh_chunk(
         &large,
@@ -222,6 +226,7 @@ fn a_mesh_that_outgrows_its_buffer_gets_a_bigger_one() {
         Absent::Air,
         &DAY,
         &client::mesher::NoFluid,
+        &client::mesher::NoGlass,
     );
     assert!(
         large_mesh.to_buffers().0.len() > small_mesh.to_buffers().0.len() * 4,

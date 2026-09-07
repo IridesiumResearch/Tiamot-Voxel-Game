@@ -325,6 +325,7 @@ fn median_mesh_time(chunk: &Chunk, runs: usize) -> Duration {
         Absent::Air,
         &DAY,
         &client::mesher::NoFluid,
+        &client::mesher::NoGlass,
     );
 
     let mut samples: Vec<Duration> = (0..runs)
@@ -336,6 +337,7 @@ fn median_mesh_time(chunk: &Chunk, runs: usize) -> Duration {
                 Absent::Air,
                 &DAY,
                 &client::mesher::NoFluid,
+                &client::mesher::NoGlass,
             );
             let elapsed = started.elapsed();
             // Keep the result observable so the optimiser cannot delete the
@@ -437,6 +439,7 @@ fn border_aware_meshing_does_not_cost_more_than_the_spike_measured() {
         Absent::Air,
         &DAY,
         &client::mesher::NoFluid,
+        &client::mesher::NoGlass,
     );
     let mut samples: Vec<Duration> = (0..25)
         .map(|_| {
@@ -447,6 +450,7 @@ fn border_aware_meshing_does_not_cost_more_than_the_spike_measured() {
                 Absent::Air,
                 &DAY,
                 &client::mesher::NoFluid,
+                &client::mesher::NoGlass,
             );
             let elapsed = started.elapsed();
             std::hint::black_box(mesh.quads.len());
@@ -507,6 +511,7 @@ fn what_mode_ones_move_to_real_light_costs_in_quads() {
         Absent::Air,
         &client::shade::Uniform(tiamot_core::light::Light::DAYLIGHT),
         &client::mesher::NoFluid,
+        &client::mesher::NoGlass,
     );
     let varying = client::mesher::mesh_chunk(
         &chunk,
@@ -514,6 +519,7 @@ fn what_mode_ones_move_to_real_light_costs_in_quads() {
         Absent::Air,
         &Gradient,
         &client::mesher::NoFluid,
+        &client::mesher::NoGlass,
     );
 
     let even = flat.quads.len();
