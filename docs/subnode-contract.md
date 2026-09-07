@@ -188,6 +188,11 @@ not a suggestion — Task 02b measured the uncached test at **≈50% overhead** 
 chiselled chunk against a treat-Partial-as-solid baseline, failing that gate.
 The remedy is six bits per block, recomputed only when the block changes.
 
+**Transparent materials are the one exception, and they do not touch this
+cache** — see §8.1. A `Uniform(transparent)` block is permeable on all six faces,
+decided by a material lookup where the cached answer is read rather than where it
+is computed, so `Chunk` still knows nothing about a material registry.
+
 **As implemented (Task 10), the cache lives on the palette entry rather than on
 the block.** Permeability is a pure function of block content, and a chunk
 already stores each distinct content exactly once, so a uniform chunk caches one
@@ -496,6 +501,57 @@ Meshing is at sub-node resolution using **binary greedy meshing**, per §1.
 
 Task 08 implements this. Task 02b's prototype measured 0.110 ms/chunk on
 realistic content and 0.128 ms on fully chiselled content.
+
+### 8.1 Transparent materials — glass
+
+A material may declare itself **transparent**. Glass is the case; a mod's window,
+ice, or a coloured pane are the same case. One flag, not an alpha value: what a
+transparent block looks like is its texture's own alpha, and a second opacity
+number beside it would be two sources of truth for one appearance.
+
+Transparency changes three rules and deliberately leaves the rest alone.
+
+**Culling (§8).** A face is culled against the neighbouring cell *unless* exactly
+one side of it is transparent. Two consequences, both required:
+
+- A glass block against air draws, as any block does.
+- A glass block against STONE draws the stone's face, which a fully-occupied
+  neighbour would normally cull. Without this a wall behind a window is a hole
+  straight through the world, which is the same fault fluid had against terrain
+  (§4) and is fixed the same way.
+- Two glass blocks against each other draw NEITHER interior face. Drawing them
+  would stack two blended surfaces per pane and darken a window in proportion to
+  its thickness.
+
+**Drawing.** Transparent quads are a separate list, drawn in a blended pass after
+the opaque world, like fluid. They are NOT sorted against each other: sorting per
+quad is per-frame work proportional to the geometry, and the artefact it removes
+— two panes at an angle blending in the wrong order — is far cheaper to accept
+than to pay for every frame. **Stated so it is a known limit rather than a bug
+report.**
+
+**Lighting (§3).** A block whose content is `Uniform(transparent)` is permeable
+on all six faces: light passes through glass. Otherwise a glass roof makes a dark
+room, which is the first thing anybody builds with it.
+
+The **permeability cache is not changed**, and charter rule 19's requirement that
+lighting never recompute the 3×3 face test still holds. The transparency test is
+a lookup on the material, done where the cached answer is READ —
+`propagate::Neighbourhood::faces` — and not where it is computed. That is what
+keeps `Chunk` free of any knowledge of a material registry, which it must be:
+`permeability` is a pure function of block content and there are ninety-four
+places that build a chunk.
+
+Only `Uniform` is transparent to light. A `Partial` or `Mixed` block holding
+glass falls back to the ordinary cell rule, because "how much light does a block
+that is half glass and half stone pass" is a question with no obviously right
+answer and no caller yet. Recorded as a limit rather than guessed at.
+
+**Collision (§2) is unchanged. Glass is solid.** You cannot walk through a
+window. Transparency is about light and sight, and nothing about it belongs in
+the collision rule — a body collides with occupancy, which glass has.
+
+**Fluid (§4) is unchanged.** Glass holds milk in, being solid.
 
 ---
 
