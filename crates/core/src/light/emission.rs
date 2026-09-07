@@ -92,6 +92,63 @@ impl Emissions {
     }
 }
 
+/// Which materials light passes straight through: glass.
+///
+/// Indexed by material id, exactly like [`Emissions`] beside it, and built the
+/// same way from what the mods registered.
+///
+/// # Why lighting asks a table rather than the block
+///
+/// The permeability rule (`docs/subnode-contract.md` §3) is a pure function of
+/// block CONTENT, cached per palette entry, and `Chunk` therefore knows nothing
+/// about a material registry — nor should it, with ninety-four places building
+/// one. So transparency is applied where the cached answer is READ, in
+/// `propagate::Neighbourhood::faces`, and never where it is computed. Contract
+/// §8.1 states that split; this is the table it needs.
+#[derive(Debug, Clone, Default)]
+pub struct SeeThrough {
+    by_id: Vec<bool>,
+}
+
+impl SeeThrough {
+    /// Builds a table from the ids that are transparent.
+    ///
+    /// Ids need not be contiguous or sorted; anything unnamed is opaque, which
+    /// is almost everything.
+    #[must_use]
+    pub fn new(ids: impl IntoIterator<Item = MaterialId>) -> Self {
+        let mut by_id: Vec<bool> = Vec::new();
+        for id in ids {
+            let index = id.get() as usize;
+            if by_id.len() <= index {
+                by_id.resize(index + 1, false);
+            }
+            by_id[index] = true;
+        }
+        Self { by_id }
+    }
+
+    /// Whether this material lets light through.
+    #[must_use]
+    pub fn is(&self, material: MaterialId) -> bool {
+        self.by_id
+            .get(material.get() as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether any material at all is transparent.
+    ///
+    /// **The gate that keeps a world without glass paying nothing.** Lighting
+    /// asks this once before it asks anything else, so the extra block lookup
+    /// in `faces` never happens in a world that has no windows in it — which is
+    /// every world until a mod registers one.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        self.by_id.iter().any(|&clear| clear)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

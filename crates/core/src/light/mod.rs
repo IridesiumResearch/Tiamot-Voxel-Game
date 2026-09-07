@@ -35,7 +35,7 @@ mod emission;
 mod layer;
 pub mod propagate;
 
-pub use emission::Emissions;
+pub use emission::{Emissions, SeeThrough};
 pub use layer::LightLayer;
 pub use propagate::{Neighbourhood, Region, edited, flood, relight};
 

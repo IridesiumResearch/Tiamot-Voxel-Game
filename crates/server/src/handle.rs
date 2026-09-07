@@ -1109,6 +1109,27 @@ impl ServerHandle {
             },
         );
 
+        // The same table for glass, built from the same rules and keyed the
+        // same way. Contract §8.1: light passes through a whole block of one
+        // transparent material.
+        let see_through = crate::light::see_through_from_rules(
+            &host
+                .as_ref()
+                .map(|loaded| loaded.vm().registered_block_rules())
+                .unwrap_or_default(),
+            |block| {
+                let runtime = registry
+                    .iter()
+                    .find(|(_, name)| *name == block)
+                    .map(|(id, _)| id)?;
+                world
+                    .materials()
+                    .to_world(runtime)
+                    .ok()
+                    .map(tiamot_core::MaterialId)
+            },
+        );
+
         // The domains the mods registered. Read here, with everything else the
         // freeze made final, and handed to the simulation thread that owns the
         // registry they go into.
@@ -1577,7 +1598,7 @@ impl ServerHandle {
                     // contended — both sides are this thread — and is never
                     // held across a callback, which is what would deadlock.
                     let lighting = std::sync::Arc::new(std::sync::RwLock::new(
-                        crate::light::Lights::new(emissions),
+                        crate::light::Lights::new(emissions, see_through),
                     ));
 
                     // Behind a lock for the same reason lighting is, and not

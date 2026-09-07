@@ -89,15 +89,22 @@ impl Shared {
 #[derive(Debug)]
 pub struct Lights {
     emissions: tiamot_core::light::Emissions,
+    /// Which materials light passes through, shared by every domain: a world's
+    /// mod set is one set, whatever domains it grows.
+    see_through: tiamot_core::light::SeeThrough,
     domains: std::collections::BTreeMap<String, Lighting>,
 }
 
 impl Lights {
     /// A set of stores for a world whose mods emit these levels.
     #[must_use]
-    pub fn new(emissions: tiamot_core::light::Emissions) -> Self {
+    pub fn new(
+        emissions: tiamot_core::light::Emissions,
+        see_through: tiamot_core::light::SeeThrough,
+    ) -> Self {
         Self {
             emissions,
+            see_through,
             domains: std::collections::BTreeMap::new(),
         }
     }
@@ -106,7 +113,7 @@ impl Lights {
     pub fn of(&mut self, domain: &str) -> &mut Lighting {
         self.domains
             .entry(domain.to_owned())
-            .or_insert_with(|| Lighting::new(self.emissions.clone()))
+            .or_insert_with(|| Lighting::new(self.emissions.clone(), self.see_through.clone()))
     }
 
     /// One domain's light, if anything has lit it.
@@ -145,15 +152,18 @@ impl tiamot_core::light::LightSource for Shared {
 pub struct Lighting {
     layers: HashMap<ChunkPos, LightLayer>,
     emissions: Emissions,
+    /// Which materials light passes straight through: glass. Contract §8.1.
+    see_through: tiamot_core::light::SeeThrough,
 }
 
 impl Lighting {
     /// A store for a world whose mods emit these levels.
     #[must_use]
-    pub fn new(emissions: Emissions) -> Self {
+    pub fn new(emissions: Emissions, see_through: tiamot_core::light::SeeThrough) -> Self {
         Self {
             layers: HashMap::new(),
             emissions,
+            see_through,
         }
     }
 
@@ -428,6 +438,28 @@ impl Neighbourhood for Lit<'_> {
         // collision documents at `World::resident`. `blocks` preserves that —
         // it caches what `resident` returned and never asks for more.
         let chunk = self.blocks(pos.chunk())?;
+        // **Glass, applied where the cached answer is READ.** Contract §8.1: a
+        // whole block of one transparent material is permeable on all six
+        // faces, or a glass roof makes a dark room. The permeability CACHE is
+        // untouched and rule 19 still holds — this is a table lookup, not the
+        // 3x3 cell test — and `Chunk` stays ignorant of the material registry,
+        // which it must, being built in ninety-four places.
+        //
+        // Gated on `any()` first, so a world with no glass in it pays one bool
+        // per call and never reaches for the block. That is every world until a
+        // mod registers a window.
+        //
+        // `Uniform` only. A chiselled or mixed block holding glass falls back
+        // to the cell rule: "how much light does a half-glass block pass" has
+        // no obviously right answer and no caller, and §8.1 records that as a
+        // limit rather than guessing.
+        if self.lighting.see_through.any()
+            && let tiamot_core::block::BlockView::Uniform(material) =
+                chunk.get_block_local(pos.local())
+            && self.lighting.see_through.is(material)
+        {
+            return Some(Faces::OPEN);
+        }
         Some(chunk.faces(pos.local()))
     }
 
@@ -466,6 +498,25 @@ impl Neighbourhood for Lit<'_> {
         layer.set(local, level);
         self.touched.chunks.insert(chunk);
     }
+}
+
+/// Builds a transparency table from what the mods registered.
+///
+/// Keyed by WORLD id for the same reason emissions are: a world that has seen a
+/// different mod set numbers its materials differently, and a table of this
+/// session's runtime ids would name every window one number out (charter rule
+/// 8).
+#[must_use]
+pub fn see_through_from_rules(
+    rules: &[tiamot_core::script::BlockRules],
+    id_of: impl Fn(&str) -> Option<MaterialId>,
+) -> tiamot_core::light::SeeThrough {
+    tiamot_core::light::SeeThrough::new(
+        rules
+            .iter()
+            .filter(|rule| rule.transparent)
+            .filter_map(|rule| id_of(&rule.block)),
+    )
 }
 
 /// Builds an emission table from what the mods registered.
@@ -517,7 +568,15 @@ mod tests {
     }
 
     fn lighting() -> Lighting {
-        Lighting::new(Emissions::new([(LAMP, Light::new(0, MAX_LEVEL, 0, 0))]))
+        lighting_with(tiamot_core::light::SeeThrough::default())
+    }
+
+    /// The same, for a world that has some glass in it.
+    fn lighting_with(see_through: tiamot_core::light::SeeThrough) -> Lighting {
+        Lighting::new(
+            Emissions::new([(LAMP, Light::new(0, MAX_LEVEL, 0, 0))]),
+            see_through,
+        )
     }
 
     /// Loads a chunk so it is resident, without caring what is in it.
@@ -541,6 +600,84 @@ mod tests {
             light.at(BlockPos::new(8, 0, 8)).sun(),
             MAX_LEVEL,
             "sunlight did not reach the bottom of an empty chunk"
+        );
+    }
+
+    #[test]
+    fn a_glass_roof_does_not_make_a_dark_room() {
+        // **Contract §8.1.** A window that blocked light would be a see-through
+        // wall rather than glass, and a greenhouse is the first thing anybody
+        // builds with it.
+        //
+        // Measured both ways in one test, because the interesting claim is the
+        // DIFFERENCE: the same room, the same roof, and the only change is
+        // whether the roof's material is in the transparency table.
+        const GLASS: tiamot_core::MaterialId = tiamot_core::MaterialId(9);
+
+        let room = |material: tiamot_core::MaterialId| {
+            let mut world = world();
+            let pos = ChunkPos::new(0, 0, 0);
+            resident(&mut world, pos);
+            {
+                let chunk = world
+                    .chunk(tiamot_core::domain::OVERWORLD, pos, &mut Empty)
+                    .expect("chunk");
+                // Solid up to y = 8, so nothing reaches the floor from the side.
+                for index in 0..tiamot_core::BLOCKS_PER_CHUNK {
+                    let local = tiamot_core::coords::LocalBlock::from_index(index);
+                    if local.y <= 8 {
+                        chunk.set_block_local(local, BlockValue::Uniform(STONE));
+                    }
+                }
+                // A room hollowed out under it, roofed with `material`.
+                for x in 4..12 {
+                    for z in 4..12 {
+                        for y in 4..8 {
+                            chunk.set_block_local(
+                                tiamot_core::coords::LocalBlock::new(x, y, z),
+                                BlockValue::AIR,
+                            );
+                        }
+                        chunk.set_block_local(
+                            tiamot_core::coords::LocalBlock::new(x, 8, z),
+                            BlockValue::Uniform(material),
+                        );
+                    }
+                }
+            }
+            (world, pos)
+        };
+
+        // Roofed in stone, with glass registered but not used: dark.
+        let (world, pos) = room(STONE);
+        let mut light = lighting_with(tiamot_core::light::SeeThrough::new([GLASS]));
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos);
+        assert_eq!(
+            light.at(BlockPos::new(8, 7, 8)).sun(),
+            0,
+            "a stone roof let daylight in"
+        );
+
+        // The same room roofed in glass: lit.
+        let (world, pos) = room(GLASS);
+        let mut light = lighting_with(tiamot_core::light::SeeThrough::new([GLASS]));
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos);
+        assert!(
+            light.at(BlockPos::new(8, 7, 8)).sun() > 0,
+            "a glass roof made a dark room"
+        );
+
+        // And the table is what decides, not the material id: the same glass
+        // roof in a world where nothing is registered transparent stays dark.
+        // Without this the test would pass for a build that treated every
+        // material as see-through.
+        let (world, pos) = room(GLASS);
+        let mut light = lighting();
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, pos);
+        assert_eq!(
+            light.at(BlockPos::new(8, 7, 8)).sun(),
+            0,
+            "light passed a material no mod registered as transparent"
         );
     }
 
