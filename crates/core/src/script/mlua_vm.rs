@@ -1665,6 +1665,11 @@ impl ScriptVm for MluaVm {
                         drops,
                         light_emit,
                         absorbs,
+                        transparent: entry
+                            .as_ref()
+                            .and_then(|entry| entry.get::<Option<bool>>("transparent").ok())
+                            .flatten()
+                            .unwrap_or(false),
                     },
                 )
             })
@@ -4975,6 +4980,11 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
                 stored.set(key, emit.get::<Option<u8>>(key)?.unwrap_or(0))?;
             }
             entry.set("light_emit", stored)?;
+        }
+        // **Recorded whether or not the mod set it**, like the rules above: an
+        // absent flag and a `false` one must not be distinguishable downstream.
+        if let Some(transparent) = spec.get::<Option<bool>>("transparent")? {
+            entry.set("transparent", transparent)?;
         }
         if let Some(absorbs) = spec.get::<Option<Table>>("absorbs")? {
             entry.set("absorbs", block_absorbs(lua, owner, &id, &absorbs)?)?;

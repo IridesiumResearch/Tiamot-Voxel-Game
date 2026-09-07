@@ -283,6 +283,14 @@ pub struct BlockRules {
     /// everything. The second half is a block id and is resolved against the
     /// registry by whoever holds one — charter rule 8 again.
     pub absorbs: (u32, Option<String>),
+    /// Whether the block can be seen through: glass.
+    ///
+    /// **A flag, not an alpha value** — the texture already carries the alpha,
+    /// and a second opacity number beside it would be two sources of truth for
+    /// one appearance. Decides what the mesher culls, which pass draws it, and
+    /// whether light passes through. NOT collision: glass is solid. See
+    /// `docs/subnode-contract.md` §8.1.
+    pub transparent: bool,
 }
 
 impl BlockRules {

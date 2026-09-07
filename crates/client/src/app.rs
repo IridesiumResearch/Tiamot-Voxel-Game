@@ -6243,6 +6243,7 @@ mod tests {
                 name: "engine:air".to_owned(),
                 texture: None,
                 placeable: true,
+                transparent: false,
                 step_sound: None,
             },
             MaterialDef {
@@ -6250,6 +6251,7 @@ mod tests {
                 name: "core:white".to_owned(),
                 texture: Some([0u8; 32]),
                 placeable: true,
+                transparent: false,
                 step_sound: None,
             },
         ];
@@ -6281,6 +6283,7 @@ mod tests {
             name: "mod:untextured".to_owned(),
             texture: None,
             placeable: true,
+            transparent: false,
             step_sound: None,
         }];
         let atlas = build_atlas(&table, &BTreeMap::new());

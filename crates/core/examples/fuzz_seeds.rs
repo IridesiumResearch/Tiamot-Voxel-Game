@@ -515,6 +515,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                     name: "engine:air".to_owned(),
                     texture: None,
                     placeable: true,
+                    transparent: false,
                     step_sound: None,
                 },
                 MaterialDef {
@@ -522,6 +523,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                     name: "engine:unknown".to_owned(),
                     texture: None,
                     placeable: true,
+                    transparent: false,
                     step_sound: None,
                 },
                 MaterialDef {
@@ -529,6 +531,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                     name: "core:white".to_owned(),
                     texture: Some([0x12; 32]),
                     placeable: true,
+                    transparent: false,
                     step_sound: None,
                 },
                 MaterialDef {
@@ -536,6 +539,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                     name: "\u{1F9F1} unicode in a material name".to_owned(),
                     texture: Some([0x00; 32]),
                     placeable: true,
+                    transparent: false,
                     step_sound: None,
                 },
             ],

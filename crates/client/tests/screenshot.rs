@@ -3365,6 +3365,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             id: 0,
             name: "engine:air".to_owned(),
             placeable: false,
+            transparent: false,
             texture: None,
         },
         MaterialDef {
@@ -3372,6 +3373,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             id: 1,
             name: "engine:unknown".to_owned(),
             placeable: false,
+            transparent: false,
             texture: None,
         },
         MaterialDef {
@@ -3379,6 +3381,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             id: 2,
             name: "test:stone".to_owned(),
             placeable: true,
+            transparent: false,
             texture: Some([7u8; 32]),
         },
     ];

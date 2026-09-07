@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 39;
+pub const PROTOCOL_VERSION: u32 = 40;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -82,6 +82,12 @@ pub const PROTOCOL_VERSION: u32 = 39;
 // stream. They are also PER PLAYER rather than broadcast — which entities
 // somebody can see is their own interest set, and sending everyone every mob
 // would make a populated world cost the square of the people watching it.
+// v40 (post-15b): `MaterialDef` carries `transparent`. A client has to know
+// before it meshes: transparency decides which faces are culled and which pass
+// is drawn, and both are baked into the geometry rather than decided in the
+// shader. One flag rather than an alpha value because the texture already
+// carries the alpha, and two sources of truth for one appearance disagree.
+// See `docs/subnode-contract.md` §8.1.
 // v39 (post-15b): appended `ServerMessage::SelectSlot`, the mirror of the
 // client message below. Which slot is held only ever travelled client-to-server,
 // so a mod could READ what somebody held and never change it — and the thing a
@@ -607,6 +613,17 @@ pub struct MaterialDef {
     /// costs nothing, and a server claiming a file it did not send is caught by
     /// the hash rather than by the decoder.
     pub texture: Option<ContentHash>,
+    /// Whether this material can be seen through: glass.
+    ///
+    /// **A flag, not an alpha value.** What a transparent block looks like is
+    /// its texture's own alpha; a second opacity number beside it would be two
+    /// sources of truth for one appearance, and they would disagree.
+    ///
+    /// Changes what the mesher culls and how the block is drawn, and lets light
+    /// through — see `docs/subnode-contract.md` §8.1. Does NOT change collision:
+    /// glass is solid.
+    #[serde(default)]
+    pub transparent: bool,
 }
 
 /// One mod in the server's resolved set.
@@ -3558,6 +3575,7 @@ mod tests {
                     name: "engine:air".to_owned(),
                     texture: None,
                     placeable: true,
+                    transparent: false,
                     step_sound: None,
                 },
                 MaterialDef {
@@ -3565,6 +3583,7 @@ mod tests {
                     name: "core:white".to_owned(),
                     texture: Some([9u8; 32]),
                     placeable: true,
+                    transparent: false,
                     step_sound: None,
                 },
             ],

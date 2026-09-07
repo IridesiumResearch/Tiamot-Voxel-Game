@@ -1848,6 +1848,7 @@ mod tests {
                 texture: *texture,
                 step_sound: None,
                 placeable: true,
+                transparent: false,
             })
             .collect()
     }

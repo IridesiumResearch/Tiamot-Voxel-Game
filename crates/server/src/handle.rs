@@ -102,6 +102,10 @@ fn material_table(
                 name: name.to_owned(),
                 texture,
                 placeable: !items.contains(name),
+                // Glass. Decides what the client culls and which pass draws it,
+                // both of which are baked into the mesh — so it has to travel
+                // with the material rather than be asked for later.
+                transparent: rules.get(name).is_some_and(|rules| rules.transparent),
             })
         })
         .collect();
