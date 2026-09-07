@@ -109,6 +109,49 @@ fn a_flying_body_ignores_gravity_and_holds_its_height() {
 }
 
 #[test]
+fn flight_is_at_least_twice_as_fast_as_the_same_gait_on_foot() {
+    // Asked for from the window: flight that is no faster than walking is not
+    // worth turning on, and a climb slower than a jump's launch reads as a
+    // feeble jump rather than as going up.
+    //
+    // Both directions, because one scale governs both and a change that sped up
+    // only the horizontal would still leave the rising press feeling wrong.
+    let tuning = Tuning::DEFAULT;
+    let scene = Scene::new(0);
+    let base = Intent {
+        walk: [1.0, 0.0],
+        jump: false,
+        gait: Gait::Walk,
+        fly: false,
+    };
+
+    // Horizontal, from a standstill in open air so nothing but the top speed
+    // and the drag differ between the two.
+    let mut walking = Body::at([24.0, 12.0, 24.0]);
+    let mut flying = Body::at([24.0, 12.0, 24.0]);
+    for _ in 0..60 {
+        walking = step(&scene, walking, base, &tuning);
+        flying = step(&scene, flying, Intent { fly: true, ..base }, &tuning);
+    }
+    let walked = walking.position[0] - 24.0;
+    let flew = flying.position[0] - 24.0;
+    assert!(
+        flew >= walked * 2.0,
+        "flying covered {flew} where walking covered {walked}; \
+         flight must be at least twice as fast"
+    );
+
+    // Vertical: a climb has to start faster than a jump does, or pressing jump
+    // in the air looks like a worse jump than pressing it on the ground.
+    let climb = Gait::Walk.top_speed(&tuning) * tuning.fly_speed_scale;
+    assert!(
+        climb > tuning.jump_speed,
+        "a climb at {climb} cells/tick is slower than a jump's {} launch",
+        tuning.jump_speed
+    );
+}
+
+#[test]
 fn a_flying_body_rises_on_jump_and_sinks_on_sneak() {
     let tuning = Tuning::DEFAULT;
     let scene = Scene::new(0);

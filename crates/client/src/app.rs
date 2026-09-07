@@ -334,6 +334,19 @@ pub fn intent_at_yaw(yaw: f32, input: Input) -> Intent {
     }
 }
 
+/// The flight half of the position line. See [`App::flight_line`].
+///
+/// A free function so it can be tested without building an `App`: the whole
+/// behaviour is the three-way choice, and the rest of the method is a field
+/// read.
+const fn flight_line(may_fly: bool, flying: bool) -> &'static str {
+    match (may_fly, flying) {
+        (true, true) => "  · FLYING",
+        (true, false) => "  · not flying (N)",
+        (false, _) => "",
+    }
+}
+
 /// Where one frame's time went, in milliseconds.
 ///
 /// **Measured for every frame, kept for the worst one.** Independent per-phase
@@ -4755,6 +4768,21 @@ impl App {
         self.may_fly
     }
 
+    /// What to append to the position line about flight.
+    ///
+    /// **Nothing said whether flight was on.** Toggling it wrote a `tracing`
+    /// line and changed nothing a player looking at the window could see, so
+    /// pressing the key and still falling was indistinguishable from pressing
+    /// the key and not being allowed to — and a climb that was slower than a
+    /// jump made "it did not turn on" the natural reading of both. Reported
+    /// from the window as gravity still winning over flight.
+    ///
+    /// Empty for the ordinary case of a player who is not flying and never
+    /// could, so this costs a grounded player no line and no noise.
+    fn flight_line(&self) -> &'static str {
+        flight_line(self.may_fly, self.flying)
+    }
+
     /// Whether flight is on right now.
     #[must_use]
     pub const fn flying(&self) -> bool {
@@ -5064,7 +5092,7 @@ impl App {
                 (worst - phases.total()).max(0.0),
             ),
             self.prediction_line(created, reused, correction),
-            format!("{x:.1}, {y:.1}, {z:.1}  ({facing})"),
+            format!("{x:.1}, {y:.1}, {z:.1}  ({facing}){}", self.flight_line()),
             format!(
                 "chunk {}, {}, {}",
                 self.camera.position.chunk.x,
@@ -5645,6 +5673,24 @@ mod dig_lock_tests {
 mod tests {
     use super::*;
     use tiamot_core::proto::MaterialDef;
+
+    #[test]
+    fn the_overlay_says_whether_flight_is_on() {
+        // **Nothing on screen said.** Toggling flight wrote a `tracing` line and
+        // nothing else, so "I pressed the key and still fell" could mean the key
+        // did nothing, or that the server refused, or that it worked and the
+        // climb was too slow to notice. Three causes, one appearance.
+        assert_eq!(flight_line(true, true), "  · FLYING");
+        assert!(
+            flight_line(true, false).contains('N'),
+            "a player who MAY fly and is not flying should be told which key"
+        );
+
+        // And a player who cannot fly is told nothing rather than told no: on an
+        // ordinary server that is everybody, every frame, for ever.
+        assert_eq!(flight_line(false, false), "");
+        assert_eq!(flight_line(false, true), "");
+    }
 
     #[test]
     fn a_client_that_ran_ahead_of_its_server_snaps_back() {

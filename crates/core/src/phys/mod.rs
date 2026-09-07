@@ -440,7 +440,12 @@ pub fn step_shaped(
         // at the gait's own speed keeps one number in charge of how fast a body
         // moves, so a sneaking descent is slow and a sprinting climb is quick
         // without flight needing speeds of its own.
-        let climb = intent.gait.top_speed(tuning);
+        //
+        // Scaled by `fly_speed_scale`, because the gait's speed ALONE was too
+        // slow to read as flight: a climb at `walk_speed` rises more slowly
+        // than a jump launches, so pressing jump in the air looked like a weak
+        // jump rather than like going up. See the field's own documentation.
+        let climb = intent.gait.top_speed(tuning) * tuning.fly_speed_scale;
         body.velocity[1] = if intent.jump {
             climb
         } else if intent.gait == Gait::Sneak {
@@ -479,6 +484,26 @@ pub fn step_shaped(
         tuning.air_drag
     };
     let mut top_speed = intent.gait.top_speed(tuning);
+    if intent.fly {
+        // **Flight steers like walking, not like a jump.** A flying body is off
+        // the ground, so without this it took `air_acceleration` — 0.06, chosen
+        // to be "enough to adjust a jump, not enough to turn one into flight"
+        // — and `air_drag`. Those settle at roughly walking pace and converge
+        // so slowly that raising the top speed alone changed nothing: the first
+        // attempt at this raised the cap and a flying body still covered LESS
+        // ground in sixty ticks than a walking one, because it never came near
+        // the cap. `flight_is_at_least_twice_as_fast_as_the_same_gait_on_foot`
+        // is that measurement.
+        //
+        // Scaling the GROUND acceleration by the same factor as the top speed
+        // keeps the two consistent by construction: the settling speed is
+        // `a × f / (1 − f)`, which is how `ground_acceleration` was derived from
+        // `walk_speed` in the first place, so scaling `a` lands exactly on the
+        // scaled cap rather than near it.
+        acceleration = tuning.ground_acceleration * tuning.fly_speed_scale;
+        friction = tuning.ground_friction;
+        top_speed *= tuning.fly_speed_scale;
+    }
     if wet > 0.0 {
         // Blended from whatever the body's dry state was rather than replacing
         // it, so a player wading a ford loses speed in proportion to how much of

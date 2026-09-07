@@ -74,6 +74,26 @@ pub struct Tuning {
     /// Top horizontal speed sneaking, cells/tick. 1.3 yd/s.
     pub sneak_speed: f32,
 
+    /// What flight multiplies the gait's top speed by, in every direction.
+    ///
+    /// **Flight used to run at exactly the gait's own speed**, which made it
+    /// slower to cross ground in the air than on foot — a sprint on the ground
+    /// beat a walking flight — and made a rising press read as a feeble jump: a
+    /// jump LAUNCHES at `jump_speed` (1.34 cells/tick, 8.9 yd/s) while a climb
+    /// held steady at `walk_speed` (0.645, 4.3 yd/s). Reported from the window
+    /// as flight feeling like "a little higher jump" with gravity still winning.
+    ///
+    /// One scale for horizontal and vertical, so the same number answers "how
+    /// much faster is flying" whichever way you point. At 2.5 a walking flight
+    /// is 10.75 yd/s and a sprinting one 14 yd/s — comfortably past the "at
+    /// least twice walking" this was asked for, and a climb now starts well
+    /// above a jump instead of below it.
+    ///
+    /// Applied only when [`super::Intent::fly`] is set, so a body on the ground
+    /// takes bit-identical arithmetic to what it took before this existed —
+    /// charter rule 4, and the determinism goldens were hashed without it.
+    pub fly_speed_scale: f32,
+
     /// Fraction of horizontal velocity kept per tick while on the ground.
     ///
     /// The counterweight to [`ground_acceleration`](Self::ground_acceleration):
@@ -182,6 +202,7 @@ impl Tuning {
         walk_speed: speed(4.3),
         sprint_speed: speed(5.6),
         sneak_speed: speed(1.3),
+        fly_speed_scale: 2.5,
         // **A little slide.** Reported from the window as wanting movement to
         // start and stop softly rather than snapping: "a tiny bit of slide...
         // when you stop the player slides just a tiny bit to make it feel more
