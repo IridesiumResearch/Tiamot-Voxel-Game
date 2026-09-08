@@ -3844,7 +3844,6 @@ impl ServerHandle {
                             // every tick would otherwise be a database write
                             // every tick.
                             flush_mod_storage(&world, &mod_storage);
-                        flush_containers(&world, &containers);
                             flush_containers(&world, &containers);
 
                             let mobs = population.write().expect("entity lock").take_dirty();
