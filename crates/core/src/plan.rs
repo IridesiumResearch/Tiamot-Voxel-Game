@@ -27,6 +27,21 @@
 //! A plan records only the cells that hold something. A hollow building is
 //! mostly air, and a dense representation would spend its whole size on the
 //! nothing inside. [`Plan::AIR_IS_ABSENT`] says what that means when stamping.
+//!
+//! # A mixed block is several entries at one position
+//!
+//! A [`PlanCell`] names ONE material and the cells it fills, and the Sub-Node
+//! Contract allows a block whose twenty-seven cells hold several materials. So
+//! a mixed block is recorded as one entry per material, each carrying that
+//! material's own mask, and the entries LAYER in the order they were recorded:
+//! the first replaces the block, and every later one adds its cells to it.
+//!
+//! The alternative — one entry per block with twenty-seven material slots —
+//! would cost a chiselled world's plan twenty-seven times what a stone wall's
+//! costs, to describe a case charter rule 19 says is real but rare. Recording
+//! mixed blocks as air instead would be worse than either: a plan is the
+//! engine's own copy of somebody's build, and quietly dropping the two-material
+//! parts of it is the class of bug that only shows up in the finished house.
 
 use std::collections::BTreeMap;
 
@@ -49,7 +64,7 @@ pub const MAX_SIDE: u16 = 64;
 pub const MAX_CELLS: usize = 65_536;
 
 /// Why a plan could not be built or read.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum PlanError {
     /// A side is zero, or longer than [`MAX_SIDE`].
     #[error("a plan is 1..={MAX_SIDE} blocks on a side, not {side} on {axis}")]
@@ -77,9 +92,35 @@ pub enum PlanError {
     /// More distinct materials than a palette index can name.
     #[error("a plan holds at most {} distinct materials", u16::MAX)]
     PaletteFull,
+    /// The world could not be read at all — there was no world behind the call.
+    ///
+    /// The same answer [`crate::sight::Reading::Unavailable`] is, for the same
+    /// moment: a mod capturing from `on_generate` is asking about a chunk that
+    /// is being made as it asks.
+    #[error("there is no world to capture from right now")]
+    Unavailable,
+    /// Some block in the box is in a chunk that is not loaded.
+    ///
+    /// **The whole capture is refused rather than the missing part skipped.**
+    /// A plan is sparse, so a block that was not captured and a block that held
+    /// nothing are the same state — a partial capture would come back as a
+    /// house with holes in it and no way for the mod to tell. Refusing is the
+    /// answer a mod can act on: move closer, or wait for the terrain.
+    #[error("({x}, {y}, {z}) is not loaded, so the capture would have holes in it")]
+    NotLoaded {
+        /// The first block found that could not be read.
+        x: i32,
+        /// The first block found that could not be read.
+        y: i32,
+        /// The first block found that could not be read.
+        z: i32,
+    },
 }
 
-/// One occupied block of a plan.
+/// One material's worth of one block of a plan.
+///
+/// Usually a whole block. A block holding several materials is several of
+/// these at the same `at`, layering in order — see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanCell {
     /// Offset from the plan's origin.
@@ -157,11 +198,15 @@ impl Plan {
         &self.palette
     }
 
-    /// Records an occupied block.
+    /// Records an occupied block, or one material's cells of a mixed one.
     ///
     /// An occupancy of zero is a block holding nothing, which is recorded as
     /// absence — see [`Plan::AIR_IS_ABSENT`] — so writing one is not an error
     /// and not a cell.
+    ///
+    /// **Writing the same position twice adds a layer rather than replacing
+    /// one**, which is how a block of several materials is recorded. Whoever
+    /// stamps the plan applies them in this order.
     ///
     /// # Errors
     ///
@@ -243,6 +288,29 @@ impl Plan {
 /// handed the pacing would get it wrong, and getting it wrong looks like the
 /// world tearing.
 pub trait Access: Send + Sync {
+    /// Reads a box of the world, inclusive of both corners.
+    ///
+    /// **Here rather than on [`crate::sight::Access`]**, which is the seam a
+    /// mod reads terrain through, because this is a different question asked a
+    /// different way: `block_at` answers about one block and is called from Lua
+    /// once per block, and a 64³ box is a quarter of a million of those calls
+    /// inside one tick. A capture is a bulk read that walks each chunk once,
+    /// and what it produces is a plan rather than a reading.
+    ///
+    /// # Errors
+    ///
+    /// [`PlanError::Side`] for a box out of bounds, [`PlanError::TooManyCells`]
+    /// for one holding more than [`MAX_CELLS`] blocks, [`PlanError::NotLoaded`]
+    /// if any of it is in a chunk that is not resident, and
+    /// [`PlanError::Unavailable`] outside the window in which there is a world
+    /// to read.
+    fn capture(
+        &self,
+        domain: &str,
+        from: crate::BlockPos,
+        to: crate::BlockPos,
+    ) -> Result<Plan, PlanError>;
+
     /// Writes a plan under one of a mod's own names, replacing any it had.
     ///
     /// Returns whether it was written.
@@ -253,6 +321,13 @@ pub trait Access: Send + Sync {
 
     /// Every plan name a mod has saved, in order.
     fn names(&self, mod_id: &str) -> Vec<String>;
+
+    /// Removes one of a mod's own plans. Returns whether there was one.
+    ///
+    /// A store a mod can only add to is a store that grows for as long as the
+    /// world exists, and the mod that saved a plan under a name it no longer
+    /// uses is the only thing that can know it is finished with it.
+    fn forget(&self, mod_id: &str, name: &str) -> bool;
 
     /// Asks for a plan to be stamped into the world with its origin at `at`.
     ///
@@ -327,6 +402,33 @@ mod tests {
         assert_eq!(plan.len(), 16);
         assert_eq!(plan.tally().get("core:stone"), Some(&8));
         assert_eq!(plan.tally().get("core:wood"), Some(&8));
+    }
+
+    #[test]
+    fn a_mixed_block_is_layers_at_one_position() {
+        // Sub-Node Contract: one block may hold several materials. A plan cell
+        // names one material, so a mixed block is several cells at one
+        // position, and the ORDER is what a stamper applies them in — the first
+        // replaces the block and the rest add to it. A test rather than a
+        // comment because the stamper depends on it.
+        let mut plan = Plan::new([2, 2, 2]).expect("a valid size");
+        plan.set([1, 0, 1], "core:stone", 0b0000_1111)
+            .expect("in bounds");
+        plan.set([1, 0, 1], "core:wood", 0b1111_0000)
+            .expect("in bounds");
+
+        let cells: Vec<PlanCell> = plan.cells().collect();
+        assert_eq!(cells.len(), 2, "a mixed block lost a material");
+        assert!(
+            cells.iter().all(|cell| cell.at == [1, 0, 1]),
+            "the layers moved apart"
+        );
+        assert_eq!(plan.palette(), &["core:stone", "core:wood"]);
+        assert_eq!(
+            cells[0].occupancy & cells[1].occupancy,
+            0,
+            "two materials claimed the same cell"
+        );
     }
 
     #[test]

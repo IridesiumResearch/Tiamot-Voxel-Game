@@ -1014,6 +1014,15 @@ pub trait ScriptVm: Sized {
     /// Points `game.storage` at the server's store.
     fn set_storage_access(&mut self, access: std::sync::Arc<dyn crate::storage::Access>);
 
+    /// Points `game.plans` at the world's saved plans, and at the world itself.
+    ///
+    /// **Two things behind one handle, unlike every other setter here**, and
+    /// deliberately: capturing reads terrain and saving writes a table, but a
+    /// mod does both in one breath and neither is any use alone. Splitting them
+    /// would put the pairing in every mod instead of in the engine — see
+    /// [`crate::plan::Access`].
+    fn set_plan_access(&mut self, access: std::sync::Arc<dyn crate::plan::Access>);
+
     /// Points the container API at the world's containers.
     fn set_container_access(&mut self, access: std::sync::Arc<dyn crate::inventory::Containers>);
 

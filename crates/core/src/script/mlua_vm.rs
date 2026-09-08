@@ -449,6 +449,11 @@ pub struct MluaVm {
     domains: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::domain::Access>>>>,
     /// Where `game.storage` reaches, once there is a world.
     storage: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::storage::Access>>>>,
+    /// Where `game.plans` reaches, once there is a world.
+    ///
+    /// The same slot shape as `storage`, and empty for the same window: the
+    /// frozen API is installed before there is a world to capture from.
+    plans: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::plan::Access>>>>,
     /// Where `game.set_hud` sends a mod's own HUD values.
     hud: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn crate::hud::Access>>>>,
     /// Where the container calls reach the world's chests.
@@ -820,6 +825,7 @@ impl ScriptVm for MluaVm {
             entities: std::sync::Arc::new(std::sync::Mutex::new(None)),
             domains: std::sync::Arc::new(std::sync::Mutex::new(None)),
             storage: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            plans: std::sync::Arc::new(std::sync::Mutex::new(None)),
             hud: std::sync::Arc::new(std::sync::Mutex::new(None)),
             containers: std::sync::Arc::new(std::sync::Mutex::new(None)),
             sight: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -964,6 +970,12 @@ impl ScriptVm for MluaVm {
 
     fn set_domain_access(&mut self, access: std::sync::Arc<dyn crate::domain::Access>) {
         if let Ok(mut slot) = self.domains.lock() {
+            *slot = Some(access);
+        }
+    }
+
+    fn set_plan_access(&mut self, access: std::sync::Arc<dyn crate::plan::Access>) {
+        if let Ok(mut slot) = self.plans.lock() {
             *slot = Some(access);
         }
     }
@@ -4073,6 +4085,165 @@ impl MluaVm {
         Ok(())
     }
 
+    /// Puts `game.plans` on the `game` table.
+    ///
+    /// One table rather than five `game.*` entries, for the reason
+    /// `game.storage` is one: this is a single concept, a mod reads
+    /// `game.plans.stamp` more easily than `game.plan_stamp`, and
+    /// `check-stubs.sh` sees one registration.
+    ///
+    /// **The mod id is captured, never passed.** A mod cannot reach another's
+    /// plans because there is nowhere in the API to put the name — the same
+    /// isolation `game.storage` has, and a property of the surface rather than
+    /// of everyone's good behaviour.
+    ///
+    /// # A plan is named, never held
+    ///
+    /// Lua is given no plan value at all. A capture writes one under a name and
+    /// every other call takes that name back. That keeps a quarter of a million
+    /// blocks out of the script VM's memory cap, makes the same call work after
+    /// a restart, and means a mod's copy-and-paste tool is
+    /// `capture("clipboard", …)` followed by `stamp("clipboard", …)`.
+    fn install_plan_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        let plans = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.plans);
+        let owner = mod_id.to_owned();
+        let capture = self
+            .lua
+            .create_function(move |lua, (name, from, to): (String, Table, Table)| {
+                let corner = |table: &Table| -> mlua::Result<crate::BlockPos> {
+                    Ok(crate::BlockPos::new(
+                        table.get("x")?,
+                        table.get("y")?,
+                        table.get("z")?,
+                    ))
+                };
+                // The domain comes from where the box STARTS, the rule sight
+                // and pathfinding already use: a box with a corner in each of
+                // two spaces is not a box.
+                let domain = domain_of(&from)?;
+                let (from, to) = (corner(&from)?, corner(&to)?);
+
+                let Some(store) = plan_store(&slot)? else {
+                    return refusal(lua, "no world");
+                };
+                match store.capture(&domain, from, to) {
+                    Ok(plan) => {
+                        let out = plan_summary(lua, &plan)?;
+                        if store.save(&owner, &name, &plan) {
+                            Ok(mlua::MultiValue::from_iter([mlua::Value::Table(out)]))
+                        } else {
+                            refusal(lua, "not saved")
+                        }
+                    }
+                    // **The reason is a short word, not a sentence.** A mod
+                    // branches on it and shows a player something of its own:
+                    // "move closer" is a sensible thing for a build tool to
+                    // say, and it can only say it if it is told which refusal
+                    // it got.
+                    Err(err) => refusal(lua, capture_refusal(&err)),
+                }
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        plans
+            .set("capture", capture)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.plans);
+        let owner = mod_id.to_owned();
+        let stamp = self
+            .lua
+            .create_function(move |_, (name, at): (String, Table)| {
+                let x: i32 = at.get("x")?;
+                let y: i32 = at.get("y")?;
+                let z: i32 = at.get("z")?;
+                let domain = domain_of(&at)?;
+                let Some(store) = plan_store(&slot)? else {
+                    return Ok(false);
+                };
+                let Some(plan) = store.load(&owner, &name) else {
+                    return Ok(false);
+                };
+                // **True means accepted, not landed.** A plan can hold far
+                // more blocks than one tick may apply, so the engine paces it
+                // over several — see `crate::plan::Access::stamp`. A mod that
+                // needs to know when it has finished watches the world.
+                Ok(store.stamp(&domain, crate::BlockPos::new(x, y, z), plan))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        plans
+            .set("stamp", stamp)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let (info, list, forget) = self.plan_listings(mod_id)?;
+        plans.set("info", info).map_err(|err| self.vm_error(&err))?;
+        plans.set("list", list).map_err(|err| self.vm_error(&err))?;
+        plans
+            .set("forget", forget)
+            .map_err(|err| self.vm_error(&err))?;
+
+        game.set("plans", plans)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
+    /// The three `game.plans` calls that only ever ask about the store.
+    ///
+    /// Split from [`Self::install_plan_api`] because that method is at the line
+    /// limit, and split HERE because these three share a property the other two
+    /// do not: none of them touches the world, so none of them can fail for
+    /// being asked at the wrong moment in a tick.
+    fn plan_listings(
+        &self,
+        mod_id: &str,
+    ) -> Result<(mlua::Function, mlua::Function, mlua::Function), ScriptError> {
+        let slot = std::sync::Arc::clone(&self.plans);
+        let owner = mod_id.to_owned();
+        let info = self
+            .lua
+            .create_function(move |lua, name: String| {
+                let Some(store) = plan_store(&slot)? else {
+                    return Ok(mlua::Value::Nil);
+                };
+                match store.load(&owner, &name) {
+                    Some(plan) => Ok(mlua::Value::Table(plan_summary(lua, &plan)?)),
+                    None => Ok(mlua::Value::Nil),
+                }
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.plans);
+        let owner = mod_id.to_owned();
+        let list = self
+            .lua
+            .create_function(move |lua, ()| {
+                let out = lua.create_table()?;
+                let Some(store) = plan_store(&slot)? else {
+                    return Ok(out);
+                };
+                for (index, name) in store.names(&owner).into_iter().enumerate() {
+                    out.set(index + 1, name)?;
+                }
+                Ok(out)
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.plans);
+        let owner = mod_id.to_owned();
+        let forget = self
+            .lua
+            .create_function(move |_, name: String| {
+                let Some(store) = plan_store(&slot)? else {
+                    return Ok(false);
+                };
+                Ok(store.forget(&owner, &name))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        Ok((info, list, forget))
+    }
+
     /// Puts `game.register_on_world_init` on the `game` table.
     ///
     /// The same shape as `register_on_tick`, deliberately — a mod author has
@@ -4319,6 +4490,7 @@ impl MluaVm {
 
         self.install_entity_api(mod_id, game)?;
         self.install_storage_api(mod_id, game)?;
+        self.install_plan_api(mod_id, game)?;
         self.install_hud_api(mod_id, game)?;
         self.install_container_api(game)?;
         self.install_heading(game)?;
@@ -6102,6 +6274,70 @@ const STYLE_FIELDS: [&str; 5] = [
 /// Read off the position table rather than passed separately, because the
 /// domain is part of what makes a position a place — splitting them would let a
 /// mod pass one position's domain with another position's coordinates.
+/// A plan as Lua is shown one: how big it is and what it would cost to build.
+///
+/// The tally is the half that matters — a mod that can only find out what a
+/// plan needs by stamping it and watching what fails cannot say "you do not
+/// have enough stone for this" before it starts.
+fn plan_summary(lua: &Lua, plan: &crate::plan::Plan) -> mlua::Result<Table> {
+    let out = lua.create_table()?;
+    let size = lua.create_table()?;
+    let [x, y, z] = plan.size();
+    size.set("x", x)?;
+    size.set("y", y)?;
+    size.set("z", z)?;
+    out.set("size", size)?;
+    out.set("blocks", plan.len())?;
+    let materials = lua.create_table()?;
+    for (name, count) in plan.tally() {
+        materials.set(name, count)?;
+    }
+    out.set("materials", materials)?;
+    Ok(out)
+}
+
+/// The plan store, or `None` when there is no world behind the VM yet.
+///
+/// A function rather than each caller locking, so that "the store is poisoned"
+/// is worded once: a mod reading that message has hit a simulation panic, and
+/// five spellings of it would look like five different faults.
+fn plan_store(
+    slot: &std::sync::Mutex<Option<std::sync::Arc<dyn crate::plan::Access>>>,
+) -> mlua::Result<Option<std::sync::Arc<dyn crate::plan::Access>>> {
+    let guard = slot.lock().map_err(|_| {
+        mlua::Error::external("the plan store is poisoned; the simulation panicked")
+    })?;
+    Ok(guard.as_ref().map(std::sync::Arc::clone))
+}
+
+/// One word for why a capture was refused, for a mod to branch on.
+///
+/// Deliberately not the error's own `Display`: those name numbers and
+/// coordinates that are useful in a log and are exactly what a mod must not
+/// pattern-match on, because they change with the message.
+const fn capture_refusal(err: &crate::plan::PlanError) -> &'static str {
+    match err {
+        crate::plan::PlanError::Unavailable => "no world",
+        crate::plan::PlanError::NotLoaded { .. } => "not loaded",
+        crate::plan::PlanError::Side { .. } => "too big",
+        crate::plan::PlanError::TooManyCells => "too many blocks",
+        crate::plan::PlanError::OutOfBounds { .. } | crate::plan::PlanError::PaletteFull => {
+            "refused"
+        }
+    }
+}
+
+/// `nil, reason` — the two-value refusal `game.find_path` established.
+///
+/// Lua treats `nil` as false in a condition, so a mod that does not care gets
+/// the safe behaviour for free and one that does can tell which refusal it was.
+fn refusal(lua: &Lua, reason: &str) -> mlua::Result<mlua::MultiValue> {
+    Ok(mlua::MultiValue::from_iter([
+        mlua::Value::Nil,
+        mlua::Value::String(lua.create_string(reason)?),
+    ]))
+}
+
 fn domain_of(position: &Table) -> mlua::Result<String> {
     Ok(position
         .get::<Option<String>>("domain")?
@@ -9416,6 +9652,220 @@ mod entity_tests {
         )
         .expect("no world");
     }
+    /// A plan store a test can watch: the server's semantics, in memory.
+    ///
+    /// `world` is what a capture finds, which is how a test says "that box is
+    /// not loaded" without a world to unload.
+    struct Drawers {
+        held: std::sync::Mutex<std::collections::BTreeMap<(String, String), crate::plan::Plan>>,
+        world: std::sync::Mutex<Result<crate::plan::Plan, crate::plan::PlanError>>,
+        asked: std::sync::Mutex<Vec<(String, crate::BlockPos, crate::BlockPos)>>,
+        stamped: std::sync::Mutex<Vec<(String, crate::BlockPos, crate::plan::Plan)>>,
+    }
+
+    impl Drawers {
+        fn holding(plan: Result<crate::plan::Plan, crate::plan::PlanError>) -> Self {
+            Self {
+                held: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                world: std::sync::Mutex::new(plan),
+                asked: std::sync::Mutex::new(Vec::new()),
+                stamped: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::plan::Access for Drawers {
+        fn capture(
+            &self,
+            domain: &str,
+            from: crate::BlockPos,
+            to: crate::BlockPos,
+        ) -> Result<crate::plan::Plan, crate::plan::PlanError> {
+            self.asked
+                .lock()
+                .expect("lock")
+                .push((domain.to_owned(), from, to));
+            self.world.lock().expect("lock").clone()
+        }
+
+        fn save(&self, mod_id: &str, name: &str, plan: &crate::plan::Plan) -> bool {
+            self.held
+                .lock()
+                .expect("lock")
+                .insert((mod_id.to_owned(), name.to_owned()), plan.clone());
+            true
+        }
+
+        fn load(&self, mod_id: &str, name: &str) -> Option<crate::plan::Plan> {
+            self.held
+                .lock()
+                .expect("lock")
+                .get(&(mod_id.to_owned(), name.to_owned()))
+                .cloned()
+        }
+
+        fn names(&self, mod_id: &str) -> Vec<String> {
+            self.held
+                .lock()
+                .expect("lock")
+                .keys()
+                .filter(|(owner, _)| owner == mod_id)
+                .map(|(_, name)| name.clone())
+                .collect()
+        }
+
+        fn forget(&self, mod_id: &str, name: &str) -> bool {
+            self.held
+                .lock()
+                .expect("lock")
+                .remove(&(mod_id.to_owned(), name.to_owned()))
+                .is_some()
+        }
+
+        fn stamp(&self, domain: &str, at: crate::BlockPos, plan: crate::plan::Plan) -> bool {
+            self.stamped
+                .lock()
+                .expect("lock")
+                .push((domain.to_owned(), at, plan));
+            true
+        }
+    }
+
+    fn a_cottage() -> crate::plan::Plan {
+        let mut plan = crate::plan::Plan::new([2, 2, 2]).expect("a valid size");
+        plan.set([0, 0, 0], "core:stone", crate::block::OCCUPANCY_FULL)
+            .expect("in bounds");
+        plan.set([1, 1, 1], "core:wood", 0b111).expect("in bounds");
+        plan
+    }
+
+    fn vm_with_plans(
+        world: Result<crate::plan::Plan, crate::plan::PlanError>,
+    ) -> (MluaVm, std::sync::Arc<Drawers>) {
+        let mut vm = vm();
+        let drawers = std::sync::Arc::new(Drawers::holding(world));
+        vm.set_plan_access(
+            std::sync::Arc::clone(&drawers) as std::sync::Arc<dyn crate::plan::Access>
+        );
+        (vm, drawers)
+    }
+
+    #[test]
+    fn a_mod_captures_a_box_saves_it_and_stamps_it_back() {
+        // The whole feature in one script, because that is how a mod meets it:
+        // capture a build, find out what it costs, and put it somewhere else.
+        let (mut vm, drawers) = vm_with_plans(Ok(a_cottage()));
+        load(&mut vm, "builder", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "builder",
+            "local made = game.plans.capture('cottage', {x=0,y=0,z=0}, {x=1,y=1,z=1})\n\
+             assert(made, 'the capture was refused')\n\
+             assert(made.size.x == 2 and made.size.y == 2 and made.size.z == 2)\n\
+             assert(made.blocks == 2, 'wrong block count: ' .. made.blocks)\n\
+             assert(made.materials['core:stone'] == 1, 'the tally lost the stone')\n\
+             assert(made.materials['core:wood'] == 1, 'the tally lost the wood')\n\
+             local names = game.plans.list()\n\
+             assert(#names == 1 and names[1] == 'cottage', 'the plan was not listed')\n\
+             assert(game.plans.info('cottage').blocks == 2)\n\
+             assert(game.plans.info('shed') == nil, 'a plan nobody saved has details')\n\
+             assert(game.plans.stamp('cottage', {x=40,y=8,z=-3}), 'the stamp was refused')\n\
+             assert(game.plans.stamp('shed', {x=0,y=0,z=0}) == false)\n\
+             assert(game.plans.forget('cottage'), 'nothing was forgotten')\n\
+             assert(#game.plans.list() == 0, 'a forgotten plan is still listed')",
+        )
+        .expect("the plan round trip");
+
+        let asked = drawers.asked.lock().expect("lock");
+        assert_eq!(
+            asked[0],
+            (
+                crate::domain::OVERWORLD.to_owned(),
+                crate::BlockPos::new(0, 0, 0),
+                crate::BlockPos::new(1, 1, 1)
+            ),
+            "the box the mod named is not the box the engine was asked for"
+        );
+
+        let stamped = drawers.stamped.lock().expect("lock");
+        assert_eq!(stamped.len(), 1, "a plan nobody saved was stamped anyway");
+        assert_eq!(stamped[0].1, crate::BlockPos::new(40, 8, -3));
+        assert_eq!(stamped[0].2, a_cottage(), "the stamp lost the plan");
+    }
+
+    #[test]
+    fn a_refused_capture_says_which_refusal_it_was() {
+        // A build tool tells a player to move closer, and it can only do that
+        // if the engine says which "no" this is. The reason is a short word on
+        // purpose: a mod branching on the error's own sentence would break the
+        // day anybody improved the wording.
+        let (mut vm, _drawers) =
+            vm_with_plans(Err(crate::plan::PlanError::NotLoaded { x: 4, y: 5, z: 6 }));
+        load(&mut vm, "builder", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "builder",
+            "local made, why = game.plans.capture('cottage', {x=0,y=0,z=0}, {x=1,y=1,z=1})\n\
+             assert(made == nil, 'a refused capture produced a plan')\n\
+             assert(why == 'not loaded', 'wrong reason: ' .. tostring(why))\n\
+             assert(#game.plans.list() == 0, 'a refused capture was saved anyway')",
+        )
+        .expect("the refusal");
+    }
+
+    #[test]
+    fn a_mods_plans_are_keyed_to_that_mod() {
+        // The isolation `game.storage` has, for the same reason and by the same
+        // mechanism: there is nowhere in the API to name another mod.
+        let (mut vm, drawers) = vm_with_plans(Ok(a_cottage()));
+        for owner in ["first", "second"] {
+            load(&mut vm, owner, "game.register_on_tick(function() end)").expect("load");
+        }
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "first",
+            "game.plans.capture('house', {x=0,y=0,z=0}, {x=1,y=1,z=1})",
+        )
+        .expect("capture");
+        vm.eval_in(
+            "second",
+            "assert(game.plans.info('house') == nil, 'a mod read the other plan')\n\
+             assert(#game.plans.list() == 0, 'a mod listed the other plans')\n\
+             assert(game.plans.stamp('house', {x=0,y=0,z=0}) == false)\n\
+             assert(game.plans.forget('house') == false, 'a mod deleted the other plan')",
+        )
+        .expect("the isolation");
+
+        assert!(
+            crate::plan::Access::load(&*drawers, "first", "house").is_some(),
+            "the other mod's attempts destroyed the plan"
+        );
+    }
+
+    #[test]
+    fn the_plan_api_does_nothing_rather_than_failing_when_there_is_no_world() {
+        // Called during worldgen, or in a test with no server behind the VM.
+        // An error here would be one every mod has to write code around — the
+        // entity, fluid and storage APIs all answer this way.
+        let mut vm = vm();
+        load(&mut vm, "early", "game.register_on_tick(function() end)").expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "early",
+            "local made, why = game.plans.capture('x', {x=0,y=0,z=0}, {x=1,y=1,z=1})\n\
+             assert(made == nil and why == 'no world')\n\
+             assert(game.plans.stamp('x', {x=0,y=0,z=0}) == false)\n\
+             assert(game.plans.info('x') == nil)\n\
+             assert(#game.plans.list() == 0)\n\
+             assert(game.plans.forget('x') == false)",
+        )
+        .expect("no world");
+    }
+
     /// A storage store a test can watch: the server's semantics, in memory.
     #[derive(Default)]
     struct Shelf {
