@@ -229,6 +229,39 @@ impl Plan {
     }
 }
 
+/// Where a mod's plans are kept, and how one reaches the world.
+///
+/// A trait for the reason [`crate::storage::Access`] is one: the script VM must
+/// not know that a plan lives in a `SQLite` table on a thread it cannot touch,
+/// and a test must be able to exercise the API without a world.
+///
+/// **Saving and stamping are asymmetric on purpose.** Saving is immediate — it
+/// is a write to a database the tick already owns. Stamping is a REQUEST: a
+/// plan can hold tens of thousands of blocks and the edit queue that carries
+/// them to every watching client is bounded at 4,096, so the engine paces it
+/// across ticks rather than letting one mod call flood a frame. A mod that was
+/// handed the pacing would get it wrong, and getting it wrong looks like the
+/// world tearing.
+pub trait Access: Send + Sync {
+    /// Writes a plan under one of a mod's own names, replacing any it had.
+    ///
+    /// Returns whether it was written.
+    fn save(&self, mod_id: &str, name: &str, plan: &Plan) -> bool;
+
+    /// Reads one of a mod's own plans.
+    fn load(&self, mod_id: &str, name: &str) -> Option<Plan>;
+
+    /// Every plan name a mod has saved, in order.
+    fn names(&self, mod_id: &str) -> Vec<String>;
+
+    /// Asks for a plan to be stamped into the world with its origin at `at`.
+    ///
+    /// Returns whether the request was ACCEPTED, not whether it has landed —
+    /// which a caller finds out by looking at the world over the next few
+    /// ticks. `false` means too many stamps are already pending.
+    fn stamp(&self, domain: &str, at: crate::BlockPos, plan: Plan) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
