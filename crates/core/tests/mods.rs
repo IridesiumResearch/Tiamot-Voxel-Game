@@ -742,6 +742,49 @@ end)
 }
 
 #[test]
+fn a_block_may_declare_every_field_the_engine_documents() {
+    // **The field allowlist is the last gate a mod passes, and it has been
+    // forgotten twice.** `register_block` refuses any key it does not know, so
+    // a field that exists everywhere else — read at registration, carried on
+    // the wire, honoured by the client — is still unusable if its NAME is not
+    // in `BLOCK_FIELDS`. The mod does not get a subtly wrong block; it fails to
+    // load, with "unknown field".
+    //
+    // The engine's own tests all reach past this: they build a `MaterialDef`
+    // or a `BlockRules` directly, which is the producing side. Only a mod
+    // calling `register_block` meets the gate, so only a mod can prove it open.
+    let root = scratch("block-fields");
+    write_mod(
+        &root,
+        "everything",
+        "",
+        r#"
+game.register_block{
+    id = "window",
+    name = "Window",
+    transparent = true,
+    tint = { strength = 0.2, scale = 24, low = {0.9, 1.0, 0.9}, high = {1.0, 1.0, 1.0} },
+    hardness = 2.0,
+    light_emit = { r = 0, g = 0, b = 0 },
+    tags = { "glass" },
+}
+game.register_on_tick(function() end)
+"#,
+    );
+
+    let host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "a block declaring documented fields should load: {:?}",
+        host.failed()
+    );
+    assert!(
+        host.vm().block_ids().contains_key("everything:window"),
+        "the block never registered"
+    );
+}
+
+#[test]
 fn a_generator_can_ask_for_sub_node_terrain_without_writing_cells_by_hand() {
     // **Asked for by a mod author writing a worldgen mod**, whose complaint was
     // that sub-node worldgen has to be done a cell at a time and is therefore

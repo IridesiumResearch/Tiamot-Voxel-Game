@@ -6013,7 +6013,7 @@ const FLUID_FIELDS: [&str; 6] = [
 /// accepted them would be an API promising behaviour nothing implements.
 const ITEM_FIELDS: [&str; 4] = ["id", "name", "texture", "description"];
 
-const BLOCK_FIELDS: [&str; 11] = [
+const BLOCK_FIELDS: [&str; 13] = [
     "id",
     "name",
     "drops",
@@ -6025,6 +6025,8 @@ const BLOCK_FIELDS: [&str; 11] = [
     "light_emit",
     "sounds",
     "absorbs",
+    "tint",
+    "transparent",
 ];
 
 /// Keys the `textures` sub-table accepts.

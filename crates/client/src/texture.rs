@@ -31,9 +31,18 @@ use std::io::Cursor;
 
 /// Largest texture edge accepted, in pixels.
 ///
-/// A block texture is 16² or 32²; 1024 is generous for a high-resolution pack
-/// and 4096× smaller than what a PNG header can claim.
-pub const MAX_DIMENSION: u32 = 1024;
+/// A block texture is 16² or 32², so 1024 was generous for a texture pack — and
+/// too tight for the other thing that comes through this decoder. **A mod's
+/// interface art is not a block texture**: a panel background or a frame is
+/// sized in screen pixels, and a UI mod author hit this at 1254.
+///
+/// **Raising it costs no safety, because it was never the binding guard.**
+/// [`MAX_DECODED_BYTES`] is: at four bytes a pixel it refuses anything past
+/// about 1448², so a 2048² image is still refused — by the limit that bounds
+/// the allocation rather than by the one that bounds the shape. What this edge
+/// stops is a header claiming a dimension so large the multiply itself is
+/// interesting, and 2048 does that as well as 1024 did.
+pub const MAX_DIMENSION: u32 = 2048;
 
 /// Largest decoded size accepted, in bytes.
 ///
@@ -786,6 +795,26 @@ mod tests {
         // legitimate high-resolution pack.
         let image = decode_png(&png_bytes(MAX_DIMENSION, 1)).expect("the limit itself is fine");
         assert_eq!(image.width, MAX_DIMENSION);
+    }
+
+    #[test]
+    fn interface_art_the_size_a_ui_mod_actually_uses_decodes() {
+        // **The reason the edge limit is 2048 and not 1024.** A block texture is
+        // 16² and a panel background is sized in screen pixels; a UI mod author
+        // hit the old cap at 1254, which is an ordinary size for a frame and
+        // nowhere near large enough to be a threat.
+        let image = decode_png(&png_bytes(1254, 1254)).expect("1254² is interface art");
+        assert_eq!((image.width, image.height), (1254, 1254));
+
+        // And the guard that actually bounds the allocation still does. At four
+        // bytes a pixel this is past MAX_DECODED_BYTES, so it is refused for
+        // its WEIGHT rather than its shape — which is the check that matters.
+        let err = decode_png(&png_bytes(MAX_DIMENSION, MAX_DIMENSION))
+            .expect_err("2048² is 16 MiB decoded and must not be allocated");
+        assert!(
+            matches!(err, TextureError::TooHeavy { .. }),
+            "expected the byte limit to refuse it, got {err:?}"
+        );
     }
 
     #[test]
