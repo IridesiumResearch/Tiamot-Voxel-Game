@@ -95,3 +95,19 @@ Thumbs.db
 # message; the logs do not belong in history. The chunk-frame bug (d5ed968) was
 # read out of a set that lived here.
 /Frames-Physics/
+
+# **A mod being developed lives in `game/` and does not belong in this repo.**
+#
+# The reference mods here are `core_*` — they are test fixtures that prove each
+# mechanism works through the public API, and they ARE tracked. Anything else in
+# this directory is somebody's own work in progress: a mod under development, a
+# symlink to where they really keep it, or one of `docs/fixtures/`' worlds
+# copied in for an afternoon.
+#
+# Written after two of them were committed by a `git add -A`: a whole third-party
+# mod, fonts and all, and a symlink pointing at a path on one person's Windows
+# machine. The symlink is the worse of the two — every checkout since has had a
+# dangling link in its mod directory, and git on Windows says so out loud.
+/game/*
+!/game/README.md
+!/game/core_*/
