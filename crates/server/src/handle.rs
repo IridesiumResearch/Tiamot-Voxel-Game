@@ -303,9 +303,11 @@ fn save_fluid_by_domain(
     )],
 ) -> Result<usize, tiamot_core::WorldError> {
     let mut written = 0;
-    for (domain, layers) in group_by_domain(dirty.iter().map(|(domain, pos, layer)| {
-        (domain.as_str(), (*pos, layer))
-    })) {
+    for (domain, layers) in group_by_domain(
+        dirty
+            .iter()
+            .map(|(domain, pos, layer)| (domain.as_str(), (*pos, layer))),
+    ) {
         written += world.save_fluid(domain, layers)?;
     }
     Ok(written)

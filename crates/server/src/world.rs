@@ -1136,17 +1136,17 @@ impl World {
     }
 
     /// How many chunks one save writes before it looks at the clock again.
-///
-/// The unit the time budget is spent in, and a compromise between two costs
-/// that pull opposite ways: a batch is one transaction, so bigger batches mean
-/// fewer WAL commits, and a batch is also the granularity at which a save can
-/// stop, so bigger batches mean a coarser overshoot. Sixty-four chunks is a few
-/// milliseconds of encoding on the machine this was measured on: about 0.18 ms
-/// a chunk, so a batch is under 6 ms and the overshoot it can cause is smaller
-/// than the budget it overshoots.
-const CHUNKS_PER_SAVE_BATCH: usize = 32;
+    ///
+    /// The unit the time budget is spent in, and a compromise between two costs
+    /// that pull opposite ways: a batch is one transaction, so bigger batches mean
+    /// fewer WAL commits, and a batch is also the granularity at which a save can
+    /// stop, so bigger batches mean a coarser overshoot. Sixty-four chunks is a few
+    /// milliseconds of encoding on the machine this was measured on: about 0.18 ms
+    /// a chunk, so a batch is under 6 ms and the overshoot it can cause is smaller
+    /// than the budget it overshoots.
+    const CHUNKS_PER_SAVE_BATCH: usize = 32;
 
-/// Writes every dirty chunk, however many that is.
+    /// Writes every dirty chunk, however many that is.
     ///
     /// For shutdown and for tests. **The tick uses
     /// [`Self::save_dirty_within`]**, because "however many that is" can be
@@ -1158,7 +1158,8 @@ const CHUNKS_PER_SAVE_BATCH: usize = 32;
     /// [`WorldError`] if a write fails. Chunks that failed stay dirty, so the
     /// next save retries rather than dropping the edit.
     pub fn save_dirty(&mut self) -> Result<usize, WorldError> {
-        self.save_dirty_within(Duration::MAX).map(|(written, _)| written)
+        self.save_dirty_within(Duration::MAX)
+            .map(|(written, _)| written)
     }
 
     /// Writes dirty chunks until `budget` is spent, and says what is left.
@@ -1571,11 +1572,7 @@ mod tests {
         // nothing here depends on generation marking them.
         let chunks = World::CHUNKS_PER_SAVE_BATCH * 2 + 5;
         for index in 0..chunks {
-            let pos = BlockPos::new(
-                (index as i32) * tiamot_core::CHUNK_BLOCKS as i32,
-                -1,
-                0,
-            );
+            let pos = BlockPos::new((index as i32) * tiamot_core::CHUNK_BLOCKS as i32, -1, 0);
             world
                 .apply(
                     overworld,
