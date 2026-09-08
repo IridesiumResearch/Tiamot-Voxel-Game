@@ -1657,6 +1657,17 @@ impl ServerHandle {
                     // it is deliberately lent.
                     let sight = crate::lease::Lease::new();
 
+                    // Plans a mod has asked to stamp, and has not seen land
+                    // yet. Owned here rather than by the VM because the tick is
+                    // what pumps them: a plan can hold far more blocks than one
+                    // tick may apply, so `game.plans.stamp` puts it here and
+                    // the tick takes a bounded number off per pass.
+                    let plan_names =
+                        std::sync::Arc::new(crate::plans::Names::new(block_names.clone()));
+                    let stamps = std::sync::Arc::new(crate::plans::Stamps::new(
+                        std::sync::Arc::clone(&plan_names),
+                    ));
+
                     // Who owns each open dialog, for routing its events back.
                     // `None` on a server with no mods, which cannot open one.
                     let mut dialog_screens: Option<std::sync::Arc<Screens>> = None;
@@ -1771,6 +1782,19 @@ impl ServerHandle {
                             // all on a running server, silently, because an
                             // uninstalled edit queue is exactly what worldgen
                             // sees and is not an error there.
+                            // And where a mod's plans are captured from,
+                            // kept, and stamped back. The same name table
+                            // `set_block` resolves through, for the same reason
+                            // — a plan holds material NAMES (charter rule 8),
+                            // and a plan captured under one mod set and stamped
+                            // under another must not build a house out of
+                            // whatever those numbers mean today.
+                            host.vm_mut()
+                                .set_plan_access(std::sync::Arc::new(crate::plans::Shared::new(
+                                    sight.handle(),
+                                    std::sync::Arc::clone(&plan_names),
+                                    std::sync::Arc::clone(&stamps),
+                                )));
                             host.vm_mut().set_world_edit(std::sync::Arc::new(
                                 crate::fluid::Edits::new(
                                     std::sync::Arc::clone(&shared),
@@ -1902,6 +1926,20 @@ impl ServerHandle {
                         // did it. A test arranging a world before a player acts
                         // is the whole use, and it goes first so the player's
                         // own actions this tick see the arranged world.
+                        // **A stamped plan is paced onto that same queue**,
+                        // a bounded number of blocks per tick — see
+                        // `crate::plans::BLOCKS_PER_TICK`. Here rather than
+                        // where the mod asked, because a plan can hold far more
+                        // blocks than one tick may apply and handing that
+                        // pacing to the mod would mean every mod getting it
+                        // slightly wrong; getting it wrong looks like the world
+                        // tearing. Before the drain, so what is pumped lands in
+                        // this pass rather than the next one.
+                        let stamped = stamps.pump(shared.as_ref());
+                        if stamped > 0 {
+                            debug!(blocks = stamped, waiting = stamps.waiting(), "stamping a plan");
+                        }
+
                         // A mod's `game.set_block` names the space it meant.
                         for (seeded_in, edit) in shared.drain_seeds() {
                             match world.apply(&seeded_in, &edit, &mut source) {

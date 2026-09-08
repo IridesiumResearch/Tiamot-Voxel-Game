@@ -142,6 +142,24 @@ pub struct Shared {
     allowance: Arc<std::sync::atomic::AtomicU32>,
 }
 
+impl Shared {
+    /// Runs `read` against the lent world, or answers `None` when there is none.
+    ///
+    /// **The escape hatch for a reader the lease has no trait for.** Sight and
+    /// pathfinding are questions the engine asks the world on a mod's behalf,
+    /// and each has its own seam; capturing a plan is a bulk read of terrain
+    /// and of the world's own database, which is neither. Everything that
+    /// reaches the lent world still comes through this file, which is the
+    /// property worth keeping.
+    ///
+    /// `None` means the same thing [`Sighting::Unavailable`] does: no world was
+    /// lent at that moment, so the caller asked outside the window.
+    pub fn with_world<T>(&self, read: impl FnOnce(&World) -> T) -> Option<T> {
+        let slot = self.slot.lock().ok()?;
+        slot.as_ref().map(read)
+    }
+}
+
 impl sight::Access for Shared {
     fn line_of_sight(&self, domain: &str, from: [f64; 3], to: [f64; 3]) -> Sighting {
         // A poisoned lease means the simulation thread panicked while the world

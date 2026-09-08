@@ -1323,6 +1323,23 @@ impl WorldDb {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Removes a plan a mod saved. Returns whether there was one.
+    ///
+    /// A store a mod can only add to grows for as long as the world exists, and
+    /// the mod that saved a plan is the only thing that can know it is finished
+    /// with it.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn delete_plan(&self, mod_id: &str, name: &str) -> Result<bool, WorldError> {
+        let removed = self.conn.execute(
+            "DELETE FROM mod_plans WHERE mod_id = ?1 AND name = ?2",
+            params![mod_id, name],
+        )?;
+        Ok(removed > 0)
+    }
+
     // -- players ----------------------------------------------------------
 
     /// Loads a player's opaque state blob.
@@ -1998,6 +2015,23 @@ mod tests {
             "sorted, and only this mod's"
         );
         assert!(db.plan_names("someone_else").expect("list").is_empty());
+
+        // And a mod can take one back out again — keyed the same way round, so
+        // one mod cannot delete another's either.
+        assert!(
+            !db.delete_plan("someone_else", "house").expect("delete"),
+            "another mod deleted a plan it did not save"
+        );
+        assert!(db.delete_plan("builder", "house").expect("delete"));
+        assert!(
+            db.load_plan("builder", "house").expect("load").is_none(),
+            "a deleted plan came back"
+        );
+        assert_eq!(db.plan_names("builder").expect("list"), vec!["barn"]);
+        assert!(
+            !db.delete_plan("builder", "house").expect("delete"),
+            "deleting nothing reported deleting something"
+        );
     }
 
     #[test]

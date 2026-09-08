@@ -31,6 +31,7 @@ pub mod handle;
 pub mod hud;
 pub mod lease;
 pub mod light;
+pub mod plans;
 pub mod rcon;
 pub mod shutdown;
 pub mod sim;

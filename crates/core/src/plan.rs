@@ -253,16 +253,21 @@ impl Plan {
         })
     }
 
-    /// How many of each material it holds, by name.
+    /// How much of each material it holds, by name, **in units**.
     ///
     /// What a mod needs to say "you do not have enough stone for this" before
-    /// stamping rather than after.
+    /// stamping rather than after — so it is counted in the unit an inventory
+    /// is counted in. Charter rule 5: 27 units to a block, and a chiselled
+    /// block costs the cells it actually fills rather than a whole one.
+    ///
+    /// Blocks are [`Plan::len`], and the two differ by more than a factor of 27
+    /// wherever a plan holds anything partial.
     #[must_use]
-    pub fn tally(&self) -> BTreeMap<&str, usize> {
-        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-        for &(_, material, _) in &self.cells {
+    pub fn tally(&self) -> BTreeMap<&str, u32> {
+        let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+        for &(_, material, occupancy) in &self.cells {
             if let Some(name) = self.palette.get(material as usize) {
-                *counts.entry(name.as_str()).or_default() += 1;
+                *counts.entry(name.as_str()).or_default() += occupancy.count_ones();
             }
         }
         counts
@@ -400,6 +405,9 @@ mod tests {
         }
         assert_eq!(plan.palette(), &["core:stone", "core:wood"]);
         assert_eq!(plan.len(), 16);
+        // **Units, not blocks** (charter rule 5): eight single-cell blocks of
+        // each. A mod comparing this with what a player is carrying is
+        // comparing two counts of the same thing, which is the whole point.
         assert_eq!(plan.tally().get("core:stone"), Some(&8));
         assert_eq!(plan.tally().get("core:wood"), Some(&8));
     }

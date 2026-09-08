@@ -9764,8 +9764,8 @@ mod entity_tests {
              assert(made, 'the capture was refused')\n\
              assert(made.size.x == 2 and made.size.y == 2 and made.size.z == 2)\n\
              assert(made.blocks == 2, 'wrong block count: ' .. made.blocks)\n\
-             assert(made.materials['core:stone'] == 1, 'the tally lost the stone')\n\
-             assert(made.materials['core:wood'] == 1, 'the tally lost the wood')\n\
+             assert(made.materials['core:stone'] == 27, 'a whole block is 27 units')\n\
+             assert(made.materials['core:wood'] == 3, 'three chiselled cells is 3')\n\
              local names = game.plans.list()\n\
              assert(#names == 1 and names[1] == 'cottage', 'the plan was not listed')\n\
              assert(game.plans.info('cottage').blocks == 2)\n\

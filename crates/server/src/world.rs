@@ -1270,6 +1270,52 @@ impl World {
         self.db.save_mod_storage(mod_id, bag)
     }
 
+    /// A plan a mod saved, or `None` if it never saved one by that name.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure. An undecodable blob is `None` rather
+    /// than an error — see [`tiamot_core::persist::Db::load_plan`].
+    pub fn load_plan(
+        &self,
+        mod_id: &str,
+        name: &str,
+    ) -> Result<Option<tiamot_core::plan::Plan>, WorldError> {
+        self.db.load_plan(mod_id, name)
+    }
+
+    /// Writes a plan under a mod's own name, replacing any it had.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or a plan that will not encode.
+    pub fn save_plan(
+        &self,
+        mod_id: &str,
+        name: &str,
+        plan: &tiamot_core::plan::Plan,
+    ) -> Result<(), WorldError> {
+        self.db.save_plan(mod_id, name, plan)
+    }
+
+    /// Every plan name a mod has saved, sorted.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure.
+    pub fn plan_names(&self, mod_id: &str) -> Result<Vec<String>, WorldError> {
+        self.db.plan_names(mod_id)
+    }
+
+    /// Removes a plan a mod saved. Returns whether there was one.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure.
+    pub fn delete_plan(&self, mod_id: &str, name: &str) -> Result<bool, WorldError> {
+        self.db.delete_plan(mod_id, name)
+    }
+
     /// The terrain of one domain, for the physics to collide against.
     ///
     /// A domain nothing has visited answers `None` to every chunk, which is
