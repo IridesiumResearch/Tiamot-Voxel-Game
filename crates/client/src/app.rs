@@ -356,6 +356,43 @@ pub fn intent_at_yaw(yaw: f32, input: Input) -> Intent {
     }
 }
 
+/// The action bits one tick's intent puts on the wire.
+///
+/// **Free-standing for the reason [`intent_at_yaw`] is**, and it is the same
+/// story twice: while this was three lines inside a method on `App`, the only
+/// way to reach it was to build a renderer, so nothing tested it — and it
+/// shipped without the flight bit. The client toggled flight, predicted it
+/// locally, and sent the server an input that never said so, so the
+/// authoritative body kept falling and the prediction was corrected back down
+/// within the second. Reported from the window as "N gives me a double jump and
+/// gravity is still on", which is exactly what that looks like.
+///
+/// The HUD said `FLYING` throughout, because the HUD reads the client's own
+/// flag. Everything the player could see agreed; the one thing that mattered
+/// was never sent.
+#[must_use]
+pub fn action_bits(intent: Intent) -> u32 {
+    use tiamot_core::proto::actions;
+
+    let mut held = 0;
+    if intent.jump {
+        held |= actions::JUMP;
+    }
+    if intent.fly {
+        // The server decides whether to honour it — `intent_from_wire` ANDs it
+        // with whether this player is an operator — so sending it is not
+        // claiming it. A client that never sends it is refusing on the server's
+        // behalf, which is the bug this line fixes.
+        held |= actions::FLY;
+    }
+    match intent.gait {
+        phys::Gait::Sprint => held |= actions::SPRINT,
+        phys::Gait::Sneak => held |= actions::SNEAK,
+        phys::Gait::Walk => {}
+    }
+    held
+}
+
 /// The flight half of the position line. See [`App::flight_line`].
 ///
 /// A free function so it can be tested without building an `App`: the whole
@@ -5206,25 +5243,14 @@ impl App {
     /// being that a lost input should not delay every input behind it — this is
     /// where the last three start being sent.
     fn report_input(&self, input: Input, intent: Intent) {
-        use tiamot_core::proto::actions;
-
         let turn = std::f32::consts::TAU;
-        let mut held = 0;
-        if intent.jump {
-            held |= actions::JUMP;
-        }
-        match intent.gait {
-            phys::Gait::Sprint => held |= actions::SPRINT,
-            phys::Gait::Sneak => held |= actions::SNEAK,
-            phys::Gait::Walk => {}
-        }
         let _ = input;
 
         self.connection.send(Command::Input {
             tick: self.tick,
             movement: [intent.walk[0], 0.0, intent.walk[1]],
             look: [self.camera.yaw / turn, self.camera.pitch / turn],
-            actions: held,
+            actions: action_bits(intent),
         });
     }
 
@@ -5959,6 +5985,40 @@ mod tests {
         // ordinary server that is everybody, every frame, for ever.
         assert_eq!(flight_line(false, false), "");
         assert_eq!(flight_line(false, true), "");
+    }
+
+    #[test]
+    fn the_wire_carries_flight_and_not_just_the_flag_that_says_it_is_on() {
+        use tiamot_core::proto::actions;
+
+        // **The bug this exists for.** Flight was toggled, predicted locally
+        // and drawn on the HUD, and the input that went to the server never
+        // said so — so the server kept applying gravity to the authoritative
+        // body and the prediction was corrected back down within the second.
+        // From the window: "N gives me a double jump and gravity is still on".
+        let flying = Intent {
+            fly: true,
+            ..Intent::default()
+        };
+        assert!(
+            action_bits(flying) & actions::FLY != 0,
+            "an intent that flies must say so on the wire"
+        );
+
+        // And the counter-example, so this is not a test that passes on a
+        // function returning every bit: not flying says not flying, and the
+        // other three are unaffected either way.
+        let grounded = Intent::default();
+        assert_eq!(action_bits(grounded) & actions::FLY, 0);
+        assert_eq!(
+            action_bits(Intent {
+                jump: true,
+                gait: phys::Gait::Sneak,
+                ..Intent::default()
+            }),
+            actions::JUMP | actions::SNEAK,
+            "the flight bit changed what the other actions encode as"
+        );
     }
 
     #[test]
