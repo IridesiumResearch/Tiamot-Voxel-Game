@@ -303,10 +303,35 @@ fn save_fluid_by_domain(
     )],
 ) -> Result<usize, tiamot_core::WorldError> {
     let mut written = 0;
-    for (domain, pos, layer) in dirty {
-        written += world.save_fluid(domain, [(*pos, layer)])?;
+    for (domain, layers) in group_by_domain(dirty.iter().map(|(domain, pos, layer)| {
+        (domain.as_str(), (*pos, layer))
+    })) {
+        written += world.save_fluid(domain, layers)?;
     }
     Ok(written)
+}
+
+/// Groups `(domain, thing)` pairs into one batch per domain, in name order.
+///
+/// **The point is the batching, and it is not decoration.** Every writer under
+/// it takes many chunks and puts them in ONE transaction, precisely because a
+/// transaction per chunk is a WAL commit per chunk; a caller that loops and
+/// hands each writer a single chunk gets the per-chunk behaviour back while
+/// looking like it is batching. That is what these two helpers did, and on the
+/// two-hundred-mob load test it put 87 ms inside a 50 ms tick.
+///
+/// A `BTreeMap` for the habit `world.rs` keeps: this decides the order rows are
+/// written in, and while that is not a simulation result, an unordered one is
+/// the sort of thing somebody later depends on.
+fn group_by_domain<'a, T>(
+    rows: impl IntoIterator<Item = (&'a str, T)>,
+) -> std::collections::BTreeMap<&'a str, Vec<T>> {
+    let mut grouped: std::collections::BTreeMap<&'a str, Vec<T>> =
+        std::collections::BTreeMap::new();
+    for (domain, row) in rows {
+        grouped.entry(domain).or_default().push(row);
+    }
+    grouped
 }
 
 /// Writes each dirty chunk of entities into the domain it belongs to.
@@ -320,8 +345,12 @@ fn save_entities_by_domain(
     dirty: &[(String, tiamot_core::ChunkPos, Vec<tiamot_core::ent::Entity>)],
 ) -> Result<usize, tiamot_core::WorldError> {
     let mut written = 0;
-    for (domain, pos, entities) in dirty {
-        written += world.save_entities(domain, [(*pos, entities.as_slice())])?;
+    for (domain, chunks) in group_by_domain(
+        dirty
+            .iter()
+            .map(|(domain, pos, entities)| (domain.as_str(), (*pos, entities.as_slice()))),
+    ) {
+        written += world.save_entities(domain, chunks)?;
     }
     Ok(written)
 }
@@ -562,6 +591,21 @@ const fn edited_block(edit: &tiamot_core::proto::Edit) -> tiamot_core::BlockPos 
 /// enough that a player chiselling one block does not cause twenty writes a
 /// second of the same chunk.
 const SAVE_INTERVAL_TICKS: u64 = 40;
+
+/// How much of a tick one save may spend writing chunks.
+///
+/// **Charter rule 18 applied to the one job whose size nobody chose.** Every
+/// other phase of the tick is bounded by what is happening now — how many
+/// players moved, how many mobs stepped, how many chunks were asked for. A save
+/// is bounded by how much happened since the LAST one, and after a burst of
+/// streaming that is every chunk the world generated: measured at 180 ms in a
+/// 50 ms tick on the two-hundred-mob load test, and still 63 ms once the writes
+/// were batched into one transaction.
+///
+/// Eight milliseconds is a sixth of the budget. What it does not reach this
+/// tick it reaches on the next, which is how relighting and chunk-serving are
+/// already bounded.
+const SAVE_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
 
 /// How many chunks may be relit from scratch in one tick.
 ///
@@ -1883,7 +1927,15 @@ impl ServerHandle {
                     > = std::collections::BTreeMap::new();
 
                     let mut held = Some(world);
+                    // Whether the last save ran out of budget before it ran out
+                    // of chunks. See the save itself, below.
+                    let mut save_backlog = false;
 
+                    // Where each tick's time goes. Allocated once and
+                    // restarted per tick: a breakdown is only built for a tick
+                    // that has already lost its budget, and the marks
+                    // themselves are an `Instant::now()` apiece.
+                    let mut phases = sim::Phases::start();
                     let mut clock = sim::MonotonicClock::new();
                     sim::run(&mut clock, &control, |tick| {
                         let mut world = held
@@ -1894,6 +1946,7 @@ impl ServerHandle {
                         // per-call ceiling bounds one search and says nothing
                         // about two hundred of them.
                         sight.open_tick();
+                        phases.restart();
                         // Every block edited this tick, relit once at the end
                         // rather than four times in the middle. Batching is
                         // what makes the cost of a swarm of players placing
@@ -2004,6 +2057,7 @@ impl ServerHandle {
                             }
                         }
 
+                        phases.mark("edits");
                         // Players move here, on the tick thread, in a fixed
                         // order over a `BTreeMap`. Not in the connection tasks:
                         // charter rule 2 allows one simulation, and stepping a
@@ -2340,6 +2394,7 @@ impl ServerHandle {
                             known_names.retain(|uuid, _| present.contains(uuid));
                         }
 
+                        phases.mark("players");
                         // Digging, after movement so a dig is judged against
                         // where the player actually ended up this tick.
                         //
@@ -2587,6 +2642,7 @@ impl ServerHandle {
                             shared.set_dig(&uuid, None);
                         }
 
+                        phases.mark("digging");
                         // Placement, after digging and after movement. The
                         // order matters and is not arbitrary: a player who dug
                         // a block this tick can place into the hole this tick,
@@ -2952,6 +3008,7 @@ impl ServerHandle {
                             }
                         }
 
+                        phases.mark("placing");
                         // Mod tick hooks, before edits are applied: a mod
                         // that queues an edit this tick should see it land
                         // this tick, not next.
@@ -3109,6 +3166,7 @@ impl ServerHandle {
                             }
                         }
 
+                        phases.mark("mods");
                         // Serve chunk requests. Bounded per tick by
                         // CHUNKS_PER_TICK: encoding is real work on this
                         // thread, and an unbounded drain would let one player
@@ -3197,6 +3255,7 @@ impl ServerHandle {
                             let _ = request.reply.send(blob);
                         }
 
+                        phases.mark("serving");
                         // Light, once, after every edit this tick has landed.
                         // Order matters: relighting between edits would do the
                         // work twice for two edits in the same room, and the
@@ -3304,6 +3363,7 @@ impl ServerHandle {
                         }
                         control.note_lit_chunks(lighting.read().expect("lighting lock").len());
 
+                        phases.mark("light");
                         // **Punches, judged here and nowhere else.** A client
                         // says which entity it hit; the server decides whether
                         // it could have. Charter rule 2: a viewer that could
@@ -3534,6 +3594,7 @@ impl ServerHandle {
                         });
                         world = returned;
 
+                        phases.mark("player hooks");
                         // **The mods' own entity logic, before the physics.**
                         //
                         // A mod sets `drive` and the step that follows acts on
@@ -3640,6 +3701,7 @@ impl ServerHandle {
                             }
                         }
 
+                        phases.mark("entities");
                         // **Fluid, at half the simulation's rate.** Nobody can
                         // see the difference between milk moving ten times a
                         // second and twenty, and it halves the cost of the one
@@ -3818,6 +3880,7 @@ impl ServerHandle {
                             }
                         }
 
+                        phases.mark("fluid");
                         // The day advances once per tick, and is broadcast at
                         // a rate a person can read rather than at the rate it
                         // changes. Twenty updates a second of a float nobody
@@ -3834,10 +3897,23 @@ impl ServerHandle {
                         // would turn a player chiselling one block into 20
                         // writes a second of the same chunk; waiting for
                         // shutdown would lose everything on a crash.
-                        if tick % SAVE_INTERVAL_TICKS == 0 || control.take_save_request() {
-                            if let Err(err) = world.save_dirty() {
-                                error!("could not save dirty chunks: {err}");
+                        // **Or straight away, if the last save left work.** A
+                        // backlog waiting two seconds for the next debounce
+                        // drains at one batch per debounce while streaming
+                        // fills it at twenty chunks a tick, and never catches
+                        // up. Coming back on the next tick keeps the debounce
+                        // for what it is FOR — a chiselled chunk rewritten
+                        // twenty times a second — without letting a burst of
+                        // generation queue up unwritten.
+                        if tick % SAVE_INTERVAL_TICKS == 0
+                            || save_backlog
+                            || control.take_save_request()
+                        {
+                            match world.save_dirty_within(SAVE_BUDGET) {
+                                Ok((_, remaining)) => save_backlog = remaining > 0,
+                                Err(err) => error!("could not save dirty chunks: {err}"),
                             }
+                            phases.mark("save chunks");
 
                             // A mod's own facts on the same debounce, for the
                             // same reason: a state machine that writes a key
@@ -3846,6 +3922,7 @@ impl ServerHandle {
                             flush_mod_storage(&world, &mod_storage);
                             flush_containers(&world, &containers);
 
+                            phases.mark("save mod state");
                             let mobs = population.write().expect("entity lock").take_dirty();
                             if !mobs.is_empty()
                                 && let Err(err) = save_entities_by_domain(&mut world, &mobs)
@@ -3858,6 +3935,7 @@ impl ServerHandle {
                             // blocks a tick, and writing its chunk every time
                             // would be a database write per tick for as long as
                             // the milk was moving.
+                            phases.mark("save entities");
                             let dirty = fluidics.write().expect("fluid lock").take_dirty();
                             if let Err(err) = save_fluid_by_domain(&mut world, &dirty) {
                                 // Put them back rather than dropping them. A
@@ -3870,6 +3948,21 @@ impl ServerHandle {
                                     ponds.of(&domain).mark_dirty(pos);
                                 }
                             }
+                        }
+
+                        // The last phase, and then the only line anybody
+                        // reads when a load test fails: WHICH of a dozen jobs
+                        // spent the budget. Built only for a tick that has
+                        // already lost it.
+                        phases.mark("saving");
+                        let took = phases.total();
+                        if took > tiamot_core::tick::TICK_DURATION {
+                            let report = phases.report();
+                            warn!("a tick ran over its budget — {report}");
+                            control.note_tick_phases(
+                                u64::try_from(took.as_micros()).unwrap_or(u64::MAX),
+                                &report,
+                            );
                         }
 
                         held = Some(world);

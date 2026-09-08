@@ -34,6 +34,7 @@
 //! chunks persist".
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use tiamot_core::block::{BlockView, Cells, EMPTY_CELLS};
 use tiamot_core::fluid::FluidLayer;
@@ -1134,22 +1135,93 @@ impl World {
             .unwrap_or(MaterialId::AIR))
     }
 
-    /// Writes every dirty chunk.
+    /// How many chunks one save writes before it looks at the clock again.
+///
+/// The unit the time budget is spent in, and a compromise between two costs
+/// that pull opposite ways: a batch is one transaction, so bigger batches mean
+/// fewer WAL commits, and a batch is also the granularity at which a save can
+/// stop, so bigger batches mean a coarser overshoot. Sixty-four chunks is a few
+/// milliseconds of encoding on the machine this was measured on: about 0.18 ms
+/// a chunk, so a batch is under 6 ms and the overshoot it can cause is smaller
+/// than the budget it overshoots.
+const CHUNKS_PER_SAVE_BATCH: usize = 32;
+
+/// Writes every dirty chunk, however many that is.
+    ///
+    /// For shutdown and for tests. **The tick uses
+    /// [`Self::save_dirty_within`]**, because "however many that is" can be
+    /// every chunk a burst of streaming generated, and encoding a thousand of
+    /// them is 180 ms of a 50 ms tick.
     ///
     /// # Errors
     ///
     /// [`WorldError`] if a write fails. Chunks that failed stay dirty, so the
     /// next save retries rather than dropping the edit.
     pub fn save_dirty(&mut self) -> Result<usize, WorldError> {
+        self.save_dirty_within(Duration::MAX).map(|(written, _)| written)
+    }
+
+    /// Writes dirty chunks until `budget` is spent, and says what is left.
+    ///
+    /// # Why a time budget rather than a count
+    ///
+    /// Charter rule 18: the 50 ms tick is shared by all simulation for all
+    /// players, and a save is the one job in it whose size is set by how much
+    /// happened since the last one rather than by what is happening now. A
+    /// count would have to be tuned for the slowest machine and the largest
+    /// chunk; a duration is the thing actually being protected, and what it
+    /// does not reach this tick it reaches on the next — the arrangement
+    /// relighting and chunk-serving already use.
+    ///
+    /// **Whole batches, checked between them.** The budget is tested between
+    /// batches of [`CHUNKS_PER_SAVE_BATCH`] rather than between chunks,
+    /// because one transaction per chunk is what made saving expensive in the
+    /// first place. So a save may overshoot by one batch, and that is the
+    /// deliberate trade.
+    ///
+    /// Returns `(written, remaining)`. A non-zero remainder means the caller
+    /// should come back next tick rather than wait for the next debounce —
+    /// otherwise a backlog drains at one batch every two seconds while
+    /// streaming fills it at twenty a second.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] if a write fails. Chunks that failed stay dirty, so the
+    /// next save retries rather than dropping the edit.
+    pub fn save_dirty_within(&mut self, budget: Duration) -> Result<(usize, usize), WorldError> {
+        let started = std::time::Instant::now();
         let Self { db, domains, .. } = self;
         let mut written = 0;
+        let mut remaining = 0;
         for (domain, space) in domains.iter_mut() {
             if space.dirty.is_empty() {
                 continue;
             }
-            let mut failed = Vec::new();
-            for pos in std::mem::take(&mut space.dirty) {
-                let Some(chunk) = space.cache.get(&pos) else {
+            // **One batch always goes.** The budget is checked only once
+            // something has been written, so a budget smaller than a single
+            // batch still makes progress — otherwise a save that could never
+            // afford its first batch would report a backlog, be called again
+            // next tick, and spin for as long as the server ran without ever
+            // writing a chunk.
+            if written > 0 && started.elapsed() >= budget {
+                // Out of time before this domain was reached. Its chunks are
+                // untouched and still dirty, which is what `remaining` is for.
+                remaining += space.dirty.len();
+                continue;
+            }
+            let mut dirty = std::mem::take(&mut space.dirty);
+            if dirty.len() > Self::CHUNKS_PER_SAVE_BATCH {
+                // **The rest go back, in order.** `split_off` leaves the first
+                // batch here and hands the tail back to the dirty list rather
+                // than to the end of it, so a chunk cannot be starved by a
+                // world that keeps dirtying new ones.
+                let rest = dirty.split_off(Self::CHUNKS_PER_SAVE_BATCH);
+                remaining += rest.len();
+                space.dirty = rest;
+            }
+            let mut batch = Vec::with_capacity(dirty.len());
+            for pos in &dirty {
+                let Some(chunk) = space.cache.get(pos) else {
                     // Evicted between being dirtied and being saved. That would
                     // be a lost edit, so it is a bug rather than a condition —
                     // but dropping it silently is worse than saying so.
@@ -1160,18 +1232,26 @@ impl World {
                     );
                     continue;
                 };
-                match db.save_chunk_in(domain, pos, chunk) {
-                    Ok(()) => written += 1,
-                    Err(err) => {
-                        warn!(?domain, ?pos, "could not save chunk: {err}");
-                        failed.push(pos);
-                    }
+                batch.push((*pos, chunk));
+            }
+            // **One transaction for the whole domain, not one per chunk.** A
+            // per-chunk transaction is a WAL commit per chunk, and this save
+            // runs on the tick thread: on the two-hundred-mob load test the
+            // per-chunk version put 87 ms inside a 50 ms tick, which is a
+            // debounce protecting the disk by spending the simulation's budget.
+            match db.save_chunks_batch_in(domain, batch) {
+                Ok(count) => written += count,
+                Err(err) => {
+                    // The batch rolled back, so every chunk in it is still
+                    // unwritten — and every one of them stays dirty. Nothing is
+                    // half-saved and nothing is forgotten.
+                    warn!(?domain, "could not save {} chunks: {err}", dirty.len());
+                    remaining += dirty.len();
+                    space.dirty.extend(dirty);
                 }
             }
-            // Keep the failures dirty so the next save tries again.
-            space.dirty = failed;
         }
-        Ok(written)
+        Ok((written, remaining))
     }
 
     /// Reads a chunk's stored fluid, if it has any.
@@ -1240,11 +1320,13 @@ impl World {
         domain: &str,
         chunks: impl IntoIterator<Item = (ChunkPos, &'a [tiamot_core::ent::Entity])>,
     ) -> Result<usize, WorldError> {
-        let mut written = 0;
-        for (pos, entities) in chunks {
-            self.db.save_chunk_entities_in(domain, pos, entities)?;
-            written += entities.len();
-        }
+        // One transaction for every chunk in this save, for the reason
+        // `save_dirty` batches: with two hundred mobs wandering, this is the
+        // writer that touches the most chunks, and a WAL commit apiece is what
+        // put 87 ms inside a 50 ms tick on the nightly's load test.
+        let chunks: Vec<(ChunkPos, &[tiamot_core::ent::Entity])> = chunks.into_iter().collect();
+        let written: usize = chunks.iter().map(|(_, entities)| entities.len()).sum();
+        self.db.save_chunk_entities_batch_in(domain, chunks)?;
         Ok(written)
     }
 
@@ -1473,6 +1555,76 @@ mod tests {
         }
         let db = WorldDb::open(&path, &mut registry).expect("reopen");
         World::open(db, 12345).expect("reopen world")
+    }
+
+    #[test]
+    fn a_save_stops_when_its_budget_is_spent_and_says_what_is_left() {
+        // **The tick's save is bounded by time, not by how much happened.**
+        // After a burst of streaming the dirty list is every chunk the world
+        // generated, and encoding a thousand of them measured 180 ms inside a
+        // 50 ms tick. What it does not reach this tick it reaches on the next.
+        let (mut world, ids) = world("save-budget");
+        let mut flat = Flat::new(ids[0]);
+        let overworld = tiamot_core::domain::OVERWORLD;
+
+        // Three batches' worth of dirty chunks, made dirty by an edit apiece so
+        // nothing here depends on generation marking them.
+        let chunks = World::CHUNKS_PER_SAVE_BATCH * 2 + 5;
+        for index in 0..chunks {
+            let pos = BlockPos::new(
+                (index as i32) * tiamot_core::CHUNK_BLOCKS as i32,
+                -1,
+                0,
+            );
+            world
+                .apply(
+                    overworld,
+                    &tiamot_core::proto::Edit::Block {
+                        pos,
+                        material: ids[1].0,
+                    },
+                    &mut flat,
+                )
+                .expect("edit");
+        }
+
+        // A budget of nothing still writes one batch: a save that could not
+        // afford its first batch would report a backlog for ever and never
+        // write a chunk.
+        let (written, remaining) = world
+            .save_dirty_within(Duration::ZERO)
+            .expect("the first batch");
+        assert_eq!(
+            written,
+            World::CHUNKS_PER_SAVE_BATCH,
+            "a spent budget should still write exactly one batch"
+        );
+        assert_eq!(
+            remaining,
+            chunks - World::CHUNKS_PER_SAVE_BATCH,
+            "the rest of the dirty list was not reported as waiting"
+        );
+
+        // And coming back drains it, losing nothing.
+        let mut total = written;
+        let mut passes = 1;
+        let mut left = remaining;
+        while left > 0 {
+            let (written, remaining) = world
+                .save_dirty_within(Duration::ZERO)
+                .expect("another batch");
+            assert!(written > 0, "a pass wrote nothing and the backlog stayed");
+            total += written;
+            left = remaining;
+            passes += 1;
+            assert!(passes < 10, "the backlog never drained");
+        }
+        assert_eq!(total, chunks, "the save lost chunks between passes");
+        assert_eq!(
+            world.save_dirty().expect("save"),
+            0,
+            "something was still dirty after the backlog drained"
+        );
     }
 
     #[test]

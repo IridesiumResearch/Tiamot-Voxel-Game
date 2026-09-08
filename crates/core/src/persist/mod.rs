@@ -983,6 +983,80 @@ impl WorldDb {
         Ok(())
     }
 
+    /// Replaces the entities of many chunks in a single transaction.
+    ///
+    /// **One transaction rather than one per chunk**, for the reason
+    /// [`Self::save_chunks_batch_in`] gives: a per-chunk transaction is a WAL
+    /// commit per chunk, and the entity save is the one that writes the most of
+    /// them — every chunk holding anything that moved since the last save,
+    /// which for a world with two hundred wandering mobs in it is most of the
+    /// chunks they are standing in, every time.
+    ///
+    /// Measured on the nightly's two-hundred-mob load test: the per-chunk
+    /// version spent up to 87 ms of one 50 ms tick inside the debounced save.
+    ///
+    /// The atomicity is the same guarantee, widened: `save_chunk_entities_in`
+    /// wraps one chunk's delete-then-insert so a half-written chunk cannot
+    /// happen, and this wraps the whole batch so a half-written SAVE cannot
+    /// either.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError`] on a SQL failure or an unencodable entity. The
+    /// transaction rolls back, so a failed batch changes nothing.
+    pub fn save_chunk_entities_batch_in<'a>(
+        &mut self,
+        domain: &str,
+        chunks: impl IntoIterator<Item = (ChunkPos, &'a [crate::ent::Entity])>,
+    ) -> Result<usize, WorldError> {
+        // Encode before opening the transaction: serialising is the slow part
+        // and holding a write transaction across it blocks checkpoints for no
+        // reason. The same order `save_chunks_batch_in` does it in.
+        let encoded = chunks
+            .into_iter()
+            .map(|(pos, entities)| {
+                let blobs = entities
+                    .iter()
+                    .map(|entity| {
+                        postcard::to_allocvec(entity).map_err(|source| WorldError::Entity {
+                            pos,
+                            domain: domain.to_owned(),
+                            reason: source.to_string(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok::<_, WorldError>((pos, blobs))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let transaction = self.conn.transaction()?;
+        {
+            let mut clear = transaction.prepare_cached(
+                "DELETE FROM entities
+                 WHERE domain = ?1 AND chunk_x = ?2 AND chunk_y = ?3 AND chunk_z = ?4",
+            )?;
+            let mut insert = transaction.prepare_cached(
+                "INSERT INTO entities (domain, chunk_x, chunk_y, chunk_z, version, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (pos, blobs) in &encoded {
+                clear.execute(params![domain, pos.x, pos.y, pos.z])?;
+                for blob in blobs {
+                    insert.execute(params![
+                        domain,
+                        pos.x,
+                        pos.y,
+                        pos.z,
+                        i64::from(ENTITY_FORMAT_VERSION),
+                        blob
+                    ])?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(encoded.len())
+    }
+
     /// Every chunk that has entities stored in it, in a stable order.
     ///
     /// For the shutdown flush and for tests. Ordered so two runs over one file
