@@ -143,6 +143,11 @@ fn twenty_bots_for_sixty_seconds_leave_the_server_healthy() {
 
     println!("{}", report.to_table());
     println!("  bots healthy: {healthy}/{BOTS}");
+    // Which phase the worst tick spent itself on, so a nightly failure names a
+    // cause rather than handing whoever reads it a bisect.
+    if let Some(phases) = control.slowest_phases() {
+        println!("  the slowest tick: {phases}");
+    }
     for failure in &failures {
         println!("  failure: {failure}");
     }

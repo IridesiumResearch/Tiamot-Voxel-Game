@@ -180,6 +180,12 @@ fn two_hundred_scripted_mobs_keep_the_tick_inside_its_budget() {
     );
     println!("{}", report.to_table());
     println!("  entities the watcher was told about: {seen}");
+    // **What the worst tick actually spent its time on.** A load test that
+    // reports only "eleven ticks ran over budget" hands whoever reads the
+    // nightly a bisect; this hands them a phase name.
+    if let Some(phases) = control.slowest_phases() {
+        println!("  the slowest tick: {phases}");
+    }
 
     assert!(
         seen >= MOBS as usize,

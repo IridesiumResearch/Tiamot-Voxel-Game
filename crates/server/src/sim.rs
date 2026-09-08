@@ -75,6 +75,102 @@ impl Clock for MonotonicClock {
     }
 }
 
+/// Where one tick's time went, phase by phase.
+///
+/// # Why the tick measures itself
+///
+/// "Eleven of six hundred ticks ran over the 50 ms budget" is a fact nobody can
+/// act on. The tick does a dozen different jobs — it serves chunks, relights
+/// them, runs every mod's hooks, steps two hundred bodies, moves fluid and
+/// writes the world to disk — and which of them spent the 135 ms is the whole
+/// question. Without this the answer is a bisect through constants, and a load
+/// test that fails on a nightly runner nobody can attach a profiler to says
+/// only that something got slower.
+///
+/// So: a mark at each phase boundary, and a named breakdown whenever a tick
+/// runs over. It costs one `Instant::now()` per phase — about a dozen a tick,
+/// some tens of nanoseconds — and the `String` is built only for a tick that
+/// has already lost its budget.
+#[derive(Debug)]
+pub struct Phases {
+    started: Instant,
+    at: Instant,
+    spans: Vec<(&'static str, Duration)>,
+}
+
+impl Default for Phases {
+    fn default() -> Self {
+        Self::start()
+    }
+}
+
+impl Phases {
+    /// Begins a tick's measurement.
+    #[must_use]
+    pub fn start() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            at: now,
+            spans: Vec::with_capacity(16),
+        }
+    }
+
+    /// Begins another tick's measurement, keeping the allocation.
+    pub fn restart(&mut self) {
+        let now = Instant::now();
+        self.started = now;
+        self.at = now;
+        self.spans.clear();
+    }
+
+    /// Closes the phase that ends here and names it.
+    ///
+    /// Every phase is the time since the last mark, so a boundary that is
+    /// missed shows up as time attributed to the phase after it rather than as
+    /// time that vanished. That is the failure mode worth having: the total
+    /// always adds up to the tick.
+    pub fn mark(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        self.spans.push((phase, now.duration_since(self.at)));
+        self.at = now;
+    }
+
+    /// How long the tick has taken so far.
+    #[must_use]
+    pub fn total(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// The phases that cost anything, largest first, as one line.
+    ///
+    /// Everything under 1% of the budget is dropped: a breakdown of twelve
+    /// phases where nine are noise is a line nobody reads to the end.
+    #[must_use]
+    pub fn report(&self) -> String {
+        let mut spans: Vec<(&'static str, Duration)> = self
+            .spans
+            .iter()
+            .filter(|(_, took)| took.as_micros() >= 500)
+            .copied()
+            .collect();
+        spans.sort_by_key(|(_, took)| std::cmp::Reverse(*took));
+        let named: Vec<String> = spans
+            .iter()
+            .map(|(phase, took)| format!("{phase} {:.1}ms", took.as_secs_f64() * 1000.0))
+            .collect();
+        format!(
+            "{:.1}ms total: {}",
+            self.total().as_secs_f64() * 1000.0,
+            if named.is_empty() {
+                "nothing over 0.5ms".to_owned()
+            } else {
+                named.join(", ")
+            }
+        )
+    }
+}
+
 /// Shared control surface for a running simulation.
 ///
 /// Cloneable and cheap; the network and RCON layers hold one to ask the
@@ -103,6 +199,15 @@ struct ControlInner {
     /// already there, at about 1.4 ms a chunk.
     full_relights: AtomicU64,
     lit_chunks: AtomicU64,
+    /// The breakdown of the slowest tick so far, if one has run over budget.
+    ///
+    /// Kept as text rather than as numbers because the only consumers are a
+    /// human reading a log and a load test printing what it just failed on —
+    /// and a load test that says which phase blew the budget is one somebody
+    /// can act on without reproducing it.
+    slowest_phases: std::sync::Mutex<Option<String>>,
+    /// How long the tick behind `slowest_phases` took, in microseconds.
+    slowest_phase_micros: AtomicU64,
     /// Per-tick durations in microseconds, for the macro benchmark.
     ///
     /// A bounded buffer: a server running for a week must not accumulate a
@@ -252,6 +357,37 @@ impl Control {
     #[must_use]
     pub fn take_save_request(&self) -> bool {
         self.inner.save_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Records what an over-budget tick spent its time on, if it is the worst.
+    ///
+    /// Worst rather than latest: a run's last slow tick is whichever one
+    /// happened to be near the end, and the one worth explaining is the one
+    /// that took longest.
+    pub fn note_tick_phases(&self, micros: u64, report: &str) {
+        // Its own high-water mark rather than `slowest_micros`, which the tick
+        // loop has already updated with this very tick by the time anything
+        // asks — comparing against it would refuse to record the tick that set
+        // it, which is every tick worth recording.
+        if micros <= self.inner.slowest_phase_micros.load(Ordering::Relaxed) {
+            return;
+        }
+        self.inner
+            .slowest_phase_micros
+            .store(micros, Ordering::Relaxed);
+        if let Ok(mut held) = self.inner.slowest_phases.lock() {
+            *held = Some(report.to_owned());
+        }
+    }
+
+    /// What the slowest tick spent its time on, if anything recorded it.
+    #[must_use]
+    pub fn slowest_phases(&self) -> Option<String> {
+        self.inner
+            .slowest_phases
+            .lock()
+            .ok()
+            .and_then(|held| held.clone())
     }
 
     /// How many ticks ran over the 50 ms budget.

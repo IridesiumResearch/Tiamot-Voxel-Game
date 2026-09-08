@@ -165,6 +165,11 @@ fn twenty_bots_churning_lamps_keep_the_tick_inside_its_budget() {
 
     println!("{}", report.to_table());
     println!("  bots healthy: {healthy}/{BOTS}, lamp edits: {edits}");
+    // Which phase the worst tick spent itself on, so a nightly failure names a
+    // cause rather than handing whoever reads it a bisect.
+    if let Some(phases) = control.slowest_phases() {
+        println!("  the slowest tick: {phases}");
+    }
     for failure in &failures {
         println!("  failure: {failure}");
     }
