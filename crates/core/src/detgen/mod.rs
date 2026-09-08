@@ -34,8 +34,8 @@ pub mod noise;
 pub mod rng;
 pub mod trig;
 
-pub use buffer::{BufferError, ChunkBuffer};
-pub use density::{Axis, Density, DensityError, MAX_DEPTH, MAX_OPS, Op, default_params};
+pub use buffer::{BufferError, ChunkBuffer, Detail};
+pub use density::{Axis, Density, DensityError, MAX_DEPTH, MAX_OPS, Op, Scratch, default_params};
 pub use map::{Combine, Map, MapError};
 pub use noise::{
     Fractal, FractalParams, Region2d, Region3d, fill_2d, fill_3d, fractal_2d, fractal_3d,

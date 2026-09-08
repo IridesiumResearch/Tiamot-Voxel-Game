@@ -78,17 +78,37 @@ function ChunkBuffer:fill_below_heightmap(heightmap, material) end
 ---This is how you get terrain a heightmap cannot describe: overhangs, arches,
 ---and caves. See `game.density`.
 ---
----Evaluated at BLOCK resolution — one sample per block. Sub-node resolution is
----27 times the samples and is not offered; carve detail afterwards with
----`set_subnode`, where the cost is proportional to what you actually change.
+---Evaluated at BLOCK resolution by default — one sample per block.
 ---
----Measured on the reference machine, per chunk: **358 us** for a single noise
----node, **719 us** for terrain with caves cut out of it. For comparison a
----heightmap generator is 52 us and lighting the same chunk is 1.44 ms. It runs
----once, when the chunk is first generated, and never again.
+---**Pass `{ detail = "smooth" }` or `{ detail = "sampled" }` for terrain at
+---sub-node resolution**, which is how you get slopes that are not staircases
+---without writing 110,592 `set_subnode` calls a chunk. The engine samples only
+---the blocks the surface actually CROSSES: a block deep in the ground is solid
+---in all 27 of its cells and one in open air is empty in all of them, and
+---neither is worth asking about twice.
+---
+---- `"smooth"` interpolates the block-resolution samples down to the cells.
+---  Cheap, and it cannot show anything finer than the block-scale field — it
+---  removes staircases rather than adding detail.
+---- `"sampled"` asks your field about all 27 cells, so a high-frequency term
+---  you add shows up in the terrain.
+---
+---Measured on the reference machine, per chunk, for terrain with caves:
+---**729 us** at block resolution, **1.08 ms** smooth (1.5x), **3.98 ms**
+---sampled (5.5x). A single noise node is 358 us, a heightmap generator 52 us,
+---and lighting the same chunk 1.44 ms. It runs once, when the chunk is first
+---generated, and never again — but a server streaming chunks generates many per
+---tick, so 5.5x is a real choice rather than a free one.
+---
+---```lua
+---buf:fill_density(field, stone)                          -- blocks, as before
+---buf:fill_density(field, stone, { detail = "smooth" })   -- no staircases
+---buf:fill_density(field, stone, { detail = "sampled" })  -- and fine detail
+---```
 ---@param density Tiamot.Density
 ---@param material integer
-function ChunkBuffer:fill_density(density, material) end
+---@param options table? `{ detail = "smooth" | "sampled" }`
+function ChunkBuffer:fill_density(density, material, options) end
 
 ---Fills every block below `level` with a fluid, around the terrain.
 ---

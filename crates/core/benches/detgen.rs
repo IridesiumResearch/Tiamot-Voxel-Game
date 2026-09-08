@@ -227,6 +227,65 @@ fn bench_density(c: &mut Criterion) {
     group.finish();
 }
 
+/// What sub-node terrain costs against the block-resolution fill it replaces.
+///
+/// **The number that decides whether the mechanism is usable.** Sampling a
+/// whole chunk at sub-node resolution is 27x the samples — 19 ms against a
+/// 50 ms tick shared by everything (charter rule 18) — which is why
+/// `fill_density_detail` samples only the blocks the surface crosses. This says
+/// what that shell actually costs on the terrain it exists for.
+fn bench_density_detail(c: &mut Criterion) {
+    use tiamot_core::ChunkPos;
+    use tiamot_core::detgen::{Axis, ChunkBuffer, Density, Detail, Op, default_params};
+    use tiamot_core::material::MaterialId;
+
+    // The same terrain-with-caves the block-resolution bench uses, so the two
+    // numbers can be read against each other.
+    let program = vec![
+        Op::Noise {
+            params: default_params(),
+            amplitude: 1.0,
+            stream: 1,
+        },
+        Op::Coordinate(Axis::Y),
+        Op::Constant(0.05),
+        Op::Multiply,
+        Op::Subtract,
+        Op::Constant(0.4),
+        Op::Noise {
+            params: default_params(),
+            amplitude: 1.0,
+            stream: 2,
+        },
+        Op::Absolute,
+        Op::Subtract,
+        Op::Minimum,
+    ];
+    let density = Density::compile(program).expect("compile");
+    let stone = MaterialId(2);
+
+    let mut group = c.benchmark_group("density_detail");
+    group.bench_function("blocks", |b| {
+        b.iter(|| {
+            let mut buffer = ChunkBuffer::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+            buffer.fill_density(&density, 42, stone).expect("fill");
+            black_box(buffer.is_expanded())
+        });
+    });
+    for (name, detail) in [("smooth", Detail::Smooth), ("sampled", Detail::Sampled)] {
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let mut buffer = ChunkBuffer::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+                buffer
+                    .fill_density_detail(&density, 42, stone, detail)
+                    .expect("fill");
+                black_box(buffer.is_expanded())
+            });
+        });
+    }
+    group.finish();
+}
+
 /// Per-octave cost, so a mod author can reason about what they are asking for.
 fn bench_noise_shapes(c: &mut Criterion) {
     let mut group = c.benchmark_group("noise");
@@ -298,6 +357,7 @@ criterion_group!(
     bench_noise_shapes,
     bench_fingerprint,
     bench_rng,
-    bench_density
+    bench_density,
+    bench_density_detail
 );
 criterion_main!(benches);

@@ -21,7 +21,7 @@
 //!
 //! This is the object handed to Lua generator callbacks in Task 05.
 
-use crate::block::{BlockValue, Cells, EMPTY_CELLS, subnode_index};
+use crate::block::{BlockValue, Cells, EMPTY_CELLS, SUBNODES_PER_BLOCK, subnode_index};
 use crate::chunk::Chunk;
 use crate::coords::{ChunkPos, LocalBlock};
 use crate::material::MaterialId;
@@ -53,6 +53,73 @@ pub struct ChunkBuffer {
     /// majority of chunks have no fluid at all and an empty layer costs
     /// nothing.
     fluid: crate::fluid::FluidLayer,
+}
+
+/// How much resolution a density fill gives the surface.
+///
+/// Block resolution is the default and costs what it always did. The other two
+/// are the opt-in of Sub-Node Contract §5, and they differ in what they can
+/// SHOW rather than only in what they cost — see
+/// [`ChunkBuffer::fill_density_detail`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// Ask the field about all 27 cells of a surface block.
+    ///
+    /// The finest answer available, and the only one that can show a term the
+    /// mod added at sub-node scale.
+    Sampled,
+    /// Interpolate the block-resolution samples down to the 27 cells.
+    ///
+    /// Nearly free, and it cannot show anything the block-resolution field did
+    /// not already contain: it removes staircases rather than adding detail.
+    Smooth,
+}
+
+/// Trilinearly interpolates a block's eight corner samples to its 27 cells.
+///
+/// The samples are at block ORIGINS, so a block's eight corners are the samples
+/// at its own position and the seven one step along each axis — which is why
+/// the caller's field is padded on the positive side as well as the negative.
+///
+/// Cell centres rather than cell corners: cell `c` spans `c/3 .. (c+1)/3` of
+/// the block, so its middle is `(c + 0.5) / 3`. Sampling the corner instead
+/// would bias every surface half a cell towards the block's origin, which over
+/// a whole world reads as terrain sitting slightly too low.
+fn trilinear_cells(field: &[f32], pitch: usize, at: [usize; 3], out: &mut [f32]) {
+    let [px, py, pz] = at;
+    let corner = |dx: usize, dy: usize, dz: usize| {
+        field[(px + dx) + pitch * ((py + dy) + pitch * (pz + dz))]
+    };
+    let c000 = corner(0, 0, 0);
+    let c100 = corner(1, 0, 0);
+    let c010 = corner(0, 1, 0);
+    let c110 = corner(1, 1, 0);
+    let c001 = corner(0, 0, 1);
+    let c101 = corner(1, 0, 1);
+    let c011 = corner(0, 1, 1);
+    let c111 = corner(1, 1, 1);
+
+    let axis = SUBNODES_PER_AXIS as usize;
+    for z in 0..axis {
+        let tz = (z as f32 + 0.5) / axis as f32;
+        for y in 0..axis {
+            let ty = (y as f32 + 0.5) / axis as f32;
+            for x in 0..axis {
+                let tx = (x as f32 + 0.5) / axis as f32;
+                // Written as explicit multiply-adds rather than `mul_add`:
+                // charter rule 4 bans the latter, because it uses a hardware
+                // FMA where there is one and a software fallback where there
+                // is not, and the two round differently.
+                let x00 = c000 + (c100 - c000) * tx;
+                let x10 = c010 + (c110 - c010) * tx;
+                let x01 = c001 + (c101 - c001) * tx;
+                let x11 = c011 + (c111 - c011) * tx;
+                let y0 = x00 + (x10 - x00) * ty;
+                let y1 = x01 + (x11 - x01) * ty;
+                out[subnode_index(x as u32, y as u32, z as u32)] = y0 + (y1 - y0) * tz;
+            }
+        }
+    }
 }
 
 impl ChunkBuffer {
@@ -224,6 +291,130 @@ impl ChunkBuffer {
                         self.set_block(LocalBlock::new(x, y, z), material);
                     }
                     index += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fills from a density field at SUB-NODE resolution, near the surface.
+    ///
+    /// # Why this is not twenty-seven times the cost
+    ///
+    /// A chunk is mostly not surface. Every block deep inside the ground is
+    /// solid in all twenty-seven of its cells and every block in open air is
+    /// empty in all of them, and sampling either at sub-node resolution asks a
+    /// question whose answer was already known. Only the blocks the isosurface
+    /// actually CROSSES need the finer look, and they are a shell through the
+    /// chunk rather than a volume of it.
+    ///
+    /// So: one block-resolution pass over the chunk and one block of padding
+    /// around it, then the fine pass on the blocks whose own sample disagrees
+    /// in sign with one of their six neighbours. A generator pays for the shell
+    /// rather than for the volume.
+    ///
+    /// # The two kinds of detail
+    ///
+    /// [`Detail::Sampled`] asks the field itself about all twenty-seven cells,
+    /// so a mod that adds a high-frequency term to its density sees that term
+    /// in the terrain. [`Detail::Smooth`] interpolates the block-resolution
+    /// samples it already has, which costs almost nothing and cannot show
+    /// anything finer than the block-scale field — it removes staircases rather
+    /// than adding detail. Both produce a surface that follows the isosurface
+    /// at sub-node resolution, which is the thing block resolution cannot do.
+    ///
+    /// # Errors
+    ///
+    /// [`BufferError`] if the density program cannot be evaluated.
+    pub fn fill_density_detail(
+        &mut self,
+        density: &super::density::Density,
+        seed: u64,
+        material: MaterialId,
+        detail: Detail,
+    ) -> Result<(), BufferError> {
+        // Padded by one block on every side, because whether a block is on the
+        // surface is a question about its NEIGHBOURS, and the ones at the chunk
+        // edge have neighbours in the next chunk. Cheaper than it looks: 18³ is
+        // 1.4x the samples of 16³, and it is the only extra field work the
+        // smooth path does at all.
+        const PAD: usize = 1;
+        let side = CHUNK_BLOCKS as usize;
+        let padded = side + PAD * 2;
+        let origin = [
+            self.pos.x * CHUNK_BLOCKS as i32,
+            self.pos.y * CHUNK_BLOCKS as i32,
+            self.pos.z * CHUNK_BLOCKS as i32,
+        ];
+        let region = super::noise::Region3d {
+            origin_x: (origin[0] - PAD as i32) as f32,
+            origin_y: (origin[1] - PAD as i32) as f32,
+            origin_z: (origin[2] - PAD as i32) as f32,
+            step: 1.0,
+            width: padded,
+            height: padded,
+            depth: padded,
+        };
+        let mut field = vec![0.0f32; region.len()];
+        let mut scratch = super::density::Scratch::default();
+        density.evaluate_with(seed, &region, &mut field, &mut scratch)?;
+
+        // x-fastest, matching `Region3d`'s own layout.
+        let at = |x: usize, y: usize, z: usize| field[x + padded * (y + padded * z)];
+
+        let mut cells = [MaterialId::AIR; SUBNODES_PER_BLOCK];
+        let mut fine = vec![0.0f32; SUBNODES_PER_BLOCK];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let (px, py, pz) = (x + PAD, y + PAD, z + PAD);
+                    let here = at(px, py, pz) > 0.0;
+                    let surface = [
+                        at(px - 1, py, pz),
+                        at(px + 1, py, pz),
+                        at(px, py - 1, pz),
+                        at(px, py + 1, pz),
+                        at(px, py, pz - 1),
+                        at(px, py, pz + 1),
+                    ]
+                    .iter()
+                    .any(|value| (*value > 0.0) != here);
+
+                    let local = LocalBlock::new(x as u32, y as u32, z as u32);
+                    if !surface {
+                        // Wholly inside or wholly outside: the answer at block
+                        // resolution is the answer, and writing it as a block
+                        // keeps the buffer unexpanded where nothing is carved.
+                        if here {
+                            self.set_block(local, material);
+                        }
+                        continue;
+                    }
+
+                    match detail {
+                        Detail::Sampled => {
+                            let cell_region = super::noise::Region3d {
+                                origin_x: (origin[0] + x as i32) as f32,
+                                origin_y: (origin[1] + y as i32) as f32,
+                                origin_z: (origin[2] + z as i32) as f32,
+                                step: 1.0 / SUBNODES_PER_AXIS as f32,
+                                width: SUBNODES_PER_AXIS as usize,
+                                height: SUBNODES_PER_AXIS as usize,
+                                depth: SUBNODES_PER_AXIS as usize,
+                            };
+                            density.evaluate_with(seed, &cell_region, &mut fine, &mut scratch)?;
+                        }
+                        Detail::Smooth => trilinear_cells(&field, padded, [px, py, pz], &mut fine),
+                    }
+
+                    for (index, value) in fine.iter().enumerate() {
+                        cells[index] = if *value > 0.0 {
+                            material
+                        } else {
+                            MaterialId::AIR
+                        };
+                    }
+                    self.set_block_cells(local, &cells);
                 }
             }
         }
@@ -496,6 +687,128 @@ mod tests {
 
     fn origin() -> ChunkPos {
         ChunkPos::new(0, 0, 0)
+    }
+
+    /// A field that is positive below a sloping plane: y < x/4, so the surface
+    /// crosses blocks at a shallow angle that block resolution has to stair-step
+    /// and sub-node resolution does not.
+    fn slope() -> super::super::density::Density {
+        use super::super::density::{Axis, Op};
+        super::super::density::Density::compile(vec![
+            Op::Coordinate(Axis::X),
+            Op::Constant(0.25),
+            Op::Multiply,
+            Op::Coordinate(Axis::Y),
+            Op::Subtract,
+        ])
+        .expect("compile")
+    }
+
+    #[test]
+    fn detail_carves_the_surface_and_leaves_the_depths_alone() {
+        // **The mechanism in one assertion.** A block deep inside the ground is
+        // solid in all 27 of its cells and a block in open air is empty in all
+        // of them; only the blocks the surface crosses are worth 27 samples.
+        // What must NOT happen is the depths being carved — that would be the
+        // shell test misfiring, and it would look like holes in the ground.
+        let mut buffer = ChunkBuffer::new(origin(), MaterialId::AIR);
+        buffer
+            .fill_density_detail(&slope(), 7, MaterialId(2), Detail::Sampled)
+            .expect("fill");
+
+        // Deep below the slope: solid, every cell.
+        for cell in 0..SUBNODES_PER_BLOCK {
+            let (sx, sy, sz) = crate::block::subnode_offset(cell);
+            assert_eq!(
+                buffer.get_subnode(LocalBlock::new(8, 0, 8), sx, sy, sz),
+                MaterialId(2),
+                "a block under the surface was carved"
+            );
+        }
+        // Well above it: empty, every cell.
+        for cell in 0..SUBNODES_PER_BLOCK {
+            let (sx, sy, sz) = crate::block::subnode_offset(cell);
+            assert_eq!(
+                buffer.get_subnode(LocalBlock::new(0, 12, 0), sx, sy, sz),
+                MaterialId::AIR,
+                "a block in open air was filled"
+            );
+        }
+    }
+
+    #[test]
+    fn detail_gives_a_surface_block_some_cells_and_not_others() {
+        // The point of sub-node worldgen: a block the surface crosses comes out
+        // PART full. At block resolution every block is all or nothing, which
+        // is the staircase a mod author is trying to get rid of.
+        for detail in [Detail::Sampled, Detail::Smooth] {
+            let mut buffer = ChunkBuffer::new(origin(), MaterialId::AIR);
+            buffer
+                .fill_density_detail(&slope(), 7, MaterialId(2), detail)
+                .expect("fill");
+            assert!(
+                buffer.is_expanded(),
+                "{detail:?} produced no sub-node detail at all"
+            );
+
+            let mut partial = 0;
+            for x in 0..CHUNK_BLOCKS {
+                for y in 0..CHUNK_BLOCKS {
+                    let filled = (0..SUBNODES_PER_BLOCK)
+                        .filter(|cell| {
+                            let (sx, sy, sz) = crate::block::subnode_offset(*cell);
+                            buffer.get_subnode(LocalBlock::new(x, y, 0), sx, sy, sz)
+                                != MaterialId::AIR
+                        })
+                        .count();
+                    if filled > 0 && filled < SUBNODES_PER_BLOCK {
+                        partial += 1;
+                    }
+                }
+            }
+            assert!(
+                partial > 0,
+                "{detail:?} left every block all-or-nothing, which is block resolution"
+            );
+        }
+    }
+
+    #[test]
+    fn detail_agrees_with_the_block_fill_about_what_is_solid() {
+        // A sub-node fill must not MOVE the terrain. Every block the block-
+        // resolution pass fills is at least partly filled here, and every block
+        // it leaves empty is at most partly filled — so a mod switching detail
+        // on gets the same landscape at a finer resolution rather than a
+        // different one.
+        let density = slope();
+        let mut blocks = ChunkBuffer::new(origin(), MaterialId::AIR);
+        blocks
+            .fill_density(&density, 7, MaterialId(2))
+            .expect("fill");
+        let mut fine = ChunkBuffer::new(origin(), MaterialId::AIR);
+        fine.fill_density_detail(&density, 7, MaterialId(2), Detail::Smooth)
+            .expect("fill");
+
+        for x in 0..CHUNK_BLOCKS {
+            for y in 0..CHUNK_BLOCKS {
+                let local = LocalBlock::new(x, y, 4);
+                let coarse = blocks.get_subnode(local, 0, 0, 0) != MaterialId::AIR;
+                let filled = (0..SUBNODES_PER_BLOCK)
+                    .filter(|cell| {
+                        let (sx, sy, sz) = crate::block::subnode_offset(*cell);
+                        fine.get_subnode(local, sx, sy, sz) != MaterialId::AIR
+                    })
+                    .count();
+                if coarse {
+                    assert!(filled > 0, "({x},{y}) was solid and came out empty");
+                } else {
+                    assert!(
+                        filled < SUBNODES_PER_BLOCK,
+                        "({x},{y}) was empty and came out solid"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

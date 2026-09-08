@@ -742,6 +742,87 @@ end)
 }
 
 #[test]
+fn a_generator_can_ask_for_sub_node_terrain_without_writing_cells_by_hand() {
+    // **Asked for by a mod author writing a worldgen mod**, whose complaint was
+    // that sub-node worldgen has to be done a cell at a time and is therefore
+    // too expensive to use. It was: `set_subnode` was the only sub-node write,
+    // and covering a chunk with it is 110,592 calls into Lua.
+    //
+    // Now the resolution is an argument to the fill the mod was already doing,
+    // and the whole 27x sample cost happens in Rust — and only for the blocks
+    // the surface actually crosses, which is why it is 1.5x or 5.5x rather than
+    // 27x. Sub-Node Contract §5: block resolution by default, sub-node opt-in.
+    let root = scratch("subnode-density");
+    write_mod(
+        &root,
+        "hills",
+        "",
+        r#"
+local stone = game.register_block{ id = "stone" }
+
+-- A surface that slopes, so it crosses blocks at an angle. At block resolution
+-- this is a staircase; the whole point of sub-node detail is that it is not.
+local field = {
+    op = "sub",
+    a = { op = "noise", stream = "terrain", frequency = 0.02, octaves = 3 },
+    b = { op = "mul", a = { op = "y" }, b = { op = "const", value = 0.08 } },
+}
+
+game.register_on_generate(function(buf, pos)
+    buf:fill_density(game.density(field), stone, { detail = "smooth" })
+end)
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+    let stone = *host
+        .vm()
+        .block_ids()
+        .get("hills:stone")
+        .expect("the mod registers hills:stone");
+
+    // Somewhere in the region there must be a PARTIAL block: one the surface
+    // crosses, holding some of its 27 cells and not others. At block resolution
+    // every block is all or nothing, and that is the staircase.
+    let mut partial = 0;
+    let mut solid = 0;
+    for cy in -2..=0 {
+        let chunk = host
+            .generate_chunk(
+                tiamot_core::domain::OVERWORLD,
+                99,
+                ChunkPos::new(0, cy, 0),
+                MaterialId::AIR,
+            )
+            .expect("generate");
+        for x in 0..16u32 {
+            for y in 0..16u32 {
+                for z in 0..16u32 {
+                    let block = chunk.get_block_local(LocalBlock::new(x, y, z));
+                    let filled = (0..27).filter(|cell| block.subnode(*cell) == stone).count();
+                    if filled == 27 {
+                        solid += 1;
+                    } else if filled > 0 {
+                        partial += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(solid > 0, "the generator produced no terrain at all");
+    assert!(
+        partial > 0,
+        "every block was all-or-nothing, so the fill was still at block resolution"
+    );
+}
+
+#[test]
 fn a_generator_can_fill_a_sea_around_its_terrain() {
     // **The only place an ocean can come from.** The conserved solver moves
     // what exists and creates nothing (Sub-Node Contract §4), so a sea is not

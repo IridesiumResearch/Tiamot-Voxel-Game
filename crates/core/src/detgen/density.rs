@@ -182,6 +182,42 @@ pub enum DensityError {
     Size(#[from] BufferSizeMismatch),
 }
 
+/// Reusable working buffers for [`Density::evaluate_with`].
+///
+/// A density program is a stack machine, and every slot it uses needs a buffer
+/// the size of the region. Held by the caller so that a generator making a
+/// thousand small calls — one per block the surface crosses, at sub-node
+/// resolution — allocates once rather than a thousand times.
+#[derive(Debug, Default)]
+pub struct Scratch {
+    slots: Vec<Vec<f32>>,
+}
+
+impl Scratch {
+    /// Buffers for `depth` slots of `len` values, grown as needed.
+    ///
+    /// Existing buffers are resized rather than replaced, so the steady state
+    /// after the first call is no allocation at all. The contents are not
+    /// cleared: every op writes its whole slot before anything reads it, which
+    /// is the same guarantee the freshly-allocated version relied on.
+    fn slots(&mut self, depth: usize, len: usize) -> &mut [Vec<f32>] {
+        while self.slots.len() < depth {
+            self.slots.push(vec![0.0; len]);
+        }
+        for slot in &mut self.slots[..depth] {
+            // **Exactly `len`, not at least it.** Every op writes and reads a
+            // whole slot, and the region's own length is what says how long
+            // that is — a longer buffer left over from a bigger region would
+            // be a size mismatch at the first `fill_3d`. `resize` down keeps
+            // the capacity, so growing back allocates nothing.
+            if slot.len() != len {
+                slot.resize(len, 0.0);
+            }
+        }
+        &mut self.slots[..depth]
+    }
+}
+
 /// A compiled density program.
 ///
 /// Built once — a mod holds one and hands it to every chunk it generates —
@@ -274,6 +310,33 @@ impl Density {
         region: &Region3d,
         out: &mut [f32],
     ) -> Result<(), DensityError> {
+        self.evaluate_with(seed, region, out, &mut Scratch::default())
+    }
+
+    /// The same, over a scratch buffer the caller keeps.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Self::evaluate`] allocates one buffer per stack slot, which is the
+    /// right trade for the one big call a chunk used to need. Sub-node terrain
+    /// makes a THOUSAND small calls — one 3×3×3 region per block the surface
+    /// crosses — and at that size the allocation is the work. The scratch grows
+    /// to the largest region it has been asked for and is reused after that.
+    ///
+    /// # Errors
+    ///
+    /// [`DensityError::Size`] if `out` is not exactly `region.len()` long.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, if the program produces a NaN — see [`Self::evaluate`].
+    pub fn evaluate_with(
+        &self,
+        seed: u64,
+        region: &Region3d,
+        out: &mut [f32],
+        scratch: &mut Scratch,
+    ) -> Result<(), DensityError> {
         let len = region.len();
         if out.len() != len {
             return Err(DensityError::Size(BufferSizeMismatch {
@@ -282,13 +345,7 @@ impl Density {
             }));
         }
 
-        // One allocation for every slot the program will use, taken once
-        // rather than per operation: a program is evaluated per chunk and a
-        // per-op allocation would be the dominant cost of a small one.
-        let mut stack: Vec<Vec<f32>> = Vec::with_capacity(self.depth);
-        for _ in 0..self.depth {
-            stack.push(vec![0.0; len]);
-        }
+        let stack = scratch.slots(self.depth, len);
         let mut height = 0usize;
 
         for op in &self.ops {

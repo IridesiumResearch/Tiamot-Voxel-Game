@@ -325,12 +325,21 @@ impl mlua::UserData for BufferHandle {
 
         methods.add_method_mut(
             "fill_density",
-            |_, this, (density, material): (mlua::AnyUserData, u16)| {
+            |_, this, (density, material, options): (mlua::AnyUserData, u16, Option<Table>)| {
                 let density = density.borrow::<DensityHandle>()?;
                 let seed = this.world_seed;
-                this.buffer
-                    .fill_density(&density.density, seed, MaterialId(material))
-                    .map_err(|err| mlua::Error::external(err.to_string()))?;
+                match fill_detail_of(options.as_ref())? {
+                    None => this
+                        .buffer
+                        .fill_density(&density.density, seed, MaterialId(material)),
+                    Some(detail) => this.buffer.fill_density_detail(
+                        &density.density,
+                        seed,
+                        MaterialId(material),
+                        detail,
+                    ),
+                }
+                .map_err(|err| mlua::Error::external(err.to_string()))?;
                 Ok(())
             },
         );
@@ -762,6 +771,28 @@ fn container_slot_of(spec: &Table) -> mlua::Result<Option<usize>> {
             "container slots are numbered from 1, and 0 is not one of them",
         )),
         Some(index) => Ok(Some(index - 1)),
+    }
+}
+
+/// A `fill_density` options table's `detail`, or `None` for block resolution.
+///
+/// **Absent means block resolution**, which is what every generator written
+/// before sub-node terrain existed asked for and still gets. Sub-Node Contract
+/// §5: block resolution by default, sub-node opt-in — and opt-in per CALL,
+/// because the caller is the one who knows whether this chunk is worth five
+/// times the field work.
+fn fill_detail_of(options: Option<&Table>) -> mlua::Result<Option<crate::detgen::Detail>> {
+    let word = options
+        .map(|table| table.get::<Option<String>>("detail"))
+        .transpose()?
+        .flatten();
+    match word.as_deref() {
+        None => Ok(None),
+        Some("sampled") => Ok(Some(crate::detgen::Detail::Sampled)),
+        Some("smooth") => Ok(Some(crate::detgen::Detail::Smooth)),
+        Some(other) => Err(mlua::Error::external(format!(
+            "fill_density: `detail` is 'sampled' or 'smooth', not `{other}`"
+        ))),
     }
 }
 
