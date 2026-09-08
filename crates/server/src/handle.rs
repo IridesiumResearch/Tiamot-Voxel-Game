@@ -106,6 +106,10 @@ fn material_table(
                 // both of which are baked into the mesh — so it has to travel
                 // with the material rather than be asked for later.
                 transparent: rules.get(name).is_some_and(|rules| rules.transparent),
+                // Colour variation, which is the client's alone: it multiplies
+                // the texture by a field sampled from world position, and
+                // nothing here ever looks at the answer.
+                tint: rules.get(name).and_then(|rules| rules.tint),
             })
         })
         .collect();

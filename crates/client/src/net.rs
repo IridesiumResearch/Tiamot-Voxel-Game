@@ -1853,6 +1853,7 @@ mod tests {
                 step_sound: None,
                 placeable: true,
                 transparent: false,
+                tint: None,
             })
             .collect()
     }

@@ -291,6 +291,12 @@ pub struct BlockRules {
     /// whether light passes through. NOT collision: glass is solid. See
     /// `docs/subnode-contract.md` §8.1.
     pub transparent: bool,
+    /// How this material's colour varies across the world, if a mod said.
+    ///
+    /// **Presentation only.** Nothing on the server reads it — it travels with
+    /// the material table so the client can multiply the texture by it, and
+    /// charter rule 4's determinism does not reach it (rendering is exempt).
+    pub tint: Option<crate::proto::Tint>,
 }
 
 impl BlockRules {

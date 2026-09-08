@@ -517,6 +517,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                     texture: None,
                     placeable: true,
                     transparent: false,
+                    tint: None,
                     step_sound: None,
                 },
                 MaterialDef {
@@ -525,6 +526,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                     texture: None,
                     placeable: true,
                     transparent: false,
+                    tint: None,
                     step_sound: None,
                 },
                 MaterialDef {
@@ -533,6 +535,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                     texture: Some([0x12; 32]),
                     placeable: true,
                     transparent: false,
+                    tint: None,
                     step_sound: None,
                 },
                 MaterialDef {
@@ -541,6 +544,7 @@ fn server_messages() -> Vec<Vec<u8>> {
                     texture: Some([0x00; 32]),
                     placeable: true,
                     transparent: false,
+                    tint: None,
                     step_sound: None,
                 },
             ],

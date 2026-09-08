@@ -658,6 +658,80 @@ fn flat_mode_draws_the_same_geometry_without_the_atlas() {
 }
 
 #[test]
+fn a_declared_tint_colours_the_world_and_stays_where_the_world_is() {
+    // **Asked for by a mod author writing a worldgen mod**: a large noise
+    // colour field over the block textures, so ground stops reading as a
+    // repeating texture.
+    //
+    // Two assertions, and the second is the one worth having. That a tint
+    // changes pixels is the easy half. The half that is easy to get WRONG is
+    // where the field is anchored: the world shader works in camera-relative
+    // space (floating origin), so a field sampled from the position it already
+    // has would slide over the terrain as the player walks.
+    //
+    // `the_frame_is_identical_at_the_origin_and_at_the_edge_of_the_world`
+    // asserts the untinted frame is the SAME fifty thousand blocks out. A
+    // world-anchored tint must make it different — that is the whole property,
+    // stated as its own opposite.
+    let Some(gpu) = gpu() else { return };
+    use tiamot_core::proto::{MaterialDef, Tint};
+
+    let near = scene();
+    let mut renderer = prepare(gpu, &near, RenderMode::Textured);
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+    let plain = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+
+    // Stone is material 2 — `prepare` puts its texture in slot 2.
+    let table = vec![MaterialDef {
+        step_sound: None,
+        id: 2,
+        name: "test:stone".to_owned(),
+        placeable: true,
+        texture: None,
+        transparent: false,
+        tint: Some(Tint {
+            strength: 255,
+            scale: 24,
+            low: [64, 128, 64],
+            high: [200, 128, 200],
+        }),
+    }];
+    renderer.set_tints(&table);
+    let tinted = target
+        .capture(&mut renderer, &viewpoint())
+        .expect("capture");
+    assert_ne!(
+        perceptual_hash(&plain),
+        perceptual_hash(&tinted),
+        "a declared tint changed nothing on screen"
+    );
+
+    // The same scene at the edge of the world, viewed from the same place
+    // relative to it — which is identical without a tint and must not be with
+    // one.
+    let far_chunk = ChunkPos::new(3125, 0, 3125);
+    renderer.clear();
+    upload(&mut renderer, &scene_at(far_chunk));
+    let corner = BlockPos::from_chunk_corner(far_chunk);
+    let (near_x, near_y, near_z) = viewpoint().position.to_world();
+    let mut far_camera = viewpoint();
+    far_camera.position = Position::from_world(
+        near_x + f64::from(corner.x),
+        near_y + f64::from(corner.y),
+        near_z + f64::from(corner.z),
+    );
+    let far = target.capture(&mut renderer, &far_camera).expect("capture");
+    assert_ne!(
+        perceptual_hash(&tinted),
+        perceptual_hash(&far),
+        "the tint looked the same fifty thousand blocks away, so it is keyed on \
+         the camera rather than on the world — it would swim as a player walked"
+    );
+}
+
+#[test]
 fn the_frame_is_identical_at_the_origin_and_at_the_edge_of_the_world() {
     // Floating origin, as pixels. The unit tests prove the draw offsets match;
     // this proves nothing downstream of them reintroduces a world coordinate.
@@ -3518,6 +3592,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             name: "engine:air".to_owned(),
             placeable: false,
             transparent: false,
+            tint: None,
             texture: None,
         },
         MaterialDef {
@@ -3526,6 +3601,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             name: "engine:unknown".to_owned(),
             placeable: false,
             transparent: false,
+            tint: None,
             texture: None,
         },
         MaterialDef {
@@ -3534,6 +3610,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             name: "test:stone".to_owned(),
             placeable: true,
             transparent: false,
+            tint: None,
             texture: Some([7u8; 32]),
         },
     ];

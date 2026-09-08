@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 41;
+pub const PROTOCOL_VERSION: u32 = 42;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -571,6 +571,87 @@ pub struct HudScriptDef {
     pub file: Option<ContentHash>,
 }
 
+/// How a material's colour varies from place to place.
+///
+/// # What this is for
+///
+/// A wall of one texture is a wall of one texture, and at any distance the
+/// repeat is the first thing the eye finds. Real ground is not uniform: it
+/// shifts in tone over tens of yards, and that low-frequency variation is most
+/// of what makes it read as ground rather than as tiling.
+///
+/// So the client multiplies the texture by a colour sampled from a smooth
+/// world-space field. It is **presentation only** — no simulation reads it, it
+/// is not in any hash, and charter rule 4's determinism does not reach it.
+///
+/// # Why the engine holds no opinion about the colours
+///
+/// Grass wants green and stone wants grey, and which is which is a mod's
+/// business (charter rule 1). The engine owns the FIELD — one smooth function
+/// of world position, the same for every material so that neighbouring
+/// materials vary together rather than each drifting on its own — and the mod
+/// owns what the two ends of it look like.
+///
+/// # Why these are integers
+///
+/// [`MaterialDef`] is `Eq`, and floats are not — but the honest reason is that
+/// a colour multiplier does not need more than a byte of precision, and a
+/// period measured in blocks does not need a fraction. A mod writes floats and
+/// the engine quantises once, here, where the mapping is written down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tint {
+    /// How far the TONE moves: 0 is none, 255 is the whole way.
+    ///
+    /// Brightness alone, and separate from [`Tint::low`] and [`Tint::high`] on
+    /// purpose. A mod that wants ground to stop looking tiled wants tone
+    /// variation and nothing else, and should not have to write three colour
+    /// channels twice to say so; a mod that wants grass greener in one place
+    /// than another wants the colours and may want no tone change at all. Two
+    /// knobs, each meaning one thing.
+    ///
+    /// At 255 the field spans half brightness to one and a half.
+    pub strength: u8,
+    /// How many blocks one period of the field spans.
+    ///
+    /// **Tens of blocks, not ones.** The point is variation broader than the
+    /// texture it is breaking up; a period near one block makes noise rather
+    /// than ground. Zero means no tint, the same as absent.
+    pub scale: u16,
+    /// The colour at the low end of the field, as RGB multipliers.
+    ///
+    /// `128` is 1.0 — the texture's own colour — so the byte spans 0 to 2:
+    /// below is a darkening and above is a brightening. Both ends at `128` is
+    /// no hue shift, which is the default and leaves [`Tint::strength`] to act
+    /// alone.
+    pub low: [u8; 3],
+    /// The colour at the high end, on the same scale.
+    pub high: [u8; 3],
+}
+
+impl Tint {
+    /// What a byte of colour means as a multiplier: `128` is 1.0.
+    #[must_use]
+    pub fn channel(byte: u8) -> f32 {
+        f32::from(byte) / 128.0
+    }
+
+    /// The inverse, saturating rather than wrapping.
+    ///
+    /// A mod asking for 3.0 gets 2.0 and not 0.5 — which is what an `as u8`
+    /// would have given it, and would have read as a mod bug rather than as a
+    /// clamp.
+    #[must_use]
+    pub fn quantise(multiplier: f32) -> u8 {
+        // `+ 0.5` and truncate rather than `round`, which the determinism lint
+        // refuses across this crate: it lowers to libm without SSE4.1.
+        let scaled = multiplier * 128.0 + 0.5;
+        if scaled.is_nan() {
+            return 128;
+        }
+        scaled.clamp(0.0, 255.0) as u8
+    }
+}
+
 /// One material in the world's id table, as the client needs to see it.
 ///
 /// # Why the client is told this at all
@@ -630,6 +711,12 @@ pub struct MaterialDef {
     /// glass is solid.
     #[serde(default)]
     pub transparent: bool,
+    /// How this material's colour varies across the world, if a mod said.
+    ///
+    /// `None` — every material until a mod says otherwise (charter rule 1) —
+    /// draws its texture exactly as it is.
+    #[serde(default)]
+    pub tint: Option<Tint>,
 }
 
 /// One mod in the server's resolved set.
@@ -3595,6 +3682,7 @@ mod tests {
                     texture: None,
                     placeable: true,
                     transparent: false,
+                    tint: None,
                     step_sound: None,
                 },
                 MaterialDef {
@@ -3603,6 +3691,7 @@ mod tests {
                     texture: Some([9u8; 32]),
                     placeable: true,
                     transparent: false,
+                    tint: None,
                     step_sound: None,
                 },
             ],

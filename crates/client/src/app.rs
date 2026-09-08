@@ -3317,6 +3317,10 @@ impl App {
         self.tiles = atlas.tiles_only();
         self.atlas_changed = true;
         self.renderer.set_atlas(&atlas);
+        // **After the atlas**, which rebuilds the bind group from the view it
+        // just uploaded: this rebuilds it again from the table, and the second
+        // one has to be the one that survives.
+        self.renderer.set_tints(table);
         // Every mesh drawn before this sampled the placeholder atlas. In
         // practice the table arrives before any chunk, but "in practice" is not
         // a guarantee the renderer should rely on.
@@ -6353,6 +6357,7 @@ mod tests {
                 texture: None,
                 placeable: true,
                 transparent: false,
+                tint: None,
                 step_sound: None,
             },
             MaterialDef {
@@ -6361,6 +6366,7 @@ mod tests {
                 texture: Some([0u8; 32]),
                 placeable: true,
                 transparent: false,
+                tint: None,
                 step_sound: None,
             },
         ];
@@ -6393,6 +6399,7 @@ mod tests {
             texture: None,
             placeable: true,
             transparent: false,
+            tint: None,
             step_sound: None,
         }];
         let atlas = build_atlas(&table, &BTreeMap::new());

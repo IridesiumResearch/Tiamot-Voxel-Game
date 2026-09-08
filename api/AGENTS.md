@@ -203,6 +203,42 @@ the wrong thing.
 
 ---
 
+## Terrain that does not look like a texture
+
+Two things, and they are separate mechanisms because they fix different halves
+of "it looks artificial".
+
+**Shape: sub-node terrain.** `fill_density` takes a resolution:
+
+```lua
+buf:fill_density(field, stone, { detail = "smooth" })   -- no block staircases
+buf:fill_density(field, stone, { detail = "sampled" })  -- and fine detail
+```
+
+Do NOT reach for `set_subnode` to do this. It writes one cell, and a chunk is
+110,592 of them — the whole point of the option above is that the 27x sample
+cost happens inside the engine, on the blocks the surface actually crosses.
+Measured per chunk on terrain with caves: 729 us at block resolution, 1.08 ms
+smooth, 3.98 ms sampled. `set_subnode` is for the handful of cells you place
+deliberately, not for terrain.
+
+**Colour: a tint field.** Declare it on the block and the client does the rest:
+
+```lua
+game.register_block{
+    id = "grass",
+    tint = { strength = 0.12, low = {0.85, 1.0, 0.8}, high = {1.0, 0.95, 0.85}, scale = 40 },
+}
+```
+
+`strength` alone gives tone variation, which is most of what stops a surface
+reading as tiling; `low`/`high` add a hue shift across the same field. One field
+for every material, keyed on world position, so a hillside varies as a hillside
+rather than each block type drifting on its own. It costs nothing for materials
+that declare nothing.
+
+---
+
 ## Machines: containers a mod can fill
 
 A chest is a container a player drags things into. A **furnace** is one your mod

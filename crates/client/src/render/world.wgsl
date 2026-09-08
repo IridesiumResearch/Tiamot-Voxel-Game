@@ -61,6 +61,76 @@ struct Globals {
 @group(0) @binding(1) var atlas: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
 
+// What each material's colour does across the world, indexed by atlas slot.
+//
+// **The engine owns the field and a mod owns the colours** — one smooth
+// function of world position shared by every material, so that neighbouring
+// materials vary together instead of each drifting on its own. A wall of one
+// texture is a wall of one texture; real ground shifts in tone over tens of
+// yards, and that is most of what stops it reading as tiling.
+struct MaterialTint {
+    // Tone amplitude in x, blocks per period in y. zw spare.
+    params: vec4<f32>,
+    low: vec4<f32>,
+    high: vec4<f32>,
+};
+@group(0) @binding(3) var<storage, read> tints: array<MaterialTint>;
+
+// A hash of an integer lattice point, in 0..1.
+//
+// Integer in and float out, so the field is EXACTLY the same every frame for a
+// given block — a hash of a float would shift with the last bit of the
+// position and shimmer as the camera moved.
+fn tint_hash(cell: vec3<i32>) -> f32 {
+    var h = u32(cell.x) * 0x9E3779B9u;
+    h = (h ^ (u32(cell.y) * 0x85EBCA6Bu)) * 0xC2B2AE35u;
+    h = (h ^ (u32(cell.z) * 0x27D4EB2Fu)) * 0x165667B1u;
+    h = h ^ (h >> 15u);
+    h = h * 0x2545F491u;
+    h = h ^ (h >> 13u);
+    return f32(h & 0xFFFFFFu) / f32(0xFFFFFFu);
+}
+
+// Smooth value noise: the lattice hash, interpolated with a fade curve.
+//
+// One octave. Two would be smoother and this is a tint rather than terrain —
+// what it has to do is vary broadly, and a second octave costs eight more
+// hashes per fragment to add detail the texture underneath already has.
+fn tint_noise(at: vec3<f32>) -> f32 {
+    let base = floor(at);
+    let f = at - base;
+    // 6t⁵ − 15t⁴ + 10t³, the same fade the engine's own gradient noise uses.
+    let w = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let c = vec3<i32>(base);
+
+    let x00 = mix(tint_hash(c + vec3<i32>(0, 0, 0)), tint_hash(c + vec3<i32>(1, 0, 0)), w.x);
+    let x10 = mix(tint_hash(c + vec3<i32>(0, 1, 0)), tint_hash(c + vec3<i32>(1, 1, 0)), w.x);
+    let x01 = mix(tint_hash(c + vec3<i32>(0, 0, 1)), tint_hash(c + vec3<i32>(1, 0, 1)), w.x);
+    let x11 = mix(tint_hash(c + vec3<i32>(0, 1, 1)), tint_hash(c + vec3<i32>(1, 1, 1)), w.x);
+    return mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z);
+}
+
+// The colour a material's texture is multiplied by at this point in the world.
+//
+// Returns white for a material that declared nothing, which is every material
+// until a mod says otherwise — and the test is one comparison, so a world whose
+// mods declare no tints pays nothing for the feature existing.
+fn material_tint(slot: u32, at: vec3<f32>) -> vec3<f32> {
+    let tint = tints[slot];
+    let strength = tint.params.x;
+    let scale = tint.params.y;
+    if (scale <= 0.0) {
+        return vec3<f32>(1.0);
+    }
+    let n = tint_noise(at / scale);
+    // Tone and hue are separate knobs on purpose: most mods want the ground to
+    // stop looking tiled, which is tone alone, and should not have to write six
+    // colour channels to say so.
+    let tone = 1.0 + (n - 0.5) * strength;
+    let hue = mix(tint.low.rgb, tint.high.rgb, n);
+    return hue * tone;
+}
+
 // Mode 3 only, and in its own bind group for exactly that reason: a binding
 // group is part of a pipeline's layout, so putting these in group 0 would make
 // every mode allocate shadow maps to have something to bind. `fragment_main`
@@ -76,6 +146,13 @@ struct VertexIn {
     @location(1) material: u32,
     // Per-instance: this chunk's camera-relative offset, in blocks.
     @location(2) chunk_offset: vec4<f32>,
+    // Per-instance: the same chunk's ABSOLUTE origin, in blocks.
+    //
+    // The tint is sampled in this space and not in the camera-relative one. A
+    // field keyed on a camera-relative position SWIMS: the pattern slides over
+    // the terrain as the player walks, because the coordinate it is read at
+    // moves with them.
+    @location(4) chunk_world: vec4<f32>,
 };
 
 struct VertexOut {
@@ -98,6 +175,9 @@ struct VertexOut {
     // renderer has no world-space coordinate to offer (floating origin), and
     // the light matrices are built in the same space for that reason.
     @location(7) world: vec3<f32>,
+    // Where this fragment is in the WORLD, for the colour field. See
+    // `VertexIn::chunk_world`.
+    @location(9) anchored: vec3<f32>,
     // Which way this face points. Flat, because a voxel face is one of six
     // directions over its whole area and interpolating between two of them
     // would invent normals no geometry has.
@@ -159,6 +239,7 @@ fn unpack_vertex(input: VertexIn) -> VertexOut {
     out.clip = globals.view_projection * vec4<f32>(camera_relative, 1.0);
     out.distance = length(camera_relative);
     out.world = camera_relative;
+    out.anchored = local + input.chunk_world.xyz;
 
     // The two coordinates that span this face's plane. Must match
     // `SubNodeGrid::cell`: axis 0 spans (y, z), axis 1 spans (x, z), axis 2
@@ -679,7 +760,12 @@ fn surface(input: VertexOut, shadow: f32) -> vec4<f32> {
     let uv = origin + fract(input.tile_uv) * extent;
 
     let texel = textureSampleGrad(atlas, atlas_sampler, uv, ddx, ddy);
-    let lit = texel.rgb * lighting(input, shadow);
+    // **Under the light, not over it.** The tint is what colour the surface IS,
+    // so it multiplies the albedo and then the lighting acts on the result. Over
+    // the top it would tint the sunlight as well, and a lamp would come out the
+    // colour of the ground it was standing on.
+    let albedo = texel.rgb * material_tint(input.slot, input.anchored);
+    let lit = albedo * lighting(input, shadow);
 
     // Mode 3 fogs in the post chain instead, from the depth buffer — which is
     // what lets its fog reach the sky and take the sun's colour with it. Doing

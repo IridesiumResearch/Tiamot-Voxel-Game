@@ -796,6 +796,80 @@ fn fill_detail_of(options: Option<&Table>) -> mlua::Result<Option<crate::detgen:
     }
 }
 
+/// A `register_block{ tint = … }` table, or `None` if it says nothing usable.
+///
+/// **Written in floats and stored in bytes.** A mod says `{ low = {0.9, 1.0,
+/// 0.85} }` because that is how anybody thinks about a colour multiplier, and
+/// the wire carries a byte per channel — see [`crate::proto::Tint`] for what
+/// the byte means. The quantisation happens once, here.
+///
+/// A tint with no strength or no scale is `None` rather than a tint that does
+/// nothing: the client tests for absence before it samples anything, and a
+/// zero-strength tint that reached it would cost every fragment a branch to
+/// discover it had nothing to do.
+fn tint_of(table: &Table) -> Option<crate::proto::Tint> {
+    /// Both colour ends at this is no hue shift at all — see `proto::Tint`.
+    const WHITE: [u8; 3] = [128; 3];
+
+    let strength: f32 = table
+        .get::<Option<f32>>("strength")
+        .ok()
+        .flatten()
+        .unwrap_or(0.0);
+    let scale: f32 = table
+        .get::<Option<f32>>("scale")
+        .ok()
+        .flatten()
+        .unwrap_or(32.0);
+    // A scale that is zero, negative or NaN is a mod that did not mean this.
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let colour = |name: &str, fallback: f32| -> [u8; 3] {
+        let read = table
+            .get::<Option<Table>>(name)
+            .ok()
+            .flatten()
+            .map(|rgb| -> [f32; 3] {
+                std::array::from_fn(|index| {
+                    rgb.get::<Option<f32>>(index + 1)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(fallback)
+                })
+            })
+            .map_or([fallback; 3], |rgb: [f32; 3]| rgb);
+        read.map(crate::proto::Tint::quantise)
+    };
+    let (low, high) = (colour("low", 1.0), colour("high", 1.0));
+    // **Nothing to do is `None`, not a tint that does nothing.** No tone
+    // movement and no hue difference is a material that draws exactly as its
+    // texture — and the client tests for absence before it samples anything, so
+    // saying so here costs every fragment of that material nothing at all.
+    if strength <= 0.0 && low == WHITE && high == WHITE {
+        return None;
+    }
+    Some(crate::proto::Tint {
+        // A plain 0..1 mapped over the byte, unlike the colours: this is a
+        // fraction rather than a multiplier, and 128 meaning "half" is easier
+        // to read than 128 meaning "one".
+        // **`+ 0.5` and truncate, not `round`.** `round` lowers to libm
+        // without SSE4.1 and the determinism lint refuses it across this crate
+        // — rightly, even though a tint never reaches simulation state, because
+        // an exception per call site is how a ban stops being one.
+        strength: (strength.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+        // Rounded rather than truncated — a mod asking for 31.9 blocks means
+        // 32 — and rounded by hand, for the reason above.
+        scale: (scale.clamp(1.0, f32::from(u16::MAX)) + 0.5) as u16,
+        // **The ends default to the texture's own colour**, so a mod that gives
+        // a strength and no colours gets tone variation and no hue shift —
+        // which is the commonest thing anybody wants and should not need three
+        // numbers to say.
+        low,
+        high,
+    })
+}
+
 fn stack_table(lua: &mlua::Lua, stack: &crate::inventory::Stack) -> mlua::Result<Table> {
     let (blocks, nodes) = stack.display();
     let entry = lua.create_table()?;
@@ -1729,6 +1803,14 @@ impl ScriptVm for MluaVm {
                         drops,
                         light_emit,
                         absorbs,
+                        // Read from the registry table the same way, and
+                        // built into its packed form HERE rather than at
+                        // registration: the table holds what the mod said, and
+                        // this is what turns it into what the wire carries.
+                        tint: entry
+                            .as_ref()
+                            .and_then(|entry| entry.get::<Option<Table>>("tint").ok().flatten())
+                            .and_then(|table| tint_of(&table)),
                         transparent: entry
                             .as_ref()
                             .and_then(|entry| entry.get::<Option<bool>>("transparent").ok())

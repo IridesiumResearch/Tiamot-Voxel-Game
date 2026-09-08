@@ -238,11 +238,80 @@ pub fn sky_colour() -> [f32; 3] {
 /// in, which nothing depends on — it is a shadow caster, not a hitbox.
 pub const BODY_WIDTH_CELLS: u8 = 2;
 
+/// One material's colour variation, as the fragment shader reads it.
+///
+/// Indexed by atlas slot, which is what a vertex carries and what the fragment
+/// already has in hand — so the lookup is one load and no arithmetic.
+///
+/// `strength` of zero is a material that does not vary, and it is the first
+/// thing the shader tests: a world whose mods declare no tints pays one
+/// comparison per fragment for the feature existing.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaterialTint {
+    /// Tone amplitude in x, blocks per period in y, two spare.
+    params: [f32; 4],
+    /// The colour at the low end of the field, as multipliers. w unused.
+    low: [f32; 4],
+    /// The colour at the high end.
+    high: [f32; 4],
+}
+
+impl MaterialTint {
+    /// A material that draws exactly as its texture.
+    const fn none() -> Self {
+        Self {
+            params: [0.0; 4],
+            low: [1.0, 1.0, 1.0, 0.0],
+            high: [1.0, 1.0, 1.0, 0.0],
+        }
+    }
+
+    /// What a mod declared, unpacked from the bytes the wire carries.
+    fn from_def(tint: &tiamot_core::proto::Tint) -> Self {
+        use tiamot_core::proto::Tint;
+        let colour = |rgb: [u8; 3]| {
+            [
+                Tint::channel(rgb[0]),
+                Tint::channel(rgb[1]),
+                Tint::channel(rgb[2]),
+                0.0,
+            ]
+        };
+        Self {
+            params: [
+                f32::from(tint.strength) / 255.0,
+                f32::from(tint.scale).max(1.0),
+                0.0,
+                0.0,
+            ],
+            low: colour(tint.low),
+            high: colour(tint.high),
+        }
+    }
+}
+
 /// One chunk's camera-relative offset, as an instance attribute.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Instance {
     offset: [f32; 4],
+    /// The same chunk's ABSOLUTE origin, in blocks. w unused.
+    ///
+    /// # Why both
+    ///
+    /// `offset` is camera-relative, which is the floating origin doing its job:
+    /// a world 120,000 blocks across cannot be drawn from absolute f32
+    /// positions without the geometry shaking. But a colour field keyed on a
+    /// camera-relative position SWIMS — the pattern slides over the terrain as
+    /// the player walks, because the coordinate it is sampled at moves with
+    /// them. So the tint is sampled here instead, in a coordinate that belongs
+    /// to the world.
+    ///
+    /// Exact rather than approximate: a chunk origin is a multiple of 16 up to
+    /// 120,000, and every one of those is representable in f32 with room to
+    /// spare — integers are exact to 16,777,216.
+    world: [f32; 4],
 }
 
 /// A chunk's mesh, on the GPU.
@@ -644,6 +713,12 @@ pub struct Renderer {
     /// upload of the same image for the UI — would double the atlas's memory
     /// just to show a player what they are carrying.
     atlas_view: wgpu::TextureView,
+    /// What each material's colour does, indexed by atlas slot.
+    ///
+    /// Held so the bind group can be rebuilt when the atlas changes without
+    /// losing it, and vice versa: the two arrive together and are replaced
+    /// independently.
+    tints: wgpu::Buffer,
     chunks: BTreeMap<ChunkPos, ChunkMesh>,
     /// Retired chunk buffers, kept for reuse. See [`BufferPool`].
     pool: BufferPool,
@@ -833,9 +908,10 @@ impl Renderer {
 
         let sampler = build_atlas_sampler(&gpu);
 
-        let placeholder = Atlas::build(&[None]);
-        let (view, grid, side) = upload_atlas(&gpu, &placeholder);
-        let bind_group = make_bind_group(&gpu, &bind_layout, &globals, &view, &sampler);
+        // One tint entry, meaning nothing varies: no material does until a
+        // table says one does, and the shader's first test is the scale.
+        let (view, grid, side, tints, bind_group) =
+            build_atlas_bindings(&gpu, &bind_layout, &globals, &sampler);
 
         let instances = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chunk-instances"),
@@ -869,6 +945,7 @@ impl Renderer {
             atlas_grid: grid,
             atlas_side: side,
             atlas_view: view,
+            tints,
             chunks: BTreeMap::new(),
             pool: BufferPool::default(),
             selection_pipeline,
@@ -1100,6 +1177,33 @@ impl Renderer {
         self.drawn
     }
 
+    /// Points the world shader at what each material's colour does.
+    ///
+    /// Taken from the material table, so it arrives with the atlas and changes
+    /// only when that does. The bind group is rebuilt because a storage buffer
+    /// is bound by identity rather than by contents, and this is a new one.
+    pub fn set_tints(&mut self, table: &[tiamot_core::proto::MaterialDef]) {
+        // Indexed by atlas slot, which is the material's own id — so the table
+        // is as long as the highest id and holes in it are materials that do
+        // not vary. A `BTreeMap`-shaped answer would cost the shader a search.
+        let highest = table.iter().map(|entry| entry.id).max().unwrap_or(0);
+        let mut tints = vec![MaterialTint::none(); usize::from(highest) + 1];
+        for entry in table {
+            if let Some(tint) = entry.tint.as_ref() {
+                tints[usize::from(entry.id)] = MaterialTint::from_def(tint);
+            }
+        }
+        self.tints = upload_tints(&self.gpu, &tints);
+        self.bind_group = make_bind_group(
+            &self.gpu,
+            &self.bind_layout,
+            &self.globals,
+            &self.atlas_view,
+            &self.sampler,
+            &self.tints,
+        );
+    }
+
     /// Replaces the atlas.
     ///
     /// Called once, when the material table and its textures arrive. Rebuilds
@@ -1114,6 +1218,7 @@ impl Renderer {
             &self.globals,
             &view,
             &self.sampler,
+            &self.tints,
         );
         self.hands.set_atlas(&self.gpu, &view, &self.sampler);
         self.atlas_view = view;
@@ -1623,8 +1728,15 @@ impl Renderer {
             if casts {
                 culled.casters.push((*pos, instance));
             }
+            let side = tiamot_core::CHUNK_BLOCKS as i32;
             instances.push(Instance {
                 offset: [offset.x, offset.y, offset.z, 0.0],
+                world: [
+                    (pos.x * side) as f32,
+                    (pos.y * side) as f32,
+                    (pos.z * side) as f32,
+                    0.0,
+                ],
             });
         }
         self.drawn = culled.visible.len();
@@ -1635,6 +1747,9 @@ impl Renderer {
         if let Some(at) = self.body_at {
             instances.push(Instance {
                 offset: [at[0], at[1], at[2], 0.0],
+                // The body is not terrain and is not tinted; a zero here is a
+                // position the shader never samples from.
+                world: [0.0; 4],
             });
         }
 
@@ -2784,6 +2899,21 @@ fn build_bind_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // **Per-material colour variation, indexed by atlas slot.** A
+                // storage buffer rather than a uniform array because the length
+                // is a mod set's business and a uniform would have to be sized
+                // for the largest one anybody might load. Read-only, and read
+                // once per fragment.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         })
 }
@@ -2810,11 +2940,21 @@ fn vertex_layout() -> [wgpu::VertexBufferLayout<'static>; 2] {
             shader_location: 1,
         },
     ];
-    const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x4,
-        offset: 0,
-        shader_location: 2,
-    }];
+    const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x4,
+            offset: 0,
+            shader_location: 2,
+        },
+        // The chunk's absolute origin — see `Instance::world`. The fluid
+        // layout below does NOT take it: fluid is not tinted, and an attribute
+        // a shader does not declare is one wgpu refuses at pipeline creation.
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x4,
+            offset: size_of::<[f32; 4]>() as u64,
+            shader_location: 4,
+        },
+    ];
 
     [
         wgpu::VertexBufferLayout {
@@ -3173,6 +3313,46 @@ fn build_world_pipeline(
 }
 
 /// Uploads an atlas and its mip chain, returning the view and its geometry.
+/// The placeholder atlas, its tint table, and the bind group over both.
+///
+/// Split out of `Renderer::new`, which is at clippy's line ceiling — and split
+/// HERE because these five things are one decision: what the world shader reads
+/// before any material table has arrived.
+fn build_atlas_bindings(
+    gpu: &Gpu,
+    layout: &wgpu::BindGroupLayout,
+    globals: &wgpu::Buffer,
+    sampler: &wgpu::Sampler,
+) -> (wgpu::TextureView, u32, u32, wgpu::Buffer, wgpu::BindGroup) {
+    let placeholder = Atlas::build(&[None]);
+    let (view, grid, side) = upload_atlas(gpu, &placeholder);
+    let tints = upload_tints(gpu, &[MaterialTint::none()]);
+    let bind_group = make_bind_group(gpu, layout, globals, &view, sampler, &tints);
+    (view, grid, side, tints, bind_group)
+}
+
+/// Uploads the per-material tint table.
+///
+/// Its own buffer rather than a slice of the globals uniform: it changes only
+/// when the material table does — once a session — and it is sized by the mod
+/// set rather than by anything the engine chose.
+fn upload_tints(gpu: &Gpu, tints: &[MaterialTint]) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt as _;
+    // Never empty: a zero-length storage binding is invalid, and an empty mod
+    // set is a legitimate world.
+    let filled = if tints.is_empty() {
+        &[MaterialTint::none()][..]
+    } else {
+        tints
+    };
+    gpu.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("material-tints"),
+            contents: bytemuck::cast_slice(filled),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        })
+}
+
 fn upload_atlas(gpu: &Gpu, atlas: &Atlas) -> (wgpu::TextureView, u32, u32) {
     let levels = atlas.mips();
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -3225,6 +3405,7 @@ fn make_bind_group(
     globals: &wgpu::Buffer,
     atlas: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
+    tints: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("world"),
@@ -3241,6 +3422,10 @@ fn make_bind_group(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: tints.as_entire_binding(),
             },
         ],
     })
