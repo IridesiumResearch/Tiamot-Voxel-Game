@@ -258,6 +258,9 @@ impl Stamping {
 
 /// The edits that put one plan cell into the world.
 ///
+/// Sub-Node Contract §7.3: a block the plan names is replaced by what the plan
+/// says it is, and a block it does not name is not touched at all.
+///
 /// A whole block is one [`Edit::Block`], a chiselled one is one
 /// [`Edit::Partial`], and a LAYER onto a block this stamp has already replaced
 /// is one [`Edit::SubNode`] per filled cell — which is the only shape that can

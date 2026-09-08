@@ -489,6 +489,41 @@ caught its absence.
 
 ---
 
+### 7.3 Stamping a plan — the named blocks replace, the absent ones are untouched
+
+**A stamp is a mod edit, not a placement.** Nothing is paid for out of an
+inventory, so §7.1 and §7.2's conservation rules do not apply to it — the same
+way they do not apply to `game.set_block`, which has replaced whole blocks
+since Task 09. What a mod may not do is destroy material a player is holding;
+what it may obviously do is change the world, which is what a mod is for.
+
+A plan (`crates/core/src/plan.rs`) is **sparse**: it records only the blocks
+that hold something, so "this block holds nothing" and "this block was not
+captured" are one state and cannot be told apart. That fixes both halves of
+what a stamp does:
+
+- **A block the plan does not name is not touched at all.** Stamping adds a
+  building to a hillside rather than cutting its bounding box out of the hill
+  first. A mod that wants the box clears it itself; a mod that wanted the
+  additive behaviour could not have undone a clearing one.
+- **A block the plan does name is replaced by what the plan says it is**,
+  including its empty cells. The plan is a description of that block, not of
+  the cells to add to it, so a half-slab in the plan lands as a half-slab.
+
+**A mixed block is stamped as a replace followed by cells**, which is §7.2's
+second shape used for the same reason: one `Edit::Partial` for the first
+material, then one `Edit::SubNode` per filled cell for each material after it.
+Sending an `Edit::Partial` per material would leave the block holding whichever
+one was captured last, and a plan that quietly dropped the two-material parts
+of somebody's build would be a loss in exactly the detail charter rule 19 says
+is the point of the engine.
+
+Implemented by `crates/server/src/plans.rs` — `capture` for the read and
+`block_edits` for the write, with
+`a_mixed_block_is_captured_as_layers_and_stamped_back_as_layers` as the test.
+
+---
+
 ## 8. Rendering — sub-node resolution, binary greedy meshing
 
 Meshing is at sub-node resolution using **binary greedy meshing**, per §1.

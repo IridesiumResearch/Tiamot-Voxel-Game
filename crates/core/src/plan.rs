@@ -28,6 +28,9 @@
 //! mostly air, and a dense representation would spend its whole size on the
 //! nothing inside. [`Plan::AIR_IS_ABSENT`] says what that means when stamping.
 //!
+//! Sub-Node Contract §7.3 is the authoritative statement of what a stamp does
+//! to a block, and §0 of the three storage forms a capture reads.
+//!
 //! # A mixed block is several entries at one position
 //!
 //! A [`PlanCell`] names ONE material and the cells it fills, and the Sub-Node
