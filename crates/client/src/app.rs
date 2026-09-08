@@ -1071,6 +1071,12 @@ pub struct App {
     flying: bool,
     /// What the connection reported about the server's certificate.
     server_label: String,
+    /// The seed this world was generated with, once the server has said.
+    ///
+    /// `None` before the join. Shown on the overlay because the server picks
+    /// the random one and writes it down beside the world, so without this a
+    /// player could ask for a seed and never read back the one they got.
+    seed: Option<u64>,
     /// Materials that can be seen through: glass.
     ///
     /// Read by the mesher, which culls and buckets faces by it. Empty until the
@@ -1249,6 +1255,7 @@ impl App {
             step_sounds: std::collections::BTreeMap::new(),
             items: std::collections::BTreeSet::new(),
             hosting: None,
+            seed: None,
             transparent: std::collections::BTreeSet::new(),
             meshing: None,
             may_fly: false,
@@ -3956,18 +3963,7 @@ impl App {
                     address,
                     fingerprint,
                     first_use,
-                } => {
-                    self.server_label = format!("{address} {}", &fingerprint[..12]);
-                    if first_use {
-                        // Trust on first use: the one connection that cannot be
-                        // verified is this one, and the player should be told
-                        // rather than left to assume it was checked.
-                        self.warn(format!(
-                            "first connection to {address}: pinned certificate {}…",
-                            &fingerprint[..16]
-                        ));
-                    }
-                }
+                } => self.connected_to(&address, &fingerprint, first_use),
 
                 Event::Materials { table, images } => self.adopt_atlas(&table, &images),
 
@@ -3975,8 +3971,9 @@ impl App {
                     spawn,
                     tick,
                     may_fly,
+                    seed,
                     ..
-                } => self.joined_world(spawn, tick, may_fly),
+                } => self.joined_world(spawn, tick, may_fly, seed),
 
                 Event::Chunk(chunk) => {
                     // The new space has started arriving, so there is something
@@ -4872,7 +4869,8 @@ impl App {
     /// Its own method because `pump_network` is at clippy's line ceiling, and
     /// because joining is a thing worth naming rather than the longest arm of a
     /// match.
-    fn joined_world(&mut self, spawn: tiamot_core::BlockPos, tick: u64, may_fly: bool) {
+    fn joined_world(&mut self, spawn: tiamot_core::BlockPos, tick: u64, may_fly: bool, seed: u64) {
+        self.seed = Some(seed);
         // Kept so the fly toggle can refuse, rather than predicting a power
         // that would be ignored on arrival.
         self.may_fly = may_fly;
@@ -4945,6 +4943,33 @@ impl App {
     #[must_use]
     pub const fn may_fly(&self) -> bool {
         self.may_fly
+    }
+
+    /// Records which server this is, and says so if it was never seen before.
+    ///
+    /// Its own method because `pump_network` is at clippy's line ceiling.
+    fn connected_to(&mut self, address: &str, fingerprint: &str, first_use: bool) {
+        self.server_label = format!("{address} {}", &fingerprint[..12]);
+        if first_use {
+            // Trust on first use: the one connection that cannot be verified is
+            // this one, and the player should be told rather than left to
+            // assume it was checked.
+            self.warn(format!(
+                "first connection to {address}: pinned certificate {}…",
+                &fingerprint[..16]
+            ));
+        }
+    }
+
+    /// The seed, where somebody can copy it off the screen.
+    ///
+    /// The server picks the random one and writes it beside the world, so
+    /// before this a player could type a seed into the new-world box and never
+    /// read back the one they actually got — which makes a world worth keeping
+    /// unshareable. Empty until the join, which is when the server says.
+    fn seed_line(&self) -> String {
+        self.seed
+            .map_or_else(String::new, |seed| format!("  ·  seed {seed}"))
     }
 
     /// What to append to the position line about flight.
@@ -5273,10 +5298,11 @@ impl App {
             self.prediction_line(created, reused, correction),
             format!("{x:.1}, {y:.1}, {z:.1}  ({facing}){}", self.flight_line()),
             format!(
-                "chunk {}, {}, {}",
+                "chunk {}, {}, {}{}",
                 self.camera.position.chunk.x,
                 self.camera.position.chunk.y,
-                self.camera.position.chunk.z
+                self.camera.position.chunk.z,
+                self.seed_line(),
             ),
             format!(
                 "{} chunks held, {} meshed, {} drawn, {} queued",

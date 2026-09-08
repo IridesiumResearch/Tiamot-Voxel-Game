@@ -336,6 +336,8 @@ pub struct JoinContext<'a> {
     /// Decided by the server from its operator list and sent with the join, so
     /// a client never has to ask and never predicts a power it does not have.
     pub may_fly: bool,
+    /// The seed this world was generated with, for the player to read back.
+    pub seed: u64,
     /// Unix timestamp, for stamping `added_at` on a first join.
     ///
     /// Passed in rather than read here so this module stays a pure function of
@@ -811,6 +813,7 @@ impl Session {
             spawn: context.spawn,
             tick: context.tick,
             may_fly: context.may_fly,
+            seed: context.seed,
         })
     }
 
@@ -980,6 +983,7 @@ mod tests {
             spawn: BlockPos::new(0, 1, 0),
             tick: 7,
             may_fly: false,
+            seed: 0,
             now: 1_700_000_000,
         }
     }

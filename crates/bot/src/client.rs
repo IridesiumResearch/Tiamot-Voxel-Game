@@ -114,6 +114,8 @@ impl PlayerPosition {
 pub struct Bot {
     /// The identity this bot authenticates as.
     identity: Identity,
+    /// The world seed, once the join has said. See [`Bot::seed`].
+    seed: Option<u64>,
     endpoint: Endpoint,
     connection: quinn::Connection,
     /// The control stream, and the artificial conditions applied to it.
@@ -270,6 +272,7 @@ impl Bot {
         });
 
         Ok(Self {
+            seed: None,
             // North, which is where a client starts. `look_at` moves it.
             look: [0.0, 0.0],
             identity,
@@ -447,9 +450,22 @@ impl Bot {
         self.recv_until(|m| matches!(m, ServerMessage::ModManifest { .. }))
             .await?;
         self.send(&ClientMessage::JoinWorld).await?;
-        self.recv_until(|m| matches!(m, ServerMessage::JoinWorld { .. }))
+        let joined = self
+            .recv_until(|m| matches!(m, ServerMessage::JoinWorld { .. }))
             .await?;
+        if let ServerMessage::JoinWorld { seed, .. } = joined {
+            self.seed = Some(seed);
+        }
         Ok(())
+    }
+
+    /// The world seed the server sent at the join.
+    ///
+    /// `None` before joining. The only way to read a world's seed back: the
+    /// server picks the random one and writes it beside the world.
+    #[must_use]
+    pub const fn seed(&self) -> Option<u64> {
+        self.seed
     }
 
     /// Sends a retired `BlockDelta`, which the server now refuses.

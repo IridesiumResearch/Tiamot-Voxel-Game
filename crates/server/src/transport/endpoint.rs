@@ -94,6 +94,19 @@ pub struct Shared {
     pub identities: Mutex<IdentityRegistry>,
     /// `BLAKE3` of this server's certificate, bound into every auth signature.
     pub cert_fingerprint: [u8; 32],
+    /// The seed this world was generated with, sent to every player who joins.
+    ///
+    /// **Atomic because the authoritative answer is not known here.** The seed
+    /// a NEW world gets is decided before the simulation thread starts, but an
+    /// EXISTING world keeps the one it was created with — and that is only
+    /// known once `World::open` has read it, on that thread. So this starts as
+    /// the candidate and the simulation corrects it the moment it knows better.
+    ///
+    /// A client that joined in the gap between the two would be told the
+    /// candidate. That window is the time it takes to open a database and no
+    /// listener is accepting yet, and the cost of being wrong is one wrong
+    /// number on an overlay — not worth a lock on the join path.
+    pub seed: std::sync::atomic::AtomicU64,
     /// The resolved mod set from Task 05.
     pub mods: Vec<ModEntry>,
     /// The mod set's fingerprint.
@@ -2388,6 +2401,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let context = JoinContext {
                 cert_fingerprint: &shared.cert_fingerprint,
+                seed: shared.seed.load(std::sync::atomic::Ordering::Relaxed),
                 mods: &shared.mods,
                 mod_set_fingerprint: shared.mod_set_fingerprint,
                 materials: &shared.materials,
@@ -2865,6 +2879,7 @@ mod tests {
         Shared {
             identities: Mutex::new(IdentityRegistry::default()),
             cert_fingerprint: [0xAB; 32],
+            seed: std::sync::atomic::AtomicU64::new(0),
             mods: Vec::new(),
             mod_set_fingerprint: 0,
             materials: Vec::new(),

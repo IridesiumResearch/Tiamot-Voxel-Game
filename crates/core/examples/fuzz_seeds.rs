@@ -427,6 +427,7 @@ fn server_messages() -> Vec<Vec<u8>> {
             spawn: BlockPos::new(0, 1, 0),
             tick: 7,
             may_fly: false,
+            seed: 0,
         },
         ServerMessage::ChunkData {
             pos: ChunkPos::new(1, -2, 3),

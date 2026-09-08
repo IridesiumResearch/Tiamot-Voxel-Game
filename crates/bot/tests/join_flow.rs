@@ -541,3 +541,61 @@ fn describe(message: &ServerMessage) -> &'static str {
         _ => "other",
     }
 }
+
+#[test]
+fn a_world_reports_the_seed_it_was_made_with_and_keeps_it() {
+    // **A seed you cannot read back is a write-only field.** The server picks
+    // the random one and writes it beside the world, so before it travelled at
+    // the join a player could ask for a seed and never learn the one they got —
+    // which makes a world worth keeping unshareable.
+    //
+    // Two claims, and the second is the one that matters for sharing: the seed
+    // reported is the seed ASKED for, and reopening the same world reports the
+    // same seed rather than a fresh one.
+    let dir = world_dir("seed-round-trip");
+    let mut asked = settings(&dir, Allowlist::open());
+    asked.seed = Some(0x5EED_0000_1234);
+    let server = ServerHandle::start(&asked).expect("start server");
+    let addr = server.local_addr();
+
+    let fingerprint = server.cert_fingerprint();
+    let first = block_on(async move {
+        let mut bot = Bot::connect(addr, Identity::generate().expect("identity"), fingerprint)
+            .await
+            .expect("connect");
+        bot.join("Seeder").await.expect("join");
+        bot.seed()
+    });
+    assert_eq!(
+        first,
+        Some(0x5EED_0000_1234),
+        "the world did not report the seed it was asked for"
+    );
+    assert!(server.stop());
+
+    // **Reopened, and asked for a DIFFERENT seed.** An existing world keeps the
+    // one it was created with — terrain beyond the explored edge would change
+    // shape otherwise — so the new request must be ignored. Without this arm
+    // the test would pass for a build that simply echoed `Settings::seed` back
+    // without ever consulting the world.
+    let mut reasked = settings(&dir, Allowlist::open());
+    reasked.seed = Some(0xFFFF_FFFF);
+    let server = ServerHandle::start(&reasked).expect("restart server");
+    let addr = server.local_addr();
+
+    let fingerprint = server.cert_fingerprint();
+    let second = block_on(async move {
+        let mut bot = Bot::connect(addr, Identity::generate().expect("identity"), fingerprint)
+            .await
+            .expect("connect");
+        bot.join("Reopener").await.expect("join");
+        bot.seed()
+    });
+    assert_eq!(
+        second,
+        Some(0x5EED_0000_1234),
+        "reopening a world reported a different seed, so the stored one is not \
+         what is being sent"
+    );
+    assert!(server.stop());
+}

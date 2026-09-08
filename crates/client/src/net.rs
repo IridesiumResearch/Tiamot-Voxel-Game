@@ -308,6 +308,8 @@ pub enum Event {
         tick: u64,
         /// Whether this player may use admin powers.
         may_fly: bool,
+        /// The seed this world was generated with, for the overlay.
+        seed: u64,
     },
 
     /// A decoded chunk.
@@ -1209,12 +1211,14 @@ async fn session(
                 spawn,
                 tick,
                 may_fly,
+                seed,
             } => {
                 let _ = events.send(Event::Joined {
                     uuid: player_uuid,
                     spawn,
                     tick,
                     may_fly,
+                    seed,
                 });
             }
 

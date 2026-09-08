@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 40;
+pub const PROTOCOL_VERSION: u32 = 41;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -82,6 +82,12 @@ pub const PROTOCOL_VERSION: u32 = 40;
 // stream. They are also PER PLAYER rather than broadcast — which entities
 // somebody can see is their own interest set, and sending everyone every mob
 // would make a populated world cost the square of the people watching it.
+// v41 (post-15b): `JoinWorld` carries the world `seed`. It was decided by the
+// server, written beside the world and never told to anybody — it appeared only
+// in the server's startup log. A player could therefore ASK for a seed and never
+// read back the one they got, which makes the seed box write-only and a world
+// worth keeping unshareable. Appended to the variant, safe because the version
+// is agreed in the handshake before a `JoinWorld` is sent.
 // v40 (post-15b): `MaterialDef` carries `transparent`. A client has to know
 // before it meshes: transparency decides which faces are culled and which pass
 // is drawn, and both are baked into the geometry rather than decided in the
@@ -1099,6 +1105,18 @@ pub enum ServerMessage {
         /// ground every tick. Charter rule 2 decides; this is the decision
         /// arriving.
         may_fly: bool,
+        /// The seed this world was generated with.
+        ///
+        /// **Appended to this variant** (protocol v41), safe for the same
+        /// reason `may_fly` was: the version is agreed in the handshake before
+        /// a `JoinWorld` is ever sent.
+        ///
+        /// A world's seed was decided by the server, written down beside the
+        /// world, and then never told to anybody — it appeared only in the
+        /// server's own startup log. So a player could ask for a seed and had
+        /// no way to read back the one they got, which makes a seed box a
+        /// write-only field and a world worth keeping unshareable.
+        seed: u64,
     },
     /// A chunk's contents.
     ChunkData {
@@ -3032,6 +3050,7 @@ mod tests {
                     spawn: BlockPos::new(0, 0, 0),
                     tick: 0,
                     may_fly: false,
+                    seed: 0,
                 },
                 4,
             ),

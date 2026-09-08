@@ -1382,9 +1382,28 @@ impl ServerHandle {
         }
 
         let control = Control::new();
+        // Drawn here rather than in the thread so a caller passing `None` still
+        // gets a reproducible run if they log what was chosen.
+        //
+        // **Before `Shared`, which now carries it.** A joining client is told
+        // the world's seed, and this is the only value available until the
+        // simulation thread has opened the world and read the stored one.
+        let new_seed = settings.seed.unwrap_or_else(|| {
+            let mut bytes = [0u8; 8];
+            // A failed entropy read is not worth refusing to start over: any
+            // seed generates a valid world, and this one only matters for a
+            // world that does not exist yet.
+            let _ = getrandom::fill(&mut bytes);
+            u64::from_le_bytes(bytes)
+        });
+
         let shared = Arc::new(Shared {
             identities: Mutex::new(identities),
             cert_fingerprint,
+            // Corrected by the simulation thread once the world is open and its
+            // STORED seed is known — an existing world keeps its own. See
+            // `Shared::seed`.
+            seed: std::sync::atomic::AtomicU64::new(new_seed),
             mod_set_fingerprint: mod_set_fingerprint(&mods),
             mods,
             materials,
@@ -1523,17 +1542,6 @@ impl ServerHandle {
                 })?
         };
 
-        // Drawn here rather than in the thread so a caller passing `None` still
-        // gets a reproducible run if they log what was chosen.
-        let new_seed = settings.seed.unwrap_or_else(|| {
-            let mut bytes = [0u8; 8];
-            // A failed entropy read is not worth refusing to start over: any
-            // seed generates a valid world, and this one only matters for a
-            // world that does not exist yet.
-            let _ = getrandom::fill(&mut bytes);
-            u64::from_le_bytes(bytes)
-        });
-
         let simulation = {
             let control = control.clone();
             let shared = Arc::clone(&shared);
@@ -1551,6 +1559,12 @@ impl ServerHandle {
                         }
                     };
                     info!(seed = world.seed(), "world seed");
+                    // **The authoritative answer, now that it is known.** An
+                    // existing world keeps the seed it was created with, so the
+                    // candidate above may not be what this world actually uses.
+                    shared
+                        .seed
+                        .store(world.seed(), std::sync::atomic::Ordering::Relaxed);
 
                     // One per server, opened on the simulation thread because
                     // that is the only thread that writes to it.
