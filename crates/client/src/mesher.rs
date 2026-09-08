@@ -2429,6 +2429,50 @@ mod summary_tests {
     }
 
     #[test]
+    fn a_summary_is_shaded_by_which_way_its_faces_point() {
+        // **Distant terrain had no shape.** Every summary face was one flat
+        // daylight level, so a mile of country came out uniformly bright and
+        // read as a painted backdrop — the side of a hill looked exactly like
+        // its top.
+        //
+        // The fake is the sky-visibility term that stored sunlight would have
+        // carried, which is what the detail radius gets for real: up sees the
+        // whole sky, a wall sees about half, down sees almost none.
+        let n = tiamot_core::lod::cells_per_axis(FINEST).expect("a level");
+        let solid =
+            Summary::from_parts(FINEST, vec![MaterialId(1); (n * n * n) as usize]).expect("build");
+        let mesh = mesh_summary(&solid);
+
+        let brightness = |axis: u8, positive: bool| {
+            mesh.quads
+                .iter()
+                .find(|quad| quad.axis == axis && quad.positive == positive)
+                .map(|quad| quad.shade.corner(0).light.sun())
+                .expect("a solid box has all six faces")
+        };
+
+        let up = brightness(1, true);
+        let down = brightness(1, false);
+        let side = brightness(0, true);
+        assert!(
+            up > side && side > down,
+            "faces should darken as they turn away from the sky: up {up}, side {side}, down \
+             {down}"
+        );
+
+        // And the sun's own angle is NOT baked in: the world shader already
+        // applies `dot(normal, sunward)` to these quads, so a north wall and a
+        // south wall must come out of the MESHER the same. Baking a direction
+        // here would count the sun twice and drift as it moved.
+        assert_eq!(
+            brightness(0, true),
+            brightness(0, false),
+            "opposite walls were shaded differently, so a sun direction has been baked in"
+        );
+        assert_eq!(brightness(0, true), brightness(2, true));
+    }
+
+    #[test]
     fn the_boundary_between_two_levels_has_no_gap_in_it() {
         // **Criterion T4.** Two chunks side by side, summarised at different
         // levels, with their surfaces at different heights. Sample the boundary
@@ -3870,6 +3914,45 @@ mod tests {
     }
 }
 
+/// How bright a summary's face is, by which way it points.
+///
+/// # Why distant terrain needs a fake at all
+///
+/// A summary carries no light. Every face was `Shade::flat(DAYLIGHT)` — one
+/// level, everywhere, unoccluded — so a mile of country came out uniformly
+/// bright and read as a painted backdrop rather than as land. Hills had no
+/// shape to them, because nothing distinguished the side of a hill from its top.
+///
+/// # What this is, and what it deliberately is not
+///
+/// It is NOT ambient occlusion. Real AO asks what is next to a cell, and a
+/// summary has thrown that away — it is a downsample, which is the whole point
+/// of it being cheap.
+///
+/// What it is instead is the **sky-visibility term that stored sunlight would
+/// have carried**: a face pointing up sees the whole sky, a vertical face sees
+/// about half of it, and a face pointing down sees almost none. That is the
+/// same quantity the detail radius gets for real, so the two agree in kind
+/// rather than merely being near each other — and it is a constant per face
+/// direction, so it costs one lookup per quad and no neighbour queries.
+///
+/// The sun's own angle is NOT baked in here. The world shader already applies
+/// `dot(normal, sunward)` to these quads, exactly as it does to real geometry,
+/// so a fixed directional tint would be counting the sun twice and would drift
+/// out of agreement as the sun moved.
+fn summary_shade(axis: usize, positive: bool) -> crate::shade::Shade {
+    use tiamot_core::light::{Light, MAX_LEVEL};
+
+    // Axis 1 is vertical. Fractions of `MAX_LEVEL` rather than literals so the
+    // relationship survives the range changing.
+    let sun = match (axis, positive) {
+        (1, true) => MAX_LEVEL,
+        (1, false) => MAX_LEVEL / 3,
+        _ => MAX_LEVEL * 2 / 3,
+    };
+    crate::shade::Shade::flat(Light::new(sun, 0, 0, 0))
+}
+
 /// Meshes a summary: the horizon, one quad per exposed cell face.
 ///
 /// # Skirts, and why cubic voxels do not need stitching
@@ -3898,11 +3981,11 @@ mod tests {
 ///
 /// # Light
 ///
-/// Full daylight, flat. A summary has no light layer — the server does not send
-/// one, because propagating light through terrain nobody can walk on would cost
-/// the tick budget for something a mile away. The horizon is therefore lit as
-/// if the sun were straight on it, which at that distance is a shade rather
-/// than a shape.
+/// A summary has no light layer — the server does not send one, because
+/// propagating light through terrain nobody can walk on would cost the tick
+/// budget for something a mile away. What it gets instead is the sky-visibility
+/// term that stored sunlight would have carried, faked from the face direction:
+/// see [`summary_shade`].
 #[must_use]
 pub fn mesh_summary(summary: &tiamot_core::lod::Summary) -> Mesh {
     let width = summary.width() as usize;
@@ -4005,7 +4088,7 @@ pub fn mesh_summary(summary: &tiamot_core::lod::Summary) -> Mesh {
                         du: u8::try_from(du * step).unwrap_or(1),
                         dv: u8::try_from(dv * step).unwrap_or(1),
                         material,
-                        shade: crate::shade::Shade::flat(tiamot_core::light::Light::DAYLIGHT),
+                        shade: summary_shade(axis, positive),
                     });
                     u += du;
                 }
