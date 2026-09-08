@@ -744,6 +744,27 @@ fn stack_of(lua: &mlua::Lua, spec: &Table) -> mlua::Result<Option<crate::invento
 }
 
 /// One stack, as a mod reads it.
+/// A container spec's `slot`, one-based as Lua counts, or `None` for anywhere.
+///
+/// **One-based, like every other index a mod sees.** The engine's own slots are
+/// zero-based and the wire has been caught carrying one convention while the UI
+/// used the other twice now — a dropdown's `selected` and a hotbar's index —
+/// each time producing an off-by-one nobody could see until a mod behaved
+/// strangely. The conversion happens here, once, at the boundary.
+fn container_slot_of(spec: &Table) -> mlua::Result<Option<usize>> {
+    let slot: Option<usize> = spec.get("slot")?;
+    match slot {
+        None => Ok(None),
+        // Slot 0 is a mod counting from zero, which is a bug in the mod rather
+        // than a request. Said out loud, because the alternative is fuel going
+        // silently into whichever slot happened to be free.
+        Some(0) => Err(mlua::Error::external(
+            "container slots are numbered from 1, and 0 is not one of them",
+        )),
+        Some(index) => Ok(Some(index - 1)),
+    }
+}
+
 fn stack_table(lua: &mlua::Lua, stack: &crate::inventory::Stack) -> mlua::Result<Table> {
     let (blocks, nodes) = stack.display();
     let entry = lua.create_table()?;
@@ -3879,11 +3900,19 @@ impl MluaVm {
         let read = self
             .lua
             .create_function(move |lua, name: String| {
-                let stacks: Vec<crate::inventory::Stack> =
-                    reach!(slot, Vec::new(), |access| access.contents(&name));
+                let held: Vec<Option<crate::inventory::Stack>> =
+                    reach!(slot, Vec::new(), |access| access.slots(&name));
                 let list = lua.create_table()?;
-                for stack in &stacks {
-                    list.push(stack_table(lua, stack)?)?;
+                // **Empty slots are skipped, and every entry says which slot it
+                // is.** A Lua list with holes in it has no reliable length, so
+                // the position in the table cannot be the slot number — and a
+                // machine needs the slot number, because "fuel is slot 1" is
+                // how a furnace is written at all.
+                for (index, stack) in held.iter().enumerate() {
+                    let Some(stack) = stack else { continue };
+                    let entry = stack_table(lua, stack)?;
+                    entry.set("slot", index + 1)?;
+                    list.push(entry)?;
                 }
                 Ok(list)
             })
@@ -3905,7 +3934,83 @@ impl MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("break_container", remove)
+            .map_err(|err| self.vm_error(&err))?;
+
+        let (give, take) = self.container_transfers()?;
+        game.set("container_give", give)
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("container_take", take)
             .map_err(|err| self.vm_error(&err))
+    }
+
+    /// `game.container_give` and `game.container_take`: the machine-facing half.
+    ///
+    /// # The gap these close
+    ///
+    /// Containers could be made, opened, read and broken, and a mod could not
+    /// put anything in one or take anything out. So every container was
+    /// something only a PLAYER could fill, by dragging — which makes a chest
+    /// expressible and a furnace not, because a furnace has to consume its own
+    /// input and place its own output on a tick nobody is watching. Reported by
+    /// a mod author trying to write a hopper that feeds one.
+    ///
+    /// Both take the same spec table `game.give` and `game.take` do, plus an
+    /// optional `slot`. Split from `install_container_api` because that method
+    /// is at the line limit.
+    fn container_transfers(&self) -> Result<(mlua::Function, mlua::Function), ScriptError> {
+        let slot = std::sync::Arc::clone(&self.containers);
+        let give = self
+            .lua
+            .create_function(move |lua, (name, spec): (String, Table)| {
+                let material = material_of(lua, &spec.get::<mlua::Value>("material")?)?;
+                let shape = shape_of(&spec)?;
+                let units = units_of(&spec, shape)?;
+                let detail = detail_of(&spec)?;
+                let into = container_slot_of(&spec)?;
+                let Some(stack) = crate::inventory::Stack::new(material, units).map(|stack| {
+                    crate::inventory::Stack {
+                        shape,
+                        detail,
+                        ..stack
+                    }
+                }) else {
+                    return Ok(0);
+                };
+                // **How many units it took, not whether it took them.** A
+                // container is a fixed size, so a partial fit is an ordinary
+                // outcome, and a mod told only `false` would not know whether
+                // to drop the remainder or try again next tick. What did not
+                // fit was never taken from the mod in the first place.
+                Ok(slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|access| access.give(&name, into, stack)))
+                    .unwrap_or(0))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        let slot = std::sync::Arc::clone(&self.containers);
+        let take = self
+            .lua
+            .create_function(move |lua, (name, spec): (String, Table)| {
+                let material = material_of(lua, &spec.get::<mlua::Value>("material")?)?;
+                let shape = shape_of(&spec)?;
+                let units = units_of(&spec, shape)?;
+                let detail = detail_of(&spec)?;
+                let from = container_slot_of(&spec)?;
+                Ok(slot
+                    .lock()
+                    .ok()
+                    .and_then(|slot| {
+                        slot.as_ref().map(|access| {
+                            access.take(&name, from, material, shape, detail.as_deref(), units)
+                        })
+                    })
+                    .unwrap_or(0))
+            })
+            .map_err(|err| self.vm_error(&err))?;
+
+        Ok((give, take))
     }
 
     /// Puts `game.set_hud` on the `game` table.
@@ -9652,6 +9757,248 @@ mod entity_tests {
         )
         .expect("no world");
     }
+    /// A container store a test can watch: fixed-size views, in memory.
+    ///
+    /// The container API had no VM-side double at all until `container_give`
+    /// and `container_take` needed one — it was covered only by a bot test
+    /// against a real server, which is the right test to have and a slow place
+    /// to find out that a spec table was parsed wrongly.
+    struct Boxes {
+        held: std::sync::Mutex<
+            std::collections::BTreeMap<String, Vec<Option<crate::inventory::Stack>>>,
+        >,
+    }
+
+    impl crate::inventory::Containers for Boxes {
+        fn ensure(&self, name: &str, slots: usize) -> bool {
+            let mut held = self.held.lock().expect("lock");
+            if held.contains_key(name) {
+                return false;
+            }
+            held.insert(name.to_owned(), vec![None; slots]);
+            true
+        }
+
+        fn open(&self, _name: &str, _player: [u8; 32]) -> bool {
+            true
+        }
+
+        fn close(&self, _name: &str, _player: [u8; 32]) -> bool {
+            true
+        }
+
+        fn slots(&self, name: &str) -> Vec<Option<crate::inventory::Stack>> {
+            self.held
+                .lock()
+                .expect("lock")
+                .get(name)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn give(&self, name: &str, slot: Option<usize>, stack: crate::inventory::Stack) -> u32 {
+            let offered = stack.units;
+            let mut held = self.held.lock().expect("lock");
+            let Some(slots) = held.get_mut(name) else {
+                return 0;
+            };
+            let mut view = crate::inventory::View {
+                name: name.to_owned(),
+                slots: std::mem::take(slots),
+            };
+            let left = view.fill(slot, stack).map_or(0, |over| over.units);
+            *slots = view.slots;
+            offered - left
+        }
+
+        fn take(
+            &self,
+            name: &str,
+            slot: Option<usize>,
+            material: crate::MaterialId,
+            shape: Option<crate::inventory::Shape>,
+            detail: Option<&str>,
+            units: u32,
+        ) -> u32 {
+            let mut held = self.held.lock().expect("lock");
+            let Some(slots) = held.get_mut(name) else {
+                return 0;
+            };
+            let mut view = crate::inventory::View {
+                name: name.to_owned(),
+                slots: std::mem::take(slots),
+            };
+            let took = view.draw(slot, material, shape, detail, units);
+            *slots = view.slots;
+            took
+        }
+
+        fn remove(&self, name: &str) -> Vec<crate::inventory::Stack> {
+            self.held
+                .lock()
+                .expect("lock")
+                .remove(name)
+                .map(|slots| slots.into_iter().flatten().collect())
+                .unwrap_or_default()
+        }
+    }
+
+    fn vm_with_containers() -> (MluaVm, std::sync::Arc<Boxes>) {
+        let mut vm = vm();
+        let boxes = std::sync::Arc::new(Boxes {
+            held: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        });
+        vm.set_container_access(
+            std::sync::Arc::clone(&boxes) as std::sync::Arc<dyn crate::inventory::Containers>
+        );
+        (vm, boxes)
+    }
+
+    #[test]
+    fn a_mod_fills_a_container_by_slot_and_draws_it_back_out() {
+        // **The furnace, in one script.** Fuel into slot 1, ore into slot 2,
+        // and the smelting tick consumes the ore and puts the ingot in slot 3.
+        // None of this was expressible: containers could be made, opened, read
+        // and broken, and nothing could put a stack into one.
+        let (mut vm, boxes) = vm_with_containers();
+        load(
+            &mut vm,
+            "cooking",
+            "game.register_block{ id = 'coal' }\n\
+             game.register_block{ id = 'ore' }\n\
+             game.register_block{ id = 'ingot' }\n\
+             game.register_on_tick(function() end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "cooking",
+            "game.make_container('cooking:furnace:1,2,3', 3)\n\
+             assert(game.container_give('cooking:furnace:1,2,3', \n\
+                 { material = 'cooking:coal', count = 1, slot = 1 }) == 27)\n\
+             assert(game.container_give('cooking:furnace:1,2,3', \n\
+                 { material = 'cooking:ore', count = 2, slot = 2 }) == 54)\n\
+             local held = game.container('cooking:furnace:1,2,3')\n\
+             assert(#held == 2, 'expected two occupied slots, got ' .. #held)\n\
+             local by_slot = {}\n\
+             for _, entry in ipairs(held) do by_slot[entry.slot] = entry end\n\
+             assert(by_slot[1].material == game.get_block_id('cooking:coal'))\n\
+             assert(by_slot[2].count == 2, 'the ore slot lost count')\n\
+             assert(by_slot[3] == nil, 'the empty output slot reported a stack')\n\
+             -- Smelt: take one ore out of its slot, put an ingot in the third.\n\
+             assert(game.container_take('cooking:furnace:1,2,3', \n\
+                 { material = 'cooking:ore', count = 1, slot = 2 }) == 27)\n\
+             assert(game.container_give('cooking:furnace:1,2,3', \n\
+                 { material = 'cooking:ingot', count = 1, slot = 3 }) == 27)",
+        )
+        .expect("the furnace");
+
+        // And the store agrees, so this is not a script talking to itself.
+        let slots = crate::inventory::Containers::slots(&*boxes, "cooking:furnace:1,2,3");
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[1].as_ref().expect("ore left").units, 27);
+        assert!(
+            slots[2].is_some(),
+            "the ingot never reached the output slot"
+        );
+    }
+
+    #[test]
+    fn a_container_that_is_full_says_how_much_it_took() {
+        // A fixed-size box makes a partial fit an ordinary outcome, so this
+        // answers in units rather than yes-or-no: a mod told `false` would not
+        // know whether to drop the remainder or try again next tick.
+        let (mut vm, _boxes) = vm_with_containers();
+        load(
+            &mut vm,
+            "cooking",
+            "game.register_block{ id = 'coal' }\ngame.register_on_tick(function() end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "cooking",
+            "game.make_container('cooking:hopper', 1)\n\
+             local spec = { material = 'cooking:coal', count = 1, slot = 1 }\n\
+             assert(game.container_give('cooking:hopper', spec) == 27)\n\
+             -- One slot, already full: a stack of the same material tops it up\n\
+             -- to the slot's capacity and the rest stays with the mod.\n\
+             local took = game.container_give('cooking:hopper',\n\
+                 { material = 'cooking:coal', count = 100, slot = 1 })\n\
+             assert(took < 100 * 27, 'a one-slot box swallowed a hundred blocks')\n\
+             assert(game.container_give('cooking:nothing:here', spec) == 0,\n\
+                 'a container nobody made accepted a stack')",
+        )
+        .expect("the full box");
+    }
+
+    #[test]
+    fn container_slots_are_numbered_from_one() {
+        // Every index a mod sees is one-based, and this codebase has twice
+        // shipped an off-by-one where one side counted from zero — a
+        // dropdown's `selected` and a hotbar's index. Slot 0 is refused out
+        // loud rather than quietly meaning slot 1.
+        let (mut vm, boxes) = vm_with_containers();
+        load(
+            &mut vm,
+            "cooking",
+            "game.register_block{ id = 'coal' }\ngame.register_on_tick(function() end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "cooking",
+            "game.make_container('cooking:box', 2)\n\
+             game.container_give('cooking:box', \n\
+                 { material = 'cooking:coal', count = 1, slot = 1 })",
+        )
+        .expect("give");
+        let slots = crate::inventory::Containers::slots(&*boxes, "cooking:box");
+        assert!(
+            slots[0].is_some() && slots[1].is_none(),
+            "slot 1 in Lua should be the first slot, not the second"
+        );
+
+        let err = vm
+            .eval_in(
+                "cooking",
+                "game.container_give('cooking:box', \n\
+                     { material = 'cooking:coal', count = 1, slot = 0 })",
+            )
+            .expect_err("slot 0 should be refused");
+        assert!(
+            format!("{err:?}").contains("numbered from 1"),
+            "the error should say what the numbering is: {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_container_api_does_nothing_rather_than_failing_when_there_is_no_world() {
+        // During worldgen, or in a test with no server behind the VM. The
+        // entity, fluid, storage and plan APIs all answer this way.
+        let mut vm = vm();
+        load(
+            &mut vm,
+            "early",
+            "game.register_block{ id = 'coal' }\ngame.register_on_tick(function() end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+
+        vm.eval_in(
+            "early",
+            "assert(game.container_give('nowhere', \n\
+                 { material = 'early:coal', count = 1 }) == 0)\n\
+             assert(game.container_take('nowhere', \n\
+                 { material = 'early:coal', count = 1 }) == 0)\n\
+             assert(#game.container('nowhere') == 0)",
+        )
+        .expect("no world");
+    }
+
     /// A plan store a test can watch: the server's semantics, in memory.
     ///
     /// `world` is what a capture finds, which is how a test says "that box is

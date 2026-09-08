@@ -203,6 +203,39 @@ the wrong thing.
 
 ---
 
+## Machines: containers a mod can fill
+
+A chest is a container a player drags things into. A **furnace** is one your mod
+fills itself, on a tick, whether or not anybody is looking — and that is the
+same mechanism with two more calls:
+
+```lua
+local FURNACE = "my_mod:furnace:" .. x .. "," .. y .. "," .. z
+game.make_container(FURNACE, 3)                 -- fuel, input, output
+
+game.register_on_tick(function()
+    local ore = game.container_take(FURNACE, { material = "my_mod:ore", count = 1, slot = 2 })
+    if ore > 0 then
+        game.container_give(FURNACE, { material = "my_mod:ingot", units = ore, slot = 3 })
+    end
+end)
+```
+
+- **Slots are one-based and worth naming.** `slot = 2` is the input; without it,
+  `container_take` would happily consume the ingots sitting in the output.
+  `game.container(name)` gives each stack its `slot` back, and leaves empty ones
+  out — so `#` counts what is in there, not how big it is.
+- **Both answer in UNITS, not true or false.** A container is a fixed size, so a
+  partial fit is ordinary: what did not fit was never taken from you. 27 units
+  to a block (charter rule 5).
+- **They work while a player has it open.** An open container lives in that
+  player's own inventory, and the engine writes into the slots they are looking
+  at, so a machine does not stop while its owner watches it.
+- **One callback per hook per mod.** Two `register_on_tick` calls is an error,
+  not a merge — put your machines in one tick function.
+
+---
+
 ## Building the same thing twice: plans
 
 A village, a dungeon, a ship, somebody's saved house. Do NOT write this as a

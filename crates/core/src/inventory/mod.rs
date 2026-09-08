@@ -1613,11 +1613,45 @@ pub trait Containers: Send + Sync {
     /// mod calls this when it wants the container back for its own reasons.
     fn close(&self, name: &str, player: [u8; 32]) -> bool;
 
-    /// What is in a container, when nobody has it open.
+    /// What is in a container, slot by slot, whether or not it is open.
     ///
-    /// Empty for one that is open — reading a copy that is about to be replaced
-    /// would be worse than reading nothing.
-    fn contents(&self, name: &str) -> Vec<Stack>;
+    /// `None` is an empty slot, and the position in the returned list IS the
+    /// slot number, so a mod can say "fuel goes in slot 1" and mean it.
+    ///
+    /// **It answers while a player has it open**, which is a reversal: it used
+    /// to answer empty, on the reasoning that a copy about to be replaced is
+    /// worse than nothing. That was right while containers were something only
+    /// players could touch. Once a mod can run a furnace, "empty while
+    /// somebody is looking at it" means the furnace stops smelting exactly
+    /// when its owner opens it to watch — and there is no stale copy involved,
+    /// because an open container's slots are the ones in that player's own
+    /// inventory and both run on the tick thread.
+    fn slots(&self, name: &str) -> Vec<Option<Stack>>;
+
+    /// Puts a stack into a container. Returns how many units it took.
+    ///
+    /// `slot` names one, or `None` for anywhere it fits.
+    ///
+    /// **Units accepted rather than a yes-or-no**, unlike [`Access::give`],
+    /// because a container has a fixed size and a player's view does not: a
+    /// partial fit is a real outcome here, and a mod that was told `false`
+    /// would not know whether to drop the remainder or try again. What did not
+    /// fit stays with the caller (charter rule 5).
+    fn give(&self, name: &str, slot: Option<usize>, stack: Stack) -> u32;
+
+    /// Takes up to `units` of one material out. Returns how many it got.
+    ///
+    /// `slot` names one, or `None` for anywhere in it. Partial by design, for
+    /// the reason [`Access::take`] is.
+    fn take(
+        &self,
+        name: &str,
+        slot: Option<usize>,
+        material: MaterialId,
+        shape: Option<Shape>,
+        detail: Option<&str>,
+        units: u32,
+    ) -> u32;
 
     /// Removes a container and hands back what was in it.
     ///

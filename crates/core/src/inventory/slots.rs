@@ -87,6 +87,129 @@ impl View {
             .map(|stack| u64::from(stack.units))
             .sum()
     }
+
+    /// Puts a stack in, filling matching stacks then empty slots, and hands
+    /// back whatever did not fit.
+    ///
+    /// # Why this is not [`Slots::insert`]
+    ///
+    /// `insert` GROWS the view rather than refuse, which is right for a player
+    /// — nobody's thirty-seventh material should vanish because a screen shows
+    /// thirty-six slots. It is wrong for a container: a three-slot furnace that
+    /// grew a fourth slot when a mod overfilled it would be a furnace whose
+    /// shape depends on how carefully the mod was written, and the extra slot
+    /// would be invisible to whatever screen the mod drew.
+    ///
+    /// So this is bounded, and therefore lossy unless the caller handles the
+    /// remainder — which is why the remainder is RETURNED rather than dropped.
+    /// Charter rule 5 has no exception for a full chest.
+    ///
+    /// `into` names one slot, or `None` for "anywhere it fits".
+    #[must_use]
+    pub fn fill(&mut self, into: Option<usize>, mut stack: Stack) -> Option<Stack> {
+        if stack.is_empty() {
+            return None;
+        }
+        let slots: Vec<usize> = match into {
+            Some(index) if index < self.slots.len() => vec![index],
+            // A slot that does not exist takes nothing, rather than falling
+            // back to anywhere: a mod naming slot 9 of a 3-slot furnace has a
+            // bug, and quietly putting the fuel somewhere else hides it.
+            Some(_) => return Some(stack),
+            None => (0..self.slots.len()).collect(),
+        };
+
+        // Matching stacks first, then empty slots — the order `Slots::insert`
+        // uses, so a container fills the way a player's own view does.
+        for &index in &slots {
+            let Some(slot) = self.slots[index].as_mut() else {
+                continue;
+            };
+            // Material AND shape AND detail: three stacks that look alike and
+            // are not. `Slots::insert` records what went wrong when only the
+            // first was tested.
+            if slot.material != stack.material
+                || slot.shape != stack.shape
+                || slot.detail != stack.detail
+            {
+                continue;
+            }
+            let room = slot.capacity().saturating_sub(slot.units);
+            let giving = stack.units.min(room);
+            if giving > 0
+                && let Ok(part) = stack.split(giving)
+                && slot.merge(&part).is_err()
+            {
+                // Refused after the units were split out. Putting them back is
+                // what keeps this from being the conservation hole the shaped
+                // stacks found in `Slots::insert`.
+                let _ = stack.merge(&part);
+            }
+            if stack.is_empty() {
+                return None;
+            }
+        }
+
+        let cap = stack.capacity();
+        for &index in &slots {
+            if stack.is_empty() {
+                break;
+            }
+            if self.slots[index].is_some() {
+                continue;
+            }
+            let Ok(part) = stack.split(stack.units.min(cap)) else {
+                break;
+            };
+            self.slots[index] = Some(part);
+        }
+
+        (!stack.is_empty()).then_some(stack)
+    }
+
+    /// Takes up to `units` of one material out, returning how many it got.
+    ///
+    /// `from` names one slot, or `None` for "anywhere in it". The match is
+    /// exact on material, shape and detail, for the reason [`Slots::take`] is:
+    /// a recipe asking for stone must not melt down the named sword somebody
+    /// left in the same box.
+    pub fn draw(
+        &mut self,
+        from: Option<usize>,
+        material: MaterialId,
+        shape: Option<super::Shape>,
+        detail: Option<&str>,
+        units: u32,
+    ) -> u32 {
+        let slots: Vec<usize> = match from {
+            Some(index) if index < self.slots.len() => vec![index],
+            Some(_) => return 0,
+            None => (0..self.slots.len()).collect(),
+        };
+        let mut left = units;
+        for index in slots {
+            if left == 0 {
+                break;
+            }
+            let Some(stack) = self.slots[index].as_mut() else {
+                continue;
+            };
+            if stack.material != material
+                || stack.shape != shape
+                || stack.detail.as_deref() != detail
+            {
+                continue;
+            }
+            let taking = stack.units.min(left);
+            if let Ok(part) = stack.split(taking) {
+                left -= part.units;
+            }
+            if stack.is_empty() {
+                self.slots[index] = None;
+            }
+        }
+        units - left
+    }
 }
 
 /// What the player is holding on the cursor, between clicking and clicking again.
@@ -1413,6 +1536,78 @@ mod tests {
             inv.views, before.views,
             "an impossible click moved something"
         );
+    }
+
+    #[test]
+    fn a_bounded_view_hands_back_what_it_could_not_hold() {
+        // **The rule a container needs and a player's view must not have.**
+        // `insert` grows so nobody's material vanishes; a three-slot furnace
+        // that grew a fourth slot would be a furnace whose shape depends on how
+        // carefully a mod was written. So this refuses — and hands the
+        // remainder back, because charter rule 5 has no exception for a full
+        // box.
+        let mut view = View::empty("mymod:furnace", 2);
+        assert!(
+            view.fill(None, Stack::new(STONE, 10).expect("stack"))
+                .is_none(),
+            "a stack that fits should leave nothing over"
+        );
+        assert!(
+            view.fill(None, Stack::new(DIRT, 5).expect("stack"))
+                .is_none(),
+            "the second slot should have taken the dirt"
+        );
+
+        let over = view
+            .fill(None, Stack::new(MaterialId(4), 7).expect("stack"))
+            .expect("a full view should hand the stack back");
+        assert_eq!(over.units, 7, "some of a refused stack went missing");
+        assert_eq!(view.slots.len(), 2, "the view grew rather than refusing");
+        assert_eq!(view.total_units(), 15, "the refusal changed what was held");
+    }
+
+    #[test]
+    fn filling_a_named_slot_fills_that_slot_and_no_other() {
+        // A furnace's fuel goes in the fuel slot. Falling back to "anywhere it
+        // fits" would put coal in the output slot and look like a mod bug.
+        let mut view = View::empty("mymod:furnace", 3);
+        assert!(
+            view.fill(Some(2), Stack::new(STONE, 4).expect("stack"))
+                .is_none()
+        );
+        assert!(view.slots[0].is_none() && view.slots[1].is_none());
+        assert_eq!(view.slots[2].as_ref().expect("filled").units, 4);
+
+        // And a slot that does not exist takes nothing rather than falling back
+        // to anywhere — a mod naming slot 9 of a 3-slot furnace has a bug, and
+        // hiding it puts the fuel somewhere nobody looked.
+        let over = view
+            .fill(Some(9), Stack::new(STONE, 4).expect("stack"))
+            .expect("a slot that does not exist should refuse");
+        assert_eq!(over.units, 4);
+        assert_eq!(view.total_units(), 4, "the refused stack landed somewhere");
+    }
+
+    #[test]
+    fn drawing_from_one_slot_leaves_the_same_material_in_another() {
+        // The other half of what a furnace needs: consume from the INPUT slot
+        // without emptying the output slot of the same material.
+        let mut view = View {
+            name: "mymod:furnace".to_owned(),
+            slots: vec![stack(STONE, 10), stack(STONE, 6)],
+        };
+        assert_eq!(view.draw(Some(0), STONE, None, None, 4), 4);
+        assert_eq!(view.slots[0].as_ref().expect("left").units, 6);
+        assert_eq!(
+            view.slots[1].as_ref().expect("untouched").units,
+            6,
+            "drawing from one slot took from another"
+        );
+
+        // Asking for more than the slot holds gets what there was, and says so.
+        assert_eq!(view.draw(Some(0), STONE, None, None, 99), 6);
+        assert!(view.slots[0].is_none(), "an emptied slot is None");
+        assert_eq!(view.draw(None, DIRT, None, None, 1), 0, "no dirt to take");
     }
 
     #[test]

@@ -408,15 +408,71 @@ function game.open_container(name, player) end
 ---@return boolean closed
 function game.close_container(name, player) end
 
----What is in a container, in the same shape `game.inventory` reports stacks.
+---What is in a container, in the same shape `game.inventory` reports stacks,
+---plus a `slot` on each — one-based, and the slot the stack is actually in.
 ---
----**Empty while somebody has it open**, because those contents are in that
----player's screen and about to change — answering with a copy that is already
----stale would be worse than answering with nothing. Close it first if you need
----to know.
+---Empty slots are left out, so `#` is the number of OCCUPIED slots and never
+---the size of the container. Index by `slot` if you care where things are:
+---
+---```lua
+---local by_slot = {}
+---for _, entry in ipairs(game.container(name)) do by_slot[entry.slot] = entry end
+---if by_slot[2] then ... end   -- something in the input slot
+---```
+---
+---**It answers while somebody has it open.** It used to answer empty, on the
+---grounds that a copy about to change is worse than nothing — which was right
+---while only players could touch a container, and wrong once a mod could run a
+---furnace: a machine that went blind whenever its owner opened it to look would
+---stop exactly when they were watching.
 ---@param name string
 ---@return table[] stacks
 function game.container(name) end
+
+---Puts a stack into a container. Returns how many UNITS it took.
+---
+---**This and `game.container_take` are what make a machine expressible.** A
+---chest only ever needed a player dragging things into it; a furnace has to
+---consume its own input and place its own output on a tick nobody is watching,
+---and a hopper has to feed one.
+---
+---The spec is the same table `game.give` takes — `material`, and `count` or
+---`units`, with optional `shape` and `detail` — plus an optional `slot`, which
+---is **one-based**. Omit `slot` for "anywhere it fits".
+---
+---**Units taken, not true or false**, because a container is a fixed size and a
+---partial fit is ordinary: what did not fit was never taken from you, so
+---compare the answer with what you offered and keep the rest.
+---
+---```lua
+---local took = game.container_give(furnace, { material = "my:ore", count = 1, slot = 2 })
+---if took < 27 then ... end     -- the input slot was already full
+---```
+---@param name string
+---@param spec table
+---@return integer units How many units went in.
+function game.container_give(name, spec) end
+
+---Takes material out of a container. Returns how many UNITS it got.
+---
+---The same spec as `game.container_give`, including the one-based `slot` — and
+---naming the slot is usually what you want in a machine, so that consuming the
+---ore in the input slot cannot quietly eat the ingots in the output slot.
+---
+---Matched exactly on material, shape and detail, for the reason `game.take` is:
+---a recipe asking for stone must not melt down the named sword somebody left in
+---the same box.
+---
+---```lua
+---local ore = game.container_take(furnace, { material = "my:ore", count = 1, slot = 2 })
+---if ore > 0 then
+---    game.container_give(furnace, { material = "my:ingot", units = ore, slot = 3 })
+---end
+---```
+---@param name string
+---@param spec table
+---@return integer units How many units came out.
+function game.container_take(name, spec) end
 
 ---Removes a container and hands back everything that was in it.
 ---

@@ -62,6 +62,10 @@ game.register_on_generate(function(buf, pos)
 end)
 
 local CHEST = "chests:at:1,2,3"
+local FURNACE = "chests:furnace:4,5,6"
+game.register_block{ id = "ore" }
+game.register_block{ id = "ingot" }
+game.register_block{ id = "smelted" }
 
 game.register_on_player_join(function(event)
     game.give(event.player, { material = "chests:ground", units = 54 })
@@ -89,6 +93,24 @@ game.register_on_chat(function(event)
         game.give(event.player, { material = "chests:ground", units = took, view = CHEST })
         return false
     end
+    if event.text == "load" then
+        -- Into the input slot, from the mod, with no player involved.
+        game.make_container(FURNACE, 3)
+        game.container_give(FURNACE, { material = "chests:ore", count = 1, slot = 2 })
+        return false
+    end
+    if event.text == "watch" then
+        game.make_container(FURNACE, 3)
+        if game.open_container(FURNACE, event.player) then
+            game.show_dialog{
+                player = event.player, form = "furnace",
+                tree = { type = "container", direction = "column", children = {
+                    { type = "item_grid", view = FURNACE, columns = 3, first = 1, count = 3 },
+                }},
+            }
+        end
+        return false
+    end
     if event.text == "count" then
         local total = 0
         for _, stack in ipairs(game.container(CHEST)) do
@@ -107,6 +129,25 @@ game.register_block{ id = "busy" }
 for n = 1, 60 do
     game.register_block{ id = "counted_" .. n }
 end
+
+-- One callback per hook per mod, which the engine enforces — so the furnace
+-- lives inside the same `on_chat` above and gets the one `on_tick` below.
+game.register_on_tick(function()
+    -- The furnace: fuel in slot 1, ore in slot 2, ingot out of slot 3, running
+    -- with nobody watching. Read, consume, produce — none of which was
+    -- expressible before a mod could put a stack into a container.
+    game.make_container(FURNACE, 3)
+    local took = game.container_take(FURNACE, { material = "chests:ore", count = 1, slot = 2 })
+    if took == 0 then
+        return
+    end
+    game.container_give(FURNACE, { material = "chests:ingot", units = took, slot = 3 })
+    for _, entry in ipairs(game.container(FURNACE)) do
+        if entry.slot == 3 then
+            game.set_block({ x = 6, y = 9, z = 6 }, "chests:smelted")
+        end
+    end
+end)
 "#,
     )
     .expect("script");
@@ -166,6 +207,83 @@ async fn until_view_exists(bot: &mut Bot, view: &str, want: bool) -> bool {
             return false;
         }
     }
+}
+
+#[test]
+fn a_mod_runs_a_furnace_in_a_container_nobody_has_open() {
+    // **The gap this closes.** `make_container` and `break_container` existed
+    // and nothing put a stack into one, so a container was something only a
+    // PLAYER could fill by dragging — which makes a chest expressible and a
+    // furnace not. Reported by a mod author whose hopper could not feed one.
+    //
+    // Nobody opens anything in this test: the mod loads its own input, its tick
+    // consumes it and produces the output, and the marker says it happened.
+    let world = scratch("furnace-world");
+    let server = start(write_chests("furnace"), world);
+    block_on(async {
+        let mut bot = join(&server, "Ada").await;
+        let smelted = bot
+            .material_table()
+            .expect("a material table")
+            .into_iter()
+            .find(|entry| entry.name == "chests:smelted")
+            .map(|entry| entry.id)
+            .expect("the mod registers the marker");
+
+        bot.chat("load").await.expect("chat");
+        bot.expect_block(tiamot_core::BlockPos::new(6, 9, 6), smelted, PATIENCE)
+            .await
+            .expect("the furnace never smelted what the mod put in it");
+        bot.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn a_furnace_keeps_running_while_somebody_watches_it() {
+    // **The decision behind `Shared::with_view`.** An open container is lent
+    // into the holder's own slots, so a mod reaching only the store would find
+    // nothing there — and the furnace would stop smelting the moment its owner
+    // opened it to look, which is the one moment they are looking.
+    //
+    // The player's own view is where this is checked, because that is where an
+    // open container's slots ARE: if the ingot shows up in the bot's copy, the
+    // mod wrote into the same slots the player is looking at.
+    let world = scratch("watched-world");
+    let server = start(write_chests("watched"), world);
+    block_on(async {
+        let mut bot = join(&server, "Ada").await;
+        bot.chat("watch").await.expect("chat");
+        assert!(
+            until_view_exists(&mut bot, "chests:furnace:4,5,6", true).await,
+            "the furnace never reached the player's views: {:?}",
+            bot.views().keys().collect::<Vec<_>>()
+        );
+
+        bot.chat("load").await.expect("chat");
+
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        loop {
+            let inside: u32 = bot
+                .view("chests:furnace:4,5,6")
+                .map(|slots| slots.iter().flatten().map(|stack| stack.units).sum())
+                .unwrap_or(0);
+            // The ore arrives, then becomes an ingot — either way the furnace
+            // holds 27 units once the mod has loaded it, and the assertion that
+            // matters is that the mod could write into it AT ALL while open.
+            if inside >= 27 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the open furnace holds {inside} units: a mod could not reach a \
+                 container somebody had open"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(100), bot.recv()).await;
+        }
+        bot.disconnect().await;
+    });
+    server.stop();
 }
 
 #[test]

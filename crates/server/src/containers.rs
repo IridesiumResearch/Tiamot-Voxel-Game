@@ -291,6 +291,36 @@ impl Shared {
     ) -> Self {
         Self { store, endpoint }
     }
+
+    /// Runs `body` against a container's slots, wherever they currently live.
+    ///
+    /// # The whole reason a mod can run a furnace somebody is watching
+    ///
+    /// A container is in one of two places and never both: in the store, or —
+    /// while it is open — lent into the holder's own `Slots` under its own
+    /// name. Every mod-facing operation has to reach the one that exists, or a
+    /// machine stops the moment its owner opens it to look, which is the one
+    /// moment they are looking.
+    ///
+    /// The client is told when the open one changes, because the slots it is
+    /// drawing are the ones being written.
+    ///
+    /// **The lock order is the store first, then the inventories**, matching
+    /// [`Containers::open`] and [`Containers::close`]. Both orders in one
+    /// process is a deadlock waiting for two mods to be busy at once.
+    fn with_view<T>(&self, name: &str, body: impl FnOnce(&mut View) -> T) -> Option<T> {
+        let mut store = self.store.lock().ok()?;
+        if let Some(holder) = store.holder(name) {
+            let out = self
+                .endpoint
+                .with_slots(&holder, |slots| slots.view_mut(name).map(body))
+                .flatten()?;
+            self.endpoint.mark_inventory_dirty(&holder);
+            return Some(out);
+        }
+        // Not open: the store has it, and `contents_mut` marks it for saving.
+        store.contents_mut(name).map(body)
+    }
 }
 
 impl tiamot_core::inventory::Containers for Shared {
@@ -333,16 +363,35 @@ impl tiamot_core::inventory::Containers for Shared {
         closed
     }
 
-    fn contents(&self, name: &str) -> Vec<tiamot_core::inventory::Stack> {
-        self.store
-            .lock()
-            .ok()
-            .and_then(|store| {
-                store
-                    .contents(name)
-                    .map(|view| view.slots.iter().flatten().cloned().collect())
-            })
+    fn slots(&self, name: &str) -> Vec<Option<tiamot_core::inventory::Stack>> {
+        // A read, but through the same "wherever it lives" path a write uses:
+        // answering empty for an open container is what used to make a machine
+        // blind exactly while its owner watched it.
+        self.with_view(name, |view| view.slots.clone())
             .unwrap_or_default()
+    }
+
+    fn give(&self, name: &str, slot: Option<usize>, stack: tiamot_core::inventory::Stack) -> u32 {
+        let offered = stack.units;
+        let left = self
+            .with_view(name, |view| view.fill(slot, stack))
+            // No such container: nothing was taken, so nothing is lost.
+            .unwrap_or(None)
+            .map_or(0, |over| over.units);
+        offered.saturating_sub(left)
+    }
+
+    fn take(
+        &self,
+        name: &str,
+        slot: Option<usize>,
+        material: tiamot_core::MaterialId,
+        shape: Option<tiamot_core::inventory::Shape>,
+        detail: Option<&str>,
+        units: u32,
+    ) -> u32 {
+        self.with_view(name, |view| view.draw(slot, material, shape, detail, units))
+            .unwrap_or(0)
     }
 
     fn remove(&self, name: &str) -> Vec<tiamot_core::inventory::Stack> {
