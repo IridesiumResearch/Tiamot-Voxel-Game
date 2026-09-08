@@ -83,6 +83,7 @@ pub mod path;
 pub mod persist;
 pub mod phys;
 pub mod place;
+pub mod plan;
 pub mod proto;
 #[cfg(feature = "script")]
 pub mod script;
