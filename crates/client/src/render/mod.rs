@@ -141,12 +141,23 @@ struct Globals {
     ambient: f32,
     /// Where fog starts, in blocks from the camera.
     fog_curve: f32,
+    /// Whether ANY material in this world declares a colour tint.
+    ///
+    /// **A world whose mods declare none pays nothing for the feature.** A
+    /// uniform is coherent across every fragment of every draw, so this branch
+    /// costs a comparison and predicts perfectly; without it every fragment
+    /// loads a tint entry from a storage buffer to discover it says nothing.
+    /// The same habit as "a world with no glass allocates no glass buffers".
+    ///
+    /// Takes one of the three padding words, so the `vec4`s below still sit
+    /// where WGSL expects them.
+    tint_any: u32,
     /// Padding to the 16-byte boundary the `vec4`s below sit on.
     ///
     /// Not decorative. WGSL aligns a `vec4<f32>` to 16 bytes, so the shader
-    /// reads `sun_colour` from offset 112 whatever this side does; without the
-    /// three words the Rust struct ends at 108 and every colour arrives shifted.
-    _pad: [u32; 3],
+    /// reads `sun_colour` from offset 112 whatever this side does; without
+    /// these the Rust struct ends short and every colour arrives shifted.
+    _pad: [u32; 2],
     /// The sun's colour, which a mod sets through the sky (Task 10).
     sun_colour: [f32; 4],
     /// The sky's colour in `xyz`, and where fog reaches full strength in `w`.
@@ -713,12 +724,12 @@ pub struct Renderer {
     /// upload of the same image for the UI — would double the atlas's memory
     /// just to show a player what they are carrying.
     atlas_view: wgpu::TextureView,
-    /// What each material's colour does, indexed by atlas slot.
+    /// What each material's colour does, and whether any of them does.
     ///
     /// Held so the bind group can be rebuilt when the atlas changes without
     /// losing it, and vice versa: the two arrive together and are replaced
     /// independently.
-    tints: wgpu::Buffer,
+    tints: TintTable,
     chunks: BTreeMap<ChunkPos, ChunkMesh>,
     /// Retired chunk buffers, kept for reuse. See [`BufferPool`].
     pool: BufferPool,
@@ -1193,14 +1204,17 @@ impl Renderer {
                 tints[usize::from(entry.id)] = MaterialTint::from_def(tint);
             }
         }
-        self.tints = upload_tints(&self.gpu, &tints);
+        self.tints = TintTable {
+            buffer: upload_tints(&self.gpu, &tints),
+            any: u32::from(table.iter().any(|entry| entry.tint.is_some())),
+        };
         self.bind_group = make_bind_group(
             &self.gpu,
             &self.bind_layout,
             &self.globals,
             &self.atlas_view,
             &self.sampler,
-            &self.tints,
+            &self.tints.buffer,
         );
     }
 
@@ -1218,7 +1232,7 @@ impl Renderer {
             &self.globals,
             &view,
             &self.sampler,
-            &self.tints,
+            &self.tints.buffer,
         );
         self.hands.set_atlas(&self.gpu, &view, &self.sampler);
         self.atlas_view = view;
@@ -1589,7 +1603,8 @@ impl Renderer {
             sun_intensity: self.sun_intensity,
             ambient: AMBIENT_FLOOR,
             fog_curve: self.fog_curve,
-            _pad: [0; 3],
+            tint_any: self.tints.any,
+            _pad: [0; 2],
             sun_colour: self.sun_colour,
             // Fog's far distance rides in the sky colour's unused fourth
             // component rather than costing another sixteen bytes of padding.
@@ -3323,12 +3338,28 @@ fn build_atlas_bindings(
     layout: &wgpu::BindGroupLayout,
     globals: &wgpu::Buffer,
     sampler: &wgpu::Sampler,
-) -> (wgpu::TextureView, u32, u32, wgpu::Buffer, wgpu::BindGroup) {
+) -> (wgpu::TextureView, u32, u32, TintTable, wgpu::BindGroup) {
     let placeholder = Atlas::build(&[None]);
     let (view, grid, side) = upload_atlas(gpu, &placeholder);
-    let tints = upload_tints(gpu, &[MaterialTint::none()]);
-    let bind_group = make_bind_group(gpu, layout, globals, &view, sampler, &tints);
+    // One entry saying nothing varies: no material does until a table says so.
+    let tints = TintTable {
+        buffer: upload_tints(gpu, &[MaterialTint::none()]),
+        any: 0,
+    };
+    let bind_group = make_bind_group(gpu, layout, globals, &view, sampler, &tints.buffer);
     (view, grid, side, tints, bind_group)
+}
+
+/// The per-material tint table, and whether anything in it varies.
+///
+/// The flag travels WITH the buffer because it is a fact about its contents: a
+/// world whose mods declare no tints skips the per-fragment lookup entirely,
+/// and the two must never disagree about whether that is so.
+struct TintTable {
+    buffer: wgpu::Buffer,
+    /// Uploaded to the shader as `Globals::tint_any`. A `u32` because that is
+    /// what a uniform carries.
+    any: u32,
 }
 
 /// Uploads the per-material tint table.

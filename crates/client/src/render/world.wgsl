@@ -37,8 +37,13 @@ struct Globals {
     ambient: f32,
     // Where fog starts, in blocks. It becomes total at `sky_colour.w`.
     fog_curve: f32,
-    // The three words of padding the Rust side spells out are implicit here:
-    // WGSL aligns a vec4 to 16 bytes, so this lands at offset 112 either way.
+    // Whether any material in this world declares a tint. A world whose mods
+    // declare none does not read the tint table at all — a uniform branch is
+    // coherent across every fragment and predicts perfectly, where a storage
+    // load per fragment to discover "nothing" does not.
+    tint_any: u32,
+    // The remaining padding the Rust side spells out is implicit here: WGSL
+    // aligns a vec4 to 16 bytes, so this lands at offset 112 either way.
     sun_colour: vec4<f32>,
     // Sky colour in xyz, fog's far distance in w.
     sky_colour: vec4<f32>,
@@ -116,6 +121,9 @@ fn tint_noise(at: vec3<f32>) -> f32 {
 // until a mod says otherwise — and the test is one comparison, so a world whose
 // mods declare no tints pays nothing for the feature existing.
 fn material_tint(slot: u32, at: vec3<f32>) -> vec3<f32> {
+    if (globals.tint_any == 0u) {
+        return vec3<f32>(1.0);
+    }
     let tint = tints[slot];
     let strength = tint.params.x;
     let scale = tint.params.y;
