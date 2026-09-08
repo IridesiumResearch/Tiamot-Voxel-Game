@@ -2252,6 +2252,60 @@ function game.player_entity(player) end
 ---```
 ---@field storage { get: fun(key: string): string|number|boolean|nil, set: fun(key: string, value: string|number|boolean|nil), keys: fun(): string[] }
 
+--- PLANS ------------------------------------------------------------------
+
+---Boxes of blocks your mod captured from the world, to build again elsewhere.
+---
+---A village, a dungeon, a ship, a player's saved house: anything you want to
+---build more than once. Reading a region with `game.get_block` and writing it
+---back with `game.set_block` means holding tens of thousands of Lua tables and
+---walking them by hand; this does it in the engine.
+---
+---**A plan is named, never held.** You are given no plan value: `capture`
+---writes one under a name and every other call takes that name back. So a
+---copy-and-paste tool is `capture("clipboard", a, b)` then
+---`stamp("clipboard", at)`, and the same names still work after a restart.
+---
+---**They are yours alone**, like `game.storage`: there is nowhere here to name
+---another mod's plans.
+---
+---**Blocks, not materials.** A plan holds material NAMES, so one captured
+---today and stamped tomorrow — or shared between two people whose mods load in
+---a different order — builds the house it captured rather than one made of
+---whatever those numbers mean today.
+---
+---**Stamping ADDS.** A plan records only the blocks that hold something, so
+---air in it is the absence of a block rather than a block of air: a stamp puts
+---a building onto a hillside rather than cutting a box out of it. Clear the
+---space first if you want the box.
+---
+---`capture` returns `nil, reason` when it cannot: `"not loaded"` (some of the
+---box is in terrain nobody has loaded — move closer), `"too big"` (over 64
+---blocks on a side), `"too many blocks"` (over 65,536 filled blocks) or
+---`"no world"` (asked during worldgen, where there is nothing to capture yet).
+---
+---`stamp` returns whether the request was ACCEPTED, not whether it has landed.
+---A plan can hold far more blocks than one tick may apply, so the engine paces
+---it across several — a big building takes a few seconds to appear, and that is
+---the engine protecting the tick rather than a fault. It is `false` when the
+---plan does not exist or too many stamps are already waiting.
+---
+---```lua
+---local made = game.plans.capture("hut", { x = 0, y = 8, z = 0 }, { x = 7, y = 12, z = 7 })
+---if made then
+---    game.log(made.blocks .. " blocks, " .. (made.materials["core:stone"] or 0) .. " units of stone")
+---    game.plans.stamp("hut", { x = 40, y = 8, z = 40 })
+---end
+---for _, name in ipairs(game.plans.list()) do game.log(name) end
+---```
+---
+---`capture` and `info` answer
+---`{ size = { x, y, z }, blocks = n, materials = { ["core:stone"] = units } }`.
+---**`materials` is in UNITS** — 27 to a whole block, the same count an
+---inventory uses — so you can compare it with what a player is carrying
+---without converting anything.
+---@field plans { capture: fun(name: string, from: table, to: table): table|nil, string, stamp: fun(name: string, at: table): boolean, info: fun(name: string): table|nil, list: fun(): string[], forget: fun(name: string): boolean }
+
 ---Runs once per tick for every entity your mod spawned.
 ---
 ---**This is where a mob's behaviour lives.** The engine moves bodies and this

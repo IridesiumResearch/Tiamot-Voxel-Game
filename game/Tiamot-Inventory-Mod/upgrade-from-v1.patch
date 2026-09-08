@@ -1,0 +1,984 @@
+diff --git a/api/stubs/game.lua b/api/stubs/game.lua
+index 872c2a7..5412237 100644
+--- a/api/stubs/game.lua
++++ b/api/stubs/game.lua
+@@ -968,7 +968,7 @@ function game.register_on_chat(callback) end
+ ---@class Tiamot.WidgetStyle
+ ---@field background integer[]? `{r, g, b}` or `{r, g, b, a}`.
+ ---@field border integer[]? Same shape. The width is the client's.
+----@field nine_slice integer[]? 32 bytes of content hash, stretched around the widget.
++---@field nine_slice integer[]? 32 BLAKE3 bytes of a PNG shipped in the mod directory. The client fetches it by hash, splits at 25%/75% on both axes, and stretches the rails/center while keeping corners square (at most 52 points). Up to eight distinct UI images per connection; absent/refused files retain the style color fallback.
+ ---@field text_colour integer[]? Same shape as `background`.
+ ---@field text_size integer? In virtual pixels; the client keeps it legible.
+ 
+diff --git a/crates/client/src/app.rs b/crates/client/src/app.rs
+index 406df36..f358035 100644
+--- a/crates/client/src/app.rs
++++ b/crates/client/src/app.rs
+@@ -34,7 +34,7 @@ use crate::render::Renderer;
+ use crate::texture::{Atlas, Image};
+ use crate::world::{ABSENT_POLICY, ChunkStore};
+ 
+-/// The font every glyph the HUD draws comes from.
++/// The bundled monospace face and missing-glyph fallback.
+ ///
+ /// Go Mono, BSD-3-Clause, vendored with its licence and the reasoning in
+ /// `assets/third-party/go-font/`. Compiled in rather than loaded at runtime: a
+@@ -51,13 +51,12 @@ const HUD_FONT: &[u8] = include_bytes!("../assets/third-party/go-font/Go-Mono.tt
+ /// knob that can be added when something wants one.
+ const UNDERWATER_VISIBILITY: f32 = 16.0;
+ 
+-/// Installs [`HUD_FONT`] as the only font egui has.
++/// Installs a bold proportional display face and the bundled mono fallback.
+ ///
+ /// **Required, not cosmetic.** The client builds egui without `default_fonts`
+ /// — see the workspace manifest for why — so egui starts with no glyphs at
+-/// all, and a HUD with no font renders nothing while reporting no error. It is
+-/// mapped to both families because the HUD wants one look and neither family
+-/// may be left empty.
++/// all, and a HUD with no font renders nothing while reporting no error.
++/// Neither family may be left empty.
+ pub fn install_fonts(ctx: &egui::Context) {
+     let mut fonts = egui::FontDefinitions::empty();
+     fonts.font_data.insert(
+@@ -71,6 +70,17 @@ pub fn install_fonts(ctx: &egui::Context) {
+             .or_default()
+             .push("go-mono".to_owned());
+     }
++    fonts.font_data.insert(
++        "cinzel-bold".to_owned(),
++        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
++            "../assets/third-party/cinzel-decorative/CinzelDecorative-Bold.ttf"
++        ))),
++    );
++    fonts
++        .families
++        .entry(egui::FontFamily::Proportional)
++        .or_default()
++        .insert(0, "cinzel-bold".to_owned());
+     ctx.set_fonts(fonts);
+ }
+ 
+@@ -818,6 +828,8 @@ pub struct App {
+     /// The server's answer, not the client's belief: a slot moves when the
+     /// server says it moved, which is why a click sends a request and this
+     /// arrives afterwards.
++    /// Images owned by this connection, including their GPU handles.
++    ui_images: crate::ui_images::Images,
+     views: std::collections::BTreeMap<String, crate::dialog::ViewContents>,
+     /// Dialogs the server has open on this player's screen, by form name.
+     ///
+@@ -1175,6 +1187,7 @@ impl App {
+             sounds: Vec::new(),
+             dialogs: std::collections::BTreeMap::new(),
+             views: std::collections::BTreeMap::new(),
++            ui_images: crate::ui_images::Images::default(),
+             chat: std::collections::VecDeque::new(),
+             chat_open: false,
+             textured: 0,
+@@ -3886,6 +3899,7 @@ impl App {
+                     }
+                 }
+ 
++                Event::UiImage { hash, image } => self.ui_images.accept(hash, image),
+                 Event::Materials { table, images } => self.adopt_atlas(&table, &images),
+ 
+                 Event::Joined {
+@@ -5216,6 +5230,33 @@ impl App {
+         }
+     }
+ 
++    /// Requests artwork referenced by the current UI and uploads finished images.
++    pub fn prepare_ui_images(&mut self, ctx: &egui::Context) -> crate::ui_images::Textures {
++        let mut hashes = std::collections::BTreeSet::new();
++        for screen in self.dialogs.values() {
++            for node in &screen.tree.nodes {
++                if let Some(hash) = node.style.nine_slice {
++                    hashes.insert(hash);
++                }
++                if let tiamot_core::ui::Widget::Image { hash } = &node.widget {
++                    hashes.insert(*hash);
++                }
++            }
++        }
++        let _ = self.hud_frame(|frame| {
++            for command in frame.commands() {
++                if let tiamot_core::hud::Command::Image { hash, .. } = command {
++                    hashes.insert(*hash);
++                }
++            }
++        });
++        let missing = self.ui_images.request(hashes);
++        if !missing.is_empty() {
++            self.connection.send(Command::UiImages(missing));
++        }
++        self.ui_images.prepare(ctx)
++    }
++
+     /// What the pushed scripts drew, for the renderer.
+     ///
+     /// `None` when there is no runtime at all. An empty frame is not the same
+diff --git a/crates/client/src/dialog.rs b/crates/client/src/dialog.rs
+index 08f71d0..a882b07 100644
+--- a/crates/client/src/dialog.rs
++++ b/crates/client/src/dialog.rs
+@@ -137,7 +137,7 @@ impl Measure for EguiRuler<'_> {
+             // Buttons and checkboxes carry padding around their text.
+             Widget::Button { text } => {
+                 let (w, h) = self.text(text, style);
+-                (w + 16, h + 8)
++                (w + if style.nine_slice.is_some() { 40 } else { 16 }, h + 8)
+             }
+             Widget::Checkbox { text, .. } => {
+                 let (w, h) = self.text(text, style);
+@@ -356,7 +356,9 @@ fn paint_tree(
+     raised: &mut Vec<Raised>,
+ ) {
+     let origin = ui.cursor().min;
+-    let laid = layout(tree, Rect::new(0, 0, size.0, size.1), ruler);
++    // Preserve legible fixed controls; the owning sheet scrolls this body.
++    let height = size.1.max(tiamot_core::ui::natural(tree, ruler).1);
++    let laid = layout(tree, Rect::new(0, 0, size.0, height), ruler);
+     // The tree and its rectangles are walked TOGETHER, by index, so a renderer
+     // cannot pair a widget with somebody else's rectangle — which a flat list
+     // plus a separate traversal invites.
+@@ -434,17 +436,24 @@ fn draw_form(
+                 reason = "a window's size in points, which is small and positive"
+             )]
+             let size = (room.x.max(1.0) as i32, room.y.max(1.0) as i32);
+-            paint_tree(
+-                ui,
+-                size,
+-                tree,
+-                &ruler,
+-                form,
+-                local,
+-                views,
+-                icons,
+-                &mut raised,
+-            );
++            // Keep large mod controls legible on narrow windows. The outer
++            // sheet owns vertical scrolling; this body handles excess width.
++            egui::ScrollArea::horizontal()
++                .auto_shrink([false, false])
++                .show(ui, |ui| {
++                    let width = size.0.max(tiamot_core::ui::natural(tree, &ruler).0);
++                    paint_tree(
++                        ui,
++                        (width, size.1),
++                        tree,
++                        &ruler,
++                        form,
++                        local,
++                        views,
++                        icons,
++                        &mut raised,
++                    );
++                });
+         });
+     }
+ 
+@@ -488,7 +497,7 @@ fn paint(
+             | Widget::ItemSlot { .. }
+             | Widget::ItemGrid { .. }
+     ) {
+-        paint_background(ui, rect, &node.style);
++        paint_background(ui, rect, &node.style, icons);
+     }
+     paint_widget(ui, rect, node, form, local, views, icons, raised);
+ 
+@@ -500,7 +509,12 @@ fn paint(
+ }
+ 
+ /// The style tokens that apply to any widget.
+-fn paint_background(ui: &egui::Ui, rect: egui::Rect, style: &Style) {
++fn paint_background(ui: &egui::Ui, rect: egui::Rect, style: &Style, icons: Icons<'_>) {
++    if let Some(hash) = style.nine_slice
++        && icons.paint_image(ui.painter(), rect, &hash, true)
++    {
++        return;
++    }
+     if let Some(fill) = style.background {
+         ui.painter().rect_filled(
+             rect,
+@@ -535,7 +549,23 @@ fn control_fill(style: &Style, fallback: u8, hovered: bool) -> egui::Color32 {
+ }
+ 
+ /// Interactive widgets paint their own fill, so their border must come last.
+-fn paint_control(ui: &egui::Ui, rect: egui::Rect, style: &Style, fallback: u8, hovered: bool) {
++fn paint_control(
++    ui: &egui::Ui,
++    rect: egui::Rect,
++    style: &Style,
++    fallback: u8,
++    hovered: bool,
++    icons: Icons<'_>,
++) {
++    if let Some(hash) = style.nine_slice
++        && icons.paint_image(ui.painter(), rect, &hash, true)
++    {
++        if hovered {
++            ui.painter()
++                .rect_filled(rect.shrink(2.0), 2.0, egui::Color32::from_white_alpha(22));
++        }
++        return;
++    }
+     ui.painter()
+         .rect_filled(rect, 3.0, control_fill(style, fallback, hovered));
+     if let Some(c) = style.border {
+@@ -662,7 +692,10 @@ fn paint_widget(
+             paint_shape_editor(ui, rect, node, (*shape, *material), &paint, local, raised);
+         }
+         // Drawn by their children, or by nothing at all.
+-        Widget::Container { .. } | Widget::Scroll | Widget::Spacer | Widget::Image { .. } => {}
++        Widget::Image { hash } => {
++            let _ = icons.paint_image(ui.painter(), rect, hash, false);
++        }
++        Widget::Container { .. } | Widget::Scroll | Widget::Spacer => {}
+     }
+ }
+ 
+@@ -704,7 +737,13 @@ fn paint_shape_editor(
+ 
+     // Square, and centred: the projection fits a six-by-six box and stretching
+     // it would put the cells' faces out of true with each other.
+-    let side = rect.width().min(rect.height());
++    let side = (rect.width().min(rect.height())
++        - if node.style.nine_slice.is_some() {
++            24.0
++        } else {
++            0.0
++        })
++    .max(0.0);
+     let area = egui::Rect::from_center_size(rect.center(), egui::vec2(side, side));
+     let response = ui.allocate_rect(rect, egui::Sense::click());
+ 
+@@ -775,7 +814,7 @@ fn paint_shape_editor(
+ }
+ 
+ /// How big the turn arrows are, in points.
+-const ARROW: f32 = 26.0;
++const ARROW: f32 = 34.0;
+ 
+ /// Where the two turn arrows sit inside a shape editor.
+ ///
+@@ -792,7 +831,7 @@ const ARROW: f32 = 26.0;
+ /// screen for a click that turns the cube and found none.
+ fn turn_arrows(rect: egui::Rect) -> (egui::Rect, egui::Rect) {
+     let size = egui::vec2(ARROW, ARROW);
+-    let inset = 2.0;
++    let inset = 10.0;
+     let left = egui::Rect::from_min_size(egui::pos2(rect.left() + inset, rect.top() + inset), size);
+     let right = egui::Rect::from_min_size(
+         egui::pos2(rect.right() - ARROW - inset, rect.top() + inset),
+@@ -810,7 +849,7 @@ fn turn_arrow(ui: &mut egui::Ui, rect: egui::Rect, pointing_left: bool) -> bool
+     let glyph = if pointing_left { "◀" } else { "▶" };
+     ui.put(
+         rect,
+-        egui::Button::new(egui::RichText::new(glyph).size(13.0).weak()),
++        egui::Button::new(egui::RichText::new(glyph).size(17.0).strong()),
+     )
+     .on_hover_text(if pointing_left {
+         "Turn the block left"
+@@ -984,7 +1023,7 @@ fn paint_button(
+     raised: &mut Vec<Raised>,
+ ) {
+     let response = ui.allocate_rect(rect, egui::Sense::click());
+-    paint_control(ui, rect, paint.style, 64, response.hovered());
++    paint_control(ui, rect, paint.style, 64, response.hovered(), paint.icons);
+     ui.painter().text(
+         rect.center(),
+         egui::Align2::CENTER_CENTER,
+@@ -1151,7 +1190,7 @@ fn paint_dropdown(
+     let shown = options
+         .get(usize::from(*current))
+         .map_or("", String::as_str);
+-    paint_control(ui, rect, paint.style, 48, response.hovered());
++    paint_control(ui, rect, paint.style, 48, response.hovered(), paint.icons);
+     ui.painter().text(
+         rect.left_center() + egui::vec2(6.0, 0.0),
+         egui::Align2::LEFT_CENTER,
+@@ -1254,7 +1293,7 @@ fn paint_slot(
+ ) {
+     let inner = rect.shrink(2.0);
+     let response = ui.allocate_rect(inner, egui::Sense::click());
+-    paint_control(ui, inner, paint.style, 52, response.hovered());
++    paint_control(ui, inner, paint.style, 52, response.hovered(), paint.icons);
+     if paint.style.border.is_none() {
+         ui.painter().rect_stroke(
+             inner,
+@@ -1270,15 +1309,22 @@ fn paint_slot(
+         .and_then(|contents| contents.slots.get(usize::from(index)).cloned().flatten())
+     {
+         let (material, units) = (stack.material, stack.units);
+-        paint
+-            .icons
+-            .paint_stack(ui.painter(), inner.shrink(6.0), material, stack.shape);
++        paint.icons.paint_stack(
++            ui.painter(),
++            inner.shrink(if paint.style.nine_slice.is_some() {
++                10.0
++            } else {
++                6.0
++            }),
++            material,
++            stack.shape,
++        );
+         let label = stack_label(units, stack.shape);
+         ui.painter().text(
+             inner.right_bottom() - egui::vec2(2.0, 2.0),
+             egui::Align2::RIGHT_BOTTOM,
+             label,
+-            egui::FontId::proportional(11.0),
++            egui::FontId::proportional(f32::from(paint.style.text_size.unwrap_or(11))),
+             paint.colour,
+         );
+     }
+diff --git a/crates/client/src/icons.rs b/crates/client/src/icons.rs
+index 51b0572..9859863 100644
+--- a/crates/client/src/icons.rs
++++ b/crates/client/src/icons.rs
+@@ -33,6 +33,7 @@ use crate::texture::TileMap;
+ /// two words and a pointer.
+ #[derive(Clone, Copy, Default)]
+ pub struct Icons<'a> {
++    ui_images: Option<&'a crate::ui_images::Textures>,
+     texture: Option<egui::TextureId>,
+     tiles: Option<&'a TileMap>,
+     /// Materials that may not be placed: the items.
+@@ -52,6 +53,7 @@ impl<'a> Icons<'a> {
+             texture,
+             tiles,
+             items: None,
++            ui_images: None,
+         }
+     }
+ 
+@@ -66,6 +68,29 @@ impl<'a> Icons<'a> {
+         self
+     }
+ 
++    /// Adds content-addressed images shared by dialogs and HUD commands.
++    #[must_use]
++    pub const fn with_ui_images(mut self, images: &'a crate::ui_images::Textures) -> Self {
++        self.ui_images = Some(images);
++        self
++    }
++
++    /// Paints downloaded artwork; false keeps the caller's fallback visible.
++    #[must_use]
++    pub fn paint_image(
++        &self,
++        painter: &egui::Painter,
++        rect: egui::Rect,
++        hash: &tiamot_core::proto::ContentHash,
++        sliced: bool,
++    ) -> bool {
++        let Some(texture) = self.ui_images.and_then(|images| images.get(hash)) else {
++            return false;
++        };
++        crate::ui_images::paint(painter, *texture, rect, sliced);
++        true
++    }
++
+     /// Whether this material is an item rather than a block.
+     #[must_use]
+     pub fn is_item(&self, material: u16) -> bool {
+diff --git a/crates/client/src/lib.rs b/crates/client/src/lib.rs
+index 4851b86..dae998e 100644
+--- a/crates/client/src/lib.rs
++++ b/crates/client/src/lib.rs
+@@ -56,6 +56,7 @@ pub mod shape_view;
+ pub mod sky;
+ pub mod texture;
+ pub mod trust;
++pub mod ui_images;
+ 
+ /// Interface controls whose behaviour is shared between screens.
+ pub mod widget {
+diff --git a/crates/client/src/main.rs b/crates/client/src/main.rs
+index e7c5dea..42bd707 100644
+--- a/crates/client/src/main.rs
++++ b/crates/client/src/main.rs
+@@ -1643,8 +1643,6 @@ fn draw_entering(ctx: &egui::Context, domain: &str) {
+ /// care of the width. Points rather than physical pixels, because egui works in
+ /// points and DPI is its problem, not the script's.
+ fn draw_hud_scripts(app: &mut App, ctx: &egui::Context, icons: client::icons::Icons<'_>) {
+-    app.run_hud_scripts();
+-
+     // **Off means off, crosshair included** — but never chat, which is drawn
+     // elsewhere and is not the HUD's to hide (see `core::hud::Builtin`).
+     if !app.hud_visible() {
+@@ -1804,24 +1802,19 @@ fn paint_hud_command(
+             );
+         }
+         Command::Image {
+-            anchor, x, y, w, h, ..
++            anchor,
++            x,
++            y,
++            w,
++            h,
++            hash,
+         } => {
+-            // **Visible rather than silent.** Content images are not bridged
+-            // into egui yet — the atlas is the world renderer's texture and
+-            // tier-1 `Widget::Image` does not draw one either. A script that
+-            // asked for a picture gets a placeholder it can SEE, because an
+-            // image that draws nothing is indistinguishable from a script that
+-            // never ran.
+             let min = place(*anchor, *x, *y);
+             let size = egui::vec2(f32::from(*w) * scale, f32::from(*h) * scale);
+             let rect = egui::Rect::from_min_size(min, size);
+-            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 0, 200));
+-            painter.rect_stroke(
+-                rect,
+-                0.0,
+-                egui::Stroke::new(scale, egui::Color32::BLACK),
+-                egui::StrokeKind::Inside,
+-            );
++            if !icons.paint_image(painter, rect, hash, false) {
++                painter.rect_filled(rect, 2.0, egui::Color32::from_gray(24));
++            }
+         }
+     }
+ }
+@@ -2313,6 +2306,8 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
+     // while it does. A set of a handful of ids.
+     let items = app.items().clone();
+     let atlas_texture = surface.atlas_texture;
++    app.run_hud_scripts();
++    let ui_images = app.prepare_ui_images(&surface.egui);
+     // **Points, not physical pixels.** `client::panel` sizes a sheet and egui
+     // lays it out, and both work in points — measuring the window instead made
+     // a mod's dialog a quarter larger than the engine's own screens at the
+@@ -2349,7 +2344,9 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
+             &context,
+             app.dialogs(),
+             app.views(),
+-            client::icons::Icons::new(atlas_texture, Some(&tiles)).with_items(&items),
++            client::icons::Icons::new(atlas_texture, Some(&tiles))
++                .with_items(&items)
++                .with_ui_images(&ui_images),
+             size,
+         );
+         // **The interface makes its own noise, locally.** A click that waited
+@@ -2367,7 +2364,9 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
+         draw_hud_scripts(
+             app,
+             &context,
+-            client::icons::Icons::new(atlas_texture, Some(&tiles)).with_items(&items),
++            client::icons::Icons::new(atlas_texture, Some(&tiles))
++                .with_items(&items)
++                .with_ui_images(&ui_images),
+         );
+         if lines.is_empty() && warnings.is_empty() && joined {
+             return;
+diff --git a/crates/client/src/net.rs b/crates/client/src/net.rs
+index a2193cd..0024368 100644
+--- a/crates/client/src/net.rs
++++ b/crates/client/src/net.rs
+@@ -109,6 +109,13 @@ pub enum NetError {
+ /// renderer; nothing here needs interpreting beyond that.
+ #[derive(Debug)]
+ pub enum Event {
++    /// A requested UI texture decoded on a bounded, panic-isolated worker.
++    UiImage {
++        /// Verified content address.
++        hash: ContentHash,
++        /// Decoded pixels.
++        image: Image,
++    },
+     /// The connection is up and the certificate has been accepted.
+     Connected {
+         /// The address connected to.
+@@ -448,6 +455,8 @@ pub enum Event {
+ /// Something the render loop wants to say.
+ #[derive(Debug, Clone)]
+ pub enum Command {
++    /// Fetch content-addressed PNGs used by dialogs or HUD images.
++    UiImages(Vec<ContentHash>),
+     /// Say something.
+     Chat(String),
+     /// Report this frame's movement intent.
+@@ -845,6 +854,7 @@ async fn session(
+     // The sound table, kept so an arriving content chunk can be matched to the
+     // sound that wanted it.
+     let mut awaited_sounds: Vec<tiamot_core::proto::SoundDef> = Vec::new();
++    let mut ui_fetches = crate::ui_images::Fetches::default();
+     let mut awaited_hud_scripts: Vec<tiamot_core::proto::HudScriptDef> = Vec::new();
+     send.impair(impairment);
+ 
+@@ -963,6 +973,17 @@ async fn session(
+                         send.impair(impairment);
+                         None
+                     }
++                    Some(Command::UiImages(hashes)) => {
++                        let fresh = ui_fetches.request(hashes);
++                        let missing = cache.missing(&fresh);
++                        for hash in fresh {
++                            offer_ui_image(hash, &cache, &events, &mut ui_fetches);
++                        }
++                        if !missing.is_empty() && let Err(err) = send.write(&ClientMessage::ContentRequest { hashes: missing }).await {
++                            say(format!("could not fetch UI artwork: {err}"));
++                        }
++                        None
++                    }
+                     Some(command) => {
+                         if let Err(err) = send.write(&to_wire(command)).await {
+                             finish(format!("could not send to the server: {err}"));
+@@ -1083,6 +1104,7 @@ async fn session(
+             } => {
+                 match accept_slice(&mut pending, &cache, hash, offset, total_len, &data) {
+                     Ok(true) => {
++                        offer_ui_image(hash, &cache, &events, &mut ui_fetches);
+                         pending.outstanding = pending.outstanding.saturating_sub(1);
+                         // **A sound's file may be what just completed, and this
+                         // is the only moment it is safe to say so.**
+@@ -1541,6 +1563,32 @@ fn offer_hud_script(
+     }
+ }
+ 
++/// Offer only verified, cached bytes, once per connection and off the network task.
++fn offer_ui_image(
++    hash: ContentHash,
++    cache: &ContentCache,
++    events: &mpsc::UnboundedSender<Event>,
++    fetches: &mut crate::ui_images::Fetches,
++) {
++    let Some(bytes) = cache.get(&hash) else {
++        return;
++    };
++    if !fetches.offer(hash) {
++        return;
++    }
++    let events = events.clone();
++    tokio::task::spawn_blocking(move || match crate::texture::decode_png_isolated(&bytes) {
++        Ok(image) => {
++            let _ = events.send(Event::UiImage { hash, image });
++        }
++        Err(err) => {
++            let _ = events.send(Event::Warning(format!(
++                "UI artwork from this server was refused: {err}"
++            )));
++        }
++    });
++}
++
+ fn decode_when_ready(
+     sound: &tiamot_core::proto::SoundDef,
+     cache: &ContentCache,
+@@ -1604,6 +1652,7 @@ fn emit_materials(pending: &mut Pending, events: &mpsc::UnboundedSender<Event>)
+ /// A command as it goes on the wire.
+ fn to_wire(command: Command) -> ClientMessage {
+     match command {
++        Command::UiImages(_) => unreachable!("UI requests are cache-aware and handled in session"),
+         Command::Chat(text) => ClientMessage::Chat { text },
+         Command::Input {
+             tick,
+@@ -1807,6 +1856,44 @@ mod tests {
+         bytes
+     }
+ 
++    #[test]
++    fn cached_ui_artwork_is_offered_once_and_poisoned_pngs_warn() {
++        let runtime = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .expect("runtime");
++        runtime.block_on(async {
++            let cache = cache("ui-artwork");
++            let (events, mut received) = mpsc::unbounded_channel();
++            let mut fetches = crate::ui_images::Fetches::default();
++            let bytes = png(&Image::solid(4, 4, [20, 30, 40, 255]));
++            let hash = tiamot_core::content::hash_bytes(&bytes);
++            cache.put(&hash, &bytes).expect("cache");
++            fetches.request(vec![hash]);
++            offer_ui_image(hash, &cache, &events, &mut fetches);
++            offer_ui_image(hash, &cache, &events, &mut fetches);
++            let event = tokio::time::timeout(std::time::Duration::from_secs(3), received.recv())
++                .await
++                .expect("decoded")
++                .expect("event");
++            assert!(matches!(event, Event::UiImage { hash: ready, .. } if ready == hash));
++            assert!(
++                received.try_recv().is_err(),
++                "duplicate offer must not decode twice"
++            );
++            let bad = b"not a PNG";
++            let hash = tiamot_core::content::hash_bytes(bad);
++            cache.put(&hash, bad).expect("cache");
++            fetches.request(vec![hash]);
++            offer_ui_image(hash, &cache, &events, &mut fetches);
++            let event = tokio::time::timeout(std::time::Duration::from_secs(3), received.recv())
++                .await
++                .expect("refused")
++                .expect("event");
++            assert!(matches!(event, Event::Warning(_)));
++        });
++    }
++
+     #[test]
+     fn a_complete_transfer_verifies_and_caches() {
+         let cache = cache("complete");
+diff --git a/crates/client/src/texture.rs b/crates/client/src/texture.rs
+index bd8087d..b38a8f9 100644
+--- a/crates/client/src/texture.rs
++++ b/crates/client/src/texture.rs
+@@ -31,9 +31,9 @@ use std::io::Cursor;
+ 
+ /// Largest texture edge accepted, in pixels.
+ ///
+-/// A block texture is 16² or 32²; 1024 is generous for a high-resolution pack
+-/// and 4096× smaller than what a PNG header can claim.
+-pub const MAX_DIMENSION: u32 = 1024;
++/// UI artwork can be larger than block tiles. The separate 8 MiB decoded
++/// byte cap still applies before allocating, including for a 2048px edge.
++pub const MAX_DIMENSION: u32 = 2048;
+ 
+ /// Largest decoded size accepted, in bytes.
+ ///
+diff --git a/crates/client/src/ui_images.rs b/crates/client/src/ui_images.rs
+new file mode 100644
+index 0000000..5e6972a
+--- /dev/null
++++ b/crates/client/src/ui_images.rs
+@@ -0,0 +1,191 @@
++// SPDX-FileCopyrightText: Iridesium
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Content-addressed UI textures and nine-slice painting. No theme lives here.
++//! Images use the existing bounded, panic-isolated PNG decoder on workers.
++//! Eight distinct images per connection cap retained decoded data at 64 MiB.
++
++use std::collections::{BTreeMap, BTreeSet};
++
++use tiamot_core::proto::ContentHash;
++
++/// Maximum distinct UI image hashes requested during one connection.
++pub const MAX_IMAGES: usize = 8;
++
++/// GPU handles exposed to the dialog and HUD painters for one frame.
++pub type Textures = BTreeMap<ContentHash, egui::TextureId>;
++
++/// Render-thread texture lifetime, owned by one connected App.
++#[derive(Default)]
++pub struct Images {
++    requested: BTreeSet<ContentHash>,
++    ready: BTreeMap<ContentHash, crate::texture::Image>,
++    textures: BTreeMap<ContentHash, egui::TextureHandle>,
++}
++
++impl Images {
++    /// Accepts a decoded response only for a hash this App requested.
++    pub fn accept(&mut self, hash: ContentHash, image: crate::texture::Image) {
++        if self.requested.contains(&hash) && !self.textures.contains_key(&hash) {
++            self.ready.insert(hash, image);
++        }
++    }
++
++    /// Deduplicates requests across frames and enforces the connection budget.
++    pub fn request(&mut self, hashes: impl IntoIterator<Item = ContentHash>) -> Vec<ContentHash> {
++        let mut missing = Vec::new();
++        for hash in hashes {
++            if self.requested.len() < MAX_IMAGES && self.requested.insert(hash) {
++                missing.push(hash);
++            }
++        }
++        missing
++    }
++
++    /// Uploads finished images; owning handles releases textures on disconnect.
++    pub fn prepare(&mut self, ctx: &egui::Context) -> Textures {
++        for (hash, image) in std::mem::take(&mut self.ready) {
++            let size = [image.width as usize, image.height as usize];
++            let pixels = egui::ColorImage::from_rgba_unmultiplied(size, &image.rgba);
++            let texture = ctx.load_texture("mod-ui-image", pixels, egui::TextureOptions::LINEAR);
++            self.textures.insert(hash, texture);
++        }
++        self.textures
++            .iter()
++            .map(|(hash, texture)| (*hash, texture.id()))
++            .collect()
++    }
++}
++
++/// A requested image may be offered only once, even if slices are repeated.
++#[derive(Default)]
++pub struct Fetches {
++    requested: BTreeSet<ContentHash>,
++    offered: BTreeSet<ContentHash>,
++}
++
++impl Fetches {
++    /// Records a small bounded set and returns newly requested hashes.
++    pub fn request(&mut self, hashes: Vec<ContentHash>) -> Vec<ContentHash> {
++        let mut fresh = Vec::new();
++        for hash in hashes.into_iter().take(MAX_IMAGES) {
++            if self.requested.len() < MAX_IMAGES && self.requested.insert(hash) {
++                fresh.push(hash);
++            }
++        }
++        fresh
++    }
++
++    /// Whether the caller should launch one decode for these verified bytes.
++    pub fn offer(&mut self, hash: ContentHash) -> bool {
++        self.requested.contains(&hash) && self.offered.insert(hash)
++    }
++}
++
++/// Nine destination/source pairs, retaining square corners on narrow controls.
++/// Source corners occupy a quarter of the texture; destination corners are
++/// at most 52 points. The center and rails alone stretch.
++#[must_use]
++pub fn slices(rect: egui::Rect) -> [(egui::Rect, egui::Rect); 9] {
++    let edge = 52.0_f32
++        .min(rect.width().max(0.0) / 4.0)
++        .min(rect.height().max(0.0) / 4.0);
++    let xs = [
++        rect.left(),
++        rect.left() + edge,
++        rect.right() - edge,
++        rect.right(),
++    ];
++    let ys = [
++        rect.top(),
++        rect.top() + edge,
++        rect.bottom() - edge,
++        rect.bottom(),
++    ];
++    let uv = [0.0, 0.25, 0.75, 1.0];
++    std::array::from_fn(|i| {
++        let x = i % 3;
++        let y = i / 3;
++        (
++            egui::Rect::from_min_max(egui::pos2(xs[x], ys[y]), egui::pos2(xs[x + 1], ys[y + 1])),
++            egui::Rect::from_min_max(egui::pos2(uv[x], uv[y]), egui::pos2(uv[x + 1], uv[y + 1])),
++        )
++    })
++}
++
++/// Paints a full image or its nine slices from an already-uploaded texture.
++pub fn paint(painter: &egui::Painter, texture: egui::TextureId, rect: egui::Rect, sliced: bool) {
++    if sliced {
++        for (destination, uv) in slices(rect) {
++            if destination.is_positive() {
++                painter.image(texture, destination, uv, egui::Color32::WHITE);
++            }
++        }
++    } else {
++        painter.image(
++            texture,
++            rect,
++            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
++            egui::Color32::WHITE,
++        );
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn bundled_ornate_artwork_decodes_and_uploads() {
++        let ctx = egui::Context::default();
++        let mut images = Images::default();
++        for bytes in [
++            include_bytes!("../../../mods/tiamot_inventory/textures/ornate-panel.png").as_slice(),
++            include_bytes!("../../../mods/tiamot_inventory/textures/iron-slot.png").as_slice(),
++        ] {
++            let hash = tiamot_core::content::hash_bytes(bytes);
++            let image = crate::texture::decode_png_isolated(bytes)
++                .expect("generated PNG must be supported");
++            assert_eq!(image.width, image.height);
++            images.request([hash]);
++            images.accept(hash, image);
++        }
++        let textures = images.prepare(&ctx);
++        assert_eq!(textures.len(), 2);
++        assert!(images.ready.is_empty());
++        assert_eq!(
++            images.prepare(&ctx),
++            textures,
++            "textures must be reused across frames"
++        );
++    }
++
++    #[test]
++    fn repeated_unknown_hashes_cannot_grow_the_image_budget() {
++        let mut images = Images::default();
++        assert_eq!(images.request((0..30).map(|n| [n; 32])).len(), MAX_IMAGES);
++        assert!(images.request([[0; 32], [80; 32]]).is_empty());
++        images.accept([80; 32], crate::texture::Image::solid(1, 1, [0; 4]));
++        assert!(images.ready.is_empty());
++        let mut fetches = Fetches::default();
++        assert_eq!(fetches.request(vec![[1; 32]; 10]), vec![[1; 32]]);
++        assert!(fetches.offer([1; 32]));
++        assert!(!fetches.offer([1; 32]));
++        assert!(!fetches.offer([2; 32]));
++    }
++
++    #[test]
++    fn nine_slices_cover_small_and_wide_rectangles_without_inversion() {
++        for (w, h) in [(8.0, 8.0), (64.0, 64.0), (240.0, 44.0), (900.0, 700.0)] {
++            let rect = egui::Rect::from_min_size(egui::pos2(12.0, 8.0), egui::vec2(w, h));
++            let slices = slices(rect);
++            let area: f32 = slices.iter().map(|(r, _)| r.area()).sum();
++            assert!((area - w * h).abs() < 0.1);
++            for (r, uv) in slices {
++                assert!(r.width() >= 0.0 && r.height() >= 0.0);
++                assert!(rect.contains_rect(r));
++                assert!(uv.min.x >= 0.0 && uv.max.x <= 1.0);
++            }
++        }
++    }
++}
+diff --git a/crates/client/tests/connection.rs b/crates/client/tests/connection.rs
+index 2cf99a0..3e0ffa7 100644
+--- a/crates/client/tests/connection.rs
++++ b/crates/client/tests/connection.rs
+@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
+ use std::time::{Duration, Instant};
+ 
+ use client::cache::ContentCache;
+-use client::net::{Connection, Event};
++use client::net::{Command, Connection, Event};
+ use client::world::ChunkStore;
+ use tiamot_core::identity::{Allowlist, Identity};
+ use tiamot_core::interest::ViewDistance;
+@@ -148,6 +148,7 @@ struct Seen {
+     connected: Option<(String, bool)>,
+     table: Vec<MaterialDef>,
+     images: BTreeMap<u16, client::texture::Image>,
++    ui_images: BTreeMap<tiamot_core::proto::ContentHash, client::texture::Image>,
+     joined: Option<BlockPos>,
+     /// Whether the material table arrived while the client was still outside
+     /// the world.
+@@ -190,6 +191,9 @@ struct Seen {
+ impl Seen {
+     fn apply(&mut self, event: Event) {
+         match event {
++            Event::UiImage { hash, image } => {
++                self.ui_images.insert(hash, image);
++            }
+             Event::Connected {
+                 address, first_use, ..
+             } => self.connected = Some((address, first_use)),
+@@ -873,3 +877,63 @@ fn a_mods_own_numbers_reach_a_mods_own_hud_script() {
+         "the mod's own values did not reach its own script"
+     );
+ }
++
++#[test]
++fn ornate_inventory_dialog_fetches_its_real_artwork_over_the_connection() {
++    let server = ServerHandle::start(&Settings {
++        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
++        world_path: scratch("ornate-ui-world"),
++        max_players: 4,
++        allowlist: Allowlist::open(),
++        operators: Vec::new(),
++        view_distance: ViewDistance::MINIMUM,
++        mods_path: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../mods")),
++        enabled_mods: Some(vec!["tiamot_inventory".to_owned()]),
++        seed: Some(4242),
++        rcon: None,
++        materials: Vec::new(),
++    })
++    .expect("start with the standalone UI mod");
++    let home = Home::new("ornate-ui");
++    let mut connection = home.open(&server);
++    let mut seen = Seen::default();
++    assert!(pump(&mut connection, &mut seen, |s| s.joined.is_some()));
++    connection.send(Command::Action {
++        id: "tiamot_inventory:inventory".to_owned(),
++        pressed: true,
++    });
++    assert!(pump(&mut connection, &mut seen, |s| s
++        .dialogs
++        .contains_key("tiamot_inventory:inventory")));
++    let tree = &seen.dialogs["tiamot_inventory:inventory"];
++    let hashes: std::collections::BTreeSet<_> = tree
++        .nodes
++        .iter()
++        .filter_map(|node| node.style.nine_slice)
++        .collect();
++    assert_eq!(
++        hashes.len(),
++        2,
++        "both frames must be referenced by actual widgets"
++    );
++    for bytes in [
++        include_bytes!("../../../mods/tiamot_inventory/textures/ornate-panel.png").as_slice(),
++        include_bytes!("../../../mods/tiamot_inventory/textures/iron-slot.png").as_slice(),
++    ] {
++        assert!(hashes.contains(&tiamot_core::content::hash_bytes(bytes)));
++    }
++    connection.send(Command::UiImages(hashes.into_iter().collect()));
++    assert!(
++        pump(&mut connection, &mut seen, |s| s.ui_images.len() == 2),
++        "received {} images; warnings: {:?}",
++        seen.ui_images.len(),
++        seen.warnings
++    );
++    assert!(
++        seen.ui_images
++            .values()
++            .all(|image| image.width == 1254 && image.height == 1254)
++    );
++    connection.shutdown();
++    assert!(server.stop());
++}
+diff --git a/fuzz/Cargo.toml b/fuzz/Cargo.toml
+index 63deadf..d3aa03e 100644
+--- a/fuzz/Cargo.toml
++++ b/fuzz/Cargo.toml
+@@ -21,6 +21,7 @@ cargo-fuzz = true
+ libfuzzer-sys = "0.4"
+ tiamot-core = { path = "../crates/core", default-features = false }
+ client = { path = "../crates/client" }
++egui = { version = "0.35", default-features = false }
+ 
+ [[bin]]
+ name = "proto_decode"
+@@ -79,3 +80,10 @@ path = "fuzz_targets/beacon_decode.rs"
+ test = false
+ doc = false
+ bench = false
++
++[[bin]]
++name = "ui_artwork"
++path = "fuzz_targets/ui_artwork.rs"
++test = false
++doc = false
++bench = false
+diff --git a/fuzz/fuzz_targets/ui_artwork.rs b/fuzz/fuzz_targets/ui_artwork.rs
+new file mode 100644
+index 0000000..033d1c6
+--- /dev/null
++++ b/fuzz/fuzz_targets/ui_artwork.rs
+@@ -0,0 +1,23 @@
++// SPDX-FileCopyrightText: Iridesium
++// SPDX-License-Identifier: GPL-3.0-only
++
++//! Fuzz the UI PNG ingest and nine-slice geometry at narrow and wide sizes.
++#![no_main]
++
++use libfuzzer_sys::fuzz_target;
++
++fuzz_target!(|data: &[u8]| {
++    let Ok(image) = client::texture::decode_png(data) else {
++        return;
++    };
++    assert!(image.rgba.len() as u64 <= client::texture::MAX_DECODED_BYTES);
++    let rect = egui::Rect::from_min_size(
++        egui::Pos2::ZERO,
++        egui::vec2(image.width as f32, image.height as f32),
++    );
++    for (destination, source) in client::ui_images::slices(rect) {
++        assert!(destination.width() >= 0.0 && destination.height() >= 0.0);
++        assert!(rect.contains_rect(destination));
++        assert!(source.min.x >= 0.0 && source.max.x <= 1.0);
++    }
++});

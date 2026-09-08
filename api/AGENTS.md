@@ -203,6 +203,41 @@ the wrong thing.
 
 ---
 
+## Building the same thing twice: plans
+
+A village, a dungeon, a ship, somebody's saved house. Do NOT write this as a
+loop over `game.get_block` and `game.set_block` holding the result in Lua
+tables — the engine has it, in one place, bounded:
+
+```lua
+local made = game.plans.capture("hut", { x = 0, y = 8, z = 0 }, { x = 7, y = 12, z = 7 })
+if made then                                    -- nil, reason if it could not
+    game.plans.stamp("hut", { x = 40, y = 8, z = 40 })
+end
+```
+
+Four things worth knowing before you design around it:
+
+- **A plan is named, never held.** `capture` saves under a name and every other
+  call takes that name back, so a plan survives a restart and a clipboard is
+  just a name you reuse.
+- **Stamping ADDS.** A plan records only blocks that hold something, so it puts
+  a building onto a hillside rather than cutting a box out of it. Clear the
+  space yourself if you want the box.
+- **`stamp` returns "accepted", not "done".** Big plans are paced across ticks
+  by the engine, so a large building appears over a second or two. That is the
+  engine protecting the 50 ms tick, and taking the pacing into your own hands is
+  not available — nor should you want it.
+- **`materials` in the summary is in UNITS**, 27 to a block, which is what an
+  inventory counts in. `blocks` is the block count. Check the first against what
+  a player is carrying before you stamp, not after.
+
+Limits: 64 blocks on a side, 65,536 filled blocks, and everything you capture
+must be in loaded terrain — a capture reaching unloaded chunks is refused whole
+rather than coming back with holes you cannot see.
+
+---
+
 ## What belongs in your mod, not in the engine
 
 The engine is deliberately small and holds no opinion about what a world is.

@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Iridesium
+# SPDX-License-Identifier: GPL-3.0-only
+id = "tiamot_inventory"
+name = "Tiamot Inventory"
+version = "0.2.0"
+description = "Dark iron inventory, shape crafter and matching hotbar. Replaces core_ui."
+license = "GPL-3.0-only"
