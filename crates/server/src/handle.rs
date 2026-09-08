@@ -3382,140 +3382,157 @@ impl ServerHandle {
                             }
                         }
 
-                        // **Mod-registered actions, before the mods' entity
-                        // logic.** A mod that flips a mode on a key press and
-                        // reads that mode while stepping its mobs should see
-                        // this tick's press, not the last one's.
+                        // **Lent the world for the hooks a player's own
+                        // actions reach.** A mod's response to a key press, a
+                        // chat line or a button in its own dialog is where a
+                        // build tool lives — "save this build", "put it over
+                        // there" — and every one of those needs to read
+                        // terrain. Without this window `game.get_block`,
+                        // `game.find_path` and `game.plans` all answer "there
+                        // is no world" inside exactly the hooks a player
+                        // triggers, which is not a limitation anybody could
+                        // guess at: the same call works from `on_tick`.
                         //
-                        // Charter rule 11 ends here: the mod is told the action
-                        // and never the key. Whether the id is real was settled
-                        // at the edge by `queue_action`, against the same table
-                        // the client was sent.
-                        for (uuid, id, pressed) in shared.drain_actions() {
-                            let verdict = source.did_action(&tiamot_core::script::ActionEvent {
-                                player: *uuid.as_bytes(),
-                                id,
-                                pressed,
-                            });
-                            for (mod_id, err) in &verdict.faults {
-                                error!(mod_id = %mod_id, "mod disabled after an on_action failure: {err}");
-                            }
-                        }
-
-                        // Chat, which every mod may veto. Broadcast only if
-                        // nobody refused: a line already sent cannot be unsent,
-                        // which is why this happens here and not on the
-                        // connection task that received it.
-                        for (uuid, text) in shared.drain_chat() {
-                            let verdict = source.may_chat(&tiamot_core::script::ChatEvent {
-                                player: *uuid.as_bytes(),
-                                text: text.clone(),
-                            });
-                            for (mod_id, err) in &verdict.faults {
-                                error!(mod_id = %mod_id, "mod disabled after an on_chat failure: {err}");
-                            }
-                            if !verdict.allowed {
-                                // Told to the speaker alone, so they know it
-                                // did not go out rather than wondering.
-                                let reason = verdict.reason.clone().unwrap_or_else(|| {
-                                    "a mod refused that message".to_owned()
+                        // Nothing in here touches `world` itself, and the
+                        // compiler is what says so — between the lend and the
+                        // return there is no `world` value to touch.
+                        let (returned, ()) = sight.lending(world, || {
+                            // **Mod-registered actions, before the mods' entity
+                            // logic.** A mod that flips a mode on a key press and
+                            // reads that mode while stepping its mobs should see
+                            // this tick's press, not the last one's.
+                            //
+                            // Charter rule 11 ends here: the mod is told the action
+                            // and never the key. Whether the id is real was settled
+                            // at the edge by `queue_action`, against the same table
+                            // the client was sent.
+                            for (uuid, id, pressed) in shared.drain_actions() {
+                                let verdict = source.did_action(&tiamot_core::script::ActionEvent {
+                                    player: *uuid.as_bytes(),
+                                    id,
+                                    pressed,
                                 });
-                                let _ = shared.push_entity_messages(
-                                    &uuid,
-                                    std::iter::once(tiamot_core::proto::ServerMessage::Chat {
-                                        from: None,
-                                        text: reason,
-                                    }),
-                                );
-                                continue;
-                            }
-                            shared.broadcast(tiamot_core::proto::ServerMessage::Chat {
-                                from: Some(*uuid.as_bytes()),
-                                text,
-                            });
-                        }
-
-                        // And the dialogs. Delivered to the OWNER alone —
-                        // `Screens` recorded who opened each form, and an
-                        // event for a form nobody owns is a client describing
-                        // a dialog that is not open, which is dropped rather
-                        // than guessed at.
-                        for (uuid, form, event) in shared.drain_dialog_events() {
-                            let player = uuid.to_hex();
-                            let Some(owner) = dialog_screens
-                                .as_ref()
-                                .and_then(|screens| screens.owner_of(&player, &form))
-                            else {
-                                continue;
-                            };
-                            // **A slot click is applied HERE, before the mod
-                            // hears about it.** The server's inventory is the
-                            // authority, and the mod is told what happened
-                            // rather than asked to make it happen — so a mod
-                            // that ignores the event still cannot leave the
-                            // player's items in a state nobody agreed to.
-                            if let tiamot_core::proto::DialogEvent::Clicked {
-                                view, index, click
-                            } = &event
-                                && shared.click_slot(&uuid, view, usize::from(*index), *click)
-                            {
-                                // Every view, not just the clicked one: a
-                                // shift-click moves a stack BETWEEN views, so
-                                // telling the client about one of them leaves
-                                // the other showing something that has moved.
-                                let _ = shared
-                                    .push_entity_messages(&uuid, shared.view_updates(&uuid));
-                            }
-                            let closing = matches!(
-                                event,
-                                tiamot_core::proto::DialogEvent::Closed
-                            );
-                            // **A stack in hand goes back when the screen
-                            // goes.** It has no picture once the screen it was
-                            // picked up on is gone, which is how an item seems
-                            // to disappear for good — and it would now stay
-                            // there across a save.
-                            // **And any container that screen had open.** A
-                            // container lent to somebody whose screen has gone
-                            // is a container nobody can ever open again — and
-                            // its contents would sit in a player's slots,
-                            // saved as theirs.
-                            if closing
-                                && let Ok(mut store) = containers.lock()
-                            {
-                                let put_back = shared
-                                    .with_slots(&uuid, |slots| store.close_all(uuid, slots))
-                                    .unwrap_or_default();
-                                if !put_back.is_empty() {
-                                    shared.mark_inventory_dirty(&uuid);
+                                for (mod_id, err) in &verdict.faults {
+                                    error!(mod_id = %mod_id, "mod disabled after an on_action failure: {err}");
                                 }
                             }
-                            if closing && shared.return_held(&uuid) {
-                                let _ = shared
-                                    .push_entity_messages(&uuid, shared.view_updates(&uuid));
-                            }
-                            let verdict =
-                                source.did_dialog_event(&tiamot_core::script::DialogEvent {
+
+                            // Chat, which every mod may veto. Broadcast only if
+                            // nobody refused: a line already sent cannot be unsent,
+                            // which is why this happens here and not on the
+                            // connection task that received it.
+                            for (uuid, text) in shared.drain_chat() {
+                                let verdict = source.may_chat(&tiamot_core::script::ChatEvent {
                                     player: *uuid.as_bytes(),
-                                    mod_id: owner,
-                                    form: form.clone(),
-                                    event,
+                                    text: text.clone(),
                                 });
-                            for (mod_id, err) in &verdict.faults {
-                                error!(mod_id = %mod_id, "mod disabled after an on_dialog_event failure: {err}");
+                                for (mod_id, err) in &verdict.faults {
+                                    error!(mod_id = %mod_id, "mod disabled after an on_chat failure: {err}");
+                                }
+                                if !verdict.allowed {
+                                    // Told to the speaker alone, so they know it
+                                    // did not go out rather than wondering.
+                                    let reason = verdict.reason.clone().unwrap_or_else(|| {
+                                        "a mod refused that message".to_owned()
+                                    });
+                                    let _ = shared.push_entity_messages(
+                                        &uuid,
+                                        std::iter::once(tiamot_core::proto::ServerMessage::Chat {
+                                            from: None,
+                                            text: reason,
+                                        }),
+                                    );
+                                    continue;
+                                }
+                                shared.broadcast(tiamot_core::proto::ServerMessage::Chat {
+                                    from: Some(*uuid.as_bytes()),
+                                    text,
+                                });
                             }
-                            // A player closing a dialog closes it, whatever the
-                            // mod does about it. Otherwise a mod that ignored
-                            // the event would leave the form owned for ever and
-                            // the player unable to reopen it.
-                            if closing && let Some(screens) = dialog_screens.as_ref() {
-                                tiamot_core::ui::host::Access::close(
-                                    screens.as_ref(),
-                                    &player,
-                                    &form,
+
+                            // And the dialogs. Delivered to the OWNER alone —
+                            // `Screens` recorded who opened each form, and an
+                            // event for a form nobody owns is a client describing
+                            // a dialog that is not open, which is dropped rather
+                            // than guessed at.
+                            for (uuid, form, event) in shared.drain_dialog_events() {
+                                let player = uuid.to_hex();
+                                let Some(owner) = dialog_screens
+                                    .as_ref()
+                                    .and_then(|screens| screens.owner_of(&player, &form))
+                                else {
+                                    continue;
+                                };
+                                // **A slot click is applied HERE, before the mod
+                                // hears about it.** The server's inventory is the
+                                // authority, and the mod is told what happened
+                                // rather than asked to make it happen — so a mod
+                                // that ignores the event still cannot leave the
+                                // player's items in a state nobody agreed to.
+                                if let tiamot_core::proto::DialogEvent::Clicked {
+                                    view, index, click
+                                } = &event
+                                    && shared.click_slot(&uuid, view, usize::from(*index), *click)
+                                {
+                                    // Every view, not just the clicked one: a
+                                    // shift-click moves a stack BETWEEN views, so
+                                    // telling the client about one of them leaves
+                                    // the other showing something that has moved.
+                                    let _ = shared
+                                        .push_entity_messages(&uuid, shared.view_updates(&uuid));
+                                }
+                                let closing = matches!(
+                                    event,
+                                    tiamot_core::proto::DialogEvent::Closed
                                 );
+                                // **A stack in hand goes back when the screen
+                                // goes.** It has no picture once the screen it was
+                                // picked up on is gone, which is how an item seems
+                                // to disappear for good — and it would now stay
+                                // there across a save.
+                                // **And any container that screen had open.** A
+                                // container lent to somebody whose screen has gone
+                                // is a container nobody can ever open again — and
+                                // its contents would sit in a player's slots,
+                                // saved as theirs.
+                                if closing
+                                    && let Ok(mut store) = containers.lock()
+                                {
+                                    let put_back = shared
+                                        .with_slots(&uuid, |slots| store.close_all(uuid, slots))
+                                        .unwrap_or_default();
+                                    if !put_back.is_empty() {
+                                        shared.mark_inventory_dirty(&uuid);
+                                    }
+                                }
+                                if closing && shared.return_held(&uuid) {
+                                    let _ = shared
+                                        .push_entity_messages(&uuid, shared.view_updates(&uuid));
+                                }
+                                let verdict =
+                                    source.did_dialog_event(&tiamot_core::script::DialogEvent {
+                                        player: *uuid.as_bytes(),
+                                        mod_id: owner,
+                                        form: form.clone(),
+                                        event,
+                                    });
+                                for (mod_id, err) in &verdict.faults {
+                                    error!(mod_id = %mod_id, "mod disabled after an on_dialog_event failure: {err}");
+                                }
+                                // A player closing a dialog closes it, whatever the
+                                // mod does about it. Otherwise a mod that ignored
+                                // the event would leave the form owned for ever and
+                                // the player unable to reopen it.
+                                if closing && let Some(screens) = dialog_screens.as_ref() {
+                                    tiamot_core::ui::host::Access::close(
+                                        screens.as_ref(),
+                                        &player,
+                                        &form,
+                                    );
+                                }
                             }
-                        }
+                        });
+                        world = returned;
 
                         // **The mods' own entity logic, before the physics.**
                         //

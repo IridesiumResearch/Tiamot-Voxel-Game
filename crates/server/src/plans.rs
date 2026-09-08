@@ -198,13 +198,12 @@ impl Stamping {
         by_name: &BTreeMap<String, u16>,
         budget: &mut usize,
     ) -> usize {
-        let palette = self.plan.palette().to_vec();
         let mut queued = 0;
         for cell in self.plan.cells().skip(self.next) {
             if *budget == 0 {
                 break;
             }
-            let Some(name) = palette.get(cell.material as usize) else {
+            let Some(name) = self.plan.palette().get(cell.material as usize) else {
                 self.next += 1;
                 continue;
             };
@@ -227,7 +226,11 @@ impl Stamping {
             let edits = block_edits(pos, material, cell.occupancy, opened);
             if edits.len() > *budget && queued > 0 {
                 // Leave a mixed block's layers for a tick with room for all of
-                // them, rather than splitting one across two.
+                // them, rather than splitting one across two. `queued > 0`
+                // because a cell that does not fit in a budget nothing has
+                // spent yet must go anyway — otherwise a stamp behind another
+                // one could wait for ever. That overshoots by at most 26
+                // edits, the most cells a block has beyond the first.
                 break;
             }
 
