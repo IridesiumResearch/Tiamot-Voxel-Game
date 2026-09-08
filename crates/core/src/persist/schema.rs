@@ -196,6 +196,26 @@ CREATE TABLE IF NOT EXISTS mod_maps (
     PRIMARY KEY (mod_id, name)
 );
 
+-- Plans: the boxes of blocks a mod has captured and can stamp back.
+--
+-- Additive, like `mod_maps`. Its own table rather than a blob in `mod_storage`
+-- so a mod's plans and a mod's own facts cannot collide in one key space, and
+-- so `all_plans` can list them without walking everything a mod ever stored.
+--
+-- One blob rather than a row per cell: a plan is read and written whole — there
+-- is no such thing as loading half a house — and a table of a quarter of a
+-- million rows would make stamping a query rather than a memcpy.
+--
+-- The blob is postcard, zstd'd like a chunk. Material NAMES travel inside it
+-- (charter rule 8): a plan shared between two people whose mods load in a
+-- different order must not stamp a house made of the wrong materials.
+CREATE TABLE IF NOT EXISTS mod_plans (
+    mod_id TEXT NOT NULL,
+    name   TEXT NOT NULL,
+    data   BLOB NOT NULL,
+    PRIMARY KEY (mod_id, name)
+);
+
 -- Inventories that belong to the WORLD rather than to a player: a chest, a
 -- furnace, a hopper. Named by the mod that made them, which is how one is
 -- found again when somebody opens the block it belongs to.

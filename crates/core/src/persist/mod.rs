@@ -49,6 +49,15 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// disks are things people edit.
 const MAP_MAX_BYTES: usize = (1024 * 1024 * 4) + 1024;
 
+/// The largest a decompressed plan blob may be.
+///
+/// **A decompression bound, not a size limit.** `crate::plan` already bounds a
+/// plan at `MAX_CELLS` occupied blocks; this is what stops a hostile or corrupt
+/// blob claiming to expand to a gigabyte before anything has looked at what is
+/// inside it. Generous against the real bound — 65,536 cells of eight bytes
+/// plus a palette — because being wrong here refuses a legitimate plan.
+const MAX_PLAN_BYTES: usize = (crate::plan::MAX_CELLS * 16) + (64 * 1024);
+
 /// `zstd` level for a map blob.
 ///
 /// The same as a chunk's, [`codec::ZSTD_LEVEL`]. A heightfield is smooth and
@@ -1239,6 +1248,81 @@ impl WorldDb {
         Ok(())
     }
 
+    // -- plans ------------------------------------------------------------
+
+    /// Loads a plan a mod saved, or `None` if it never saved one by that name.
+    ///
+    /// A blob that will not decode is `None` rather than an error, for the same
+    /// reason a summary is: a plan is something a mod can rebuild or do without,
+    /// and refusing to open a world because one saved building is unreadable
+    /// costs the player everything to protect nothing.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn load_plan(
+        &self,
+        mod_id: &str,
+        name: &str,
+    ) -> Result<Option<crate::plan::Plan>, WorldError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT data FROM mod_plans WHERE mod_id = ?1 AND name = ?2")?;
+        let blob: Option<Vec<u8>> = statement
+            .query_row(params![mod_id, name], |row| row.get(0))
+            .optional()?;
+        let Some(blob) = blob else {
+            return Ok(None);
+        };
+        let Ok(raw) = zstd::bulk::decompress(&blob, MAX_PLAN_BYTES) else {
+            return Ok(None);
+        };
+        Ok(postcard::from_bytes(&raw).ok())
+    }
+
+    /// Writes a plan under a mod's own name, replacing any it had.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure, or a plan too large to encode.
+    pub fn save_plan(
+        &self,
+        mod_id: &str,
+        name: &str,
+        plan: &crate::plan::Plan,
+    ) -> Result<(), WorldError> {
+        let raw = postcard::to_allocvec(plan).map_err(|source| WorldError::ModStorage {
+            mod_id: mod_id.to_owned(),
+            key: name.to_owned(),
+            reason: source.to_string(),
+        })?;
+        let blob = zstd::bulk::compress(&raw, MAP_ZSTD_LEVEL).map_err(|source| {
+            WorldError::ModStorage {
+                mod_id: mod_id.to_owned(),
+                key: name.to_owned(),
+                reason: source.to_string(),
+            }
+        })?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO mod_plans (mod_id, name, data) VALUES (?1, ?2, ?3)",
+            params![mod_id, name, blob],
+        )?;
+        Ok(())
+    }
+
+    /// The names of every plan a mod has saved, sorted.
+    ///
+    /// # Errors
+    ///
+    /// Any SQL failure.
+    pub fn plan_names(&self, mod_id: &str) -> Result<Vec<String>, WorldError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT name FROM mod_plans WHERE mod_id = ?1 ORDER BY name")?;
+        let rows = statement.query_map(params![mod_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     // -- players ----------------------------------------------------------
 
     /// Loads a player's opaque state blob.
@@ -1872,6 +1956,49 @@ pub struct StoredPlayerKey {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_plan_round_trips_and_is_kept_apart_from_another_mods() {
+        use crate::plan::Plan;
+
+        let mut registry = Registry::new();
+        let db = WorldDb::open_in_memory(&mut registry).expect("open");
+
+        let mut plan = Plan::new([4, 3, 2]).expect("a valid size");
+        plan.set([3, 2, 1], "core:stone", 0x07FF_FFFF)
+            .expect("in bounds");
+        plan.set([0, 0, 0], "core:wood", 0b1011).expect("in bounds");
+        db.save_plan("builder", "house", &plan).expect("save");
+
+        let back = db
+            .load_plan("builder", "house")
+            .expect("load")
+            .expect("a plan was saved under that name");
+        assert_eq!(back, plan, "the plan did not survive being written down");
+
+        // **Keyed by mod AND name.** One mod's plans must not be reachable by
+        // another's, which is a property of the primary key rather than of
+        // everyone's good behaviour — the same rule `mod_storage` follows.
+        assert!(
+            db.load_plan("someone_else", "house")
+                .expect("load")
+                .is_none(),
+            "another mod read a plan it did not save"
+        );
+        assert!(
+            db.load_plan("builder", "shed").expect("load").is_none(),
+            "a name nobody saved came back as something"
+        );
+
+        // Listing is per mod for the same reason.
+        db.save_plan("builder", "barn", &plan).expect("save");
+        assert_eq!(
+            db.plan_names("builder").expect("list"),
+            vec!["barn".to_owned(), "house".to_owned()],
+            "sorted, and only this mod's"
+        );
+        assert!(db.plan_names("someone_else").expect("list").is_empty());
+    }
 
     #[test]
     fn a_map_round_trips_and_a_changed_shape_reads_as_absent() {
