@@ -1119,6 +1119,12 @@ pub struct App {
     /// Read by the mesher, which culls and buckets faces by it. Empty until the
     /// material table arrives, which is the same state as a world with no glass
     /// in it — and a world with no glass pays nothing for glass existing.
+    /// Pictures a mod's dialogs and HUD draw, by content hash.
+    ///
+    /// Not the atlas: interface art is whatever size the artist drew, is drawn
+    /// by egui rather than the world shader, and can arrive at any moment
+    /// rather than at the join.
+    pub pictures: crate::pictures::Pictures,
     transparent: std::collections::BTreeSet<u16>,
     /// A chunk being meshed across frames, if one is part-built.
     ///
@@ -1294,6 +1300,7 @@ impl App {
             hosting: None,
             seed: None,
             transparent: std::collections::BTreeSet::new(),
+            pictures: crate::pictures::Pictures::new(),
             meshing: None,
             may_fly: false,
             flying: false,
@@ -3333,6 +3340,56 @@ impl App {
         &self.tiles
     }
 
+    /// Uploads the art every open dialog draws, keyed by form.
+    ///
+    /// **Here rather than in the painter** because the painter takes the
+    /// dialogs and the views by reference and the store by `&mut`, and the
+    /// borrow checker cannot split three accessors on one `App`. Doing it in
+    /// one method ends the mutable borrow before the draw begins, which is also
+    /// the honest ordering: a texture is uploaded once, and drawn many times.
+    pub fn dialog_art(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> std::collections::BTreeMap<String, crate::pictures::Resolved> {
+        let forms: Vec<String> = self.dialogs.keys().cloned().collect();
+        let mut art = std::collections::BTreeMap::new();
+        for form in forms {
+            let Some(screen) = self.dialogs.get(&form) else {
+                continue;
+            };
+            // Cloned because `resolve` needs `&mut self.pictures` while the
+            // tree is borrowed from `self.dialogs`. A tree is a few dozen
+            // nodes and this happens once a frame per open dialog.
+            let tree = screen.tree.clone();
+            let resolved = self.pictures.resolve(ctx, &tree);
+            if !resolved.is_empty() {
+                art.insert(form, resolved);
+            }
+        }
+        art
+    }
+
+    /// Uploads the art this frame's HUD scripts draw.
+    ///
+    /// Two passes over the frame — what does it name, then upload those —
+    /// because naming needs the frame borrowed and uploading needs the store
+    /// mutable, and they are the same `App`. See [`App::dialog_art`].
+    pub fn hud_art(&mut self, ctx: &egui::Context) -> crate::pictures::Resolved {
+        let wanted: Vec<tiamot_core::proto::ContentHash> = self
+            .hud_frame(|frame| {
+                frame
+                    .commands()
+                    .iter()
+                    .filter_map(|command| match command {
+                        tiamot_core::hud::Command::Image { hash, .. } => Some(*hash),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.pictures.resolve_hashes(ctx, &wanted)
+    }
+
     /// Materials that may not be placed: the items.
     ///
     /// Read by whatever draws a slot, because an item is drawn flat and a block
@@ -4007,6 +4064,9 @@ impl App {
                 } => self.connected_to(&address, &fingerprint, first_use),
 
                 Event::Materials { table, images } => self.adopt_atlas(&table, &images),
+                // A dialog's art, arriving whenever it arrives. Held until
+                // something draws it — see `crate::pictures`.
+                Event::Picture { hash, image } => self.pictures.insert(hash, image),
 
                 Event::Joined {
                     spawn,

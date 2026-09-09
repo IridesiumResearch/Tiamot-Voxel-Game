@@ -198,6 +198,10 @@ impl Seen {
                 address, first_use, ..
             } => self.connected = Some((address, first_use)),
             Event::SelectSlot { slot } => self.selected = Some(slot),
+            // A dialog's art. This test never opens one, and the arm is here
+            // because the match is exhaustive on purpose: a new event should
+            // make somebody decide what this test does about it.
+            Event::Picture { .. } => {}
             Event::Materials { table, images } => {
                 self.table_before_join = Some(self.joined.is_none());
                 self.table = table;

@@ -194,13 +194,22 @@ impl Dialogs {
         open: &BTreeMap<String, Screen>,
         views: &BTreeMap<String, ViewContents>,
         icons: Icons<'_>,
+        art: &BTreeMap<String, crate::pictures::Resolved>,
         area: (f32, f32),
     ) -> Vec<Raised> {
         self.retain_open(open);
         let mut raised = Vec::new();
         for (form, screen) in open {
             let local = self.forms.entry(form.clone()).or_default();
-            raised.extend(draw_form(ctx, form, screen, local, views, icons, area));
+            // Uploaded before the walk, so the walk stays immutable — see
+            // `Pictures::resolve` and `App::dialog_art`. A form with no art
+            // resolves to nothing and every lookup in it misses, which is what
+            // every dialog written before pictures existed does.
+            let empty = crate::pictures::Resolved::default();
+            let form_art = art.get(form).unwrap_or(&empty);
+            raised.extend(draw_form(
+                ctx, form, screen, local, views, icons, form_art, area,
+            ));
         }
         // **Last, and over everything.** What is on the cursor is drawn after
         // every screen, because it is above them by definition — a stack in
@@ -353,6 +362,7 @@ fn paint_tree(
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
+    art: &crate::pictures::Resolved,
     raised: &mut Vec<Raised>,
 ) {
     let origin = ui.cursor().min;
@@ -361,12 +371,16 @@ fn paint_tree(
     // cannot pair a widget with somebody else's rectangle — which a flat list
     // plus a separate traversal invites.
     paint(
-        ui, origin, tree, 0, &laid, form, local, views, icons, raised,
+        ui, origin, tree, 0, &laid, form, local, views, icons, art, raised,
     );
     ui.allocate_space(egui::vec2(laid.rect.w as f32, laid.rect.h as f32));
 }
 
 /// Draws one dialog in its own window.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the same context a paint walk carries, one level up from it"
+)]
 fn draw_form(
     ctx: &egui::Context,
     form: &str,
@@ -374,6 +388,7 @@ fn draw_form(
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
+    art: &crate::pictures::Resolved,
     area: (f32, f32),
 ) -> Vec<Raised> {
     let tree = &screen.tree;
@@ -403,6 +418,7 @@ fn draw_form(
                     local,
                     views,
                     icons,
+                    art,
                     &mut raised,
                 );
                 if ui.button("Close").clicked() {
@@ -443,6 +459,7 @@ fn draw_form(
                 local,
                 views,
                 icons,
+                art,
                 &mut raised,
             );
         });
@@ -472,6 +489,7 @@ fn paint(
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
+    art: &crate::pictures::Resolved,
     raised: &mut Vec<Raised>,
 ) {
     let Some(node) = tree.nodes.get(index) else {
@@ -481,18 +499,42 @@ fn paint(
         origin + egui::vec2(laid.rect.x as f32, laid.rect.y as f32),
         egui::vec2(laid.rect.w as f32, laid.rect.h as f32),
     );
-    paint_background(ui, rect, &node.style);
-    paint_widget(ui, rect, node, form, local, views, icons, raised);
+    paint_background(ui, rect, &node.style, art);
+    paint_widget(ui, rect, node, form, local, views, icons, art, raised);
 
     for (child, child_laid) in tree.children_of(index).zip(&laid.children) {
         paint(
-            ui, origin, tree, child, child_laid, form, local, views, icons, raised,
+            ui, origin, tree, child, child_laid, form, local, views, icons, art, raised,
         );
     }
 }
 
 /// The style tokens that apply to any widget.
-fn paint_background(ui: &egui::Ui, rect: egui::Rect, style: &Style) {
+fn paint_background(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    style: &Style,
+    art: &crate::pictures::Resolved,
+) {
+    // **The frame goes under the fill and the border.** A nine-slice IS the
+    // background where a mod supplies one, and a mod that supplies both meant
+    // the flat colour to sit inside the frame rather than over it.
+    if let Some(hash) = style.nine_slice
+        && let Some(picture) = art.get(&hash)
+    {
+        // **Corner size in source pixels, one for one.** The layout is already
+        // in the same points egui draws in, so a frame drawn at 48 pixels
+        // across has 16-point corners whatever the interface scale — which is
+        // the behaviour a nine-slice exists for: the corners keep their size
+        // and the edges take up the slack.
+        crate::pictures::paint_nine_slice(
+            ui.painter(),
+            picture.texture,
+            rect,
+            1.0,
+            (picture.width, picture.height),
+        );
+    }
     if let Some(fill) = style.background {
         ui.painter().rect_filled(
             rect,
@@ -580,6 +622,7 @@ fn paint_widget(
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
+    art: &crate::pictures::Resolved,
     raised: &mut Vec<Raised>,
 ) {
     let paint = Paint {
@@ -653,8 +696,18 @@ fn paint_widget(
         Widget::ShapeEditor { shape, material } => {
             paint_shape_editor(ui, rect, node, (*shape, *material), &paint, local, raised);
         }
+        // **A picture, if its bytes have arrived.** Nothing until they do,
+        // rather than a placeholder: art landing a few frames after the dialog
+        // it belongs to is the ordinary case, and a magenta square flashing on
+        // every panel open helps nobody. A picture that will NOT decode is
+        // dropped with a warning where it is decoded — see `net::offer_picture`.
+        Widget::Image { hash } => {
+            if let Some(picture) = art.get(hash) {
+                crate::pictures::paint(ui.painter(), picture.texture, rect);
+            }
+        }
         // Drawn by their children, or by nothing at all.
-        Widget::Container { .. } | Widget::Scroll | Widget::Spacer | Widget::Image { .. } => {}
+        Widget::Container { .. } | Widget::Scroll | Widget::Spacer => {}
     }
 }
 
@@ -1425,7 +1478,14 @@ mod tests {
         for _ in 0..2 {
             let output = ctx.run_ui(raw.clone(), |root| {
                 let ctx = root.ctx().clone();
-                dialogs.draw(&ctx, &open, &views, Icons::default(), area);
+                dialogs.draw(
+                    &ctx,
+                    &open,
+                    &views,
+                    Icons::default(),
+                    &BTreeMap::new(),
+                    area,
+                );
             });
             covered = egui::Rect::NOTHING;
             for clipped in &output.shapes {
@@ -1500,7 +1560,14 @@ mod tests {
             let views = &self.views;
             let _ = self.ctx.run_ui(raw, |root| {
                 let ctx = root.ctx().clone();
-                raised = dialogs.draw(&ctx, open, views, Icons::default(), (1280.0, 720.0));
+                raised = dialogs.draw(
+                    &ctx,
+                    open,
+                    views,
+                    Icons::default(),
+                    &BTreeMap::new(),
+                    (1280.0, 720.0),
+                );
             });
             raised
         }

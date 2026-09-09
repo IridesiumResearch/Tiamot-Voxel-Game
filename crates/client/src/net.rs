@@ -217,6 +217,19 @@ pub enum Event {
         source: String,
     },
 
+    /// A picture a dialog draws has been fetched and decoded.
+    ///
+    /// Arrives after the dialog it belongs to, and often several frames after:
+    /// a mod's panel opens with its art missing and fills in when it lands,
+    /// which is better than a dialog that will not open until its background
+    /// has downloaded.
+    Picture {
+        /// What it was asked for by.
+        hash: tiamot_core::proto::ContentHash,
+        /// The decoded image, RGBA8.
+        image: crate::texture::Image,
+    },
+
     /// A sound has been fetched and decoded, and can now be played.
     ///
     /// Arrives after the join rather than before it: a client should be in the
@@ -906,6 +919,10 @@ async fn session(
     // sound that wanted it.
     let mut awaited_sounds: Vec<tiamot_core::proto::SoundDef> = Vec::new();
     let mut awaited_hud_scripts: Vec<tiamot_core::proto::HudScriptDef> = Vec::new();
+    // Pictures an open dialog draws. **Unlike sounds and scripts there is no
+    // table for these**: nothing in the protocol lists a dialog's art, so the
+    // tree is the manifest and this is what it said — see `ui::Tree::content`.
+    let mut awaited_pictures: Vec<tiamot_core::proto::ContentHash> = Vec::new();
     send.impair(impairment);
 
     let _ = events.send(Event::Connected {
@@ -1073,6 +1090,27 @@ async fn session(
                 tree,
                 compact,
             } => {
+                // **The pictures a dialog draws are asked for here**, because
+                // this message is the only thing that says which they are. The
+                // same shape as a sound: by hash, after the join, and a client
+                // that already has the bytes asks for nothing.
+                let wanted = tree.content();
+                for hash in &wanted {
+                    if !awaited_pictures.contains(hash) {
+                        awaited_pictures.push(*hash);
+                    }
+                    offer_picture(*hash, &cache, &events);
+                }
+                let missing = cache.missing(&wanted);
+                if !missing.is_empty()
+                    && let Err(err) = send
+                        .write(&ClientMessage::ContentRequest { hashes: missing })
+                        .await
+                {
+                    finish(format!("could not ask for a dialog's pictures: {err}"));
+                    break;
+                }
+
                 // Validated at decode, so this is a tree that passed `check`.
                 let _ = events.send(Event::Dialog {
                     form,
@@ -1187,6 +1225,13 @@ async fn session(
                             .filter(|script| script.file == Some(hash))
                         {
                             offer_hud_script(script, &cache, &events);
+                        }
+
+                        // And a dialog's art, at the same moment and for the
+                        // same reason: this is the first instant the bytes are
+                        // certainly in the cache.
+                        if awaited_pictures.contains(&hash) {
+                            offer_picture(hash, &cache, &events);
                         }
                     }
                     Ok(false) => {}
@@ -1605,6 +1650,40 @@ fn offer_hud_script(
             )));
         }
     }
+}
+
+/// Decodes an interface picture, if its bytes have arrived.
+///
+/// Quiet when they have not: this is called both when a dialog names a hash and
+/// when that hash finishes downloading, and exactly one of those finds bytes.
+/// Doing nothing on the other is the point rather than a fallback.
+///
+/// Charter rule 14: server-pushed and hostile. The same guarded decoder a block
+/// texture goes through, on a worker, with the limits applied before the
+/// allocation — and a picture that will not decode is dropped with a warning
+/// rather than drawn as a magenta checker. A missing block texture must be
+/// unmistakable because the world is made of it; a missing dialog picture is
+/// somebody's art failing to appear, and painting a magenta square over their
+/// panel helps nobody.
+fn offer_picture(
+    hash: tiamot_core::proto::ContentHash,
+    cache: &ContentCache,
+    events: &mpsc::UnboundedSender<Event>,
+) {
+    let Some(bytes) = cache.get(&hash) else {
+        return;
+    };
+    let events = events.clone();
+    tokio::task::spawn_blocking(move || {
+        let (image, failure) = decode_or_missing(&bytes);
+        if let Some(err) = failure {
+            let _ = events.send(Event::Warning(format!(
+                "a dialog's picture could not be decoded and will not be drawn: {err}"
+            )));
+            return;
+        }
+        let _ = events.send(Event::Picture { hash, image });
+    });
 }
 
 fn decode_when_ready(

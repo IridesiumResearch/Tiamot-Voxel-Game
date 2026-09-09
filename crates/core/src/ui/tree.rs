@@ -291,6 +291,40 @@ impl Tree {
         self.nodes.first()
     }
 
+    /// Every piece of content this tree draws, in node order, without repeats.
+    ///
+    /// # Why the tree has to be asked
+    ///
+    /// A dialog's pictures arrive by content hash, like a texture or a sound —
+    /// and unlike either, nothing else in the protocol lists them. The material
+    /// table names its textures and the sound table names its files, so a
+    /// client knows what to fetch before it needs it; a `Widget::Image` names
+    /// its hash and nothing else does, so the tree IS the manifest.
+    ///
+    /// Includes a style's nine-slice frame, which is a picture by another name.
+    ///
+    /// Ordered and deduplicated: a client turns this straight into a request,
+    /// and asking twice for the frame every panel shares would be a request as
+    /// long as the dialog.
+    #[must_use]
+    pub fn content(&self) -> Vec<crate::proto::ContentHash> {
+        let mut seen = Vec::new();
+        let mut push = |hash: crate::proto::ContentHash| {
+            if !seen.contains(&hash) {
+                seen.push(hash);
+            }
+        };
+        for node in &self.nodes {
+            if let Widget::Image { hash } = &node.widget {
+                push(*hash);
+            }
+            if let Some(hash) = node.style.nine_slice {
+                push(hash);
+            }
+        }
+        seen
+    }
+
     /// The children of the node at `index`, as indices.
     ///
     /// Empty for a node whose range falls outside the list, so a walk over a
@@ -377,5 +411,53 @@ impl Build {
             at += 1;
         }
         Tree { nodes }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(byte: u8) -> crate::proto::ContentHash {
+        [byte; 32]
+    }
+
+    #[test]
+    fn a_tree_lists_every_picture_it_draws_once() {
+        // **The tree is the manifest.** The material table names its textures
+        // and the sound table names its files, so a client knows what to fetch
+        // before it needs it. Nothing in the protocol lists a dialog's art, so
+        // this walk is the only thing that can — and a client turns it straight
+        // into a request.
+        let mut tree = Tree::leaf(Widget::Container {
+            direction: Direction::Column,
+            gap: 0,
+            padding: 0,
+            align: Align::Start,
+        });
+        tree.nodes[0].style.nine_slice = Some(hash(1));
+        tree.nodes[0].children = Children { first: 1, count: 3 };
+        tree.nodes.push(Node::new(Widget::Image { hash: hash(2) }));
+        tree.nodes.push(Node::new(Widget::Image { hash: hash(2) }));
+        let mut framed = Node::new(Widget::Label {
+            text: "hello".to_owned(),
+        });
+        framed.style.nine_slice = Some(hash(1));
+        tree.nodes.push(framed);
+
+        // Deduplicated: every panel sharing one frame must not become a request
+        // as long as the dialog.
+        assert_eq!(tree.content(), vec![hash(1), hash(2)]);
+    }
+
+    #[test]
+    fn a_tree_with_no_pictures_asks_for_nothing() {
+        // Which is every dialog written before pictures existed, and most of
+        // them after. A client that asked for something here would be sending
+        // an empty request per dialog for ever.
+        let tree = Tree::leaf(Widget::Label {
+            text: "plain".to_owned(),
+        });
+        assert!(tree.content().is_empty());
     }
 }

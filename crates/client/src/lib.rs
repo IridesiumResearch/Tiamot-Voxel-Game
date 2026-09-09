@@ -49,6 +49,7 @@ pub mod input;
 pub mod launcher;
 pub mod mesher;
 pub mod net;
+pub mod pictures;
 pub mod predict;
 pub mod render;
 pub mod shade;

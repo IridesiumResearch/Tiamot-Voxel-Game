@@ -1718,11 +1718,15 @@ fn draw_hud_scripts(app: &mut App, ctx: &egui::Context, icons: client::icons::Ic
         egui::Order::Foreground,
         egui::Id::new("hud_scripts"),
     ));
+    // Uploaded before the frame is walked, for the reason `App::dialog_art`
+    // gives: naming the pictures needs the frame, uploading them needs the
+    // store, and they are the same `App`.
+    let art = app.hud_art(ctx);
 
     let hides_crosshair = app
         .hud_frame(|frame| {
             for command in frame.commands() {
-                paint_hud_command(&painter, command, virtual_width, scale, icons);
+                paint_hud_command(&painter, command, virtual_width, scale, &art, icons);
             }
             frame.hides(tiamot_core::hud::Builtin::Crosshair)
         })
@@ -1780,6 +1784,7 @@ fn paint_hud_command(
     command: &tiamot_core::hud::Command,
     virtual_width: f32,
     scale: f32,
+    art: &client::pictures::Resolved,
     icons: client::icons::Icons<'_>,
 ) {
     use tiamot_core::hud::Command;
@@ -1857,24 +1862,36 @@ fn paint_hud_command(
             );
         }
         Command::Image {
-            anchor, x, y, w, h, ..
+            anchor,
+            x,
+            y,
+            w,
+            h,
+            hash,
         } => {
-            // **Visible rather than silent.** Content images are not bridged
-            // into egui yet — the atlas is the world renderer's texture and
-            // tier-1 `Widget::Image` does not draw one either. A script that
-            // asked for a picture gets a placeholder it can SEE, because an
-            // image that draws nothing is indistinguishable from a script that
-            // never ran.
             let min = place(*anchor, *x, *y);
             let size = egui::vec2(f32::from(*w) * scale, f32::from(*h) * scale);
             let rect = egui::Rect::from_min_size(min, size);
-            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 0, 200));
-            painter.rect_stroke(
-                rect,
-                0.0,
-                egui::Stroke::new(scale, egui::Color32::BLACK),
-                egui::StrokeKind::Inside,
-            );
+            match art.get(hash) {
+                Some(picture) => client::pictures::paint(painter, picture.texture, rect),
+                // **Still visible rather than silent, and only while it is
+                // missing.** This used to be every image, always: content was
+                // not bridged into egui at all, so a script that asked for a
+                // picture got a magenta box for ever. Now it means one thing —
+                // the bytes have not arrived, or would not decode — and a HUD
+                // script's picture that never appears is worth seeing, because
+                // an image that draws nothing is indistinguishable from a
+                // script that never ran.
+                None => {
+                    painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(200, 0, 200));
+                    painter.rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(scale, egui::Color32::BLACK),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
         }
     }
 }
@@ -2399,6 +2416,9 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // server sent: `client::dialog` walks the tree and the rectangles
         // `core::ui` computed for it. See that module for why the layout is
         // not egui's.
+        // Uploaded first, so the draw below can hold the dialogs and the views
+        // by reference — see `App::dialog_art`.
+        let dialog_art = app.dialog_art(&context);
         let raised = surface.dialogs.draw(
             &context,
             app.dialogs(),
@@ -2406,6 +2426,7 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
             client::icons::Icons::new(atlas_texture, Some(&tiles))
                 .with_items(&items)
                 .with_names(&material_names),
+            &dialog_art,
             size,
         );
         // **The interface makes its own noise, locally.** A click that waited
