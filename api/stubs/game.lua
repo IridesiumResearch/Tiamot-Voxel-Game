@@ -1906,6 +1906,45 @@ local Density = {}
 ---@return integer
 function Density:len() end
 
+---What this field can possibly be over one chunk, without evaluating it.
+---
+---Returns `{ low, high, all_solid, all_empty }` for the chunk at `pos` — the
+---same `pos` your `register_on_generate` was handed. **The engine already does
+---this before every `fill_density`**, so terrain the surface cannot reach costs
+---nothing whether you call this or not; use it to skip work of your OWN, like a
+---second field or a pass of decoration.
+---
+---```lua
+---game.register_on_generate(function(buf, pos)
+---    if surface:bounds(pos).all_empty then return end   -- nothing here but sky
+---    buf:fill_density(surface, stone)
+---end)
+---```
+---
+---**It is a bound, not a measurement, and the difference is the whole point.**
+---The tempting version of this is to sample the eight corners and the centre
+---and look at the signs — and that is wrong: noise between two samples is not
+---bounded by those samples, so a chunk whose nine samples agree can still
+---contain surface, and skipping it leaves a hole. What decides whether the
+---shortcut bites is feature size against sample spacing, so a gentle heightmap
+---survives it and your caves do not. This answers from the shape of your
+---program instead, and it can be trusted when it says no.
+---
+---`all_solid` and `all_empty` are the two answers worth acting on. Anything
+---else means the surface might cross this chunk and only evaluating will say.
+---**Wrong in one direction only**: it may say "maybe" about a chunk that turns
+---out to be empty, and it will never say "empty" about a chunk that is not.
+---
+---How often it can decide is set by your own field. The surface sits where
+---your noise balances your height term, so the band it cannot see through is
+---the noise amplitude divided by that term's coefficient: a field of
+---`noise(40) - y * 0.08` has 500 blocks of real relief and a band to match,
+---while `noise(11) - y` has eleven. Measured on a streamed column, the second
+---shape has 88% of its chunks decided outright and the first has none.
+---@param pos table The chunk position your generator was given.
+---@return { low: number, high: number, all_solid: boolean, all_empty: boolean }
+function Density:bounds(pos) end
+
 ---Compiles a density field from a table of nested operations.
 ---
 ---**This is how a mod gets 3D terrain and caves.** A heightmap gives one
@@ -1952,6 +1991,12 @@ function Density:len() end
 ---  `stream` really matters: it is a NAME, hashed into the world seed, and two
 ---  nodes with different names give independent fields. Give your terrain and
 ---  your caves different streams or the caves will follow the hills exactly.
+---- `{ op = "map", map = <a Tiamot.Map> }` — the map's value under this
+---  sample, ignoring y. **The way an eroded field becomes terrain.** A map is
+---  a surface, so subtract `y` to get a density from it. The node takes a COPY
+---  of the map as it is when `game.density` is called: a program that read a
+---  live map would generate different terrain after your next `blur`, and the
+---  seam between the two would be permanent and invisible.
 ---- `{ op = "abs", a = ... }`
 ---- `{ op = "clamp", a = ..., low = -1, high = 1 }`
 ---- `{ op = "add" | "sub" | "mul" | "div" | "min" | "max", a = ..., b = ... }`
@@ -2016,6 +2061,33 @@ function Map:blur(radius) end
 ---@param other Tiamot.Map
 ---@param how string
 function Map:combine(other, how) end
+
+---Replaces every value with a density field's, sampled on one plane.
+---
+---**The other half of the loop.** `{ op = "map" }` lets terrain read a field;
+---this lets a field read terrain. Together they are what makes erosion
+---expressible: take your surface into a map, run passes over it — blur,
+---combine, clamp — and build the terrain from the result.
+---
+---```lua
+---local land = game.map{ name = "land", side = 256, scale = 16 }
+---land:fill(game.density(SURFACE), { y = 0.0, seed = 99 })
+---local smoothed = game.map{ name = "smoothed", side = 256, scale = 16 }
+---smoothed:fill(game.density(SURFACE), { y = 0.0, seed = 99 })
+---smoothed:blur(3)
+---land:combine(smoothed, "min")   -- valleys cut, ridges kept
+---```
+---
+---`y` is the plane the field is asked about, because a map is a surface and a
+---density is a volume and something has to say where they meet. For a field of
+---the usual shape — noise minus `y` — sampling at `y = 0` gives exactly the
+---height at which it changes sign. Defaults to 0.
+---
+---One evaluation per cell at the map's own resolution, in world coordinates,
+---so two maps of the same region with the same field and seed agree.
+---@param density Tiamot.Density
+---@param options { y: number?, seed: integer? }?
+function Map:fill(density, options) end
 
 ---One chunk's worth of heights, sampled from this map.
 ---

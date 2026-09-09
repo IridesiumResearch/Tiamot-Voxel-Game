@@ -164,6 +164,37 @@ impl mlua::UserData for DensityHandle {
         // How many operations it compiled to, so a mod can see that its table
         // became what it meant. Nothing else: there is nothing else to know.
         methods.add_method("len", |_, this, ()| Ok(this.density.len()));
+
+        // What the field can possibly be over one chunk, without evaluating it.
+        // The answer is a BOUND and not a measurement: it can say "the surface
+        // is not here" and be trusted, and when it says "maybe" that is the
+        // honest answer rather than a failure. Sampling a few points instead
+        // would be faster and would put holes in the world — see
+        // `Density::bounds`.
+        methods.add_method("bounds", |lua, this, pos: Table| {
+            // The same `pos` the generator was handed, read the same way
+            // `game.rng_stream` and `game.noise_heightmap` read it.
+            let x: i32 = pos.get("x")?;
+            let y: i32 = pos.get("y")?;
+            let z: i32 = pos.get("z")?;
+            let side = crate::CHUNK_BLOCKS as usize;
+            let region = crate::detgen::Region3d {
+                origin_x: (x * crate::CHUNK_BLOCKS as i32) as f32,
+                origin_y: (y * crate::CHUNK_BLOCKS as i32) as f32,
+                origin_z: (z * crate::CHUNK_BLOCKS as i32) as f32,
+                step: 1.0,
+                width: side,
+                height: side,
+                depth: side,
+            };
+            let bounds = this.density.bounds(&region);
+            let table = lua.create_table()?;
+            table.set("low", bounds.low)?;
+            table.set("high", bounds.high)?;
+            table.set("all_solid", bounds.is_all_solid())?;
+            table.set("all_empty", bounds.is_all_empty())?;
+            Ok(table)
+        });
     }
 }
 
@@ -204,6 +235,30 @@ impl mlua::UserData for MapHandle {
             this.locked()?.noise(seed, &params, amplitude);
             Ok(())
         });
+
+        methods.add_method_mut(
+            "fill",
+            |_, this, (density, options): (mlua::AnyUserData, Option<Table>)| {
+                let density = density.borrow::<DensityHandle>().map_err(|_| {
+                    mlua::Error::external("map:fill wants a density, from game.density")
+                })?;
+                let options = options.as_ref();
+                let height = options
+                    .map(|table| table.get::<Option<f32>>("y"))
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or(0.0);
+                let seed = options
+                    .map(|table| table.get::<Option<u64>>("seed"))
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or(0);
+                this.locked()?
+                    .fill_from_density(&density.density, seed, height)
+                    .map_err(|err| mlua::Error::external(err.to_string()))?;
+                Ok(())
+            },
+        );
 
         methods.add_method_mut("offset", |_, this, by: f32| {
             this.locked()?.offset(by);
@@ -6762,6 +6817,33 @@ fn compile_density(
         "y" => ops.push(Op::Coordinate(Axis::Y)),
         "z" => ops.push(Op::Coordinate(Axis::Z)),
         "noise" => ops.push(density_noise(spec)),
+        "map" => {
+            let handle: mlua::AnyUserData = spec.get("map").map_err(|_| {
+                mlua::Error::external("a `map` node needs a `map` field holding a map")
+            })?;
+            let handle = handle
+                .borrow::<MapHandle>()
+                .map_err(|_| mlua::Error::external("a `map` node's `map` field is not a map"))?;
+            let map = handle.locked()?;
+            // The range comes off the copy, once. Walking a million samples per
+            // chunk to bound a field that cannot change is the per-sample loop
+            // the whole density mechanism exists to avoid.
+            let mut low = f32::INFINITY;
+            let mut high = f32::NEG_INFINITY;
+            for value in map.values() {
+                low = low.min(*value);
+                high = high.max(*value);
+            }
+            if !low.is_finite() || !high.is_finite() {
+                return Err(mlua::Error::external(
+                    "a `map` node's map holds no finite values to read",
+                ));
+            }
+            ops.push(Op::Map {
+                map: std::sync::Arc::new(map.clone()),
+                range: (low, high),
+            });
+        }
         "abs" => {
             child("a", ops)?;
             ops.push(Op::Absolute);

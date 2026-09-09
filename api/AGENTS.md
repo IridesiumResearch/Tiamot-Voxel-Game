@@ -175,6 +175,63 @@ reads it back. **There is no `erode` and there will not be one** — what erosio
 looks like is an opinion about what a landscape is, and that is yours. Blur and
 `combine("min")` are the primitives it is built from.
 
+**A map and a density field feed each other, which is what makes erosion work
+on terrain a heightmap cannot describe.** `map:fill(density)` reads a surface
+into a field; `{ op = "map" }` reads a field back into a surface. Without both
+you can erode a heightmap and nothing else — a world with a dome, overhangs or
+caves could compute an eroded field and have no way to use it:
+
+```lua
+game.register_on_world_init(function()
+    local land = game.map{ name = "land", side = 256, scale = 16 }
+    land:fill(game.density(SURFACE), { y = 0.0, seed = 99 })   -- surface -> field
+    local worn = game.map{ name = "worn", side = 256, scale = 16 }
+    worn:fill(game.density(SURFACE), { y = 0.0, seed = 99 })
+    worn:blur(3)
+    land:combine(worn, "min")
+end)
+
+game.register_on_generate(function(buf, pos)
+    local eroded = game.density{                               -- field -> surface
+        op = "sub",
+        a = { op = "map", map = game.map{ name = "land", side = 256, scale = 16 } },
+        b = { op = "y" },
+    }
+    buf:fill_density(eroded, stone)
+end)
+```
+
+`y = 0` is where a field of the form `noise - y` changes sign, so that is its
+height. The `map` node takes a COPY of the map as it is when `game.density` is
+called — a program reading a live map would generate different terrain after
+your next `blur`, and the seam between the two would be permanent and invisible.
+
+**A field says what it cannot be, and the engine skips the rest.** Before every
+`fill_density` the engine asks your program what values it could possibly take
+over that chunk, and generates nothing at all where the surface cannot reach.
+You pay nothing for this and need not call anything. `density:bounds(pos)` is
+the same answer, for skipping work of your own:
+
+```lua
+if surface:bounds(pos).all_empty then return end     -- nothing here but sky
+```
+
+**How much it can skip is set by your field, not by the engine.** The surface
+sits where your noise balances your height term, so the band that cannot be
+decided is the noise amplitude divided by that term's coefficient. Measured
+over a streamed column: `noise(11) - y` has **88%** of its chunks decided
+outright and runs four times faster; `noise(40) - y * 0.08` is 500 blocks of
+real relief, and none of it can be decided. If you want the skipping, keep your
+relief small against your view distance — and note that dividing the height
+term down is the same thing as scaling the relief up.
+
+**Do not write your own version of this by sampling the corners.** Nine samples
+over a chunk are not a bound: noise between two samples is not bounded by those
+samples, so a chunk whose corners agree can still contain surface, and skipping
+it leaves a hole. It fails exactly where feature size drops below sample
+spacing, which is to say at your caves and your ore, while a gentle heightmap
+survives it — so "I tried it and it looked fine" is not evidence.
+
 **Water is placed at generation or not at all.** The fluid solver conserves
 volume — it moves what exists and creates nothing — so there are no sources and
 nothing pours a sea into being later:

@@ -1009,6 +1009,113 @@ end)
 }
 
 #[test]
+fn a_map_and_a_density_can_feed_each_other_so_erosion_is_expressible() {
+    // **The loop erosion needs, and the half that was missing.** A map could
+    // only ever leave through `heightmap`, which feeds `fill_below_heightmap`
+    // and nothing else — so a world whose surface is a DENSITY (a dome,
+    // overhangs, caves) could compute an eroded field and had no way to read
+    // it. Both directions exist now: `map:fill(density)` takes a surface into
+    // a field, and `{ op = "map" }` reads a field back into a surface.
+    //
+    // The mod below is a small erosion: take the surface, smooth it, keep the
+    // lower of the two — a valley cut rather than a hill averaged away — and
+    // then build terrain from the result.
+    let root = scratch("erosion");
+    write_mod(
+        &root,
+        "erode",
+        "",
+        r#"
+local stone = game.register_block{ id = "stone" }
+
+-- The surface, as a density: this is the shape a heightmap cannot describe.
+local SURFACE = {
+    op = "sub",
+    a = { op = "noise", stream = "terrain", frequency = 0.01, octaves = 4, amplitude = 40.0 },
+    b = { op = "y" },
+}
+
+local function field()
+    return game.map{ name = "land", side = 64, scale = 16 }
+end
+
+game.register_on_world_init(function()
+    local land = field()
+    -- Read the density's own surface into the map. `y = 0` is where a field
+    -- of the form `noise - y` changes sign, so this is its height.
+    land:fill(game.density(SURFACE), { y = 0.0, seed = 99 })
+
+    local smoothed = game.map{ name = "smoothed", side = 64, scale = 16 }
+    smoothed:fill(game.density(SURFACE), { y = 0.0, seed = 99 })
+    smoothed:blur(3)
+    land:combine(smoothed, "min")
+end)
+
+game.register_on_generate(function(buf, pos)
+    -- And back out again: solid below the eroded field.
+    local eroded = game.density{
+        op = "sub",
+        a = { op = "map", map = field() },
+        b = { op = "y" },
+    }
+    -- What the engine can say about this chunk without evaluating it. A mod
+    -- may skip its own work on the strength of it; the engine skips its own
+    -- either way.
+    local bounds = eroded:bounds(pos)
+    if bounds.all_empty then
+        return
+    end
+    buf:fill_density(eroded, stone)
+end)
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+    let faults = host.vm_mut().world_init().expect("pre-pass");
+    assert!(faults.is_empty(), "the pre-pass faulted: {faults:?}");
+
+    // Under the surface: solid. Well above it: air. The field runs to about
+    // +/-40 blocks around zero, so a chunk at y = -64 is under all of it and
+    // one at y = 64 is over all of it.
+    let deep = host
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            1,
+            ChunkPos::new(0, -4, 0),
+            MaterialId::AIR,
+        )
+        .expect("generate");
+    let sky = host
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            1,
+            ChunkPos::new(0, 4, 0),
+            MaterialId::AIR,
+        )
+        .expect("generate");
+
+    // `is_uniform` is how the other generation tests read a chunk back: it
+    // answers with the one material a chunk is made of, or `None` when it
+    // holds more than one.
+    assert_ne!(
+        deep.is_uniform(),
+        Some(MaterialId::AIR),
+        "the ground under an eroded field should not be entirely air"
+    );
+    assert_eq!(
+        sky.is_uniform(),
+        Some(MaterialId::AIR),
+        "the sky over an eroded field should be empty"
+    );
+}
+
+#[test]
 fn a_world_pre_pass_computes_a_map_that_generation_then_reads() {
     // **The shape a river needs and a density field cannot have.** Where water
     // goes depends on where the land is everywhere else, so it cannot be a

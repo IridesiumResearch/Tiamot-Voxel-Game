@@ -234,6 +234,33 @@ pub enum Op {
     Maximum,
     /// Pop one, push its absolute value.
     Absolute,
+    /// Push a map's value at the sample's world x and z, ignoring its y.
+    ///
+    /// # Why a density needs this at all
+    ///
+    /// [`super::map`] exists because erosion and rivers cannot be a function of
+    /// one position — where water goes depends on the land everywhere else — so
+    /// the engine computes whole fields in passes. Without this node the only
+    /// exit from a map is `Map::heightmap`, which feeds
+    /// `ChunkBuffer::fill_below_heightmap` and nothing else: a world whose
+    /// surface is a DENSITY (a dome, overhangs, caves) could not read an eroded
+    /// field at all. The mechanism was half-built, and this is the other half.
+    ///
+    /// # It holds the map, rather than pointing at one
+    ///
+    /// A density program is a value, and a value that changed underneath a
+    /// world would be the worst kind of bug: chunks generated before a mod
+    /// blurred its map once more would disagree for ever with chunks generated
+    /// after, along a seam nothing downstream can see. So compiling the node
+    /// takes a COPY, shared with an `Arc` so that copy is made once however
+    /// many programs read it.
+    Map {
+        /// The field, as it was when the program was compiled.
+        map: std::sync::Arc<super::map::Map>,
+        /// The smallest and largest value it holds, found once at compile time
+        /// so [`Density::bounds`] can answer without walking it again.
+        range: (f32, f32),
+    },
     /// Pop one, push it bounded to a range.
     Clamp {
         /// Lower bound.
@@ -500,6 +527,10 @@ impl Density {
                     let scaled = Interval { low, high }.multiply(Interval::exactly(*amplitude));
                     stack.push(scaled);
                 }
+                Op::Map { range, .. } => stack.push(Interval {
+                    low: range.0,
+                    high: range.1,
+                }),
                 Op::Absolute => {
                     let Some(value) = stack.pop() else {
                         return Interval {
@@ -624,6 +655,11 @@ impl Density {
                     }
                     height += 1;
                 }
+                Op::Map { map, .. } => {
+                    let slot = &mut stack[height];
+                    fill_from_map(map, region, slot);
+                    height += 1;
+                }
                 Op::Absolute | Op::Clamp { .. } => {
                     let slot = &mut stack[height - 1];
                     match op {
@@ -667,7 +703,7 @@ impl Op {
     /// How many values this consumes.
     const fn arity(&self) -> usize {
         match self {
-            Self::Constant(_) | Self::Coordinate(_) | Self::Noise { .. } => 0,
+            Self::Constant(_) | Self::Coordinate(_) | Self::Noise { .. } | Self::Map { .. } => 0,
             Self::Absolute | Self::Clamp { .. } => 1,
             Self::Add
             | Self::Subtract
@@ -709,6 +745,27 @@ pub fn default_params() -> FractalParams {
 }
 
 /// Writes a coordinate value into every sample of the region.
+/// Fills a slot with a map's value under each sample.
+///
+/// A map is a surface, so y does nothing here: every sample in a column gets
+/// the same value, and a program that wants a height comparison subtracts `y`
+/// itself. Sampled per position rather than per column because the region's
+/// layout is x-fastest and re-deriving the column would cost more than the
+/// bilinear read does.
+fn fill_from_map(map: &super::map::Map, region: &Region3d, out: &mut [f32]) {
+    let mut index = 0;
+    for layer in 0..region.depth {
+        let z = region.origin_z + layer as f32 * region.step;
+        for _ in 0..region.height {
+            for column in 0..region.width {
+                let x = region.origin_x + column as f32 * region.step;
+                out[index] = map.sample(super::floor_to_i32(x), super::floor_to_i32(z));
+                index += 1;
+            }
+        }
+    }
+}
+
 fn fill_coordinate(axis: Axis, region: &Region3d, out: &mut [f32]) {
     let mut index = 0;
     for layer in 0..region.depth {

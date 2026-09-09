@@ -320,6 +320,51 @@ impl Map {
         top + (bottom - top) * tz
     }
 
+    /// Replaces every value with a density program's, sampled on one plane.
+    ///
+    /// # Why a map wants to read a density
+    ///
+    /// It closes the loop the map operations were written for. A generator
+    /// whose surface is a density can now take that surface INTO a map, run
+    /// blurs and combines over it — which is what erosion is — and read the
+    /// result back through [`super::density::Op::Map`]. Without one of the two
+    /// directions the field can be computed and never used, or used and never
+    /// computed.
+    ///
+    /// `height` is the plane the program is asked about, because a map is a
+    /// surface and a density is a volume, and something has to say where the
+    /// two meet. For a field of the usual shape — noise minus `y` — sampling at
+    /// `y = 0` gives exactly the height at which that field changes sign.
+    ///
+    /// Sampled at the map's own resolution, one evaluation per cell, in world
+    /// coordinates: two maps of the same region with the same program and seed
+    /// agree, as they do for [`Self::noise`].
+    ///
+    /// # Errors
+    ///
+    /// [`super::density::DensityError`] if the program will not evaluate.
+    pub fn fill_from_density(
+        &mut self,
+        density: &super::density::Density,
+        seed: u64,
+        height: f32,
+    ) -> Result<(), super::density::DensityError> {
+        let side = self.side as usize;
+        let region = super::noise::Region3d {
+            origin_x: self.origin[0] as f32,
+            origin_y: height,
+            origin_z: self.origin[1] as f32,
+            step: self.scale as f32,
+            width: side,
+            height: 1,
+            depth: side,
+        };
+        // Straight into the map's own storage: the layout `Region3d` produces
+        // with a height of one is x-fastest rows of z, which is exactly how
+        // `values` is indexed by `sample`.
+        density.evaluate(seed, &region, &mut self.values)
+    }
+
     /// A chunk's worth of heights, sampled from this map.
     ///
     /// **The whole point of the type, and why a script never sees a sample.**
@@ -343,6 +388,141 @@ impl Map {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_map_filled_from_a_density_holds_what_the_density_says() {
+        // The round trip both new pieces exist for: a surface described as a
+        // density becomes a field, which map operations can then work on.
+        use super::super::density::{Axis, Density, Op};
+        let density = Density::compile(vec![
+            Op::Coordinate(Axis::X),
+            Op::Constant(0.5),
+            Op::Multiply,
+            Op::Coordinate(Axis::Z),
+            Op::Add,
+        ])
+        .expect("compile");
+
+        let mut map = Map::new(8, 4, [0, 0]).expect("map");
+        map.fill_from_density(&density, 1, 0.0).expect("fill");
+
+        // x fastest, and the values are the program's: x/2 + z at the world
+        // position of each cell, which is the cell index times the scale.
+        for z in 0..8usize {
+            for x in 0..8usize {
+                let expected = (x * 4) as f32 * 0.5 + (z * 4) as f32;
+                let found = map.values()[z * 8 + x];
+                assert!(
+                    (found - expected).abs() < 1e-3,
+                    "cell ({x}, {z}) holds {found}, not {expected} — a transposed fill is \
+                     exactly what this looks like"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_density_reading_a_map_sees_what_the_map_holds() {
+        // The other direction, and the one erosion needs: whatever passes a
+        // mod ran over the map, the terrain follows them.
+        use super::super::density::{Density, Op};
+        let mut map = Map::new(4, 16, [0, 0]).expect("map");
+        map.set_values(vec![5.0; 16]).expect("values");
+        // A ridge down one row, so a wrong axis shows up as a value in the
+        // wrong place rather than as no difference at all.
+        let mut values = map.values().to_vec();
+        values[4] = 40.0;
+        map.set_values(values).expect("values");
+
+        let range = (5.0, 40.0);
+        let density = Density::compile(vec![Op::Map {
+            map: std::sync::Arc::new(map.clone()),
+            range,
+        }])
+        .expect("compile");
+
+        // Exactly on the cell the ridge is in: (0, 16) at scale 16 is cell
+        // (0, 1), which holds 40.
+        let on_the_cell = super::super::noise::Region3d {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_z: 16.0,
+            step: 1.0,
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let mut out = [0.0];
+        density
+            .evaluate(3, &on_the_cell, &mut out)
+            .expect("evaluate");
+        assert!(
+            (out[0] - 40.0).abs() < 1e-3,
+            "reading the map at its own cell gave {}, not the 40 it holds there",
+            out[0]
+        );
+
+        // And one block along, where `Map::sample` interpolates towards the
+        // neighbouring 5 — the behaviour that makes a map a smooth field
+        // rather than a grid of steps, and worth pinning so a switch to
+        // nearest-neighbour cannot pass unnoticed.
+        let between = super::super::noise::Region3d {
+            origin_x: 1.0,
+            ..on_the_cell
+        };
+        let mut nearby = [0.0];
+        density
+            .evaluate(3, &between, &mut nearby)
+            .expect("evaluate");
+        assert!(
+            nearby[0] < 40.0 && nearby[0] > 5.0,
+            "one block from the ridge gave {}, which is neither interpolated nor plausible",
+            nearby[0]
+        );
+
+        // And a bound over the map is the map's own range, so a chunk under a
+        // flat part of an eroded field can still be decided.
+        assert!(
+            !density.bounds(&on_the_cell).is_undecided(),
+            "a bound over a map is the map's own range, so this had to be decidable"
+        );
+    }
+
+    #[test]
+    fn a_density_keeps_the_map_it_compiled_with() {
+        // **The seam this design exists to prevent.** A program that pointed at
+        // a live map would generate different terrain after the mod blurred it
+        // once more, and the boundary between the two would be permanent and
+        // invisible.
+        use super::super::density::{Density, Op};
+        let mut map = Map::new(2, 16, [0, 0]).expect("map");
+        map.set_values(vec![1.0; 4]).expect("values");
+        let density = Density::compile(vec![Op::Map {
+            map: std::sync::Arc::new(map.clone()),
+            range: (1.0, 1.0),
+        }])
+        .expect("compile");
+
+        map.set_values(vec![99.0; 4]).expect("values");
+
+        let region = super::super::noise::Region3d {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            origin_z: 0.0,
+            step: 1.0,
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let mut out = [0.0];
+        density.evaluate(1, &region, &mut out).expect("evaluate");
+        assert!(
+            (out[0] - 1.0).abs() < 1e-6,
+            "the program saw {}, so it is reading the map as it is now rather than as it was \
+             when it compiled",
+            out[0]
+        );
+    }
     use super::*;
 
     fn flat(side: u32, value: f32) -> Map {
