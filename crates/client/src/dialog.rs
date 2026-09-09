@@ -57,6 +57,14 @@ pub struct ViewContents {
 /// Per-widget state the tree itself cannot carry.
 #[derive(Debug, Default)]
 struct Local {
+    /// How far each scroll box has been scrolled, in points, by node index.
+    ///
+    /// **By index rather than by name**, unlike everything else here: a scroll
+    /// box is a container and containers are rarely named, so keying on the
+    /// name would give every unnamed one in a dialog the same offset. The index
+    /// is stable for as long as the tree is, and a tree that changes shape is a
+    /// tree whose scroll position was about to be wrong anyway.
+    scroll: BTreeMap<usize, f32>,
     /// What is in each text input, by widget name.
     text: BTreeMap<String, String>,
     /// Where each slider sits, by widget name.
@@ -90,6 +98,35 @@ struct Local {
     /// and never what they are making — and the mod is never told, because
     /// there is nothing here it could act on.
     turn: BTreeMap<String, crate::shape_view::Turn>,
+}
+
+impl Local {
+    /// Applies the wheel to a scroll box and returns how far it is scrolled.
+    ///
+    /// # Why the offset is clamped every frame rather than only when it moves
+    ///
+    /// The content changes under it. A mod redrawing a list one item shorter
+    /// leaves a box scrolled past its own end, and the symptom is a panel that
+    /// looks empty until the player scrolls back up — which reads as the mod
+    /// having lost its contents. Clamping on read means the offset can only
+    /// ever be somewhere the content is.
+    ///
+    /// Only when the pointer is inside the box, so a dialog with two lists does
+    /// not scroll both, and so the wheel still reaches the world when nothing
+    /// is under it.
+    fn scroll_by(&mut self, ui: &egui::Ui, index: usize, rect: egui::Rect, content: f32) -> f32 {
+        let room = (content - rect.height()).max(0.0);
+        let offset = self.scroll.entry(index).or_insert(0.0);
+        let hovered = ui
+            .ctx()
+            .pointer_latest_pos()
+            .is_some_and(|at| rect.contains(at));
+        if hovered && room > 0.0 {
+            *offset -= ui.ctx().input(|input| input.smooth_scroll_delta.y);
+        }
+        *offset = offset.clamp(0.0, room);
+        *offset
+    }
 }
 
 /// Every open dialog's local state.
@@ -172,6 +209,21 @@ impl Measure for EguiRuler<'_> {
             Widget::Spacer | Widget::Container { .. } | Widget::Scroll => (0, 0),
         }
     }
+}
+
+/// The font a count sits in, for a slot of a given size.
+///
+/// **Proportional to the slot, not a constant.** It was a flat 11 points
+/// everywhere, which is legible on the 36-point slot the engine draws and
+/// unreadable on the big one a mod asks for — the count stayed the same size
+/// while the box around it grew, so a large inventory looked like it had lost
+/// its numbers. Reported by a mod author building a bigger interface.
+///
+/// Just under a third of the slot, and never below the 11 that was there
+/// before: shrinking a count out of legibility on a small slot would trade one
+/// complaint for the other.
+fn count_font(slot: f32) -> egui::FontId {
+    egui::FontId::proportional((slot * 0.3).max(11.0))
 }
 
 /// One inventory slot's size in virtual pixels, borders included.
@@ -267,7 +319,7 @@ fn paint_cursor_stack(
         box_.right_bottom(),
         egui::Align2::RIGHT_BOTTOM,
         stack_label(stack.units, stack.shape),
-        egui::FontId::proportional(11.0),
+        count_font(side),
         egui::Color32::WHITE,
     );
 }
@@ -502,10 +554,43 @@ fn paint(
     paint_background(ui, rect, &node.style, art);
     paint_widget(ui, rect, node, form, local, views, icons, art, raised);
 
+    // **A scroll box clips its children and moves them under the clip.**
+    // `core::ui` already lays them out at their full height inside it — "the
+    // renderer clips it", says the layout — and this is the renderer finally
+    // doing so. Before it, an oversized dialog drew its contents straight over
+    // whatever was below and none of it could be reached.
+    let scrolled = matches!(node.widget, Widget::Scroll).then(|| {
+        let content = laid
+            .children
+            .iter()
+            .map(|child| (child.rect.y + child.rect.h) as f32)
+            .fold(0.0f32, f32::max)
+            - laid.rect.y as f32;
+        let offset = local.scroll_by(ui, index, rect, content);
+        let saved = ui.clip_rect();
+        ui.set_clip_rect(saved.intersect(rect));
+        (saved, offset)
+    });
+    let child_origin = origin - egui::vec2(0.0, scrolled.map_or(0.0, |(_, offset)| offset));
+
     for (child, child_laid) in tree.children_of(index).zip(&laid.children) {
         paint(
-            ui, origin, tree, child, child_laid, form, local, views, icons, art, raised,
+            ui,
+            child_origin,
+            tree,
+            child,
+            child_laid,
+            form,
+            local,
+            views,
+            icons,
+            art,
+            raised,
         );
+    }
+
+    if let Some((saved, _)) = scrolled {
+        ui.set_clip_rect(saved);
     }
 }
 
@@ -904,7 +989,10 @@ fn paint_face_labels(ui: &egui::Ui, area: egui::Rect, mask: u32, turn: crate::sh
             centre.to_pos2(),
             egui::Align2::CENTER_CENTER,
             label.text(),
-            egui::FontId::proportional(11.0),
+            // The editor's own size, for the reason a slot's count uses the
+            // slot's: a mod that asks for a bigger chiselling area should get
+            // bigger writing on it, not the same eleven points in a larger box.
+            egui::FontId::proportional((area.width() * 0.06).max(11.0)),
             colour,
         );
     }
@@ -1363,7 +1451,7 @@ fn paint_slot(
             inner.right_bottom() - egui::vec2(2.0, 2.0),
             egui::Align2::RIGHT_BOTTOM,
             label,
-            egui::FontId::proportional(11.0),
+            count_font(inner.width()),
             paint.colour,
         );
 
@@ -1789,5 +1877,53 @@ mod tests {
             laid.children[1].rect.x > laid.children[0].rect.x,
             "a row did not lay out left to right"
         );
+    }
+    #[test]
+    fn a_count_grows_with_the_slot_it_sits_in() {
+        // **Reported by a mod author building a bigger interface.** The count
+        // was a flat eleven points everywhere, so a slot twice the size had the
+        // same small number in the corner of a much larger box — which reads as
+        // an inventory that lost its numbers rather than as a font size.
+        let small = count_font(36.0).size;
+        let large = count_font(96.0).size;
+        assert!(
+            large > small * 2.0,
+            "a slot nearly three times the size got {large} against {small}"
+        );
+
+        // And never below what it was: shrinking a count out of legibility on
+        // a small slot would trade one complaint for the other.
+        assert!((count_font(8.0).size - 11.0).abs() < f32::EPSILON);
+        assert!((count_font(36.0).size - 11.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_scroll_box_stops_at_both_ends_and_ignores_a_wheel_it_does_not_need() {
+        // The clamp is applied on READ rather than only when the wheel turns,
+        // because the content changes under it: a mod redrawing a list one item
+        // shorter leaves a box scrolled past its own end, and a panel that
+        // looks empty until you scroll back up reads as lost contents.
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+            let ui = root;
+            let mut local = Local::default();
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 50.0));
+
+            // Content shorter than the box: nothing to scroll, and the offset
+            // stays at the top however the content changed.
+            local.scroll.insert(0, 40.0);
+            assert!(
+                (local.scroll_by(ui, 0, rect, 20.0) - 0.0).abs() < f32::EPSILON,
+                "a box with nothing to scroll kept an offset"
+            );
+
+            // Content taller than the box: the offset is allowed up to the
+            // difference and no further.
+            local.scroll.insert(1, 500.0);
+            assert!(
+                (local.scroll_by(ui, 1, rect, 130.0) - 80.0).abs() < f32::EPSILON,
+                "the offset should clamp to content minus box height"
+            );
+        });
     }
 }
