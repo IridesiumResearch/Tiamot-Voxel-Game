@@ -3418,15 +3418,18 @@ impl MluaVm {
         self.lua
             .create_function(
                 move |_, (position, block, occupancy): (Table, String, Option<u32>)| {
+                    // Every bit of a third argument must name a cell, and at
+                    // least one must: a block with no cells is `engine:air`,
+                    // and asking for it that way is a mask that went wrong
+                    // rather than a request. Declared before the statements
+                    // below because an item after a statement exists from the
+                    // top of the scope anyway, and clippy says so.
+                    const FULL: u32 = (1 << crate::UNITS_PER_BLOCK) - 1;
                     let x: i32 = position.get("x")?;
                     let y: i32 = position.get("y")?;
                     let z: i32 = position.get("z")?;
                     let domain = domain_of(&position)?;
-                    // A third argument makes it a partly filled block. Every
-                    // bit must name a cell, and at least one must: a block
-                    // with no cells is `engine:air`, and asking for it this
-                    // way is a mask that went wrong rather than a request.
-                    const FULL: u32 = (1 << crate::UNITS_PER_BLOCK) - 1;
+                    // A third argument makes it a partly filled block.
                     let occupancy = match occupancy {
                         None | Some(FULL) => None,
                         Some(mask) if mask == 0 || mask > FULL => {
