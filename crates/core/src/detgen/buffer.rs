@@ -407,12 +407,27 @@ impl ChunkBuffer {
                         Detail::Smooth => trilinear_cells(&field, padded, [px, py, pz], &mut fine),
                     }
 
+                    // **A fill ADDS.** At block resolution a block where the
+                    // field is not positive is left alone, and the cells are
+                    // no different: start from what the block holds now and
+                    // write the material only where the field is positive.
+                    // Writing the other cells as air — which this did at
+                    // first — meant a second sub-node fill wiped the first
+                    // wherever its own surface crossed, so a generator could
+                    // not put grass on dirt, or dirt on stone, without
+                    // carving air between them.
+                    for cz in 0..SUBNODES_PER_AXIS {
+                        for cy in 0..SUBNODES_PER_AXIS {
+                            for cx in 0..SUBNODES_PER_AXIS {
+                                cells[subnode_index(cx, cy, cz)] =
+                                    self.get_subnode(local, cx, cy, cz);
+                            }
+                        }
+                    }
                     for (index, value) in fine.iter().enumerate() {
-                        cells[index] = if *value > 0.0 {
-                            material
-                        } else {
-                            MaterialId::AIR
-                        };
+                        if *value > 0.0 {
+                            cells[index] = material;
+                        }
                     }
                     self.set_block_cells(local, &cells);
                 }
@@ -702,6 +717,39 @@ mod tests {
             Op::Subtract,
         ])
         .expect("compile")
+    }
+
+    #[test]
+    fn a_second_detail_fill_adds_to_the_first_instead_of_clearing_it() {
+        // **Fills layer.** A generator paints stone, then dirt over it with a
+        // band of the same field, then grass over that. Each of those is a
+        // sub-node fill whose surface crosses blocks the earlier fill already
+        // shaped, and the rule at cell resolution is the block rule: where the
+        // field is not positive, leave the cell alone. Written as air instead,
+        // the second fill's surface wipes the first's cells under it, and a
+        // hillside comes out as ribbons of grass floating over stepped dirt.
+        for detail in [Detail::Sampled, Detail::Smooth] {
+            let mut buffer = ChunkBuffer::new(origin(), MaterialId(5));
+            buffer
+                .fill_density_detail(&slope(), 7, MaterialId(2), detail)
+                .expect("fill");
+            // A block the slope crosses: x = 8 puts the surface at y = 2.
+            let local = LocalBlock::new(8, 2, 8);
+            let mut below = 0;
+            let mut above = 0;
+            for cell in 0..SUBNODES_PER_BLOCK {
+                let (sx, sy, sz) = crate::block::subnode_offset(cell);
+                match buffer.get_subnode(local, sx, sy, sz) {
+                    MaterialId(2) => below += 1,
+                    MaterialId(5) => above += 1,
+                    other => panic!("a cell the fill did not claim became {other:?} ({detail:?})"),
+                }
+            }
+            assert!(
+                below > 0 && above > 0,
+                "the block was not crossed ({detail:?})"
+            );
+        }
     }
 
     #[test]

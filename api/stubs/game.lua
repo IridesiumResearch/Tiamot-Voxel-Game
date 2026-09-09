@@ -93,6 +93,11 @@ function ChunkBuffer:fill_below_heightmap(heightmap, material) end
 ---- `"sampled"` asks your field about all 27 cells, so a high-frequency term
 ---  you add shows up in the terrain.
 ---
+---The rule is the same at either resolution: cells where the field is positive
+---take the material and every other cell is left as it was. So fills LAYER —
+---stone with one field, dirt over it with a band of the same field, grass over
+---that — and the first fill at a surface is the one that gives it its shape.
+---
 ---Measured on the reference machine, per chunk, for terrain with caves:
 ---**729 us** at block resolution, **1.08 ms** smooth (1.5x), **3.98 ms**
 ---sampled (5.5x). A single noise node is 358 us, a heightmap generator 52 us,
