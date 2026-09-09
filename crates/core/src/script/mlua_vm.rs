@@ -204,12 +204,72 @@ impl mlua::UserData for DensityHandle {
 /// operations on it and lets the handle go; the values have to still be there
 /// when the server collects them to save. So the handle and the VM's registry
 /// point at the same field.
+/// A copy of a map handed to a density program, and the revision it was taken
+/// at.
+type Snapshot = Option<(u64, std::sync::Arc<crate::detgen::Map>, (f32, f32))>;
+
 #[derive(Clone)]
 struct MapHandle {
     map: std::sync::Arc<std::sync::Mutex<crate::detgen::Map>>,
+    /// The last copy handed to a density program, and the revision it was.
+    ///
+    /// **So the obvious generator is not the slow one.** `{ op = "map" }` takes
+    /// a copy of the field and reads its range, which is what stops a compiled
+    /// program changing under a world — and a mod that builds its density
+    /// inside `on_generate`, as the shortest correct code does, would pay that
+    /// per chunk: 0.303 ms and four megabytes at 1,024 a side, measured by the
+    /// `densityprobe` example. The map has not changed between two of those
+    /// calls, so neither has the answer.
+    ///
+    /// Keyed on the map's own revision rather than on this handle's use of it,
+    /// because a map is also written from outside Lua — `persist` loads one
+    /// back into the same field — and a cache that only watched its own writes
+    /// would go stale exactly when a world is loaded.
+    ///
+    /// **Beside the `Arc`, not inside the handle**, because `game.map` answers
+    /// with a CLONE of the stored handle every call. A cache in the value would
+    /// be populated on a copy that is dropped a moment later, and would never
+    /// be read — which is exactly what the first version of this did, and only
+    /// a deliberately broken cache failing to fail a test found it.
+    snapshot: std::sync::Arc<std::sync::Mutex<Snapshot>>,
 }
 
 impl MapHandle {
+    /// The field as a value a density program can hold, with its range.
+    ///
+    /// Copied the first time and reused until something edits the map, which
+    /// `Map::revision` is how it knows. See the field's own docs for what the
+    /// copy costs and why it exists at all.
+    fn snapshot(&self) -> mlua::Result<(std::sync::Arc<crate::detgen::Map>, (f32, f32))> {
+        let map = self.locked()?;
+        let revision = map.revision();
+        // The map first and then the cache, always in that order — two locks
+        // taken the same way round cannot deadlock against each other.
+        let mut cache = self
+            .snapshot
+            .lock()
+            .map_err(|_| mlua::Error::external("this map's snapshot was poisoned"))?;
+        if let Some((cached, snapshot, range)) = cache.as_ref()
+            && *cached == revision
+        {
+            return Ok((std::sync::Arc::clone(snapshot), *range));
+        }
+        let mut low = f32::INFINITY;
+        let mut high = f32::NEG_INFINITY;
+        for value in map.values() {
+            low = low.min(*value);
+            high = high.max(*value);
+        }
+        if !low.is_finite() || !high.is_finite() {
+            return Err(mlua::Error::external(
+                "a `map` node's map holds no finite values to read",
+            ));
+        }
+        let snapshot = std::sync::Arc::new(map.clone());
+        *cache = Some((revision, std::sync::Arc::clone(&snapshot), (low, high)));
+        Ok((snapshot, (low, high)))
+    }
+
     /// The field, or a script error if another hold on it panicked.
     ///
     /// **Poisoning is reported rather than unwrapped.** A map is shared between
@@ -1393,6 +1453,7 @@ impl ScriptVm for MluaVm {
         for (mod_id, name, map) in maps {
             let handle = MapHandle {
                 map: std::sync::Arc::new(std::sync::Mutex::new(map)),
+                snapshot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             };
             if let Err(err) = held.set(format!("{mod_id}\u{1f}{name}"), handle) {
                 tracing::error!(%mod_id, %name, "could not install a saved map: {err}");
@@ -4812,6 +4873,7 @@ impl MluaVm {
                     .map_err(|err| mlua::Error::external(err.to_string()))?;
                 let handle = MapHandle {
                     map: std::sync::Arc::new(std::sync::Mutex::new(fresh)),
+                    snapshot: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 };
                 held.set(key, handle.clone())?;
                 Ok(handle)
@@ -6824,25 +6886,8 @@ fn compile_density(
             let handle = handle
                 .borrow::<MapHandle>()
                 .map_err(|_| mlua::Error::external("a `map` node's `map` field is not a map"))?;
-            let map = handle.locked()?;
-            // The range comes off the copy, once. Walking a million samples per
-            // chunk to bound a field that cannot change is the per-sample loop
-            // the whole density mechanism exists to avoid.
-            let mut low = f32::INFINITY;
-            let mut high = f32::NEG_INFINITY;
-            for value in map.values() {
-                low = low.min(*value);
-                high = high.max(*value);
-            }
-            if !low.is_finite() || !high.is_finite() {
-                return Err(mlua::Error::external(
-                    "a `map` node's map holds no finite values to read",
-                ));
-            }
-            ops.push(Op::Map {
-                map: std::sync::Arc::new(map.clone()),
-                range: (low, high),
-            });
+            let (map, range) = handle.snapshot()?;
+            ops.push(Op::Map { map, range });
         }
         "abs" => {
             child("a", ops)?;

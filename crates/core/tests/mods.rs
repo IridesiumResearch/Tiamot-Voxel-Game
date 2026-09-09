@@ -1009,6 +1009,64 @@ end)
 }
 
 #[test]
+fn a_density_compiled_twice_from_an_edited_map_sees_the_edit() {
+    // `{ op = "map" }` copies the field, and the copy is cached so a generator
+    // that compiles its program per chunk — which is what the shortest correct
+    // code does — does not copy four megabytes per chunk. That cache is only
+    // sound if an edit to the map is visible to the next compile.
+    //
+    // **The mod does the asserting**, because a fault in `on_world_init` is
+    // reported and a `game.log` line is not: the check has to be able to fail.
+    let root = scratch("snapshot");
+    write_mod(
+        &root,
+        "snap",
+        "",
+        r#"
+game.register_block{ id = "stone" }
+
+local function field()
+    return game.map{ name = "f", side = 4, scale = 16 }
+end
+
+local function reading()
+    return game.density{ op = "map", map = field() }:bounds({ x = 0, y = 0, z = 0 }).high
+end
+
+game.register_on_world_init(function()
+    local map = field()
+    map:offset(5.0)
+    local first = reading()
+    -- The same map, untouched: served from the cached copy, same answer.
+    local again = reading()
+    if math.abs(first - again) > 0.001 then
+        error(string.format("two compiles of an untouched map disagreed: %f vs %f", first, again))
+    end
+    -- Edited: the copy is stale and has to be retaken.
+    map:offset(10.0)
+    local after = reading()
+    if after < again + 5.0 then
+        error(string.format("a compile after an edit saw %f, still the old %f", after, again))
+    end
+end)
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+    let faults = host.vm_mut().world_init().expect("pre-pass");
+    assert!(
+        faults.is_empty(),
+        "the map snapshot is wrong — the mod's own check failed: {faults:?}"
+    );
+}
+
+#[test]
 fn a_map_and_a_density_can_feed_each_other_so_erosion_is_expressible() {
     // **The loop erosion needs, and the half that was missing.** A map could
     // only ever leave through `heightmap`, which feeds `fill_below_heightmap`

@@ -81,6 +81,52 @@ fn main() {
         println!("\n{name}:");
         probe(&density);
     }
+    snapshot_cost();
+}
+
+/// What `{ op = "map" }` costs each time a density program is compiled.
+///
+/// The node takes a copy of the map and reads its range, so that a program is
+/// a value that cannot change under a world. Both are proportional to the map,
+/// and a generator that builds its density INSIDE `on_generate` pays them once
+/// per chunk — which is the shape the obvious code has.
+fn snapshot_cost() {
+    use tiamot_core::detgen::Map;
+
+    println!("\ncompiling a map node:");
+    for side in [256u32, 1024] {
+        let mut map = Map::new(side, 16, [0, 0]).expect("map");
+        map.noise(
+            7,
+            &FractalParams {
+                fractal: Fractal::Fbm,
+                octaves: 4,
+                frequency: 0.01,
+                lacunarity: 2.0,
+                gain: 0.5,
+            },
+            40.0,
+        );
+
+        let runs = 200;
+        let started = Instant::now();
+        let mut sink = 0.0f32;
+        for _ in 0..runs {
+            let copy = map.clone();
+            let mut low = f32::INFINITY;
+            let mut high = f32::NEG_INFINITY;
+            for value in copy.values() {
+                low = low.min(*value);
+                high = high.max(*value);
+            }
+            sink += low + high;
+        }
+        let each = started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
+        println!(
+            "  side {side:>4}: {each:.3} ms a compile, {:.1} MiB copied (checksum {sink:.0})",
+            f64::from(side) * f64::from(side) * 4.0 / (1024.0 * 1024.0)
+        );
+    }
 }
 
 fn probe(density: &Density) {

@@ -90,7 +90,7 @@ pub enum Combine {
 }
 
 /// A square field of values over a region of the world.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Map {
     side: u32,
     /// Blocks per sample.
@@ -98,6 +98,29 @@ pub struct Map {
     /// World block coordinate of sample `(0, 0)`.
     origin: [i32; 2],
     values: Vec<f32>,
+    /// Bumped by every operation that changes a value.
+    ///
+    /// **So a snapshot can tell whether it is still current.**
+    /// `density::Op::Map` holds a COPY of the field, which is what stops a
+    /// program changing under a world — and a copy per compile is a copy of up
+    /// to four megabytes, which a generator building its program per chunk
+    /// pays per chunk (0.303 ms at 1,024 a side, measured by the
+    /// `densityprobe` example). Comparing this is how that copy is made once
+    /// and reused until something actually edits the field.
+    ///
+    /// Deliberately NOT part of equality or of what is stored: two maps
+    /// holding the same values are the same map, whatever they have been
+    /// through, and a revision read back from a world would mean nothing.
+    revision: u64,
+}
+
+impl PartialEq for Map {
+    fn eq(&self, other: &Self) -> bool {
+        self.side == other.side
+            && self.scale == other.scale
+            && self.origin == other.origin
+            && self.values == other.values
+    }
 }
 
 impl Map {
@@ -126,6 +149,7 @@ impl Map {
             scale,
             origin,
             values: vec![0.0; (side as usize) * (side as usize)],
+            revision: 0,
         })
     }
 
@@ -147,6 +171,26 @@ impl Map {
         self.origin
     }
 
+    /// How many times this map's values have been changed.
+    ///
+    /// The number itself means nothing; two readings differing means the field
+    /// has moved on and anything derived from it is stale.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The values, to change — every write goes through here.
+    ///
+    /// **The revision bump lives here rather than in each operation** so that
+    /// an operation added later cannot forget it. A stale snapshot is invisible
+    /// until a world generates terrain from a field it no longer matches, which
+    /// is much too late to find out.
+    fn values_mut(&mut self) -> &mut Vec<f32> {
+        self.revision += 1;
+        &mut self.values
+    }
+
     /// The values, row-major, x fastest.
     #[must_use]
     pub fn values(&self) -> &[f32] {
@@ -162,7 +206,7 @@ impl Map {
         if values.len() != self.values.len() {
             return Err(MapError::BadSide { found: self.side });
         }
-        self.values = values;
+        *self.values_mut() = values;
         Ok(())
     }
 
@@ -183,28 +227,28 @@ impl Map {
         if fill_2d(seed, &region, params, &mut samples).is_err() {
             return;
         }
-        for (value, sample) in self.values.iter_mut().zip(samples) {
+        for (value, sample) in self.values_mut().iter_mut().zip(samples) {
             *value = sample * amplitude;
         }
     }
 
     /// Adds a constant to every sample.
     pub fn offset(&mut self, by: f32) {
-        for value in &mut self.values {
+        for value in self.values_mut().iter_mut() {
             *value += by;
         }
     }
 
     /// Multiplies every sample by a constant.
     pub fn scale_by(&mut self, by: f32) {
-        for value in &mut self.values {
+        for value in self.values_mut().iter_mut() {
             *value *= by;
         }
     }
 
     /// Bounds every sample to a range.
     pub fn clamp(&mut self, low: f32, high: f32) {
-        for value in &mut self.values {
+        for value in self.values_mut().iter_mut() {
             *value = value.clamp(low, high);
         }
     }
@@ -221,6 +265,9 @@ impl Map {
                 right: other.side,
             });
         }
+        // `other` is read while `self` is written, so the bump is taken first
+        // rather than through the accessor — one borrow, not two.
+        self.revision += 1;
         for (value, source) in self.values.iter_mut().zip(&other.values) {
             *value = match how {
                 Combine::Add => *value + *source,
@@ -290,7 +337,7 @@ impl Map {
                 vertical[(y * side + x) as usize] = total / span;
             }
         }
-        self.values = vertical;
+        *self.values_mut() = vertical;
         Ok(())
     }
 
@@ -362,7 +409,7 @@ impl Map {
         // Straight into the map's own storage: the layout `Region3d` produces
         // with a height of one is x-fastest rows of z, which is exactly how
         // `values` is indexed by `sample`.
-        density.evaluate(seed, &region, &mut self.values)
+        density.evaluate(seed, &region, self.values_mut())
     }
 
     /// A chunk's worth of heights, sampled from this map.
@@ -388,6 +435,84 @@ impl Map {
 
 #[cfg(test)]
 mod tests {
+
+    /// One named operation that writes to a map.
+    type Mutator = (&'static str, Box<dyn Fn(&mut Map)>);
+
+    #[test]
+    fn every_operation_that_changes_a_value_moves_the_revision() {
+        // **What a stale snapshot costs is invisible until it is far too
+        // late**: a world generating terrain from a field it no longer
+        // matches, along a seam nothing downstream can see. So every operation
+        // that writes a value has to move the revision, and this is the list.
+        //
+        // The bump lives inside `values_mut` rather than in each operation, so
+        // an operation added later gets it for free — but one written to touch
+        // `values` directly would not, which is what this would catch.
+        let params = FractalParams::default();
+        let mut other = Map::new(4, 16, [0, 0]).expect("map");
+        other.noise(1, &params, 1.0);
+
+        let operations: Vec<Mutator> = vec![
+            (
+                "noise",
+                Box::new(move |map: &mut Map| map.noise(3, &params, 2.0)),
+            ),
+            ("offset", Box::new(|map: &mut Map| map.offset(1.0))),
+            ("scale_by", Box::new(|map: &mut Map| map.scale_by(2.0))),
+            ("clamp", Box::new(|map: &mut Map| map.clamp(-1.0, 1.0))),
+            (
+                "combine",
+                Box::new(move |map: &mut Map| {
+                    map.combine(&other, Combine::Minimum).expect("combine");
+                }),
+            ),
+            (
+                "blur",
+                Box::new(|map: &mut Map| {
+                    map.blur(1).expect("blur");
+                }),
+            ),
+            (
+                "set_values",
+                Box::new(|map: &mut Map| {
+                    map.set_values(vec![1.0; 16]).expect("values");
+                }),
+            ),
+            (
+                "fill_from_density",
+                Box::new(|map: &mut Map| {
+                    let density = super::super::density::Density::compile(vec![
+                        super::super::density::Op::Constant(3.0),
+                    ])
+                    .expect("compile");
+                    map.fill_from_density(&density, 1, 0.0).expect("fill");
+                }),
+            ),
+        ];
+
+        for (name, operate) in operations {
+            let mut map = Map::new(4, 16, [0, 0]).expect("map");
+            let before = map.revision();
+            operate(&mut map);
+            assert!(
+                map.revision() > before,
+                "`{name}` changed values without moving the revision, so a density compiled \
+                 before it would keep serving the old field"
+            );
+        }
+
+        // And the other half of the contract: a revision is not part of what a
+        // map IS. Two maps holding the same values are equal however many
+        // operations either has been through, or a map read back from a world
+        // would never match the one that was stored.
+        let mut travelled = Map::new(4, 16, [0, 0]).expect("map");
+        travelled.offset(5.0);
+        travelled.offset(-5.0);
+        let fresh = Map::new(4, 16, [0, 0]).expect("map");
+        assert!(travelled.revision() > fresh.revision());
+        assert_eq!(travelled, fresh, "equality must ignore the revision");
+    }
 
     #[test]
     fn a_map_filled_from_a_density_holds_what_the_density_says() {
