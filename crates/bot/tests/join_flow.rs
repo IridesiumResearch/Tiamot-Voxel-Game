@@ -137,6 +137,11 @@ fn a_bot_completes_the_whole_join_flow() {
             // plays. After the sound table it refers to, so a client never
             // holds a binding to a sound it has not been told exists.
             "SoundBindings",
+            // Protocol v43, and now the last of the tables: the fonts a mod
+            // ships. After everything a dialog reads, and before the join —
+            // a world whose lettering has not arrived draws in the client's
+            // own face, which is a world somebody can play.
+            "FontTable",
             "JoinWorld",
         ];
         assert!(
@@ -536,6 +541,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::SoundTable { .. } => "SoundTable",
         ServerMessage::HudScripts { .. } => "HudScripts",
         ServerMessage::SoundBindings { .. } => "SoundBindings",
+        ServerMessage::FontTable { .. } => "FontTable",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",
         _ => "other",
