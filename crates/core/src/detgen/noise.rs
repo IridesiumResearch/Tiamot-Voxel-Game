@@ -157,6 +157,37 @@ const SIMPLEX_2D_SCALE: f32 = 45.0;
 /// Empirical normalisation for the 3D simplex kernel and gradient set.
 const SIMPLEX_3D_SCALE: f32 = 32.0;
 
+/// The largest magnitude one octave of [`simplex_3d`] can return.
+///
+/// **Derived, not measured**, because what stands on it is a decision to SKIP
+/// generating terrain: a bound that is merely usually right puts holes in a
+/// world, and they appear only where the field happens to wiggle between
+/// whatever samples were taken to justify it.
+///
+/// The kernel is `t⁴ · (g · d)` summed over four lattice corners, where
+/// `t = 0.6 - |d|²` and the contribution is zero once `t` is. Every gradient in
+/// [`GRADIENTS_3D`] has two unit components and a zero, so `|g| = sqrt(2)` and
+/// Cauchy-Schwarz gives `|g · d| <= sqrt(2)·|d|`. Writing `r = |d|`, one corner
+/// is at most
+///
+/// ```text
+///     f(r) = (0.6 - r²)⁴ · sqrt(2) · r
+/// ```
+///
+/// whose derivative `(0.6 - r²)³ · (0.6 - 9r²)` vanishes at `r² = 0.6/9`, giving
+/// `f = 0.029543`. Four corners and [`SIMPLEX_3D_SCALE`]:
+/// `4 × 0.029543 × 32 = 3.7815`.
+///
+/// **Conservative by about 3.8x.** The four corners cannot all be at their own
+/// worst distance at once — being near one corner of a tetrahedron is being far
+/// from the others — so the observed maximum over a dense search is near 1.0.
+/// Tightening this is a pure win for how much terrain can be skipped and needs
+/// no API change: it is one constant, and `the_simplex_bound_holds_everywhere`
+/// is what would have to keep passing. Proving a tighter one means bounding the
+/// sum under the geometric constraint that links the four distances, which is
+/// real work and is not done here.
+pub const SIMPLEX_3D_BOUND: f32 = 3.7815;
+
 /// Hashes lattice coordinates to a gradient index.
 ///
 /// # A tried and rejected optimisation
@@ -474,6 +505,32 @@ impl FractalParams {
     /// for crash isolation; this is the same instinct applied to a number.
     pub const MAX_OCTAVES: u32 = 16;
 
+    /// The range this fractal's output can occupy, as `(low, high)`.
+    ///
+    /// Every octave is shaped and then averaged with positive weights — the
+    /// division by `normaliser` in [`fractal_3d`] is exactly that — so the
+    /// result lies between the smallest and largest value `shape` can produce.
+    /// No octave count, frequency or gain can widen it, which is why none of
+    /// them appear here.
+    ///
+    /// [`SIMPLEX_3D_BOUND`] is the bound on one raw sample. `Ridged` and
+    /// `Billow` map it through `1 - 2|s|` and `2|s| - 1`, both of which are
+    /// monotone in `|s|`, so their ends follow directly.
+    ///
+    /// Used by `Density::bounds` to decide that a chunk cannot contain any
+    /// surface. Conservative in one direction only: too wide costs terrain that
+    /// gets generated when it need not have been, too narrow puts a hole in the
+    /// world.
+    #[must_use]
+    pub fn range(&self) -> (f32, f32) {
+        let bound = SIMPLEX_3D_BOUND;
+        match self.fractal {
+            Fractal::Fbm => (-bound, bound),
+            Fractal::Ridged => (1.0 - 2.0 * bound, 1.0),
+            Fractal::Billow => (-1.0, 2.0 * bound - 1.0),
+        }
+    }
+
     /// The octave count actually used.
     #[must_use]
     pub const fn effective_octaves(&self) -> u32 {
@@ -759,6 +816,72 @@ mod tests {
         assert!(max < 1.6, "max {max} is implausibly high");
         assert!(min < -0.3, "min {min} suggests the field is not varying");
         assert!(max > 0.3, "max {max} suggests the field is not varying");
+    }
+
+    #[test]
+    fn the_simplex_bound_holds_everywhere_it_is_searched() {
+        // `SIMPLEX_3D_BOUND` is the licence to skip generating a chunk, so a
+        // sample outside it is a hole in somebody's world. The bound is derived
+        // rather than measured — the derivation is on the constant — and this
+        // searches hard for a counter-example anyway, because a derivation
+        // about the kernel stops being about the kernel the moment the kernel
+        // is retuned.
+        let mut worst = 0.0f32;
+        for seed in 0..24u64 {
+            for i in 0..4000 {
+                // Deliberately awkward strides: whole numbers land on lattice
+                // points, where the kernel is smallest and least interesting.
+                let x = i as f32 * 0.137 - 274.0;
+                let y = i as f32 * 0.311 - 622.0;
+                let z = i as f32 * 0.073 + 41.0;
+                let value = simplex_3d(seed, x, y, z);
+                assert!(
+                    value.abs() <= SIMPLEX_3D_BOUND,
+                    "simplex_3d gave {value} at ({x}, {y}, {z}) seed {seed}, outside the                      {SIMPLEX_3D_BOUND} the pruning in Density::bounds relies on"
+                );
+                worst = worst.max(value.abs());
+            }
+        }
+        // Non-vacuous: a kernel returning zero everywhere would pass the
+        // assertion above and prune the entire world.
+        assert!(
+            worst > 0.5,
+            "the field barely varies; worst magnitude {worst}"
+        );
+        // And the record of how much room is being left on the table. This is
+        // the number to beat if the bound is ever tightened; it is NOT itself a
+        // bound, because a dense search is not a proof.
+        assert!(
+            worst < SIMPLEX_3D_BOUND,
+            "the search reached the derived bound, so the derivation wants re-checking"
+        );
+    }
+
+    #[test]
+    fn a_fractal_stays_inside_the_range_it_reports() {
+        // Every shape, and the ones with an asymmetric range are the point:
+        // `Ridged` tops out at exactly 1 and reaches far further down.
+        for fractal in [Fractal::Fbm, Fractal::Ridged, Fractal::Billow] {
+            let params = FractalParams {
+                fractal,
+                octaves: 5,
+                frequency: 0.03,
+                lacunarity: 2.0,
+                gain: 0.5,
+            };
+            let (low, high) = params.range();
+            assert!(low < high, "{fractal:?} reports an empty range");
+            for i in 0..3000 {
+                let x = i as f32 * 0.213 - 319.0;
+                let y = i as f32 * 0.089 + 7.0;
+                let z = i as f32 * 0.157 - 88.0;
+                let value = fractal_3d(11, x, y, z, &params);
+                assert!(
+                    value >= low && value <= high,
+                    "{fractal:?} gave {value} at ({x}, {y}, {z}), outside ({low}, {high})"
+                );
+            }
+        }
     }
 
     #[test]

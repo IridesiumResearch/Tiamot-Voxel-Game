@@ -278,6 +278,22 @@ impl ChunkBuffer {
             height: side,
             depth: side,
         };
+        // **What the field cannot possibly do here, before doing it.** Most of
+        // a world is not near its surface: a chunk a hundred blocks up is all
+        // sky and one a hundred down is all rock, and both used to cost a full
+        // evaluation to discover. `Density::bounds` answers from the program's
+        // shape rather than from samples, so it cannot miss surface the way a
+        // handful of probe points can — see its own docs for why that
+        // distinction is the whole design.
+        let bounds = density.bounds(&region);
+        if bounds.is_all_empty() {
+            return Ok(());
+        }
+        if bounds.is_all_solid() {
+            self.fill_all(material);
+            return Ok(());
+        }
+
         let mut field = vec![0.0f32; region.len()];
         density.evaluate(seed, &region, &mut field)?;
 
@@ -355,6 +371,23 @@ impl ChunkBuffer {
             height: padded,
             depth: padded,
         };
+        // The same skip as the block-resolution fill, and it is worth more
+        // here: this path pays 18³ samples and then a 27-sample pass on every
+        // block of the surface shell. **Over the PADDED region**, so a chunk
+        // called solid is solid including the ring its neighbours look at, and
+        // no block can be found on the surface after the fact.
+        let bounds = density.bounds(&region);
+        if bounds.is_all_empty() {
+            return Ok(());
+        }
+        if bounds.is_all_solid() {
+            // Every cell of every block, with no surface anywhere in it: the
+            // sub-node pass would write exactly this and take 4,096 samples to
+            // decide it.
+            self.fill_all(material);
+            return Ok(());
+        }
+
         let mut field = vec![0.0f32; region.len()];
         let mut scratch = super::density::Scratch::default();
         density.evaluate_with(seed, &region, &mut field, &mut scratch)?;
@@ -717,6 +750,98 @@ mod tests {
             Op::Subtract,
         ])
         .expect("compile")
+    }
+
+    #[test]
+    fn skipping_a_chunk_by_its_bounds_writes_what_evaluating_it_would_have() {
+        // **The differential test the pruning has to pass.** `fill_density`
+        // now asks `Density::bounds` whether a chunk can hold any surface and
+        // returns early when it cannot, which is only sound if the answer is
+        // the same as doing the work. So: the same fills, checked against a
+        // reference that evaluates every block and knows nothing about bounds.
+        //
+        // Chunks are chosen to cover all three outcomes — wholly empty, wholly
+        // solid, and crossed — and the assertion at the end is that all three
+        // actually occurred, because a run where every chunk was crossed would
+        // pass this without testing anything.
+        use super::super::density::{Axis, Op};
+        use super::super::noise::{Fractal, FractalParams};
+
+        let density = super::super::density::Density::compile(vec![
+            Op::Noise {
+                params: FractalParams {
+                    fractal: Fractal::Fbm,
+                    octaves: 3,
+                    frequency: 0.02,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                },
+                amplitude: 10.0,
+                stream: 5,
+            },
+            Op::Coordinate(Axis::Y),
+            Op::Subtract,
+        ])
+        .expect("compile");
+
+        let (mut empty, mut solid, mut crossed) = (0, 0, 0);
+        for cy in -6..6 {
+            for cx in -2..3 {
+                let pos = ChunkPos::new(cx, cy, 1);
+                let mut buffer = ChunkBuffer::new(pos, MaterialId::AIR);
+                buffer.fill_density(&density, 3, STONE).expect("fill");
+
+                // The reference: evaluate the whole chunk, block by block.
+                let side = CHUNK_BLOCKS as usize;
+                let region = super::super::noise::Region3d {
+                    origin_x: (pos.x * CHUNK_BLOCKS as i32) as f32,
+                    origin_y: (pos.y * CHUNK_BLOCKS as i32) as f32,
+                    origin_z: (pos.z * CHUNK_BLOCKS as i32) as f32,
+                    step: 1.0,
+                    width: side,
+                    height: side,
+                    depth: side,
+                };
+                let mut field = vec![0.0f32; region.len()];
+                density.evaluate(3, &region, &mut field).expect("evaluate");
+
+                let mut positive = 0;
+                let mut index = 0;
+                for z in 0..CHUNK_BLOCKS {
+                    for y in 0..CHUNK_BLOCKS {
+                        for x in 0..CHUNK_BLOCKS {
+                            let local = LocalBlock::new(x, y, z);
+                            let wanted = if field[index] > 0.0 {
+                                positive += 1;
+                                STONE
+                            } else {
+                                MaterialId::AIR
+                            };
+                            assert_eq!(
+                                buffer.get_block(local),
+                                wanted,
+                                "chunk {pos:?} block ({x}, {y}, {z}): the pruned fill and the \
+                                 reference disagree"
+                            );
+                            index += 1;
+                        }
+                    }
+                }
+                if positive == 0 {
+                    empty += 1;
+                } else if positive == region.len() {
+                    solid += 1;
+                } else {
+                    crossed += 1;
+                }
+            }
+        }
+
+        assert!(
+            empty > 0 && solid > 0 && crossed > 0,
+            "the sweep has to reach all three outcomes to mean anything: \
+             {empty} empty, {solid} solid, {crossed} crossed"
+        );
     }
 
     #[test]

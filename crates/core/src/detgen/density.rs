@@ -74,6 +74,124 @@ pub const MAX_OPS: usize = 256;
 /// almost certainly a mistake, and one that is not can be split.
 pub const MAX_DEPTH: usize = 8;
 
+/// The range a density program can take over a box, as `[low, high]`.
+///
+/// Always contains every value the program produces there, and usually more:
+/// it is an interval extension, not a measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Interval {
+    /// No sample in the box is below this.
+    pub low: f32,
+    /// No sample in the box is above this.
+    pub high: f32,
+}
+
+impl Interval {
+    /// The interval holding exactly one value.
+    #[must_use]
+    pub const fn exactly(value: f32) -> Self {
+        Self {
+            low: value,
+            high: value,
+        }
+    }
+
+    /// Whether every value in the box is solid — the field is positive
+    /// throughout, so a fill can write the material without asking.
+    #[must_use]
+    pub const fn is_all_solid(self) -> bool {
+        self.low > 0.0
+    }
+
+    /// Whether no value in the box is solid, so a fill can do nothing at all.
+    ///
+    /// The comparison is `<=` because [`Density`] treats a sample as solid when
+    /// it is strictly greater than zero, and the two rules have to agree
+    /// exactly or a plane of cells appears or disappears at the boundary.
+    #[must_use]
+    pub const fn is_all_empty(self) -> bool {
+        self.high <= 0.0
+    }
+
+    /// Whether the surface might cross this box, so it has to be evaluated.
+    #[must_use]
+    pub const fn is_undecided(self) -> bool {
+        !self.is_all_solid() && !self.is_all_empty()
+    }
+
+    /// Widens by the arithmetic's own error, outwards.
+    ///
+    /// Interval arithmetic in `f32` rounds to nearest, which can move an end
+    /// the WRONG way by half an ulp per operation, and a bound that is too
+    /// narrow by one ulp is still a bound that can put a hole in a world.
+    /// [`MAX_OPS`] caps the program at 256 operations, so `256 × 2⁻²³` relative
+    /// covers the accumulation with room to spare; the absolute term covers an
+    /// interval that straddles zero, where relative means nothing.
+    fn widened(self) -> Self {
+        let magnitude = self.low.abs().max(self.high.abs());
+        let margin = magnitude * 3.1e-5 + 1e-6;
+        Self {
+            low: self.low - margin,
+            high: self.high + margin,
+        }
+    }
+
+    /// The interval containing both ends of a product's four corners.
+    fn multiply(self, other: Self) -> Self {
+        let corners = [
+            self.low * other.low,
+            self.low * other.high,
+            self.high * other.low,
+            self.high * other.high,
+        ];
+        let mut low = corners[0];
+        let mut high = corners[0];
+        for corner in &corners[1..] {
+            low = low.min(*corner);
+            high = high.max(*corner);
+        }
+        Self { low, high }
+    }
+
+    /// The same for a quotient, which has one case a product does not.
+    fn divide(self, other: Self) -> Self {
+        // **A divisor that straddles zero gives up.** The quotient runs to
+        // both infinities and no finite interval contains it, so the honest
+        // answer is the one that decides nothing and makes the caller
+        // evaluate. `Op::Divide`'s own doc explains why an infinity is allowed
+        // to exist at all.
+        if other.low <= 0.0 && other.high >= 0.0 {
+            return Self {
+                low: f32::NEG_INFINITY,
+                high: f32::INFINITY,
+            };
+        }
+        self.multiply(Self {
+            low: 1.0 / other.high,
+            high: 1.0 / other.low,
+        })
+    }
+
+    /// The interval of `|x|` over this one.
+    fn absolute(self) -> Self {
+        if self.low <= 0.0 && self.high >= 0.0 {
+            // Straddles zero, so the smallest magnitude available is zero
+            // itself — not `min(|low|, |high|)`, which is the mistake that
+            // makes `abs` look like it preserves a gap it has closed.
+            Self {
+                low: 0.0,
+                high: self.low.abs().max(self.high.abs()),
+            }
+        } else {
+            let (a, b) = (self.low.abs(), self.high.abs());
+            Self {
+                low: a.min(b),
+                high: a.max(b),
+            }
+        }
+    }
+}
+
 /// One step of a compiled density program, in postfix order.
 ///
 /// Values are pushed and consumed on a stack of whole arrays. A binary
@@ -313,6 +431,140 @@ impl Density {
         self.evaluate_with(seed, region, out, &mut Scratch::default())
     }
 
+    /// What the program can possibly produce over a box, without evaluating it.
+    ///
+    /// # Why a bound and not nine samples
+    ///
+    /// The obvious way to ask "could the surface be in this chunk?" is to
+    /// evaluate the corners and the centre and look at the signs. **That is not
+    /// a bound and it will put holes in a world**: gradient noise between two
+    /// samples is not bounded by those samples, so a chunk whose nine samples
+    /// all read solid can still contain surface. The holes appear only where
+    /// the field happens to wiggle at the wrong scale, which makes them look
+    /// like corruption rather than like a wrong constant.
+    ///
+    /// So this is an interval extension instead: every operation is replaced by
+    /// its interval version, and the result is guaranteed to contain every
+    /// value the program takes anywhere in the box. It costs one pass over the
+    /// operations — for a 26-node program, twenty-six interval operations
+    /// against 26 × 5,832 sample evaluations, so it is free beside the thing it
+    /// avoids.
+    ///
+    /// The answer is conservative in ONE direction, always: an interval that is
+    /// too wide costs terrain that is generated when it need not have been, and
+    /// one that is too narrow is a hole. Where a bound is not known, the widest
+    /// possible one is returned rather than a guess — see [`Interval::divide`].
+    ///
+    /// # What the caller may do with it
+    ///
+    /// [`Interval::is_all_solid`] and [`Interval::is_all_empty`] are the two
+    /// decisions worth taking. Anything else is [`Interval::is_undecided`], and
+    /// the only answer to that is to evaluate.
+    ///
+    /// The box is the one the region SPANS, corner to corner, so a caller that
+    /// has a `Region3d` for a chunk already has the right argument. Values
+    /// between the sample points are covered too, which matters: a sub-node
+    /// pass samples inside the same box at a finer step and must not be able to
+    /// find surface a coarser bound said was not there.
+    #[must_use]
+    pub fn bounds(&self, over: &Region3d) -> Interval {
+        let span = |origin: f32, count: usize| -> Interval {
+            let far = origin + (count.saturating_sub(1)) as f32 * over.step;
+            Interval {
+                low: origin.min(far),
+                high: origin.max(far),
+            }
+        };
+        let axes = [
+            span(over.origin_x, over.width),
+            span(over.origin_y, over.height),
+            span(over.origin_z, over.depth),
+        ];
+
+        let mut stack: Vec<Interval> = Vec::with_capacity(self.depth);
+        for op in &self.ops {
+            match op {
+                Op::Constant(value) => stack.push(Interval::exactly(*value)),
+                Op::Coordinate(which) => stack.push(match which {
+                    Axis::X => axes[0],
+                    Axis::Y => axes[1],
+                    Axis::Z => axes[2],
+                }),
+                Op::Noise {
+                    params, amplitude, ..
+                } => {
+                    // The seed does not appear: a bound on the fractal holds
+                    // for every seed, which is the property that makes this
+                    // safe to compute once and reuse.
+                    let (low, high) = params.range();
+                    let scaled = Interval { low, high }.multiply(Interval::exactly(*amplitude));
+                    stack.push(scaled);
+                }
+                Op::Absolute => {
+                    let Some(value) = stack.pop() else {
+                        return Interval {
+                            low: f32::NEG_INFINITY,
+                            high: f32::INFINITY,
+                        };
+                    };
+                    stack.push(value.absolute());
+                }
+                Op::Clamp { low, high } => {
+                    let Some(value) = stack.pop() else {
+                        return Interval {
+                            low: f32::NEG_INFINITY,
+                            high: f32::INFINITY,
+                        };
+                    };
+                    stack.push(Interval {
+                        low: value.low.clamp(*low, *high),
+                        high: value.high.clamp(*low, *high),
+                    });
+                }
+                binary => {
+                    // `first` is the deeper of the two, matching `apply_binary`
+                    // folding `second` into `first`. Getting this backwards is
+                    // invisible for `add` and wrong for `sub` and `div`.
+                    let (Some(second), Some(first)) = (stack.pop(), stack.pop()) else {
+                        return Interval {
+                            low: f32::NEG_INFINITY,
+                            high: f32::INFINITY,
+                        };
+                    };
+                    stack.push(match binary {
+                        Op::Add => Interval {
+                            low: first.low + second.low,
+                            high: first.high + second.high,
+                        },
+                        Op::Subtract => Interval {
+                            low: first.low - second.high,
+                            high: first.high - second.low,
+                        },
+                        Op::Multiply => first.multiply(second),
+                        Op::Divide => first.divide(second),
+                        Op::Minimum => Interval {
+                            low: first.low.min(second.low),
+                            high: first.high.min(second.high),
+                        },
+                        Op::Maximum => Interval {
+                            low: first.low.max(second.low),
+                            high: first.high.max(second.high),
+                        },
+                        _ => unreachable!("the outer match limits this to the binary ops"),
+                    });
+                }
+            }
+        }
+
+        stack.pop().map_or(
+            Interval {
+                low: f32::NEG_INFINITY,
+                high: f32::INFINITY,
+            },
+            Interval::widened,
+        )
+    }
+
     /// The same, over a scratch buffer the caller keeps.
     ///
     /// # Why this exists
@@ -533,6 +785,193 @@ mod tests {
             height: 16,
             depth: 16,
         }
+    }
+
+    /// A field with hills in it, the shape a real generator uses: noise that
+    /// falls off with height, so the surface is where the two balance.
+    fn terrain(frequency: f32, amplitude: f32) -> Vec<Op> {
+        vec![
+            Op::Noise {
+                params: FractalParams {
+                    fractal: Fractal::Fbm,
+                    octaves: 4,
+                    frequency,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                },
+                amplitude,
+                stream: 7,
+            },
+            Op::Coordinate(Axis::Y),
+            Op::Subtract,
+        ]
+    }
+
+    #[test]
+    fn a_bound_contains_every_sample_inside_it() {
+        // The whole contract, over boxes all over the world rather than at the
+        // origin: a bound that only holds near zero is a bound that fails
+        // wherever anybody actually builds.
+        let density = Density::compile(terrain(0.03, 12.0)).expect("compile");
+        for corner in [-8192.0, -256.0, 0.0, 1024.0, 60_000.0] {
+            for height in [-320.0, -16.0, 0.0, 96.0] {
+                let region = Region3d {
+                    origin_x: corner,
+                    origin_y: height,
+                    origin_z: corner * 0.5,
+                    step: 1.0,
+                    width: 16,
+                    height: 16,
+                    depth: 16,
+                };
+                let bounds = density.bounds(&region);
+                let mut field = vec![0.0; region.len()];
+                density.evaluate(9, &region, &mut field).expect("evaluate");
+                for value in &field {
+                    assert!(
+                        *value >= bounds.low && *value <= bounds.high,
+                        "sample {value} at ({corner}, {height}) fell outside \
+                         ({}, {})",
+                        bounds.low,
+                        bounds.high
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bound_still_holds_at_sub_node_resolution() {
+        // The case the sub-node fill depends on. A coarse bound is taken over
+        // the box, and then the fine pass samples INSIDE it at a third of the
+        // step: if the bound only covered the coarse sample points, the fine
+        // pass could find surface where the chunk was skipped.
+        let density = Density::compile(terrain(0.08, 6.0)).expect("compile");
+        let coarse = Region3d {
+            origin_x: 32.0,
+            origin_y: -4.0,
+            origin_z: -64.0,
+            step: 1.0,
+            width: 16,
+            height: 16,
+            depth: 16,
+        };
+        let bounds = density.bounds(&coarse);
+        let fine = Region3d {
+            step: 1.0 / 3.0,
+            width: 46,
+            height: 46,
+            depth: 46,
+            ..coarse
+        };
+        let mut field = vec![0.0; fine.len()];
+        density.evaluate(9, &fine, &mut field).expect("evaluate");
+        for value in &field {
+            assert!(
+                *value >= bounds.low && *value <= bounds.high,
+                "a sub-node sample {value} escaped the block-resolution bound ({}, {})",
+                bounds.low,
+                bounds.high
+            );
+        }
+    }
+
+    /// Noise about a threshold, with no height term: the shape of a cave field
+    /// or an ore pocket, and the one where a coarse sample grid is blindest.
+    fn blobs(frequency: f32, threshold: f32) -> Vec<Op> {
+        vec![
+            Op::Noise {
+                params: FractalParams {
+                    fractal: Fractal::Fbm,
+                    octaves: 2,
+                    frequency,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                },
+                amplitude: 1.0,
+                stream: 3,
+            },
+            Op::Constant(threshold),
+            Op::Subtract,
+        ]
+    }
+
+    #[test]
+    fn sampling_the_corners_and_the_centre_is_not_a_bound() {
+        // **The counter-example this whole mechanism exists for.** The cheap
+        // way to ask "could the surface be in this chunk" is to evaluate the
+        // eight corners and the centre and look at the signs, and it is wrong:
+        // noise between two samples is not bounded by those samples. A chunk
+        // whose nine samples agree can still contain surface, and a generator
+        // that skipped it would leave a hole.
+        //
+        // **What makes it fail is feature size against sample spacing.** Nine
+        // samples over sixteen blocks see nothing smaller than sixteen blocks,
+        // and a mod's caves and ore are deliberately smaller than that. A
+        // gentle heightmap would survive the same test, which is exactly why
+        // "it worked when I tried it" is not evidence here.
+        //
+        // Searched rather than hand-picked, so it keeps meaning something if
+        // the noise is ever retuned.
+        let mut found = None;
+        'search: for (frequency, threshold) in [(0.45, 0.5), (0.8, 0.35), (1.3, 0.2)] {
+            let density = Density::compile(blobs(frequency, threshold)).expect("compile");
+            for x in 0..24 {
+                for z in 0..24 {
+                    let region = Region3d {
+                        origin_x: (x * 16) as f32,
+                        origin_y: 0.0,
+                        origin_z: (z * 16) as f32,
+                        step: 1.0,
+                        width: 16,
+                        height: 16,
+                        depth: 16,
+                    };
+                    let far = 15.0;
+                    let mut corners = vec![(far / 2.0, far / 2.0, far / 2.0)];
+                    for dx in [0.0, far] {
+                        for dy in [0.0, far] {
+                            for dz in [0.0, far] {
+                                corners.push((dx, dy, dz));
+                            }
+                        }
+                    }
+                    let missed = corners.iter().all(|(dx, dy, dz)| {
+                        let point = Region3d {
+                            origin_x: region.origin_x + dx,
+                            origin_y: region.origin_y + dy,
+                            origin_z: region.origin_z + dz,
+                            step: 1.0,
+                            width: 1,
+                            height: 1,
+                            depth: 1,
+                        };
+                        let mut one = [0.0];
+                        density.evaluate(5, &point, &mut one).expect("evaluate");
+                        one[0] <= 0.0
+                    });
+                    if !missed {
+                        continue;
+                    }
+                    let mut field = vec![0.0; region.len()];
+                    density.evaluate(5, &region, &mut field).expect("evaluate");
+                    if let Some(solid) = field.iter().copied().find(|value| *value > 0.0) {
+                        found = Some((density, region, solid));
+                        break 'search;
+                    }
+                }
+            }
+        }
+
+        let (density, region, solid) = found.expect(
+            "no counter-example found — nine samples are not sound, so this search failing \
+             means the search is wrong rather than that the shortcut is safe",
+        );
+        // The interval extension is not fooled by the chunk that fooled them.
+        assert!(
+            !density.bounds(&region).is_all_empty(),
+            "a chunk holding a sample of {solid} was called empty by its own bound"
+        );
     }
 
     fn evaluate(ops: Vec<Op>) -> Vec<f32> {
