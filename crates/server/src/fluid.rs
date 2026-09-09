@@ -266,6 +266,21 @@ impl tiamot_core::script::WorldEdit for Edits {
         self.shared
             .queue_seed(domain, tiamot_core::proto::Edit::Block { pos, material })
     }
+
+    fn set_partial(&self, domain: &str, pos: BlockPos, block: &str, occupancy: u32) -> bool {
+        let Some(&material) = self.by_name.get(block) else {
+            tracing::debug!(block, "a mod asked to place a block nothing registered");
+            return false;
+        };
+        self.shared.queue_seed(
+            domain,
+            tiamot_core::proto::Edit::Partial {
+                pos,
+                material,
+                occupancy,
+            },
+        )
+    }
 }
 
 /// Every loaded chunk's fluid, and what the mods registered.

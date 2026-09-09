@@ -354,6 +354,16 @@ pub trait WorldEdit: Send + Sync {
     /// landed, which the caller finds out by looking next tick. `false` means
     /// the queue is full or the block name is not registered.
     fn set_block(&self, domain: &str, pos: crate::BlockPos, block: &str) -> bool;
+
+    /// Replaces a whole block with a partly filled one: `block` in the cells
+    /// `occupancy` names — a 27-bit mask indexed by
+    /// [`crate::block::subnode_index`] — and air in the rest.
+    ///
+    /// The same queue and the same answer as [`set_block`](Self::set_block).
+    /// This is the runtime half of sub-node worldgen: a generator can shape a
+    /// surface to the cell, and without this nothing a mod grew afterwards — a
+    /// tree, a stalactite — could be anything but whole blocks.
+    fn set_partial(&self, domain: &str, pos: crate::BlockPos, block: &str, occupancy: u32) -> bool;
 }
 
 /// What a mod said about a fluid.

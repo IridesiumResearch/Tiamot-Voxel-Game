@@ -3416,25 +3416,45 @@ impl MluaVm {
     fn block_writer(&self) -> Result<mlua::Function, ScriptError> {
         let edits = std::sync::Arc::clone(&self.edits);
         self.lua
-            .create_function(move |_, (position, block): (Table, String)| {
-                let x: i32 = position.get("x")?;
-                let y: i32 = position.get("y")?;
-                let z: i32 = position.get("z")?;
-                let domain = domain_of(&position)?;
-                let guard = edits.lock().map_err(|_| {
-                    mlua::Error::external(
-                        "the edit queue is poisoned; the simulation thread panicked",
-                    )
-                })?;
-                // No world yet — during worldgen, or in a test with no server
-                // behind the VM. Dropped rather than an error, the same way
-                // `get_fluid` answers empty: a mod handling an error here would
-                // be a mod written around the engine's startup order.
-                let Some(edits) = guard.as_ref() else {
-                    return Ok(false);
-                };
-                Ok(edits.set_block(&domain, crate::BlockPos::new(x, y, z), &block))
-            })
+            .create_function(
+                move |_, (position, block, occupancy): (Table, String, Option<u32>)| {
+                    let x: i32 = position.get("x")?;
+                    let y: i32 = position.get("y")?;
+                    let z: i32 = position.get("z")?;
+                    let domain = domain_of(&position)?;
+                    // A third argument makes it a partly filled block. Every
+                    // bit must name a cell, and at least one must: a block
+                    // with no cells is `engine:air`, and asking for it this
+                    // way is a mask that went wrong rather than a request.
+                    const FULL: u32 = (1 << crate::UNITS_PER_BLOCK) - 1;
+                    let occupancy = match occupancy {
+                        None | Some(FULL) => None,
+                        Some(mask) if mask == 0 || mask > FULL => {
+                            return Err(mlua::Error::external(format!(
+                                "set_block: occupancy {mask:#x} is not a 27-bit mask with a cell in it"
+                            )));
+                        }
+                        Some(mask) => Some(mask),
+                    };
+                    let guard = edits.lock().map_err(|_| {
+                        mlua::Error::external(
+                            "the edit queue is poisoned; the simulation thread panicked",
+                        )
+                    })?;
+                    // No world yet — during worldgen, or in a test with no server
+                    // behind the VM. Dropped rather than an error, the same way
+                    // `get_fluid` answers empty: a mod handling an error here would
+                    // be a mod written around the engine's startup order.
+                    let Some(edits) = guard.as_ref() else {
+                        return Ok(false);
+                    };
+                    let pos = crate::BlockPos::new(x, y, z);
+                    Ok(match occupancy {
+                        None => edits.set_block(&domain, pos, &block),
+                        Some(mask) => edits.set_partial(&domain, pos, &block, mask),
+                    })
+                },
+            )
             .map_err(|err| self.vm_error(&err))
     }
 
@@ -7245,6 +7265,67 @@ mod tests {
                 .map(|mut written| written.push((pos, block.to_owned())))
                 .is_ok()
         }
+
+        fn set_partial(
+            &self,
+            _domain: &str,
+            pos: crate::BlockPos,
+            block: &str,
+            occupancy: u32,
+        ) -> bool {
+            // Recorded as `name@mask`, so one list holds both kinds.
+            self.written
+                .lock()
+                .map(|mut written| written.push((pos, format!("{block}@{occupancy:#x}"))))
+                .is_ok()
+        }
+    }
+
+    #[test]
+    fn a_mod_can_place_a_partly_filled_block() {
+        // **The runtime half of sub-node worldgen.** A generator can shape a
+        // surface to the cell; a tree a mod grows on it afterwards could only
+        // be whole blocks until `set_block` took a mask. A full mask is a
+        // whole block and goes the ordinary way; a mask with a bit past the
+        // 27th, or none at all, is an error the mod hears about.
+        let mut vm = vm();
+        let slate = std::sync::Arc::new(Slate::default());
+        vm.set_world_edit(
+            std::sync::Arc::clone(&slate) as std::sync::Arc<dyn crate::script::WorldEdit>
+        );
+        load(
+            &mut vm,
+            "grower",
+            "game.register_on_tick(function()
+               local three = (1 << 12) | (1 << 13) | (1 << 14)
+               assert(game.set_block({x=1,y=2,z=3}, 'core:white', three))
+               assert(game.set_block({x=4,y=5,z=6}, 'core:white', (1 << 27) - 1))
+               assert(not pcall(game.set_block, {x=0,y=0,z=0}, 'core:white', 0),
+                 'a mask with no cell was accepted')
+               assert(not pcall(game.set_block, {x=0,y=0,z=0}, 'core:white', 1 << 27),
+                 'a mask past the 27th cell was accepted')
+             end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+        let faults = vm.tick(1).expect("tick");
+        assert!(
+            faults.is_empty(),
+            "placing a partial block raised: {faults:?}"
+        );
+
+        let written = slate.written.lock().expect("slate");
+        assert_eq!(
+            written.as_slice(),
+            &[
+                (
+                    crate::BlockPos::new(1, 2, 3),
+                    "core:white@0x7000".to_owned()
+                ),
+                (crate::BlockPos::new(4, 5, 6), "core:white".to_owned()),
+            ],
+            "a full mask should go the whole-block way and a partial one carry its mask"
+        );
     }
 
     #[test]

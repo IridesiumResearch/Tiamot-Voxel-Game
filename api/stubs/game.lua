@@ -1684,13 +1684,25 @@ function game.set_fluid(position, spec) end
 ---
 ---Pass `"engine:air"` to clear a block.
 ---
+---**A third argument makes it a partly filled block**: a 27-bit mask of
+---which cells hold the material, indexed `x + 3*y + 9*z` like everything
+---else (the shape editor, `on_place`, `get_block`'s `occupancy`), with air in
+---the rest. This is the runtime half of sub-node worldgen — a generator can
+---shape a surface to the cell with `fill_density`'s `detail`, and this is how
+---something a mod grows on it afterwards (a tree, a stalactite, a boulder)
+---is more than whole blocks. A full mask is a whole block; a mask with no
+---cell, or a bit past the 27th, is an error rather than a guess.
+---
 ---```lua
 ---game.set_block({ x = 10, y = 64, z = -3 }, "core_milk:waterlogged")
+----- the middle column of a block, three cells tall: a thin branch
+---game.set_block({ x = 10, y = 70, z = -3 }, "my_mod:log", (1 << 4) | (1 << 13) | (1 << 22))
 ---```
 ---@param position { x: integer, y: integer, z: integer }
 ---@param block string A registered block id, qualified.
+---@param occupancy integer? Which of the 27 cells to fill. Omit for the whole block.
 ---@return boolean queued
-function game.set_block(position, block) end
+function game.set_block(position, block, occupancy) end
 
 ---A dig about to happen.
 ---@class Tiamot.DigEvent
