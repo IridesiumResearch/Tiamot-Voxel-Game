@@ -239,6 +239,41 @@ that declare nothing.
 
 ---
 
+## Interfaces: what a mod can and cannot do to the look
+
+**Pictures.** `{ type = "image", hash = ... }` in a dialog tree, and
+`style.nine_slice` on any widget. Both take a content hash — the same hash the
+material table and the sound table use — and the client fetches, decodes and
+draws them. A picture that has not arrived yet draws nothing and fills in when
+it lands, so do not design around it being there on the first frame.
+
+A **nine-slice's border is a third of the image**, both ways. Draw your frame so
+its corners are the outer third and they will keep their size at any box size
+while the edges stretch; that is the whole point of a nine-slice and it is why
+there is no border argument to get wrong.
+
+Pictures may be up to **2048 pixels on an edge**, and no more than 8 MiB
+decoded — which at four bytes a pixel means about 1448² in practice. A frame at
+1254² is fine.
+
+**Scrolling.** `{ type = "scroll", children = { ... } }` gives its children
+their full height and clips them, and the wheel moves them when the pointer is
+inside. That is the answer to a dialog with more in it than fits: put the long
+part in a scroll box rather than shrinking the controls, and the controls keep
+the size you asked for.
+
+**Slot counts scale with the slot**, so a bigger `item_slot` gets bigger
+numbers. You do not set the font.
+
+**Fonts are the engine's, not yours.** There is no font registration, and there
+will not be one until it can be done properly — a font file is a parser running
+on bytes a server pushed (charter rule 14), which needs pre-decode caps, panic
+isolation and a fuzz target of its own. Everything a dialog draws is in the
+client's bundled font. If your art depends on a particular typeface, put the
+words in the picture.
+
+---
+
 ## Machines: containers a mod can fill
 
 A chest is a container a player drags things into. A **furnace** is one your mod

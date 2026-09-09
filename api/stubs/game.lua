@@ -1074,7 +1074,7 @@ function game.register_on_chat(callback) end
 ---@class Tiamot.WidgetStyle
 ---@field background integer[]? `{r, g, b}` or `{r, g, b, a}`.
 ---@field border integer[]? Same shape. The width is the client's.
----@field nine_slice integer[]? 32 bytes of content hash, stretched around the widget.
+---@field nine_slice integer[]? 32 bytes of content hash, drawn as a nine-slice frame behind the widget. **The border is a THIRD of the image**, both ways: draw your frame so its corners are the outer third and they keep their size at any box size while the edges stretch. That is what a nine-slice is for, and it is why there is no border argument. Goes UNDER `background` and `border`, so a widget with both gets the flat colour inside the frame. Fetched by hash like a texture; a frame that has not arrived yet draws nothing and fills in when it lands.
 ---@field text_colour integer[]? Same shape as `background`.
 ---@field text_size integer? In virtual pixels; the client keeps it legible.
 
