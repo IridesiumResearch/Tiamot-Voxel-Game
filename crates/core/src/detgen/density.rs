@@ -865,6 +865,46 @@ mod tests {
     }
 
     #[test]
+    fn a_bound_decides_most_of_a_column_of_ordinary_terrain() {
+        // **The bound is sound whatever it answers, so soundness tests cannot
+        // tell whether it is USEFUL.** One that returned the widest possible
+        // interval every time would pass every other test in this file and
+        // prune nothing, and the failure would show up as a server that had
+        // quietly gone back to generating a kilometre of empty sky.
+        //
+        // The field is the reference fixture's shape — relief of about eleven
+        // blocks, one unit of noise to one block of height — over a column
+        // reaching well above and below it. What cannot be decided is the band
+        // the surface might be in, and at this relief that is a small part of
+        // the column.
+        let density = Density::compile(terrain(0.008, 11.0)).expect("compile");
+        let mut decided = 0;
+        let mut total = 0;
+        for cy in -12..12 {
+            let region = Region3d {
+                origin_x: 128.0,
+                origin_y: (cy * 16) as f32,
+                origin_z: -96.0,
+                step: 1.0,
+                width: 16,
+                height: 16,
+                depth: 16,
+            };
+            total += 1;
+            if !density.bounds(&region).is_undecided() {
+                decided += 1;
+            }
+        }
+        // Measured at 88% over a wider sweep; two thirds is the line at which
+        // something has gone wrong rather than a number to tune towards.
+        assert!(
+            decided * 3 >= total * 2,
+            "only {decided} of {total} chunks could be decided, so the bound has stopped \
+             paying for itself — see the densityprobe example for the full picture"
+        );
+    }
+
+    #[test]
     fn a_bound_contains_every_sample_inside_it() {
         // The whole contract, over boxes all over the world rather than at the
         // origin: a bound that only holds near zero is a bound that fails
