@@ -197,6 +197,7 @@ fn seeds() -> Vec<(&'static str, Tree)> {
                         nine_slice: Some([3; 32]),
                         text_colour: Some([240, 240, 240, 255]),
                         text_size: Some(16),
+                        font: Some("seeds:display".to_owned()),
                     },
                     grow: 1,
                     size: Some(320),

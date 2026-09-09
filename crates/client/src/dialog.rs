@@ -141,6 +141,11 @@ pub struct Dialogs {
 /// `core`, and this is the font `core` is not allowed to have.
 struct EguiRuler<'a> {
     ctx: &'a egui::Context,
+    /// **The measurer needs the fonts too.** A mod's display face measured in
+    /// the client's own font gives every box the wrong size, and the text is
+    /// then drawn into it in the right one — a dialog whose lettering does not
+    /// fit its buttons.
+    look: Look<'a>,
 }
 
 impl EguiRuler<'_> {
@@ -155,14 +160,10 @@ impl EguiRuler<'_> {
         reason = "UI layout is presentation; float-determinism.md Scope"
     )]
     fn text(&self, text: &str, style: &Style) -> (i32, i32) {
-        let size = f32::from(style.text_size.unwrap_or(14)).clamp(8.0, 48.0);
-        let galley = self.ctx.fonts_mut(|fonts| {
-            fonts.layout_no_wrap(
-                text.to_owned(),
-                egui::FontId::proportional(size),
-                egui::Color32::WHITE,
-            )
-        });
+        let font = self.look.font(style);
+        let galley = self
+            .ctx
+            .fonts_mut(|fonts| fonts.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE));
         (galley.size().x.ceil() as i32, galley.size().y.ceil() as i32)
     }
 }
@@ -226,6 +227,39 @@ fn count_font(slot: f32) -> egui::FontId {
     egui::FontId::proportional((slot * 0.3).max(11.0))
 }
 
+/// What a dialog is drawn WITH, as opposed to what it says.
+///
+/// A pair rather than two parameters: the paint walk already carries six things
+/// and both of these are answers to "how does this look", resolved once before
+/// the walk and immutable inside it.
+#[derive(Clone, Copy)]
+pub struct Look<'a> {
+    /// The pictures this tree draws, uploaded — see [`crate::pictures`].
+    pub art: &'a crate::pictures::Resolved,
+    /// The fonts this server's mods pushed — see [`crate::fonts`].
+    pub fonts: &'a crate::fonts::Fonts,
+}
+
+impl Look<'_> {
+    /// The font a style asks for, at the size it asks for.
+    ///
+    /// **The measurer uses this too**, and must: a mod's display face laid out
+    /// in the client's own font would give every box the wrong size, and the
+    /// text would then be drawn into it in the right one. A dialog whose
+    /// lettering does not fit its buttons is what that looks like.
+    ///
+    /// A font id nothing answers to falls back to the client's own, for the
+    /// reason `fonts::Fonts::family` gives: a missing file must not become a
+    /// missing screen.
+    fn font(&self, style: &Style) -> egui::FontId {
+        let size = f32::from(style.text_size.unwrap_or(14)).clamp(8.0, 48.0);
+        match style.font.as_deref().and_then(|id| self.fonts.family(id)) {
+            Some(family) => egui::FontId::new(size, family),
+            None => egui::FontId::proportional(size),
+        }
+    }
+}
+
 /// One inventory slot's size in virtual pixels, borders included.
 const SLOT: i32 = 36;
 
@@ -240,6 +274,11 @@ impl Dialogs {
     }
 
     /// Draws every open dialog and returns what the player did.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "everything a dialog is drawn with: its contents, its art, its \
+                  lettering and the space it has"
+    )]
     pub fn draw(
         &mut self,
         ctx: &egui::Context,
@@ -247,6 +286,7 @@ impl Dialogs {
         views: &BTreeMap<String, ViewContents>,
         icons: Icons<'_>,
         art: &BTreeMap<String, crate::pictures::Resolved>,
+        fonts: &crate::fonts::Fonts,
         area: (f32, f32),
     ) -> Vec<Raised> {
         self.retain_open(open);
@@ -258,9 +298,12 @@ impl Dialogs {
             // resolves to nothing and every lookup in it misses, which is what
             // every dialog written before pictures existed does.
             let empty = crate::pictures::Resolved::default();
-            let form_art = art.get(form).unwrap_or(&empty);
+            let look = Look {
+                art: art.get(form).unwrap_or(&empty),
+                fonts,
+            };
             raised.extend(draw_form(
-                ctx, form, screen, local, views, icons, form_art, area,
+                ctx, form, screen, local, views, icons, look, area,
             ));
         }
         // **Last, and over everything.** What is on the cursor is drawn after
@@ -414,7 +457,7 @@ fn paint_tree(
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
-    art: &crate::pictures::Resolved,
+    look: Look<'_>,
     raised: &mut Vec<Raised>,
 ) {
     let origin = ui.cursor().min;
@@ -423,7 +466,7 @@ fn paint_tree(
     // cannot pair a widget with somebody else's rectangle — which a flat list
     // plus a separate traversal invites.
     paint(
-        ui, origin, tree, 0, &laid, form, local, views, icons, art, raised,
+        ui, origin, tree, 0, &laid, form, local, views, icons, look, raised,
     );
     ui.allocate_space(egui::vec2(laid.rect.w as f32, laid.rect.h as f32));
 }
@@ -440,12 +483,12 @@ fn draw_form(
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
-    art: &crate::pictures::Resolved,
+    look: Look<'_>,
     area: (f32, f32),
 ) -> Vec<Raised> {
     let tree = &screen.tree;
     let mut raised = Vec::new();
-    let ruler = EguiRuler { ctx };
+    let ruler = EguiRuler { ctx, look };
     let mut close = false;
 
     if screen.compact {
@@ -470,7 +513,7 @@ fn draw_form(
                     local,
                     views,
                     icons,
-                    art,
+                    look,
                     &mut raised,
                 );
                 if ui.button("Close").clicked() {
@@ -511,7 +554,7 @@ fn draw_form(
                 local,
                 views,
                 icons,
-                art,
+                look,
                 &mut raised,
             );
         });
@@ -541,7 +584,7 @@ fn paint(
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
-    art: &crate::pictures::Resolved,
+    look: Look<'_>,
     raised: &mut Vec<Raised>,
 ) {
     let Some(node) = tree.nodes.get(index) else {
@@ -551,8 +594,8 @@ fn paint(
         origin + egui::vec2(laid.rect.x as f32, laid.rect.y as f32),
         egui::vec2(laid.rect.w as f32, laid.rect.h as f32),
     );
-    paint_background(ui, rect, &node.style, art);
-    paint_widget(ui, rect, node, form, local, views, icons, art, raised);
+    paint_background(ui, rect, &node.style, look);
+    paint_widget(ui, rect, node, form, local, views, icons, look, raised);
 
     // **A scroll box clips its children and moves them under the clip.**
     // `core::ui` already lays them out at their full height inside it — "the
@@ -584,7 +627,7 @@ fn paint(
             local,
             views,
             icons,
-            art,
+            look,
             raised,
         );
     }
@@ -595,17 +638,12 @@ fn paint(
 }
 
 /// The style tokens that apply to any widget.
-fn paint_background(
-    ui: &egui::Ui,
-    rect: egui::Rect,
-    style: &Style,
-    art: &crate::pictures::Resolved,
-) {
+fn paint_background(ui: &egui::Ui, rect: egui::Rect, style: &Style, look: Look<'_>) {
     // **The frame goes under the fill and the border.** A nine-slice IS the
     // background where a mod supplies one, and a mod that supplies both meant
     // the flat colour to sit inside the frame rather than over it.
     if let Some(hash) = style.nine_slice
-        && let Some(picture) = art.get(&hash)
+        && let Some(picture) = look.art.get(&hash)
     {
         // **Corner size in source pixels, one for one.** The layout is already
         // in the same points egui draws in, so a frame drawn at 48 pixels
@@ -707,7 +745,7 @@ fn paint_widget(
     local: &mut Local,
     views: &BTreeMap<String, ViewContents>,
     icons: Icons<'_>,
-    art: &crate::pictures::Resolved,
+    look: Look<'_>,
     raised: &mut Vec<Raised>,
 ) {
     let paint = Paint {
@@ -716,9 +754,7 @@ fn paint_widget(
         colour: node.style.text_colour.map_or(egui::Color32::WHITE, |c| {
             egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
         }),
-        font: egui::FontId::proportional(
-            f32::from(node.style.text_size.unwrap_or(14)).clamp(8.0, 48.0),
-        ),
+        font: look.font(&node.style),
         fill: node
             .style
             .background
@@ -787,7 +823,7 @@ fn paint_widget(
         // every panel open helps nobody. A picture that will NOT decode is
         // dropped with a warning where it is decoded — see `net::offer_picture`.
         Widget::Image { hash } => {
-            if let Some(picture) = art.get(hash) {
+            if let Some(picture) = look.art.get(hash) {
                 crate::pictures::paint(ui.painter(), picture.texture, rect);
             }
         }
@@ -1572,6 +1608,7 @@ mod tests {
                     &views,
                     Icons::default(),
                     &BTreeMap::new(),
+                    &crate::fonts::Fonts::new(),
                     area,
                 );
             });
@@ -1654,6 +1691,7 @@ mod tests {
                     views,
                     Icons::default(),
                     &BTreeMap::new(),
+                    &crate::fonts::Fonts::new(),
                     (1280.0, 720.0),
                 );
             });

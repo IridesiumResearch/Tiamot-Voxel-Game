@@ -1076,6 +1076,7 @@ function game.register_on_chat(callback) end
 ---@field border integer[]? Same shape. The width is the client's.
 ---@field nine_slice integer[]? 32 bytes of content hash, drawn as a nine-slice frame behind the widget. **The border is a THIRD of the image**, both ways: draw your frame so its corners are the outer third and they keep their size at any box size while the edges stretch. That is what a nine-slice is for, and it is why there is no border argument. Goes UNDER `background` and `border`, so a widget with both gets the flat colour inside the frame. Fetched by hash like a texture; a frame that has not arrived yet draws nothing and fills in when it lands.
 ---@field text_colour integer[]? Same shape as `background`.
+---@field font string? A registered font id — `game.register_font` qualified it with your mod, so `"my_mod:display"`. The client draws this widget's text in it. A font that failed to load, or a name nothing registered, falls back to the client's own face: a missing file is never a missing screen, so do not design a dialog that only makes sense in your typeface.
 ---@field text_size integer? In virtual pixels; the client keeps it legible.
 
 ---Fields accepted by `game.show_dialog` and `game.update_dialog`.
@@ -1184,6 +1185,35 @@ function game.register_on_dialog_event(callback) end
 ---client.
 ---@param spec Tiamot.SoundSpec
 function game.register_sound(spec) end
+
+---Registers a font your interface can draw text in.
+---
+---**Charter rule 1 for the lettering.** The engine has an opinion about exactly
+---one typeface — its own, which is what a mod that says nothing gets — and a
+---mod that can choose its blocks, sounds and dialogs but not its lettering has
+---screens that all look like the engine's.
+---
+---`file` is a path inside your mod's directory. It travels to clients by
+---content hash on the same pipeline as a texture or a sound, so a client that
+---already has it fetches nothing.
+---
+---Name it on any widget with text: `{ type = "label", font = "my_mod:display" }`.
+---
+---**Limits, and why.** Eight fonts per server and 2 MiB each. The size cap is
+---small because a font file is a parser running on bytes a server pushed; the
+---count cap is about the client's glyph atlas rather than the files, since what
+---costs is coverage — a face with a full CJK range is orders of magnitude more
+---atlas than a Latin one. A ninth `register_font` is an error where you wrote
+---it, not a font quietly dropped later.
+---
+---A font a client cannot load falls back to the client's own face, and so does
+---a style naming one nothing registered. **A missing file is never a missing
+---screen.**
+---
+---Ship a font you have the right to ship: it is published with your mod, and
+---the engine has no way to check a licence.
+---@param spec { id: string, file: string }
+function game.register_font(spec) end
 
 ---Binds a sound to a named event. Registration window only.
 ---

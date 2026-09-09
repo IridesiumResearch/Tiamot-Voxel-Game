@@ -300,6 +300,12 @@ pub struct JoinContext<'a> {
     /// that was not told this would have nothing to play. Empty is a world
     /// nobody made a noise in. See [`crate::proto::SoundDef`].
     pub sounds: &'a [crate::proto::SoundDef],
+    /// Every font a mod registered, in load order.
+    ///
+    /// Charter rule 1 once more: a typeface is most of what an interface looks
+    /// like, and the engine has an opinion about exactly one — its own, which
+    /// is what a mod that says nothing gets. See [`crate::proto::FontDef`].
+    pub fonts: &'a [crate::proto::FontDef],
     /// Which sound each named event plays, in load order.
     ///
     /// The client needs this and not only the server: the handful of cues the
@@ -795,6 +801,13 @@ impl Session {
                 ServerMessage::SoundBindings {
                     bindings: context.sound_bindings.to_vec(),
                 },
+                // And the fonts. Last of the tables, and fetched by hash after
+                // the join like the sounds: a world whose lettering has not
+                // arrived draws in the client's own font, which is a world
+                // somebody can play. One that waited for a typeface is not.
+                ServerMessage::FontTable {
+                    fonts: context.fonts.to_vec(),
+                },
             ],
             close: false,
             action: Action::None,
@@ -974,6 +987,7 @@ mod tests {
             tools: &[],
             actions: &[],
             sounds: &[],
+            fonts: &[],
             sound_bindings: &[],
             hud_scripts: &[],
             sky: (0, &[]),
@@ -1079,7 +1093,11 @@ mod tests {
         assert!(matches!(sent[8], ServerMessage::SoundTable { .. }));
         assert!(matches!(sent[9], ServerMessage::HudScripts { .. }));
         assert!(matches!(sent[10], ServerMessage::SoundBindings { .. }));
-        assert!(matches!(sent[11], ServerMessage::JoinWorld { .. }));
+        // And the fonts, last of the tables: a world whose lettering has not
+        // arrived draws in the client's own face, which is a world somebody can
+        // play — one that waited for a typeface is not.
+        assert!(matches!(sent[11], ServerMessage::FontTable { .. }));
+        assert!(matches!(sent[12], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]

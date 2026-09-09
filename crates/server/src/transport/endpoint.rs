@@ -132,6 +132,8 @@ pub struct Shared {
     pub action_table: Vec<tiamot_core::proto::ActionDef>,
     /// Every sound the mods registered, for the join tables.
     pub sound_table: Vec<tiamot_core::proto::SoundDef>,
+    /// Every font a mod registered, sent on join. See `tiamot_core::font`.
+    pub font_table: Vec<tiamot_core::proto::FontDef>,
     /// The HUD scripts the mods asked to push, in load order.
     pub hud_scripts: Vec<tiamot_core::proto::HudScriptDef>,
     /// Which sound each named event plays, in load order.
@@ -2409,6 +2411,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 fluids: &shared.fluid_table,
                 actions: &shared.action_table,
                 sounds: &shared.sound_table,
+                fonts: &shared.font_table,
                 hud_scripts: &shared.hud_scripts,
                 sound_bindings: &shared.sound_bindings,
                 sky: (shared.sky_day_length, &shared.sky_keyframes),
@@ -2889,6 +2892,7 @@ mod tests {
             held_slot: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             action_table: Vec::new(),
             sound_table: Vec::new(),
+            font_table: Vec::new(),
             hud_scripts: Vec::new(),
             sound_bindings: Vec::new(),
             fluid_table: Vec::new(),

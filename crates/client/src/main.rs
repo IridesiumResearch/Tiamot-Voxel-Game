@@ -2416,6 +2416,11 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
         // server sent: `client::dialog` walks the tree and the rectangles
         // `core::ui` computed for it. See that module for why the layout is
         // not egui's.
+        // **Fonts before anything is drawn with them.** Installing rebuilds
+        // egui's glyph atlas, so it happens here — once per batch that has
+        // arrived — rather than on the network pump or every frame.
+        client::app::install_mod_fonts(app, &context);
+
         // Uploaded first, so the draw below can hold the dialogs and the views
         // by reference — see `App::dialog_art`.
         let dialog_art = app.dialog_art(&context);
@@ -2427,6 +2432,7 @@ fn draw_hud(surface: &mut Surface, view: &wgpu::TextureView) {
                 .with_items(&items)
                 .with_names(&material_names),
             &dialog_art,
+            &app.fonts,
             size,
         );
         // **The interface makes its own noise, locally.** A click that waited

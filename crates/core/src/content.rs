@@ -49,11 +49,17 @@ pub const MAX_MOD_BYTES: u64 = 128 * 1024 * 1024;
 ///
 /// An **allowlist**. A denylist would grow a new hole every time a file type
 /// was invented, and the failure mode is leaking a server's private files.
-const DISTRIBUTABLE: [&str; 9] = [
+const DISTRIBUTABLE: [&str; 12] = [
     "png", "jpg", "jpeg", // textures
     "ogg", "wav", // audio
     "gltf", "glb", // models
     "json", "toml", // client-readable metadata
+    // Fonts. **An allowlist is only as good as its additions**: a mod could
+    // register a font, the server would build a table naming it, and
+    // `hash_of` would answer `None` for every one — so every client drew in
+    // its own face and nothing anywhere said why. Caught by the seam test that
+    // asks a real server for a real mod's font table.
+    "ttf", "otf", "ttc",
 ];
 
 /// Whether a path is one clients receive.
@@ -539,6 +545,7 @@ mod tests {
         let dir = scratch("extensions");
         write(&dir, "stone.png", b"texture");
         write(&dir, "step.ogg", b"audio");
+        write(&dir, "display.ttf", b"font");
         write(&dir, "init.lua", b"-- secrets");
         write(&dir, "admin_tokens.txt", b"hunter2");
         write(&dir, "mod.toml", b"id = 'x'");
@@ -553,6 +560,11 @@ mod tests {
             .collect();
         assert!(paths.contains(&"stone.png"));
         assert!(paths.contains(&"step.ogg"));
+        // A font, and the reason it is worth naming here: a mod may register
+        // one, the server will build a table naming it, and an allowlist that
+        // had not been added to would answer `None` for every hash — so every
+        // client would draw in its own face and nothing would say why.
+        assert!(paths.contains(&"display.ttf"));
         assert!(paths.contains(&"mod.toml"));
         // Checked through `is_distributable` rather than by string suffix, so
         // the assertion tests the real rule and not a second copy of it.
@@ -565,7 +577,7 @@ mod tests {
             paths.iter().all(|p| is_distributable(Path::new(p))),
             "every indexed path must be distributable: {paths:?}"
         );
-        assert_eq!(paths.len(), 3, "exactly the three allowed files: {paths:?}");
+        assert_eq!(paths.len(), 4, "exactly the four allowed files: {paths:?}");
     }
 
     #[test]

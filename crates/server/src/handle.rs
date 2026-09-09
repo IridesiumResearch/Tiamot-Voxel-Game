@@ -1058,6 +1058,34 @@ impl ServerHandle {
             .collect();
         info!(sounds = sound_table.len(), "sound table built");
 
+        // Fonts, on the same pipeline and for the same reason: charter rule 1
+        // says the engine has no opinion about what an interface looks like,
+        // and a typeface is most of what one looks like.
+        let font_table: Vec<tiamot_core::proto::FontDef> = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_fonts())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|font| {
+                let file = content_index.hash_of(&font.mod_id, &font.file);
+                if file.is_none() {
+                    error!(
+                        mod_id = %font.mod_id,
+                        path = %font.file,
+                        font = %font.id,
+                        "font declares a file that is not in the mod directory; clients will \
+                         draw in their own font"
+                    );
+                }
+                tiamot_core::proto::FontDef {
+                    id: font.id,
+                    mod_id: font.mod_id,
+                    file,
+                }
+            })
+            .collect();
+        info!(fonts = font_table.len(), "font table built");
+
         // Which sound each named event plays. Charter rule 1 again: the engine
         // emits cues and has no opinion about what any of them sounds like.
         let sound_bindings: Vec<tiamot_core::proto::SoundBinding> = host
@@ -1461,6 +1489,7 @@ impl ServerHandle {
             views,
             action_table,
             sound_table,
+            font_table,
             sound_bindings,
             hud_scripts,
             fluid_table,

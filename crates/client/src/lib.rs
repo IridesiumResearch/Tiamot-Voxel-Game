@@ -43,6 +43,7 @@ pub mod config;
 pub mod dialog;
 pub mod discovery;
 pub mod entities;
+pub mod fonts;
 pub mod front;
 pub mod icons;
 pub mod input;

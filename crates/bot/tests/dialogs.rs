@@ -144,6 +144,93 @@ async fn join(server: &ServerHandle, name: &str) -> Bot {
     bot
 }
 
+/// A mod that registers a font and draws a label in it.
+///
+/// The file is the client's own bundled face, copied into the mod's directory
+/// — a real TrueType file, because what is being tested is that the content
+/// pipeline carries one and the server hashes it, and a file of zeroes would
+/// prove the pipeline and not the font.
+fn write_lettering(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("lettering");
+    std::fs::create_dir_all(dir.join("fonts")).expect("mod dir");
+    let face = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../client/assets/third-party/go-font/Go-Mono.ttf");
+    std::fs::copy(&face, dir.join("fonts/display.ttf")).expect("a real font to ship");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"lettering\"\nname = \"Lettering\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        r#"
+local ground = game.register_block{ id = "ground" }
+game.register_on_generate(function(buf, pos)
+    buf:fill_below_heightmap(game.flat_heightmap(0), ground)
+end)
+
+game.register_font{ id = "display", file = "fonts/display.ttf" }
+
+game.register_on_player_join(function(event)
+    game.show_dialog{
+        player = event.player, form = "titled",
+        tree = {
+            type = "container", direction = "column",
+            children = {
+                { type = "label", text = "Chapter One",
+                  style = { font = "lettering:display", text_size = 24 } },
+            },
+        },
+    }
+end)
+"#,
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_mods_font_reaches_a_client_by_hash_and_a_style_names_it() {
+    // **The seam test.** A registry, a table and a client-side installer can
+    // all be right while nothing joins them — `game.set_block` was dead on
+    // every real server for three tasks that way. So: a real server, a real
+    // mod, a real font file, and a bot that reads what it was actually sent.
+    let server = start("fonts", write_lettering("fonts"));
+    block_on(async {
+        let mut bot = join(&server, "Reader").await;
+        bot.recv_until(|m| matches!(m, tiamot_core::proto::ServerMessage::ShowDialog { .. }))
+            .await
+            .expect("no dialog arrived");
+
+        let fonts = bot.font_table().expect("a font table on join");
+        assert_eq!(fonts.len(), 1, "the font table is {fonts:?}");
+        assert_eq!(fonts[0].id, "lettering:display");
+        assert_eq!(fonts[0].mod_id, "lettering");
+        assert!(
+            fonts[0].file.is_some(),
+            "the server did not hash the font file, so no client can fetch it"
+        );
+
+        // And the style carries the id, which is the half that fails silently:
+        // a style key missing from the engine's allowlist takes the whole
+        // dialog down rather than the one field.
+        let dialogs = bot.dialogs();
+        let (_, tree) = &dialogs[0];
+        let named = tree
+            .nodes
+            .iter()
+            .filter_map(|node| node.style.font.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named,
+            vec!["lettering:display"],
+            "the style's font did not survive the trip"
+        );
+    });
+}
+
 #[test]
 fn a_server_mod_shows_a_dialog_to_a_client_that_pushed_no_code() {
     // **Criterion 2.** Nothing the server sent is executed by this bot. It

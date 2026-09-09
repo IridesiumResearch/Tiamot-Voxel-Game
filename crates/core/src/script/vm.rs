@@ -1335,6 +1335,12 @@ pub trait ScriptVm: Sized {
     /// Every sound the loaded mods registered, in load order.
     fn registered_sounds(&self) -> Vec<crate::sound::Sound>;
 
+    /// Every font a mod registered, in load order.
+    ///
+    /// Bounded by [`crate::font::MAX_FONTS`] — the cap is about the client's
+    /// glyph atlas as much as about parsing bytes a server pushed.
+    fn registered_fonts(&self) -> Vec<crate::font::Font>;
+
     /// Every cue binding the loaded mods declared, in load order.
     ///
     /// Load order is precedence: two mods binding the same cue leave the later

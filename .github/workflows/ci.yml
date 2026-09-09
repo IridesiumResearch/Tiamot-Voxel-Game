@@ -218,6 +218,18 @@ jobs:
             --target x86_64-unknown-linux-gnu \
             -- -max_total_time=60 -rss_limit_mb=2048
 
+      # Charter rule 14 for the lettering. A font file is a parser running on
+      # bytes a server pushed, and font parsers are among the most attacked
+      # surfaces there are — so the target ships with the loading path rather
+      # than after it. Seeded with the client's own bundled face, because a
+      # fuzzer starting from noise spends its whole budget failing the table
+      # directory's magic.
+      - name: Fuzz the font parser (smoke)
+        run: |
+          cargo +nightly fuzz run font_ingest \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=60 -rss_limit_mb=2048
+
       # Charter rule 14 again, for Task 10's chunk-light payloads. A run-length
       # format is exactly the shape that goes wrong under hostile input — a run
       # header claiming more than a chunk, a run of zero length, a payload that

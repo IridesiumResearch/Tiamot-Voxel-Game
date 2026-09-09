@@ -52,6 +52,14 @@ pub struct Style {
     pub text_colour: Option<Colour>,
     /// Text size in virtual pixels, clamped by the client to something legible.
     pub text_size: Option<u16>,
+    /// Which registered font to draw this widget's text in.
+    ///
+    /// A font id, as `game.register_font` qualified it. `None` — every widget
+    /// until a mod says otherwise — is the client's own font, and so is a name
+    /// no font answers to: a dialog whose lettering failed to arrive is still a
+    /// dialog, and refusing to draw it would turn a missing file into a missing
+    /// screen.
+    pub font: Option<String>,
 }
 
 /// One widget, and what it holds.

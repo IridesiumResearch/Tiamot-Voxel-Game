@@ -742,6 +742,78 @@ end)
 }
 
 #[test]
+fn a_mod_registers_a_font_and_a_style_may_name_it() {
+    // **Charter rule 1 for the lettering.** A mod that can choose its blocks,
+    // its sounds and its dialogs and not its typeface is a mod whose screens
+    // all look like the engine's.
+    //
+    // Both halves in one mod, because a font nothing can name is not a
+    // feature: the registration, and a style that asks for it. The style is
+    // the half that would fail silently — `STYLE_FIELDS` refuses an unknown key
+    // and takes the whole dialog down with it, which is what shipped twice for
+    // block fields.
+    let root = scratch("fonts");
+    write_mod(
+        &root,
+        "lettering",
+        "",
+        r#"
+game.register_font{ id = "display", file = "fonts/display.ttf" }
+game.register_on_player_join(function(event)
+    game.show_dialog{
+        player = event.player,
+        form = "titled",
+        tree = {
+            type = "container", direction = "column",
+            children = {
+                { type = "label", text = "Chapter One", font = "lettering:display", text_size = 24 },
+            },
+        },
+    }
+end)
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+
+    let fonts = host.vm().registered_fonts();
+    assert_eq!(fonts.len(), 1, "the font did not register");
+    assert_eq!(fonts[0].id, "lettering:display", "the id was not qualified");
+    assert_eq!(fonts[0].mod_id, "lettering");
+    assert_eq!(fonts[0].file, "fonts/display.ttf");
+}
+
+#[test]
+fn a_mod_may_not_push_more_fonts_than_a_client_will_hold() {
+    // The cap is about the client's glyph atlas as much as about parsing bytes
+    // a server pushed — coverage is what costs, not the file. Refused where the
+    // mod asked, rather than quietly dropped by the server later: a mod should
+    // hear about its ninth font at the line that registers it.
+    let root = scratch("too-many-fonts");
+    let mut source = String::new();
+    for index in 0..=tiamot_core::font::MAX_FONTS {
+        source.push_str(&format!(
+            "game.register_font{{ id = \"f{index}\", file = \"fonts/f{index}.ttf\" }}\n"
+        ));
+    }
+    write_mod(&root, "greedy", "", &source);
+
+    let host = host_for(&root);
+    let failure = format!("{:?}", host.failed());
+    assert!(
+        failure.contains("at most"),
+        "a mod registering {} fonts should be refused: {failure}",
+        tiamot_core::font::MAX_FONTS + 1
+    );
+}
+
+#[test]
 fn a_block_may_declare_every_field_the_engine_documents() {
     // **The field allowlist is the last gate a mod passes, and it has been
     // forgotten twice.** `register_block` refuses any key it does not know, so

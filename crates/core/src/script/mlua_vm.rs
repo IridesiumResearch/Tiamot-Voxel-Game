@@ -1053,6 +1053,26 @@ impl ScriptVm for MluaVm {
             .collect()
     }
 
+    fn registered_fonts(&self) -> Vec<crate::font::Font> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.fonts") else {
+            return Vec::new();
+        };
+        registry
+            .sequence_values::<Table>()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                Some(crate::font::Font {
+                    id: entry.get("id").ok()?,
+                    mod_id: entry.get("mod_id").ok()?,
+                    file: entry.get("file").ok()?,
+                })
+            })
+            // Bounded here as well as at registration: one mod cannot register
+            // a ninth, and eight mods registering one each still can.
+            .take(crate::font::MAX_FONTS)
+            .collect()
+    }
+
     fn registered_bindings(&self) -> Vec<crate::sound::Binding> {
         let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.bindings") else {
             return Vec::new();
@@ -2296,6 +2316,8 @@ impl MluaVm {
         game.set("register_sound", register_sound)
             .map_err(|err| self.vm_error(&err))?;
 
+        self.install_font(mod_id, game)?;
+
         // **One per mod, and the last one wins.** A mod with two HUD scripts is
         // a mod that should concatenate them: the client budgets per script per
         // frame, so two scripts from one mod would quietly buy it twice the
@@ -2768,6 +2790,54 @@ impl MluaVm {
             })
             .map_err(|err| self.vm_error(&err))?;
         game.set("take", take).map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
+    /// The `game.register_font` function.
+    ///
+    /// Its own method because `install_sound` is at the line limit, and its own
+    /// concern anyway: what a sound is handed to is a mixer, and what a font is
+    /// handed to is a parser running on bytes a server pushed. See
+    /// [`crate::font`] for the caps that follow from that.
+    fn install_font(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        // **The same shape as a sound, and for the same reason**: a file in
+        // the mod's own directory, travelling by hash. What differs is what it
+        // is handed to — a font parser, on bytes a server pushed, which is why
+        // `core::font` has caps of its own.
+        let owner = mod_id.to_owned();
+        let register_font = self
+            .lua
+            .create_function(move |lua, spec: Table| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                let id: String = spec.get("id")?;
+                let entry = lua.create_table()?;
+                entry.set(
+                    "id",
+                    qualify_id(&owner, &id).map_err(mlua::Error::external)?,
+                )?;
+                entry.set("mod_id", owner.clone())?;
+                entry.set("file", spec.get::<String>("file")?)?;
+                let fonts: Table = lua.named_registry_value("tiamot.fonts")?;
+                // **Refused rather than truncated later.** A mod that registers
+                // a ninth font should hear about it where it asked, not have
+                // the server quietly drop whichever came last.
+                if fonts.raw_len() >= crate::font::MAX_FONTS {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: a server may push at most {} fonts",
+                        crate::font::MAX_FONTS
+                    )));
+                }
+                fonts.push(entry)?;
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_font", register_font)
+            .map_err(|err| self.vm_error(&err))?;
         Ok(())
     }
 
@@ -4915,6 +4985,10 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.sounds", sounds)
             .map_err(|err| self.vm_error(&err))?;
+        let fonts = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.fonts", fonts)
+            .map_err(|err| self.vm_error(&err))?;
         self.lua
             .set_named_registry_value("tiamot.hud_scripts", hud_scripts)
             .map_err(|err| self.vm_error(&err))?;
@@ -6409,6 +6483,7 @@ fn widget_style(spec: &Table) -> mlua::Result<crate::ui::Style> {
             .transpose()?,
         text_colour: colour(&style, "text_colour")?,
         text_size: style.get::<Option<u16>>("text_size")?,
+        font: style.get::<Option<String>>("font")?,
     })
 }
 
@@ -6477,12 +6552,17 @@ const WIDGET_FIELDS: [&str; 29] = [
 ];
 
 /// Keys a style table accepts.
-const STYLE_FIELDS: [&str; 5] = [
+const STYLE_FIELDS: [&str; 6] = [
     "background",
     "border",
     "nine_slice",
     "text_colour",
     "text_size",
+    // **Adding a field here is half the job.** A style key missing from this
+    // list is refused with "unknown field" and the whole dialog fails to open —
+    // the same gate `BLOCK_FIELDS` is, which shipped two block fields nobody
+    // could use.
+    "font",
 ];
 
 /// The domain a mod named on a position, or the overworld.

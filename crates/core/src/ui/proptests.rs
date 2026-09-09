@@ -80,14 +80,18 @@ fn any_style() -> impl Strategy<Value = Style> {
         any::<Option<[u8; 32]>>(),
         any::<Option<[u8; 4]>>(),
         any::<Option<u16>>(),
+        // A font id, including names no font answers to — which a client must
+        // draw in its own font rather than refuse.
+        proptest::option::of("[a-z_]{1,12}:[a-z_]{1,12}"),
     )
         .prop_map(
-            |(background, border, nine_slice, text_colour, text_size)| Style {
+            |(background, border, nine_slice, text_colour, text_size, font)| Style {
                 background,
                 border,
                 nine_slice,
                 text_colour,
                 text_size,
+                font,
             },
         )
 }

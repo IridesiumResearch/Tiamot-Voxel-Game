@@ -70,6 +70,7 @@ pub mod discover;
 pub mod domain;
 pub mod ent;
 pub mod fluid;
+pub mod font;
 pub mod hud;
 pub mod identity;
 pub mod interest;

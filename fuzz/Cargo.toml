@@ -21,6 +21,10 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 tiamot-core = { path = "../crates/core", default-features = false }
 client = { path = "../crates/client" }
+# The font parser egui itself uses (epaint is built on the fontations stack),
+# so `font_ingest` fuzzes the code a client actually runs rather than a
+# lookalike. Pinned to what the lockfile already resolved for epaint.
+skrifa = "0.35"
 
 [[bin]]
 name = "proto_decode"
@@ -32,6 +36,13 @@ bench = false
 [[bin]]
 name = "texture_ingest"
 path = "fuzz_targets/texture_ingest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "font_ingest"
+path = "fuzz_targets/font_ingest.rs"
 test = false
 doc = false
 bench = false

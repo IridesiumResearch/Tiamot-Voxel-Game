@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 42;
+pub const PROTOCOL_VERSION: u32 = 43;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -464,6 +464,23 @@ pub struct ActionDef {
     /// Empty means the mod shipped it unbound, which is legitimate: the player
     /// binds it or it does nothing.
     pub default_key: String,
+}
+
+/// A font a mod registered, as the client needs to see it.
+///
+/// The file travels by hash through the same content pipeline a texture and a
+/// sound do. **Hostile input** — see [`crate::font`] for the caps and why a
+/// font gets stricter ones than any other file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FontDef {
+    /// The qualified id, e.g. `"my_mod:cinzel"`, which a style names.
+    pub id: String,
+    /// The mod that registered it, for attribution in the UI and in warnings.
+    pub mod_id: String,
+    /// The content hash of the font file, or `None` if the mod named one that
+    /// is not in its directory — the client draws in its own font rather than
+    /// guessing at what was meant.
+    pub file: Option<ContentHash>,
 }
 
 /// A sound a mod registered, as the client needs to see it.
@@ -1780,6 +1797,23 @@ pub enum ServerMessage {
         /// Which slot, zero-based.
         slot: u16,
     },
+
+    /// The fonts a server's mods registered, sent once on join.
+    ///
+    /// **Appended at the end** (protocol v43).
+    ///
+    /// Empty is the ordinary case: a mod that says nothing about lettering
+    /// gets the client's own font, which is what every mod written before this
+    /// gets and what every mod that does not care should get.
+    ///
+    /// The files travel by hash on the same content pipeline as textures and
+    /// sounds, and are **hostile input with stricter caps than either** — see
+    /// [`crate::font`].
+    FontTable {
+        /// Every registered font, in load order, bounded by
+        /// [`crate::font::MAX_FONTS`].
+        fonts: Vec<FontDef>,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -2296,6 +2330,21 @@ fn check_sounds(sounds: &[SoundDef]) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+/// Bounds a font table.
+///
+/// Charter rule 14: a server is not trusted for being the server, and this is
+/// the message that decides how many parsers a client will run on bytes it
+/// pushed. The count cap is [`crate::font::MAX_FONTS`] — the file bytes are
+/// bounded where they arrive, not here, because this message carries hashes.
+fn check_fonts(fonts: &[FontDef]) -> Result<(), ProtocolError> {
+    check_len("font_table", fonts.len(), crate::font::MAX_FONTS)?;
+    for font in fonts {
+        check_len("font_id", font.id.len(), MAX_ID_BYTES)?;
+        check_len("font_mod_id", font.mod_id.len(), MAX_ID_BYTES)?;
+    }
+    Ok(())
+}
+
 /// Bounds a play request, including the numbers that reach a mixer.
 ///
 /// Charter rule 14: a server is not trusted. A `NaN` gain is not a quiet sound,
@@ -2503,6 +2552,7 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         ServerMessage::ViewUpdate { view, slots, .. } => check_view(view, slots)?,
         ServerMessage::ActionTable { actions } => check_actions(actions)?,
         ServerMessage::SoundTable { sounds } => check_sounds(sounds)?,
+        ServerMessage::FontTable { fonts } => check_fonts(fonts)?,
         ServerMessage::HudScripts { scripts } => check_hud_scripts(scripts)?,
         ServerMessage::HudValues { mod_id, values } => check_hud_values(mod_id, values)?,
         // A domain id is a string a server chose, and it reaches a loading

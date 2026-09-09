@@ -46,6 +46,12 @@ wgpu.workspace = true
 winit.workspace = true
 symphonia.workspace = true
 kira.workspace = true
+# The font parser `epaint` itself uses. Named directly so a mod's font can be
+# VALIDATED before egui is handed it: egui takes a font's bytes without reading
+# them and parses at first layout, so a guard around `set_fonts` isolates
+# nothing. Charter rule 14 wants the check before the allocation, and this is
+# where it goes. Pure Rust, and already in the tree through `epaint`.
+skrifa = "0.42"
 egui.workspace = true
 egui-wgpu.workspace = true
 egui-winit.workspace = true

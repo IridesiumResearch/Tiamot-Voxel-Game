@@ -795,6 +795,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "server",
+ "skrifa",
  "socket2",
  "symphonia",
  "thiserror 2.0.19",

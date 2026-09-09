@@ -51,6 +51,25 @@ const HUD_FONT: &[u8] = include_bytes!("../assets/third-party/go-font/Go-Mono.tt
 /// knob that can be added when something wants one.
 const UNDERWATER_VISIBILITY: f32 = 16.0;
 
+/// Installs any font a server's mods have pushed, once per batch.
+///
+/// **Called from the frame, not from the network pump**, because installing
+/// rebuilds egui's glyph atlas: doing it where the bytes arrive would put that
+/// cost on an arbitrary frame and doing it every frame would be a permanent
+/// hitch.
+pub fn install_mod_fonts(app: &mut App, ctx: &egui::Context) {
+    if !app.fonts.has_pending() {
+        return;
+    }
+    for refused in app.fonts.install(ctx, HUD_FONT) {
+        // The player is told, because a mod's screen drawn in the wrong
+        // typeface is a thing they can see and cannot explain.
+        app.warn(format!(
+            "font `{refused}` could not be loaded and its text will draw in the client's own"
+        ));
+    }
+}
+
 /// Installs [`HUD_FONT`] as the only font egui has.
 ///
 /// **Required, not cosmetic.** The client builds egui without `default_fonts`
@@ -58,6 +77,9 @@ const UNDERWATER_VISIBILITY: f32 = 16.0;
 /// all, and a HUD with no font renders nothing while reporting no error. It is
 /// mapped to both families because the HUD wants one look and neither family
 /// may be left empty.
+///
+/// A mod's font is added BESIDE this one and never instead of it — see
+/// [`crate::fonts`].
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::empty();
     fonts.font_data.insert(
@@ -1125,6 +1147,11 @@ pub struct App {
     /// by egui rather than the world shader, and can arrive at any moment
     /// rather than at the join.
     pub pictures: crate::pictures::Pictures,
+    /// Fonts a server's mods pushed, and whether any are waiting to install.
+    ///
+    /// Charter rule 14 lives in `crate::fonts`: a font file is a parser running
+    /// on bytes a server chose.
+    pub fonts: crate::fonts::Fonts,
     transparent: std::collections::BTreeSet<u16>,
     /// A chunk being meshed across frames, if one is part-built.
     ///
@@ -1301,6 +1328,7 @@ impl App {
             seed: None,
             transparent: std::collections::BTreeSet::new(),
             pictures: crate::pictures::Pictures::new(),
+            fonts: crate::fonts::Fonts::new(),
             meshing: None,
             may_fly: false,
             flying: false,
@@ -3390,6 +3418,19 @@ impl App {
         self.pictures.resolve_hashes(ctx, &wanted)
     }
 
+    /// Takes a mod's font, or says why it will not be used.
+    ///
+    /// **Parsed before egui is handed it** — see `crate::fonts::parses` for why
+    /// that cannot wait until it is installed.
+    fn adopt_font(&mut self, id: &str, bytes: Vec<u8>) {
+        if !self.fonts.offer(id.to_owned(), bytes) {
+            self.warn(format!(
+                "font `{id}` is not a font this client can read; its text will draw in the \
+                 client's own"
+            ));
+        }
+    }
+
     /// Materials that may not be placed: the items.
     ///
     /// Read by whatever draws a slot, because an item is drawn flat and a block
@@ -3947,7 +3988,7 @@ impl App {
     /// it per world would be a visible stall — so it goes back to the window,
     /// along with the bindings, which are the player's and not this world's.
     #[must_use]
-    pub fn leave(self) -> (Renderer, crate::input::Bindings, crate::config::Config) {
+    pub fn leave(mut self) -> (Renderer, crate::input::Bindings, crate::config::Config) {
         let Self {
             connection,
             mut renderer,
@@ -3973,6 +4014,13 @@ impl App {
         // belongs to the thing that knows what the renderer holds, and so a
         // second caller cannot forget it.
         renderer.clear();
+        // **And what the server's mods pushed to look at.** A typeface and a
+        // panel background belong to the server that sent them; carrying either
+        // into the next world would be one mod's art appearing in somebody
+        // else's game. The client's own font is reinstalled by the window when
+        // it builds the next context.
+        self.pictures.clear();
+        self.fonts.clear();
         // **The config comes back too.** A world holds its own copy so that a
         // setting changed in it takes effect immediately, and the window kept
         // the copy it started with — so a scale or a volume set in game was
@@ -4067,6 +4115,9 @@ impl App {
                 // A dialog's art, arriving whenever it arrives. Held until
                 // something draws it — see `crate::pictures`.
                 Event::Picture { hash, image } => self.pictures.insert(hash, image),
+                // Queued, not installed: installing rebuilds egui's glyph
+                // atlas and this is the network pump. See `client::fonts`.
+                Event::Font { id, bytes } => self.adopt_font(&id, bytes),
 
                 Event::Joined {
                     spawn,

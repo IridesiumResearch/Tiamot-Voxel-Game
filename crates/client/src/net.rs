@@ -217,6 +217,19 @@ pub enum Event {
         source: String,
     },
 
+    /// A font a mod registered has been fetched, and is within its caps.
+    ///
+    /// **Bytes, not a parsed font.** Parsing happens where the font is
+    /// installed, on the frame thread, because that is where egui's font
+    /// definitions live — and it is isolated there, so a font that kills the
+    /// parser disables that font and nothing else.
+    Font {
+        /// The qualified id a style names.
+        id: String,
+        /// The file, already checked against `font::MAX_FONT_BYTES`.
+        bytes: Vec<u8>,
+    },
+
     /// A picture a dialog draws has been fetched and decoded.
     ///
     /// Arrives after the dialog it belongs to, and often several frames after:
@@ -923,6 +936,8 @@ async fn session(
     // table for these**: nothing in the protocol lists a dialog's art, so the
     // tree is the manifest and this is what it said — see `ui::Tree::content`.
     let mut awaited_pictures: Vec<tiamot_core::proto::ContentHash> = Vec::new();
+    // Fonts a server registered, waiting for their files.
+    let mut awaited_fonts: Vec<tiamot_core::proto::FontDef> = Vec::new();
     send.impair(impairment);
 
     let _ = events.send(Event::Connected {
@@ -1233,6 +1248,15 @@ async fn session(
                         if awaited_pictures.contains(&hash) {
                             offer_picture(hash, &cache, &events);
                         }
+
+                        // And a font, `filter` for the third time and the third
+                        // reason to spell it out: two mods shipping the same
+                        // typeface share one hash, and `find` would install it
+                        // under one id and leave the other drawing in the
+                        // client's font for ever.
+                        for font in awaited_fonts.iter().filter(|font| font.file == Some(hash)) {
+                            offer_font(font, &cache, &events);
+                        }
                     }
                     Ok(false) => {}
                     Err(reason) => {
@@ -1478,6 +1502,29 @@ async fn session(
                     values: values.into_iter().collect(),
                 });
             }
+            ServerMessage::FontTable { fonts } => {
+                // The same pipeline as a sound: by hash, after the join, and a
+                // client that already has the bytes asks for nothing. What
+                // differs is what the bytes are handed to — a font parser, on
+                // input a server chose, which is why `core::font` caps them
+                // harder than any other file and why the parse is isolated.
+                let wanted: Vec<tiamot_core::proto::ContentHash> =
+                    fonts.iter().filter_map(|font| font.file).collect();
+                let missing = cache.missing(&wanted);
+                for font in &fonts {
+                    offer_font(font, &cache, &events);
+                }
+                awaited_fonts = fonts;
+                if !missing.is_empty()
+                    && let Err(err) = send
+                        .write(&ClientMessage::ContentRequest { hashes: missing })
+                        .await
+                {
+                    finish(format!("could not ask for the fonts: {err}"));
+                    break;
+                }
+            }
+
             ServerMessage::HudScripts { scripts } => {
                 // The same pipeline as a sound, for the same reason: by hash,
                 // after the join, and a client that already has the bytes asks
@@ -1650,6 +1697,49 @@ fn offer_hud_script(
             )));
         }
     }
+}
+
+/// Hands a font's bytes over, if they have arrived and pass the caps.
+///
+/// # Charter rule 14, and why this one is stricter than a texture
+///
+/// A font file is a parser running on bytes a server pushed, and font parsers
+/// are among the most attacked surfaces there are. Three things stand between
+/// one and this client:
+///
+/// - [`tiamot_core::font::MAX_FONT_BYTES`], checked HERE, before anything
+///   parses — well under the general file cap, because a font is not a texture
+///   pack;
+/// - a pure-Rust parser (`ab_glyph`, through egui), so no C codec is in the
+///   path;
+/// - panic isolation at the parse, which happens where the font is installed.
+///
+/// `fuzz/fuzz_targets/font_ingest.rs` fuzzes the same entry point.
+fn offer_font(
+    font: &tiamot_core::proto::FontDef,
+    cache: &ContentCache,
+    events: &mpsc::UnboundedSender<Event>,
+) {
+    let Some(hash) = font.file else {
+        // The server already logged that the mod named a file it does not have.
+        return;
+    };
+    let Some(bytes) = cache.get(&hash) else {
+        return;
+    };
+    if bytes.len() as u64 > tiamot_core::font::MAX_FONT_BYTES {
+        let _ = events.send(Event::Warning(format!(
+            "font `{}` is {} bytes, over the {} a font may be, and will not be loaded",
+            font.id,
+            bytes.len(),
+            tiamot_core::font::MAX_FONT_BYTES
+        )));
+        return;
+    }
+    let _ = events.send(Event::Font {
+        id: font.id.clone(),
+        bytes,
+    });
 }
 
 /// Decodes an interface picture, if its bytes have arrived.

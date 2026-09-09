@@ -44,6 +44,15 @@
 !/fuzz/corpus/dialog_schema/seed-*.bin
 !/fuzz/corpus/dialog_schema/regression-*.bin
 
+# The font corpus, on the rule the audio one uses and for the same reason: the
+# seed is a real typeface that cannot be generated, and a fuzzer derives
+# megabytes from it in minutes. `seed-go-mono.ttf` is the client's own bundled
+# font — the one face this repository is certain to have the right to carry —
+# plus anything that has ever crashed the parser.
+/fuzz/corpus/font_ingest/*
+!/fuzz/corpus/font_ingest/seed-*.ttf
+!/fuzz/corpus/font_ingest/regression-*.ttf
+
 # The discovery beacon's corpus, same rule and same reason: the format is a
 # couple of dozen bytes and a fuzzer derives thousands of entries from it in
 # under a minute. What is worth keeping is every input that has ever crashed

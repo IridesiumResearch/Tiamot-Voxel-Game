@@ -202,6 +202,8 @@ impl Seen {
             // because the match is exhaustive on purpose: a new event should
             // make somebody decide what this test does about it.
             Event::Picture { .. } => {}
+            // A mod's font. Same reasoning as the picture above.
+            Event::Font { .. } => {}
             Event::Materials { table, images } => {
                 self.table_before_join = Some(self.joined.is_none());
                 self.table = table;

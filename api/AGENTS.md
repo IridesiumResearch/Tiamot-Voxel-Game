@@ -265,12 +265,25 @@ the size you asked for.
 **Slot counts scale with the slot**, so a bigger `item_slot` gets bigger
 numbers. You do not set the font.
 
-**Fonts are the engine's, not yours.** There is no font registration, and there
-will not be one until it can be done properly — a font file is a parser running
-on bytes a server pushed (charter rule 14), which needs pre-decode caps, panic
-isolation and a fuzz target of its own. Everything a dialog draws is in the
-client's bundled font. If your art depends on a particular typeface, put the
-words in the picture.
+**Fonts.** Register one and name it in a style:
+
+```lua
+game.register_font{ id = "display", file = "fonts/display.ttf" }
+-- ...then on any widget that has text:
+{ type = "label", text = "Chapter One", font = "my_mod:display", text_size = 24 }
+```
+
+Up to **eight fonts per server** and **2 MiB each** — the count cap is about the
+client's glyph atlas rather than the files, because what costs is coverage, and
+a face with a full CJK range is orders of magnitude more atlas than a Latin one.
+
+A font a client cannot load, or a `font` naming one nothing registered, draws in
+the client's own face. A missing file is never a missing screen, so do not
+design a dialog that only makes sense in your typeface.
+
+**Ship a font you have the right to ship.** The engine carries no opinion about
+your licence and no way to check one; a font in your mod directory is published
+with your mod.
 
 ---
 

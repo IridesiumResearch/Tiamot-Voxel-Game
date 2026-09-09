@@ -49,6 +49,21 @@ pub enum BotError {
         got: String,
     },
 
+    /// Nothing the caller was waiting for arrived in time.
+    ///
+    /// **A deadline exists so a test fails rather than hangs.** A mod that did
+    /// not load, a hook that never fired and a table that was never sent all
+    /// look identical from outside a server — which is to say they look like
+    /// nothing at all — and a test that stops says nothing about which.
+    #[error("waited {waited:?} for a message that never came; {received} arrived before it")]
+    TimedOut {
+        /// How long the caller waited.
+        waited: std::time::Duration,
+        /// How many messages did arrive, which is the number that says whether
+        /// the server was quiet or merely never said this.
+        received: usize,
+    },
+
     /// The server refused the connection.
     #[error("server refused the connection: {reason:?}")]
     Refused {
@@ -369,8 +384,29 @@ impl Bot {
         &mut self,
         want: fn(&ServerMessage) -> bool,
     ) -> Result<ServerMessage, BotError> {
+        // **A deadline, because the alternative is a hang.** This used to loop
+        // for ever, so a message that never came stopped the test rather than
+        // failing it — and a test that stops says nothing about why. A mod that
+        // failed to load, a hook that never fired, a table that was not sent:
+        // all of them looked identical from outside, which is to say they
+        // looked like nothing at all. One of them cost an hour.
+        //
+        // Generous, because this is a real server on a shared machine and the
+        // deadline is here to end a hang rather than to time anything.
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + PATIENCE;
         loop {
-            let message = self.recv().await?;
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(BotError::TimedOut {
+                    waited: PATIENCE,
+                    received: self.received().len(),
+                });
+            }
+            let Ok(message) = tokio::time::timeout(left, self.recv()).await else {
+                continue;
+            };
+            let message = message?;
             if want(&message) {
                 return Ok(message);
             }
@@ -1603,6 +1639,17 @@ impl Bot {
             .into_iter()
             .find_map(|message| match message {
                 ServerMessage::SoundTable { sounds } => Some(sounds),
+                _ => None,
+            })
+    }
+
+    /// The fonts a server's mods registered.
+    #[must_use]
+    pub fn font_table(&self) -> Option<Vec<tiamot_core::proto::FontDef>> {
+        self.received()
+            .into_iter()
+            .find_map(|message| match message {
+                ServerMessage::FontTable { fonts } => Some(fonts),
                 _ => None,
             })
     }
