@@ -88,6 +88,23 @@ jobs:
       - name: Two hundred scripted mobs for thirty seconds
         run: cargo test -p bot --test entity_load --release -- --ignored --nocapture
 
+  serve-budget:
+    name: expensive terrain (serve budget)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # A mod generating terrain from a sampled density field, which is several
+      # times what the reference world's flat fill costs. The engine may not
+      # spend more than its share of the tick serving it however expensive a
+      # chunk turns out to be, because a chunk's cost belongs to the mod. The
+      # regression this guards is a count-shaped budget coming back: before the
+      # clock, this workload dropped 94 of 386 ticks.
+      - name: Terrain a mod paid for, for twenty-five seconds
+        run: cargo test -p bot --test serve_budget --release -- --ignored --nocapture
+
   micro-bench:
     name: criterion micro-benchmarks
     runs-on: ubuntu-latest
