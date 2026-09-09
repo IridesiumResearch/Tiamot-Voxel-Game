@@ -222,6 +222,32 @@ Measured per chunk on terrain with caves: 729 us at block resolution, 1.08 ms
 smooth, 3.98 ms sampled. `set_subnode` is for the handful of cells you place
 deliberately, not for terrain.
 
+**What that costs the server, and what the engine does about it.** Your
+generator runs on the simulation thread, and the tick is 50 ms shared by
+everything (charter rule 18). The engine will spend at most **half of it**
+serving chunks — generating, lighting and sending them — and whatever does not
+fit waits for the next tick. So an expensive generator does not make the world
+stutter; it makes the world arrive more slowly, which is the trade worth having
+and the one you can see coming.
+
+The arithmetic is yours to do: at 3.98 ms a chunk, sampled detail fills about
+six chunks a tick, and `smooth` at 1.08 ms fills nearly four times as many. A
+player at view distance 24 is asking for tens of thousands of chunks, so that
+ratio is minutes of waiting rather than a detail. Pick `sampled` where the
+surface is worth it and `smooth` where it is not — they can be different fills
+in the same generator.
+
+If a server does run over its budget it says so, and it names your share:
+
+```
+a tick ran over its budget — 74.5ms total: serving 45.6ms, save chunks 28.7ms
+  — serving 1 chunks, 1 summaries, 10 deferred; gen 45.1ms, light 0.5ms
+```
+
+`gen` is your generator. `light` is the engine lighting what you generated.
+`deferred` is what the budget held back, which is the number that tells you the
+server is keeping up with the tick but not with the player.
+
 **Colour: a tint field.** Declare it on the block and the client does the rest:
 
 ```lua

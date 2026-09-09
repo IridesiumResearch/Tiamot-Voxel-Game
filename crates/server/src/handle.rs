@@ -21,6 +21,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::time::Duration;
 
 use tiamot_core::identity::{Allowlist, PlayerUuid};
 use tiamot_core::phys::Occupant;
@@ -580,6 +581,236 @@ fn broadcast_light(
             },
         );
     }
+}
+
+/// What one tick's worth of chunk serving did, and where the time went.
+///
+/// The tick already says `serving 95.8ms` when it loses its budget, and that
+/// sentence has never been enough to act on: serving is worldgen, encoding,
+/// lighting and fluid, and which of them spent the tick is the whole question.
+/// It is also the number a MOD moves — a generator that samples a density
+/// field costs several times what the reference world's flat fill does — so
+/// the breakdown is as much for the mod author as for the engine.
+#[derive(Debug, Default, Clone, Copy)]
+struct ServeReport {
+    /// Full chunks generated or loaded, lit, and sent.
+    chunks: usize,
+    /// Horizon summaries answered.
+    summaries: usize,
+    /// Requests taken but left for the next tick when the clock ran out.
+    deferred: usize,
+    /// Time inside `World::chunk` / `World::summary`, including the encode.
+    generating: Duration,
+    /// Time relighting what was served.
+    lighting: Duration,
+}
+
+impl ServeReport {
+    /// Whether anything happened worth reporting.
+    const fn is_idle(&self) -> bool {
+        self.chunks == 0 && self.summaries == 0 && self.deferred == 0
+    }
+
+    /// The breakdown as one line, for a tick that has lost its budget.
+    fn line(&self) -> String {
+        format!(
+            "{} chunks, {} summaries, {} deferred; gen {:.1}ms, light {:.1}ms",
+            self.chunks,
+            self.summaries,
+            self.deferred,
+            self.generating.as_secs_f64() * 1000.0,
+            self.lighting.as_secs_f64() * 1000.0,
+        )
+    }
+}
+
+/// Serves queued chunk requests until `budget` is spent, and no further.
+///
+/// # Why this stops on a clock and not on a count
+///
+/// It used to run [`CHUNKS_PER_TICK`] requests and take as long as they took.
+/// That number is sized on what a chunk costs in the REFERENCE world (~2.3 ms,
+/// four fifths of it lighting), and a chunk's cost is not the engine's to
+/// know: it is whatever the mod generating the terrain does, plus whatever
+/// lighting that terrain costs. A world at view distance 24 with a real
+/// generator was measured serving for 50–110 ms of a 50 ms tick, sustained for
+/// as long as it took to fill, with the simulation dropping a fifth of its
+/// ticks underneath — which is the part a player feels, as every mob and every
+/// other player moving in jerks.
+///
+/// So the count stays as the ceiling — it bounds how much comes off the queue
+/// and owns the chunks-before-summaries split — and this is the clock.
+/// Whichever binds first wins.
+///
+/// **One request is always served.** A budget that can refuse everything is a
+/// world that never finishes loading on a slow enough machine.
+///
+/// [`CHUNKS_PER_TICK`]: crate::transport::endpoint::CHUNKS_PER_TICK
+///
+/// What is taken and not served is put back at the front, in order
+/// ([`Shared::requeue_chunk_requests`]): the queue is the only record that
+/// those chunks were asked for, and the client counts them as in flight and
+/// will not ask twice.
+fn serve_chunk_requests(
+    shared: &Shared,
+    world: &mut crate::world::World,
+    source: &mut dyn crate::world::ChunkSource,
+    lighting: &std::sync::RwLock<crate::light::Lights>,
+    fluidics: &std::sync::RwLock<crate::fluid::Ponds>,
+    control: &Control,
+    budget: Duration,
+) -> ServeReport {
+    let started = std::time::Instant::now();
+    let mut report = ServeReport::default();
+    let mut queue = shared.take_chunk_requests().into_iter();
+    loop {
+        let Some(request) = queue.next() else { break };
+        // Out of time, or near enough that the next one would not fit.
+        // Everything still in hand goes back where it came from, including the
+        // one just taken.
+        //
+        // **The budget is a deadline to START by, with a fifth of it as slack,
+        // not a wall the work fits inside.** Nothing can preempt a generation
+        // call, so an overshoot of one request is not avoidable by any policy
+        // here — and the three that were measured say what the choice really
+        // costs. Stopping only once the budget is gone overshot a 25 ms budget
+        // to a 45 ms phase; refusing to start anything that MIGHT run over gave
+        // away 23% of the terrain to protect a tick that was not in danger.
+        // The slack keeps that terrain and still refuses the request whose own
+        // expected cost is larger than the slack, which is the one that
+        // overshoots by a lot.
+        //
+        // The estimate is the mean of what this tick has already served. There
+        // is nothing better to predict with — the cost is the mod's and it
+        // varies with the terrain, so the engine learns it by doing it — and it
+        // is free.
+        let done = u32::try_from(report.chunks + report.summaries).unwrap_or(u32::MAX);
+        let spent = started.elapsed();
+        let expected = if done == 0 {
+            Duration::ZERO
+        } else {
+            (report.generating + report.lighting) / done
+        };
+        if done > 0 && spent + expected >= budget + budget / 5 {
+            let rest: Vec<crate::transport::endpoint::ChunkRequest> =
+                std::iter::once(request).chain(queue).collect();
+            report.deferred = rest.len();
+            shared.requeue_chunk_requests(rest);
+            break;
+        }
+        // A summary is answered and nothing else happens: no light, no fluid,
+        // no residency. It is the shape of land a mile away, and everything
+        // below this that travels with a chunk would be work done for a client
+        // that cannot draw it.
+        if let Some(level) = request.level {
+            let at = std::time::Instant::now();
+            let summary = world
+                .summary(&request.domain, level, request.pos, source)
+                .map_err(|err| {
+                    debug!(pos = ?request.pos, level, "could not summarise: {err}");
+                })
+                .ok();
+            report.generating += at.elapsed();
+            report.summaries += 1;
+            let _ = request.reply.send(summary);
+            continue;
+        }
+        serve_one_chunk(
+            shared,
+            world,
+            source,
+            lighting,
+            fluidics,
+            control,
+            request,
+            &mut report,
+        );
+        report.chunks += 1;
+    }
+    report
+}
+
+/// Generates or loads one chunk, lights it, and sends it with its fluid.
+///
+/// Split out of [`serve_chunk_requests`] so the loop above is the clock and
+/// this is the work; they are read for different reasons.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the tick's state, threaded through rather than made global"
+)]
+fn serve_one_chunk(
+    shared: &Shared,
+    world: &mut crate::world::World,
+    source: &mut dyn crate::world::ChunkSource,
+    lighting: &std::sync::RwLock<crate::light::Lights>,
+    fluidics: &std::sync::RwLock<crate::fluid::Ponds>,
+    control: &Control,
+    request: crate::transport::endpoint::ChunkRequest,
+    report: &mut ServeReport,
+) {
+    let at = std::time::Instant::now();
+    let blob = match world.chunk(&request.domain, request.pos, source) {
+        Ok(chunk) => {
+            let chunk = chunk.clone();
+            world.db().chunk_blob(request.pos, &chunk).ok()
+        }
+        Err(err) => {
+            debug!(pos = ?request.pos, "could not load chunk: {err}");
+            None
+        }
+    };
+    report.generating += at.elapsed();
+    // Light for a chunk that is about to be sent. A client that had blocks and
+    // no light would draw the world black until something happened to relight
+    // it, so this is not an optimisation to defer.
+    //
+    // **Only if it is not already lit.** A chunk's light is kept current by
+    // every edit, so relighting one that has a layer produces the answer it
+    // already had — at 1.47 ms a chunk (measured, see `light::Lit`). It is not
+    // a rare case either: the players who join together are the ones who ask
+    // for the same chunks, so the second and third of them were each paying
+    // full price for a chunk the first had already lit. The requester still
+    // needs the light itself, which is what the send below is.
+    if blob.is_some() {
+        let at = std::time::Instant::now();
+        let mut lit = lighting.write().expect("lighting lock");
+        // The requester's own domain: a chunk is lit by the sky and the lamps
+        // of the space it is in.
+        let light = lit.of(&request.domain);
+        let touched = if light.holds(request.pos) {
+            std::iter::once(request.pos).collect()
+        } else {
+            control.note_full_relight();
+            light.chunk_loaded(&request.domain, world, request.pos)
+        };
+        broadcast_light(shared, &request.domain, light, &touched);
+        report.lighting += at.elapsed();
+    }
+    // Fluid travels with the chunk, and always — an empty layer is ONE byte,
+    // so telling a client there is no milk here costs less than making it
+    // wonder. Without this a joining player sees a pond only once something
+    // disturbs it.
+    if blob.is_some() {
+        let layer = fluidics
+            .read()
+            .expect("fluid lock")
+            .get(&request.domain)
+            .and_then(|fluid| fluid.layer(request.pos).cloned())
+            .unwrap_or_else(tiamot_core::fluid::FluidLayer::empty);
+        // To the requester's own space: the same position is a different pond
+        // elsewhere.
+        shared.broadcast_in(
+            &request.domain,
+            ServerMessage::ChunkFluid {
+                pos: request.pos,
+                fluid: tiamot_core::fluid::codec::encode(&layer),
+            },
+        );
+    }
+
+    // A failed send means the connection went away between asking and being
+    // answered, which is ordinary rather than an error.
+    let _ = request.reply.send(blob);
 }
 
 /// The block an edit changed.
@@ -3202,93 +3433,18 @@ impl ServerHandle {
                         }
 
                         phases.mark("mods");
-                        // Serve chunk requests. Bounded per tick by
-                        // CHUNKS_PER_TICK: encoding is real work on this
-                        // thread, and an unbounded drain would let one player
-                        // joining stall the world for everyone.
-                        for request in shared.take_chunk_requests() {
-                            // A summary is answered and nothing else happens:
-                            // no light, no fluid, no residency. It is the shape
-                            // of land a mile away, and everything below this
-                            // that travels with a chunk would be work done for
-                            // a client that cannot draw it.
-                            if let Some(level) = request.level {
-                                let summary = world
-                                    .summary(&request.domain, level, request.pos, &mut source)
-                                    .map_err(|err| {
-                                        debug!(pos = ?request.pos, level, "could not summarise: {err}");
-                                    })
-                                    .ok();
-                                let _ = request.reply.send(summary);
-                                continue;
-                            }
-                            let blob = match world.chunk(&request.domain, request.pos, &mut source) {
-                                Ok(chunk) => {
-                                    let chunk = chunk.clone();
-                                    world.db().chunk_blob(request.pos, &chunk).ok()
-                                }
-                                Err(err) => {
-                                    debug!(pos = ?request.pos, "could not load chunk: {err}");
-                                    None
-                                }
-                            };
-                            // Light for a chunk that is about to be sent. A
-                            // client that had blocks and no light would draw
-                            // the world black until something happened to
-                            // relight it, so this is not an optimisation to
-                            // defer.
-                            //
-                            // **Only if it is not already lit.** A chunk's
-                            // light is kept current by every edit, so relighting
-                            // one that has a layer produces the answer it
-                            // already had — at 1.47 ms a chunk (measured, see
-                            // `light::Lit`). It is not a rare case either: the
-                            // players who join together are the ones who ask for
-                            // the same chunks, so the second and third of them
-                            // were each paying full price for a chunk the first
-                            // had already lit. The requester still needs the
-                            // light itself, which is what the send below is.
-                            if blob.is_some() {
-                                let mut lit = lighting.write().expect("lighting lock");
-                                // The requester's own domain: a chunk is lit by
-                                // the sky and the lamps of the space it is in.
-                                let light = lit.of(&request.domain);
-                                let touched = if light.holds(request.pos) {
-                                    std::iter::once(request.pos).collect()
-                                } else {
-                                    control.note_full_relight();
-                                    light.chunk_loaded(&request.domain, &world, request.pos)
-                                };
-                                broadcast_light(&shared, &request.domain, light, &touched);
-                            }
-                            // Fluid travels with the chunk, and always — an
-                            // empty layer is ONE byte, so telling a client
-                            // there is no milk here costs less than making it
-                            // wonder. Without this a joining player sees a pond
-                            // only once something disturbs it.
-                            if blob.is_some() {
-                                let layer = fluidics
-                                    .read()
-                                    .expect("fluid lock")
-                                    .get(&request.domain)
-                                    .and_then(|fluid| fluid.layer(request.pos).cloned())
-                                    .unwrap_or_else(tiamot_core::fluid::FluidLayer::empty);
-                                // To the requester's own space: the same
-                                // position is a different pond elsewhere.
-                                shared.broadcast_in(
-                                    &request.domain,
-                                    ServerMessage::ChunkFluid {
-                                        pos: request.pos,
-                                        fluid: tiamot_core::fluid::codec::encode(&layer),
-                                    },
-                                );
-                            }
-
-                            // A failed send means the connection went away
-                            // between asking and being answered, which is
-                            // ordinary rather than an error.
-                            let _ = request.reply.send(blob);
-                        }
+                        // Serve chunk requests, for as much of the tick as
+                        // `SERVE_TIME_BUDGET` allows and no longer. What does
+                        // not fit is still queued and goes next tick.
+                        let served = serve_chunk_requests(
+                            &shared,
+                            &mut world,
+                            &mut source,
+                            &lighting,
+                            &fluidics,
+                            &control,
+                            crate::transport::endpoint::SERVE_TIME_BUDGET,
+                        );
 
                         phases.mark("serving");
                         // Light, once, after every edit this tick has landed.
@@ -3992,7 +4148,15 @@ impl ServerHandle {
                         phases.mark("saving");
                         let took = phases.total();
                         if took > tiamot_core::tick::TICK_DURATION {
-                            let report = phases.report();
+                            // The serving line beside the phase breakdown: a
+                            // phase that names itself is still only a name, and
+                            // what serving costs is a property of the mod that
+                            // generates the terrain rather than of the engine.
+                            let report = if served.is_idle() {
+                                phases.report()
+                            } else {
+                                format!("{} — serving {}", phases.report(), served.line())
+                            };
                             warn!("a tick ran over its budget — {report}");
                             control.note_tick_phases(
                                 u64::try_from(took.as_micros()).unwrap_or(u64::MAX),

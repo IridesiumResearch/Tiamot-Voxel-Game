@@ -664,7 +664,45 @@ pub struct PlacementRequest {
 /// What it does NOT do is make room for more: 63% is the ceiling this has been
 /// tested at, and the next increase needs lighting to get cheaper again rather
 /// than a bigger appetite.
+///
+/// **Since 2026-09-09 this is a ceiling and not the whole story.** The
+/// arithmetic above is all measured in the reference world, and a chunk's cost
+/// belongs to whichever mod generates the terrain — a sampled density field is
+/// several times a flat fill, and no number written here can know that.
+/// [`SERVE_TIME_BUDGET`] is the bound that holds whatever a chunk costs;
+/// this one bounds how much comes off the queue at a time and owns the
+/// chunks-before-summaries split, which is a question about fairness rather
+/// than about time.
 pub const CHUNKS_PER_TICK: usize = 22;
+
+/// How much of a tick serving chunks may spend, whatever they cost.
+///
+/// **Half the 50 ms budget.** [`CHUNKS_PER_TICK`] is a COUNT, and a count is
+/// only a budget if you know what a chunk costs — the same mistake the client
+/// made with `REMESH_BUDGET` before it grew a clock. In the reference world a
+/// chunk is ~2.3 ms and twenty-two of them are a full tick; in a world whose
+/// mod generates real terrain a chunk costs more, and nothing in the count
+/// knows that. Reported from a world at view distance 24 with a mod's own
+/// generator: `serving` alone taking 50–110 ms of a 50 ms tick, sustained, and
+/// the simulation dropping a fifth of its ticks to keep up.
+///
+/// A chunk's cost is a property of the MOD, so it is not something the engine
+/// can put in a constant. What the engine can promise is the share of the tick
+/// it will spend, which is what this is. What does not fit stays queued and
+/// goes next tick, in order.
+///
+/// Half rather than all, for the reason [`Shared::chunks_in_flight_per_client`]
+/// is half: the other half is the simulation this terrain is terrain FOR.
+/// Charter rule 18 owns that 50 ms and this split is the copyright holder's
+/// decision, recorded 2026-09-09.
+///
+/// One request is always served, however long the last tick ran over. A budget
+/// that can refuse everything is a world that never finishes loading on a slow
+/// enough machine.
+///
+/// Spent with a fifth of itself as slack — `handle::serve_chunk_requests` has
+/// the measurements for why a deadline to START by beats a wall to fit inside.
+pub const SERVE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// The fewest chunks one connection may have outstanding, however busy.
 ///
@@ -1445,6 +1483,29 @@ impl Shared {
                 taken
             })
             .unwrap_or_default()
+    }
+
+    /// Puts back requests taken but not served, at the FRONT and in order.
+    ///
+    /// [`Self::take_chunk_requests`] REMOVES what it hands out, so a serve loop
+    /// that stops on its clock ([`SERVE_TIME_BUDGET`]) and drops the remainder
+    /// would lose those chunks for good: the client counts them as in flight
+    /// and never asks again, so a player stands in a hole that never fills.
+    /// The client mesher hit exactly this and needed `ChunkStore::requeue` for
+    /// exactly this reason.
+    ///
+    /// The front, because these are the oldest requests in the queue and a
+    /// player waiting on the chunk under their feet should not go behind the
+    /// horizon that was asked for while they waited.
+    pub fn requeue_chunk_requests(&self, requests: Vec<ChunkRequest>) {
+        if requests.is_empty() {
+            return;
+        }
+        if let Ok(mut queue) = self.chunk_requests.lock() {
+            for request in requests.into_iter().rev() {
+                queue.push_front(request);
+            }
+        }
     }
 
     /// Credits stacks to a player and marks them for an update.
@@ -3013,6 +3074,53 @@ mod tests {
         assert_eq!(
             next.iter().filter(|r| r.level.is_some()).count(),
             SUMMARIES_PER_TICK
+        );
+    }
+
+    #[test]
+    fn requests_put_back_go_to_the_front_in_the_order_they_were_taken() {
+        // The serve loop stops on a clock, so most ticks hand something back.
+        // Two things have to hold or a chunk is lost for good: the client
+        // counts a request as in flight and never asks twice, so a dropped one
+        // is a hole in the world that nothing fills.
+        let shared = shared();
+        for n in 0..6 {
+            let _ = shared.request_chunk(
+                tiamot_core::domain::OVERWORLD,
+                tiamot_core::ChunkPos::new(n, 0, 0),
+            );
+        }
+
+        let mut taken = shared.take_chunk_requests();
+        assert_eq!(taken.len(), 6);
+        // Two served, four back on the queue — the shape of a tick that ran
+        // out of time after the second.
+        let deferred = taken.split_off(2);
+        let put_back: Vec<i32> = deferred.iter().map(|r| r.pos.x).collect();
+        shared.requeue_chunk_requests(deferred);
+
+        // A seventh, asked for after the tick gave up: it must go BEHIND the
+        // four that were already waiting, not in front of them. A player
+        // waiting on the chunk under their feet does not go to the back of the
+        // queue because the horizon asked for something while they waited.
+        let _ = shared.request_chunk(
+            tiamot_core::domain::OVERWORLD,
+            tiamot_core::ChunkPos::new(99, 0, 0),
+        );
+
+        let next: Vec<i32> = shared
+            .take_chunk_requests()
+            .iter()
+            .map(|r| r.pos.x)
+            .collect();
+        assert_eq!(
+            next,
+            put_back
+                .iter()
+                .copied()
+                .chain(std::iter::once(99))
+                .collect::<Vec<_>>(),
+            "put back at the front and in order, with later requests behind them"
         );
     }
 
