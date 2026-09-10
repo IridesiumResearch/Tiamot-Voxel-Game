@@ -723,7 +723,16 @@ fn core_ui_owns_the_hotbar_and_taking_it_away_leaves_the_engine_alone() {
         seen.warnings
     );
 
-    let (mod_id, source) = seen.hud_scripts[0].clone();
+    // **`core_ui`'s script, not whichever arrived first.** A developer's own
+    // mods live in `game/` by the guide's own instruction and push their own
+    // HUDs, so indexing position zero made this red for anybody writing one.
+    // `.gitignore` is what makes `core_*` the reference set.
+    let (mod_id, source) = seen
+        .hud_scripts
+        .iter()
+        .find(|(mod_id, _)| mod_id.starts_with("core_"))
+        .cloned()
+        .expect("a reference mod should have pushed a HUD script");
     assert_eq!(mod_id, "core_ui");
 
     // The source arrived, so run it — in the same sandbox the client runs it

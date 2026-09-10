@@ -93,10 +93,19 @@ fn the_reference_mods_push_exactly_one_hud_script() {
             .next()
             .expect("a HudScripts message on join");
 
-        assert_eq!(scripts.len(), 1, "got {scripts:?}");
-        assert_eq!(scripts[0].mod_id, "core_ui");
+        // **The reference mods, which are the `core_*` ones.** `.gitignore` keeps
+        // everything else in `game/` out of the repository, so that is what a
+        // reference mod is — and a developer's own mods live in `game/` by the
+        // guide's own instruction, so counting every script here made this red
+        // for anybody actually writing one.
+        let reference: Vec<&tiamot_core::proto::HudScriptDef> = scripts
+            .iter()
+            .filter(|script| script.mod_id.starts_with("core_"))
+            .collect();
+        assert_eq!(reference.len(), 1, "got {scripts:?}");
+        assert_eq!(reference[0].mod_id, "core_ui");
         assert!(
-            scripts[0].file.is_some(),
+            reference[0].file.is_some(),
             "the script's file should have been indexed; a `None` here means the server could \
              not find `hud.lua` in the mod directory"
         );

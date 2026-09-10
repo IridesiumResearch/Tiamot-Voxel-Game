@@ -3042,7 +3042,7 @@ fn one_material_is_not_one_flat_colour() {
     // **What `CELL_VARIATION` is for, and the bound on it.** A wall of one
     // material is the same texel repeated across hundreds of cells, which reads
     // as a painted surface rather than as a material. Each cell keeps a
-    // brightness of its own, within one per cent, so the eye finds grain in it.
+    // brightness of its own, within a few per cent, so the eye finds grain in it.
     //
     // Two assertions, and neither means anything without the other: the colours
     // across the wall must DIFFER, or the variation is not happening; and they

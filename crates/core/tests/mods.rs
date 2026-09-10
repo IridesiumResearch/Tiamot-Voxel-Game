@@ -83,11 +83,22 @@ fn the_reference_mods_load_in_dependency_order() {
     // this is the test that notices a reference mod being added or removed,
     // which is exactly the change most likely to be made without thinking
     // about load order.
+    // **`core_*` is what a reference mod IS**, and `.gitignore` is where that is
+    // decided: everything in `game/` is ignored except `README.md` and
+    // `core_*/`, so a mod under any other name cannot be committed. The
+    // exhaustive assertion loses nothing by scoping to them and stops being red
+    // for every developer who keeps their own mods where the guide tells them
+    // to — including the fixtures `known_fixtures` was written for, which are
+    // not `core_*` either.
+    //
+    // A new reference mod still fails this, which is the point: it has to be
+    // `core_*` to be committed at all.
     let fixtures = known_fixtures();
     let loaded: Vec<&str> = host
         .resolved()
         .ids()
         .into_iter()
+        .filter(|id| *id == "core" || id.starts_with("core_"))
         .filter(|id| !fixtures.iter().any(|fixture| fixture == id))
         .collect();
     assert_eq!(
