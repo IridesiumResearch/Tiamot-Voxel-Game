@@ -1153,6 +1153,13 @@ pub struct App {
     /// on bytes a server chose.
     pub fonts: crate::fonts::Fonts,
     transparent: mesher::Sight,
+    /// Materials a body walks through — Sub-Node Contract §2.
+    ///
+    /// **The client keeps its own copy because it predicts its own movement.**
+    /// A rule only the server applied would be a correction on every step
+    /// through a fern, which is exactly the jitter prediction exists to remove.
+    /// Sorted, so the sweep's per-cell lookup is a scan of a handful of `u16`s.
+    passable: Vec<u16>,
     /// A chunk being meshed across frames, if one is part-built.
     ///
     /// At most one: the budget is spent depth-first, so a second chunk is not
@@ -1327,6 +1334,7 @@ impl App {
             hosting: None,
             seed: None,
             transparent: mesher::Sight::default(),
+            passable: Vec::new(),
             pictures: crate::pictures::Pictures::new(),
             fonts: crate::fonts::Fonts::new(),
             meshing: None,
@@ -1527,7 +1535,8 @@ impl App {
         for _ in 0..gap {
             self.tick += 1;
             if let Some(predictor) = self.predictor.as_mut() {
-                let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin());
+                let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin())
+                    .passing(&self.passable);
                 predictor.predict(&voxels, self.tick, intent, &Tuning::DEFAULT);
             }
         }
@@ -1683,7 +1692,8 @@ impl App {
         // them against a world with no milk in it would put a swimming player
         // back where a falling one would have been, and the correction would
         // arrive as a lurch every time the server's state message landed.
-        let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin());
+        let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin())
+            .passing(&self.passable);
         predictor.reconcile(&voxels, state, &Tuning::DEFAULT);
         let divergence = predictor.divergence();
         // Asked after the replay rather than before: what matters is whether the
@@ -2445,6 +2455,18 @@ impl App {
                 .filter(|entry| entry.cutout)
                 .map(|entry| entry.id)
                 .collect(),
+        };
+
+        // And what a body walks through. Not part of `Sight`: it changes no
+        // geometry, only what stops a step (Contract §2).
+        self.passable = {
+            let mut ids: Vec<u16> = table
+                .iter()
+                .filter(|entry| entry.passable)
+                .map(|entry| entry.id)
+                .collect();
+            ids.sort_unstable();
+            ids
         };
     }
 
@@ -4052,7 +4074,8 @@ impl App {
     /// screenshot.
     fn submerged_in(&self) -> Option<tiamot_core::fluid::FluidId> {
         let predictor = self.predictor.as_ref()?;
-        let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin());
+        let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin())
+            .passing(&self.passable);
         let fluid = phys::swim::fluid_at(&voxels, predictor.body().eye());
         (!fluid.is_none()).then_some(fluid)
     }
@@ -4725,7 +4748,8 @@ impl App {
             let mut touched_absent = false;
             let mut ground = None;
             if let Some(predictor) = self.predictor.as_mut() {
-                let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin());
+                let voxels = phys::Voxels::with_fluid(&self.store, &self.store, predictor.origin())
+                    .passing(&self.passable);
                 predictor.predict(&voxels, self.tick, intent, &Tuning::DEFAULT);
                 // **Asked on the PREDICTION path, not only on the replay.** The
                 // first version of this instrument watched `reconcile` alone, so
@@ -6479,6 +6503,7 @@ mod tests {
                 placeable: true,
                 transparent: false,
                 cutout: false,
+                passable: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6489,6 +6514,7 @@ mod tests {
                 placeable: true,
                 transparent: false,
                 cutout: false,
+                passable: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6523,6 +6549,7 @@ mod tests {
             placeable: true,
             transparent: false,
             cutout: false,
+            passable: false,
             tint: None,
             step_sound: None,
         }];

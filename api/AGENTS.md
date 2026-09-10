@@ -538,6 +538,31 @@ opinion to implement.
 A block is one or the other. Declaring both is refused at registration rather
 than silently resolved.
 
+**Plants want `passable = true` as well.** Every block collided until this
+existed, so a two-cell fern was a lip the player stepped up and foliage had to
+be shaped around the engine — tufts one cell tall, clumps with gaps. A passable
+material stops nothing:
+
+```lua
+game.register_block{ id = "grass", cutout = true, passable = true }
+```
+
+**Collision only.** The cell still meshes, is still lit, still holds fluid out,
+and a ray still stops at it — which is deliberate and is what lets a player aim
+at a tuft and break it. A material that reported itself hollow everywhere would
+be one nobody could pick.
+
+**A sprite card is cells, not a billboard.** The engine has no diagonal geometry
+— the mesher emits axis-aligned faces from cell occupancy — so a tuft is a plane
+of cells one cell thick, and a crossed pair is two planes in a `+`. A one-cell
+plane draws a face on both sides, so it is visible from either direction. The
+merge write makes one tuft one call:
+
+```lua
+local card = (1 << 12) | (1 << 13) | (1 << 14) | (1 << 4) | (1 << 22)
+game.set_block(pos, "my_mod:grass", card, { merge = true })
+```
+
 **Erosion, rivers and biome blending are compositions**, not engine features.
 Build them from `game.density`'s arithmetic. If a shape genuinely cannot be
 expressed with the operations that exist, that is a finding worth reporting —

@@ -137,6 +137,81 @@ fn a_block_a_mod_places_reaches_the_world() {
     });
 }
 
+/// A mod whose world has a wall of grass across it, and a wall of stone beside
+/// it — the same shape, one passable and one not.
+fn write_meadow(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("meadow");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"meadow\"\nname = \"Meadow\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        "local ground = game.register_block{ id = \"ground\" }\n\
+         local grass = game.register_block{ id = \"grass\", passable = true }\n\
+         local wall = game.register_block{ id = \"wall\" }\n\
+         game.register_on_generate(function(buf, pos)\n\
+         \x20   buf:fill_below_heightmap(game.flat_heightmap(0), ground)\n\
+         \x20   if pos.x ~= 0 or pos.y ~= 0 or pos.z ~= 0 then return end\n\
+         \x20   -- Two walls a block thick, three tall: grass at z = 4, stone\n\
+         \x20   -- at z = 10. A body meets one of them going forward.\n\
+         \x20   for x = 0, 15 do\n\
+         \x20       for y = 0, 2 do\n\
+         \x20           buf:set_block(x, y, 4, grass)\n\
+         \x20           buf:set_block(x, y, 10, wall)\n\
+         \x20       end\n\
+         \x20   end\n\
+         end)\n",
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_body_walks_through_grass_and_not_through_stone() {
+    // **Sub-Node Contract §2.** Every block collided until now, so a fern was a
+    // lip to climb and foliage had to be built around that — tufts one cell
+    // tall, clumps with gaps. A `passable` material stops nothing.
+    //
+    // The stone wall beside it is the control, and it is what makes the test
+    // mean something: a run where the bot simply failed to move would sail
+    // through the first assertion on its own.
+    let server = start("meadow", write_meadow("meadow"));
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Walker").await.expect("join");
+
+        // Walking +z from before the grass wall. Far enough to be well past it
+        // if nothing stopped the body.
+        bot.move_to(8.0, 1.0, 1.0).await.expect("place");
+        let through = bot.walk([0.0, 0.0, 1.0], 0, 40).await.expect("walk");
+        let reached = through.block().z;
+        assert!(
+            reached > 5,
+            "the body stopped at the grass wall (z {reached}), which passable should not do"
+        );
+
+        // And the same walk into stone stops, from a start just before it.
+        bot.move_to(8.0, 1.0, 7.0).await.expect("place");
+        let stopped = bot.walk([0.0, 0.0, 1.0], 0, 40).await.expect("walk");
+        let halted = stopped.block().z;
+        assert!(
+            halted < 10,
+            "the body walked through a wall that is not passable (z {halted})"
+        );
+    });
+}
+
 /// A mod that puts a few cells of rock into a block of ground, both ways.
 ///
 /// The two positions differ only in the `merge` option, which is what makes the

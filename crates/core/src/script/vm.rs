@@ -301,6 +301,12 @@ pub struct BlockRules {
     /// with the opaque world rather than blended. See
     /// `docs/subnode-contract.md` §8.2.
     pub cutout: bool,
+    /// Whether a body walks through it: grass, ferns, vines.
+    ///
+    /// Collision only. The cell is still occupied for meshing, lighting, fluid
+    /// and — importantly — for the dig ray, or a tuft nothing collided with
+    /// would be a tuft nothing could aim at. See `docs/subnode-contract.md` §2.
+    pub passable: bool,
     /// How this material's colour varies across the world, if a mod said.
     ///
     /// **Presentation only.** Nothing on the server reads it — it travels with

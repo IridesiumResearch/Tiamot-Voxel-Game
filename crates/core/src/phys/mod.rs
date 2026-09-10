@@ -189,6 +189,24 @@ pub trait Solid {
     /// not fall through a world that has not arrived yet.
     fn solid(&self, x: i32, y: i32, z: i32) -> bool;
 
+    /// Whether this cell stops a BODY, as opposed to being occupied at all.
+    ///
+    /// **Sub-Node Contract §2: a `passable` material stops nothing.** Grass and
+    /// ferns are there for every other purpose — they mesh, they are lit, they
+    /// hold fluid out — and a body walks through them.
+    ///
+    /// Its own question rather than a different answer from [`Solid::solid`],
+    /// because the dig ray and the reach check use `solid` too: a material that
+    /// simply reported itself hollow would be one a player could neither
+    /// collide with NOR aim at, which is a plant that cannot be picked.
+    ///
+    /// Defaults to `solid`, so an implementation with no opinion — every test
+    /// double, and every caller that predates plants — behaves exactly as it
+    /// did.
+    fn blocks_body(&self, x: i32, y: i32, z: i32) -> bool {
+        self.solid(x, y, z)
+    }
+
     /// Whether the world actually knows what is at this cell.
     ///
     /// **Absence and solidity are different questions, and only one of them is a
@@ -263,7 +281,7 @@ pub trait Solid {
         for y in min_y..=max_y {
             for z in min_z..=max_z {
                 for x in min_x..=max_x {
-                    if self.solid(x, y, z) {
+                    if self.blocks_body(x, y, z) {
                         return true;
                     }
                 }
@@ -887,7 +905,7 @@ pub fn standing_on_ground_shaped(solid: &impl Solid, position: [f32; 3], shape: 
 
     for z in min_z..=max_z {
         for x in min_x..=max_x {
-            if solid.solid(x, y, z) {
+            if solid.blocks_body(x, y, z) {
                 return true;
             }
         }
@@ -950,9 +968,9 @@ fn sweep(solid: &impl Solid, aabb: &Aabb, axis: usize, delta: f32) -> Sweep {
         for a in min_a..=max_a {
             for b in min_b..=max_b {
                 let solid_here = match axis {
-                    0 => solid.solid(cell, a, b),
-                    1 => solid.solid(a, cell, b),
-                    _ => solid.solid(a, b, cell),
+                    0 => solid.blocks_body(cell, a, b),
+                    1 => solid.blocks_body(a, cell, b),
+                    _ => solid.blocks_body(a, b, cell),
                 };
                 if solid_here {
                     return true;

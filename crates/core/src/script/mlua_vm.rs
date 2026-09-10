@@ -1957,6 +1957,11 @@ impl ScriptVm for MluaVm {
                             .and_then(|entry| entry.get::<Option<bool>>("cutout").ok())
                             .flatten()
                             .unwrap_or(false),
+                        passable: entry
+                            .as_ref()
+                            .and_then(|entry| entry.get::<Option<bool>>("passable").ok())
+                            .flatten()
+                            .unwrap_or(false),
                     },
                 )
             })
@@ -5379,6 +5384,25 @@ impl MluaVm {
 /// A free function rather than the closure it used to be, so the closure is one
 /// line and this can be read without scrolling past the rest of the
 /// registration API.
+/// Copies a block's plain boolean flags from the spec into its registry entry.
+///
+/// **This copy is the step that is easy to forget**, and forgetting it is
+/// invisible: the field passes the allowlist, the mod loads, and the flag is
+/// simply gone by the time anything reads it. `tint` shipped that way, then
+/// `transparent`, then `cutout` — three times for one missing line, which is
+/// why they are gathered here where the list can be read at a glance.
+///
+/// A flag is recorded whether or not the mod set it, like the rules beside it:
+/// an absent flag and a `false` one must not be distinguishable downstream.
+fn copy_block_flags(spec: &Table, entry: &Table) -> mlua::Result<()> {
+    for flag in ["transparent", "cutout", "passable"] {
+        if let Some(value) = spec.get::<Option<bool>>(flag)? {
+            entry.set(flag, value)?;
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a block spec with a field the engine does not know.
 ///
 /// A typo in `hardness` should say so rather than silently taking the default.
@@ -5623,17 +5647,7 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
         }
         // **Recorded whether or not the mod set it**, like the rules above: an
         // absent flag and a `false` one must not be distinguishable downstream.
-        if let Some(transparent) = spec.get::<Option<bool>>("transparent")? {
-            entry.set("transparent", transparent)?;
-        }
-        // And foliage beside it. **This copy is the step that is easy to
-        // forget**, and forgetting it is invisible: the field passes the
-        // allowlist, the mod loads, and the flag is simply gone by the time
-        // anything reads it — which is what `tint` and `transparent` both did
-        // when they shipped.
-        if let Some(cutout) = spec.get::<Option<bool>>("cutout")? {
-            entry.set("cutout", cutout)?;
-        }
+        copy_block_flags(spec, &entry)?;
         if let Some(absorbs) = spec.get::<Option<Table>>("absorbs")? {
             entry.set("absorbs", block_absorbs(lua, owner, &id, &absorbs)?)?;
         }
@@ -6271,7 +6285,7 @@ const FLUID_FIELDS: [&str; 6] = [
 /// accepted them would be an API promising behaviour nothing implements.
 const ITEM_FIELDS: [&str; 4] = ["id", "name", "texture", "description"];
 
-const BLOCK_FIELDS: [&str; 14] = [
+const BLOCK_FIELDS: [&str; 15] = [
     "id",
     "name",
     "drops",
@@ -6286,6 +6300,7 @@ const BLOCK_FIELDS: [&str; 14] = [
     "tint",
     "transparent",
     "cutout",
+    "passable",
 ];
 
 /// Keys the `textures` sub-table accepts.

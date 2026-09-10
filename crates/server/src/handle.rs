@@ -108,6 +108,7 @@ fn material_table(
                 // with the material rather than be asked for later.
                 transparent: rules.get(name).is_some_and(|rules| rules.transparent),
                 cutout: rules.get(name).is_some_and(|rules| rules.cutout),
+                passable: rules.get(name).is_some_and(|rules| rules.passable),
                 // Colour variation, which is the client's alone: it multiplies
                 // the texture by a field sampled from world position, and
                 // nothing here ever looks at the answer.
@@ -1440,6 +1441,40 @@ impl ServerHandle {
             },
         );
 
+        // And the materials a body walks through, from the same rules and keyed
+        // the same way. Contract §2: collision only — the cell still meshes, is
+        // still lit, and still stops the dig ray.
+        //
+        // A sorted `Vec` rather than a set: it is read once per cell of every
+        // body's sweep, it holds a handful of ids, and a linear scan of four
+        // `u16`s beats hashing one.
+        let passable: Vec<u16> = {
+            let rules = host
+                .as_ref()
+                .map(|loaded| loaded.vm().registered_block_rules())
+                .unwrap_or_default();
+            let mut ids: Vec<u16> = rules
+                .iter()
+                .filter(|rule| rule.passable)
+                .filter_map(|rule| {
+                    // **World ids, not this session's runtime ones**, for the
+                    // reason `see_through` says: a chunk holds world ids, and a
+                    // table of runtime ids would name a different material in
+                    // any world that has seen a different mod set (charter rule
+                    // 8). Getting this wrong makes some unrelated block
+                    // walk-through-able, which is a bug nobody would look for
+                    // here.
+                    let runtime = registry
+                        .iter()
+                        .find(|(_, name)| *name == rule.block)
+                        .map(|(id, _)| id)?;
+                    world.materials().to_world(runtime).ok()
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+
         // The domains the mods registered. Read here, with everything else the
         // freeze made final, and handed to the simulation thread that owns the
         // registry they go into.
@@ -2458,7 +2493,8 @@ impl ServerHandle {
                                     &terrain,
                                     wet,
                                     player.origin,
-                                );
+                                )
+                                .passing(&passable);
                                 let before = player.body;
                                 player.body = tiamot_core::phys::step(
                                     &voxels,
@@ -3869,7 +3905,7 @@ impl ServerHandle {
                                 .map(str::to_owned)
                                 .collect();
                             for domain in occupied {
-                                mobs.tick(&domain, &world, ponds.get(&domain).unwrap_or(&dry));
+                                mobs.tick(&domain, &world, ponds.get(&domain).unwrap_or(&dry), &passable);
                             }
                         }
 

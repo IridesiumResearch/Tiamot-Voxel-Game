@@ -3398,6 +3398,60 @@ mod tests {
     }
 
     #[test]
+    fn a_sprite_card_of_cutout_cells_draws_both_of_its_sides() {
+        // **What a grass tuft actually is here.** The engine has no billboard
+        // and no diagonal geometry — the mesher emits axis-aligned faces from
+        // cell occupancy and nothing else — so a "sprite card" is a plane of
+        // cells one cell thick, and a crossed pair of them is two planes in a
+        // `+`. That is buildable from the cells a mod already has, and this
+        // pins the property that makes it work: a one-cell-thick plane draws a
+        // face on BOTH sides, so it is visible from either direction rather
+        // than disappearing when walked around.
+        let leaf = MaterialId(7);
+        let foliage = Leaves(leaf);
+
+        // One cell of the middle column, three cells of it deep: a card.
+        let mut card = empty();
+        let block = BlockPos::new(4, 4, 4);
+        for z in 0..3u32 {
+            card.set_subnode(block.subnode(1, 0, z as i32), leaf)
+                .expect("in chunk");
+        }
+
+        let mesh = mesh_chunk(
+            &card,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &foliage,
+        );
+
+        // Six faces: the two broad sides, and the four thin edges. The two
+        // broad ones are the card; without them it is invisible edge-on from
+        // one side, which is what a single-sided plane looks like.
+        assert_eq!(
+            mesh.cutout_quads.len(),
+            6,
+            "a one-cell card should be six faces, got {}",
+            mesh.cutout_quads.len()
+        );
+
+        // And the two broad faces really do point opposite ways along the same
+        // axis, which is the property "both sides" means.
+        let broad: Vec<&Quad> = mesh
+            .cutout_quads
+            .iter()
+            .filter(|quad| quad.axis == 0)
+            .collect();
+        assert_eq!(broad.len(), 2, "the card's own two sides: {broad:?}");
+        assert!(
+            broad[0].positive != broad[1].positive,
+            "both broad faces point the same way, so the card is one-sided"
+        );
+    }
+
+    #[test]
     fn foliage_keeps_the_faces_inside_it_and_not_the_ones_inside_a_block() {
         // **Contract §8.2, and the fault reported from the window.** Declared
         // transparent, two leaf blocks lose the faces between them by §8.1's

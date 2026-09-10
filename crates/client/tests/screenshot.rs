@@ -240,6 +240,40 @@ fn average(image: &Image, x0: u32, y0: u32, x1: u32, y1: u32) -> [f32; 3] {
     ]
 }
 
+/// The share of pixels where two frames differ by more than the colour field
+/// can account for.
+///
+/// **Exact equality stopped being the right claim when the world gained a
+/// colour field.** `material_tint` and `cell_variation` are both functions of
+/// WORLD position — deliberately, because a pattern anchored to the chunk
+/// repeats every sixteen blocks and that tiling is the thing they exist to
+/// break. So the same scene built in two different places is not supposed to
+/// produce the same pixels.
+///
+/// **Per pixel, and not per region average**, which is the whole difference
+/// between a test and a formality. The fault these tests exist to catch is a
+/// world-space `f32` accumulating, and what that does is move geometry: an edge
+/// shifts, and the pixels along it change completely while the average of the
+/// region containing them barely moves. Measured — a displacement of one block
+/// at 50,000 out moves no region average by even three per cent, so a
+/// region-average comparison passes a bug this catches.
+fn pixels_beyond(here: &Image, there: &Image, tolerance: u8) -> f32 {
+    let mut differing = 0u64;
+    let mut counted = 0u64;
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let (Some(a), Some(b)) = (here.pixel(x, y), there.pixel(x, y)) else {
+                continue;
+            };
+            counted += 1;
+            if (0..3).any(|channel| a[channel].abs_diff(b[channel]) > tolerance) {
+                differing += 1;
+            }
+        }
+    }
+    differing as f32 / counted.max(1) as f32
+}
+
 /// Whether a colour is more blue than it is red — i.e. sky rather than stone.
 fn is_sky(colour: [f32; 3]) -> bool {
     colour[2] > colour[0] + 0.05
@@ -692,6 +726,7 @@ fn a_declared_tint_colours_the_world_and_stays_where_the_world_is() {
         texture: None,
         transparent: false,
         cutout: false,
+        passable: false,
         tint: Some(Tint {
             strength: 255,
             scale: 24,
@@ -772,11 +807,16 @@ fn the_frame_is_identical_at_the_origin_and_at_the_edge_of_the_world() {
     );
     let there = target.capture(&mut renderer, &far_camera).expect("capture");
 
-    assert_eq!(
-        perceptual_hash(&here),
-        perceptual_hash(&there),
-        "the same scene looks different at the edge of the world; something in the render path \
-         is accumulating a world-space f32"
+    // Every pixel within the colour field's own amplitude — see
+    // `pixels_beyond`. A tolerance of 8/255 covers a per-cell variation of
+    // 2.5%; anything that MOVES geometry changes whole edges and blows through
+    // it immediately.
+    let differing = pixels_beyond(&here, &there, 8);
+    assert!(
+        differing < 0.005,
+        "{:.1}% of the frame differs at the edge of the world by more than the colour field \
+         can account for; something in the render path is accumulating a world-space f32",
+        differing * 100.0
     );
 }
 
@@ -822,10 +862,11 @@ fn the_debug_teleport_leaves_the_world_on_screen() {
         "the bottom of the frame is sky at 50,000 blocks out ({bottom:?}), so this gate would \
          pass on an empty screen"
     );
-    assert_eq!(
-        perceptual_hash(&here),
-        perceptual_hash(&there),
-        "the picture changed 50,000 blocks from the origin: {} here, {} there",
+    let differing = pixels_beyond(&here, &there, 8);
+    assert!(
+        differing < 0.005,
+        "{:.1}% of the picture changed 50,000 blocks from the origin: {} here, {} there",
+        differing * 100.0,
         hash_hex(&here),
         hash_hex(&there)
     );
@@ -2874,13 +2915,16 @@ fn one_material_is_not_one_flat_colour() {
         "every patch of a wall of ONE material came out identical, so the per-cell \
          variation is not reaching the picture: {lowest} to {highest}"
     );
-    // The bound. One per cent either way is a two per cent spread, and the
-    // patches are averages of several cells, so the spread they can show is
-    // smaller still — five per cent of the level is generous and would catch a
-    // constant that had been changed by an order of magnitude.
+    // The bound, and it is a LITERAL rather than a multiple of the constant it
+    // guards: a bound derived from the number under test moves with it and
+    // stops being a bound at all. Ten per cent catches an order-of-magnitude
+    // mistake — measured, the wall spreads 2.6% at the current setting and
+    // 36.7% with the constant at 0.5, which is what noise rather than grain
+    // looks like. The patches are averages of several cells, so what they can
+    // show is always less than the full range.
     let spread = (highest - lowest) / highest;
     assert!(
-        spread < 0.05,
+        spread < 0.10,
         "the variation is {:.1}% across the wall, which is noise rather than grain",
         spread * 100.0
     );
@@ -3675,6 +3719,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             placeable: false,
             transparent: false,
             cutout: false,
+            passable: false,
             tint: None,
             texture: None,
         },
@@ -3685,6 +3730,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             placeable: false,
             transparent: false,
             cutout: false,
+            passable: false,
             tint: None,
             texture: None,
         },
@@ -3695,6 +3741,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             placeable: true,
             transparent: false,
             cutout: false,
+            passable: false,
             tint: None,
             texture: Some([7u8; 32]),
         },

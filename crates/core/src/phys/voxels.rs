@@ -106,6 +106,13 @@ pub struct Voxels<'a, S: ChunkLookup, F: FluidLookup = Dry> {
     /// different: the second one is a wall the server does not have, and the
     /// divergence it causes arrives as a correction the player sees.
     absent: std::cell::Cell<bool>,
+    /// Materials a body walks through — Sub-Node Contract §2.
+    ///
+    /// Borrowed rather than owned because the caller has it already: it comes
+    /// from the material table and changes only when a world's mods do. Empty
+    /// for every view that has no opinion, which is every ray cast and every
+    /// test.
+    passable: &'a [u16],
 }
 
 impl<'a, S: ChunkLookup> Voxels<'a, S, Dry> {
@@ -121,11 +128,24 @@ impl<'a, S: ChunkLookup> Voxels<'a, S, Dry> {
             fluid: None,
             origin: std::cell::Cell::new(origin),
             absent: std::cell::Cell::new(false),
+            passable: &[],
         }
     }
 }
 
 impl<'a, S: ChunkLookup, F: FluidLookup> Voxels<'a, S, F> {
+    /// The same view, told which materials a body walks through.
+    ///
+    /// **Only the stepping view needs this.** A ray and a reach check use
+    /// `solid`, which passable does not change — Sub-Node Contract §2 keeps
+    /// aim and movement separate so that a tuft a player walks through is
+    /// still a tuft they can break.
+    #[must_use]
+    pub const fn passing(mut self, passable: &'a [u16]) -> Self {
+        self.passable = passable;
+        self
+    }
+
     /// Views geometry and fluid together, in a frame anchored at `origin`.
     ///
     /// What steps a player. The two sources are separate because they are
@@ -137,6 +157,7 @@ impl<'a, S: ChunkLookup, F: FluidLookup> Voxels<'a, S, F> {
             fluid: Some(fluid),
             origin: std::cell::Cell::new(origin),
             absent: std::cell::Cell::new(false),
+            passable: &[],
         }
     }
 
@@ -240,6 +261,18 @@ impl<S: ChunkLookup, F: FluidLookup> Solid for Voxels<'_, S, F> {
     fn solid(&self, x: i32, y: i32, z: i32) -> bool {
         self.material(x, y, z)
             .is_none_or(|material| !material.is_air())
+    }
+
+    /// The same, minus the materials a body walks through.
+    ///
+    /// **An absent chunk still stops a body**, because the `is_none_or` above
+    /// is the guess that keeps a player out of a world still in flight and a
+    /// missing chunk has no material to be passable.
+    fn blocks_body(&self, x: i32, y: i32, z: i32) -> bool {
+        match self.material(x, y, z) {
+            None => true,
+            Some(material) => !material.is_air() && !self.passable.contains(&material.get()),
+        }
     }
 
     /// Follows the body into its new origin.
@@ -351,6 +384,59 @@ mod tests {
         fn chunk(&self, pos: ChunkPos) -> Option<&Chunk> {
             self.0.get(&pos)
         }
+    }
+
+    #[test]
+    fn a_passable_material_stops_no_body_and_still_stops_a_ray() {
+        // **Sub-Node Contract §2, both halves.** A body walks through grass; a
+        // ray still stops at it. The second is not a detail — the dig ray and
+        // the reach check use `solid`, so a material that simply reported
+        // itself hollow would be one a player could neither collide with nor
+        // aim at, and a plant nobody can pick is worse than a plant that trips
+        // them.
+        const GRASS: MaterialId = MaterialId(9);
+
+        let origin = ChunkPos::new(0, 0, 0);
+        let mut chunk = Chunk::new(origin, MaterialId::AIR);
+        // A tuft standing on nothing, so the only thing either question can be
+        // about is the tuft itself.
+        chunk
+            .set_block(BlockPos::new(4, 4, 4), BlockValue::Uniform(GRASS))
+            .expect("in chunk");
+        let world = Loaded::default().insert(chunk);
+
+        let plain = Voxels::new(&world, origin);
+        let cell = [4 * 3 + 1, 4 * 3 + 1, 4 * 3 + 1];
+
+        // Untold, it is ordinary geometry — which is the control: without this
+        // the assertions below could pass on a cell that was empty all along.
+        assert!(
+            plain.solid(cell[0], cell[1], cell[2]),
+            "the tuft is not in the world at all"
+        );
+        assert!(
+            plain.blocks_body(cell[0], cell[1], cell[2]),
+            "a material nothing was told about must behave exactly as it did"
+        );
+
+        let grass = [GRASS.get()];
+        let passing = Voxels::new(&world, origin).passing(&grass);
+        assert!(
+            !passing.blocks_body(cell[0], cell[1], cell[2]),
+            "a body should walk through a passable material"
+        );
+        assert!(
+            passing.solid(cell[0], cell[1], cell[2]),
+            "a passable material must still stop a ray, or it cannot be aimed at"
+        );
+
+        // And the guess that keeps a player out of a world still arriving is
+        // unchanged: an absent chunk has no material, so nothing can have
+        // declared it passable.
+        assert!(
+            passing.blocks_body(9_000, 9_000, 9_000),
+            "an absent chunk must still stop a body"
+        );
     }
 
     #[test]

@@ -2023,6 +2023,7 @@ mod tests {
                 placeable: true,
                 transparent: false,
                 cutout: false,
+                passable: false,
                 tint: None,
             })
             .collect()

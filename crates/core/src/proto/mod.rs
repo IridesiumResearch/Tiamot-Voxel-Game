@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -88,6 +88,9 @@ pub const PROTOCOL_VERSION: u32 = 44;
 // read back the one they got, which makes the seed box write-only and a world
 // worth keeping unshareable. Appended to the variant, safe because the version
 // is agreed in the handshake before a `JoinWorld` is sent.
+// v45 (post-15b): `MaterialDef` carries `passable`. The client predicts its own
+// movement, so a rule only the server knew would be a correction on every step
+// through a fern.
 // v44 (post-15b): `MaterialDef` carries `cutout` beside `transparent`. Foliage
 // culls the opposite way to glass (§8.2), so the client cannot infer one from
 // the other and a canopy drawn by §8.1's rule is a hollow shell.
@@ -685,6 +688,15 @@ impl Tint {
 /// server's mods itself, which is both a second code path for something the
 /// server has already decided and a reason to execute mod code the client has
 /// no other need to run.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent facts about a material, each read by a different \
+              system: the mesher asks two, the sweep asks one, the light asks \
+              another. `transparent` and `cutout` are the pair that could be one \
+              enum — Contract §8.2 makes them exclusive and `register_block` \
+              refuses both — and are left apart because the wire is positional \
+              and a fifth kind should not renumber the four"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterialDef {
     /// The sound a footstep on this material makes, if a mod named one.
@@ -737,6 +749,11 @@ pub struct MaterialDef {
     /// opposite culling — Sub-Node Contract §8.2 — and a client that guessed
     /// between them would draw a canopy as a hollow shell.
     pub cutout: bool,
+    /// Whether a body walks through it.
+    ///
+    /// The client predicts its own movement, so it has to apply the same rule
+    /// the server does or every step through a fern is a correction.
+    pub passable: bool,
     /// How this material's colour varies across the world, if a mod said.
     ///
     /// `None` — every material until a mod says otherwise (charter rule 1) —
@@ -3742,6 +3759,7 @@ mod tests {
                     placeable: true,
                     transparent: false,
                     cutout: false,
+                    passable: false,
                     tint: None,
                     step_sound: None,
                 },
@@ -3752,6 +3770,7 @@ mod tests {
                     placeable: true,
                     transparent: false,
                     cutout: false,
+                    passable: false,
                     tint: None,
                     step_sound: None,
                 },

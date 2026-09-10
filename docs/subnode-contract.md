@@ -82,6 +82,21 @@ enterable; the shape you see is the shape you collide with.
 - A sub-node cell is solid iff occupied (not air). `Uniform`, `Partial`, and
   `Mixed` are all treated identically — only the per-cell occupancy matters, not
   which storage form holds it.
+- **A material may declare itself `passable`, and then it stops nothing.** Grass,
+  a fern, a hanging vine: a body walks through it as though it were air. The
+  cell is still OCCUPIED for every other purpose — it meshes, it is lit, it
+  holds fluid out, and a ray still stops at it, which is what lets a player aim
+  at a tuft and break it. Only the body sweep asks the question differently.
+
+  **Movement and aim are separate questions and this is where they separate.**
+  A `passable` material answering "not solid" everywhere would be unbreakable:
+  the dig ray and the reach check use the same solidity test the sweep does, so
+  a tuft nothing collided with would also be a tuft nothing could target.
+
+  Without this, every plant is a lip. Collision is at sub-node resolution and a
+  two-cell fern is two thirds of a yard to climb — so foliage had to grow in
+  clumps with gaps and tufts had to stay one cell tall, which is a mod shaping
+  its content around an engine limit rather than around what it wants.
 - **Step-up height is one sub-node (1/3 yard).** A body blocked horizontally
   retries the move one sub-node higher; if that is clear and it was on the
   ground, it steps. A two-sub-node lip stops it.

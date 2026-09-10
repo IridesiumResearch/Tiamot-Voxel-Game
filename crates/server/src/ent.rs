@@ -529,7 +529,17 @@ impl Population {
     ///
     /// A marker with no box has no physics to run. It can still be moved by a
     /// mod writing its transform; it simply does not fall.
-    pub fn tick(&mut self, domain: &str, world: &World, fluid: &crate::fluid::Fluidics) {
+    /// `passable` is the materials a body walks through — Sub-Node Contract §2.
+    /// A mob obeys it for the reason a player does: one simulation, charter
+    /// rule 2, and a stalker that could not walk through the grass a player
+    /// walks through would path around a field.
+    pub fn tick(
+        &mut self,
+        domain: &str,
+        world: &World,
+        fluid: &crate::fluid::Fluidics,
+        passable: &[u16],
+    ) {
         // Bound once for the whole pass: every body here is in this domain, and
         // `ChunkLookup` has no way to carry one.
         let terrain = world.solid(domain);
@@ -571,7 +581,7 @@ impl Population {
             // chunk inside the tick budget. It reads the fluid too, so a mob
             // floats in the same milk a player does — charter rule 2, one
             // simulation.
-            let voxels = phys::Voxels::with_fluid(&terrain, fluid, origin);
+            let voxels = phys::Voxels::with_fluid(&terrain, fluid, origin).passing(passable);
             let stepped = phys::step_shaped(&voxels, body, drive, &phys::Tuning::DEFAULT, collider);
 
             // Charter rule 7: keep the local part inside one chunk so it never
@@ -1277,8 +1287,8 @@ mod tests {
         population.set_domain(away, "mod:elsewhere");
 
         for _ in 0..30 {
-            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
-            population.tick("mod:elsewhere", &world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid, &[]);
+            population.tick("mod:elsewhere", &world, &fluid, &[]);
         }
 
         let landed = population.get(here).expect("still there").transform.local[1];
@@ -1314,7 +1324,7 @@ mod tests {
         let before = population.get(away).expect("there").transform.local[1];
 
         for _ in 0..10 {
-            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid, &[]);
         }
 
         let after = population.get(away).expect("there").transform.local[1];
@@ -1496,7 +1506,7 @@ mod tests {
 
         let fluid = crate::fluid::Fluidics::default();
         for _ in 0..10 {
-            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid, &[]);
         }
 
         let after = population.get(id).expect("mirror").transform;
@@ -1616,7 +1626,7 @@ mod tests {
         let fluid = crate::fluid::Fluidics::default();
 
         for _ in 0..200 {
-            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid, &[]);
         }
 
         let entity = population.get(id).expect("live");
@@ -1680,7 +1690,7 @@ mod tests {
 
         let fluid = crate::fluid::Fluidics::default();
         for _ in 0..120 {
-            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid, &[]);
         }
 
         let travelled = |id| population.get(id).expect("live").transform.local[0] - start;
@@ -1712,7 +1722,7 @@ mod tests {
         let world = world();
         let fluid = crate::fluid::Fluidics::default();
         for _ in 0..10 {
-            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid);
+            population.tick(tiamot_core::domain::OVERWORLD, &world, &fluid, &[]);
         }
 
         let entity = population.get(marker).expect("live");
