@@ -202,6 +202,9 @@ impl Seen {
             // because the match is exhaustive on purpose: a new event should
             // make somebody decide what this test does about it.
             Event::Picture { .. } => {}
+            // A mod's options. Same reasoning: this test's server declares
+            // none, and an empty table is still a table that arrives.
+            Event::ModSettings { .. } => {}
             // A mod's font. Same reasoning as the picture above.
             Event::Font { .. } => {}
             Event::Materials { table, images } => {

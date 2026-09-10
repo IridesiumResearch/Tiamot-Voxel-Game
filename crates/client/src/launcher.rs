@@ -87,6 +87,18 @@ pub struct Entry {
     /// machine's to choose.
     #[serde(default)]
     pub mods: Vec<String>,
+    /// The player's answers to this world's mods' settings, by qualified id.
+    ///
+    /// **Per world, for the reason the mod list is.** A preference set for one
+    /// world should not follow the player into the next, and one set for a
+    /// server should still be there when they come back to it — which is the
+    /// whole complaint that moved the mod list here.
+    ///
+    /// Only what was ANSWERED. A setting absent from this map is the mod's own
+    /// default, so a mod that changes its default changes it for everybody who
+    /// never had an opinion — the same rule key bindings follow.
+    #[serde(default)]
+    pub settings: std::collections::BTreeMap<String, u32>,
     /// When this was last opened — or added, for one never opened — in seconds
     /// since the Unix epoch.
     ///
@@ -259,6 +271,20 @@ impl Library {
             None
         } else {
             Some(Mismatch { missing, added })
+        }
+    }
+
+    /// Records a world's answers to its mods' settings.
+    ///
+    /// By name, because that is what the caller has once the world is closed:
+    /// the entry it opened is a copy, and the row in the list may have been
+    /// rewritten by the open itself.
+    pub fn set_settings(&mut self, name: &str, settings: std::collections::BTreeMap<String, u32>) {
+        for entry in &mut self.entries {
+            if entry.name == name {
+                entry.settings = settings;
+                return;
+            }
         }
     }
 }
@@ -469,6 +495,7 @@ mod tests {
                 path: PathBuf::from("worlds").join(name),
             },
             mods: mods.iter().map(|id| (*id).to_owned()).collect(),
+            settings: std::collections::BTreeMap::default(),
             last_played: 0,
         }
     }
@@ -520,6 +547,7 @@ mod tests {
                 address: "example.com:4433".to_owned(),
             },
             mods: Vec::new(),
+            settings: std::collections::BTreeMap::default(),
             last_played: 0,
         });
         library.save(&path).expect("save");
@@ -640,6 +668,7 @@ local = { path = \"worlds/home\" }
                 address: "example.com:4433".to_owned(),
             },
             mods: Vec::new(),
+            settings: std::collections::BTreeMap::default(),
             last_played: 0,
         };
         assert_eq!(Library::mismatch(&server, &["core_ui".to_owned()]), None);

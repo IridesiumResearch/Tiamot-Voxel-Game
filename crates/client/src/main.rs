@@ -152,6 +152,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Whatever it was played with was not recorded, so it is recorded
             // as what is on now: inventing a set would invent a warning.
             mods: catalogue.enabled(),
+            settings: std::collections::BTreeMap::default(),
             last_played: client::launcher::now_seconds(),
         });
         if let Err(err) = library.save(&data.join("worlds.toml")) {
@@ -215,6 +216,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut client = Client {
+        playing: None,
         config,
         library,
         catalogue,
@@ -522,6 +524,13 @@ struct Client {
     connection: Option<Connection>,
     /// Kept alive for as long as the client runs. Dropping it stops the world.
     embedded: Option<tiamot_server::ServerHandle>,
+    /// Which world is open, by name, while one is.
+    ///
+    /// A mod's options are answered per world, so writing them back needs to
+    /// know which row they belong to — and by the time they are written the
+    /// player may already be back on the front screen with something else
+    /// highlighted.
+    playing: Option<String>,
     /// Saying this world is here, while it is open to the network.
     ///
     /// Dropped when the world is left, which stops the beacon — a world nobody
@@ -1198,6 +1207,18 @@ impl Client {
             if let Err(err) = self.catalogue.save(&self.data.join("mods.toml")) {
                 tracing::warn!(%err, "could not save which mods are on");
             }
+            // A mod's options belong to the world they were answered in, so
+            // they go into its row rather than beside the client's own
+            // settings. One-shot: `take_setting_changes` reports a change once.
+            if let Stage::Playing(app) = &mut surface.stage
+                && let Some(values) = app.take_setting_changes()
+                && let Some(name) = self.playing.clone()
+            {
+                self.library.set_settings(&name, values);
+                if let Err(err) = self.library.save(&self.data.join("worlds.toml")) {
+                    tracing::warn!(%err, "could not save a mod's settings for this world");
+                }
+            }
         }
         // **Read after drawing and before acting.** The tick box lives on the
         // screen that produced the action, and `open` borrows the window.
@@ -1244,6 +1265,11 @@ impl Client {
                     } else {
                         Vec::new()
                     },
+                    // **Carried through, not reset.** `add` replaces the whole
+                    // row, so an entry rebuilt without these would forget every
+                    // answer the player has ever given this world — silently,
+                    // and on the way IN, which is the worst moment for it.
+                    settings: entry.settings.clone(),
                     // **Stamped on the way IN, not on the way out.** A world
                     // is last played from the moment it opens; recording it on
                     // leaving would lose the stamp for a session that ended in
@@ -1274,6 +1300,7 @@ impl Client {
                 path: unused_world_directory(&self.data, name),
             },
             mods: self.catalogue.enabled(),
+            settings: std::collections::BTreeMap::default(),
             last_played: client::launcher::now_seconds(),
         };
         self.open(&entry, lan, seed)
@@ -1367,7 +1394,13 @@ impl Client {
             err.to_string()
         })?;
 
+        self.playing = Some(entry.name.clone());
         let mut app = self.start_app(connection);
+        // **The world's own answers, before the declarations arrive.** They are
+        // sent the moment the server says what it offers, so seeding them after
+        // that would send the previous world's — or none, which is a silent
+        // reset of every preference the player has for this place.
+        app.adopt_setting_values(entry.settings.clone());
         // **Only when it was actually opened**, and only for a world this
         // machine runs: joining somebody else's server is not hosting one.
         if lan && matches!(entry.kind, client::launcher::Kind::Local { .. }) {
@@ -2146,6 +2179,65 @@ fn draw_settings(app: &mut App, ctx: &egui::Context) {
             // action per mod, so they run to a screenful on their own — and
             // putting them above the sliders meant the fog control was found
             // by scrolling past everything else, or reported as missing.
+            // **A mod's own options, above the engine's.** They are the ones a
+            // player came looking for and cannot guess at — the engine's are in
+            // every game and a mod's are in this one — and a list of key
+            // bindings is long enough to bury anything below it.
+            //
+            // Grouped by the mod that asked, because "Compact hotbar" means
+            // nothing without knowing who offers it, and two mods may
+            // reasonably offer the same thing.
+            let settings = app.mod_settings().to_vec();
+            if !settings.is_empty() {
+                ui.heading("mods");
+                let mut owner: Option<String> = None;
+                for def in &settings {
+                    if owner.as_deref() != Some(def.mod_id.as_str()) {
+                        ui.weak(&def.mod_id);
+                        owner = Some(def.mod_id.clone());
+                    }
+                    let current = app.mod_setting(def);
+                    match def.kind {
+                        tiamot_core::proto::SettingKind::Toggle => {
+                            let mut on = current != 0;
+                            if ui.checkbox(&mut on, &def.name).changed() {
+                                app.set_mod_setting(&def.id, u32::from(on));
+                            }
+                        }
+                        tiamot_core::proto::SettingKind::Choice => {
+                            let index = (current as usize).min(def.options.len().saturating_sub(1));
+                            let shown = def
+                                .options
+                                .get(index)
+                                .map_or_else(String::new, Clone::clone);
+                            ui.horizontal(|ui| {
+                                ui.label(&def.name);
+                                egui::ComboBox::from_id_salt(&def.id)
+                                    .selected_text(shown)
+                                    .show_ui(ui, |ui| {
+                                        for (n, option) in def.options.iter().enumerate() {
+                                            let mut picked = index == n;
+                                            if ui
+                                                .selectable_value(&mut picked, true, option)
+                                                .clicked()
+                                            {
+                                                app.set_mod_setting(
+                                                    &def.id,
+                                                    u32::try_from(n).unwrap_or(0),
+                                                );
+                                            }
+                                        }
+                                    });
+                            });
+                        }
+                    }
+                    if !def.description.is_empty() {
+                        ui.indent(&def.id, |ui| ui.weak(&def.description));
+                    }
+                }
+                ui.separator();
+            }
+
             ui.heading("volume");
             // **Live, not on close.** A slider you cannot hear while dragging
             // is a slider you have to guess at, so every change goes straight

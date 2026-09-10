@@ -1262,6 +1262,40 @@ impl ServerHandle {
             .collect();
         info!(actions = action_table.len(), "action table built");
 
+        // The options those mods offer, on the same pattern. Truncated rather
+        // than refused past the cap: a server whose mods between them declare
+        // more than a screen can hold should start and show the first sixty-four
+        // of them, and `validate_server_message` would refuse the message
+        // otherwise — a world nobody can join over a mod's enthusiasm.
+        let mut setting_table: Vec<tiamot_core::proto::SettingDef> = host
+            .as_ref()
+            .map(|loaded| loaded.vm().registered_settings())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|setting| tiamot_core::proto::SettingDef {
+                mod_id: setting.mod_id,
+                id: setting.id,
+                name: setting.name,
+                description: setting.description,
+                kind: if setting.options.is_empty() {
+                    tiamot_core::proto::SettingKind::Toggle
+                } else {
+                    tiamot_core::proto::SettingKind::Choice
+                },
+                options: setting.options,
+                default: setting.default,
+            })
+            .collect();
+        if setting_table.len() > tiamot_core::proto::MAX_MOD_SETTINGS {
+            warn!(
+                declared = setting_table.len(),
+                cap = tiamot_core::proto::MAX_MOD_SETTINGS,
+                "more mod settings than a screen holds; the rest are dropped"
+            );
+            setting_table.truncate(tiamot_core::proto::MAX_MOD_SETTINGS);
+        }
+        info!(settings = setting_table.len(), "mod setting table built");
+
         // Charter rule 1 once more: the engine has no sounds, so this is
         // whatever the mods registered. The file travels by hash through the
         // same content pipeline a texture does.
@@ -1756,6 +1790,7 @@ impl ServerHandle {
             tool_table,
             views,
             action_table,
+            setting_table,
             sound_table,
             font_table,
             sound_bindings,
@@ -1794,6 +1829,7 @@ impl ServerHandle {
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
             actions: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            setting_answers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             dialog_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
             chat: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -3743,6 +3779,20 @@ impl ServerHandle {
                                 for (mod_id, err) in &verdict.faults {
                                     error!(mod_id = %mod_id, "mod disabled after an on_action failure: {err}");
                                 }
+                            }
+
+                            // A player's answers to mod settings, applied on the
+                            // tick for the reason actions are: mods run here, and
+                            // a value written from a connection task could land
+                            // in the middle of one running.
+                            let answers: Vec<(tiamot_core::identity::PlayerUuid, String, u32)> =
+                                shared
+                                    .setting_answers
+                                    .lock()
+                                    .map(|mut queue| queue.drain(..).collect())
+                                    .unwrap_or_default();
+                            for (uuid, id, value) in answers {
+                                source.set_player_setting(&uuid, &id, value);
                             }
 
                             // Chat, which every mod may veto. Broadcast only if

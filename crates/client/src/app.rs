@@ -873,6 +873,26 @@ fn ray_box(origin: [f32; 3], direction: [f32; 3], min: [f32; 3], max: [f32; 3]) 
 /// They ARE independent — borders, source outlines and the time override answer
 /// unrelated questions and are turned on and off separately — so folding them
 /// into an enum or a bitflags type would be obeying the lint rather than the
+/// What a server's mods offer the player, and what they answered.
+///
+/// One struct because the three move together — declarations arrive, answers
+/// are seeded from the world, and a change dirties the record — and three
+/// loose fields on `App` is three things to remember to reset.
+#[derive(Debug, Default)]
+struct ModSettings {
+    /// As declared. Empty until the table arrives on join, and empty for ever
+    /// on a server whose mods offer none, which is most of them.
+    declared: Vec<tiamot_core::proto::SettingDef>,
+    /// The player's answers, by qualified id, for the world they are in.
+    ///
+    /// Seeded from the world's own record before the connection opens, so the
+    /// answers given last time are the ones sent when the declarations arrive.
+    /// Only what was ANSWERED: absent is the mod's default.
+    answers: std::collections::BTreeMap<String, u32>,
+    /// Whether an answer changed, so the world's record wants writing.
+    dirty: bool,
+}
+
 /// reason for it.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
@@ -884,6 +904,8 @@ pub struct App {
     /// the result. Charter rule 11's split, in the type layout: the client owns
     /// bindings, and a mod owns nothing but the name.
     actions: crate::input::Actions,
+    /// The options this server's mods offer, and what the player answered.
+    mod_settings: ModSettings,
     /// What each action is bound to.
     bindings: crate::input::Bindings,
     /// Every sound the server's mods registered.
@@ -1316,6 +1338,7 @@ impl App {
             granted_view: config.view(),
             config,
             actions: crate::input::Actions::engine(),
+            mod_settings: ModSettings::default(),
             bindings,
             sounds: Vec::new(),
             dialogs: std::collections::BTreeMap::new(),
@@ -2468,6 +2491,76 @@ impl App {
             ids.sort_unstable();
             ids
         };
+    }
+
+    /// Takes the options a server's mods offer, and answers with what this
+    /// world already knows.
+    ///
+    /// **The answers go back immediately.** A mod asks what a player chose the
+    /// moment it runs, and a server holding defaults until the player next
+    /// opens a screen would apply the wrong ones for the whole session — and
+    /// silently, because nothing looks wrong about a default.
+    ///
+    /// An answer to a setting this server does not declare is kept rather than
+    /// dropped: the player may be visiting a server running an older version of
+    /// a mod, and forgetting their preference because it is momentarily
+    /// unrecognised is how a preference quietly resets.
+    fn adopt_mod_settings(&mut self, settings: Vec<tiamot_core::proto::SettingDef>) {
+        self.mod_settings.declared = settings;
+        let answered: Vec<(String, u32)> = self
+            .mod_settings
+            .declared
+            .iter()
+            .filter_map(|def| {
+                self.mod_settings
+                    .answers
+                    .get(&def.id)
+                    .map(|value| (def.id.clone(), *value))
+            })
+            .collect();
+        for (id, value) in answered {
+            self.connection
+                .send(crate::net::Command::SetSetting { id, value });
+        }
+    }
+
+    /// The options this server's mods offer, for the settings screen.
+    #[must_use]
+    pub fn mod_settings(&self) -> &[tiamot_core::proto::SettingDef] {
+        &self.mod_settings.declared
+    }
+
+    /// What the player has answered for one setting, or the mod's default.
+    #[must_use]
+    pub fn mod_setting(&self, def: &tiamot_core::proto::SettingDef) -> u32 {
+        self.mod_settings
+            .answers
+            .get(&def.id)
+            .copied()
+            .unwrap_or(def.default)
+    }
+
+    /// Records an answer and tells the server.
+    pub fn set_mod_setting(&mut self, id: &str, value: u32) {
+        self.mod_settings.answers.insert(id.to_owned(), value);
+        self.mod_settings.dirty = true;
+        self.connection.send(crate::net::Command::SetSetting {
+            id: id.to_owned(),
+            value,
+        });
+    }
+
+    /// Seeds the answers from the world about to be opened.
+    pub fn adopt_setting_values(&mut self, values: std::collections::BTreeMap<String, u32>) {
+        self.mod_settings.answers = values;
+    }
+
+    /// The answers to write back into the world's record, if any changed.
+    ///
+    /// One-shot, like every other "what does the window have to persist"
+    /// question here: asking twice must not write twice.
+    pub fn take_setting_changes(&mut self) -> Option<std::collections::BTreeMap<String, u32>> {
+        std::mem::take(&mut self.mod_settings.dirty).then(|| self.mod_settings.answers.clone())
     }
 
     /// Replaces the mod-registered actions with a server's.
@@ -4250,6 +4343,7 @@ impl App {
                 }
 
                 Event::Actions { actions } => self.adopt_actions(actions),
+                Event::ModSettings { settings } => self.adopt_mod_settings(settings),
 
                 // Recorded now, played later: the audio backend is the next
                 // piece of Task 13, and until it lands a client knows what a

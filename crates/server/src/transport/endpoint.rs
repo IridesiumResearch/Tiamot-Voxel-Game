@@ -130,6 +130,8 @@ pub struct Shared {
     /// Charter rule 11: the engine owns bindings and a mod owns only the name,
     /// so this is the whole of what a mod gets to say about controls.
     pub action_table: Vec<tiamot_core::proto::ActionDef>,
+    /// The options this world's mods offer the player, sent once on join.
+    pub setting_table: Vec<tiamot_core::proto::SettingDef>,
     /// Every sound the mods registered, for the join tables.
     pub sound_table: Vec<tiamot_core::proto::SoundDef>,
     /// Every font a mod registered, sent on join. See `tiamot_core::font`.
@@ -199,6 +201,12 @@ pub struct Shared {
     /// other thing a client asks for: running a Lua hook on the network thread
     /// would put a mod's runtime inside a connection's read loop.
     pub actions: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, String, bool)>>,
+    /// Answers to mod settings, drained by the tick.
+    ///
+    /// Queued rather than applied where they arrive, for the reason every other
+    /// player-driven change is: mods run on the tick, and a value written from
+    /// a connection task could land in the middle of one.
+    pub setting_answers: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, String, u32)>>,
     /// Chat waiting for the tick to offer to the mods.
     pub chat: std::sync::Mutex<std::collections::VecDeque<(PlayerUuid, String)>>,
     /// Dialog events waiting for the tick to hand to the owning mods.
@@ -2521,6 +2529,7 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                 tools: &shared.tool_table,
                 fluids: &shared.fluid_table,
                 actions: &shared.action_table,
+                settings: &shared.setting_table,
                 sounds: &shared.sound_table,
                 fonts: &shared.font_table,
                 hud_scripts: &shared.hud_scripts,
@@ -2727,6 +2736,18 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
             Action::Action { id, pressed } => {
                 if let Some(uuid) = session.uuid() {
                     shared.queue_action(uuid, id.clone(), *pressed);
+                }
+            }
+            Action::SetSetting { id, value } => {
+                if let Some(uuid) = session.uuid()
+                    && let Ok(mut queue) = shared.setting_answers.lock()
+                {
+                    // Bounded like every other player-driven queue: a client
+                    // spraying answers must not grow this without limit before
+                    // the tick drains it.
+                    if queue.len() < MAX_QUEUED_EDITS {
+                        queue.push_back((uuid, id.clone(), *value));
+                    }
                 }
             }
             Action::Dialog { form, event } => {
@@ -3002,6 +3023,7 @@ mod tests {
             items: std::collections::BTreeSet::new(),
             held_slot: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             action_table: Vec::new(),
+            setting_table: Vec::new(),
             sound_table: Vec::new(),
             font_table: Vec::new(),
             hud_scripts: Vec::new(),
@@ -3019,6 +3041,7 @@ mod tests {
             edits: std::sync::Mutex::new(std::collections::VecDeque::new()),
             punches: std::sync::Mutex::new(std::collections::VecDeque::new()),
             actions: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            setting_answers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             dialog_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
             chat: std::sync::Mutex::new(std::collections::VecDeque::new()),
             placements: std::sync::Mutex::new(std::collections::VecDeque::new()),

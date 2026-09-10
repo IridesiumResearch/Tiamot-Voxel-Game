@@ -137,6 +137,114 @@ fn a_block_a_mod_places_reaches_the_world() {
     });
 }
 
+/// A mod that offers the player an option and builds what they answered.
+///
+/// The answer is reported the only way anything reaches a test — as an edit —
+/// which is `perception.rs`'s trick and `write_reader`'s below.
+fn write_optional(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("optional");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"optional\"\nname = \"Optional\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        "local ground = game.register_block{ id = \"ground\" }\n\
+         local yes = game.register_block{ id = \"yes\" }\n\
+         local no = game.register_block{ id = \"no\" }\n\
+         game.register_setting{ id = \"marker\", name = \"Place a marker\", default = 0 }\n\
+         game.register_setting{\n\
+         \x20   id = \"size\", name = \"Marker size\",\n\
+         \x20   options = { \"small\", \"large\" }, default = 0,\n\
+         }\n\
+         game.register_on_generate(function(buf, pos)\n\
+         \x20   buf:fill_below_heightmap(game.flat_heightmap(0), ground)\n\
+         end)\n\
+         local who = nil\n\
+         game.register_on_player_join(function(event) who = event.player end)\n\
+         -- Read on the tick rather than at join, because the answers the client\n\
+         -- sends with a join arrive as their own messages and are applied by\n\
+         -- the tick that follows. Idempotent, so it simply corrects itself the\n\
+         -- moment an answer lands.\n\
+         game.register_on_tick(function()\n\
+         \x20   if who == nil then return end\n\
+         \x20   local on = game.setting(who, \"optional:marker\")\n\
+         \x20   local size = game.setting(who, \"optional:size\")\n\
+         \x20   game.set_block({ x = 2, y = 9, z = 2 }, on and \"optional:yes\" or \"optional:no\")\n\
+         \x20   if size == \"large\" then\n\
+         \x20       game.set_block({ x = 3, y = 9, z = 2 }, \"optional:yes\")\n\
+         \x20   end\n\
+         end)\n",
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_mods_option_reaches_the_mod_as_the_player_answered_it() {
+    // **The whole loop.** A mod declares an option, the server sends the
+    // declaration on join, the player answers, and the mod reads the answer —
+    // and no part of that is worth anything without the others: a declaration
+    // nobody sees, an answer nobody applies, or a read that always returns the
+    // default are each invisible on their own.
+    //
+    // The DEFAULT case is the control. Without it, a test that only checked
+    // the answered value would pass just as well on a server that ignored the
+    // answer and happened to default to it.
+    let server = start("optional", write_optional("optional"));
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Chooser").await.expect("join");
+
+        let table = bot
+            .material_table()
+            .expect("the server sends a material table on join");
+        let id_of = |name: &str| {
+            table
+                .iter()
+                .find(|entry| entry.name == name)
+                .map(|entry| entry.id)
+                .unwrap_or_else(|| panic!("the mod registers {name}"))
+        };
+
+        // The declarations reached the client at all.
+        let settings = bot
+            .mod_settings()
+            .expect("the server should send its mods' settings on join");
+        assert_eq!(
+            settings.len(),
+            2,
+            "expected the two the mod declares, got {settings:?}"
+        );
+        assert_eq!(settings[0].id, "optional:marker");
+        assert_eq!(
+            settings[1].options,
+            vec!["small".to_owned(), "large".to_owned()]
+        );
+
+        // Answered: the toggle on, and the choice at its second option.
+        bot.set_setting("optional:marker", 1).await.expect("answer");
+        bot.set_setting("optional:size", 1).await.expect("answer");
+
+        bot.expect_block(PLACED, id_of("optional:yes"), PATIENCE)
+            .await
+            .expect("the mod should have read the answered toggle");
+        bot.expect_block(BlockPos::new(3, 9, 2), id_of("optional:yes"), PATIENCE)
+            .await
+            .expect("the mod should have read the answered choice");
+    });
+}
+
 /// A mod whose world has a wall of grass across it, and a wall of stone beside
 /// it — the same shape, one passable and one not.
 fn write_meadow(name: &str) -> PathBuf {

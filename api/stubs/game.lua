@@ -1888,6 +1888,61 @@ function game.register_on_fluid_flow(callback) end
 ---@param spec Tiamot.ActionSpec
 function game.register_action(spec) end
 
+---Offers the player an option, shown in the in-game settings screen.
+---
+---**Declared like an action and answered like a key binding.** You say what you
+---offer; the client draws it under your mod's name in the screen a player
+---already opens; their answer belongs to the world they are in, so it is still
+---there when they come back to that world or that server and does not follow
+---them into the next one.
+---
+---```lua
+---game.register_setting{ id = "nameplates", name = "Show name tags", default = 1 }
+---game.register_setting{
+---    id = "difficulty",
+---    name = "How hard the mimics hit",
+---    description = "Takes effect the next time one wakes up.",
+---    options = { "gentle", "ordinary", "unfair" },
+---    default = 1,
+---}
+---```
+---
+---No `options` is a checkbox and `default` is `0` or `1`; with options it is a
+---dropdown and `default` indexes them. A list of exactly one is refused — a
+---choice of one is not a choice — and a `default` past the end is clamped
+---rather than refused, because a mod that fails to load teaches nobody
+---anything.
+---
+---**An answer arrives with a PLAYER, so a setting cannot shape a world.**
+---Worldgen has already happened by the time anybody joins — for chunks
+---generated before the first player, it happened with nobody to ask — so a
+---setting cannot decide how terrain is made, and a mod that tried would get a
+---world whose shape depended on who logged in first. Options that shape a world
+---belong in your own configuration, read when you load.
+---@param spec { id: string, name: string?, description: string?, options: string[]?, default: integer? }
+function game.register_setting(spec) end
+
+---What a player answered for one of your settings.
+---
+---A boolean for a checkbox, and the chosen string for a dropdown — never the
+---raw number, so comparing against `"unfair"` keeps working when you insert an
+---option above it.
+---
+---Answers with your declared default for a player who has never touched it,
+---which is most of them, so this needs no guard.
+---
+---```lua
+---if game.setting(uuid, "my_mod:nameplates") then ... end
+---if game.setting(uuid, "my_mod:difficulty") == "unfair" then ... end
+---```
+---
+---`nil` for an id nothing registered. Key on the UUID, never the display name
+---(charter rule 13).
+---@param player string The player's UUID, as 64 hex characters.
+---@param id string The qualified setting id.
+---@return boolean|string|nil
+function game.setting(player, id) end
+
 ---Looks up a registered block's numeric id by its string id.
 ---
 ---String ids like `"core:white"` are stable forever. Numeric ids are per

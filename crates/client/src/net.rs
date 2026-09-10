@@ -314,6 +314,15 @@ pub enum Event {
         actions: Vec<tiamot_core::proto::ActionDef>,
     },
 
+    /// The options a server's mods offer, sent once on join.
+    ///
+    /// The same shape as [`Event::Actions`] and for the same reason: a mod
+    /// declares, the player answers, and the answer is the client's to keep.
+    ModSettings {
+        /// The settings, in mod load order.
+        settings: Vec<tiamot_core::proto::SettingDef>,
+    },
+
     /// What the player is carrying, in **units** (charter rule 5).
     ///
     /// Whole, not a delta: an inventory is tens of stacks at most, and a delta
@@ -500,6 +509,13 @@ pub enum Command {
         look: [f32; 2],
         /// Held actions.
         actions: u32,
+    },
+    /// The player's answer to one of a mod's settings.
+    SetSetting {
+        /// The qualified id, as declared.
+        id: String,
+        /// `0`/`1` for a toggle, or an index into the declared options.
+        value: u32,
     },
     /// Start or re-aim a dig, or stop one with `None`.
     Dig {
@@ -1448,6 +1464,9 @@ async fn session(
             ServerMessage::ActionTable { actions } => {
                 let _ = events.send(Event::Actions { actions });
             }
+            ServerMessage::ModSettings { settings } => {
+                let _ = events.send(Event::ModSettings { settings });
+            }
 
             ServerMessage::SoundTable { sounds } => {
                 // **Fetched after the join, not before it.** The material
@@ -1861,6 +1880,7 @@ fn to_wire(command: Command) -> ClientMessage {
         Command::SwapOffhand { slot } => ClientMessage::SwapOffhand { slot },
         Command::SelectTool { tool } => ClientMessage::SelectTool { tool },
         Command::SelectSlot { slot } => ClientMessage::SelectSlot { slot },
+        Command::SetSetting { id, value } => ClientMessage::SetSetting { id, value },
         Command::ViewDistance {
             horizontal,
             vertical,

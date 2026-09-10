@@ -247,6 +247,7 @@ impl Front {
             name: self.library.unused_name(&address),
             kind: Kind::Remote { address },
             mods: Vec::new(),
+            settings: std::collections::BTreeMap::default(),
             // A server nobody has played yet, stamped so it sorts to the top:
             // it is the line the player just typed and is about to click, not
             // the oldest thing they own.
@@ -465,6 +466,7 @@ impl Front {
                             // set and says so at join; this list is not a
                             // claim about it.
                             mods: Vec::new(),
+                            settings: std::collections::BTreeMap::default(),
                             last_played: crate::launcher::now_seconds(),
                         }));
                     }
@@ -756,6 +758,7 @@ mod tests {
                 path: PathBuf::from("worlds").join(name),
             },
             mods: mods.iter().map(|id| (*id).to_owned()).collect(),
+            settings: std::collections::BTreeMap::default(),
             last_played: 0,
         }
     }
@@ -1143,6 +1146,7 @@ mod tests {
                     address: "example:1234".to_owned(),
                 },
                 mods: Vec::new(),
+                settings: std::collections::BTreeMap::default(),
                 last_played: 0,
             },
             world("brand new", &[]),

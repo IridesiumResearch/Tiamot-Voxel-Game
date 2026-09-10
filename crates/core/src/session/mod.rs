@@ -173,6 +173,18 @@ pub enum Action {
         slot: u16,
     },
 
+    /// Record a player's answer to one of a mod's settings.
+    ///
+    /// Not a request either: what a player wants a mod to do for them changes
+    /// nothing about the world, and a server that refused one would be
+    /// arguing with a preference.
+    SetSetting {
+        /// The qualified id, as declared.
+        id: String,
+        /// `0`/`1` for a toggle, or an index into the declared options.
+        value: u32,
+    },
+
     /// Record a movement/look input for the next tick.
     Input {
         /// The tick the client believes it is on.
@@ -294,6 +306,8 @@ pub struct JoinContext<'a> {
     /// NOT in here — a client already has those, and a server does not get to
     /// redefine what jump means. See [`crate::proto::ActionDef`].
     pub actions: &'a [crate::proto::ActionDef],
+    /// The options a server's mods offer the player.
+    pub settings: &'a [crate::proto::SettingDef],
     /// Every sound the loaded mods registered, in load order.
     ///
     /// Charter rule 1 again: the engine has no sounds of its own, so a client
@@ -421,6 +435,10 @@ impl Session {
                 Response::act(Action::SwapOffhand { slot: *slot })
             }
             ClientMessage::SelectSlot { slot } => Response::act(Action::SelectSlot { slot: *slot }),
+            ClientMessage::SetSetting { id, value } => Response::act(Action::SetSetting {
+                id: id.clone(),
+                value: *value,
+            }),
             ClientMessage::Action { id, pressed } => Response::act(Action::pressed(id, *pressed)),
             ClientMessage::DialogEvent { form, event } => Response::act(Action::Dialog {
                 form: form.clone(),
@@ -808,6 +826,13 @@ impl Session {
                 ServerMessage::FontTable {
                     fonts: context.fonts.to_vec(),
                 },
+                // And a mod's options last, for the reason the action table is
+                // near the end: the join sequence is pinned by tests on both
+                // sides of the wire, and appending is the only edit that does
+                // not renumber every message after it.
+                ServerMessage::ModSettings {
+                    settings: context.settings.to_vec(),
+                },
             ],
             close: false,
             action: Action::None,
@@ -952,6 +977,7 @@ impl Session {
             ClientMessage::Action { .. } => "Action",
             ClientMessage::SelectTool { .. } => "SelectTool",
             ClientMessage::SelectSlot { .. } => "SelectSlot",
+            ClientMessage::SetSetting { .. } => "SetSetting",
             ClientMessage::Place { .. } => "Place",
             ClientMessage::ViewDistance { .. } => "ViewDistance",
             ClientMessage::Punch { .. } => "Punch",
@@ -986,6 +1012,7 @@ mod tests {
             fluids: &[],
             tools: &[],
             actions: &[],
+            settings: &[],
             sounds: &[],
             fonts: &[],
             sound_bindings: &[],
@@ -1097,7 +1124,12 @@ mod tests {
         // arrived draws in the client's own face, which is a world somebody can
         // play — one that waited for a typeface is not.
         assert!(matches!(sent[11], ServerMessage::FontTable { .. }));
-        assert!(matches!(sent[12], ServerMessage::JoinWorld { .. }));
+        // And a mod's options after them, for the same reason the action table
+        // sits near the end: appending is the only edit to this sequence that
+        // does not renumber every message after it — which is what this
+        // assertion exists to notice.
+        assert!(matches!(sent[12], ServerMessage::ModSettings { .. }));
+        assert!(matches!(sent[13], ServerMessage::JoinWorld { .. }));
     }
 
     #[test]

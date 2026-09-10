@@ -260,6 +260,46 @@ the wrong thing.
 
 ---
 
+## Your mod's own options
+
+Do not write a config file the player will never find. Declare what you offer
+and the client draws it under your mod's name, in the screen they already open:
+
+```lua
+game.register_setting{ id = "nameplates", name = "Show name tags", default = 1 }
+game.register_setting{
+    id = "difficulty",
+    name = "How hard the mimics hit",
+    options = { "gentle", "ordinary", "unfair" },
+    default = 1,
+}
+
+-- and where it matters:
+if game.setting(uuid, "my_mod:difficulty") == "unfair" then ... end
+```
+
+No `options` is a checkbox; with them it is a dropdown. `game.setting` answers
+a boolean or the chosen STRING — never the raw index — so comparing against
+`"unfair"` keeps working when you insert an option above it, and it answers your
+declared default for a player who has never touched it.
+
+**Answers belong to the world, not to the machine.** A player's choices are
+remembered per world and per server, so they are still there when they come
+back to that server and do not follow them into the next one. That is the same
+rule the mod selection follows and for the same reason.
+
+**An answer arrives with a PLAYER, so a setting cannot shape a world.** Worldgen
+has already happened by the time anybody joins — for chunks made before the
+first player, it happened with nobody to ask. A setting cannot decide how your
+terrain is generated, and one that tried would give a world whose shape depended
+on who logged in first. **Options that shape a world are yours to configure**,
+read when your mod loads, and the engine deliberately offers no way to put them
+on a player's screen.
+
+Key on the UUID, never the display name (charter rule 13).
+
+---
+
 ## Terrain that does not look like a texture
 
 Two things, and they are separate mechanisms because they fix different halves

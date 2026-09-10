@@ -728,6 +728,30 @@ impl Bot {
             })
     }
 
+    /// The options this server's mods offer, as sent on join.
+    #[must_use]
+    pub fn mod_settings(&self) -> Option<Vec<tiamot_core::proto::SettingDef>> {
+        self.received()
+            .into_iter()
+            .find_map(|message| match message {
+                ServerMessage::ModSettings { settings } => Some(settings),
+                _ => None,
+            })
+    }
+
+    /// Answers one of them, as a player would from the settings screen.
+    ///
+    /// # Errors
+    ///
+    /// [`BotError::Frame`] if the write fails.
+    pub async fn set_setting(&mut self, id: &str, value: u32) -> Result<(), BotError> {
+        self.send(&tiamot_core::proto::ClientMessage::SetSetting {
+            id: id.to_owned(),
+            value,
+        })
+        .await
+    }
+
     /// The mod manifest the server sent, if it has arrived.
     #[must_use]
     pub fn manifest(&self) -> Option<Vec<tiamot_core::proto::ModEntry>> {

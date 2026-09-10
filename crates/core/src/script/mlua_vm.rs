@@ -2112,6 +2112,49 @@ impl ScriptVm for MluaVm {
             .collect()
     }
 
+    fn registered_settings(&self) -> Vec<super::vm::Setting> {
+        let Ok(registry) = self.lua.named_registry_value::<Table>("tiamot.settings") else {
+            return Vec::new();
+        };
+        // Load order, for the reason actions are: it is what the screen groups
+        // by and the only order a player can predict.
+        registry
+            .sequence_values::<Table>()
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                Some(super::vm::Setting {
+                    id: entry.get("id").ok()?,
+                    mod_id: entry.get("mod_id").unwrap_or_default(),
+                    name: entry.get("name").unwrap_or_default(),
+                    description: entry.get("description").unwrap_or_default(),
+                    options: entry.get("options").unwrap_or_default(),
+                    default: entry.get("default").unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    fn set_player_setting(&mut self, player: &crate::identity::PlayerUuid, id: &str, value: u32) {
+        let Ok(answers) = self.lua.named_registry_value::<Table>("tiamot.answers") else {
+            return;
+        };
+        // Keyed by UUID and then by setting id: a preference belongs to a
+        // player, never to a display name (charter rule 13).
+        let key = player.to_hex();
+        let per_player: Table = if let Ok(Some(table)) = answers.get(key.clone()) {
+            table
+        } else {
+            let Ok(table) = self.lua.create_table() else {
+                return;
+            };
+            if answers.set(key, table.clone()).is_err() {
+                return;
+            }
+            table
+        };
+        let _ = per_player.set(id, value);
+    }
+
     fn registered_sky(&self) -> Option<Sky> {
         let registry = self
             .lua
@@ -3032,6 +3075,128 @@ impl MluaVm {
     /// The name is still set with a literal at the call site, because
     /// `scripts/check-stubs.sh` finds the API surface by grepping for
     /// `game.set("...")` and a name built in a loop is one it cannot see.
+    /// Creates the registry tables that describe a WORLD rather than a block:
+    /// domains, their generators, fluids and skies.
+    ///
+    /// Grouped and extracted because `install_registry` sits at clippy's line
+    /// ceiling and these four belong together — a mod that registers one
+    /// usually registers another.
+    fn install_world_tables(&mut self) -> Result<(), ScriptError> {
+        for name in [
+            "tiamot.domain_generators",
+            "tiamot.domains",
+            "tiamot.fluids",
+            "tiamot.skies",
+        ] {
+            let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+            self.lua
+                .set_named_registry_value(name, table)
+                .map_err(|err| self.vm_error(&err))?;
+        }
+        Ok(())
+    }
+
+    /// Creates the two registry tables the settings live in.
+    ///
+    /// Two, because the first is frozen at registration and the second changes
+    /// all session — and a player's answers are keyed by UUID, never by name
+    /// (charter rule 13). Its own method because `install_registry` is at
+    /// clippy's line ceiling.
+    fn install_setting_tables(&mut self) -> Result<(), ScriptError> {
+        let settings = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.settings", settings)
+            .map_err(|err| self.vm_error(&err))?;
+        let answers = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.lua
+            .set_named_registry_value("tiamot.answers", answers)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
+    /// Installs the settings pair: what a mod offers, and what a player chose.
+    ///
+    /// Its own method because `install_registration` is at clippy's line
+    /// ceiling — extract, never append.
+    fn install_settings(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        game.set("register_setting", self.setting_registrar(mod_id)?)
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("setting", self.setting_reader()?)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
+    /// The `game.register_setting` function, built once per mod environment.
+    ///
+    /// The same shape as [`MluaVm::action_registrar`] and deliberately so: a
+    /// mod declares what it offers, the client draws it, the player answers.
+    fn setting_registrar(&self, mod_id: &str) -> Result<mlua::Function, ScriptError> {
+        let owner = mod_id.to_owned();
+        let registrar = self
+            .lua
+            .create_function(move |lua, spec: Table| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                let id: String = spec.get("id")?;
+                let options: Vec<String> = spec
+                    .get::<Option<Vec<String>>>("options")?
+                    .unwrap_or_default();
+                if options.len() == 1 {
+                    return Err(mlua::Error::external(format!(
+                        "register_setting(\"{id}\"): a choice of one is not a choice. Leave \
+                         `options` out for a checkbox, or give at least two"
+                    )));
+                }
+                let entry = lua.create_table()?;
+                entry.set(
+                    "id",
+                    qualify_id(&owner, &id).map_err(mlua::Error::external)?,
+                )?;
+                entry.set("mod_id", owner.clone())?;
+                // Falls back to the id rather than to nothing: a setting with
+                // no label is a row a player cannot identify, and the id is at
+                // least true.
+                entry.set(
+                    "name",
+                    spec.get::<Option<String>>("name")?
+                        .unwrap_or_else(|| id.clone()),
+                )?;
+                entry.set(
+                    "description",
+                    spec.get::<Option<String>>("description")?
+                        .unwrap_or_default(),
+                )?;
+                let ceiling = if options.is_empty() {
+                    1
+                } else {
+                    options.len() as u32 - 1
+                };
+                // **Clamped, not refused.** A mod shipping a default past its
+                // own options should show the first one rather than fail to
+                // load — the player can see what it does and the author can fix
+                // it, where a refusal is a mod that simply is not there.
+                let default: u32 = spec
+                    .get::<Option<u32>>("default")?
+                    .unwrap_or(0)
+                    .min(ceiling);
+                entry.set("default", default)?;
+                let list = lua.create_table()?;
+                for option in options {
+                    list.push(option)?;
+                }
+                entry.set("options", list)?;
+                let settings: Table = lua.named_registry_value("tiamot.settings")?;
+                settings.push(entry)?;
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(registrar)
+    }
+
     fn action_registrar(&self, mod_id: &str) -> Result<mlua::Function, ScriptError> {
         let owner = mod_id.to_owned();
         let registrar = self
@@ -3191,7 +3356,56 @@ impl MluaVm {
 
         game.set("register_action", self.action_registrar(mod_id)?)
             .map_err(|err| self.vm_error(&err))?;
+        self.install_settings(mod_id, game)?;
         Ok(())
+    }
+
+    /// The `game.setting` function, built once per mod environment.
+    ///
+    /// Answers with the player's choice, or the mod's declared default when
+    /// they have never had an opinion — which is the overwhelmingly common
+    /// case, and the reason a mod can read this without checking whether
+    /// anybody has been to the settings screen.
+    ///
+    /// A boolean for a checkbox and the chosen string for a dropdown, rather
+    /// than the raw number either is stored as: a mod comparing against
+    /// `"medium"` is a mod that still reads correctly when the author inserts
+    /// an option above it.
+    fn setting_reader(&self) -> Result<mlua::Function, ScriptError> {
+        self.lua
+            .create_function(move |lua, (player, id): (String, String)| {
+                let settings: Table = lua.named_registry_value("tiamot.settings")?;
+                let Some(def) = settings
+                    .sequence_values::<Table>()
+                    .filter_map(Result::ok)
+                    .find(|entry| entry.get::<String>("id").is_ok_and(|found| found == id))
+                else {
+                    // A setting nothing declared. `nil`, not an error: a mod
+                    // asking about an id it did not register is a bug in the
+                    // mod, and one that reads a setting it removed last version
+                    // is not.
+                    return Ok(mlua::Value::Nil);
+                };
+                let answers: Table = lua.named_registry_value("tiamot.answers")?;
+                let chosen = answers
+                    .get::<Option<Table>>(player)
+                    .ok()
+                    .flatten()
+                    .and_then(|per_player| {
+                        per_player.get::<Option<u32>>(id.clone()).ok().flatten()
+                    });
+                let value = chosen.unwrap_or_else(|| def.get::<u32>("default").unwrap_or(0));
+                let options: Vec<String> = def.get("options").unwrap_or_default();
+                if options.is_empty() {
+                    return Ok(mlua::Value::Boolean(value != 0));
+                }
+                // Clamped rather than nil: an answer past the end is a mod that
+                // shortened its own list between versions, and the first option
+                // is a better answer than nothing at all.
+                let index = (value as usize).min(options.len() - 1);
+                Ok(mlua::Value::String(lua.create_string(&options[index])?))
+            })
+            .map_err(|err| self.vm_error(&err))
     }
 
     /// The `game.get_light` function, built once per mod environment.
@@ -5075,6 +5289,7 @@ impl MluaVm {
         let sounds = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let hud_scripts = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         let bindings = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+        self.install_setting_tables()?;
         self.lua
             .set_named_registry_value("tiamot.blocks", blocks)
             .map_err(|err| self.vm_error(&err))?;
@@ -5097,22 +5312,7 @@ impl MluaVm {
         self.lua
             .set_named_registry_value("tiamot.tools", tools)
             .map_err(|err| self.vm_error(&err))?;
-        let domain_generators = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
-        self.lua
-            .set_named_registry_value("tiamot.domain_generators", domain_generators)
-            .map_err(|err| self.vm_error(&err))?;
-        let domains = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
-        self.lua
-            .set_named_registry_value("tiamot.domains", domains)
-            .map_err(|err| self.vm_error(&err))?;
-        let fluids = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
-        self.lua
-            .set_named_registry_value("tiamot.fluids", fluids)
-            .map_err(|err| self.vm_error(&err))?;
-        let skies = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
-        self.lua
-            .set_named_registry_value("tiamot.skies", skies)
-            .map_err(|err| self.vm_error(&err))?;
+        self.install_world_tables()?;
         self.install_map_registry()?;
         let tickers = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
         self.lua

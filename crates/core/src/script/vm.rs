@@ -621,6 +621,27 @@ pub struct Action {
     pub default_key: String,
 }
 
+/// One option a mod offers the player.
+///
+/// Declared like an [`Action`] and answered like a key binding: the mod says
+/// what it offers, the client draws it in the screen a player already opens,
+/// and the answer belongs to the world the player is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setting {
+    /// The qualified id, e.g. `"my_mod:show_names"`.
+    pub id: String,
+    /// The mod that registered it, for attribution in the UI.
+    pub mod_id: String,
+    /// What the screen calls it.
+    pub name: String,
+    /// One line under it. Empty when the mod did not say.
+    pub description: String,
+    /// The choices. Empty means a checkbox.
+    pub options: Vec<String>,
+    /// The answer a player who has never touched it gives.
+    pub default: u32,
+}
+
 /// A tool a mod registered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tool {
@@ -1427,6 +1448,16 @@ pub trait ScriptVm: Sized {
     /// Load order rather than sorted, because that is the order the settings
     /// screen groups mods in and it is the only order a player can predict.
     fn registered_actions(&self) -> Vec<Action>;
+
+    /// Every option a mod offers the player, in load order.
+    fn registered_settings(&self) -> Vec<Setting>;
+
+    /// Records one player's answer.
+    ///
+    /// An id nothing registered is ignored: a player may be carrying a
+    /// preference from a newer version of a mod, and refusing it would be a
+    /// disconnection over something nobody can act on.
+    fn set_player_setting(&mut self, player: &crate::identity::PlayerUuid, id: &str, value: u32);
 
     /// The sky a mod registered, if any.
     ///

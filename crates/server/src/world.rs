@@ -356,6 +356,25 @@ impl Generator {
         }
     }
 
+    /// Records one player's answer to a mod's setting.
+    ///
+    /// No outcome and no hook: nothing is asked of any mod, the value is simply
+    /// there the next time one reads it. A world with no mods has nothing to
+    /// answer, which is why the air case does nothing rather than complaining.
+    pub fn set_player_setting(
+        &mut self,
+        player: &tiamot_core::identity::PlayerUuid,
+        id: &str,
+        value: u32,
+    ) {
+        if let Self::Mods(generator) = self {
+            generator
+                .host_mut()
+                .vm_mut()
+                .set_player_setting(player, id, value);
+        }
+    }
+
     /// Asks the mods whether a line of chat may be said.
     ///
     /// Named `may_` rather than `did_`, unlike the dialog and action hooks:

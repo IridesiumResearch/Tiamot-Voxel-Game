@@ -142,6 +142,11 @@ fn a_bot_completes_the_whole_join_flow() {
             // a world whose lettering has not arrived draws in the client's
             // own face, which is a world somebody can play.
             "FontTable",
+            // Protocol v47: a mod's own options, appended after the tables it
+            // has nothing to do with. A player's answers go back the moment
+            // this arrives, so it has to precede the join for a mod to see
+            // them on the player's first tick.
+            "ModSettings",
             "JoinWorld",
         ];
         assert!(
@@ -542,6 +547,7 @@ fn describe(message: &ServerMessage) -> &'static str {
         ServerMessage::HudScripts { .. } => "HudScripts",
         ServerMessage::SoundBindings { .. } => "SoundBindings",
         ServerMessage::FontTable { .. } => "FontTable",
+        ServerMessage::ModSettings { .. } => "ModSettings",
         ServerMessage::JoinWorld { .. } => "JoinWorld",
         ServerMessage::Disconnect { .. } => "Disconnect",
         _ => "other",

@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 46;
+pub const PROTOCOL_VERSION: u32 = 47;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -88,6 +88,9 @@ pub const PROTOCOL_VERSION: u32 = 46;
 // read back the one they got, which makes the seed box write-only and a world
 // worth keeping unshareable. Appended to the variant, safe because the version
 // is agreed in the handshake before a `JoinWorld` is sent.
+// v47 (post-15b): appended `ServerMessage::ModSettings` and
+// `ClientMessage::SetSetting`. A mod's options, declared like its actions and
+// answered by the player like a key binding.
 // v46 (post-15b): `MaterialDef` carries `sway`. Presentation only — the server
 // never reads it — but the client cannot invent which materials are plants.
 // v45 (post-15b): `MaterialDef` carries `passable`. The client predicts its own
@@ -472,6 +475,62 @@ pub struct ActionDef {
     /// Empty means the mod shipped it unbound, which is legitimate: the player
     /// binds it or it does nothing.
     pub default_key: String,
+}
+
+/// Most settings a server's mods may offer between them.
+///
+/// A screen is a thing a player reads, and past a point a list of options is
+/// somewhere preferences go to be lost. It is also untrusted input — a server
+/// sends this — so it needs a bound before it needs a taste.
+pub const MAX_MOD_SETTINGS: usize = 64;
+
+/// What kind of control a mod's setting is drawn as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettingKind {
+    /// A checkbox. The value is `0` or `1`.
+    Toggle,
+    /// A dropdown. The value indexes [`SettingDef::options`].
+    Choice,
+}
+
+/// One option a mod offers the player, as the client needs to see it.
+///
+/// # Why a mod cannot just read a config file
+///
+/// It could — `game.storage` is right there — and it would be a file the player
+/// never finds. A mod's options belong beside the engine's own, in the screen a
+/// player already opens to change things, attributed to the mod that asked for
+/// them. That is the same argument `ActionDef` makes for key bindings, and this
+/// deliberately has the same shape.
+///
+/// # These arrive with a PLAYER, and cannot shape a world
+///
+/// A value is a player's answer, sent when they join and whenever they change
+/// it. Worldgen has already happened by then — for a chunk generated before
+/// anybody joined, it happened with nobody to ask — so a setting cannot decide
+/// how a world is generated, and a mod that tried would get a world whose
+/// terrain depended on who logged in first. Options that shape a world belong
+/// in that mod's own configuration, read at load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingDef {
+    /// The mod that registered it, for attribution in the UI.
+    pub mod_id: String,
+    /// The qualified id, e.g. `"core_ui:compact_hotbar"`.
+    pub id: String,
+    /// What the screen calls it.
+    pub name: String,
+    /// One line under it. Empty when the mod did not say.
+    pub description: String,
+    /// Which control to draw.
+    pub kind: SettingKind,
+    /// The choices, for [`SettingKind::Choice`]. Empty for a toggle.
+    pub options: Vec<String>,
+    /// The answer a player who has never touched it gives.
+    ///
+    /// `0` or `1` for a toggle; an index into `options` for a choice. Out of
+    /// range is clamped rather than refused — a mod that ships a bad default
+    /// should show its first option, not fail to load.
+    pub default: u32,
 }
 
 /// A font a mod registered, as the client needs to see it.
@@ -1080,6 +1139,28 @@ pub enum ClientMessage {
     SelectSlot {
         /// Zero-based, into `player:main`.
         slot: u16,
+    },
+
+    /// The player's answer to one of a mod's settings.
+    ///
+    /// **Appended at the end** (protocol v47).
+    ///
+    /// Sent for every setting the player has an answer to when they join, and
+    /// again whenever one changes. A setting the client says nothing about is
+    /// the mod's declared default — the same rule key bindings follow, and the
+    /// reason a client that has never seen a mod before still behaves.
+    ///
+    /// An id nothing registered is IGNORED rather than refused. A player who
+    /// keeps their preferences and joins a server running an older version of
+    /// the mod is not doing anything wrong, and disconnecting them over a
+    /// setting that no longer exists would be a very expensive way to say
+    /// nothing.
+    SetSetting {
+        /// The qualified id, as sent in [`ServerMessage::ModSettings`].
+        id: String,
+        /// `0` or `1` for a toggle; an index into the declared options for a
+        /// choice. Out of range is clamped, for the reason a bad default is.
+        value: u32,
     },
 }
 
@@ -1844,6 +1925,20 @@ pub enum ServerMessage {
         /// [`crate::font::MAX_FONTS`].
         fonts: Vec<FontDef>,
     },
+
+    /// The options a server's mods offer the player, sent once on join.
+    ///
+    /// **Appended at the end** (protocol v47).
+    ///
+    /// The same shape and the same argument as [`ServerMessage::Actions`]: a
+    /// mod declares, the client draws it in the screen a player already opens,
+    /// and the player's answer is theirs to keep. Empty for a server whose mods
+    /// offer nothing, which is most of them.
+    ModSettings {
+        /// Every registered setting, in load order, bounded by
+        /// [`MAX_MOD_SETTINGS`].
+        settings: Vec<SettingDef>,
+    },
 }
 
 /// An entity as a client is first told about it.
@@ -2153,6 +2248,13 @@ pub fn validate_client_message(message: &ClientMessage) -> Result<(), ProtocolEr
             check_len("action_id", id.len(), MAX_ID_BYTES)?;
         }
         ClientMessage::DialogEvent { form, event } => check_dialog_event(form, event)?,
+        ClientMessage::SetSetting { id, .. } => {
+            // An id a client chose, bounded before it is looked up — the same
+            // reason `Action`'s is. The VALUE needs no check: it is a `u32`,
+            // every one of them is a legal answer, and what a mod does with one
+            // out of range is clamp it.
+            check_len("setting_id", id.len(), MAX_ID_BYTES)?;
+        }
         ClientMessage::SelectTool { tool: Some(tool) } => {
             // An id is a string from a peer. Bounded like a display name, and
             // for the same reason: it is stored and echoed.
@@ -2536,6 +2638,28 @@ pub fn validate_server_message(message: &ServerMessage) -> Result<(), ProtocolEr
         ServerMessage::EntitySpawn { entities } => check_entity_spawns(entities)?,
         ServerMessage::EntityDespawn { entities } => {
             check_len("entity_despawn", entities.len(), MAX_ENTITIES_PER_MESSAGE)?;
+        }
+        // **A server's own list, and a server is not trusted** (charter rule
+        // 14). Every string here is drawn on a screen and kept for the session.
+        ServerMessage::ModSettings { settings } => {
+            check_len("mod_settings", settings.len(), MAX_MOD_SETTINGS)?;
+            for setting in settings {
+                check_len("setting_id", setting.id.len(), MAX_ID_BYTES)?;
+                check_len("setting_mod", setting.mod_id.len(), MAX_ID_BYTES)?;
+                check_len("setting_name", setting.name.len(), MAX_NAME_BYTES)?;
+                check_len(
+                    "setting_description",
+                    setting.description.len(),
+                    MAX_CHAT_BYTES,
+                )?;
+                // A dropdown with hundreds of entries is not a dropdown. The
+                // same bound the list itself gets, which is generous for a
+                // control a person reads.
+                check_len("setting_options", setting.options.len(), MAX_MOD_SETTINGS)?;
+                for option in &setting.options {
+                    check_len("setting_option", option.len(), MAX_NAME_BYTES)?;
+                }
+            }
         }
         // **A held stack is a shape, and a server is not trusted** (charter
         // rule 14). The same check the spawn's item gets, for the same reason:
