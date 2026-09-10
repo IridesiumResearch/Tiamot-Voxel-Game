@@ -708,6 +708,45 @@ somebody debugs from the wrong end.
 
 ---
 
+### 8.3 Swaying materials — fake wind
+
+A material may declare itself **swaying**, and then the TOP of it moves.
+
+**Presentation only, and it moves nothing real.** The world does not know the
+grass is bending: collision, lighting, meshing and the server's idea of where
+anything is are all untouched, and two clients with different frame rates
+disagree about where a leaf is at any instant without disagreeing about
+anything that matters. Charter rule 4 does not reach it — rendering is exempt.
+
+**Which vertex moves is geometry; whether it moves at all is the material.**
+The two are decided in different places on purpose:
+
+- The mesher marks the vertices on the **top edge** of every quad, from the
+  quad's own corners: for a face pointing up, all four; for a side face, the
+  two with the greater height; for a face pointing down, none. It asks nothing
+  about the material, so the mark costs a comparison per corner and no lookup.
+- The shader displaces a marked vertex only if its material declares a sway
+  amplitude. A world whose mods declare none does not read the table at all.
+
+Marking the top edge rather than the whole quad is what makes it **bend rather
+than slide**. Greedy meshing merges a plant's side into one quad spanning its
+whole height, so displacing the top corners and leaving the bottom ones gives a
+linear bend from base to tip for free — and the base stays planted, which a
+rigid offset would not.
+
+The motion is the engine's own smooth noise sampled at the vertex's world
+position and the animation clock, so neighbouring plants move together in
+gusts rather than each buzzing independently, and a plant keeps its phase as
+the camera moves.
+
+**A cell that is not the top of anything still gets marked** if it is the top
+of its own quad. That is not a defect: the alternative is asking the world what
+is above every cell at mesh time, and the artefact it would fix — a fern's
+midriff moving because it happens to be the top of one merged run — is smaller
+than a per-cell lookup across the whole chunk.
+
+---
+
 ## 9. Inventory — 27-unit arithmetic, no exceptions
 
 Charter rule 5, implemented in Task 02. Quantities are stored in units as `u32`;

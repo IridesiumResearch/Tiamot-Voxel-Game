@@ -152,12 +152,16 @@ struct Globals {
     /// Takes one of the three padding words, so the `vec4`s below still sit
     /// where WGSL expects them.
     tint_any: u32,
+    /// Whether ANY material in this world sways, for the same reason and out of
+    /// the same padding. Read in the VERTEX stage — Contract §8.3 — so a world
+    /// with no plants does not sample noise per vertex to discover it is still.
+    sway_any: u32,
     /// Padding to the 16-byte boundary the `vec4`s below sit on.
     ///
     /// Not decorative. WGSL aligns a `vec4<f32>` to 16 bytes, so the shader
     /// reads `sun_colour` from offset 112 whatever this side does; without
     /// these the Rust struct ends short and every colour arrives shifted.
-    _pad: [u32; 2],
+    _pad: [u32; 1],
     /// The sun's colour, which a mod sets through the sky (Task 10).
     sun_colour: [f32; 4],
     /// The sky's colour in `xyz`, and where fog reaches full strength in `w`.
@@ -260,13 +264,29 @@ pub const BODY_WIDTH_CELLS: u8 = 2;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialTint {
-    /// Tone amplitude in x, blocks per period in y, two spare.
+    /// Tone amplitude in x, blocks per period in y, sway amplitude in z, one
+    /// spare.
+    ///
+    /// Sway rides in the tint's own entry rather than a second buffer: it is one
+    /// number per material read by the vertex stage, and a binding of its own
+    /// would be a second storage buffer bound for every draw to carry four
+    /// bytes.
     params: [f32; 4],
     /// The colour at the low end of the field, as multipliers. w unused.
     low: [f32; 4],
     /// The colour at the high end.
     high: [f32; 4],
 }
+
+/// How far the top of a swaying material moves, in blocks.
+///
+/// **A twelfth of a yard, which is a third of a sub-node cell.** Grass that
+/// moves further than the cell it grows in stops reading as wind and starts
+/// reading as the world being loose. One constant rather than a per-material
+/// number for the reason the alpha threshold is one: what a plant looks like is
+/// its texture's business, and a second knob beside it is a second thing to get
+/// wrong.
+const SWAY_AMPLITUDE: f32 = 1.0 / 12.0;
 
 impl MaterialTint {
     /// A material that draws exactly as its texture.
@@ -1215,10 +1235,17 @@ impl Renderer {
             if let Some(tint) = entry.tint.as_ref() {
                 tints[usize::from(entry.id)] = MaterialTint::from_def(tint);
             }
+            // **Written after the tint, into the entry either way.** A plant
+            // that declares no colour field still needs a row here to carry its
+            // sway, and one that declares both keeps the tint it was given.
+            if entry.sway {
+                tints[usize::from(entry.id)].params[2] = SWAY_AMPLITUDE;
+            }
         }
         self.tints = TintTable {
             buffer: upload_tints(&self.gpu, &tints),
             any: u32::from(table.iter().any(|entry| entry.tint.is_some())),
+            swaying: u32::from(table.iter().any(|entry| entry.sway)),
         };
         self.bind_group = make_bind_group(
             &self.gpu,
@@ -1642,7 +1669,8 @@ impl Renderer {
             ambient: AMBIENT_FLOOR,
             fog_curve: self.fog_curve,
             tint_any: self.tints.any,
-            _pad: [0; 2],
+            sway_any: self.tints.swaying,
+            _pad: [0; 1],
             sun_colour: self.sun_colour,
             // Fog's far distance rides in the sky colour's unused fourth
             // component rather than costing another sixteen bytes of padding.
@@ -2997,7 +3025,13 @@ fn build_bind_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
                 // once per fragment.
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // **Both stages.** The fragment reads a material's colour
+                    // field from here; the vertex reads its sway amplitude
+                    // (Contract §8.3), because bending is a change of position
+                    // and position is decided in the vertex stage. A layout
+                    // naming only one of them is a pipeline that refuses to
+                    // build, which is how this was found rather than shipped.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
@@ -3494,6 +3528,7 @@ fn build_atlas_bindings(
     // One entry saying nothing varies: no material does until a table says so.
     let tints = TintTable {
         buffer: upload_tints(gpu, &[MaterialTint::none()]),
+        swaying: 0,
         any: 0,
     };
     let bind_group = make_bind_group(gpu, layout, globals, &view, sampler, &tints.buffer);
@@ -3510,6 +3545,8 @@ struct TintTable {
     /// Uploaded to the shader as `Globals::tint_any`. A `u32` because that is
     /// what a uniform carries.
     any: u32,
+    /// The same, for whether any material sways — `Globals::sway_any`.
+    swaying: u32,
 }
 
 /// Uploads the per-material tint table.

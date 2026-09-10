@@ -563,6 +563,26 @@ local card = (1 << 12) | (1 << 13) | (1 << 14) | (1 << 4) | (1 << 22)
 game.set_block(pos, "my_mod:grass", card, { merge = true })
 ```
 
+**And `sway = true` makes it move.**
+
+```lua
+game.register_block{ id = "grass", cutout = true, passable = true, sway = true }
+```
+
+Presentation only: the world does not know the grass is moving, so collision,
+lighting and the server's idea of where anything is are untouched, and two
+clients at different frame rates disagree about where a leaf is without
+disagreeing about anything that matters.
+
+**It bends rather than slides**, because the mesher marks the top edge of each
+face and the shader moves only those vertices — greedy meshing spans a plant's
+whole height in one quad, so the base staying put gives a linear bend from base
+to tip. The motion is the engine's own noise over world position and time, so a
+field leans in gusts instead of every plant buzzing on its own.
+
+There is no amplitude to set. What a plant looks like is its texture's business
+and its shape's; a knob beside them is a third thing to get wrong.
+
 **Erosion, rivers and biome blending are compositions**, not engine features.
 Build them from `game.density`'s arithmetic. If a shape genuinely cannot be
 expressed with the operations that exist, that is a finding worth reporting —

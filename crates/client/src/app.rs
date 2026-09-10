@@ -6504,6 +6504,7 @@ mod tests {
                 transparent: false,
                 cutout: false,
                 passable: false,
+                sway: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6515,6 +6516,7 @@ mod tests {
                 transparent: false,
                 cutout: false,
                 passable: false,
+                sway: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6550,6 +6552,7 @@ mod tests {
             transparent: false,
             cutout: false,
             passable: false,
+            sway: false,
             tint: None,
             step_sound: None,
         }];

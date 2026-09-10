@@ -1282,11 +1282,28 @@ impl Mesh {
 
         for quad in quads {
             let base = u32::try_from(vertices.len()).unwrap_or(0);
-            for (corner, (x, y, z)) in quad_corners(quad).into_iter().enumerate() {
+            let corners = quad_corners(quad);
+            // **Which corners are the top edge**, for Contract §8.3's fake
+            // wind. Geometry only: nothing here asks what the material is,
+            // because the shader decides whether a marked vertex actually moves
+            // and a world with no plants reads none of it.
+            //
+            // A face pointing DOWN has no top edge — marking it would displace
+            // the underside of a plant and unplant it. One pointing up is all
+            // top. A side face is its corners at the greater height, which is
+            // what makes a plant BEND: greedy meshing spans its whole height in
+            // one quad, so moving the top corners and leaving the bottom ones
+            // is a linear bend from base to tip for nothing.
+            let highest = corners.iter().map(|(_, y, _)| *y).max().unwrap_or(0);
+            let tops = match (quad.axis, quad.positive) {
+                (1, false) => u32::MAX,
+                (1, true) | (_, _) => highest,
+            };
+            for (corner, (x, y, z)) in corners.into_iter().enumerate() {
                 // Corner `n` of the shade is vertex `n` here: both walk
                 // `[(0,0), (1,0), (1,1), (0,1)]`, and `crate::shade::Shade`
                 // says so where it is defined.
-                vertices.push(PackedVertex::lit(
+                let vertex = PackedVertex::lit(
                     x,
                     y,
                     z,
@@ -1294,7 +1311,8 @@ impl Mesh {
                     quad.positive,
                     quad.material,
                     quad.shade.corner(corner),
-                ));
+                );
+                vertices.push(if y == tops { vertex.on_top() } else { vertex });
             }
             push_quad_indices(&mut indices, base, quad);
         }
@@ -1673,6 +1691,28 @@ impl PackedVertex {
     #[must_use]
     pub const fn light(&self) -> tiamot_core::light::Light {
         tiamot_core::light::Light((self.material >> 16) as u16)
+    }
+
+    /// The same vertex, marked as the top edge of its quad.
+    ///
+    /// Its own step rather than an argument to [`Self::lit`], which already
+    /// takes seven and would need an eighth for a bit most callers have no
+    /// opinion about.
+    #[must_use]
+    pub const fn on_top(mut self) -> Self {
+        self.packed |= 1 << 31;
+        self
+    }
+
+    /// Whether this vertex is on the top edge of its quad.
+    ///
+    /// Bit 31, the one the packing had spare. Read by the vertex shader to bend
+    /// a swaying material — Sub-Node Contract §8.3 — and ignored by everything
+    /// else, which is why the mesher can set it without asking what the
+    /// material is.
+    #[must_use]
+    pub const fn top(&self) -> bool {
+        self.packed >> 31 != 0
     }
 
     /// The occlusion level this vertex carries, `0` darkest to `3` open.
@@ -3395,6 +3435,60 @@ mod tests {
         fn any_cutout(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn only_the_top_edge_of_a_quad_is_marked_for_the_wind() {
+        // **Contract §8.3.** The shader bends whatever the mesher marks, so
+        // what is marked decides whether a plant bends or slides. A side face
+        // is marked at its greater height and not at its lesser: greedy meshing
+        // spans a plant's whole height in one quad, so that is a linear bend
+        // from base to tip. A face pointing DOWN is marked nowhere, or the
+        // underside of a plant moves and unplants it.
+        let mut column = empty();
+        // Three blocks tall, so the side faces really do span a height and the
+        // test is not about a single cube.
+        for y in 4..7 {
+            column
+                .set_block(BlockPos::new(4, y, 4), BlockValue::Uniform(STONE))
+                .expect("in chunk");
+        }
+        let mesh = mesh_chunk(
+            &column,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &NoGlass,
+        );
+
+        let (vertices, _) = mesh.to_buffers();
+        assert!(!vertices.is_empty(), "the column produced no geometry");
+
+        let marked: Vec<&PackedVertex> = vertices.iter().filter(|v| v.top()).collect();
+        assert!(!marked.is_empty(), "nothing was marked for the wind at all");
+
+        // Every marked vertex is at the column's own top, and every vertex
+        // there that belongs to a face which HAS a top edge is marked.
+        let highest = vertices.iter().map(|v| v.position().1).max().expect("any");
+        for vertex in &marked {
+            assert_eq!(
+                vertex.position().1,
+                highest,
+                "a vertex below the top of the column was marked for the wind"
+            );
+        }
+
+        // And the underside is not marked, which the height check above cannot
+        // see: the bottom face's corners are all at the column's lowest y, so
+        // they would fail that assertion only if they were marked at all.
+        let lowest = vertices.iter().map(|v| v.position().1).min().expect("any");
+        assert!(
+            !vertices
+                .iter()
+                .any(|vertex| vertex.top() && vertex.position().1 == lowest),
+            "the underside of the column was marked, which would unplant it"
+        );
     }
 
     #[test]

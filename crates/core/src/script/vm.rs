@@ -234,6 +234,14 @@ pub use crate::dig::Brush;
 /// same reason those are apart from each other: the id order is a contract with
 /// the material registry, and widening that tuple would drag simulation rules
 /// into it.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent facts a mod declares about a block, each read by \
+              a different system — the mesher, the light, the body sweep and the \
+              vertex stage. Grouping them into one enum would mean inventing \
+              combinations nobody asked for: a block can be cutout AND passable \
+              AND swaying, and glass can be none of the three"
+)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockRules {
     /// The qualified block id.
@@ -307,6 +315,12 @@ pub struct BlockRules {
     /// and — importantly — for the dig ray, or a tuft nothing collided with
     /// would be a tuft nothing could aim at. See `docs/subnode-contract.md` §2.
     pub passable: bool,
+    /// Whether the top of it moves in a fake wind.
+    ///
+    /// **Presentation only.** Nothing on the server reads it; it travels with
+    /// the material table so the client can bend the geometry it draws. See
+    /// `docs/subnode-contract.md` §8.3.
+    pub sway: bool,
     /// How this material's colour varies across the world, if a mod said.
     ///
     /// **Presentation only.** Nothing on the server reads it — it travels with

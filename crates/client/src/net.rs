@@ -2024,6 +2024,7 @@ mod tests {
                 transparent: false,
                 cutout: false,
                 passable: false,
+                sway: false,
                 tint: None,
             })
             .collect()

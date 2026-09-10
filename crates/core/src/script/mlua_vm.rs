@@ -1962,6 +1962,11 @@ impl ScriptVm for MluaVm {
                             .and_then(|entry| entry.get::<Option<bool>>("passable").ok())
                             .flatten()
                             .unwrap_or(false),
+                        sway: entry
+                            .as_ref()
+                            .and_then(|entry| entry.get::<Option<bool>>("sway").ok())
+                            .flatten()
+                            .unwrap_or(false),
                     },
                 )
             })
@@ -5395,7 +5400,7 @@ impl MluaVm {
 /// A flag is recorded whether or not the mod set it, like the rules beside it:
 /// an absent flag and a `false` one must not be distinguishable downstream.
 fn copy_block_flags(spec: &Table, entry: &Table) -> mlua::Result<()> {
-    for flag in ["transparent", "cutout", "passable"] {
+    for flag in ["transparent", "cutout", "passable", "sway"] {
         if let Some(value) = spec.get::<Option<bool>>(flag)? {
             entry.set(flag, value)?;
         }
@@ -6285,7 +6290,7 @@ const FLUID_FIELDS: [&str; 6] = [
 /// accepted them would be an API promising behaviour nothing implements.
 const ITEM_FIELDS: [&str; 4] = ["id", "name", "texture", "description"];
 
-const BLOCK_FIELDS: [&str; 15] = [
+const BLOCK_FIELDS: [&str; 16] = [
     "id",
     "name",
     "drops",
@@ -6301,6 +6306,7 @@ const BLOCK_FIELDS: [&str; 15] = [
     "transparent",
     "cutout",
     "passable",
+    "sway",
 ];
 
 /// Keys the `textures` sub-table accepts.

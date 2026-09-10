@@ -42,6 +42,10 @@ struct Globals {
     // coherent across every fragment and predicts perfectly, where a storage
     // load per fragment to discover "nothing" does not.
     tint_any: u32,
+    // Whether any material sways, read by the VERTEX stage — Contract §8.3.
+    // Same argument as `tint_any`: a world with no plants must not sample noise
+    // per vertex to discover it is still.
+    sway_any: u32,
     // The remaining padding the Rust side spells out is implicit here: WGSL
     // aligns a vec4 to 16 bytes, so this lands at offset 112 either way.
     sun_colour: vec4<f32>,
@@ -80,6 +84,13 @@ struct MaterialTint {
     high: vec4<f32>,
 };
 @group(0) @binding(3) var<storage, read> tints: array<MaterialTint>;
+
+// How fast the wind field drifts, in field units a second.
+const WIND_SPEED: f32 = 0.08;
+// How coarse it is: one over the size of a gust, in blocks. A twentieth means a
+// gust about twenty yards across, so a field of grass leans in waves instead of
+// every plant deciding for itself.
+const WIND_SCALE: f32 = 0.05;
 
 // A hash of an integer lattice point, in 0..1.
 //
@@ -277,7 +288,36 @@ fn unpack_vertex(input: VertexIn) -> VertexOut {
     let local = vec3<f32>(x, y, z) / subnodes;
 
     var out: VertexOut;
-    let camera_relative = local + input.chunk_offset.xyz;
+
+    // **Fake wind, Contract §8.3.** The mesher marked the vertices on the top
+    // edge of each quad; this moves them and leaves the rest, which is what
+    // makes a plant BEND rather than slide — greedy meshing spans a plant's
+    // whole height in one quad, so the bottom corners staying put gives a
+    // linear bend from base to tip for nothing.
+    //
+    // Nothing about it is simulation: the world does not know the grass is
+    // moving, and charter rule 4 does not reach rendering.
+    var swayed = local;
+    if (globals.sway_any != 0u && (input.packed >> 31u) != 0u) {
+        let anchored_here = local + input.chunk_world.xyz;
+        let amplitude = tints[input.material & 0xFFFFu].params.z;
+        if (amplitude > 0.0) {
+            // Sampled at the vertex's WORLD position so a plant keeps its
+            // phase as the camera moves, and slowly enough in space that
+            // neighbours lean together in gusts rather than each buzzing on
+            // its own.
+            let time = globals.fluid.x;
+            let drift = vec3<f32>(time * WIND_SPEED, 0.0, time * WIND_SPEED * 0.6);
+            let field = anchored_here * WIND_SCALE + drift;
+            // Two samples a quarter-period apart in the field, so the two axes
+            // are independent and the tip traces a wander rather than a line.
+            let x = tint_noise(field) * 2.0 - 1.0;
+            let z = tint_noise(field + vec3<f32>(31.7, 0.0, 11.3)) * 2.0 - 1.0;
+            swayed = local + vec3<f32>(x, 0.0, z) * amplitude;
+        }
+    }
+
+    let camera_relative = swayed + input.chunk_offset.xyz;
     out.clip = globals.view_projection * vec4<f32>(camera_relative, 1.0);
     out.distance = length(camera_relative);
     out.world = camera_relative;

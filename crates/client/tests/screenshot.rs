@@ -727,6 +727,7 @@ fn a_declared_tint_colours_the_world_and_stays_where_the_world_is() {
         transparent: false,
         cutout: false,
         passable: false,
+        sway: false,
         tint: Some(Tint {
             strength: 255,
             scale: 24,
@@ -2847,6 +2848,83 @@ fn spread(image: &Image) -> f32 {
 }
 
 #[test]
+fn a_swaying_material_moves_with_the_clock_and_a_still_one_does_not() {
+    // **Contract §8.3, end to end.** The mesher marks a quad's top edge and the
+    // shader bends it, and neither half is worth anything without the other:
+    // marks nothing reads are invisible, and a shader reading marks nobody sets
+    // moves nothing.
+    //
+    // The still material is the half that makes this a test. Every frame in a
+    // world differs from the last for a dozen reasons, so "the picture changed"
+    // proves nothing on its own — what proves it is that the picture changed
+    // for the material that declared `sway` and did NOT for the one beside it.
+    let Some(gpu) = gpu() else { return };
+
+    const PLANT: MaterialId = MaterialId(2);
+
+    let table = |sway: bool| {
+        vec![MaterialDef {
+            id: PLANT.get(),
+            name: "plant".to_owned(),
+            step_sound: None,
+            texture: None,
+            placeable: true,
+            transparent: false,
+            cutout: false,
+            passable: false,
+            sway,
+            tint: None,
+        }]
+    };
+
+    // A single column, seen from the side and close, so the top edge is a
+    // large part of the frame and a twelfth of a block moves real pixels.
+    let mut chunk = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+    for y in 6..10 {
+        chunk
+            .set_block(BlockPos::new(8, y, 8), BlockValue::Uniform(PLANT))
+            .expect("in chunk");
+    }
+
+    // Yaw zero faces +z, so the camera stands SHORT of the column and looks
+    // along the axis at it. Standing past it and looking back is the mistake
+    // that renders sky and reads as the feature doing nothing.
+    let mut camera = Camera {
+        position: Position::from_world(8.5, 8.0, 4.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, 0.0);
+
+    let moved = |sway: bool| {
+        let mut renderer =
+            Renderer::new(gpu.clone(), RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+        let atlas = Atlas::build(&[None, None, Some(Image::solid(16, 16, [90, 170, 90, 255]))]);
+        renderer.set_atlas(&atlas);
+        renderer.set_tints(&table(sway));
+        upload(&mut renderer, std::slice::from_ref(&chunk));
+        let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+        let first = target.capture(&mut renderer, &camera).expect("capture");
+        // Far enough for the wind field to have drifted somewhere else.
+        renderer.advance_clock(6.0);
+        let later = target.capture(&mut renderer, &camera).expect("capture");
+        pixels_beyond(&first, &later, 8)
+    };
+
+    let swaying = moved(true);
+    let still = moved(false);
+
+    assert!(
+        swaying > 0.0,
+        "a swaying material drew the same picture six seconds later, so nothing is bending"
+    );
+    assert_eq!(
+        still, 0.0,
+        "a material that declared no sway moved anyway, so the clock is bending everything"
+    );
+}
+
+#[test]
 fn one_material_is_not_one_flat_colour() {
     // **What `CELL_VARIATION` is for, and the bound on it.** A wall of one
     // material is the same texel repeated across hundreds of cells, which reads
@@ -3720,6 +3798,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             transparent: false,
             cutout: false,
             passable: false,
+            sway: false,
             tint: None,
             texture: None,
         },
@@ -3731,6 +3810,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             transparent: false,
             cutout: false,
             passable: false,
+            sway: false,
             tint: None,
             texture: None,
         },
@@ -3742,6 +3822,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             transparent: false,
             cutout: false,
             passable: false,
+            sway: false,
             tint: None,
             texture: Some([7u8; 32]),
         },
