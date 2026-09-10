@@ -201,6 +201,32 @@ fn run_frames(app: &mut App, done: impl Fn(&App) -> bool) -> bool {
 /// same day. This is stricter where it counts — a uniform frame fails even if it
 /// happens to be the right hue — and no longer asks a question about colour that
 /// the renderer is entitled to answer either way.
+/// The share of pixels where two frames differ by more than a tolerance.
+///
+/// The same measure `screenshot.rs` uses, and duplicated rather than shared for
+/// the reason every helper in these two files is: they are separate integration
+/// binaries, and a `tests/common` module would be compiled into both anyway.
+fn pixels_beyond(
+    here: &client::texture::Image,
+    there: &client::texture::Image,
+    tolerance: u8,
+) -> f32 {
+    let mut differing = 0u64;
+    let mut counted = 0u64;
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let (Some(a), Some(b)) = (here.pixel(x, y), there.pixel(x, y)) else {
+                continue;
+            };
+            counted += 1;
+            if (0..3).any(|channel| a[channel].abs_diff(b[channel]) > tolerance) {
+                differing += 1;
+            }
+        }
+    }
+    differing as f32 / counted.max(1) as f32
+}
+
 fn shows_a_world(frame: &client::texture::Image) -> bool {
     let mut lowest = [f32::MAX; 3];
     let mut highest = [f32::MIN; 3];
@@ -396,11 +422,25 @@ fn teleporting_fifty_thousand_blocks_leaves_the_geometry_where_it_was() {
         "the frame at 50,000 blocks out is empty sky, so this proves nothing about jitter — \
          the world did not come along"
     );
-    assert_eq!(
-        perceptual_hash(&before),
-        perceptual_hash(&away),
-        "the picture changed at the edge of the world; something in the render path is \
-         accumulating a world-space f32"
+    // **Not identical, and that is not a weakening.** The world has a colour
+    // field anchored to WORLD position — `material_tint`, and the per-cell
+    // variation §8.3's neighbour in `world.wgsl` — so the same scene in two
+    // places is not supposed to produce the same pixels. Demanding it does is
+    // asserting the absence of a feature, and this test passed until now only
+    // because nothing in its world declared a tint.
+    //
+    // What still holds is that nothing GROSS moved. Per pixel rather than per
+    // region average, because the fault this catches shifts geometry: an edge
+    // moves and the pixels along it change completely while the average of the
+    // region containing them barely does. Measured in the sibling tests in
+    // `screenshot.rs`, a one-block displacement at 50,000 blocks moves no
+    // region average by even three per cent.
+    let differing = pixels_beyond(&before, &away, 8);
+    assert!(
+        differing < 0.005,
+        "{:.1}% of the picture changed at the edge of the world by more than the colour field \
+         can account for; something in the render path is accumulating a world-space f32",
+        differing * 100.0
     );
 
     // Idempotent: the displacement is absolute, so a second press is a no-op
