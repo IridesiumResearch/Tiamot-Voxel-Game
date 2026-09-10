@@ -96,6 +96,34 @@ fn tint_hash(cell: vec3<i32>) -> f32 {
     return f32(h & 0xFFFFFFu) / f32(0xFFFFFFu);
 }
 
+// How far a single cell's colour may stray from its texture's, either way.
+//
+// **One per cent, and it is meant to be invisible as an effect.** What it fixes
+// is a wall of one material reading as a painted surface rather than as a
+// material: identical texels repeated across hundreds of cells look flat in a
+// way no amount of lighting hides. A per-cell nudge gives the eye something to
+// find grain in. Bigger than this and it stops being grain and starts being
+// noise, which is a different and much worse artefact.
+//
+// Presentation only, so charter rule 4 does not reach it (rendering is exempt).
+// It is still STABLE — the hash takes an integer lattice point, so a cell keeps
+// its own value across frames, camera moves and remeshes. A hash of a float
+// would shift in its last bit as the camera moved and shimmer.
+const CELL_VARIATION: f32 = 0.01;
+
+// The brightness this cell keeps, in `1 +/- CELL_VARIATION`.
+//
+// **Half a cell back along the normal**, so every face of a cell samples the
+// cell it BELONGS to. A face sits exactly on a boundary, and flooring the
+// position there would give the six faces of one cell up to two different
+// values — the cell would read as two shades stuck together rather than as one
+// slightly-off cube.
+fn cell_variation(anchored: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let inside = anchored - normal / (CELLS_PER_BLOCK * 2.0);
+    let cell = vec3<i32>(floor(inside * CELLS_PER_BLOCK));
+    return 1.0 + (tint_hash(cell) * 2.0 - 1.0) * CELL_VARIATION;
+}
+
 // Smooth value noise: the lattice hash, interpolated with a fade curve.
 //
 // One octave. Two would be smoother and this is a tint rather than terrain —
@@ -744,7 +772,7 @@ fn shadow_factor(input: VertexOut) -> f32 {
 // Shared by both entry points so the atlas lookup, the lighting and the fog
 // exist once. The only difference between a shadowed frame and an unshadowed
 // one is the number that arrives here.
-fn surface(input: VertexOut, shadow: f32) -> vec4<f32> {
+fn surface(input: VertexOut, shadow: f32, variation: f32) -> vec4<f32> {
     if (globals.render_mode == 1u) {
         // Flat: directional shading and occlusion, no propagated light.
         // **Mode 1 must keep Task 08's cost profile exactly**, and that
@@ -772,7 +800,12 @@ fn surface(input: VertexOut, shadow: f32) -> vec4<f32> {
     // so it multiplies the albedo and then the lighting acts on the result. Over
     // the top it would tint the sunlight as well, and a lamp would come out the
     // colour of the ground it was standing on.
-    let albedo = texel.rgb * material_tint(input.slot, input.anchored);
+    // **Under the light with the tint, and for the tint's reason**: the
+    // variation is part of what colour this cell IS. Over the lighting it would
+    // jitter the sunlight, and over the fog it would put grain on the haze — at
+    // distance the fog is most of the colour, so that is where a per-cell
+    // pattern would be most visible and least wanted.
+    let albedo = texel.rgb * material_tint(input.slot, input.anchored) * variation;
     let lit = albedo * lighting(input, shadow);
 
     // Mode 3 fogs in the post chain instead, from the depth buffer — which is
@@ -966,7 +999,13 @@ fn fluid_fragment(input: FluidOut) -> @location(0) vec4<f32> {
     if (globals.lighting_mode == 1u) {
         shadow = generic_shadow(lit);
     }
-    let colour = surface(lit, shadow);
+    // **No cell variation on milk**, and it is passed explicitly rather than
+    // left out: a fluid surface is a smooth sheet whose whole point is that it
+    // is not made of cells, and the fluid vertex carries no world anchor to
+    // hash even if it wanted one — `FluidIn` has a chunk offset and no
+    // `chunk_world`, which is also why `material_tint` reads the field at the
+    // origin for fluid rather than where the pond is.
+    let colour = surface(lit, shadow, 1.0);
     return vec4<f32>(colour.rgb, colour.a * FLUID_ALPHA);
 }
 
@@ -977,15 +1016,23 @@ fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
     // at all, only the axis constants in `face_shade` — so handing it a facing
     // term would be shading it twice by two different rules.
     if (globals.lighting_mode == 0u) {
-        return surface(input, 1.0);
+        return surface(input, 1.0, cell_variation(input.anchored, input.normal));
     }
-    return surface(input, generic_shadow(input));
+    return surface(
+        input,
+        generic_shadow(input),
+        cell_variation(input.anchored, input.normal),
+    );
 }
 
 // Mode 3: the same surface, with the cascades consulted.
 @fragment
 fn fragment_shadowed(input: VertexOut) -> @location(0) vec4<f32> {
-    return surface(input, shadow_factor(input));
+    return surface(
+        input,
+        shadow_factor(input),
+        cell_variation(input.anchored, input.normal),
+    );
 }
 
 // Foliage: the same surface, with the texture's holes taken out of it.
@@ -1001,7 +1048,11 @@ fn fragment_shadowed(input: VertexOut) -> @location(0) vec4<f32> {
 // it, and the terrain must not pay that to make leaves work.
 @fragment
 fn fragment_cutout(input: VertexOut) -> @location(0) vec4<f32> {
-    let colour = surface(input, generic_shadow(input));
+    let colour = surface(
+        input,
+        generic_shadow(input),
+        cell_variation(input.anchored, input.normal),
+    );
     // Half, and a constant rather than a per-material number for §8.1's
     // reason: the texture already carries the alpha and a second threshold
     // beside it would be two sources of truth for one appearance.

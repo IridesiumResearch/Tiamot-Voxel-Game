@@ -2805,6 +2805,87 @@ fn spread(image: &Image) -> f32 {
         .fold(0.0, f32::max)
 }
 
+#[test]
+fn one_material_is_not_one_flat_colour() {
+    // **What `CELL_VARIATION` is for, and the bound on it.** A wall of one
+    // material is the same texel repeated across hundreds of cells, which reads
+    // as a painted surface rather than as a material. Each cell keeps a
+    // brightness of its own, within one per cent, so the eye finds grain in it.
+    //
+    // Two assertions, and neither means anything without the other: the colours
+    // across the wall must DIFFER, or the variation is not happening; and they
+    // must differ by very little, or it has stopped being grain and become
+    // noise. A test that only checked the first would pass just as well on a
+    // wall of random colours.
+    let Some(gpu) = gpu() else { return };
+
+    const WALL: MaterialId = MaterialId(2);
+
+    // A floor seen from above, close enough that one cell is several pixels
+    // wide, under flat daylight so nothing but the material's own colour varies
+    // across it. The same arrangement the glass test uses, for the same reason:
+    // looking down at a floor is the one framing where the whole frame is one
+    // surface and nothing else can account for a difference.
+    let mut chunk = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+    for x in 0..16 {
+        for z in 0..16 {
+            chunk
+                .set_block(BlockPos::new(x, 8, z), BlockValue::Uniform(WALL))
+                .expect("in chunk");
+        }
+    }
+
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+    let atlas = Atlas::build(&[None, None, Some(Image::solid(16, 16, [150, 150, 150, 255]))]);
+    renderer.set_atlas(&atlas);
+
+    let mut camera = Camera {
+        position: Position::from_world(8.0, 12.0, 8.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -1.4);
+    let scene = Scene {
+        label: "flat floor",
+        chunks: vec![chunk],
+        lit: None,
+        camera,
+        sky_above: false,
+    };
+    let image = render_scene(&mut renderer, &scene, LightingMode::Simple);
+
+    // Sampled in small patches across the middle of the frame, each about a
+    // cell across at this distance. Averaging a patch rather than reading one
+    // pixel keeps the reading away from any single texel's filtering.
+    let mut readings = Vec::new();
+    for row in 0..6 {
+        for column in 0..6 {
+            let x0 = WIDTH / 4 + column * WIDTH / 24;
+            let y0 = HEIGHT / 4 + row * HEIGHT / 24;
+            let patch = average(&image, x0, y0, x0 + WIDTH / 48, y0 + HEIGHT / 48);
+            readings.push((patch[0] + patch[1] + patch[2]) / 3.0);
+        }
+    }
+
+    let lowest = readings.iter().copied().fold(f32::MAX, f32::min);
+    let highest = readings.iter().copied().fold(f32::MIN, f32::max);
+    assert!(lowest > 0.0, "the wall did not render at all: {readings:?}");
+    assert!(
+        highest > lowest,
+        "every patch of a wall of ONE material came out identical, so the per-cell \
+         variation is not reaching the picture: {lowest} to {highest}"
+    );
+    // The bound. One per cent either way is a two per cent spread, and the
+    // patches are averages of several cells, so the spread they can show is
+    // smaller still — five per cent of the level is generous and would catch a
+    // constant that had been changed by an order of magnitude.
+    let spread = (highest - lowest) / highest;
+    assert!(
+        spread < 0.05,
+        "the variation is {:.1}% across the wall, which is noise rather than grain",
+        spread * 100.0
+    );
+}
+
 /// Every lighting mode, in the order the settings cycle them.
 const MODES: [LightingMode; 3] = [
     LightingMode::Simple,
