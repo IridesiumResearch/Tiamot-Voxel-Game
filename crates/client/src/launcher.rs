@@ -373,6 +373,30 @@ impl Catalogue {
             .collect()
     }
 
+    /// Ticks exactly the mods a world was last played with.
+    ///
+    /// **This is what makes a selection belong to a world rather than to the
+    /// machine.** The tick list used to be one global set, so a player who
+    /// arranged their mods for one world found them still arranged that way in
+    /// the next and had to redo it — and the only thing that noticed was a
+    /// warning telling them the two disagreed.
+    ///
+    /// A mod the world does not name comes back OFF, including one installed
+    /// since it was last played. That is the safe direction and not an
+    /// oversight: a mod turned on in an existing world can change its
+    /// generation, and a world quietly gaining one because it happened to be
+    /// installed yesterday is a world that changed without being asked. The
+    /// player can tick it on, and doing so records it against that world.
+    ///
+    /// A mod the world names but which is no longer installed cannot be ticked
+    /// at all — [`Library::mismatch`] is what reports that, and it stays
+    /// meaningful for exactly this case.
+    pub fn adopt(&mut self, enabled: &[String]) {
+        for listing in &mut self.mods {
+            listing.enabled = enabled.contains(&listing.id);
+        }
+    }
+
     /// Turns one mod on or off.
     pub fn set(&mut self, id: &str, on: bool) {
         for listing in &mut self.mods {

@@ -286,6 +286,7 @@ impl Front {
                         .clicked()
                     {
                         self.selected = Some(index);
+                        self.adopt_selected();
                     }
                 }
             }
@@ -367,6 +368,26 @@ impl Front {
 
     /// The mod list: a box each, and a box at the top for all of them.
     fn mods_tab(&mut self, ui: &mut egui::Ui) {
+        // **Whose list this is.** Picking a world ticks the mods that world was
+        // played with, and a screen that did that silently would read as the
+        // menu forgetting what the player had set. Named, so the change is
+        // something they watched happen.
+        if let Some(entry) = self
+            .selected
+            .and_then(|index| self.library.entries.get(index))
+            .filter(|entry| entry.is_local())
+        {
+            ui.label(format!("Mods for “{}”", entry.name));
+            ui.weak("Each world keeps its own selection. Changing these changes that world.");
+        } else {
+            ui.label("Mods for a new world");
+            ui.weak(
+                "Pick a world on the Play tab to see and change its own selection. A server's \
+                 mods are the server's to choose.",
+            );
+        }
+        ui.separator();
+
         let mut changed = false;
         let mut all = self.catalogue.all_on();
         if ui.checkbox(&mut all, "Everything").changed() {
@@ -652,6 +673,36 @@ impl Front {
         self.settings_dirty |= changed;
     }
 
+    /// Points the tick list at whichever world is selected.
+    ///
+    /// **A selection belongs to a world.** Ticking mods for one world used to
+    /// leave them ticked for the next, so a player kept re-arranging the same
+    /// list — and the only thing that noticed was a dialog telling them the two
+    /// disagreed, which is a warning about a problem the screen had just
+    /// created.
+    ///
+    /// Only for a world this machine runs. A remote server's mod set is not
+    /// ours to choose, so its entry records none and adopting an empty list
+    /// there would silently turn everything off before the next local world was
+    /// picked.
+    ///
+    /// A world that has never been opened records no mods either, and keeps
+    /// whatever is ticked now — so a new world inherits the set the player is
+    /// already using, and diverges from it the moment they change it here.
+    fn adopt_selected(&mut self) {
+        let Some(entry) = self
+            .selected
+            .and_then(|index| self.library.entries.get(index))
+        else {
+            return;
+        };
+        if !entry.is_local() || entry.mods.is_empty() {
+            return;
+        }
+        let wanted = entry.mods.clone();
+        self.catalogue.adopt(&wanted);
+    }
+
     /// Which mods are ticked, for a world about to start.
     #[must_use]
     pub fn enabled_mods(&self) -> Vec<String> {
@@ -665,6 +716,7 @@ impl Front {
             .entries
             .iter()
             .position(|entry| entry.name == name);
+        self.adopt_selected();
     }
 }
 
@@ -1030,6 +1082,85 @@ mod tests {
             "Quit is at {quit:?} and the tab strip is at {strip:?} — {:.0} points apart, \
              which reads as a button floating somewhere of its own",
             (quit.y - strip.y).abs()
+        );
+    }
+
+    #[test]
+    fn picking_a_world_ticks_the_mods_that_world_was_played_with() {
+        // **The complaint this fixes.** The tick list was one global set, so a
+        // player who arranged their mods for one world found them still
+        // arranged that way in the next and had to redo it every time — and the
+        // only thing that noticed was a dialog telling them the two disagreed,
+        // which is a warning about a problem the screen had just made.
+        let mut screen = front(vec![
+            world("orchard", &["core_worldgen", "trees"]),
+            world("desert", &["core_worldgen"]),
+        ]);
+        screen.catalogue.mods = vec![
+            listing("core_worldgen"),
+            listing("trees"),
+            listing("weather"),
+        ];
+
+        screen.select("orchard");
+        assert_eq!(
+            screen.enabled_mods(),
+            vec!["core_worldgen".to_owned(), "trees".to_owned()],
+            "picking a world should tick what that world was played with"
+        );
+
+        screen.select("desert");
+        assert_eq!(
+            screen.enabled_mods(),
+            vec!["core_worldgen".to_owned()],
+            "and picking another should tick ITS set, not leave the last one's behind"
+        );
+
+        // `weather` was installed after either world was last opened, and stays
+        // OFF in both. The safe direction, and deliberate: a mod turned on in
+        // an existing world can change its generation, so one arriving because
+        // it happened to be installed yesterday is a world changing without
+        // being asked.
+        screen.select("orchard");
+        assert!(
+            !screen.enabled_mods().contains(&"weather".to_owned()),
+            "a mod the world never used was turned on just by being installed"
+        );
+    }
+
+    #[test]
+    fn a_remote_server_and_a_new_world_leave_the_ticks_alone() {
+        // Two cases that must NOT adopt, and they fail in opposite directions.
+        //
+        // A remote server's mod set is not this machine's to choose, so its
+        // entry records none — adopting there would turn everything off. A
+        // world that has never been opened records none either, and should
+        // inherit whatever the player is already using rather than start empty.
+        let mut screen = front(vec![
+            Entry {
+                name: "somebody's server".to_owned(),
+                kind: Kind::Remote {
+                    address: "example:1234".to_owned(),
+                },
+                mods: Vec::new(),
+                last_played: 0,
+            },
+            world("brand new", &[]),
+        ]);
+        screen.catalogue.mods = vec![listing("core_worldgen"), listing("trees")];
+
+        screen.select("somebody's server");
+        assert_eq!(
+            screen.enabled_mods().len(),
+            2,
+            "picking a remote server turned the local mod selection off"
+        );
+
+        screen.select("brand new");
+        assert_eq!(
+            screen.enabled_mods().len(),
+            2,
+            "a world with no recorded mods should inherit what is ticked, not empty it"
         );
     }
 
