@@ -987,3 +987,26 @@ fn fragment_main(input: VertexOut) -> @location(0) vec4<f32> {
 fn fragment_shadowed(input: VertexOut) -> @location(0) vec4<f32> {
     return surface(input, shadow_factor(input));
 }
+
+// Foliage: the same surface, with the texture's holes taken out of it.
+//
+// Sub-Node Contract §8.2. A leaf texture is opaque in places and empty in
+// others, and what makes a canopy read as leaves rather than as a box is that
+// the empty part is GONE — not blended, discarded, so the fragment writes no
+// depth and whatever is behind it draws normally. That is also why foliage does
+// not need the sorting §8.1 gave up on: depth does the work.
+//
+// Its own entry point rather than a branch in `fragment_main`, because a shader
+// containing `discard` gives up early depth testing for every draw that uses
+// it, and the terrain must not pay that to make leaves work.
+@fragment
+fn fragment_cutout(input: VertexOut) -> @location(0) vec4<f32> {
+    let colour = surface(input, generic_shadow(input));
+    // Half, and a constant rather than a per-material number for §8.1's
+    // reason: the texture already carries the alpha and a second threshold
+    // beside it would be two sources of truth for one appearance.
+    if (colour.a < 0.5) {
+        discard;
+    }
+    return vec4<f32>(colour.rgb, 1.0);
+}

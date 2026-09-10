@@ -635,6 +635,64 @@ the collision rule — a body collides with occupancy, which glass has.
 
 ---
 
+### 8.2 Cutout materials — foliage
+
+A material may instead declare itself **cutout**. Leaves are the case; a fern, a
+grate, a chain-link fence are the same case. It is a different declaration from
+§8.1 and not a variant of it, because **the two want opposite culling** and a
+mod that picks the wrong one gets an artefact rather than a preference.
+
+A texture that is transparent in PLACES is not the same thing as a texture that
+is see-through EVERYWHERE, and the rule that is right for a window is wrong for
+a canopy:
+
+**Culling (§8). A cutout face is never culled, and never culls its
+neighbour.** Not "unless one side is transparent" — never, including against
+another cell of the same material. §8.1's rule exists so two panes do not stack
+two blended surfaces and darken a window by its thickness; a canopy has the
+opposite requirement, because the faces inside it are the leaves you see through
+the gaps in the leaves in front. Culled, a mass of foliage becomes a hollow
+shell whose alpha holes look straight through the world — reported from the
+window as seeing the sky through the leaves, which is exactly what it was:
+the frame's clear colour, with nothing drawn over it.
+
+A cutout cell is therefore in NO occupancy set for culling purposes. Stone
+behind leaves keeps its face for §8.1's reason, and the leaves keep all of
+theirs.
+
+**Drawing.** Cutout quads are their own list, drawn with an **alpha-tested
+pipeline in the opaque phase**: the fragment is discarded below the alpha
+threshold, and what survives writes depth like any solid surface. So the
+sorting limit §8.1 records **does not apply here** — foliage occludes itself
+correctly at every angle, for free, because depth does the work that sorting
+would have to.
+
+The threshold is a constant and not a per-material number, for §8.1's reason:
+the texture already carries the alpha.
+
+**The cost is real and is the trade.** Every interior face of a mass of foliage
+is drawn, where a solid material would have culled it — a dense canopy is
+several times the quads of the same volume of stone. That is what makes it look
+like foliage rather than like a painted box, and a mod that wants the cheap
+version leaves the flag off.
+
+**Lighting (§3) is §8.1's rule, unchanged**: a block whose content is
+`Uniform(cutout)` is permeable, so light passes through leaves. Dappled shade —
+foliage that passes SOME light — is not expressible: permeability is a yes or
+no, and inventing a third state for one material would put a number in the
+lighting hot path that every other block would pay to read. Recorded as a limit.
+
+**Collision (§2) is unchanged.** Leaves are solid, like glass. Whether a player
+can walk through foliage is a mod's opinion about its own blocks, and the engine
+has no view.
+
+**A material is one or the other, never both.** `register_block` refuses a block
+declaring `transparent` and `cutout` together rather than picking one, because
+the two answer the same question differently and a silent winner is a bug
+somebody debugs from the wrong end.
+
+---
+
 ## 9. Inventory — 27-unit arithmetic, no exceptions
 
 Charter rule 5, implemented in Task 02. Quantities are stored in units as `u32`;

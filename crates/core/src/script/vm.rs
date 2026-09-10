@@ -291,6 +291,16 @@ pub struct BlockRules {
     /// whether light passes through. NOT collision: glass is solid. See
     /// `docs/subnode-contract.md` §8.1.
     pub transparent: bool,
+    /// Whether the block is see-through in PLACES rather than everywhere:
+    /// leaves.
+    ///
+    /// A different declaration from [`transparent`](Self::transparent), not a
+    /// variant of it: the two want opposite culling, and `register_block`
+    /// refuses a block that claims both. A cutout face is never culled, so a
+    /// canopy is full rather than a hollow shell, and it is drawn alpha-tested
+    /// with the opaque world rather than blended. See
+    /// `docs/subnode-contract.md` §8.2.
+    pub cutout: bool,
     /// How this material's colour varies across the world, if a mod said.
     ///
     /// **Presentation only.** Nothing on the server reads it — it travels with

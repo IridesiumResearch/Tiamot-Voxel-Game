@@ -1152,7 +1152,7 @@ pub struct App {
     /// Charter rule 14 lives in `crate::fonts`: a font file is a parser running
     /// on bytes a server chose.
     pub fonts: crate::fonts::Fonts,
-    transparent: std::collections::BTreeSet<u16>,
+    transparent: mesher::Sight,
     /// A chunk being meshed across frames, if one is part-built.
     ///
     /// At most one: the budget is spent depth-first, so a second chunk is not
@@ -1326,7 +1326,7 @@ impl App {
             items: std::collections::BTreeSet::new(),
             hosting: None,
             seed: None,
-            transparent: std::collections::BTreeSet::new(),
+            transparent: mesher::Sight::default(),
             pictures: crate::pictures::Pictures::new(),
             fonts: crate::fonts::Fonts::new(),
             meshing: None,
@@ -2431,11 +2431,21 @@ impl App {
         // decided when drawing — transparency changes which faces exist at all
         // (Contract §8.1) — so this has to be settled before anything meshes.
         // It arrives with the material table, which is before the join.
-        self.transparent = table
-            .iter()
-            .filter(|entry| entry.transparent)
-            .map(|entry| entry.id)
-            .collect();
+        self.transparent = mesher::Sight {
+            glass: table
+                .iter()
+                .filter(|entry| entry.transparent)
+                .map(|entry| entry.id)
+                .collect(),
+            // Foliage is its own set for the opposite culling rule — §8.2 —
+            // and a material is in at most one of them, which registration
+            // enforces rather than this.
+            foliage: table
+                .iter()
+                .filter(|entry| entry.cutout)
+                .map(|entry| entry.id)
+                .collect(),
+        };
     }
 
     /// Replaces the mod-registered actions with a server's.
@@ -6468,6 +6478,7 @@ mod tests {
                 texture: None,
                 placeable: true,
                 transparent: false,
+                cutout: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6477,6 +6488,7 @@ mod tests {
                 texture: Some([0u8; 32]),
                 placeable: true,
                 transparent: false,
+                cutout: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6510,6 +6522,7 @@ mod tests {
             texture: None,
             placeable: true,
             transparent: false,
+            cutout: false,
             tint: None,
             step_sound: None,
         }];

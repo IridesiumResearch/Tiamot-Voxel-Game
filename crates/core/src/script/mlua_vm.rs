@@ -1952,6 +1952,11 @@ impl ScriptVm for MluaVm {
                             .and_then(|entry| entry.get::<Option<bool>>("transparent").ok())
                             .flatten()
                             .unwrap_or(false),
+                        cutout: entry
+                            .as_ref()
+                            .and_then(|entry| entry.get::<Option<bool>>("cutout").ok())
+                            .flatten()
+                            .unwrap_or(false),
                     },
                 )
             })
@@ -5392,6 +5397,22 @@ fn check_block_fields(id: &str, spec: &Table) -> mlua::Result<()> {
             }
         }
     }
+    // **One or the other, never both.** Sub-Node Contract §8.2: glass and
+    // foliage answer the same question about culling in opposite ways, so a
+    // block claiming both has to be told rather than quietly given whichever
+    // the engine happens to test first.
+    let declared = |field: &str| {
+        spec.get::<Option<bool>>(field)
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    };
+    if declared("transparent") && declared("cutout") {
+        return Err(mlua::Error::external(format!(
+            "register_block(\"{id}\"): `transparent` is see-through everywhere and `cutout` is \
+             see-through in places; a block is one or the other"
+        )));
+    }
     Ok(())
 }
 
@@ -5604,6 +5625,14 @@ fn register_block(lua: &Lua, owner: &str, spec: &Table) -> mlua::Result<u16> {
         // absent flag and a `false` one must not be distinguishable downstream.
         if let Some(transparent) = spec.get::<Option<bool>>("transparent")? {
             entry.set("transparent", transparent)?;
+        }
+        // And foliage beside it. **This copy is the step that is easy to
+        // forget**, and forgetting it is invisible: the field passes the
+        // allowlist, the mod loads, and the flag is simply gone by the time
+        // anything reads it — which is what `tint` and `transparent` both did
+        // when they shipped.
+        if let Some(cutout) = spec.get::<Option<bool>>("cutout")? {
+            entry.set("cutout", cutout)?;
         }
         if let Some(absorbs) = spec.get::<Option<Table>>("absorbs")? {
             entry.set("absorbs", block_absorbs(lua, owner, &id, &absorbs)?)?;
@@ -6242,7 +6271,7 @@ const FLUID_FIELDS: [&str; 6] = [
 /// accepted them would be an API promising behaviour nothing implements.
 const ITEM_FIELDS: [&str; 4] = ["id", "name", "texture", "description"];
 
-const BLOCK_FIELDS: [&str; 13] = [
+const BLOCK_FIELDS: [&str; 14] = [
     "id",
     "name",
     "drops",
@@ -6256,6 +6285,7 @@ const BLOCK_FIELDS: [&str; 13] = [
     "absorbs",
     "tint",
     "transparent",
+    "cutout",
 ];
 
 /// Keys the `textures` sub-table accepts.
@@ -7486,6 +7516,52 @@ mod tests {
             ],
             "a full mask should go the whole-block way and a partial one carry its mask"
         );
+    }
+
+    #[test]
+    fn a_block_is_glass_or_foliage_and_never_both() {
+        // **Contract §8.2.** The two flags answer the same question about
+        // culling in opposite ways: glass hides the face between two panes,
+        // foliage keeps the face between two leaf blocks. A block claiming both
+        // has to be told, because whichever the engine tested first would win
+        // silently and the symptom — a canopy that is a hollow shell, or a
+        // window that doubles up — is debugged from the wrong end.
+        let mut both = vm();
+        let err = load(
+            &mut both,
+            "wood",
+            "game.register_block{ id = 'leaves', transparent = true, cutout = true }",
+        )
+        .expect_err("a block claiming both was accepted");
+        let detail = format!("{err:?}");
+        assert!(
+            detail.contains("one or the other"),
+            "the error should say what is wrong: {detail}"
+        );
+
+        // And each on its own is fine, or the check above would pass by
+        // refusing everything.
+        let mut fresh = vm();
+        load(
+            &mut fresh,
+            "wood",
+            "game.register_block{ id = 'leaves', cutout = true }\n\
+             game.register_block{ id = 'pane', transparent = true }",
+        )
+        .expect("one flag at a time should load");
+        let rules = fresh.registered_block_rules();
+        let leaves = rules
+            .iter()
+            .find(|rule| rule.block == "wood:leaves")
+            .expect("the leaves registered");
+        assert!(leaves.cutout, "the cutout flag did not reach the rules");
+        assert!(!leaves.transparent);
+        let pane = rules
+            .iter()
+            .find(|rule| rule.block == "wood:pane")
+            .expect("the pane registered");
+        assert!(pane.transparent);
+        assert!(!pane.cutout);
     }
 
     #[test]

@@ -509,6 +509,35 @@ trade: sorting per quad is per-frame work proportional to the geometry. And only
 a WHOLE block of one transparent material passes light — a chiselled or mixed
 block holding glass falls back to the ordinary cell rule.
 
+**Leaves are NOT glass — use `cutout`.** This is the one to get right, because
+picking the wrong flag gives an artefact rather than a preference:
+
+```lua
+game.register_block{
+    id = "leaves",
+    cutout = true,                             -- see-through in PLACES
+    textures = { all = "textures/leaves.png" },
+}
+```
+
+`transparent` is see-through EVERYWHERE and hides the face between two panes,
+so a window does not double up. Foliage needs the opposite: the faces between
+two leaf blocks are kept, because those are the leaves you see through the gaps
+in the leaves in front of them. Declared `transparent`, a canopy becomes a
+hollow shell and its alpha holes look straight through the world at the sky —
+which is exactly what it is, since the sky is the frame's clear colour with
+nothing drawn over it.
+
+Cutout is drawn alpha-tested with the opaque world, so it writes depth,
+occludes itself correctly at every angle, and the sorting limit above does not
+apply to it. Light passes as it does through glass — dappled shade is not
+expressible, because permeability is yes or no. Collision does not change:
+leaves are solid, and whether a player may walk through them is your mod's
+opinion to implement.
+
+A block is one or the other. Declaring both is refused at registration rather
+than silently resolved.
+
 **Erosion, rivers and biome blending are compositions**, not engine features.
 Build them from `game.density`'s arithmetic. If a shape genuinely cannot be
 expressed with the operations that exist, that is a finding worth reporting —

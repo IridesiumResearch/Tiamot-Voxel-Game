@@ -514,7 +514,10 @@ pub fn see_through_from_rules(
     tiamot_core::light::SeeThrough::new(
         rules
             .iter()
-            .filter(|rule| rule.transparent)
+            // Contract §8.2: foliage passes light the way glass does. Leaves
+            // that stopped it would put a forest floor in total darkness, and
+            // "some light" is not expressible — permeability is yes or no.
+            .filter(|rule| rule.transparent || rule.cutout)
             .filter_map(|rule| id_of(&rule.block)),
     )
 }

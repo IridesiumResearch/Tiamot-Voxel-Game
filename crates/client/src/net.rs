@@ -2022,6 +2022,7 @@ mod tests {
                 step_sound: None,
                 placeable: true,
                 transparent: false,
+                cutout: false,
                 tint: None,
             })
             .collect()

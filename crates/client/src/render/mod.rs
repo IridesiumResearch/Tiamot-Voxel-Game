@@ -342,6 +342,11 @@ struct ChunkMesh {
     /// two are drawn by different pipelines — one writes depth and one does
     /// not — and a draw call takes a whole buffer.
     glass: Option<GlassMesh>,
+    /// The alpha-tested half: foliage. Drawn WITH the opaque geometry rather
+    /// than after it, because it writes depth like any solid surface — which is
+    /// what saves it from §8.1's sorting limit. `None` for a chunk with no
+    /// leaves in it. Contract §8.2.
+    cutout: Option<GlassMesh>,
     /// Bytes actually written, as opposed to the pooled buffers' capacity.
     used_bytes: u64,
 }
@@ -364,6 +369,7 @@ struct WorldPass<'a> {
     depth: &'a wgpu::TextureView,
     world: &'a wgpu::RenderPipeline,
     glass: &'a wgpu::RenderPipeline,
+    cutout: &'a wgpu::RenderPipeline,
     fluid: &'a wgpu::RenderPipeline,
     selection: &'a wgpu::RenderPipeline,
     skinned: &'a wgpu::RenderPipeline,
@@ -548,6 +554,12 @@ impl BufferPool {
             self.give(BufferKind::Vertex, glass.vertices);
             self.give(BufferKind::Index, glass.indices);
         }
+        // And the foliage, for the same reason: a leaf chunk would otherwise
+        // leak two buffers on every remesh, which is every nearby dig.
+        if let Some(cutout) = mesh.cutout {
+            self.give(BufferKind::Vertex, cutout.vertices);
+            self.give(BufferKind::Index, cutout.indices);
+        }
     }
 }
 
@@ -707,6 +719,9 @@ pub struct Renderer {
     fluid_pipeline: wgpu::RenderPipeline,
     /// The blended pass for glass. See [`build_glass_pipeline`].
     glass_pipeline: wgpu::RenderPipeline,
+    /// The alpha-tested pass for foliage. Depth-writing and unblended: it is
+    /// the world pipeline with a fragment entry that discards. See §8.2.
+    cutout_pipeline: wgpu::RenderPipeline,
     /// Seconds of animation, for the fluid scroll. See `advance_clock`.
     elapsed: f32,
     globals: wgpu::Buffer,
@@ -893,16 +908,12 @@ impl Renderer {
         // against a format the surface refuses is a crash at `configure`, which
         // is what macOS gave: Metal has no `Rgba8UnormSrgb` surface at all.
         let target = gpu.surface_format();
-        let pipeline = build_pipeline(&gpu, &shader, &bind_layout, mode, target);
-        let fluid_pipeline = build_fluid_pipeline(&gpu, &shader, &[Some(&bind_layout)], target);
-        let glass_pipeline = build_glass_pipeline(
-            &gpu,
-            &shader,
-            &[Some(&bind_layout)],
-            "fragment_main",
-            mode,
-            target,
-        );
+        let TerrainPipelines {
+            pipeline,
+            fluid_pipeline,
+            glass_pipeline,
+            cutout_pipeline,
+        } = build_terrain_pipelines(&gpu, &shader, &bind_layout, mode, target);
 
         let (blob_pipeline, blob_pipeline_hdr, blobs) = build_blobs(&gpu, &bind_layout);
         let (prop_pipeline, prop_pipeline_hdr, props) = build_props(&gpu, &bind_layout);
@@ -948,6 +959,7 @@ impl Renderer {
             pipeline,
             fluid_pipeline,
             glass_pipeline,
+            cutout_pipeline,
             elapsed: 0.0,
             globals,
             bind_layout,
@@ -1339,6 +1351,30 @@ impl Renderer {
             });
         }
 
+        // And the foliage, on the same pattern again. Its buffers are the
+        // world's own vertex, like glass — only the pipeline differs.
+        let mut cutout = None;
+        let mut cutout_bytes = 0;
+        if !mesh.has_no_cutout() {
+            let (cutout_vertices, cutout_indices) = mesh.cutout_buffers();
+            let vertex_bytes: &[u8] = bytemuck::cast_slice(&cutout_vertices);
+            let index_bytes: &[u8] = bytemuck::cast_slice(&cutout_indices);
+            let vertices = self
+                .pool
+                .take(&self.gpu, BufferKind::Vertex, vertex_bytes.len() as u64);
+            let indices = self
+                .pool
+                .take(&self.gpu, BufferKind::Index, index_bytes.len() as u64);
+            self.gpu.queue.write_buffer(&vertices, 0, vertex_bytes);
+            self.gpu.queue.write_buffer(&indices, 0, index_bytes);
+            cutout_bytes = (vertex_bytes.len() + index_bytes.len()) as u64;
+            cutout = Some(GlassMesh {
+                vertices,
+                indices,
+                index_count: u32::try_from(cutout_indices.len()).unwrap_or(0),
+            });
+        }
+
         self.chunks.insert(
             pos,
             ChunkMesh {
@@ -1347,8 +1383,10 @@ impl Renderer {
                 index_count: u32::try_from(indices.len()).unwrap_or(0),
                 fluid,
                 glass,
+                cutout,
                 used_bytes: (vertex_bytes.len() + index_bytes.len()) as u64
                     + fluid_bytes
+                    + cutout_bytes
                     + glass_bytes,
             },
         );
@@ -1876,6 +1914,7 @@ impl Renderer {
                     depth,
                     world: post.world_pipeline(),
                     glass: post.glass_pipeline(),
+                    cutout: post.cutout_pipeline(),
                     fluid: post.fluid_pipeline(),
                     selection: post.selection_pipeline(),
                     skinned: post.skinned_pipeline(),
@@ -1886,6 +1925,7 @@ impl Renderer {
                 depth: &self.depth,
                 world: &self.pipeline,
                 glass: &self.glass_pipeline,
+                cutout: &self.cutout_pipeline,
                 fluid: &self.fluid_pipeline,
                 selection: &self.selection_pipeline,
                 skinned: &self.skinned_pipeline,
@@ -1926,6 +1966,37 @@ impl Renderer {
             pass.set_vertex_buffer(0, glass.vertices.slice(..));
             pass.set_index_buffer(glass.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..glass.index_count, 0, *instance..*instance + 1);
+        }
+    }
+
+    /// Draws every visible chunk's foliage, WITH the opaque geometry.
+    ///
+    /// **Not after it, which is the whole difference from `draw_glass`.** An
+    /// alpha-tested surface is opaque where it survives the test: it writes
+    /// depth, occludes what is behind it, and is occluded in turn. So it needs
+    /// no sorting and must not be deferred to the blended sweep, where it would
+    /// be composited against a scene it should have been part of. Contract
+    /// §8.2.
+    fn draw_cutout(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pipeline: &wgpu::RenderPipeline,
+        visible: &[(ChunkPos, u32)],
+    ) {
+        let mut any = false;
+        for (pos, instance) in visible {
+            let Some(cutout) = self.chunks.get(pos).and_then(|mesh| mesh.cutout.as_ref()) else {
+                continue;
+            };
+            if !any {
+                // The same gate as glass: a world without leaves pays no
+                // pipeline switch.
+                pass.set_pipeline(pipeline);
+                any = true;
+            }
+            pass.set_vertex_buffer(0, cutout.vertices.slice(..));
+            pass.set_index_buffer(cutout.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..cutout.index_count, 0, *instance..*instance + 1);
         }
     }
 
@@ -2188,6 +2259,11 @@ impl Renderer {
             // What those figures are holding, in the same company: opaque,
             // depth-tested, after the terrain and before the blended fluid.
             self.draw_props(&mut pass);
+
+            // Foliage, still with the opaque geometry: it writes depth and is
+            // not composited, so it belongs before anything blended rather
+            // than among it.
+            self.draw_cutout(&mut pass, pass_targets.cutout, &culled.visible);
 
             // Glass first of the two blended passes, then the milk. Both
             // inherit slot 1 from the chunk loop above, which is what the
@@ -3104,6 +3180,80 @@ fn build_pipeline(
 /// opaque world, so it needs the same bind groups and the same fragment entry —
 /// a pane lit differently from the wall it sits in would read as a bug in the
 /// lighting rather than in the pass.
+/// The four pipelines that draw terrain into the window's own format.
+struct TerrainPipelines {
+    pipeline: wgpu::RenderPipeline,
+    fluid_pipeline: wgpu::RenderPipeline,
+    glass_pipeline: wgpu::RenderPipeline,
+    cutout_pipeline: wgpu::RenderPipeline,
+}
+
+/// Builds them together, because `Renderer::new` is at clippy's line ceiling
+/// and four near-identical calls are what pushed it over.
+fn build_terrain_pipelines(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    bind_layout: &wgpu::BindGroupLayout,
+    mode: RenderMode,
+    target: wgpu::TextureFormat,
+) -> TerrainPipelines {
+    TerrainPipelines {
+        pipeline: build_pipeline(gpu, shader, bind_layout, mode, target),
+        fluid_pipeline: build_fluid_pipeline(gpu, shader, &[Some(bind_layout)], target),
+        glass_pipeline: build_glass_pipeline(
+            gpu,
+            shader,
+            &[Some(bind_layout)],
+            "fragment_main",
+            mode,
+            target,
+        ),
+        // Foliage: `blended = false`, so it writes depth and is not
+        // composited, with a fragment entry that discards the texture's holes.
+        // Contract §8.2 — that combination is what lets it be drawn with the
+        // opaque world and self-occlude without sorting.
+        cutout_pipeline: build_world_pipeline(
+            gpu,
+            shader,
+            &[Some(bind_layout)],
+            "fragment_cutout",
+            mode,
+            target,
+            false,
+        ),
+    }
+}
+
+/// The foliage pipeline for the float target, with or without cascades.
+///
+/// **One fragment entry, not two.** Glass has a shadowed variant because it is
+/// composited into a lit scene; foliage discards and writes depth, so the only
+/// thing its entry has to do differently is the discard — and the cascades it
+/// would consult are the same ones `fragment_cutout` already asks
+/// `generic_shadow` for. Mode 3 keeps its own shadowed terrain; leaves take the
+/// generic term, which is what they had as ordinary blocks.
+pub(crate) fn cutout_pipeline_for(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+    shadows: Option<&shadow::Shadows>,
+    mode: RenderMode,
+) -> wgpu::RenderPipeline {
+    let layouts: Vec<Option<&wgpu::BindGroupLayout>> = match shadows {
+        Some(shadows) => vec![Some(layout), Some(shadows.sample_layout())],
+        None => vec![Some(layout)],
+    };
+    build_world_pipeline(
+        gpu,
+        shader,
+        &layouts,
+        "fragment_cutout",
+        mode,
+        graph::HDR_FORMAT,
+        false,
+    )
+}
+
 pub(crate) fn glass_pipeline_for(
     gpu: &Gpu,
     shader: &wgpu::ShaderModule,

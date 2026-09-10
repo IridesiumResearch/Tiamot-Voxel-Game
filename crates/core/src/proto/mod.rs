@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 43;
+pub const PROTOCOL_VERSION: u32 = 44;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -88,6 +88,9 @@ pub const PROTOCOL_VERSION: u32 = 43;
 // read back the one they got, which makes the seed box write-only and a world
 // worth keeping unshareable. Appended to the variant, safe because the version
 // is agreed in the handshake before a `JoinWorld` is sent.
+// v44 (post-15b): `MaterialDef` carries `cutout` beside `transparent`. Foliage
+// culls the opposite way to glass (§8.2), so the client cannot infer one from
+// the other and a canopy drawn by §8.1's rule is a hollow shell.
 // v40 (post-15b): `MaterialDef` carries `transparent`. A client has to know
 // before it meshes: transparency decides which faces are culled and which pass
 // is drawn, and both are baked into the geometry rather than decided in the
@@ -728,6 +731,12 @@ pub struct MaterialDef {
     /// glass is solid.
     #[serde(default)]
     pub transparent: bool,
+    /// Whether it is see-through in places: foliage.
+    ///
+    /// Separate from [`transparent`](Self::transparent) because the two want
+    /// opposite culling — Sub-Node Contract §8.2 — and a client that guessed
+    /// between them would draw a canopy as a hollow shell.
+    pub cutout: bool,
     /// How this material's colour varies across the world, if a mod said.
     ///
     /// `None` — every material until a mod says otherwise (charter rule 1) —
@@ -3732,6 +3741,7 @@ mod tests {
                     texture: None,
                     placeable: true,
                     transparent: false,
+                    cutout: false,
                     tint: None,
                     step_sound: None,
                 },
@@ -3741,6 +3751,7 @@ mod tests {
                     texture: Some([9u8; 32]),
                     placeable: true,
                     transparent: false,
+                    cutout: false,
                     tint: None,
                     step_sound: None,
                 },

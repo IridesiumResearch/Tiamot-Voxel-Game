@@ -62,6 +62,38 @@ const FIRST: u32 = 1;
 /// so it goes in as one OR rather than three.
 const FULL_BLOCK_BITS: u64 = (1 << SUBNODES_PER_AXIS) - 1;
 
+/// Bits where a cell and the NEXT cell along an axis belong to the same block.
+///
+/// **What makes foliage keep its faces without slicing its own texture.**
+/// Sub-Node Contract §8.2 says a cutout face is never culled against another
+/// block's cutout cell, and the qualifier is load-bearing: a leaf block is 27
+/// cells, and drawing the faces between its own cells would fill it with planes
+/// showing a THIRD of a leaf texture each, because the shader repeats a texture
+/// once per block and not once per cell.
+///
+/// So a cutout face survives unless the cell it faces is cutout and is inside
+/// the same block. Shifting this by one gives the same relation looking the
+/// other way, which is why there is one constant and not two.
+const SAME_BLOCK: u64 = same_block_mask();
+
+/// Builds [`SAME_BLOCK`]. A `const fn` because the answer is a property of the
+/// layout, not of a chunk.
+const fn same_block_mask() -> u64 {
+    let mut mask = 0u64;
+    let mut bit = 0u32;
+    while bit < 64 {
+        // The cell this bit stands for, lifted past the padding so the modulo
+        // never sees a negative — cell -1 is the last cell of the block below,
+        // and must read as a different block.
+        let cell = bit + 3 * 64 - FIRST;
+        if cell % SUBNODES_PER_AXIS != SUBNODES_PER_AXIS - 1 {
+            mask |= 1 << bit;
+        }
+        bit += 1;
+    }
+    mask
+}
+
 /// The six face directions, as (axis, positive).
 const FACES: [(usize, bool); 6] = [
     (0, false),
@@ -190,6 +222,14 @@ pub struct SubNodeGrid {
     /// nearly all of them: it skips both the allocation and the second mask per
     /// column, so a world without windows meshes exactly as it did.
     glass: Option<[Vec<u64>; 3]>,
+    /// The occupancy columns of every cutout cell, or `None` for a chunk with
+    /// no foliage in it — nearly all of them.
+    ///
+    /// Its own set for the opposite reason glass has one. Glass is culled
+    /// against glass; cutout is culled against nothing but its OWN block
+    /// ([`SAME_BLOCK`]), so a canopy keeps the faces inside it and is not a
+    /// hollow shell. Contract §8.2.
+    cutout: Option<[Vec<u64>; 3]>,
     /// Each block's fluid surface height, in sixteenths of a cell, `0` for dry.
     ///
     /// **This is what makes the surface smooth rather than a staircase.** The
@@ -408,12 +448,14 @@ impl SubNodeGrid {
         // `FluidFill::any` gates the fluid columns. A world without windows
         // meshes as it always did.
         let glass = glass_columns(&materials, transparent);
+        let cutout = cutout_columns(&materials, transparent);
 
         let mut grid = Self {
             materials,
             columns,
             fluid: wet,
             glass,
+            cutout,
             heights,
             walls,
         };
@@ -749,6 +791,18 @@ pub trait Transparency {
     /// Whether this material is glass — see `docs/subnode-contract.md` §8.1.
     fn is_transparent(&self, material: u16) -> bool;
 
+    /// Whether a material is see-through in PLACES rather than everywhere:
+    /// foliage. Sub-Node Contract §8.2.
+    fn is_cutout(&self, _material: u16) -> bool {
+        false
+    }
+
+    /// Whether ANY material in play is cutout, so a world without foliage pays
+    /// nothing — the same gate `any` is.
+    fn any_cutout(&self) -> bool {
+        false
+    }
+
     /// Whether ANY material in play is transparent.
     ///
     /// **Defaults to yes, which is the safe answer**, and every implementation
@@ -787,6 +841,38 @@ impl<T: Transparency + ?Sized> Transparency for &T {
     /// fast path silently.
     fn any(&self) -> bool {
         (*self).any()
+    }
+}
+
+/// Which materials are see-through, and in which of the two ways.
+///
+/// **Two sets rather than one with a flag**, because the mesher asks the two
+/// questions in different places and a material is in at most one of them —
+/// `register_block` refuses a block claiming both (Contract §8.2). Either being
+/// empty costs a world nothing, the same way an empty set of panes does.
+#[derive(Debug, Default, Clone)]
+pub struct Sight {
+    /// See-through everywhere: glass. Contract §8.1.
+    pub glass: std::collections::BTreeSet<u16>,
+    /// See-through in places: foliage. Contract §8.2.
+    pub foliage: std::collections::BTreeSet<u16>,
+}
+
+impl Transparency for Sight {
+    fn is_transparent(&self, material: u16) -> bool {
+        self.glass.contains(&material)
+    }
+
+    fn any(&self) -> bool {
+        !self.glass.is_empty()
+    }
+
+    fn is_cutout(&self, material: u16) -> bool {
+        self.foliage.contains(&material)
+    }
+
+    fn any_cutout(&self) -> bool {
+        !self.foliage.is_empty()
     }
 }
 
@@ -1045,6 +1131,12 @@ pub struct Mesh {
     ///
     /// Empty for a chunk with no glass in it, which is nearly all of them.
     pub glass_quads: Vec<Quad>,
+    /// The merged alpha-tested quads: foliage.
+    ///
+    /// Their own list rather than the opaque one because their pipeline
+    /// discards fragments, and a shader that discards gives up early depth
+    /// testing — a cost the whole world would pay to draw some leaves.
+    pub cutout_quads: Vec<Quad>,
     /// The fluid half, **already expanded to vertices**.
     ///
     /// Terrain stays as quads because a quad is self-describing: its four
@@ -1105,7 +1197,10 @@ impl Mesh {
         // itself empty, `Renderer::set_chunk` drops it, and a greenhouse
         // vanishes — the same shape of bug a pond hanging in the air had before
         // `fluid_vertices` was counted here.
-        self.quads.is_empty() && self.fluid_vertices.is_empty() && self.glass_quads.is_empty()
+        self.quads.is_empty()
+            && self.fluid_vertices.is_empty()
+            && self.glass_quads.is_empty()
+            && self.cutout_quads.is_empty()
     }
 
     /// Whether there is no opaque geometry. A pond hanging in the air has none.
@@ -1124,6 +1219,12 @@ impl Mesh {
     #[must_use]
     pub fn has_no_glass(&self) -> bool {
         self.glass_quads.is_empty()
+    }
+
+    /// Whether there is no foliage, which is most chunks.
+    #[must_use]
+    pub fn has_no_cutout(&self) -> bool {
+        self.cutout_quads.is_empty()
     }
 
     /// Expands to the vertex and index buffers a renderer uploads.
@@ -1165,6 +1266,12 @@ impl Mesh {
     #[must_use]
     pub fn glass_buffers(&self) -> (Vec<PackedVertex>, Vec<u32>) {
         Self::buffers_of(&self.glass_quads)
+    }
+
+    /// The same, for the alpha-tested faces of foliage.
+    #[must_use]
+    pub fn cutout_buffers(&self) -> (Vec<PackedVertex>, Vec<u32>) {
+        Self::buffers_of(&self.cutout_quads)
     }
 
     /// Expands any list of quads. Shared by both of the above, so the opaque
@@ -1617,6 +1724,8 @@ struct Scratch {
     /// And for the transparent faces, for the same reason. Allocated only for a
     /// chunk that has glass in it.
     glass_plane: Vec<u64>,
+    /// The same, for the alpha-tested faces of foliage.
+    cutout_plane: Vec<u64>,
     /// One slice's worth of corner light, reused across every slice and
     /// direction. Entries for cells with no face are never read.
     shades: Vec<Shade>,
@@ -1637,6 +1746,11 @@ impl Scratch {
             plane: vec![0u64; N * N],
             wet_plane: if wet { vec![0u64; N * N] } else { Vec::new() },
             glass_plane: if panes { vec![0u64; N * N] } else { Vec::new() },
+            cutout_plane: if grid.cutout.is_some() {
+                vec![0u64; N * N]
+            } else {
+                Vec::new()
+            },
             shades: vec![Shade::default(); N * N],
             keys: if wet { vec![0u32; N * N] } else { Vec::new() },
             fluid: Vec::new(),
@@ -1666,9 +1780,11 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
     let columns = &grid.columns[axis];
     let wet = grid.fluid.as_ref().map(|fluid| &fluid[axis]);
     let glass = grid.glass.as_ref().map(|glass| &glass[axis]);
+    let cutout = grid.cutout.as_ref().map(|cutout| &cutout[axis]);
     scratch.plane.fill(0);
     scratch.wet_plane.fill(0);
     scratch.glass_plane.fill(0);
+    scratch.cutout_plane.fill(0);
 
     for u in 0..N {
         for v in 0..N {
@@ -1711,11 +1827,32 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
             // from outside, and a hole straight through the world seen from
             // inside. The same fault milk had against terrain, in §4.
             let panes = glass.map_or(0, |glass| glass[u * N + v]);
-            let opaque = solid & !panes;
-            let (faces, glass_faces) = if positive {
-                (opaque & !(opaque >> 1), panes & !(panes >> 1))
+            // **Foliage is in no set at all**, which is Contract §8.2 and the
+            // opposite of the rule above. Taken out of the opaque set so the
+            // stone behind a hedge keeps its face, and never culled against
+            // another leaf, so the canopy keeps the faces INSIDE it — culled,
+            // a mass of foliage is a hollow shell whose alpha holes look
+            // straight through the world at the sky.
+            //
+            // The one thing it is culled against is its own block: a leaf block
+            // is 27 cells and the faces between them would each show a third of
+            // a leaf texture, because the shader repeats once per block.
+            let leaves = cutout.map_or(0, |cutout| cutout[u * N + v]);
+            let opaque = solid & !panes & !leaves;
+            let (faces, glass_faces, leaf_faces) = if positive {
+                (
+                    opaque & !(opaque >> 1),
+                    panes & !(panes >> 1),
+                    leaves & !((leaves >> 1) & SAME_BLOCK),
+                )
             } else {
-                (opaque & !(opaque << 1), panes & !(panes << 1))
+                (
+                    opaque & !(opaque << 1),
+                    panes & !(panes << 1),
+                    // The same relation read the other way round, which is what
+                    // the shift of the constant is.
+                    leaves & !((leaves << 1) & (SAME_BLOCK << 1)),
+                )
             };
             // **The fluid's own faces go to their own plane**, rather than
             // being OR-ed into the terrain's as they were. They are drawn in
@@ -1768,6 +1905,17 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
                     scratch.glass_plane[w * N + u] |= 1 << v;
                 }
             }
+            // And foliage into its own, for a different reason from either:
+            // it is drawn alpha-tested with the opaque world, so it cannot
+            // share a draw call with geometry whose shader does not discard.
+            let mut remaining = leaf_faces >> FIRST;
+            while remaining != 0 {
+                let w = remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
+                if w < N {
+                    scratch.cutout_plane[w * N + u] |= 1 << v;
+                }
+            }
         }
     }
 }
@@ -1801,6 +1949,18 @@ fn merge_slice(
             None,
             (axis, positive, w),
             &mut scratch.mesh.glass_quads,
+        );
+    }
+
+    if !scratch.cutout_plane.is_empty() {
+        shade_and_merge(
+            grid,
+            light,
+            &mut scratch.cutout_plane[w * N..(w + 1) * N],
+            &mut scratch.shades,
+            None,
+            (axis, positive, w),
+            &mut scratch.mesh.cutout_quads,
         );
     }
 
@@ -2057,6 +2217,34 @@ fn glass_columns(materials: &[u16], transparent: &impl Transparency) -> Option<[
     // `None` rather than a zeroed set, so a chunk that COULD have held glass
     // and does not costs the same as one that could not — the culling below
     // then takes its original path rather than an extra mask per column.
+    found.then_some(columns)
+}
+
+/// The occupancy columns of every cutout cell, or `None` if there are none.
+///
+/// The same walk as [`glass_columns`] over the other flag. Two passes rather
+/// than one that sorts into both, because a world has glass or foliage or
+/// neither far more often than both, and each pass is skipped whole.
+fn cutout_columns(materials: &[u16], transparent: &impl Transparency) -> Option<[Vec<u64>; 3]> {
+    if !transparent.any_cutout() {
+        return None;
+    }
+    let mut columns = [vec![0u64; N * N], vec![0u64; N * N], vec![0u64; N * N]];
+    let mut found = false;
+    for z in 0..N {
+        for y in 0..N {
+            for x in 0..N {
+                let material = materials[x + N * y + N * N * z];
+                if material == 0 || !transparent.is_cutout(material) {
+                    continue;
+                }
+                found = true;
+                columns[0][y * N + z] |= 1 << (x as u32 + FIRST);
+                columns[1][x * N + z] |= 1 << (y as u32 + FIRST);
+                columns[2][x * N + y] |= 1 << (z as u32 + FIRST);
+            }
+        }
+    }
     found.then_some(columns)
 }
 
@@ -3186,6 +3374,113 @@ mod tests {
         fn is_transparent(&self, material: u16) -> bool {
             material == self.0.get()
         }
+    }
+
+    /// A material table in which exactly one material is foliage.
+    struct Leaves(MaterialId);
+
+    impl Transparency for Leaves {
+        fn is_transparent(&self, _material: u16) -> bool {
+            false
+        }
+
+        fn is_cutout(&self, material: u16) -> bool {
+            material == self.0.get()
+        }
+
+        fn any(&self) -> bool {
+            false
+        }
+
+        fn any_cutout(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn foliage_keeps_the_faces_inside_it_and_not_the_ones_inside_a_block() {
+        // **Contract §8.2, and the fault reported from the window.** Declared
+        // transparent, two leaf blocks lose the faces between them by §8.1's
+        // rule — which is right for glass and turns a canopy into a hollow
+        // shell whose alpha holes look straight through the world at the sky.
+        //
+        // Cutout is the other rule, and it has two halves that have to hold
+        // together: the faces BETWEEN leaf blocks survive, and the faces
+        // between the cells INSIDE one do not. The second half is not a
+        // detail — a leaf block is 27 cells, the shader repeats a texture once
+        // per block, and drawing its interior cell faces would fill it with
+        // planes showing a third of a leaf each.
+        let leaf = MaterialId(7);
+        let foliage = Leaves(leaf);
+
+        // Two leaf blocks touching.
+        let mut canopy = empty();
+        canopy
+            .set_block(BlockPos::new(4, 4, 4), BlockValue::Uniform(leaf))
+            .expect("in chunk");
+        canopy
+            .set_block(BlockPos::new(5, 4, 4), BlockValue::Uniform(leaf))
+            .expect("in chunk");
+
+        let as_leaves = mesh_chunk(
+            &canopy,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &foliage,
+        );
+        let as_glass = mesh_chunk(
+            &canopy,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &Glass(leaf),
+        );
+
+        // The faces are in the cutout list, not the opaque or blended ones:
+        // they are drawn alpha-tested with the world, and a leaf face left
+        // among the opaque quads would show its texture's holes as solid.
+        assert!(
+            !as_leaves.cutout_quads.is_empty(),
+            "foliage produced no cutout quads at all"
+        );
+        assert!(
+            as_leaves.glass_quads.is_empty(),
+            "foliage should not reach the blended list"
+        );
+
+        // **The reported fault, as an assertion.** Glass loses the two faces
+        // between the blocks; cutout keeps them.
+        assert!(
+            as_leaves.cutout_quads.len() > as_glass.glass_quads.len(),
+            "the faces between two leaf blocks were culled: {} cutout quads against {} glass",
+            as_leaves.cutout_quads.len(),
+            as_glass.glass_quads.len()
+        );
+
+        // And the other half: ONE leaf block is its six outer faces and no
+        // interior planes. Six quads exactly — a block whose own cell faces
+        // were drawn would be far more, and the number says which.
+        let mut single = empty();
+        single
+            .set_block(BlockPos::new(4, 4, 4), BlockValue::Uniform(leaf))
+            .expect("in chunk");
+        let one_block = mesh_chunk(
+            &single,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &foliage,
+        );
+        assert_eq!(
+            one_block.cutout_quads.len(),
+            6,
+            "one leaf block should be six faces and no interior planes, got {}",
+            one_block.cutout_quads.len()
+        );
     }
 
     #[test]
