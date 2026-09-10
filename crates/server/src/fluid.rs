@@ -281,6 +281,17 @@ impl tiamot_core::script::WorldEdit for Edits {
             },
         )
     }
+
+    fn merge_partial(&self, domain: &str, pos: BlockPos, block: &str, occupancy: u32) -> bool {
+        let Some(&material) = self.by_name.get(block) else {
+            tracing::debug!(block, "a mod asked to place a block nothing registered");
+            return false;
+        };
+        // Queued as an intent rather than as edits: Sub-Node Contract §7.4 is
+        // resolved against what the block holds, and the world is lent to the
+        // mod that is calling this.
+        self.shared.queue_merge(domain, pos, material, occupancy)
+    }
 }
 
 /// Every loaded chunk's fluid, and what the mods registered.

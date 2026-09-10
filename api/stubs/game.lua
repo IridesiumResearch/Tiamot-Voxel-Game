@@ -1698,11 +1698,33 @@ function game.set_fluid(position, spec) end
 ----- the middle column of a block, three cells tall: a thin branch
 ---game.set_block({ x = 10, y = 70, z = -3 }, "my_mod:log", (1 << 4) | (1 << 13) | (1 << 22))
 ---```
+---**A masked write REPLACES the block by default**, which is what you want for
+---something growing into open air and wrong for something growing into ground.
+---The cells the mask does not name become air, so a boulder placed into turf
+---sits in a footprint of its own bounding block. Pass `{ merge = true }` for the
+---other shape: the cells you name become yours, and every cell you did not name
+---keeps what it held.
+---
+---```lua
+----- A rock embedded in the turf, rather than standing in a hole in it.
+---game.set_block(pos, "my_mod:rock", cells, { merge = true })
+---```
+---
+---A named cell is taken whatever was in it — merging is about the cells you did
+---NOT name. To fill only what is empty, ask what the block holds first.
+---
+---Merging into a block that holds a different material sends one edit per named
+---cell, because that is the only form that adds a material to a block without
+---erasing the first (Sub-Node Contract §7.4). It costs what a player placing
+---the same cells costs; a shape of many cells across varied ground is not free.
+---Without a mask there are no cells to keep, so `merge` has nothing to answer
+---and is ignored.
 ---@param position { x: integer, y: integer, z: integer }
 ---@param block string A registered block id, qualified.
 ---@param occupancy integer? Which of the 27 cells to fill. Omit for the whole block.
+---@param options { merge: boolean? }? `merge` keeps the cells the mask does not name.
 ---@return boolean queued
-function game.set_block(position, block, occupancy) end
+function game.set_block(position, block, occupancy, options) end
 
 ---A dig about to happen.
 ---@class Tiamot.DigEvent

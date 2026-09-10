@@ -218,7 +218,7 @@ pub struct Shared {
     /// carries a `PlayerUuid` because a player is answerable for what it does;
     /// this one has no actor, and giving it a synthetic one would mean every
     /// consumer had to remember which uuids were real.
-    pub seeds: std::sync::Mutex<std::collections::VecDeque<(String, Edit)>>,
+    pub seeds: std::sync::Mutex<std::collections::VecDeque<(String, Seed)>>,
 
     /// Placements waiting for the tick that will decide them.
     ///
@@ -562,6 +562,27 @@ pub fn intent_from_wire(
 }
 
 /// A connection asking the simulation for a chunk.
+/// One edit a mod asked for, as it was asked for.
+///
+/// **A merge cannot be an `Edit` yet.** What edits it becomes depends on what
+/// the block already holds — Sub-Node Contract §7.4 — and the queue is filled
+/// from a mod callback, where the world is lent out and cannot be read. So the
+/// intent travels and the tick resolves it.
+#[derive(Debug)]
+pub enum Seed {
+    /// Apply this edit as it stands.
+    Replace(Edit),
+    /// Add these cells to whatever the block holds, keeping the rest.
+    Merge {
+        /// Which block.
+        pos: tiamot_core::BlockPos,
+        /// The material going into the named cells.
+        material: u16,
+        /// Which cells, as a 27-bit mask.
+        occupancy: u32,
+    },
+}
+
 pub struct ChunkRequest {
     /// Which domain's chunk.
     ///
@@ -824,13 +845,42 @@ impl Shared {
         if queue.len() >= MAX_QUEUED_EDITS {
             return false;
         }
-        queue.push_back((domain.to_owned(), edit));
+        queue.push_back((domain.to_owned(), Seed::Replace(edit)));
+        true
+    }
+
+    /// Queues cells to be added to whatever a block already holds.
+    ///
+    /// Sub-Node Contract §7.4. Same queue and same limit as
+    /// [`Self::queue_seed`], because a mod flooding either would stall the same
+    /// tick.
+    pub fn queue_merge(
+        &self,
+        domain: &str,
+        pos: tiamot_core::BlockPos,
+        material: u16,
+        occupancy: u32,
+    ) -> bool {
+        let Ok(mut queue) = self.seeds.lock() else {
+            return false;
+        };
+        if queue.len() >= MAX_QUEUED_EDITS {
+            return false;
+        }
+        queue.push_back((
+            domain.to_owned(),
+            Seed::Merge {
+                pos,
+                material,
+                occupancy,
+            },
+        ));
         true
     }
 
     /// Takes every queued operator edit, leaving the queue empty.
     #[must_use]
-    pub fn drain_seeds(&self) -> Vec<(String, Edit)> {
+    pub fn drain_seeds(&self) -> Vec<(String, Seed)> {
         self.seeds
             .lock()
             .map(|mut queue| queue.drain(..).collect())

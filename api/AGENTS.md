@@ -465,6 +465,23 @@ end)
 Reading terrain to decide where ore may go is the same shape: bounded, and
 proportional to what you place rather than to the volume you place it in.
 
+**Decoration that embeds needs the merge write.** A masked `game.set_block`
+REPLACES the block — the cells your mask does not name become air — which is
+right for something growing into open air and wrong for a rock or a root going
+into ground: it ends up standing in a footprint of its own bounding block.
+
+```lua
+game.set_block(pos, "my_mod:rock", cells, { merge = true })  -- keeps the turf
+game.set_block(pos, "my_mod:rock", cells)                    -- clears the rest
+```
+
+A named cell is taken whatever was in it; merging is about the cells you did
+NOT name. During generation the buffer already works this way — `set_subnode`
+writes one cell and leaves the other twenty-six — so this is the runtime half
+of the same rule (Sub-Node Contract §7.4). Merging into a block holding a
+different material sends one edit per named cell, which is what it costs to add
+a material to a block without erasing the first.
+
 **Glass is a flag, not a shader.** `register_block{ transparent = true }` and
 the block's own texture alpha decides how see-through it is. That one flag
 changes three things and leaves the rest alone (Sub-Node Contract §8.1):

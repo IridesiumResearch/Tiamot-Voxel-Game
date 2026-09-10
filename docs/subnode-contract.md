@@ -524,6 +524,51 @@ Implemented by `crates/server/src/plans.rs` — `capture` for the read and
 
 ---
 
+### 7.4 A mod's merge write — the cells it names, and nothing else
+
+**`game.set_block` replaces, and that stays the default.** §7.3 says so and the
+reason holds: a mod that says what a block is has said what the whole block is,
+including which of its cells are empty, and a mod wanting to add to a block
+could not have undone a replacing one.
+
+But a mod growing something INTO terrain wants the other shape. A rock in turf
+or a root through soil occupies a few cells of a block the world has already
+filled, and a masked `set_block` there replaces the turf with air in the
+twenty-odd cells the rock does not claim — the rock ends up standing in a
+footprint of its own bounding block, which is the opposite of embedding it.
+
+The merge write is **§7.2's rule made available to a mod**, and it is the same
+rule for the same reason, so it produces the same two shapes of edit:
+
+- The block is empty, or everything in it is already the material going in: one
+  `Edit::Partial` carrying the UNION of what is there and what is being added,
+  canonicalising to `Edit::Block` when that union is full.
+- The block holds a different material: one `Edit::SubNode` per named cell,
+  each preserving what it does not name. The result is a `Mixed` block — the
+  storage form §0 exists for.
+
+**A named cell is taken, whatever was in it.** Merging is about the cells the
+write does NOT name, not about yielding to what is already there: a rock cell
+landing where turf was becomes rock. A mod wanting to fill only what is empty
+asks what the block holds first.
+
+**Nothing on the wire is new.** The union and the per-cell forms are the edits
+§7.2 already sends, so a merge write costs what a player placing the same cells
+costs — up to twenty-seven edits for a block that holds a different material,
+which §10 prices. A mod merging a large shape into varied terrain pays for it,
+and the alternative is a variant that means "and keep the rest", which every
+peer would have to be taught for a saving of a few bytes on a path no player
+action reaches.
+
+Conservation (charter rule 5) is not at stake either way: nothing is paid out
+of an inventory, exactly as §7.3 describes for stamps.
+
+Implemented by `WorldEdit::merge_partial`, resolved where the seeds are drained
+because that is where the world can be read; `place::writes` is the shared
+implementation of both shapes, so this section and §7.2 cannot drift apart.
+
+---
+
 ## 8. Rendering — sub-node resolution, binary greedy meshing
 
 Meshing is at sub-node resolution using **binary greedy meshing**, per §1.

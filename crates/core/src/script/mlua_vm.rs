@@ -3533,7 +3533,12 @@ impl MluaVm {
         let edits = std::sync::Arc::clone(&self.edits);
         self.lua
             .create_function(
-                move |_, (position, block, occupancy): (Table, String, Option<u32>)| {
+                move |_, (position, block, occupancy, options): (
+                    Table,
+                    String,
+                    Option<u32>,
+                    Option<Table>,
+                )| {
                     // Every bit of a third argument must name a cell, and at
                     // least one must: a block with no cells is `engine:air`,
                     // and asking for it that way is a mask that went wrong
@@ -3568,8 +3573,18 @@ impl MluaVm {
                         return Ok(false);
                     };
                     let pos = crate::BlockPos::new(x, y, z);
+                    // **Merge is only a question about a mask.** Without one
+                    // the write is the whole block, and "keep the cells I did
+                    // not name" names none of them — accepting the option there
+                    // would be answering a question the caller did not ask.
+                    let merge = options
+                        .map(|table| table.get::<Option<bool>>("merge"))
+                        .transpose()?
+                        .flatten()
+                        .unwrap_or(false);
                     Ok(match occupancy {
                         None => edits.set_block(&domain, pos, &block),
+                        Some(mask) if merge => edits.merge_partial(&domain, pos, &block, mask),
                         Some(mask) => edits.set_partial(&domain, pos, &block, mask),
                     })
                 },
@@ -7409,6 +7424,21 @@ mod tests {
                 .map(|mut written| written.push((pos, format!("{block}@{occupancy:#x}"))))
                 .is_ok()
         }
+
+        fn merge_partial(
+            &self,
+            _domain: &str,
+            pos: crate::BlockPos,
+            block: &str,
+            occupancy: u32,
+        ) -> bool {
+            // `+` for the merge, so a test can tell the two apart — which is
+            // the whole point of the option and would be invisible otherwise.
+            self.written
+                .lock()
+                .map(|mut written| written.push((pos, format!("{block}+{occupancy:#x}"))))
+                .is_ok()
+        }
     }
 
     #[test]
@@ -7455,6 +7485,62 @@ mod tests {
                 (crate::BlockPos::new(4, 5, 6), "core:white".to_owned()),
             ],
             "a full mask should go the whole-block way and a partial one carry its mask"
+        );
+    }
+
+    #[test]
+    fn a_merge_write_asks_for_a_different_write_than_a_replacing_one() {
+        // **Sub-Node Contract §7.4.** A masked `set_block` SETS the block, so
+        // the cells the mask does not name become air — a rock merged into turf
+        // that way stands in a footprint of its own bounding block instead of
+        // embedding in it. `{ merge = true }` asks for the other shape.
+        //
+        // What the mask means is unchanged, so the option is only a question
+        // about which write; the same mask with and without it has to reach
+        // different methods, and that is what this pins.
+        let mut vm = vm();
+        let slate = std::sync::Arc::new(Slate::default());
+        vm.set_world_edit(
+            std::sync::Arc::clone(&slate) as std::sync::Arc<dyn crate::script::WorldEdit>
+        );
+        load(
+            &mut vm,
+            "grower",
+            "game.register_on_tick(function()
+               local three = (1 << 12) | (1 << 13) | (1 << 14)
+               assert(game.set_block({x=1,y=2,z=3}, 'core:white', three, { merge = true }))
+               assert(game.set_block({x=1,y=2,z=4}, 'core:white', three))
+               assert(game.set_block({x=1,y=2,z=5}, 'core:white', three, { merge = false }))
+               -- Without a mask there are no cells to keep, so the option has
+               -- nothing to answer and the whole-block write is unchanged.
+               assert(game.set_block({x=9,y=9,z=9}, 'core:white', nil, { merge = true }))
+             end)",
+        )
+        .expect("load");
+        let _ = vm.freeze();
+        let faults = vm.tick(1).expect("tick");
+        assert!(faults.is_empty(), "a merge write raised: {faults:?}");
+
+        let written = slate.written.lock().expect("slate");
+        assert_eq!(
+            written.as_slice(),
+            &[
+                // `+` is the merge, `@` the replace — see `Slate`.
+                (
+                    crate::BlockPos::new(1, 2, 3),
+                    "core:white+0x7000".to_owned()
+                ),
+                (
+                    crate::BlockPos::new(1, 2, 4),
+                    "core:white@0x7000".to_owned()
+                ),
+                (
+                    crate::BlockPos::new(1, 2, 5),
+                    "core:white@0x7000".to_owned()
+                ),
+                (crate::BlockPos::new(9, 9, 9), "core:white".to_owned()),
+            ],
+            "the same mask with and without `merge` must not take the same path"
         );
     }
 

@@ -137,6 +137,105 @@ fn a_block_a_mod_places_reaches_the_world() {
     });
 }
 
+/// A mod that puts a few cells of rock into a block of ground, both ways.
+///
+/// The two positions differ only in the `merge` option, which is what makes the
+/// test a comparison rather than an assertion about one number.
+fn write_embedder(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let dir = root.join("embed");
+    std::fs::create_dir_all(&dir).expect("mod dir");
+    std::fs::write(
+        dir.join("mod.toml"),
+        "id = \"embed\"\nname = \"Embed\"\nversion = \"0.1.0\"\n\
+         license = \"GPL-3.0-only\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("init.lua"),
+        "local ground = game.register_block{ id = \"ground\" }\n\
+         local rock = game.register_block{ id = \"rock\" }\n\
+         game.register_on_generate(function(buf, pos)\n\
+         \x20   buf:fill_below_heightmap(game.flat_heightmap(0), ground)\n\
+         end)\n\
+         local done = false\n\
+         game.register_on_tick(function()\n\
+         \x20   if done then return end\n\
+         \x20   done = true\n\
+         \x20   local three = (1 << 12) | (1 << 13) | (1 << 14)\n\
+         \x20   game.set_block({ x = 2, y = -2, z = 2 }, \"embed:rock\", three, { merge = true })\n\
+         \x20   game.set_block({ x = 5, y = -2, z = 5 }, \"embed:rock\", three)\n\
+         end)\n",
+    )
+    .expect("script");
+    root
+}
+
+#[test]
+fn a_merge_write_embeds_in_the_ground_instead_of_standing_in_a_footprint() {
+    // **Sub-Node Contract §7.4, end to end.** A masked `set_block` SETS the
+    // block: the twenty-four cells the mask does not name become air, so a rock
+    // placed into turf that way sits in a footprint of its own bounding block.
+    // With `merge`, the cells it does not name keep what they held.
+    //
+    // The two are told apart by the SHAPE of the edits, which is what §7.4
+    // specifies and what the wire actually carries: a merge into a different
+    // material is one `SubNode` edit per named cell — the only form that adds a
+    // material to a block without erasing the first — and a replace is one
+    // `Partial`. The replacing case is here for contrast, so a run where
+    // nothing happened at all cannot pass.
+    use tiamot_core::proto::Edit;
+
+    let server = start("embed", write_embedder("embed"));
+    block_on(async {
+        let mut bot = Bot::connect(
+            server.local_addr(),
+            Identity::generate().expect("identity"),
+            server.cert_fingerprint(),
+        )
+        .await
+        .expect("connect");
+        bot.join("Bystander").await.expect("join");
+
+        let merged_at = BlockPos::new(2, -2, 2);
+        let replaced_at = BlockPos::new(5, -2, 5);
+        let mut merged = Vec::new();
+        let mut replaced = Vec::new();
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while std::time::Instant::now() < deadline && (merged.len() < 3 || replaced.is_empty()) {
+            let Some(edit) = bot
+                .next_block_delta(Duration::from_secs(2))
+                .await
+                .expect("delta")
+            else {
+                continue;
+            };
+            match edit {
+                Edit::SubNode { pos, .. } if pos.block() == merged_at => merged.push(edit),
+                Edit::Partial { pos, .. } | Edit::Block { pos, .. } if pos == merged_at => {
+                    panic!(
+                        "a merge write sent a {edit:?}, which SETS the block and clears the rest"
+                    )
+                }
+                Edit::Partial { pos, .. } if pos == replaced_at => replaced.push(edit),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            merged.len(),
+            3,
+            "a merge of three cells into ground should be three cell edits, got {merged:?}"
+        );
+        assert_eq!(
+            replaced.len(),
+            1,
+            "the replacing write should still be one Partial, got {replaced:?} — without this \
+             the assertion above passes on a server that did nothing"
+        );
+    });
+}
+
 /// A mod that READS a block and reports what it found by writing a marker.
 ///
 /// The reporting-by-marker trick is `perception.rs`'s: there is no "read a

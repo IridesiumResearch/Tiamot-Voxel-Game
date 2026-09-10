@@ -364,6 +364,29 @@ pub trait WorldEdit: Send + Sync {
     /// surface to the cell, and without this nothing a mod grew afterwards — a
     /// tree, a stalactite — could be anything but whole blocks.
     fn set_partial(&self, domain: &str, pos: crate::BlockPos, block: &str, occupancy: u32) -> bool;
+
+    /// Adds `block` in the cells `occupancy` names, keeping every cell it does
+    /// not name.
+    ///
+    /// Sub-Node Contract §7.4. [`set_partial`](Self::set_partial) SETS a block,
+    /// so a mask naming only new cells clears the rest — a rock merged into
+    /// turf that way stands in a footprint of air instead of embedding in it.
+    /// This is the write that embeds.
+    ///
+    /// A named cell is taken whatever was in it; merging is about the cells the
+    /// write does not name.
+    ///
+    /// The same queue and the same answer as [`set_block`](Self::set_block).
+    /// **Resolved when the queue is drained**, not here: what edits this
+    /// becomes depends on what the block already holds, and only the tick can
+    /// read the world.
+    fn merge_partial(
+        &self,
+        domain: &str,
+        pos: crate::BlockPos,
+        block: &str,
+        occupancy: u32,
+    ) -> bool;
 }
 
 /// What a mod said about a fluid.

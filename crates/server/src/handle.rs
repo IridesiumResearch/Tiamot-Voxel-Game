@@ -2260,26 +2260,65 @@ impl ServerHandle {
                         }
 
                         // A mod's `game.set_block` names the space it meant.
-                        for (seeded_in, edit) in shared.drain_seeds() {
-                            match world.apply(&seeded_in, &edit, &mut source) {
-                                Ok(_) => {
-                                    relight.push(edited_block(&edit));
-                                    // What the block will ACCEPT has changed,
-                                    // even though its fluid has not: a wall
-                                    // knocked out is how a pond finds out there
-                                    // is somewhere new to go.
-                                    fluidics
-                                        .write()
-                                        .expect("fluid lock")
-                                        .of(&seeded_in)
-                                        .touch(edited_block(&edit));
-                                    shared.broadcast_in(
-                                        &seeded_in,
-                                        ServerMessage::BlockDelta { edit, actor: None },
-                                    );
-                                }
-                                Err(err) => {
-                                    debug!("an operator edit would not apply: {err}");
+                        for (seeded_in, seed) in shared.drain_seeds() {
+                            // A merge becomes edits HERE, because what it
+                            // becomes depends on what the block already holds
+                            // and only this thread can read the world —
+                            // Sub-Node Contract §7.4. `place::writes` is the
+                            // same implementation a player's placement uses, so
+                            // the two cannot drift apart.
+                            let edits = match seed {
+                                crate::transport::endpoint::Seed::Replace(edit) => vec![edit],
+                                crate::transport::endpoint::Seed::Merge {
+                                    pos,
+                                    material,
+                                    occupancy,
+                                } => match world.block_cells(&seeded_in, pos, &mut source) {
+                                    Ok(held) => {
+                                        let filled = held.iter().enumerate().fold(
+                                            0u32,
+                                            |mask, (index, cell)| {
+                                                if cell.is_air() { mask } else { mask | (1 << index) }
+                                            },
+                                        );
+                                        let same = filled == 0
+                                            || held.iter().all(|cell| {
+                                                cell.is_air()
+                                                    || *cell
+                                                        == tiamot_core::MaterialId(material)
+                                            });
+                                        tiamot_core::place::writes(
+                                            pos, occupancy, material, filled, same,
+                                        )
+                                    }
+                                    Err(err) => {
+                                        debug!("a mod's merge could not read its block: {err}");
+                                        Vec::new()
+                                    }
+                                },
+                            };
+                            for edit in edits {
+                                match world.apply(&seeded_in, &edit, &mut source) {
+                                    Ok(_) => {
+                                        relight.push(edited_block(&edit));
+                                        // What the block will ACCEPT has
+                                        // changed, even though its fluid has
+                                        // not: a wall knocked out is how a pond
+                                        // finds out there is somewhere new to
+                                        // go.
+                                        fluidics
+                                            .write()
+                                            .expect("fluid lock")
+                                            .of(&seeded_in)
+                                            .touch(edited_block(&edit));
+                                        shared.broadcast_in(
+                                            &seeded_in,
+                                            ServerMessage::BlockDelta { edit, actor: None },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        debug!("an operator edit would not apply: {err}");
+                                    }
                                 }
                             }
                         }
