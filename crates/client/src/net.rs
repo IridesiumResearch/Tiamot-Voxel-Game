@@ -2045,6 +2045,7 @@ mod tests {
                 cutout: false,
                 passable: false,
                 sway: false,
+                billboard: false,
                 tint: None,
             })
             .collect()

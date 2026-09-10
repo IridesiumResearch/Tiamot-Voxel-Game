@@ -747,6 +747,55 @@ than a per-cell lookup across the whole chunk.
 
 ---
 
+### 8.4 Billboard materials — grass
+
+A material may declare itself a **billboard**, and then its cells are not drawn
+as geometry at all. Each run of them becomes one camera-facing sprite.
+
+**Why §8.2 is not enough, and this is not a preference.** A cutout cell is still
+a cube: six faces, each showing what the texture does over that cell. Two things
+follow and both are fatal for grass.
+
+- **A texture repeats once per BLOCK** (§8, and `world.wgsl` says so at the
+  top), so a face one cell across shows a NINTH of the tile — a crop, not a
+  sprite. A grass texture drawn on single cells is nine pieces of grass, none of
+  them whole.
+- **A cube seen from any angle is a cube.** A tuft one cell across reads as a
+  small floating box, and a plane of them reads as a fence. Neither reads as a
+  plant, which is what "sprite cards are not really a thing here" means and it
+  is correct.
+
+So a billboard is its own kind of drawing:
+
+- **One instance per RUN, not per cell.** Contiguous billboard cells in a column
+  are one sprite standing on the lowest of them, as tall as the run and as wide.
+  A run of one is a third of a yard; a run of three is a yard. Drawn per cell
+  instead, a plant three cells tall would be three copies of its own texture
+  stacked, which is worse than the cube it replaced.
+- **It faces the camera about the vertical axis only.** Yaw, never pitch: grass
+  that tilted to meet a player looking down would lie over like a fallen sign,
+  and the ground is the one direction a sprite must keep its footing on.
+- **No geometry buffer.** The quad is built in the vertex stage from the vertex
+  index, exactly as a blob shadow is. A cell costs one instance rather than four
+  vertices and six indices, which is why a field of grass is cheaper this way
+  than as the cubes it replaces.
+- **Alpha-tested and depth-writing**, like §8.2 and for the same reason: it
+  needs no sorting, and it occludes and is occluded correctly at every angle.
+- **It is culled against nothing and culls nothing.** A billboard cell is in no
+  occupancy set, so the ground under it keeps its face and the sprite is drawn
+  wherever the mod put it.
+
+**Everything else about the cell is unchanged.** It is still there for collision
+(unless it also declares `passable`), still lit, still holds fluid out, and a
+ray still stops at it — so a player can aim at a tuft and break it. What changes
+is only how it is drawn.
+
+**Sway (§8.3) applies to the top of a sprite**, which is where its own vertices
+are, so grass bends without any of §8.3's marking: the shader knows which two
+corners are the top because it built them.
+
+---
+
 ## 9. Inventory — 27-unit arithmetic, no exceptions
 
 Charter rule 5, implemented in Task 02. Quantities are stored in units as `u32`;

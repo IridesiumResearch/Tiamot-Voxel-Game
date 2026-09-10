@@ -184,7 +184,21 @@ fn upload(renderer: &mut Renderer, chunks: &[Chunk]) {
 /// For the tests that are about what the shader does with a light level, which
 /// need one the server would really have produced — a sealed room's zero, above
 /// all, which no scene built out of daylight can offer.
+fn upload_with(renderer: &mut Renderer, chunks: &[Chunk], sight: &mesher::Sight) {
+    upload_seeing(renderer, chunks, &DAY, sight);
+}
+
 fn upload_lit(renderer: &mut Renderer, chunks: &[Chunk], light: &impl client::shade::BlockLight) {
+    upload_seeing(renderer, chunks, light, &mesher::Sight::default());
+}
+
+/// The one that does the work, told what the materials are.
+fn upload_seeing(
+    renderer: &mut Renderer,
+    chunks: &[Chunk],
+    light: &impl client::shade::BlockLight,
+    sight: &mesher::Sight,
+) {
     let by_pos: std::collections::BTreeMap<ChunkPos, &Chunk> =
         chunks.iter().map(|chunk| (chunk.pos(), chunk)).collect();
 
@@ -212,7 +226,7 @@ fn upload_lit(renderer: &mut Renderer, chunks: &[Chunk], light: &impl client::sh
             Absent::Air,
             light,
             &mesher::NoFluid,
-            &mesher::NoGlass,
+            sight,
         );
         renderer.set_chunk(pos, &mesh);
     }
@@ -728,6 +742,7 @@ fn a_declared_tint_colours_the_world_and_stays_where_the_world_is() {
         cutout: false,
         passable: false,
         sway: false,
+        billboard: false,
         tint: Some(Tint {
             strength: 255,
             scale: 24,
@@ -2873,6 +2888,7 @@ fn a_swaying_material_moves_with_the_clock_and_a_still_one_does_not() {
             cutout: false,
             passable: false,
             sway,
+            billboard: false,
             tint: None,
         }]
     };
@@ -2921,6 +2937,103 @@ fn a_swaying_material_moves_with_the_clock_and_a_still_one_does_not() {
     assert_eq!(
         still, 0.0,
         "a material that declared no sway moved anyway, so the clock is bending everything"
+    );
+}
+
+#[test]
+fn a_billboard_turns_to_face_the_camera_from_any_side() {
+    // **Contract §8.4, and the reason it exists.** A cutout cell is a cube:
+    // walk round it and you see a different face, and edge-on to a plane of
+    // them you see almost nothing — which is what "sprite cards are not really
+    // a thing" means and why grass built from cells reads as floating boxes.
+    // A sprite turns, so it presents the same face from every side.
+    //
+    // The test is that: photograph one plant from four directions and assert it
+    // covers about the same area each time. A cube would be wide from the front
+    // and a sliver from the side.
+    let Some(gpu) = gpu() else { return };
+
+    const GRASS: MaterialId = MaterialId(2);
+
+    let mut chunk = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+    // One cell of grass, standing on nothing so the only thing in frame is it.
+    chunk
+        .set_subnode(BlockPos::new(8, 8, 8).subnode(1, 0, 1), GRASS)
+        .expect("in chunk");
+
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+    let atlas = Atlas::build(&[None, None, Some(Image::solid(16, 16, [80, 200, 90, 255]))]);
+    renderer.set_atlas(&atlas);
+    renderer.set_tints(&[MaterialDef {
+        id: GRASS.get(),
+        name: "grass".to_owned(),
+        step_sound: None,
+        texture: None,
+        placeable: true,
+        transparent: false,
+        cutout: false,
+        passable: false,
+        sway: false,
+        billboard: true,
+        tint: None,
+    }]);
+    upload_with(
+        &mut renderer,
+        std::slice::from_ref(&chunk),
+        &client::mesher::Sight {
+            glass: std::collections::BTreeSet::new(),
+            foliage: std::collections::BTreeSet::new(),
+            sprites: [GRASS.get()].into_iter().collect(),
+        },
+    );
+    let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
+
+    // Four viewpoints around the plant at the same distance and height.
+    let plant = (8.5_f32, 8.2_f32, 8.5_f32);
+    // Yaw is in RADIANS and zero faces +z, so each viewpoint turns to look back
+    // at the plant: from -z look along +z, from +x look along -x, and so on.
+    // Getting a sign wrong here photographs the sky and reads exactly like a
+    // sprite that is not being drawn.
+    let around = [
+        (plant.0, plant.2 - 2.0, 0.0_f32),
+        (plant.0 + 2.0, plant.2, 0.25),
+        (plant.0, plant.2 + 2.0, 0.5),
+        (plant.0 - 2.0, plant.2, -0.25),
+    ];
+    let mut areas = Vec::new();
+    for (x, z, yaw) in around {
+        let mut camera = Camera {
+            position: Position::from_world(x.into(), plant.1.into(), z.into()),
+            ..Camera::default()
+        };
+        camera.look(yaw * std::f32::consts::TAU, 0.0);
+        let frame = target.capture(&mut renderer, &camera).expect("capture");
+        // Count the green: the sprite is the only thing in the world.
+        let mut green = 0u32;
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                if let Some(pixel) = frame.pixel(x, y)
+                    && pixel[1] > pixel[0] + 20
+                    && pixel[1] > pixel[2] + 20
+                {
+                    green += 1;
+                }
+            }
+        }
+        areas.push(green);
+    }
+
+    let smallest = areas.iter().copied().min().expect("four views");
+    let largest = areas.iter().copied().max().expect("four views");
+    assert!(
+        smallest > 0,
+        "the sprite was invisible from at least one side: {areas:?}"
+    );
+    // Within a quarter of each other. A flat cell would be a full quad from
+    // the front and one pixel wide edge-on — orders apart, not a quarter.
+    assert!(
+        largest <= smallest * 5 / 4,
+        "the sprite's size changed as the camera went round: {areas:?}, so it is not turning"
     );
 }
 
@@ -3799,6 +3912,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             cutout: false,
             passable: false,
             sway: false,
+            billboard: false,
             tint: None,
             texture: None,
         },
@@ -3811,6 +3925,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             cutout: false,
             passable: false,
             sway: false,
+            billboard: false,
             tint: None,
             texture: None,
         },
@@ -3823,6 +3938,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             cutout: false,
             passable: false,
             sway: false,
+            billboard: false,
             tint: None,
             texture: Some([7u8; 32]),
         },

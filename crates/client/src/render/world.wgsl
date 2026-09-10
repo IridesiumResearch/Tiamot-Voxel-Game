@@ -64,6 +64,9 @@ struct Globals {
     shadow_texel: vec4<f32>,
     // Seconds of animation in x, three spare. Read by the fluid stages only.
     fluid: vec4<f32>,
+    // The camera's RIGHT in world space, xyz; w unused. Read by the sprite
+    // stage, which builds its quad facing the camera — Contract §8.4.
+    camera_right: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -1053,6 +1056,94 @@ fn fluid_fragment(input: FluidOut) -> @location(0) vec4<f32> {
     // origin for fluid rather than where the pond is.
     let colour = surface(lit, shadow, 1.0);
     return vec4<f32>(colour.rgb, colour.a * FLUID_ALPHA);
+}
+
+// One camera-facing sprite: grass, a fern, a flower. Contract §8.4.
+//
+// # No geometry buffer
+//
+// The quad is built here from `vertex_index`, so a run of cells costs one
+// instance and no vertices — the same trick `blob.wgsl` uses for a shadow, and
+// the reason a field of grass is cheaper as sprites than as the cubes it
+// replaces.
+//
+// # Yaw only
+//
+// Rotated about the vertical axis to face the camera and never pitched. Grass
+// that tilted to meet a player looking down would lie over like a fallen sign,
+// and the ground is the one direction a sprite has to keep its footing on. So
+// the quad is built from the camera's RIGHT and world UP, not from its right and
+// its up.
+struct SpriteIn {
+    // Camera-relative position of the run's base centre in xyz, and the sprite's
+    // size in blocks in w.
+    @location(0) anchor: vec4<f32>,
+    // World position of the same point, for the wind and the colour field.
+    @location(1) world: vec4<f32>,
+    // material | light << 16.
+    @location(2) packed: u32,
+    // The chunk's camera-relative origin, one value for every sprite in it —
+    // the vertex layout gives this a stride of zero.
+    @location(3) chunk_offset: vec4<f32>,
+};
+
+@vertex
+fn sprite_vertex(@builtin(vertex_index) index: u32, sprite: SpriteIn) -> VertexOut {
+    // Two triangles as a strip of four, the same winding `blob.wgsl` uses.
+    let corner = vec2<f32>(
+        select(-1.0, 1.0, (index & 1u) != 0u),
+        select(0.0, 1.0, (index & 2u) != 0u),
+    );
+    let size = sprite.anchor.w;
+    let right = normalize(vec3<f32>(globals.camera_right.x, 0.0, globals.camera_right.z));
+
+    // The wind moves the TOP of the sprite, which is corner.y — so a sprite
+    // bends from its own base for nothing, without any of §8.3's marking.
+    var lean = vec3<f32>(0.0);
+    if (globals.sway_any != 0u && corner.y > 0.0) {
+        let amplitude = tints[sprite.packed & 0xFFFFu].params.z;
+        if (amplitude > 0.0) {
+            let time = globals.fluid.x;
+            let drift = vec3<f32>(time * WIND_SPEED, 0.0, time * WIND_SPEED * 0.6);
+            let field = sprite.world.xyz * WIND_SCALE + drift;
+            lean = vec3<f32>(
+                tint_noise(field) * 2.0 - 1.0,
+                0.0,
+                tint_noise(field + vec3<f32>(31.7, 0.0, 11.3)) * 2.0 - 1.0,
+            ) * amplitude;
+        }
+    }
+
+    let offset = right * (corner.x * size * 0.5) + vec3<f32>(0.0, corner.y * size, 0.0);
+    let placed = sprite.anchor.xyz + sprite.chunk_offset.xyz + offset + lean;
+
+    var out: VertexOut;
+    out.clip = globals.view_projection * vec4<f32>(placed, 1.0);
+    out.distance = length(placed);
+    out.world = placed;
+    out.anchored = sprite.world.xyz;
+    out.slot = sprite.packed & 0xFFFFu;
+    // **The whole tile across the sprite**, which is the difference between a
+    // sprite and a cell of a cube: a face one cell across shows a ninth of its
+    // texture, and that is why a card made of cells is not a sprite card.
+    out.tile_uv = vec2<f32>(corner.x * 0.5 + 0.5, 1.0 - corner.y);
+    // Faces the camera, so it is lit as though facing it: a sprite has no
+    // surface to catch the sun at an angle, and shading one by a normal it
+    // does not really have makes grass flicker as the camera turns.
+    out.normal = vec3<f32>(0.0, 1.0, 0.0);
+    out.shade = 1.0;
+    out.occlusion = 1.0;
+    // **Sun in the TOP nibble**, then red, green, blue — the order
+    // `light::Light::new` packs them in, and getting it backwards lights grass
+    // by its blue channel under a midday sun.
+    let light = (sprite.packed >> 16u) & 0xFFFFu;
+    out.sun = f32((light >> 12u) & 0xFu) / 15.0;
+    out.block_light = vec3<f32>(
+        f32((light >> 8u) & 0xFu) / 15.0,
+        f32((light >> 4u) & 0xFu) / 15.0,
+        f32(light & 0xFu) / 15.0,
+    );
+    return out;
 }
 
 // Modes 1 and 2. Neither has a shadow map; mode 2 has an opinion anyway.

@@ -2478,6 +2478,13 @@ impl App {
                 .filter(|entry| entry.cutout)
                 .map(|entry| entry.id)
                 .collect(),
+            // Contract §8.4: these are not drawn as geometry at all, so the
+            // mesher needs to know before it culls anything.
+            sprites: table
+                .iter()
+                .filter(|entry| entry.billboard)
+                .map(|entry| entry.id)
+                .collect(),
         };
 
         // And what a body walks through. Not part of `Sight`: it changes no
@@ -6599,6 +6606,7 @@ mod tests {
                 cutout: false,
                 passable: false,
                 sway: false,
+                billboard: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6611,6 +6619,7 @@ mod tests {
                 cutout: false,
                 passable: false,
                 sway: false,
+                billboard: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6647,6 +6656,7 @@ mod tests {
             cutout: false,
             passable: false,
             sway: false,
+            billboard: false,
             tint: None,
             step_sound: None,
         }];

@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 47;
+pub const PROTOCOL_VERSION: u32 = 48;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -88,6 +88,8 @@ pub const PROTOCOL_VERSION: u32 = 47;
 // read back the one they got, which makes the seed box write-only and a world
 // worth keeping unshareable. Appended to the variant, safe because the version
 // is agreed in the handshake before a `JoinWorld` is sent.
+// v48 (post-15b): `MaterialDef` carries `billboard`. Presentation only, and the
+// client cannot infer which materials are plants.
 // v47 (post-15b): appended `ServerMessage::ModSettings` and
 // `ClientMessage::SetSetting`. A mod's options, declared like its actions and
 // answered by the player like a key binding.
@@ -817,6 +819,8 @@ pub struct MaterialDef {
     pub passable: bool,
     /// Whether the top of it moves in a fake wind. Presentation only.
     pub sway: bool,
+    /// Whether its cells are drawn as camera-facing sprites. Presentation only.
+    pub billboard: bool,
     /// How this material's colour varies across the world, if a mod said.
     ///
     /// `None` — every material until a mod says otherwise (charter rule 1) —
@@ -3889,6 +3893,7 @@ mod tests {
                     cutout: false,
                     passable: false,
                     sway: false,
+                    billboard: false,
                     tint: None,
                     step_sound: None,
                 },
@@ -3901,6 +3906,7 @@ mod tests {
                     cutout: false,
                     passable: false,
                     sway: false,
+                    billboard: false,
                     tint: None,
                     step_sound: None,
                 },

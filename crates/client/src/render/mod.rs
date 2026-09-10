@@ -210,6 +210,13 @@ struct Globals {
     /// reads it — charter rule 4 does not reach the scroll rate of a texture,
     /// and this value is deliberately not the simulation's tick.
     fluid: [f32; 4],
+    /// The camera's RIGHT in world space, xyz, `w` unused.
+    ///
+    /// **Appended**, for the reason `light_view_projection` documents: every
+    /// field after an insertion moves, and the shader reads by offset. Written
+    /// every frame because it is the camera's, and read only by the sprite
+    /// stage — Contract §8.4, which builds its quad facing the viewer.
+    camera_right: [f32; 4],
 }
 
 /// How much light the darkest place still gets.
@@ -276,6 +283,20 @@ struct MaterialTint {
     low: [f32; 4],
     /// The colour at the high end.
     high: [f32; 4],
+}
+
+/// One sprite, as the GPU takes it. Contract §8.4.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SpriteInstance {
+    /// Camera-relative base centre in xyz, size in blocks in w.
+    anchor: [f32; 4],
+    /// World position of the same point, for the wind and the colour field.
+    world: [f32; 4],
+    /// `material | light << 16`.
+    packed: u32,
+    /// To the 16-byte stride a vertex buffer wants.
+    _pad: [u32; 3],
 }
 
 /// How far the top of a swaying material moves, in blocks.
@@ -367,8 +388,17 @@ struct ChunkMesh {
     /// what saves it from §8.1's sorting limit. `None` for a chunk with no
     /// leaves in it. Contract §8.2.
     cutout: Option<GlassMesh>,
+    /// The sprites: one instance per run of billboard cells. `None` for a
+    /// chunk with no grass in it. Contract §8.4.
+    sprites: Option<SpriteMesh>,
     /// Bytes actually written, as opposed to the pooled buffers' capacity.
     used_bytes: u64,
+}
+
+/// One chunk's sprites, as instances rather than geometry.
+struct SpriteMesh {
+    instances: wgpu::Buffer,
+    count: u32,
 }
 
 /// One chunk's transparent fluid geometry.
@@ -390,6 +420,7 @@ struct WorldPass<'a> {
     world: &'a wgpu::RenderPipeline,
     glass: &'a wgpu::RenderPipeline,
     cutout: &'a wgpu::RenderPipeline,
+    sprites: &'a wgpu::RenderPipeline,
     fluid: &'a wgpu::RenderPipeline,
     selection: &'a wgpu::RenderPipeline,
     skinned: &'a wgpu::RenderPipeline,
@@ -576,6 +607,9 @@ impl BufferPool {
         }
         // And the foliage, for the same reason: a leaf chunk would otherwise
         // leak two buffers on every remesh, which is every nearby dig.
+        if let Some(sprites) = mesh.sprites {
+            self.give(BufferKind::Vertex, sprites.instances);
+        }
         if let Some(cutout) = mesh.cutout {
             self.give(BufferKind::Vertex, cutout.vertices);
             self.give(BufferKind::Index, cutout.indices);
@@ -742,8 +776,16 @@ pub struct Renderer {
     /// The alpha-tested pass for foliage. Depth-writing and unblended: it is
     /// the world pipeline with a fragment entry that discards. See §8.2.
     cutout_pipeline: wgpu::RenderPipeline,
+    /// The instanced pass for sprites. Contract §8.4.
+    sprite_pipeline: wgpu::RenderPipeline,
     /// Seconds of animation, for the fluid scroll. See `advance_clock`.
     elapsed: f32,
+    /// The camera's right vector, from the frame being drawn.
+    ///
+    /// Kept rather than threaded through `globals_for`, which every pass calls
+    /// and only one of them cares: a seventh argument for one stage is a worse
+    /// trade than a field written once a frame.
+    camera_right: [f32; 4],
     globals: wgpu::Buffer,
     bind_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
@@ -933,6 +975,7 @@ impl Renderer {
             fluid_pipeline,
             glass_pipeline,
             cutout_pipeline,
+            sprite_pipeline,
         } = build_terrain_pipelines(&gpu, &shader, &bind_layout, mode, target);
 
         let (blob_pipeline, blob_pipeline_hdr, blobs) = build_blobs(&gpu, &bind_layout);
@@ -979,8 +1022,10 @@ impl Renderer {
             pipeline,
             fluid_pipeline,
             glass_pipeline,
+            sprite_pipeline,
             cutout_pipeline,
             elapsed: 0.0,
+            camera_right: [1.0, 0.0, 0.0, 0.0],
             globals,
             bind_layout,
             bind_group,
@@ -1402,6 +1447,8 @@ impl Renderer {
             });
         }
 
+        let (sprites, sprite_bytes) = self.upload_sprites(pos, mesh);
+
         self.chunks.insert(
             pos,
             ChunkMesh {
@@ -1411,9 +1458,11 @@ impl Renderer {
                 fluid,
                 glass,
                 cutout,
+                sprites,
                 used_bytes: (vertex_bytes.len() + index_bytes.len()) as u64
                     + fluid_bytes
                     + cutout_bytes
+                    + sprite_bytes
                     + glass_bytes,
             },
         );
@@ -1710,6 +1759,7 @@ impl Renderer {
                 [world[0], world[1], world[2], 0.0]
             },
             fluid: [self.elapsed, 0.0, 0.0, 0.0],
+            camera_right: self.camera_right,
         }
     }
 
@@ -1943,6 +1993,7 @@ impl Renderer {
                     world: post.world_pipeline(),
                     glass: post.glass_pipeline(),
                     cutout: post.cutout_pipeline(),
+                    sprites: post.sprite_pipeline(),
                     fluid: post.fluid_pipeline(),
                     selection: post.selection_pipeline(),
                     skinned: post.skinned_pipeline(),
@@ -1954,6 +2005,7 @@ impl Renderer {
                 world: &self.pipeline,
                 glass: &self.glass_pipeline,
                 cutout: &self.cutout_pipeline,
+                sprites: &self.sprite_pipeline,
                 fluid: &self.fluid_pipeline,
                 selection: &self.selection_pipeline,
                 skinned: &self.skinned_pipeline,
@@ -1994,6 +2046,124 @@ impl Renderer {
             pass.set_vertex_buffer(0, glass.vertices.slice(..));
             pass.set_index_buffer(glass.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..glass.index_count, 0, *instance..*instance + 1);
+        }
+    }
+
+    /// Draws the selection outline and the chunk cage over the world.
+    ///
+    /// **Last, so they draw over what they outline.** The pipeline does not
+    /// write depth, so the order within the pass is what decides this rather
+    /// than the depth buffer.
+    fn draw_overlays(&self, pass: &mut wgpu::RenderPass<'_>, pipeline: &wgpu::RenderPipeline) {
+        if self.selection_vertices > 0 {
+            pass.set_pipeline(pipeline);
+            pass.set_vertex_buffer(0, self.selection.slice(..));
+            pass.draw(0..self.selection_vertices, 0..1);
+        }
+        if self.border_vertices > 0 {
+            pass.set_pipeline(pipeline);
+            pass.set_vertex_buffer(0, self.borders.slice(..));
+            pass.draw(0..self.border_vertices, 0..1);
+        }
+    }
+
+    /// Records which way sprites should face this frame.
+    ///
+    /// **Called before the globals are written, because it goes in them.** Set
+    /// after, a sprite faces where the camera was LAST frame — which looks
+    /// right whenever the camera is still and edge-on the moment it turns, and
+    /// reads exactly like a sprite that is not being drawn at all.
+    ///
+    /// Yaw only (Contract §8.4), and flattened here rather than in the shader
+    /// so every sprite in the frame agrees: normalising per vertex a vector
+    /// that is the same for all of them is work done a thousand times for one
+    /// answer.
+    fn face_sprites_at(&mut self, camera: &Camera) {
+        let facing = camera.forward();
+        let right = glam::Vec3::new(facing.z, 0.0, -facing.x).normalize_or_zero();
+        self.camera_right = [right.x, right.y, right.z, 0.0];
+    }
+
+    /// Uploads a chunk's sprites, or nothing at all if it has none.
+    ///
+    /// Its own method because `set_chunk` is at clippy's line ceiling and this
+    /// is the fourth buffer it fills — extract, never append.
+    fn upload_sprites(&mut self, pos: ChunkPos, mesh: &Mesh) -> (Option<SpriteMesh>, u64) {
+        if mesh.billboards.is_empty() {
+            return (None, 0);
+        }
+        let corner = tiamot_core::BlockPos::from_chunk_corner(pos);
+        let per_axis = tiamot_core::SUBNODES_PER_AXIS as f32;
+        let instances: Vec<SpriteInstance> = mesh
+            .billboards
+            .iter()
+            .map(|sprite| {
+                let size = f32::from(sprite.height) / per_axis;
+                // The middle of the run's base cell, so a sprite stands ON the
+                // cell rather than on the corner of it.
+                let local = [
+                    (f32::from(sprite.cell[0]) + 0.5) / per_axis,
+                    f32::from(sprite.cell[1]) / per_axis,
+                    (f32::from(sprite.cell[2]) + 0.5) / per_axis,
+                ];
+                SpriteInstance {
+                    // Chunk-relative. The chunk's own camera-relative offset
+                    // arrives in the second vertex buffer, which is what keeps
+                    // this out of a world-space `f32` (charter rule 7).
+                    anchor: [local[0], local[1], local[2], size],
+                    world: [
+                        corner.x as f32 + local[0],
+                        corner.y as f32 + local[1],
+                        corner.z as f32 + local[2],
+                        0.0,
+                    ],
+                    packed: u32::from(sprite.material) | (u32::from(sprite.light) << 16),
+                    _pad: [0; 3],
+                }
+            })
+            .collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&instances);
+        let buffer = self
+            .pool
+            .take(&self.gpu, BufferKind::Vertex, bytes.len() as u64);
+        self.gpu.queue.write_buffer(&buffer, 0, bytes);
+        (
+            Some(SpriteMesh {
+                instances: buffer,
+                count: u32::try_from(instances.len()).unwrap_or(0),
+            }),
+            bytes.len() as u64,
+        )
+    }
+
+    /// Draws every visible chunk's sprites, with the opaque geometry.
+    ///
+    /// One instance per run of cells and no vertex data at all — the quad is
+    /// built in the vertex stage facing the camera (Contract §8.4). Depth is
+    /// written, so this belongs before anything blended and needs no sorting.
+    fn draw_sprites(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        pipeline: &wgpu::RenderPipeline,
+        visible: &[(ChunkPos, u32)],
+    ) {
+        let mut any = false;
+        for (pos, instance) in visible {
+            let Some(sprites) = self.chunks.get(pos).and_then(|mesh| mesh.sprites.as_ref()) else {
+                continue;
+            };
+            if !any {
+                pass.set_pipeline(pipeline);
+                any = true;
+            }
+            // **The chunk's own instance stays in slot 1**, which is what puts
+            // the sprite in the right chunk: slot 0 is the sprite list and slot
+            // 1 is the chunk offset every other draw in this pass inherits.
+            let stride = size_of::<Instance>() as u64;
+            let at = u64::from(*instance) * stride;
+            pass.set_vertex_buffer(0, sprites.instances.slice(..));
+            pass.set_vertex_buffer(1, self.instances.slice(at..at + stride));
+            pass.draw(0..4, 0..sprites.count);
         }
     }
 
@@ -2166,6 +2336,8 @@ impl Renderer {
         let aspect = size.0 as f32 / size.1.max(1) as f32;
         let view_projection = camera.view_projection(aspect);
 
+        self.face_sprites_at(camera);
+
         // Before the globals are written, because the matrices go in them.
         if let Some(shadows) = self.post.as_mut().and_then(graph::Post::shadows_mut) {
             shadows.update(&self.gpu, camera, aspect, self.sun_direction);
@@ -2293,6 +2465,8 @@ impl Renderer {
             // than among it.
             self.draw_cutout(&mut pass, pass_targets.cutout, &culled.visible);
 
+            self.draw_sprites(&mut pass, pass_targets.sprites, &culled.visible);
+
             // Glass first of the two blended passes, then the milk. Both
             // inherit slot 1 from the chunk loop above, which is what the
             // instance rebind just before this comment protects.
@@ -2300,21 +2474,7 @@ impl Renderer {
 
             self.draw_fluid(&mut pass, pass_targets.fluid, &culled.visible);
 
-            // Last, so it draws over the world it outlines. Its pipeline does
-            // not write depth, so the order within the pass is what decides
-            // this rather than the depth buffer.
-            if self.selection_vertices > 0 {
-                pass.set_pipeline(pass_targets.selection);
-                pass.set_vertex_buffer(0, self.selection.slice(..));
-                pass.draw(0..self.selection_vertices, 0..1);
-            }
-
-            // And the chunk cage over that, when it is asked for.
-            if self.border_vertices > 0 {
-                pass.set_pipeline(pass_targets.selection);
-                pass.set_vertex_buffer(0, self.borders.slice(..));
-                pass.draw(0..self.border_vertices, 0..1);
-            }
+            self.draw_overlays(&mut pass, pass_targets.selection);
         }
 
         // The post chain, if this mode has one. It reads the scene texture the
@@ -3214,12 +3374,13 @@ fn build_pipeline(
 /// opaque world, so it needs the same bind groups and the same fragment entry —
 /// a pane lit differently from the wall it sits in would read as a bug in the
 /// lighting rather than in the pass.
-/// The four pipelines that draw terrain into the window's own format.
+/// The pipelines that draw terrain into the window's own format.
 struct TerrainPipelines {
     pipeline: wgpu::RenderPipeline,
     fluid_pipeline: wgpu::RenderPipeline,
     glass_pipeline: wgpu::RenderPipeline,
     cutout_pipeline: wgpu::RenderPipeline,
+    sprite_pipeline: wgpu::RenderPipeline,
 }
 
 /// Builds them together, because `Renderer::new` is at clippy's line ceiling
@@ -3255,7 +3416,108 @@ fn build_terrain_pipelines(
             target,
             false,
         ),
+        sprite_pipeline: build_sprite_pipeline(gpu, shader, &[Some(bind_layout)], target),
     }
+}
+
+/// The sprite pipeline: instanced, alpha-tested, depth-writing.
+///
+/// **Its own pipeline rather than a flag**, for `build_fluid_pipeline`'s
+/// reasons: the vertex input is different in kind — one instance and no
+/// vertices at all — and a pipeline's vertex layout is fixed when it is built.
+/// The fragment stage is `fragment_cutout` unchanged, because a sprite and a
+/// leaf want exactly the same thing of it: discard the holes, write depth, no
+/// sorting (Contract §8.4).
+fn build_sprite_pipeline(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    bind_layouts: &[Option<&wgpu::BindGroupLayout>],
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let layout = gpu
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sprite-pipeline-layout"),
+            bind_group_layouts: bind_layouts,
+            immediate_size: 0,
+        });
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sprites"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("sprite_vertex"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: size_of::<SpriteInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 16,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Uint32,
+                                offset: 32,
+                                shader_location: 2,
+                            },
+                        ],
+                    },
+                    // **The chunk's offset, with a stride of zero.** Every sprite
+                    // in a chunk sits against the same origin, and a stride of zero
+                    // is how WebGPU says "one value for all of them" — so the draw
+                    // binds this chunk's element and the shader reads it from every
+                    // instance. Without it a sprite's position would have to be
+                    // world-absolute, which is charter rule 7's floating-origin
+                    // problem in an `f32`.
+                    wgpu::VertexBufferLayout {
+                        array_stride: 0,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 0,
+                            shader_location: 3,
+                        }],
+                    },
+                ],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fragment_cutout"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                // **Both sides.** A sprite is a flat quad turned to face the
+                // camera; culling a side of it would make it vanish for half a
+                // turn, which is the artefact billboards exist to avoid.
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
 }
 
 /// The foliage pipeline for the float target, with or without cascades.
@@ -3266,6 +3528,23 @@ fn build_terrain_pipelines(
 /// would consult are the same ones `fragment_cutout` already asks
 /// `generic_shadow` for. Mode 3 keeps its own shadowed terrain; leaves take the
 /// generic term, which is what they had as ordinary blocks.
+/// The sprite pipeline for the float target.
+///
+/// The shadow layout is taken only so the bind groups match what mode 3 binds;
+/// `fragment_cutout` reads the cascades through `generic_shadow` either way.
+pub(crate) fn sprite_pipeline_for(
+    gpu: &Gpu,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::BindGroupLayout,
+    shadows: Option<&shadow::Shadows>,
+) -> wgpu::RenderPipeline {
+    let layouts: Vec<Option<&wgpu::BindGroupLayout>> = match shadows {
+        Some(shadows) => vec![Some(layout), Some(shadows.sample_layout())],
+        None => vec![Some(layout)],
+    };
+    build_sprite_pipeline(gpu, shader, &layouts, graph::HDR_FORMAT)
+}
+
 pub(crate) fn cutout_pipeline_for(
     gpu: &Gpu,
     shader: &wgpu::ShaderModule,

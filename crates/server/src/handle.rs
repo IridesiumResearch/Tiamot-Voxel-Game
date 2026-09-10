@@ -110,6 +110,7 @@ fn material_table(
                 cutout: rules.get(name).is_some_and(|rules| rules.cutout),
                 passable: rules.get(name).is_some_and(|rules| rules.passable),
                 sway: rules.get(name).is_some_and(|rules| rules.sway),
+                billboard: rules.get(name).is_some_and(|rules| rules.billboard),
                 // Colour variation, which is the client's alone: it multiplies
                 // the texture by a field sampled from world position, and
                 // nothing here ever looks at the answer.

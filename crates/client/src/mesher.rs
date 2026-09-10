@@ -230,6 +230,13 @@ pub struct SubNodeGrid {
     /// ([`SAME_BLOCK`]), so a canopy keeps the faces inside it and is not a
     /// hollow shell. Contract §8.2.
     cutout: Option<[Vec<u64>; 3]>,
+    /// Runs of billboard cells, found once while the material table is in
+    /// scope. Empty for a world with no sprites in it, which is most.
+    sprites: Vec<Sprite>,
+    /// The same cells as an occupancy mask, so the culling can take them out of
+    /// every set — a sprite is not geometry and neither hides a face nor has
+    /// one (Contract §8.4).
+    sprite_columns: Option<[Vec<u64>; 3]>,
     /// Each block's fluid surface height, in sixteenths of a cell, `0` for dry.
     ///
     /// **This is what makes the surface smooth rather than a staircase.** The
@@ -449,6 +456,8 @@ impl SubNodeGrid {
         // meshes as it always did.
         let glass = glass_columns(&materials, transparent);
         let cutout = cutout_columns(&materials, transparent);
+        let sprites = billboards_of(&materials, transparent);
+        let sprite_columns = sprite_columns_of(&materials, transparent);
 
         let mut grid = Self {
             materials,
@@ -456,6 +465,8 @@ impl SubNodeGrid {
             fluid: wet,
             glass,
             cutout,
+            sprites,
+            sprite_columns,
             heights,
             walls,
         };
@@ -803,6 +814,17 @@ pub trait Transparency {
         false
     }
 
+    /// Whether a material's cells are drawn as camera-facing sprites rather
+    /// than as geometry. Sub-Node Contract §8.4.
+    fn is_billboard(&self, _material: u16) -> bool {
+        false
+    }
+
+    /// Whether ANY material in play is a billboard.
+    fn any_billboard(&self) -> bool {
+        false
+    }
+
     /// Whether ANY material in play is transparent.
     ///
     /// **Defaults to yes, which is the safe answer**, and every implementation
@@ -856,6 +878,8 @@ pub struct Sight {
     pub glass: std::collections::BTreeSet<u16>,
     /// See-through in places: foliage. Contract §8.2.
     pub foliage: std::collections::BTreeSet<u16>,
+    /// Drawn as camera-facing sprites rather than as geometry. Contract §8.4.
+    pub sprites: std::collections::BTreeSet<u16>,
 }
 
 impl Transparency for Sight {
@@ -873,6 +897,14 @@ impl Transparency for Sight {
 
     fn any_cutout(&self) -> bool {
         !self.foliage.is_empty()
+    }
+
+    fn is_billboard(&self, material: u16) -> bool {
+        self.sprites.contains(&material)
+    }
+
+    fn any_billboard(&self) -> bool {
+        !self.sprites.is_empty()
     }
 }
 
@@ -1118,6 +1150,11 @@ fn fill_fluid(
 /// this is the same work sorted into two buckets rather than any extra.
 #[derive(Debug, Default, Clone)]
 pub struct Mesh {
+    /// One camera-facing sprite, from a run of billboard cells in a column.
+    ///
+    /// Not a quad: it has no corners until the vertex stage builds them facing
+    /// the camera, which is the whole point of it — Contract §8.4.
+
     /// The merged opaque quads.
     pub quads: Vec<Quad>,
     /// The merged transparent quads: glass.
@@ -1131,6 +1168,8 @@ pub struct Mesh {
     ///
     /// Empty for a chunk with no glass in it, which is nearly all of them.
     pub glass_quads: Vec<Quad>,
+    /// The sprites: one per run of billboard cells. Contract §8.4.
+    pub billboards: Vec<Billboard>,
     /// The merged alpha-tested quads: foliage.
     ///
     /// Their own list rather than the opaque one because their pipeline
@@ -1201,6 +1240,7 @@ impl Mesh {
             && self.fluid_vertices.is_empty()
             && self.glass_quads.is_empty()
             && self.cutout_quads.is_empty()
+            && self.billboards.is_empty()
     }
 
     /// Whether there is no opaque geometry. A pond hanging in the air has none.
@@ -1821,6 +1861,7 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
     let wet = grid.fluid.as_ref().map(|fluid| &fluid[axis]);
     let glass = grid.glass.as_ref().map(|glass| &glass[axis]);
     let cutout = grid.cutout.as_ref().map(|cutout| &cutout[axis]);
+    let billboards = grid.sprite_columns.as_ref().map(|sprites| &sprites[axis]);
     scratch.plane.fill(0);
     scratch.wet_plane.fill(0);
     scratch.glass_plane.fill(0);
@@ -1878,7 +1919,12 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
             // is 27 cells and the faces between them would each show a third of
             // a leaf texture, because the shader repeats once per block.
             let leaves = cutout.map_or(0, |cutout| cutout[u * N + v]);
-            let opaque = solid & !panes & !leaves;
+            // **A billboard cell is not geometry.** Contract §8.4: it is drawn
+            // as a sprite, so it emits no face of its own and hides none —
+            // taken out of every set here, and the ground under it keeps the
+            // face it would otherwise have lost.
+            let sprites = billboards.map_or(0, |sprites| sprites[u * N + v]);
+            let opaque = solid & !panes & !leaves & !sprites;
             let (faces, glass_faces, leaf_faces) = if positive {
                 (
                     opaque & !(opaque >> 1),
@@ -2162,7 +2208,27 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
             merge_slice(grid, light, (face.0, face.1, w), &mut scratch);
         }
     }
-    scratch.finish(grid)
+    let mut mesh = scratch.finish(grid);
+    // **The sprites, lit where they stand.** Found when the grid was built,
+    // because that is where the material table was; lit here, because that is
+    // where the light is. Contract §8.4.
+    mesh.billboards = grid
+        .sprites
+        .iter()
+        .map(|sprite| Billboard {
+            cell: sprite.cell,
+            height: sprite.height,
+            material: sprite.material,
+            light: light
+                .at(
+                    i32::from(sprite.cell[0]) / SUBNODES_PER_AXIS as i32,
+                    i32::from(sprite.cell[1]) / SUBNODES_PER_AXIS as i32,
+                    i32::from(sprite.cell[2]) / SUBNODES_PER_AXIS as i32,
+                )
+                .0,
+        })
+        .collect();
+    mesh
 }
 
 /// Shades one slice's faces, then merges them.
@@ -2260,6 +2326,36 @@ fn glass_columns(materials: &[u16], transparent: &impl Transparency) -> Option<[
     found.then_some(columns)
 }
 
+/// A run of billboard cells, before its light is known.
+///
+/// The grid finds these while it has the material table; `mesh` turns them into
+/// [`Billboard`]s when it has the light, which is the same split every other
+/// quad goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sprite {
+    cell: [u8; 3],
+    height: u8,
+    material: u16,
+}
+
+/// One camera-facing sprite: a run of billboard cells in a column.
+///
+/// Sub-Node Contract §8.4. It carries where the run STARTS and how tall it is,
+/// not four corners — the corners are built in the vertex stage facing the
+/// camera, and a sprite that carried them would be a sprite facing wherever it
+/// was meshed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Billboard {
+    /// The cell the run stands on, in chunk cell coordinates.
+    pub cell: [u8; 3],
+    /// How many cells tall the run is, at least one.
+    pub height: u8,
+    /// What it is made of, for the atlas.
+    pub material: u16,
+    /// The light where it stands, packed as [`tiamot_core::light::Light`].
+    pub light: u16,
+}
+
 /// The occupancy columns of every cutout cell, or `None` if there are none.
 ///
 /// The same walk as [`glass_columns`] over the other flag. Two passes rather
@@ -2286,6 +2382,79 @@ fn cutout_columns(materials: &[u16], transparent: &impl Transparency) -> Option<
         }
     }
     found.then_some(columns)
+}
+
+/// The occupancy columns of every billboard cell, or `None` if there are none.
+///
+/// The same walk `cutout_columns` does over the other flag, and needed for the
+/// opposite reason: these cells are removed from the geometry rather than added
+/// to a second set of it.
+fn sprite_columns_of(materials: &[u16], transparent: &impl Transparency) -> Option<[Vec<u64>; 3]> {
+    if !transparent.any_billboard() {
+        return None;
+    }
+    let mut columns = [vec![0u64; N * N], vec![0u64; N * N], vec![0u64; N * N]];
+    let mut found = false;
+    for z in 0..N {
+        for y in 0..N {
+            for x in 0..N {
+                let material = materials[x + N * y + N * N * z];
+                if material == 0 || !transparent.is_billboard(material) {
+                    continue;
+                }
+                found = true;
+                columns[0][y * N + z] |= 1 << (x as u32 + FIRST);
+                columns[1][x * N + z] |= 1 << (y as u32 + FIRST);
+                columns[2][x * N + y] |= 1 << (z as u32 + FIRST);
+            }
+        }
+    }
+    found.then_some(columns)
+}
+
+/// Finds every run of billboard cells and makes one sprite of each.
+///
+/// **A run, not a cell.** Sub-Node Contract §8.4: three stacked cells of grass
+/// are one sprite a yard tall, not three copies of the same texture stacked a
+/// third of a yard apart — which is worse-looking than the cubes billboards
+/// replace, and was the first version of this.
+///
+/// Walks columns upward so a run is found from its base, which is where the
+/// sprite stands.
+fn billboards_of(materials: &[u16], transparent: &impl Transparency) -> Vec<Sprite> {
+    if !transparent.any_billboard() {
+        return Vec::new();
+    }
+    let mut sprites = Vec::new();
+    for z in 0..N {
+        for x in 0..N {
+            let mut y = 0;
+            while y < N {
+                let material = materials[x + N * y + N * N * z];
+                if material == 0 || !transparent.is_billboard(material) {
+                    y += 1;
+                    continue;
+                }
+                // How far the same material continues upward. A different
+                // billboard material starts its own sprite: two plants sharing
+                // a column are two plants.
+                let mut height = 1;
+                while y + height < N && materials[x + N * (y + height) + N * N * z] == material {
+                    height += 1;
+                }
+                // Lit where it STANDS. One light for the sprite rather than a
+                // gradient up it: a sprite is a third of a yard to a yard tall
+                // and the light over that span is the light at its foot.
+                sprites.push(Sprite {
+                    cell: [x as u8, y as u8, z as u8],
+                    height: u8::try_from(height).unwrap_or(u8::MAX),
+                    material,
+                });
+                y += height;
+            }
+        }
+    }
+    sprites
 }
 
 /// Lays one block's terrain into the grid.
@@ -3435,6 +3604,85 @@ mod tests {
         fn any_cutout(&self) -> bool {
             true
         }
+    }
+
+    /// A world in which exactly one material is drawn as a sprite.
+    struct Sprites(MaterialId);
+
+    impl Transparency for Sprites {
+        fn is_transparent(&self, _material: u16) -> bool {
+            false
+        }
+
+        fn any(&self) -> bool {
+            false
+        }
+
+        fn is_billboard(&self, material: u16) -> bool {
+            material == self.0.get()
+        }
+
+        fn any_billboard(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_billboard_run_is_one_sprite_and_no_geometry() {
+        // **Contract §8.4, both halves.** A billboard cell is drawn as a
+        // camera-facing sprite, so it produces no faces at all — and a RUN of
+        // them is ONE sprite as tall as the run, not one per cell. Three cells
+        // drawn as three sprites is the same grass texture stacked three times
+        // a third of a yard apart, which is worse than the cubes it replaces.
+        let grass = MaterialId(7);
+        let sprites = Sprites(grass);
+
+        let mut world = empty();
+        // Three cells of one column, and a single cell elsewhere.
+        let base = BlockPos::new(4, 4, 4);
+        for step in 0..3i32 {
+            world
+                .set_subnode(base.subnode(1, step, 1), grass)
+                .expect("in chunk");
+        }
+        world
+            .set_subnode(BlockPos::new(6, 4, 6).subnode(0, 0, 0), grass)
+            .expect("in chunk");
+
+        let mesh = mesh_chunk(
+            &world,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &sprites,
+        );
+
+        assert_eq!(
+            mesh.billboards.len(),
+            2,
+            "a run of three and a single cell are two sprites, got {:?}",
+            mesh.billboards
+        );
+        let tall = mesh
+            .billboards
+            .iter()
+            .find(|sprite| sprite.height > 1)
+            .expect("the run of three should be one tall sprite");
+        assert_eq!(tall.height, 3, "the run's height is its cell count");
+        assert!(
+            mesh.billboards.iter().any(|sprite| sprite.height == 1),
+            "the single cell should still be a sprite of its own"
+        );
+
+        // And none of it became geometry — which is the half that would show up
+        // as grass drawn twice, once as a cube and once as a sprite.
+        assert!(
+            mesh.quads.is_empty() && mesh.cutout_quads.is_empty() && mesh.glass_quads.is_empty(),
+            "a billboard cell produced faces: {} opaque, {} cutout",
+            mesh.quads.len(),
+            mesh.cutout_quads.len()
+        );
     }
 
     #[test]

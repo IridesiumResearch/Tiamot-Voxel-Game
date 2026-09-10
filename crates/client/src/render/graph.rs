@@ -396,6 +396,8 @@ pub struct Post {
     glass: wgpu::RenderPipeline,
     /// The alpha-tested pass for foliage, compiled for the float target.
     cutout: wgpu::RenderPipeline,
+    /// The instanced pass for sprites, compiled for the float target.
+    sprites: wgpu::RenderPipeline,
     selection: wgpu::RenderPipeline,
     /// Figures, for the float target. Compiled here for the reason the others
     /// are: a pipeline is compiled against one output format.
@@ -513,6 +515,7 @@ impl Post {
                 shadows.as_ref(),
                 mode,
             ),
+            sprites: super::sprite_pipeline_for(gpu, world_shader, world_layout, shadows.as_ref()),
             skinned: super::skinned::colour_pipeline(
                 gpu,
                 skinned_model,
@@ -586,6 +589,12 @@ impl Post {
     #[must_use]
     pub const fn cutout_pipeline(&self) -> &wgpu::RenderPipeline {
         &self.cutout
+    }
+
+    /// The instanced sprite pipeline, compiled for the float target.
+    #[must_use]
+    pub const fn sprite_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.sprites
     }
 
     /// The blended fluid pipeline, compiled for the float target.

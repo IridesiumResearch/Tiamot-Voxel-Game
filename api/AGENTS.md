@@ -592,16 +592,28 @@ and a ray still stops at it — which is deliberate and is what lets a player ai
 at a tuft and break it. A material that reported itself hollow everywhere would
 be one nobody could pick.
 
-**A sprite card is cells, not a billboard.** The engine has no diagonal geometry
-— the mesher emits axis-aligned faces from cell occupancy — so a tuft is a plane
-of cells one cell thick, and a crossed pair is two planes in a `+`. A one-cell
-plane draws a face on both sides, so it is visible from either direction. The
-merge write makes one tuft one call:
+**Grass is `billboard = true`, not a card of cells.** Building a sprite card out
+of cells does not work here and it is worth knowing why, because the geometry
+looks like it should: a texture repeats once per BLOCK, so a face one cell
+across shows a ninth of the tile — a crop, not a sprite — and a cell is a cube,
+so a tuft made of them reads as a little floating box. That is what "sprite
+cards are not really a thing" means, and it is correct.
 
 ```lua
-local card = (1 << 12) | (1 << 13) | (1 << 14) | (1 << 4) | (1 << 22)
-game.set_block(pos, "my_mod:grass", card, { merge = true })
+game.register_block{
+    id = "grass",
+    billboard = true,   -- drawn as a camera-facing sprite, not as geometry
+    passable = true,
+    sway = true,
+}
 ```
+
+A RUN of cells in a column is ONE sprite as tall as the run — one cell is a
+third of a yard, three is a yard — so you control a plant's size by how many
+cells you place, and you never get the same texture stacked on top of itself.
+It turns about the vertical axis only, so it never lies over when a player looks
+down at it, and the cells stay exactly where they are for collision, light,
+fluid and the dig ray. Only the drawing changes.
 
 **And `sway = true` makes it move.**
 

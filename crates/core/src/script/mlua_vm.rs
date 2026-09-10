@@ -1947,26 +1947,11 @@ impl ScriptVm for MluaVm {
                             .as_ref()
                             .and_then(|entry| entry.get::<Option<Table>>("tint").ok().flatten())
                             .and_then(|table| tint_of(&table)),
-                        transparent: entry
-                            .as_ref()
-                            .and_then(|entry| entry.get::<Option<bool>>("transparent").ok())
-                            .flatten()
-                            .unwrap_or(false),
-                        cutout: entry
-                            .as_ref()
-                            .and_then(|entry| entry.get::<Option<bool>>("cutout").ok())
-                            .flatten()
-                            .unwrap_or(false),
-                        passable: entry
-                            .as_ref()
-                            .and_then(|entry| entry.get::<Option<bool>>("passable").ok())
-                            .flatten()
-                            .unwrap_or(false),
-                        sway: entry
-                            .as_ref()
-                            .and_then(|entry| entry.get::<Option<bool>>("sway").ok())
-                            .flatten()
-                            .unwrap_or(false),
+                        transparent: flag(entry.as_ref(), "transparent"),
+                        cutout: flag(entry.as_ref(), "cutout"),
+                        passable: flag(entry.as_ref(), "passable"),
+                        sway: flag(entry.as_ref(), "sway"),
+                        billboard: flag(entry.as_ref(), "billboard"),
                     },
                 )
             })
@@ -5589,6 +5574,19 @@ impl MluaVm {
 /// A free function rather than the closure it used to be, so the closure is one
 /// line and this can be read without scrolling past the rest of the
 /// registration API.
+/// One boolean a block declared, or `false` if it did not.
+///
+/// **Absent and `false` are the same answer here**, deliberately: a mod that
+/// leaves a flag out and one that writes `false` describe the same block, and
+/// anything downstream that could tell them apart would be reading something a
+/// mod never said.
+fn flag(entry: Option<&Table>, name: &str) -> bool {
+    entry
+        .and_then(|entry| entry.get::<Option<bool>>(name).ok())
+        .flatten()
+        .unwrap_or(false)
+}
+
 /// Copies a block's plain boolean flags from the spec into its registry entry.
 ///
 /// **This copy is the step that is easy to forget**, and forgetting it is
@@ -5600,7 +5598,7 @@ impl MluaVm {
 /// A flag is recorded whether or not the mod set it, like the rules beside it:
 /// an absent flag and a `false` one must not be distinguishable downstream.
 fn copy_block_flags(spec: &Table, entry: &Table) -> mlua::Result<()> {
-    for flag in ["transparent", "cutout", "passable", "sway"] {
+    for flag in ["transparent", "cutout", "passable", "sway", "billboard"] {
         if let Some(value) = spec.get::<Option<bool>>(flag)? {
             entry.set(flag, value)?;
         }
@@ -6490,7 +6488,7 @@ const FLUID_FIELDS: [&str; 6] = [
 /// accepted them would be an API promising behaviour nothing implements.
 const ITEM_FIELDS: [&str; 4] = ["id", "name", "texture", "description"];
 
-const BLOCK_FIELDS: [&str; 16] = [
+const BLOCK_FIELDS: [&str; 17] = [
     "id",
     "name",
     "drops",
@@ -6507,6 +6505,7 @@ const BLOCK_FIELDS: [&str; 16] = [
     "cutout",
     "passable",
     "sway",
+    "billboard",
 ];
 
 /// Keys the `textures` sub-table accepts.

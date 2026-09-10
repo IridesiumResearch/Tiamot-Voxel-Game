@@ -321,6 +321,12 @@ pub struct BlockRules {
     /// the material table so the client can bend the geometry it draws. See
     /// `docs/subnode-contract.md` §8.3.
     pub sway: bool,
+    /// Whether its cells are drawn as camera-facing sprites: grass.
+    ///
+    /// Not geometry at all — see `docs/subnode-contract.md` §8.4. A run of
+    /// cells becomes one sprite; the cells stay where they are for collision,
+    /// light, fluid and the dig ray.
+    pub billboard: bool,
     /// How this material's colour varies across the world, if a mod said.
     ///
     /// **Presentation only.** Nothing on the server reads it — it travels with
