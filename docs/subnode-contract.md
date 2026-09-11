@@ -859,6 +859,15 @@ is only how it is drawn.
 are, so grass bends without any of §8.3's marking: the shader knows which two
 corners are the top because it built them.
 
+**Crossed cards.** `billboard = "cross"` is the same run of cells, found the
+same way, drawn as TWO cards on the diagonals of the run's column at fixed
+headings — the X that Minecraft and Minetest draw. A card that turns reads,
+from the window, as a sticker that swivels as the player walks round it; the
+X reads as a plant and holds still. Each card is the square a turning sprite
+would be, so the tile is whole across it; both sides are drawn, and sway
+applies to their tops as before. The renderer emits two instances per run and
+hands each its heading, so nothing in the mesh changes but a flag.
+
 ---
 
 ### 8.5 Biome colour — per chunk column, blended, never stored

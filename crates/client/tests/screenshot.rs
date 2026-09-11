@@ -743,6 +743,7 @@ fn a_declared_tint_colours_the_world_and_stays_where_the_world_is() {
         passable: false,
         sway: false,
         billboard: false,
+        billboard_cross: false,
         tint: Some(Tint {
             strength: 255,
             scale: 24,
@@ -2894,6 +2895,7 @@ fn a_swaying_material_moves_with_the_clock_and_a_still_one_does_not() {
             passable: false,
             sway,
             billboard: false,
+            billboard_cross: false,
             tint: None,
         }]
     };
@@ -2980,6 +2982,7 @@ fn a_billboard_turns_to_face_the_camera_from_any_side() {
         passable: false,
         sway: false,
         billboard: true,
+        billboard_cross: false,
         tint: None,
     }]);
     upload_with(
@@ -2989,6 +2992,7 @@ fn a_billboard_turns_to_face_the_camera_from_any_side() {
             glass: std::collections::BTreeSet::new(),
             foliage: std::collections::BTreeSet::new(),
             sprites: [GRASS.get()].into_iter().collect(),
+            crosses: std::collections::BTreeSet::new(),
         },
     );
     let target = Offscreen::new(renderer.gpu(), WIDTH, HEIGHT);
@@ -3101,6 +3105,7 @@ fn a_biome_colour_blends_across_a_chunk_edge_instead_of_tiling_it() {
         passable: false,
         sway: false,
         billboard: false,
+        billboard_cross: false,
         tint: Some(Tint {
             strength: 0,
             scale: 24,
@@ -4050,6 +4055,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             passable: false,
             sway: false,
             billboard: false,
+            billboard_cross: false,
             tint: None,
             texture: None,
         },
@@ -4063,6 +4069,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             passable: false,
             sway: false,
             billboard: false,
+            billboard_cross: false,
             tint: None,
             texture: None,
         },
@@ -4076,6 +4083,7 @@ fn terrain_drawn_through_a_real_atlas_is_not_the_missing_texture_chequer() {
             passable: false,
             sway: false,
             billboard: false,
+            billboard_cross: false,
             tint: None,
             texture: Some([7u8; 32]),
         },

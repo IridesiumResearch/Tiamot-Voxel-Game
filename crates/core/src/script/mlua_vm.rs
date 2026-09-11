@@ -2139,7 +2139,8 @@ impl ScriptVm for MluaVm {
                         cutout: flag(entry.as_ref(), "cutout"),
                         passable: flag(entry.as_ref(), "passable"),
                         sway: flag(entry.as_ref(), "sway"),
-                        billboard: flag(entry.as_ref(), "billboard"),
+                        billboard: billboard_of(entry.as_ref()).0,
+                        billboard_cross: billboard_of(entry.as_ref()).1,
                     },
                 )
             })
@@ -5821,12 +5822,53 @@ fn flag(entry: Option<&Table>, name: &str) -> bool {
 /// `transparent`, then `cutout` — three times for one missing line, which is
 /// why they are gathered here where the list can be read at a glance.
 ///
+/// `(billboard, cross)` from a registry entry's `billboard`, which is a bool or
+/// the word "cross" — see [`copy_block_flags`].
+fn billboard_of(entry: Option<&Table>) -> (bool, bool) {
+    let Some(entry) = entry else {
+        return (false, false);
+    };
+    match entry.get::<Option<Value>>("billboard") {
+        Ok(Some(Value::Boolean(value))) => (value, false),
+        Ok(Some(Value::String(word))) => {
+            let cross = word.to_string_lossy() == "cross";
+            (cross, cross)
+        }
+        _ => (false, false),
+    }
+}
+
 /// A flag is recorded whether or not the mod set it, like the rules beside it:
 /// an absent flag and a `false` one must not be distinguishable downstream.
 fn copy_block_flags(spec: &Table, entry: &Table) -> mlua::Result<()> {
-    for flag in ["transparent", "cutout", "passable", "sway", "billboard"] {
+    for flag in ["transparent", "cutout", "passable", "sway"] {
         if let Some(value) = spec.get::<Option<bool>>(flag)? {
             entry.set(flag, value)?;
+        }
+    }
+    // `billboard` is a flag OR the word "cross": one card turned to the camera,
+    // or two fixed cards on the diagonals (Contract §8.4). Anything else is
+    // refused by name rather than read as false — the parser used to read a
+    // non-boolean as false silently, which is how a mod asking for "cross"
+    // before it existed lost its grass without a word.
+    match spec.get::<Option<Value>>("billboard")? {
+        None | Some(Value::Nil) => {}
+        Some(Value::Boolean(value)) => entry.set("billboard", value)?,
+        Some(Value::String(word)) => {
+            let word = word.to_string_lossy();
+            if word == "cross" {
+                entry.set("billboard", "cross")?;
+            } else {
+                return Err(mlua::Error::external(format!(
+                    "register_block: `billboard` is true, false or \"cross\", not \"{word}\""
+                )));
+            }
+        }
+        Some(other) => {
+            return Err(mlua::Error::external(format!(
+                "register_block: `billboard` is true, false or \"cross\", not a {}",
+                other.type_name()
+            )));
         }
     }
     Ok(())

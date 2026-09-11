@@ -1122,13 +1122,18 @@ struct SpriteIn {
     // Camera-relative position of the run's base centre in xyz, and the sprite's
     // size in blocks in w.
     @location(0) anchor: vec4<f32>,
-    // World position of the same point, for the wind and the colour field.
+    // World position of the same point, for the wind and the colour field —
+    // and in w, for a crossed card, its FIXED heading in radians.
     @location(1) world: vec4<f32>,
     // material | light << 16.
     @location(2) packed: u32,
     // The chunk's camera-relative origin, one value for every sprite in it —
     // the vertex layout gives this a stride of zero.
     @location(3) chunk_offset: vec4<f32>,
+    // Bit 0: stand at `world.w` rather than turning to the camera. One of the
+    // two cards of a cross (Contract §8.4), which never swivels as the
+    // player walks round it — a plant, not a sticker.
+    @location(4) flags: u32,
 };
 
 @vertex
@@ -1139,7 +1144,10 @@ fn sprite_vertex(@builtin(vertex_index) index: u32, sprite: SpriteIn) -> VertexO
         select(0.0, 1.0, (index & 2u) != 0u),
     );
     let size = sprite.anchor.w;
-    let right = normalize(vec3<f32>(globals.camera_right.x, 0.0, globals.camera_right.z));
+    var right = normalize(vec3<f32>(globals.camera_right.x, 0.0, globals.camera_right.z));
+    if ((sprite.flags & 1u) != 0u) {
+        right = vec3<f32>(cos(sprite.world.w), 0.0, sin(sprite.world.w));
+    }
 
     // The wind moves the TOP of the sprite, which is corner.y — so a sprite
     // bends from its own base for nothing, without any of §8.3's marking.

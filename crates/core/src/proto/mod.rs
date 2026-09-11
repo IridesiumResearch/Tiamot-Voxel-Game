@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 49;
+pub const PROTOCOL_VERSION: u32 = 50;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -88,6 +88,8 @@ pub const PROTOCOL_VERSION: u32 = 49;
 // read back the one they got, which makes the seed box write-only and a world
 // worth keeping unshareable. Appended to the variant, safe because the version
 // is agreed in the handshake before a `JoinWorld` is sent.
+// v50 (post-15b): `MaterialDef` carries `billboard_cross`. A billboard that
+// stands as two fixed crossed cards rather than turning to the camera.
 // v48 (post-15b): `MaterialDef` carries `billboard`. Presentation only, and the
 // client cannot infer which materials are plants.
 // v47 (post-15b): appended `ServerMessage::ModSettings` and
@@ -821,6 +823,9 @@ pub struct MaterialDef {
     pub sway: bool,
     /// Whether its cells are drawn as camera-facing sprites. Presentation only.
     pub billboard: bool,
+    /// Whether those sprites are two FIXED crossed cards instead of one that
+    /// turns to the camera. Presentation only; implies `billboard`.
+    pub billboard_cross: bool,
     /// How this material's colour varies across the world, if a mod said.
     ///
     /// `None` — every material until a mod says otherwise (charter rule 1) —
@@ -3912,6 +3917,7 @@ mod tests {
                     passable: false,
                     sway: false,
                     billboard: false,
+                    billboard_cross: false,
                     tint: None,
                     step_sound: None,
                 },
@@ -3925,6 +3931,7 @@ mod tests {
                     passable: false,
                     sway: false,
                     billboard: false,
+                    billboard_cross: false,
                     tint: None,
                     step_sound: None,
                 },

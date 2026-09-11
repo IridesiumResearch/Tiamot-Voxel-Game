@@ -295,9 +295,19 @@ struct SpriteInstance {
     world: [f32; 4],
     /// `material | light << 16`.
     packed: u32,
+    /// Bit 0: a FIXED heading, held in `world.w` as radians, rather than the
+    /// camera's — one of the two cards of a cross. Contract §8.4.
+    flags: u32,
     /// To the 16-byte stride a vertex buffer wants.
-    _pad: [u32; 3],
+    _pad: [u32; 2],
 }
+
+/// The two headings of a crossed card, in radians: the diagonals of the
+/// run's column. Contract §8.4.
+const CROSS_HEADINGS: [f32; 2] = [
+    std::f32::consts::FRAC_PI_4,
+    3.0 * std::f32::consts::FRAC_PI_4,
+];
 
 /// How far the top of a swaying material moves, in blocks.
 ///
@@ -2147,34 +2157,42 @@ impl Renderer {
         }
         let corner = tiamot_core::BlockPos::from_chunk_corner(pos);
         let per_axis = tiamot_core::SUBNODES_PER_AXIS as f32;
-        let instances: Vec<SpriteInstance> = mesh
-            .billboards
-            .iter()
-            .map(|sprite| {
-                let size = f32::from(sprite.height) / per_axis;
-                // The middle of the run's base cell, so a sprite stands ON the
-                // cell rather than on the corner of it.
-                let local = [
-                    (f32::from(sprite.cell[0]) + 0.5) / per_axis,
-                    f32::from(sprite.cell[1]) / per_axis,
-                    (f32::from(sprite.cell[2]) + 0.5) / per_axis,
-                ];
-                SpriteInstance {
-                    // Chunk-relative. The chunk's own camera-relative offset
-                    // arrives in the second vertex buffer, which is what keeps
-                    // this out of a world-space `f32` (charter rule 7).
-                    anchor: [local[0], local[1], local[2], size],
-                    world: [
-                        corner.x as f32 + local[0],
-                        corner.y as f32 + local[1],
-                        corner.z as f32 + local[2],
-                        0.0,
-                    ],
-                    packed: u32::from(sprite.material) | (u32::from(sprite.light) << 16),
-                    _pad: [0; 3],
+        let mut instances: Vec<SpriteInstance> = Vec::with_capacity(mesh.billboards.len());
+        for sprite in &mesh.billboards {
+            let size = f32::from(sprite.height) / per_axis;
+            // The middle of the run's base cell, so a sprite stands ON the
+            // cell rather than on the corner of it.
+            let local = [
+                (f32::from(sprite.cell[0]) + 0.5) / per_axis,
+                f32::from(sprite.cell[1]) / per_axis,
+                (f32::from(sprite.cell[2]) + 0.5) / per_axis,
+            ];
+            let instance = |heading: Option<f32>| SpriteInstance {
+                // Chunk-relative. The chunk's own camera-relative offset
+                // arrives in the second vertex buffer, which is what keeps
+                // this out of a world-space `f32` (charter rule 7).
+                anchor: [local[0], local[1], local[2], size],
+                world: [
+                    corner.x as f32 + local[0],
+                    corner.y as f32 + local[1],
+                    corner.z as f32 + local[2],
+                    heading.unwrap_or(0.0),
+                ],
+                packed: u32::from(sprite.material) | (u32::from(sprite.light) << 16),
+                flags: u32::from(heading.is_some()),
+                _pad: [0; 2],
+            };
+            // **A cross is two instances, not a wider quad**: each card is the
+            // same square as a turning sprite, on its own diagonal, and the
+            // vertex stage tells them apart by the heading it is handed.
+            if sprite.cross {
+                for heading in CROSS_HEADINGS {
+                    instances.push(instance(Some(heading)));
                 }
-            })
-            .collect();
+            } else {
+                instances.push(instance(None));
+            }
+        }
         let bytes: &[u8] = bytemuck::cast_slice(&instances);
         let buffer = self
             .pool
@@ -3569,6 +3587,11 @@ fn build_sprite_pipeline(
                                 format: wgpu::VertexFormat::Uint32,
                                 offset: 32,
                                 shader_location: 2,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Uint32,
+                                offset: 36,
+                                shader_location: 4,
                             },
                         ],
                     },

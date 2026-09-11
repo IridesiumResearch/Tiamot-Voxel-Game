@@ -2485,6 +2485,12 @@ impl App {
                 .filter(|entry| entry.billboard)
                 .map(|entry| entry.id)
                 .collect(),
+            // The subset drawn as fixed crossed cards. Contract §8.4.
+            crosses: table
+                .iter()
+                .filter(|entry| entry.billboard_cross)
+                .map(|entry| entry.id)
+                .collect(),
         };
 
         // And what a body walks through. Not part of `Sight`: it changes no
@@ -6620,6 +6626,7 @@ mod tests {
                 passable: false,
                 sway: false,
                 billboard: false,
+                billboard_cross: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6633,6 +6640,7 @@ mod tests {
                 passable: false,
                 sway: false,
                 billboard: false,
+                billboard_cross: false,
                 tint: None,
                 step_sound: None,
             },
@@ -6670,6 +6678,7 @@ mod tests {
             passable: false,
             sway: false,
             billboard: false,
+            billboard_cross: false,
             tint: None,
             step_sound: None,
         }];

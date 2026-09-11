@@ -820,6 +820,12 @@ pub trait Transparency {
         false
     }
 
+    /// Whether a billboard material stands as two FIXED crossed cards rather
+    /// than one card turned to the camera. Sub-Node Contract §8.4.
+    fn is_cross(&self, _material: u16) -> bool {
+        false
+    }
+
     /// Whether ANY material in play is a billboard.
     fn any_billboard(&self) -> bool {
         false
@@ -880,6 +886,8 @@ pub struct Sight {
     pub foliage: std::collections::BTreeSet<u16>,
     /// Drawn as camera-facing sprites rather than as geometry. Contract §8.4.
     pub sprites: std::collections::BTreeSet<u16>,
+    /// Of those, the ones drawn as two fixed crossed cards. Contract §8.4.
+    pub crosses: std::collections::BTreeSet<u16>,
 }
 
 impl Transparency for Sight {
@@ -905,6 +913,10 @@ impl Transparency for Sight {
 
     fn any_billboard(&self) -> bool {
         !self.sprites.is_empty()
+    }
+
+    fn is_cross(&self, material: u16) -> bool {
+        self.crosses.contains(&material)
     }
 }
 
@@ -2243,6 +2255,7 @@ fn lit_billboards(grid: &SubNodeGrid, light: &impl BlockLight) -> Vec<Billboard>
                     i32::from(sprite.cell[2]) / SUBNODES_PER_AXIS as i32,
                 )
                 .0,
+            cross: sprite.cross,
         })
         .collect()
 }
@@ -2352,6 +2365,7 @@ struct Sprite {
     cell: [u8; 3],
     height: u8,
     material: u16,
+    cross: bool,
 }
 
 /// One camera-facing sprite: a run of billboard cells in a column.
@@ -2370,6 +2384,9 @@ pub struct Billboard {
     pub material: u16,
     /// The light where it stands, packed as [`tiamot_core::light::Light`].
     pub light: u16,
+    /// Two fixed crossed cards rather than one turned to the camera: the
+    /// renderer draws it as two instances at fixed headings. Contract §8.4.
+    pub cross: bool,
 }
 
 /// The occupancy columns of every cutout cell, or `None` if there are none.
@@ -2465,6 +2482,7 @@ fn billboards_of(materials: &[u16], transparent: &impl Transparency) -> Vec<Spri
                     cell: [x as u8, y as u8, z as u8],
                     height: u8::try_from(height).unwrap_or(u8::MAX),
                     material,
+                    cross: transparent.is_cross(material),
                 });
                 y += height;
             }
@@ -3696,6 +3714,60 @@ mod tests {
             stepped.quads, one_shot.quads,
             "stepping changed the geometry"
         );
+    }
+
+    #[test]
+    fn a_crossed_material_flags_its_sprites_and_a_plain_one_does_not() {
+        // Contract §8.4: `billboard = "cross"` is the same run of cells, found
+        // the same way, carrying a flag the renderer turns into two fixed
+        // cards. The flag rides on the sprite; nothing else about the mesh
+        // changes.
+        struct Crosses(MaterialId);
+        impl Transparency for Crosses {
+            fn is_transparent(&self, _material: u16) -> bool {
+                false
+            }
+            fn is_billboard(&self, material: u16) -> bool {
+                material == self.0.get()
+            }
+            fn any_billboard(&self) -> bool {
+                true
+            }
+            fn is_cross(&self, material: u16) -> bool {
+                material == self.0.get()
+            }
+        }
+        let grass = MaterialId(7);
+        let mut world = empty();
+        world
+            .set_subnode(BlockPos::new(4, 4, 4).subnode(1, 0, 1), grass)
+            .expect("in chunk");
+
+        let crossed = mesh_chunk(
+            &world,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &Crosses(grass),
+        );
+        assert_eq!(crossed.billboards.len(), 1);
+        assert!(
+            crossed.billboards[0].cross,
+            "a cross material's sprite carries the flag"
+        );
+
+        let plain = mesh_chunk(
+            &world,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &Sprites(grass),
+        );
+        assert_eq!(plain.billboards.len(), 1);
+        assert!(!plain.billboards[0].cross, "a plain billboard does not");
+        assert_eq!(plain.quads, crossed.quads, "the flag changes no geometry");
     }
 
     #[test]

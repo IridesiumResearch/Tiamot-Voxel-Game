@@ -65,7 +65,7 @@ use super::noise::{BufferSizeMismatch, Fractal, FractalParams, Region3d, fill_3d
 /// dozen nodes and this is two orders above that. It exists because the program
 /// arrives from a script and a runaway table should be refused with a message
 /// rather than allocated.
-pub const MAX_OPS: usize = 256;
+pub const MAX_OPS: usize = 512;
 
 /// How many array buffers may be live at once.
 ///
@@ -124,7 +124,7 @@ impl Interval {
     /// Interval arithmetic in `f32` rounds to nearest, which can move an end
     /// the WRONG way by half an ulp per operation, and a bound that is too
     /// narrow by one ulp is still a bound that can put a hole in a world.
-    /// [`MAX_OPS`] caps the program at 256 operations, so `256 × 2⁻²³` relative
+    /// [`MAX_OPS`] caps the program at 512 operations, so `512 × 2⁻²³` relative
     /// covers the accumulation with room to spare; the absolute term covers an
     /// interval that straddles zero, where relative means nothing.
     fn widened(self) -> Self {

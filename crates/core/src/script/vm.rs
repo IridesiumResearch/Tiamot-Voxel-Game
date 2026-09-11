@@ -327,6 +327,10 @@ pub struct BlockRules {
     /// cells becomes one sprite; the cells stay where they are for collision,
     /// light, fluid and the dig ray.
     pub billboard: bool,
+    /// Whether a billboard stands as two FIXED crossed cards rather than one
+    /// that turns to face the camera: `billboard = "cross"`. Implies
+    /// `billboard`. Presentation only; see `docs/subnode-contract.md` §8.4.
+    pub billboard_cross: bool,
     /// How this material's colour varies across the world, if a mod said.
     ///
     /// **Presentation only.** Nothing on the server reads it — it travels with
