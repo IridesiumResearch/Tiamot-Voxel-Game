@@ -1176,6 +1176,28 @@ pub trait ScriptVm: Sized {
         fill: MaterialId,
     ) -> Result<(Chunk, crate::fluid::FluidLayer), ScriptError>;
 
+    /// The biome colour a mod gives one chunk, or white if none does.
+    ///
+    /// **Defaulted, because almost no VM will have one.** A mod registers a
+    /// `chunk_tint` callback and the server asks for it once per chunk it
+    /// serves — the answer is not stored, so changing a biome's colours
+    /// recolours the world rather than leaving the old colours in the ground
+    /// behind the player.
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError`] if the callback faulted; the mod is disabled and the
+    /// chunk is served white.
+    fn chunk_tint(
+        &mut self,
+        domain: &str,
+        world_seed: u64,
+        pos: ChunkPos,
+    ) -> Result<[u8; 3], ScriptError> {
+        let _ = (domain, world_seed, pos);
+        Ok([u8::MAX; 3])
+    }
+
     /// Tells the VM which numeric id each registered fluid was given.
     ///
     /// **Called once, after the registries freeze and before anything

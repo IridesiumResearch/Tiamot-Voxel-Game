@@ -432,10 +432,12 @@ fn server_messages() -> Vec<Vec<u8>> {
         ServerMessage::ChunkData {
             pos: ChunkPos::new(1, -2, 3),
             blob: vec![0x05, 0x00, 0x01, 0x02, 0x03],
+            tint: [0x00, 0x7F, 0xFF],
         },
         ServerMessage::ChunkData {
             pos: ChunkPos::new(0, 0, 0),
             blob: Vec::new(),
+            tint: [u8::MAX; 3],
         },
         ServerMessage::ChunkUnload {
             pos: ChunkPos::new(-4, 5, -6),

@@ -3043,6 +3043,138 @@ fn a_billboard_turns_to_face_the_camera_from_any_side() {
 }
 
 #[test]
+fn a_biome_colour_blends_across_a_chunk_edge_instead_of_tiling_it() {
+    // **Why this is not simply a colour per chunk.** A flat colour per chunk
+    // draws the world as 16-block squares, which reads worse than the hard
+    // biome edge it was meant to soften: it trades a line nobody notices at
+    // ground level for a grid nobody can stop noticing from a hill. So the
+    // colour is carried at the chunk's four corners, each the mean of the
+    // columns meeting there, and blended across.
+    //
+    // Three assertions, and the third is the one with teeth. The two ends must
+    // differ, or no colour is arriving. The middle must sit BETWEEN them, or it
+    // is a hard edge with a blend painted over it. And the step from one sample
+    // to the next must stay small, or it is a staircase — which is what a flat
+    // per-chunk colour would give and what this exists to avoid.
+    use tiamot_core::proto::{MaterialDef, Tint};
+    let Some(gpu) = gpu() else { return };
+
+    const FLOOR: MaterialId = MaterialId(2);
+
+    // A floor four chunks long in x, seen from above. Four so there is a whole
+    // chunk of each end colour and two of blend between them.
+    let mut chunks = Vec::new();
+    for chunk_x in 0..4 {
+        let mut chunk = Chunk::new(ChunkPos::new(chunk_x, 0, 0), MaterialId::AIR);
+        for x in 0..16 {
+            for z in 0..16 {
+                chunk
+                    .set_block(
+                        BlockPos::new(chunk_x * 16 + x, 8, z),
+                        BlockValue::Uniform(FLOOR),
+                    )
+                    .expect("in chunk");
+            }
+        }
+        chunks.push(chunk);
+    }
+
+    let mut renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+    renderer.set_atlas(&Atlas::build(&[
+        None,
+        None,
+        Some(Image::solid(16, 16, [180, 180, 180, 255])),
+    ]));
+    // A tint the material declares, because declaring one is what opts a
+    // material into varying with its surroundings and so into varying with the
+    // place. `scale` must be positive or `material_tint` returns early and the
+    // biome colour never reaches the albedo — which is the behaviour stone
+    // wants and the reason this test has to declare something.
+    renderer.set_tints(&[MaterialDef {
+        step_sound: None,
+        id: 2,
+        name: "test:floor".to_owned(),
+        placeable: true,
+        texture: None,
+        transparent: false,
+        cutout: false,
+        passable: false,
+        sway: false,
+        billboard: false,
+        tint: Some(Tint {
+            strength: 0,
+            scale: 24,
+            low: [255, 255, 255],
+            high: [255, 255, 255],
+        }),
+    }]);
+
+    // Green at the west end, red at the east, over the columns the four chunks
+    // and their corner neighbours read.
+    for chunk_x in -1..=4 {
+        let green = chunk_x <= 1;
+        let colour = if green { [40, 255, 40] } else { [255, 40, 40] };
+        renderer.set_chunk_tint(ChunkPos::new(chunk_x, 0, 0), colour);
+    }
+
+    let mut camera = Camera {
+        position: Position::from_world(32.0, 52.0, 8.0),
+        ..Camera::default()
+    };
+    camera.look(0.0, -1.5);
+    let scene = Scene {
+        label: "biome blend",
+        chunks,
+        lit: None,
+        camera,
+        sky_above: false,
+    };
+    let image = render_scene(&mut renderer, &scene, LightingMode::Simple);
+
+    // Sampled left to right across the middle of the frame. The measure is how
+    // red the patch is against how green, which runs one way across the blend
+    // and is unaffected by the lighting falling off towards the edges.
+    let mut readings = Vec::new();
+    for column in 0..8 {
+        let x0 = WIDTH / 8 + column * WIDTH / 16;
+        let y0 = HEIGHT / 2 - HEIGHT / 32;
+        let patch = average(&image, x0, y0, x0 + WIDTH / 32, y0 + HEIGHT / 16);
+        readings.push(patch[0] - patch[1]);
+    }
+
+    // **Which end of the frame is which is not asserted**, only that they
+    // differ and that the change between them is gradual. Yaw zero faces +Z, so
+    // the world's +x runs right to left across the picture — a fact that has
+    // cost this suite three separate tests aimed at the sky, and one this test
+    // has no reason to depend on.
+    let first = readings[0];
+    let last = readings[readings.len() - 1];
+    let range = last - first;
+    assert!(
+        range.abs() > 0.05,
+        "the two ends came out the same, so no biome colour is reaching the \
+         picture: {readings:?}"
+    );
+    let middle = readings[readings.len() / 2];
+    assert!(
+        (middle - first).abs() > 0.0 && (middle - first).abs() < range.abs(),
+        "the middle is not between the two ends, so this is a hard edge rather \
+         than a blend: {readings:?}"
+    );
+    // The staircase check. Across eight samples spanning four chunks, no single
+    // step may be most of the whole range — a flat colour per chunk would put
+    // the entire change into one or two steps and leave the rest flat.
+    for pair in readings.windows(2) {
+        let step = (pair[1] - pair[0]).abs();
+        assert!(
+            step < range.abs() * 0.6,
+            "one step of {step} out of a total {range} — the colour is changing in \
+             jumps at chunk boundaries rather than blending: {readings:?}"
+        );
+    }
+}
+
+#[test]
 fn one_material_is_not_one_flat_colour() {
     // **What `CELL_VARIATION` is for, and the bound on it.** A wall of one
     // material is the same texel repeated across hundreds of cells, which reads

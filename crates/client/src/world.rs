@@ -105,6 +105,14 @@ pub struct Due {
 #[derive(Debug, Default)]
 pub struct ChunkStore {
     chunks: BTreeMap<ChunkPos, Chunk>,
+    /// Each chunk COLUMN's biome colour, keyed on `(x, z)`.
+    ///
+    /// **Per column, not per chunk**, because a biome is a fact about a place
+    /// on the map and not about a height. Keyed per chunk it would band
+    /// vertically: the chunk at your feet and the one over your head would be
+    /// different colours, with a seam at eye level, and a mod would have to
+    /// remember to answer the same thing for every `y` to avoid it.
+    tints: BTreeMap<(i32, i32), [u8; 3]>,
     dirty: BTreeSet<ChunkPos>,
     /// Chunks an EDIT dirtied, which have to be rebuilt together.
     ///
@@ -204,6 +212,27 @@ impl ChunkStore {
     #[must_use]
     pub fn get(&self, pos: ChunkPos) -> Option<&Chunk> {
         self.chunks.get(&pos)
+    }
+
+    /// Records one chunk column's biome colour.
+    ///
+    /// Marks nothing dirty: the colour is not baked into a mesh, it is handed
+    /// to the shader with the chunk each frame, so a colour that changes needs
+    /// no remesh at all. That is most of the reason it is per chunk rather
+    /// than per vertex.
+    pub fn set_tint(&mut self, pos: ChunkPos, tint: [u8; 3]) {
+        self.tints.insert((pos.x, pos.z), tint);
+    }
+
+    /// One chunk column's biome colour, white where none is known.
+    ///
+    /// White for an unknown column rather than skipping it, so a chunk at the
+    /// edge of what has arrived blends towards no colour instead of towards
+    /// black — and so the answer exists for every column the interpolation
+    /// asks about, which is four per chunk and some of them off the edge.
+    #[must_use]
+    pub fn tint(&self, x: i32, z: i32) -> [u8; 3] {
+        self.tints.get(&(x, z)).copied().unwrap_or([u8::MAX; 3])
     }
 
     /// Stores a chunk's light, marking it for remeshing.

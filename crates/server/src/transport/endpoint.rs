@@ -591,6 +591,20 @@ pub enum Seed {
     },
 }
 
+/// What answering one chunk request produced.
+///
+/// The blob and the chunk's biome colour travel together because they are
+/// answered together and a client needs both to draw the chunk once. Sending
+/// the colour separately would give a window in which terrain was on screen in
+/// the wrong one, which is a flicker on every chunk that streams in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Served {
+    /// The encoded chunk or summary.
+    pub blob: Vec<u8>,
+    /// The chunk's biome colour, white when no mod gives one.
+    pub tint: [u8; 3],
+}
+
 pub struct ChunkRequest {
     /// Which domain's chunk.
     ///
@@ -613,7 +627,7 @@ pub struct ChunkRequest {
     /// answered simply drops the receiver and the simulation's send fails
     /// harmlessly. A shared queue of replies would need the simulation to know
     /// which connections still exist.
-    pub reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+    pub reply: tokio::sync::oneshot::Sender<Option<Served>>,
 }
 
 /// One broadcast, and who it is for.
@@ -1471,7 +1485,7 @@ impl Shared {
         &self,
         domain: &str,
         pos: tiamot_core::ChunkPos,
-    ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Option<Served>>> {
         self.request_chunk_at(domain, pos, None)
     }
 
@@ -1486,7 +1500,7 @@ impl Shared {
         domain: &str,
         pos: tiamot_core::ChunkPos,
         level: Option<u8>,
-    ) -> Option<tokio::sync::oneshot::Receiver<Option<Vec<u8>>>> {
+    ) -> Option<tokio::sync::oneshot::Receiver<Option<Served>>> {
         let domain = domain.to_owned();
         let mut queue = self.chunk_requests.lock().ok()?;
         if queue.len() >= MAX_QUEUED_CHUNK_REQUESTS {
@@ -2816,7 +2830,7 @@ fn unix_now() -> i64 {
 type Awaiting = (
     tiamot_core::ChunkPos,
     Option<u8>,
-    tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
+    tokio::sync::oneshot::Receiver<Option<Served>>,
 );
 
 /// Which chunk an edit is in.
@@ -2846,12 +2860,14 @@ async fn pump_chunks(
     let mut still_waiting = Vec::with_capacity(pending.len());
     for (pos, level, mut receiver) in pending.drain(..) {
         match receiver.try_recv() {
-            Ok(Some(blob)) => {
+            Ok(Some(Served { blob, tint })) => {
                 // Whichever was asked for. Sending the wrong message for a
                 // blob would be a client decoding a summary as a chunk, which
                 // is not a thing the codec can catch — both are byte strings.
                 let message = match level {
-                    None => ServerMessage::ChunkData { pos, blob },
+                    None => ServerMessage::ChunkData { pos, blob, tint },
+                    // A summary is a distant silhouette: it carries no tinted
+                    // materials to colour, so the tint has nowhere to land.
                     Some(_) => ServerMessage::ChunkSummary { pos, blob },
                 };
                 frame::write(send, &message).await?;

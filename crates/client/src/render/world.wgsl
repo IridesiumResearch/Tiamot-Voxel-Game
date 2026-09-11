@@ -172,7 +172,23 @@ fn tint_noise(at: vec3<f32>) -> f32 {
 // Returns white for a material that declared nothing, which is every material
 // until a mod says otherwise — and the test is one comparison, so a world whose
 // mods declare no tints pays nothing for the feature existing.
-fn material_tint(slot: u32, at: vec3<f32>) -> vec3<f32> {
+// This chunk's biome colour where a vertex stands.
+//
+// Bilinear between the chunk's four x/z corners. Each corner is already the
+// mean of the four chunk columns meeting there (see `Renderer::corner_tint`),
+// so neighbouring chunks agree exactly on the two corners they share and the
+// field runs across the boundary with no seam.
+//
+// Computed per VERTEX and interpolated by the rasteriser rather than evaluated
+// per fragment: over a flat quad the two are the same answer, and this way it
+// costs four multiplies on a vertex instead of on every pixel.
+fn biome_at(local: vec3<f32>, c00: vec3<f32>, c10: vec3<f32>, c01: vec3<f32>, c11: vec3<f32>) -> vec3<f32> {
+    let side = 16.0;
+    let t = clamp(vec2<f32>(local.x, local.z) / side, vec2<f32>(0.0), vec2<f32>(1.0));
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
+
+fn material_tint(slot: u32, at: vec3<f32>, biome: vec3<f32>) -> vec3<f32> {
     if (globals.tint_any == 0u) {
         return vec3<f32>(1.0);
     }
@@ -188,7 +204,13 @@ fn material_tint(slot: u32, at: vec3<f32>) -> vec3<f32> {
     // colour channels to say so.
     let tone = 1.0 + (n - 0.5) * strength;
     let hue = mix(tint.low.rgb, tint.high.rgb, n);
-    return hue * tone;
+    // **The biome colour rides on the material's own tint, and only there.**
+    // Declaring a tint is what opts a material into varying with its
+    // surroundings, so it is also what opts it into varying with the PLACE: a
+    // mod does not say the same thing twice, and stone — which declares
+    // nothing — is the colour of stone in every biome, which is what anybody
+    // would expect of it.
+    return hue * tone * biome;
 }
 
 // Mode 3 only, and in its own bind group for exactly that reason: a binding
@@ -213,6 +235,13 @@ struct VertexIn {
     // the terrain as the player walks, because the coordinate it is read at
     // moves with them.
     @location(4) chunk_world: vec4<f32>,
+    // Per-instance: this chunk's biome colour at its four x/z corners, in the
+    // order -x-z, +x-z, -x+z, +x+z. Blended bilinearly across the chunk — see
+    // `biome_at`, and `Instance::corners` for why there are four.
+    @location(5) biome_00: vec4<f32>,
+    @location(6) biome_10: vec4<f32>,
+    @location(7) biome_01: vec4<f32>,
+    @location(8) biome_11: vec4<f32>,
 };
 
 struct VertexOut {
@@ -242,6 +271,10 @@ struct VertexOut {
     // directions over its whole area and interpolating between two of them
     // would invent normals no geometry has.
     @location(8) @interpolate(flat) normal: vec3<f32>,
+    // This place's biome colour, blended across the chunk and then across the
+    // face by the rasteriser — which is what makes it continuous rather than a
+    // grid of 16-block squares.
+    @location(10) biome: vec3<f32>,
 };
 
 // The outward normal of a face, from the two bits that describe it.
@@ -329,6 +362,13 @@ fn unpack_vertex(input: VertexIn) -> VertexOut {
     out.distance = length(camera_relative);
     out.world = camera_relative;
     out.anchored = local + input.chunk_world.xyz;
+    out.biome = biome_at(
+        local,
+        input.biome_00.rgb,
+        input.biome_10.rgb,
+        input.biome_01.rgb,
+        input.biome_11.rgb,
+    );
 
     // The two coordinates that span this face's plane. Must match
     // `SubNodeGrid::cell`: axis 0 spans (y, z), axis 1 spans (x, z), axis 2
@@ -858,7 +898,7 @@ fn surface(input: VertexOut, shadow: f32, variation: f32) -> vec4<f32> {
     // jitter the sunlight, and over the fog it would put grain on the haze — at
     // distance the fog is most of the colour, so that is where a per-cell
     // pattern would be most visible and least wanted.
-    let albedo = texel.rgb * material_tint(input.slot, input.anchored) * variation;
+    let albedo = texel.rgb * material_tint(input.slot, input.anchored, input.biome) * variation;
     let lit = albedo * lighting(input, shadow);
 
     // Mode 3 fogs in the post chain instead, from the depth buffer — which is

@@ -231,7 +231,10 @@ impl Seen {
             Event::DialogClosed { form } => {
                 self.dialogs.remove(&form);
             }
-            Event::Chunk(chunk) => self.store.insert(*chunk),
+            Event::Chunk(chunk, tint) => {
+                self.store.set_tint(chunk.pos(), tint);
+                self.store.insert(*chunk);
+            }
             Event::ChunkLight(pos, layer) => self.store.set_light(pos, *layer),
             Event::ChunkFluid(pos, layer) => self.store.set_fluid(pos, *layer),
             Event::EntitySpawn(entities) => {

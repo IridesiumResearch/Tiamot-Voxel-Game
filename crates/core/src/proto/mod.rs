@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 48;
+pub const PROTOCOL_VERSION: u32 = 49;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -1343,6 +1343,22 @@ pub enum ServerMessage {
         pos: ChunkPos,
         /// The chunk blob, in the Task 03 format.
         blob: Vec<u8>,
+        /// This chunk's biome colour, which every tinted material here is
+        /// multiplied by. White (255, 255, 255) leaves them alone.
+        ///
+        /// **Not in the blob, and so not on disk.** A mod computes it from the
+        /// same field it chooses biomes with, and the server asks for it when
+        /// it serves the chunk — see `game.register_chunk_tint`. Storing it
+        /// would freeze a mod's palette into every world it ever generated,
+        /// so that changing a biome's colour left the colour it used to be in
+        /// the ground behind the player. It costs one script call per chunk
+        /// served, against the several milliseconds generating one costs.
+        ///
+        /// Bytes rather than floats because it is a colour, seen at a quarter
+        /// of a chunk's width across a screen: 8 bits a channel is more
+        /// precision than the eye has, and 9 bytes a chunk is less than the
+        /// blob's compression noise.
+        tint: [u8; 3],
     },
     /// A chunk left the client's interest set.
     ChunkUnload {
@@ -2892,6 +2908,7 @@ mod tests {
             ServerMessage::ChunkData {
                 pos: ChunkPos::new(1, -2, 3),
                 blob: vec![5, 6, 7],
+                tint: [12, 240, 3],
             },
             ServerMessage::Disconnect {
                 reason: DisconnectReason::VersionMismatch {
@@ -3353,6 +3370,7 @@ mod tests {
                 ServerMessage::ChunkData {
                     pos: ChunkPos::new(0, 0, 0),
                     blob: Vec::new(),
+                    tint: [u8::MAX; 3],
                 },
                 5,
             ),

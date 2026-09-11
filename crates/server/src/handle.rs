@@ -716,7 +716,14 @@ fn serve_chunk_requests(
                 .ok();
             report.generating += at.elapsed();
             report.summaries += 1;
-            let _ = request.reply.send(summary);
+            // A summary is white: it is a distant silhouette with no tinted
+            // materials in it to colour.
+            let _ = request
+                .reply
+                .send(summary.map(|blob| crate::transport::endpoint::Served {
+                    blob,
+                    tint: [u8::MAX; 3],
+                }));
             continue;
         }
         serve_one_chunk(
@@ -812,9 +819,22 @@ fn serve_one_chunk(
         );
     }
 
+    // **Asked for, never stored.** The colour comes from the mod every time
+    // the chunk is served, so changing a biome's palette recolours the world
+    // rather than leaving the colour it used to be in the ground behind the
+    // player. One script call against the milliseconds generating a chunk
+    // costs — and only for chunks that are actually going out.
+    let tint = if blob.is_some() {
+        source.tint(&request.domain, request.pos, world.seed())
+    } else {
+        [u8::MAX; 3]
+    };
+
     // A failed send means the connection went away between asking and being
     // answered, which is ordinary rather than an error.
-    let _ = request.reply.send(blob);
+    let _ = request
+        .reply
+        .send(blob.map(|blob| crate::transport::endpoint::Served { blob, tint }));
 }
 
 /// The block an edit changed.

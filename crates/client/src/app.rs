@@ -4260,11 +4260,24 @@ impl App {
                     ..
                 } => self.joined_world(spawn, tick, may_fly, seed),
 
-                Event::Chunk(chunk) => {
+                Event::Chunk(chunk, tint) => {
                     // The new space has started arriving, so there is something
                     // to look at. Cleared here rather than on a timer: what the
                     // player is waiting for is terrain, and this is it.
                     self.entering = None;
+                    // The colour before the blocks: the two arrived in one
+                    // message precisely so there is no frame in which the
+                    // terrain is on screen wearing the wrong one.
+                    //
+                    // **And its neighbours are marked**, because a corner
+                    // colour is the mean of the four columns meeting there —
+                    // so a column arriving changes the colour of the chunks
+                    // already drawn beside it. The renderer reads the colours
+                    // fresh every frame, so nothing has to be remeshed; the
+                    // instance simply carries different numbers next frame.
+                    let pos = chunk.pos();
+                    self.store.set_tint(pos, tint);
+                    self.renderer.set_chunk_tint(pos, tint);
                     self.store.insert(*chunk);
                 }
 

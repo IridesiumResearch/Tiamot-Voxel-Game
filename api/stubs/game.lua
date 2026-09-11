@@ -642,6 +642,42 @@ function game.register_item(spec) end
 ---@param callback fun(buf: Tiamot.ChunkBuffer, pos: Tiamot.ChunkPos)
 function game.register_on_generate(callback) end
 
+---Gives one chunk its biome colour: a multiplier every TINTED material in it
+---is drawn through.
+---
+---```lua
+---game.register_chunk_tint(function(pos)
+---    local warmth = game.density(WARMTH):bounds(pos)
+---    if warmth.low > 0.0 then return 1.0, 0.85, 0.6 end   -- dry, sandy
+---    return 0.75, 1.0, 0.8                                 -- cool, green
+---end)
+---```
+---
+---**Only materials that declare a `tint` take it.** Declaring one is what opts
+---a material into varying with its surroundings, so it is also what opts it
+---into varying with the place — you do not say it twice, and stone stays the
+---colour of stone in every biome.
+---
+---**The engine blends it; do not try to.** The colour is carried at each
+---chunk's four corners, each the mean of the columns meeting there, so
+---neighbouring chunks agree on the corners they share: no seam, and no grid of
+---16-block squares. A hard step between two biomes comes out as a gradient
+---about a chunk wide, which is what a biome edge should look like.
+---
+---**Asked every time a chunk is served, and never stored.** Change your palette
+---and the world changes with it, instead of the colour it used to be staying in
+---the ground behind the player. One call per chunk, so make it a lookup — this
+---is not the place to run your generator again.
+---
+---One per mod, and the first to answer in load order wins: two mods with an
+---opinion about what colour a place is cannot be averaged into a third opinion
+---either of them meant.
+---
+---Channels are 0..1 and are clamped. `pos` carries `x`, `y`, `z`, `seed` and
+---`domain`.
+---@param callback fun(pos: table): number, number, number
+function game.register_chunk_tint(callback) end
+
 ---Called when somebody leaves. **Registration window only.**
 ---
 ---The other half of `register_on_player_join`, and a mod needs both: anything

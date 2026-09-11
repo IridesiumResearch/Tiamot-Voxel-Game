@@ -614,7 +614,7 @@ impl Bot {
             .iter()
             .rev()
             .find_map(|message| match message {
-                ServerMessage::ChunkData { pos: got, blob } if *got == pos => Some(blob),
+                ServerMessage::ChunkData { pos: got, blob, .. } if *got == pos => Some(blob),
                 _ => None,
             })
             .ok_or_else(|| BotError::Unexpected {

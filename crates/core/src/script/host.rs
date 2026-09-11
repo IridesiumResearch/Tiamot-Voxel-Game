@@ -226,6 +226,21 @@ impl<V: ScriptVm> ModHost<V> {
         self.vm.generate_chunk(domain, world_seed, pos, fill)
     }
 
+    /// The biome colour a mod gives one chunk, or white if none does.
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError`] if the callback faulted; the mod is disabled and the
+    /// chunk is served white.
+    pub fn chunk_tint(
+        &mut self,
+        domain: &str,
+        world_seed: u64,
+        pos: ChunkPos,
+    ) -> Result<[u8; 3], ScriptError> {
+        self.vm.chunk_tint(domain, world_seed, pos)
+    }
+
     /// The VM, for tests and diagnostics.
     pub fn vm_mut(&mut self) -> &mut V {
         &mut self.vm

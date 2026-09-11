@@ -861,6 +861,49 @@ corners are the top because it built them.
 
 ---
 
+### 8.5 Biome colour — per chunk column, blended, never stored
+
+A mod gives each chunk a colour through `register_chunk_tint`, and every
+material in it that **declares a tint** is drawn through it. Declaring a tint is
+what opts a material into varying with its surroundings; it is therefore also
+what opts it into varying with the place, and a material that declares nothing
+is the same colour everywhere.
+
+**Per chunk COLUMN, not per chunk.** A biome is a fact about a place on the map
+and not about a height. Keyed per chunk the colour would band vertically, with a
+seam at eye level, and a mod would have to remember to answer the same thing for
+every `y` to avoid it.
+
+**Carried at the corners, not at the centre.** One flat colour per chunk draws
+the world as 16-block squares — it trades a biome line nobody notices at ground
+level for a grid nobody can stop noticing from a hill. Each of a chunk's four
+x/z corners takes the mean of the four columns meeting there, so two chunks side
+by side compute the same value for the corners they share and the field runs
+across the boundary with nothing to see. A hard step between two biomes becomes
+a gradient about a chunk wide.
+
+**On the instance, not in the vertices.** A per-vertex colour would be four more
+bytes on every terrain vertex, against the absolute VRAM bound charter rule 19
+put in place of the geometry-inflation gate — for a value that is constant over
+sixteen blocks. Sixteen floats per chunk costs nothing, and it means a colour
+that changes needs no remesh: the next frame's instance simply carries different
+numbers.
+
+**Asked for when a chunk is served, and never stored.** A colour on disk would
+freeze a mod's palette into every world it ever generated, so that changing a
+biome's colour left the colour it used to be in the ground behind the player.
+It costs one script call per chunk served, against the milliseconds generating
+one costs.
+
+Summaries carry no colour: a horizon silhouette holds no tinted material for it
+to land on.
+
+**Implemented by** `ScriptVm::chunk_tint` and `ChunkSource::tint`, sent as
+`ServerMessage::ChunkData::tint`, held by `Renderer::set_chunk_tint` and blended
+by `biome_at` in `world.wgsl`.
+
+---
+
 ## 9. Inventory — 27-unit arithmetic, no exceptions
 
 Charter rule 5, implemented in Task 02. Quantities are stored in units as `u32`;

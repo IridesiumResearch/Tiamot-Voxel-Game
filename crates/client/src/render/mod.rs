@@ -364,6 +364,27 @@ struct Instance {
     /// 120,000, and every one of those is representable in f32 with room to
     /// spare — integers are exact to 16,777,216.
     world: [f32; 4],
+    /// This chunk's biome colour at its four x/z corners: `-x-z`, `+x-z`,
+    /// `-x+z`, `+x+z`. Every tinted material in the chunk is multiplied by the
+    /// bilinear blend of these.
+    ///
+    /// # Why four and not one
+    ///
+    /// One colour a chunk draws the world as 16-block squares, which reads
+    /// worse than the hard biome edge it was meant to soften — it trades a line
+    /// nobody notices at ground level for a grid nobody can stop noticing from
+    /// a hill. Each corner is the mean of the four columns meeting there, so
+    /// two chunks side by side compute the same value for the two corners they
+    /// share and the field runs across the boundary with nothing to see.
+    ///
+    /// # Why here and not in the vertices
+    ///
+    /// A per-vertex colour would be four more bytes on every terrain vertex,
+    /// against the absolute VRAM bound charter rule 19 put in place of the
+    /// geometry-inflation gate — for a colour that is constant over sixteen
+    /// blocks. Sixteen floats per CHUNK is nothing, and it means a biome whose
+    /// colour changes needs no remesh at all.
+    corners: [[f32; 4]; 4],
 }
 
 /// A chunk's mesh, on the GPU.
@@ -808,6 +829,10 @@ pub struct Renderer {
     /// independently.
     tints: TintTable,
     chunks: BTreeMap<ChunkPos, ChunkMesh>,
+    /// Each chunk COLUMN's biome colour, keyed on `(x, z)`. See
+    /// [`Self::set_chunk_tint`]. Distinct from `tints`, which is the per
+    /// MATERIAL table: this one says what a place is, that one what a thing is.
+    biome_tints: BTreeMap<(i32, i32), [u8; 3]>,
     /// Retired chunk buffers, kept for reuse. See [`BufferPool`].
     pool: BufferPool,
     instances: wgpu::Buffer,
@@ -961,7 +986,6 @@ impl Renderer {
         let shader = gpu
             .device
             .create_shader_module(wgpu::include_wgsl!("world.wgsl"));
-
         let bind_layout = build_bind_layout(&gpu);
 
         // **The surface's format, not this client's own.** Every pipeline here
@@ -980,17 +1004,10 @@ impl Renderer {
 
         let (blob_pipeline, blob_pipeline_hdr, blobs) = build_blobs(&gpu, &bind_layout);
         let (prop_pipeline, prop_pipeline_hdr, props) = build_props(&gpu, &bind_layout);
-
         let (selection_shader, selection_pipeline, selection_buffer, border_buffer) =
             build_lines(&gpu, &bind_layout);
 
-        let globals = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("globals"),
-            size: size_of::<Globals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
+        let globals = build_uniform(&gpu, "globals", size_of::<Globals>() as u64);
         let sampler = build_atlas_sampler(&gpu);
 
         // One tint entry, meaning nothing varies: no material does until a
@@ -998,12 +1015,7 @@ impl Renderer {
         let (view, grid, side, tints, bind_group) =
             build_atlas_bindings(&gpu, &bind_layout, &globals, &sampler);
 
-        let instances = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("chunk-instances"),
-            size: (size_of::<Instance>() * 64) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let instances = build_instance_buffer(&gpu, 64);
 
         let depth = make_depth(&gpu, width, height);
 
@@ -1034,6 +1046,7 @@ impl Renderer {
             atlas_side: side,
             atlas_view: view,
             tints,
+            biome_tints: BTreeMap::new(),
             chunks: BTreeMap::new(),
             pool: BufferPool::default(),
             selection_pipeline,
@@ -1339,6 +1352,44 @@ impl Renderer {
     #[must_use]
     pub const fn atlas_view(&self) -> &wgpu::TextureView {
         &self.atlas_view
+    }
+
+    /// Records one chunk COLUMN's biome colour.
+    ///
+    /// **Per column, and not baked into the mesh.** A biome is a fact about a
+    /// place on the map, so keying it per chunk would band vertically with a
+    /// seam at eye level; and holding it here rather than in the vertices means
+    /// a colour that changes costs nothing — no remesh, no upload, just a
+    /// different number in next frame's instance.
+    pub fn set_chunk_tint(&mut self, pos: ChunkPos, tint: [u8; 3]) {
+        self.biome_tints.insert((pos.x, pos.z), tint);
+    }
+
+    /// The colour at one chunk-column CORNER, as the mean of the four columns
+    /// that meet there.
+    ///
+    /// This is what makes the field continuous. Two chunks side by side share
+    /// two corners, and both compute the same mean for them, so the colour
+    /// runs across the boundary with no seam — which the flat per-chunk colour
+    /// this replaces could not do: that draws the world as 16-block squares,
+    /// which reads worse than the hard biome edge it was meant to soften.
+    ///
+    /// Columns that have not arrived count as white, so the field fades
+    /// towards no colour at the edge of what is loaded rather than towards
+    /// black.
+    fn corner_tint(&self, x: i32, z: i32) -> [f32; 3] {
+        let mut total = [0.0_f32; 3];
+        for (dx, dz) in [(-1, -1), (0, -1), (-1, 0), (0, 0)] {
+            let held = self
+                .biome_tints
+                .get(&(x + dx, z + dz))
+                .copied()
+                .unwrap_or([u8::MAX; 3]);
+            for (sum, channel) in total.iter_mut().zip(held) {
+                *sum += f32::from(channel) / 255.0;
+            }
+        }
+        total.map(|sum| sum / 4.0)
     }
 
     /// Uploads a chunk's mesh, replacing any previous one.
@@ -1860,6 +1911,10 @@ impl Renderer {
                 culled.casters.push((*pos, instance));
             }
             let side = tiamot_core::CHUNK_BLOCKS as i32;
+            let corner = |dx: i32, dz: i32| {
+                let colour = self.corner_tint(pos.x + dx, pos.z + dz);
+                [colour[0], colour[1], colour[2], 0.0]
+            };
             instances.push(Instance {
                 offset: [offset.x, offset.y, offset.z, 0.0],
                 world: [
@@ -1868,6 +1923,7 @@ impl Renderer {
                     (pos.z * side) as f32,
                     0.0,
                 ],
+                corners: [corner(0, 0), corner(1, 0), corner(0, 1), corner(1, 1)],
             });
         }
         self.drawn = culled.visible.len();
@@ -1881,6 +1937,8 @@ impl Renderer {
                 // The body is not terrain and is not tinted; a zero here is a
                 // position the shader never samples from.
                 world: [0.0; 4],
+                // White, so that if it ever were tinted it would be unchanged.
+                corners: [[1.0, 1.0, 1.0, 0.0]; 4],
             });
         }
 
@@ -1888,12 +1946,7 @@ impl Renderer {
             // Grown in powers of two rather than to the exact size, so a world
             // filling in does not reallocate on almost every frame.
             let capacity = instances.len().next_power_of_two();
-            self.instances = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("chunk-instances"),
-                size: (size_of::<Instance>() * capacity) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            self.instances = build_instance_buffer(&self.gpu, capacity);
             self.instance_capacity = capacity;
         }
         if !instances.is_empty() {
@@ -2923,6 +2976,31 @@ fn build_blobs(
 /// Its own function because `Renderer::new` sits at clippy's line ceiling and
 /// this is a block of settings with one reason to change — the same argument
 /// `build_lines` and `build_blobs` make.
+/// A uniform buffer of `size` bytes, write-only from the host.
+fn build_uniform(gpu: &Gpu, label: &str, size: u64) -> wgpu::Buffer {
+    gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// The per-chunk instance buffer, sized for `capacity` chunks.
+///
+/// Its own function because it is built twice: once here at a starting size and
+/// again whenever a frame needs more chunks than the last one did, and the two
+/// disagreeing about usage flags would be a validation error a long way from
+/// the cause.
+fn build_instance_buffer(gpu: &Gpu, capacity: usize) -> wgpu::Buffer {
+    gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("chunk-instances"),
+        size: (size_of::<Instance>() * capacity) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
 fn build_atlas_sampler(gpu: &Gpu) -> wgpu::Sampler {
     gpu.device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("atlas"),
@@ -3225,7 +3303,7 @@ fn vertex_layout() -> [wgpu::VertexBufferLayout<'static>; 2] {
             shader_location: 1,
         },
     ];
-    const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
+    const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x4,
             offset: 0,
@@ -3238,6 +3316,30 @@ fn vertex_layout() -> [wgpu::VertexBufferLayout<'static>; 2] {
             format: wgpu::VertexFormat::Float32x4,
             offset: size_of::<[f32; 4]>() as u64,
             shader_location: 4,
+        },
+        // The four x/z corner colours — see `Instance::corners`. Four
+        // attributes rather than one, because a vertex attribute is at most a
+        // `vec4` and there is no matrix format that means "sixteen floats I
+        // will index".
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x4,
+            offset: size_of::<[[f32; 4]; 2]>() as u64,
+            shader_location: 5,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x4,
+            offset: size_of::<[[f32; 4]; 3]>() as u64,
+            shader_location: 6,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x4,
+            offset: size_of::<[[f32; 4]; 4]>() as u64,
+            shader_location: 7,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x4,
+            offset: size_of::<[[f32; 4]; 5]>() as u64,
+            shader_location: 8,
         },
     ];
 

@@ -1020,6 +1020,78 @@ end)
 }
 
 #[test]
+fn a_mod_gives_each_place_its_own_colour_and_is_asked_again_every_time() {
+    // **Asked for, never stored.** The colour is computed when a chunk is
+    // served rather than written into it, so a mod that changes its palette
+    // recolours the world instead of leaving the colour it used to be in the
+    // ground behind the player. That is the property this checks: the same
+    // chunk, asked twice, answers with whatever the mod says NOW.
+    let root = scratch("chunk_tint");
+    write_mod(
+        &root,
+        "palette",
+        "",
+        r#"
+game.register_block{ id = "ground" }
+
+-- Two biomes, chosen the way the guide says to choose them: from a wide field
+-- bounded over the chunk. West is cold, east is warm.
+local WARMTH = { op = "x" }
+
+-- Counts its own calls, so the test can see that it is asked EVERY time rather
+-- than once per chunk with the answer kept.
+local calls = 0
+
+game.register_chunk_tint(function(pos)
+    calls = calls + 1
+    local warmth = game.density(WARMTH):bounds(pos)
+    if warmth.low > 0.0 then
+        return 1.0, 0.5, calls / 255.0     -- warm
+    else
+        return 0.4, 0.7, 1.0               -- cold
+    end
+end)
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+
+    let mut tint = |x: i32| {
+        host.chunk_tint(tiamot_core::domain::OVERWORLD, 7, ChunkPos::new(x, 0, 0))
+            .expect("tint")
+    };
+
+    let east = tint(4);
+    let west = tint(-4);
+    assert_ne!(
+        east, west,
+        "two places with different biomes came out the same colour"
+    );
+    assert!(
+        east[0] > west[0] && west[2] > east[2],
+        "the warm end should be redder and the cold end bluer: {east:?} against {west:?}"
+    );
+
+    // **The same chunk, asked again.** The mod counts its calls into the blue
+    // channel, so a second answer that differs is the server asking rather than
+    // remembering — which is what lets a mod change its palette and have the
+    // world change with it, instead of the old colours staying in the ground
+    // behind the player.
+    let again = tint(4);
+    assert!(
+        again[2] > east[2],
+        "the same chunk answered identically twice, so the colour is being kept \
+         rather than asked for: {again:?} against {east:?}"
+    );
+}
+
+#[test]
 fn a_structure_crosses_a_chunk_edge_and_does_not_care_which_chunk_was_made_first() {
     // **The order-independent shape, which is the only correct one.** The
     // obvious way to build a structure across an edge is to let a generator

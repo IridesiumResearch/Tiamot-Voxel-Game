@@ -389,6 +389,38 @@ for every material, keyed on world position, so a hillside varies as a hillside
 rather than each block type drifting on its own. It costs nothing for materials
 that declare nothing.
 
+**Biome colour: one call, and the engine blends it.** The tint above varies a
+material with its SURROUNDINGS. `register_chunk_tint` varies it with the PLACE —
+a multiplier for one chunk, from the same field you choose biomes with:
+
+```lua
+game.register_chunk_tint(function(pos)
+    local warmth = game.density(WARMTH):bounds(pos)
+    if warmth.low > 0.0 then return 1.0, 0.85, 0.6 end    -- dry, sandy
+    return 0.75, 1.0, 0.8                                  -- cool, green
+end)
+```
+
+Three things worth knowing before you design around it:
+
+- **It applies to materials that declare a `tint`, and only those.** Declaring
+  one is what opts a material into varying with its surroundings, so it is also
+  what opts it into varying with the place. You do not say it twice — and stone,
+  which declares nothing, is the colour of stone in every biome.
+- **The engine blends it; do not try to.** The colour is carried at each chunk's
+  four corners, each the mean of the columns meeting there, and blended across.
+  Neighbouring chunks agree exactly on the corners they share, so there is no
+  seam and no 16-block grid. Returning a hard step between two biomes gives a
+  gradient about a chunk wide, which is what a biome edge should look like.
+- **You are asked every time a chunk is served, and nothing is stored.** Change
+  your palette and the world changes with it, rather than leaving the colour it
+  used to be in the ground behind the player. It costs one call per chunk, so
+  keep it to a lookup — this is not the place to run your generator again.
+
+One per mod. Two mods with an opinion about what colour a place is cannot be
+averaged into a third opinion either of them meant, so the first that answers,
+in load order, is the one that does.
+
 ---
 
 ## Interfaces: what a mod can and cannot do to the look

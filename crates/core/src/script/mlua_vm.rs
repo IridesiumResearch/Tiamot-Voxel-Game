@@ -112,6 +112,9 @@ const HOOK_DOMAIN_ENTER: &str = "on_domain_enter";
 const ACTORS: &str = "tiamot.actors";
 const DIALOGISTS: &str = "tiamot.dialogists";
 const CHATTERS: &str = "tiamot.chatters";
+
+/// Mods that registered a `chunk_tint` callback.
+const CHUNK_TINTERS: &str = "tiamot.chunk_tinters";
 /// What an `on_action` hook is called in errors.
 const HOOK_ACTION: &str = "on_action";
 const HOOK_DIALOG: &str = "on_dialog_event";
@@ -710,6 +713,28 @@ impl MluaVm {
     /// The registry key under which a mod's `on_generate` callback is stored.
     fn generator_key(mod_id: &str) -> String {
         format!("tiamot.on_generate.{mod_id}")
+    }
+
+    /// One channel of a mod's colour as a byte.
+    ///
+    /// **Clamped, not wrapped or refused.** A mod returning 1.2 means "as much
+    /// of this as there is" and a mod returning a NaN has a bug somewhere else;
+    /// neither is worth disabling it over, and a chunk is a poor place to learn
+    /// about it. `f32 as u8` already saturates in Rust and maps NaN to zero,
+    /// and the clamp is written anyway so the intent does not rest on that.
+    fn tint_bytes(colour: (f32, f32, f32)) -> [u8; 3] {
+        let channel = |value: f32| -> u8 {
+            if value.is_nan() {
+                return u8::MAX;
+            }
+            (value.clamp(0.0, 1.0) * 255.0) as u8
+        };
+        [channel(colour.0), channel(colour.1), channel(colour.2)]
+    }
+
+    /// Where one mod's chunk-tint callback lives.
+    fn tint_key(mod_id: &str) -> String {
+        format!("tiamot.chunk_tint.{mod_id}")
     }
 
     /// Where one DOMAIN's generator callback lives. See the free function of
@@ -1402,6 +1427,64 @@ impl ScriptVm for MluaVm {
         if let Err(err) = self.lua.set_named_registry_value("tiamot.fluid_ids", table) {
             tracing::error!("could not install the fluid ids: {err}");
         }
+    }
+
+    fn chunk_tint(
+        &mut self,
+        domain: &str,
+        world_seed: u64,
+        pos: ChunkPos,
+    ) -> Result<[u8; 3], ScriptError> {
+        let tinters: Vec<String> = self
+            .lua
+            .named_registry_value::<Table>(CHUNK_TINTERS)
+            .map(|table| table.sequence_values::<String>().flatten().collect())
+            .unwrap_or_default();
+
+        // **The first mod that answers wins, in load order.** Two mods with an
+        // opinion about what colour a place is cannot be averaged into a third
+        // opinion that either of them meant, and load order is already the
+        // resolution for every other registry conflict.
+        for mod_id in tinters {
+            if self.faulted.contains(&mod_id) {
+                continue;
+            }
+            let Ok(callback) = self
+                .lua
+                .named_registry_value::<mlua::Function>(&Self::tint_key(&mod_id))
+            else {
+                continue;
+            };
+
+            let position = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
+            for (name, value) in [("x", pos.x), ("y", pos.y), ("z", pos.z)] {
+                position
+                    .set(name, value)
+                    .map_err(|err| self.vm_error(&err))?;
+            }
+            position
+                .set("seed", world_seed)
+                .map_err(|err| self.vm_error(&err))?;
+            position
+                .set("domain", domain)
+                .map_err(|err| self.vm_error(&err))?;
+
+            self.arm_budget(self.limits.instructions_per_call)?;
+            let answer = callback.call::<(f32, f32, f32)>(position);
+            self.disarm_budget();
+
+            match answer {
+                Ok(colour) => return Ok(Self::tint_bytes(colour)),
+                Err(err) => {
+                    // Charter rule 10: the mod is disabled and the world keeps
+                    // its colour rather than the tick dying over a paint job.
+                    let error = Self::classify(&err, &mod_id, "chunk_tint");
+                    self.faulted.insert(mod_id.clone());
+                    return Err(error);
+                }
+            }
+        }
+        Ok([u8::MAX; 3])
     }
 
     fn generate_chunk(
@@ -3327,6 +3410,41 @@ impl MluaVm {
         Ok(registrar)
     }
 
+    /// Registers `game.register_chunk_tint`.
+    ///
+    /// Its own method because `install_registration` sits at the line limit —
+    /// the same reason `install_density` is separate from `install_frozen_api`.
+    fn install_tint_registration(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
+        // The biome colour of one chunk. One per mod, like every other hook —
+        // two of them would be two mods arguing about what colour a place is,
+        // and there is no sensible way to combine that.
+        let owner = mod_id.to_owned();
+        let key = Self::tint_key(mod_id);
+        let register_chunk_tint = self
+            .lua
+            .create_function(move |lua, callback: mlua::Function| {
+                let frozen: bool = lua.named_registry_value("tiamot.frozen").unwrap_or(false);
+                if frozen {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: registration is closed"
+                    )));
+                }
+                if lua.named_registry_value::<mlua::Function>(&key).is_ok() {
+                    return Err(mlua::Error::external(format!(
+                        "mod `{owner}`: one register_chunk_tint per mod"
+                    )));
+                }
+                lua.set_named_registry_value(&key, callback)?;
+                let tinters: Table = lua.named_registry_value(CHUNK_TINTERS)?;
+                tinters.push(owner.clone())?;
+                Ok(())
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("register_chunk_tint", register_chunk_tint)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     /// The `register_*` family, live only during the registration window.
     fn install_registration(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- registration -------------------------------------------------
@@ -3360,6 +3478,8 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
         game.set("register_on_generate", register_on_generate)
             .map_err(|err| self.vm_error(&err))?;
+
+        self.install_tint_registration(mod_id, game)?;
 
         let owner = mod_id.to_owned();
         let register_tool = self
@@ -5430,6 +5550,7 @@ impl MluaVm {
             CHATTERS,
             RANDOM_TICKS,
             RANDOM_TICK_OWNERS,
+            CHUNK_TINTERS,
         ] {
             let table = self.lua.create_table().map_err(|err| self.vm_error(&err))?;
             self.lua

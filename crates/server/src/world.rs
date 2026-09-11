@@ -104,6 +104,21 @@ pub trait ChunkSource {
             tiamot_core::fluid::FluidLayer::default(),
         )
     }
+
+    /// This chunk's biome colour, for every tinted material in it.
+    ///
+    /// **Defaulted to white, because almost nothing has an opinion.** Only a
+    /// mod registering `chunk_tint` does, and every other source — including
+    /// every test double — wants the old behaviour and gets it untouched.
+    ///
+    /// Asked for when a chunk is SERVED rather than when it is generated, and
+    /// never stored: a colour on disk would freeze a mod's palette into every
+    /// world it ever made, so changing a biome's colours would leave the
+    /// colour it used to be in the ground behind the player.
+    fn tint(&mut self, domain: &str, pos: ChunkPos, world_seed: u64) -> [u8; 3] {
+        let _ = (domain, pos, world_seed);
+        [u8::MAX; 3]
+    }
 }
 
 /// A generator that produces nothing but air.
@@ -141,6 +156,15 @@ impl<V: tiamot_core::script::ScriptVm> ModGenerator<V> {
 impl<V: tiamot_core::script::ScriptVm> ChunkSource for ModGenerator<V> {
     fn generate(&mut self, domain: &str, pos: ChunkPos, world_seed: u64) -> Chunk {
         self.generate_with_fluid(domain, pos, world_seed).0
+    }
+
+    fn tint(&mut self, domain: &str, pos: ChunkPos, world_seed: u64) -> [u8; 3] {
+        // A faulted mod has already been disabled (charter rule 10); white is
+        // the honest answer, and a world losing its colours is a great deal
+        // better than a world losing its terrain.
+        self.host
+            .chunk_tint(domain, world_seed, pos)
+            .unwrap_or([u8::MAX; 3])
     }
 
     fn generate_with_fluid(
