@@ -422,24 +422,37 @@ fn teleporting_fifty_thousand_blocks_leaves_the_geometry_where_it_was() {
         "the frame at 50,000 blocks out is empty sky, so this proves nothing about jitter — \
          the world did not come along"
     );
-    // **Not identical, and that is not a weakening.** The world has a colour
-    // field anchored to WORLD position — `material_tint`, and the per-cell
-    // variation §8.3's neighbour in `world.wgsl` — so the same scene in two
-    // places is not supposed to produce the same pixels. Demanding it does is
-    // asserting the absence of a feature, and this test passed until now only
-    // because nothing in its world declared a tint.
+    // **A sanity check, and NOT the floating-origin gate — which it never was.**
     //
-    // What still holds is that nothing GROSS moved. Per pixel rather than per
-    // region average, because the fault this catches shifts geometry: an edge
-    // moves and the pixels along it change completely while the average of the
-    // region containing them barely does. Measured in the sibling tests in
-    // `screenshot.rs`, a one-block displacement at 50,000 blocks moves no
-    // region average by even three per cent.
-    let differing = pixels_beyond(&before, &away, 8);
+    // Two things are true here. The world has a colour field anchored to WORLD
+    // position (`material_tint`, and the per-cell variation in `world.wgsl`), so
+    // the same scene in two places is not supposed to produce identical pixels
+    // and demanding that asserts the absence of a feature.
+    //
+    // And this scene cannot see the fault the message below names. It is the
+    // reference generator's world: a flat plain of two plain colours, very
+    // nearly invariant under translation. Leaking a world-space `f32` into the
+    // clip position on purpose — a third of a block of drift at 50,000 — leaves
+    // this test passing at any tolerance that lets the colour field exist. The
+    // `perceptual_hash` equality that used to be here was insensitive for the
+    // same reason, and passed because the frames happened to be bit-identical
+    // rather than because it was watching.
+    //
+    // **The claim lives in `screenshot.rs`**, whose scene has features: the same
+    // leak fails `the_frame_is_identical_at_the_origin_and_at_the_edge_of_the_world`
+    // with a third of the frame changed.
+    //
+    // What this test earns is the three assertions above — the camera really
+    // moved 50,000 blocks, the world came with it, the bottom of the frame is
+    // not sky — and a cheap guard against something gross below. The tolerance
+    // tracks `CELL_VARIATION`: two cells differ by up to twice it, eleven levels
+    // of a channel at 5%.
+    let differing = pixels_beyond(&before, &away, 16);
     assert!(
         differing < 0.005,
         "{:.1}% of the picture changed at the edge of the world by more than the colour field \
-         can account for; something in the render path is accumulating a world-space f32",
+         can account for — something gross moved. What this cannot see, \
+         `screenshot.rs` can: check the two tests there before hunting here",
         differing * 100.0
     );
 

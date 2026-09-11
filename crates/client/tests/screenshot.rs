@@ -824,10 +824,15 @@ fn the_frame_is_identical_at_the_origin_and_at_the_edge_of_the_world() {
     let there = target.capture(&mut renderer, &far_camera).expect("capture");
 
     // Every pixel within the colour field's own amplitude — see
-    // `pixels_beyond`. A tolerance of 8/255 covers a per-cell variation of
-    // 2.5%; anything that MOVES geometry changes whole edges and blows through
-    // it immediately.
-    let differing = pixels_beyond(&here, &there, 8);
+    // `pixels_beyond`.
+    //
+    // **The tolerance is tied to `CELL_VARIATION` and has to move with it.** Two
+    // cells differ by up to twice it, so at 5% the field alone moves a channel
+    // by up to eleven levels on this scene — measured, with nothing above that.
+    // Sixteen leaves headroom for a brighter surface without coming near what
+    // MOVING geometry does: an edge that shifts changes its pixels by tens or
+    // hundreds, which is why the sabotage still fails this at 16.
+    let differing = pixels_beyond(&here, &there, 16);
     assert!(
         differing < 0.005,
         "{:.1}% of the frame differs at the edge of the world by more than the colour field \
@@ -878,7 +883,7 @@ fn the_debug_teleport_leaves_the_world_on_screen() {
         "the bottom of the frame is sky at 50,000 blocks out ({bottom:?}), so this gate would \
          pass on an empty screen"
     );
-    let differing = pixels_beyond(&here, &there, 8);
+    let differing = pixels_beyond(&here, &there, 16);
     assert!(
         differing < 0.005,
         "{:.1}% of the picture changed 50,000 blocks from the origin: {} here, {} there",

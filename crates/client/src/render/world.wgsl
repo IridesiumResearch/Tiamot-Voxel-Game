@@ -112,24 +112,28 @@ fn tint_hash(cell: vec3<i32>) -> f32 {
 
 // How far a single cell's colour may stray from its texture's, either way.
 //
-// **Two and a half per cent, and it is meant to be invisible as an EFFECT** —
-// you should see grain in the material, not a sparkle laid over it. What it
-// fixes
-// is a wall of one material reading as a painted surface rather than as a
-// material: identical texels repeated across hundreds of cells look flat in a
-// way no amount of lighting hides. A per-cell nudge gives the eye something to
+// **Five per cent, and it is meant to be invisible as an EFFECT** — you should
+// see grain in the material, not a sparkle laid over it. What it fixes is a wall
+// of one material reading as a painted surface rather than as a material:
+// identical texels repeated across hundreds of cells look flat in a way no
+// amount of lighting hides. A per-cell nudge gives the eye something to
 // find grain in. Bigger than this and it stops being grain and starts being
 // noise, which is a different and much worse artefact.
 //
-// **Raised from one per cent on 2026-09-10**, asked for from the window: one was
-// too subtle to read on a real monitor at a real distance. This is the number to
-// move if it wants tuning again, and nothing else has to change with it.
+// **One per cent, then 2.5%, then this**, each asked for from the window: the
+// smaller numbers were too subtle to read on a real monitor at a real distance.
+//
+// It is no longer true that nothing else moves with it. Two cells differ by up
+// to twice this, and the floating-origin tests compare frames built in two
+// places pixel by pixel — so `pixels_beyond`'s tolerance has to stay above the
+// field's own amplitude or those tests fail on the feature rather than on a
+// fault. They carry the arithmetic.
 //
 // Presentation only, so charter rule 4 does not reach it (rendering is exempt).
 // It is still STABLE — the hash takes an integer lattice point, so a cell keeps
 // its own value across frames, camera moves and remeshes. A hash of a float
 // would shift in its last bit as the camera moved and shimmer.
-const CELL_VARIATION: f32 = 0.025;
+const CELL_VARIATION: f32 = 0.05;
 
 // The brightness this cell keeps, in `1 +/- CELL_VARIATION`.
 //
