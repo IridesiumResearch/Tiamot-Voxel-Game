@@ -216,14 +216,43 @@ the same answer, for skipping work of your own:
 if surface:bounds(pos).all_empty then return end     -- nothing here but sky
 ```
 
-**How much it can skip is set by your field, not by the engine.** The surface
-sits where your noise balances your height term, so the band that cannot be
-decided is the noise amplitude divided by that term's coefficient. Measured
-over a streamed column: `noise(11) - y` has **88%** of its chunks decided
-outright and runs four times faster; `noise(40) - y * 0.08` is 500 blocks of
-real relief, and none of it can be decided. If you want the skipping, keep your
-relief small against your view distance — and note that dividing the height
-term down is the same thing as scaling the relief up.
+**Pass the `pos` your generator was handed**, not a table you built. It carries
+the world seed, and a bound over a box is a fact about one world's field — the
+interval that holds for every seed is the one that says the same thing in every
+chunk, which is the thing this call exists not to be. A `pos` without a `seed`
+is an error rather than a guess.
+
+**This is how you pick a biome without running every biome.** `bounds` answers
+`low` and `high` as well as `all_empty` and `all_solid`, so a selector field —
+coherent noise, no height term — tells you which biomes a chunk can hold:
+
+```lua
+local WARMTH = { op = "noise", stream = "warmth", frequency = 0.001, octaves = 2 }
+
+game.register_on_generate(function(buf, pos)
+    local warmth = game.density(WARMTH):bounds(pos)
+    if warmth.low > 0.0 then      generate_warm(buf, pos)    -- cold ruled out
+    elseif warmth.high < 0.0 then generate_cold(buf, pos)    -- warm ruled out
+    else                          generate_both(buf, pos)    -- the chunk straddles
+    end
+end)
+```
+
+**How much it can skip is set by your field, not by the engine**, and the rule
+is that a box cannot bound features smaller than itself. Two measurements:
+
+- A terrain field's chunks decided outright — the engine's own skip. The
+  surface sits where your noise balances your height term, so the band that
+  cannot be decided is the noise amplitude divided by that term's coefficient.
+  `noise(11) - y` has **93%** of its chunks decided and runs four times faster;
+  `noise(40) - y * 0.08` is 500 blocks of real relief, and none of it can be
+  decided. Keep your relief small against your view distance — and note that
+  dividing the height term down is the same thing as scaling the relief up.
+- A selector field's chunks landing wholly on one side of a threshold, which is
+  what the biome skip above turns into work saved: **72%** at frequency 0.001,
+  60% at 0.002, 4% at 0.004, and none at all by 0.01. So choose biomes from a
+  WIDE field. A selector whose features are smaller than a chunk cannot be
+  bounded by one, and you will run every biome in every chunk again.
 
 **Do not write your own version of this by sampling the corners.** Nine samples
 over a chunk are not a bound: noise between two samples is not bounded by those
@@ -484,8 +513,10 @@ The engine is deliberately small and holds no opinion about what a world is.
 Three things assistants routinely ask the engine for that are yours:
 
 **Biomes are a Lua table.** A registry of names to parameters needs nothing
-from the engine. Pick the biome from a value you already have — a `game.density`
-field sampled at block resolution, or a heightmap — and index your own table.
+from the engine. What the engine owes you is a way to tell which biomes a chunk
+can hold WITHOUT running each of them, and that is `density:bounds(pos)` on a
+selector field — see "A field says what it cannot be" above, which has the
+shape and the numbers. Index your own table off the branch it picks.
 
 **Ore placement is already possible, and is NOT per-sample work.** This is the
 distinction to get right: the forbidden thing is O(volume) arithmetic in Lua.
@@ -614,6 +645,26 @@ cells you place, and you never get the same texture stacked on top of itself.
 It turns about the vertical axis only, so it never lies over when a player looks
 down at it, and the cells stay exactly where they are for collision, light,
 fluid and the dig ray. Only the drawing changes.
+
+**Place it with `fill_cover`, not with a field.** A density has no idea which
+block a sample is in, so a two-cell run written by `fill_density` lands half in
+one block and half in the next, and the sampled fill misses most of it in
+stripes that follow the contours. `fill_cover` stands a run on every surface the
+buffer already holds, inside one block:
+
+```lua
+game.register_on_generate(function(buf, pos)
+    buf:fill_density(surface, dirt, { detail = "smooth" })   -- the ground first
+    buf:fill_cover(grass, { cells = 2, take = tufts })       -- then what grows on it
+end)
+```
+
+Call it AFTER the fills that make the ground — it reads what they wrote. `take`
+is a density sampled at the run's base cell: positive means a run goes there, so
+a noise minus a threshold thins the cover, and a term from your terrain field
+keeps it off cave floors. Left out, every surface is covered. It costs about a
+tenth of what generating the chunk costs, and nothing at all on a chunk of plain
+sky or plain rock.
 
 **And `sway = true` makes it move.**
 

@@ -177,6 +177,17 @@ impl mlua::UserData for DensityHandle {
             let x: i32 = pos.get("x")?;
             let y: i32 = pos.get("y")?;
             let z: i32 = pos.get("z")?;
+            // **The same `pos` the generator was handed carries the seed**, so
+            // there is nothing extra to pass. A bound over a box is a fact
+            // about one world's field: the interval that holds for EVERY seed
+            // is the one that says the same thing in every chunk, which is the
+            // thing this call exists not to be.
+            let seed: u64 = pos.get("seed").map_err(|_| {
+                mlua::Error::external(
+                    "density:bounds wants the `pos` your generator was handed — it carries the \
+                     world seed, and a bound over a box cannot be computed without it",
+                )
+            })?;
             let side = crate::CHUNK_BLOCKS as usize;
             let region = crate::detgen::Region3d {
                 origin_x: (x * crate::CHUNK_BLOCKS as i32) as f32,
@@ -187,7 +198,7 @@ impl mlua::UserData for DensityHandle {
                 height: side,
                 depth: side,
             };
-            let bounds = this.density.bounds(&region);
+            let bounds = this.density.bounds(seed, &region);
             let table = lua.create_table()?;
             table.set("low", bounds.low)?;
             table.set("high", bounds.high)?;
@@ -405,6 +416,58 @@ struct BufferHandle {
     world_seed: u64,
 }
 
+impl BufferHandle {
+    /// Registers `buf:fill_cover`.
+    ///
+    /// Its own function because `add_methods` sits at the line limit — the
+    /// same reason `install_density` is separate from `install_frozen_api`.
+    fn add_cover_method<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // Ground cover: a run of cells stood on every surface the buffer holds,
+        // inside one block. Its own call because a field cannot say "the block
+        // the surface is in" — see `ChunkBuffer::fill_cover`.
+        methods.add_method_mut(
+            "fill_cover",
+            |_, this, (material, options): (u16, Option<Table>)| {
+                let cells = options
+                    .as_ref()
+                    .map(|table| table.get::<Option<u32>>("cells"))
+                    .transpose()?
+                    .flatten()
+                    .unwrap_or(1);
+                if !(1..=3).contains(&cells) {
+                    return Err(mlua::Error::external(format!(
+                        "fill_cover: `cells` is 1 to 3, not {cells}"
+                    )));
+                }
+                let take = options
+                    .as_ref()
+                    .map(|table| table.get::<Option<mlua::AnyUserData>>("take"))
+                    .transpose()?
+                    .flatten();
+                let seed = this.world_seed;
+                match take {
+                    Some(handle) => {
+                        let density = handle.borrow::<DensityHandle>().map_err(|_| {
+                            mlua::Error::external("fill_cover: `take` is not a density")
+                        })?;
+                        this.buffer.fill_cover(
+                            MaterialId(material),
+                            cells,
+                            Some(&density.density),
+                            seed,
+                        )
+                    }
+                    None => this
+                        .buffer
+                        .fill_cover(MaterialId(material), cells, None, seed),
+                }
+                .map_err(|err| mlua::Error::external(err.to_string()))?;
+                Ok(())
+            },
+        );
+    }
+}
+
 impl mlua::UserData for BufferHandle {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method_mut("fill_all", |_, this, material: u16| {
@@ -458,6 +521,8 @@ impl mlua::UserData for BufferHandle {
                 Ok(())
             },
         );
+
+        Self::add_cover_method(methods);
 
         methods.add_method_mut(
             "set_block",

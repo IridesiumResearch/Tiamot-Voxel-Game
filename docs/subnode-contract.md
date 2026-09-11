@@ -388,6 +388,43 @@ expands.
 All worldgen randomness comes from engine-provided seeded noise and per-chunk RNG
 streams (charter rule 4). Sub-node detail does not change that.
 
+### 5.1 Ground cover — a run of cells, standing on the surface, inside one block
+
+A generator placing grass, ferns or moss needs three things a density field
+cannot express, and `ChunkBuffer::fill_cover` is where they are defined.
+
+**The surface is a fact about cells, not about samples.** It is wherever an
+occupied cell has an empty cell directly above it. A field knows nothing of
+this: it has one sample per block at block resolution, and a run two cells tall
+in a block whose surface sits at an arbitrary cell contains that sample in only
+a third of columns — so the surface-shell test §5's detail fill is built from
+misses the other two thirds, in stripes that follow the contours.
+
+**A run never crosses a block boundary.** The run starts at the lowest empty
+cell in the block that stands on an occupied one, and stops at the block's top
+however many cells were asked for. This is what keeps a tuft from being two
+stacked blocks that highlight separately, dig separately and can be left
+half-standing — which §7.1's "the acting tool's brush decides" would otherwise
+permit and which reads as a bug.
+
+**Cover is not ground for more cover.** Every base is found before any cell is
+written, so a run never stands on a run. Without this rule a two-cell run would
+seed a further run above it on the next block, and grass would climb.
+
+Two consequences worth stating because they are visible:
+
+- A block holding two surfaces at once — a one-cell shelf — grows cover on the
+  lower one only. The upper face is bare. Rare shape, deliberate limit.
+- A surface exactly on a chunk's bottom cell row gets no cover from that chunk:
+  the block below is in the neighbouring chunk, which is not available at
+  generation. One row in forty-eight.
+
+Cover written this way is ordinary sub-node terrain — §2 collides with it, §3
+lights through it, §8.4 draws it as a billboard when its material asks. Nothing
+about it is a special case downstream.
+
+**Implemented by** `ChunkBuffer::fill_cover`, exposed as `buf:fill_cover`.
+
 ---
 
 ## 6. Pathfinding — block resolution

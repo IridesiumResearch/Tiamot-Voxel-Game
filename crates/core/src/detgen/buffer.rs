@@ -285,7 +285,7 @@ impl ChunkBuffer {
         // shape rather than from samples, so it cannot miss surface the way a
         // handful of probe points can — see its own docs for why that
         // distinction is the whole design.
-        let bounds = density.bounds(&region);
+        let bounds = density.bounds(seed, &region);
         if bounds.is_all_empty() {
             return Ok(());
         }
@@ -376,7 +376,7 @@ impl ChunkBuffer {
         // block of the surface shell. **Over the PADDED region**, so a chunk
         // called solid is solid including the ring its neighbours look at, and
         // no block can be found on the surface after the fact.
-        let bounds = density.bounds(&region);
+        let bounds = density.bounds(seed, &region);
         if bounds.is_all_empty() {
             return Ok(());
         }
@@ -463,6 +463,172 @@ impl ChunkBuffer {
                         }
                     }
                     self.set_block_cells(local, &cells);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stands a run of cells of `material` on every surface the buffer holds.
+    ///
+    /// # Why this is a fill of its own and not a field
+    ///
+    /// Ground cover — grass, ferns — wants three things at once: to stand ON
+    /// the surface the ground fill made, neither floating over a smooth slope
+    /// nor sunk into it; to be a cell or two tall; and to stay inside ONE
+    /// block, so a tuft is never two stacked blocks that highlight and dig
+    /// apart. A density field can say none of that. It has no idea which block
+    /// a sample is in, and a run two cells tall in a block whose surface sits
+    /// at an arbitrary cell contains the block's one sample point in a third
+    /// of columns — so [`fill_density_detail`](Self::fill_density_detail)'s
+    /// surface-shell test, built from those samples, misses the other two
+    /// thirds in stripes that follow the contours. The buffer, on the other
+    /// hand, knows exactly where every surface is: it is wherever an occupied
+    /// cell has an empty one above it.
+    ///
+    /// # The rule
+    ///
+    /// For every cell column, at the LOWEST cell in each block that is empty
+    /// with an occupied cell below it, and where `take` is positive at that
+    /// cell (everywhere, with no `take`), that cell and up to `cells - 1`
+    /// empty cells above it become `material` — never crossing into the block
+    /// above, and never overwriting a cell that holds something. Where the
+    /// surface is a block's top cell the run is that one cell. Cover written
+    /// by this call is not a surface for it: a run never stands on another
+    /// run.
+    ///
+    /// **The lowest, not every one**, which matters only for a block holding
+    /// two surfaces at once — a one-cell shelf, air over stone over air over
+    /// stone inside three cells. The shelf's upper face gets nothing. It is a
+    /// rare shape and the lower face is the one a player stands on, so this is
+    /// a deliberate limit rather than an oversight; the alternative is runs
+    /// interleaved with the ground they grow from, inside one block, which is
+    /// the thing this call exists to avoid.
+    ///
+    /// `cells` is clamped to 1..=3. `take` is evaluated at cell resolution and
+    /// only in the blocks that hold a surface, the economy the detail fill
+    /// makes.
+    ///
+    /// The chunk's bottom cell row has nothing below it to look at, so a
+    /// surface exactly on the chunk floor gets no cover from this chunk: the
+    /// neighbouring chunk is not available at generation. One row in
+    /// forty-eight.
+    ///
+    /// # Errors
+    ///
+    /// [`BufferError`] if `take` cannot be evaluated.
+    pub fn fill_cover(
+        &mut self,
+        material: MaterialId,
+        cells: u32,
+        take: Option<&super::density::Density>,
+        seed: u64,
+    ) -> Result<(), BufferError> {
+        let cells = cells.clamp(1, SUBNODES_PER_AXIS);
+        // **Nothing to stand on, and nothing to look at.** Cover grows where an
+        // empty cell sits on an occupied one, and a buffer holding one material
+        // everywhere has no such cell anywhere in it — the chunk floor is the
+        // only boundary left, and this call already cannot reach below itself.
+        //
+        // Worth its own check because the scan below reads all 27 cells of all
+        // 4,096 blocks whatever they hold: measured at 0.047 ms on a chunk of
+        // plain air, against 0.011 ms to generate one. A generator calling this
+        // over a streamed column pays that on every chunk of empty sky above
+        // its terrain and every chunk of solid rock below it, which is most of
+        // them.
+        if let Storage::Blocks(blocks) = &self.storage
+            && let Some(first) = blocks.first()
+            && blocks.iter().all(|block| block == first)
+        {
+            return Ok(());
+        }
+        let origin = [
+            self.pos.x * CHUNK_BLOCKS as i32,
+            self.pos.y * CHUNK_BLOCKS as i32,
+            self.pos.z * CHUNK_BLOCKS as i32,
+        ];
+        let mut fine = vec![0.0f32; SUBNODES_PER_BLOCK];
+        let mut scratch = super::density::Scratch::default();
+        let mut block_cells: Cells = EMPTY_CELLS;
+
+        for z in 0..CHUNK_BLOCKS {
+            for x in 0..CHUNK_BLOCKS {
+                // Whether the cell under each of this column's nine cell
+                // columns is occupied, carried up block by block. Starts
+                // false: the chunk floor has no cell below it.
+                let mut below = [false; (SUBNODES_PER_AXIS * SUBNODES_PER_AXIS) as usize];
+                for y in 0..CHUNK_BLOCKS {
+                    let local = LocalBlock::new(x, y, z);
+                    for cz in 0..SUBNODES_PER_AXIS {
+                        for cy in 0..SUBNODES_PER_AXIS {
+                            for cx in 0..SUBNODES_PER_AXIS {
+                                block_cells[subnode_index(cx, cy, cz)] =
+                                    self.get_subnode(local, cx, cy, cz);
+                            }
+                        }
+                    }
+                    // The bases: empty cells standing on an occupied one.
+                    // Read BEFORE anything is written, so a run this call
+                    // writes is never the ground for another.
+                    let mut bases: [Option<u32>; (SUBNODES_PER_AXIS * SUBNODES_PER_AXIS) as usize] =
+                        [None; (SUBNODES_PER_AXIS * SUBNODES_PER_AXIS) as usize];
+                    let mut any = false;
+                    for cz in 0..SUBNODES_PER_AXIS {
+                        for cx in 0..SUBNODES_PER_AXIS {
+                            let column = (cz * SUBNODES_PER_AXIS + cx) as usize;
+                            let mut under = below[column];
+                            for cy in 0..SUBNODES_PER_AXIS {
+                                let here =
+                                    block_cells[subnode_index(cx, cy, cz)] != MaterialId::AIR;
+                                if !here && under && bases[column].is_none() {
+                                    bases[column] = Some(cy);
+                                    any = true;
+                                }
+                                under = here;
+                            }
+                            below[column] = under;
+                        }
+                    }
+                    if !any {
+                        continue;
+                    }
+                    if let Some(take) = take {
+                        let cell_region = super::noise::Region3d {
+                            origin_x: (origin[0] + x as i32) as f32,
+                            origin_y: (origin[1] + y as i32) as f32,
+                            origin_z: (origin[2] + z as i32) as f32,
+                            step: 1.0 / SUBNODES_PER_AXIS as f32,
+                            width: SUBNODES_PER_AXIS as usize,
+                            height: SUBNODES_PER_AXIS as usize,
+                            depth: SUBNODES_PER_AXIS as usize,
+                        };
+                        take.evaluate_with(seed, &cell_region, &mut fine, &mut scratch)?;
+                    }
+                    let mut written = false;
+                    for cz in 0..SUBNODES_PER_AXIS {
+                        for cx in 0..SUBNODES_PER_AXIS {
+                            let column = (cz * SUBNODES_PER_AXIS + cx) as usize;
+                            let Some(base) = bases[column] else {
+                                continue;
+                            };
+                            if take.is_some() && fine[subnode_index(cx, base, cz)] <= 0.0 {
+                                continue;
+                            }
+                            // Up from the base, inside this block, through
+                            // empty cells only.
+                            for cy in base..(base + cells).min(SUBNODES_PER_AXIS) {
+                                let index = subnode_index(cx, cy, cz);
+                                if block_cells[index] != MaterialId::AIR {
+                                    break;
+                                }
+                                block_cells[index] = material;
+                                written = true;
+                            }
+                        }
+                    }
+                    if written {
+                        self.set_block_cells(local, &block_cells);
+                    }
                 }
             }
         }
@@ -1203,6 +1369,183 @@ mod tests {
             [4, 4, 4],
         );
         assert_eq!(target.get_block(LocalBlock::new(15, 15, 15)), DIRT);
+    }
+
+    /// Ground under the cover tests: the slope, at sub-node resolution, so
+    /// its surface sits at a different cell in different columns.
+    fn sloped_ground() -> ChunkBuffer {
+        let mut buffer = ChunkBuffer::new(origin(), MaterialId::AIR);
+        buffer
+            .fill_density_detail(&slope(), 7, STONE, Detail::Sampled)
+            .expect("fill");
+        buffer
+    }
+
+    /// The material of the cell directly under `(local, cx, cy, cz)`, or
+    /// `None` at the chunk floor.
+    fn under(
+        buffer: &ChunkBuffer,
+        local: LocalBlock,
+        cx: u32,
+        cy: u32,
+        cz: u32,
+    ) -> Option<MaterialId> {
+        if cy > 0 {
+            Some(buffer.get_subnode(local, cx, cy - 1, cz))
+        } else if local.y > 0 {
+            Some(buffer.get_subnode(LocalBlock::new(local.x, local.y - 1, local.z), cx, 2, cz))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn cover_stands_on_the_ground_inside_one_block_and_is_never_stacked() {
+        // Every cover cell either stands on ground, or stands on a cover cell
+        // that stands on ground — and a cover cell at the bottom of a block
+        // ALWAYS stands on ground, which is what "never two stacked blocks"
+        // means in cells. The slope puts the surface at every cell height, so
+        // the one-cell case (surface in a block's top cell) and the two-cell
+        // case both occur.
+        const GRASS: MaterialId = MaterialId(9);
+        let mut buffer = sloped_ground();
+        buffer.fill_cover(GRASS, 2, None, 7).expect("cover");
+
+        let (mut singles, mut doubles, mut total) = (0, 0, 0);
+        for z in 0..CHUNK_BLOCKS {
+            for y in 0..CHUNK_BLOCKS {
+                for x in 0..CHUNK_BLOCKS {
+                    let local = LocalBlock::new(x, y, z);
+                    for cell in 0..SUBNODES_PER_BLOCK {
+                        let (cx, cy, cz) = crate::block::subnode_offset(cell);
+                        if buffer.get_subnode(local, cx, cy, cz) != GRASS {
+                            continue;
+                        }
+                        total += 1;
+                        let below = under(&buffer, local, cx, cy, cz)
+                            .expect("cover never sits on the chunk floor");
+                        if below == GRASS {
+                            assert!(
+                                cy > 0,
+                                "a run crossed a block boundary at {local:?} ({cx}, {cy}, {cz})"
+                            );
+                            let ground = under(&buffer, local, cx, cy - 1, cz).expect("in chunk");
+                            assert_eq!(
+                                ground, STONE,
+                                "a run is more than two cells tall at {local:?}"
+                            );
+                            doubles += 1;
+                        } else {
+                            assert_eq!(
+                                below, STONE,
+                                "cover floating at {local:?} ({cx}, {cy}, {cz})"
+                            );
+                            let above_is_grass =
+                                cy < 2 && buffer.get_subnode(local, cx, cy + 1, cz) == GRASS;
+                            if !above_is_grass {
+                                singles += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(total > 0, "the slope should have grown cover");
+        assert!(
+            doubles > 0,
+            "no run reached two cells, so `cells` did nothing"
+        );
+        assert!(
+            singles > 0,
+            "no run was clipped to one cell at a block's top, which the slope must produce"
+        );
+    }
+
+    #[test]
+    fn cover_on_a_chunk_of_one_material_writes_nothing_and_looks_at_nothing() {
+        // The skip that makes this call affordable over a streamed column: a
+        // chunk of plain sky or plain rock has no cell standing on another, so
+        // there is nothing to find and the 27-cells-of-4,096-blocks scan is
+        // pure cost. The assertion is that skipping it is not a behaviour
+        // change — the same chunk, cell for cell.
+        const GRASS: MaterialId = MaterialId(9);
+        for held in [MaterialId::AIR, STONE] {
+            let mut buffer = ChunkBuffer::new(origin(), held);
+            let before = buffer.clone();
+            buffer.fill_cover(GRASS, 2, None, 7).expect("cover");
+            assert_eq!(
+                buffer, before,
+                "cover changed a chunk made entirely of one material"
+            );
+        }
+
+        // And the skip is not reached once anything breaks the uniformity, or
+        // it would be skipping real work. One block of stone in the sky is a
+        // surface, and its top cell grows a run.
+        let mut buffer = ChunkBuffer::new(origin(), MaterialId::AIR);
+        buffer.set_block(LocalBlock::new(5, 5, 5), STONE);
+        buffer.fill_cover(GRASS, 2, None, 7).expect("cover");
+        assert_eq!(
+            buffer.get_subnode(LocalBlock::new(5, 6, 5), 1, 0, 1),
+            GRASS,
+            "the block over a lone stone block should have grown cover"
+        );
+    }
+
+    #[test]
+    fn cover_takes_only_where_the_field_is_positive_and_never_overwrites() {
+        // `take` positive for x < 8 only; and a slab of stone laid one cell
+        // over part of the surface, which a run must not write into.
+        use super::super::density::{Axis, Op};
+        const GRASS: MaterialId = MaterialId(9);
+        let take = super::super::density::Density::compile(vec![
+            Op::Constant(8.0),
+            Op::Coordinate(Axis::X),
+            Op::Subtract,
+        ])
+        .expect("compile");
+        let mut buffer = sloped_ground();
+        buffer.fill_cover(GRASS, 2, Some(&take), 7).expect("cover");
+
+        let mut west = 0;
+        for z in 0..CHUNK_BLOCKS {
+            for y in 0..CHUNK_BLOCKS {
+                for x in 0..CHUNK_BLOCKS {
+                    let local = LocalBlock::new(x, y, z);
+                    for cell in 0..SUBNODES_PER_BLOCK {
+                        let (cx, cy, cz) = crate::block::subnode_offset(cell);
+                        if buffer.get_subnode(local, cx, cy, cz) == GRASS {
+                            assert!(x < 8, "cover where `take` is not positive, at {local:?}");
+                            west += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(west > 0, "no cover where `take` is positive");
+
+        // A block of stone set whole is untouched, and the cell under it in
+        // the column gets a run of one.
+        let mut buffer = ChunkBuffer::new(origin(), MaterialId::AIR);
+        for x in 0..CHUNK_BLOCKS {
+            for z in 0..CHUNK_BLOCKS {
+                buffer.set_block(LocalBlock::new(x, 3, z), STONE);
+                buffer.set_block(LocalBlock::new(x, 4, z), STONE);
+            }
+        }
+        // Carve the bottom cell layer of the upper block: a one-cell gap.
+        buffer.set_subnode(LocalBlock::new(5, 4, 5), 1, 0, 1, MaterialId::AIR);
+        buffer.fill_cover(GRASS, 2, None, 7).expect("cover");
+        assert_eq!(
+            buffer.get_subnode(LocalBlock::new(5, 4, 5), 1, 0, 1),
+            GRASS,
+            "the gap gets a run of one"
+        );
+        assert_eq!(
+            buffer.get_subnode(LocalBlock::new(5, 4, 5), 1, 1, 1),
+            STONE,
+            "the stone over the gap is kept"
+        );
     }
 
     #[test]

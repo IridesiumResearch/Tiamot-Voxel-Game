@@ -458,6 +458,63 @@ impl Density {
         self.evaluate_with(seed, region, out, &mut Scratch::default())
     }
 
+    /// A noise node's interval over one box.
+    ///
+    /// **Over THIS box.** [`super::noise::FractalParams::range`] is the range the
+    /// field occupies somewhere, which is the same interval in every chunk in the
+    /// world and so decides nothing: a generator asking "can this biome be here?"
+    /// would get the same yes everywhere. [`super::noise::fractal_3d_bounds`]
+    /// answers over the box, and intersects itself with the constant, so this is
+    /// never the worse of the two.
+    ///
+    /// Measured over 1,600 chunks of a 16-block box, as the share of chunks whose
+    /// bound lands entirely on one side of a threshold at zero: **72%** at
+    /// frequency 0.001, 60% at 0.002, 4% at 0.004, and none at all by 0.01. That
+    /// is the honest shape of it — a box cannot bound features smaller than
+    /// itself, so this buys a great deal for the wide fields a biome is chosen
+    /// from and nothing for the narrow ones terrain detail is made of.
+    fn noise_bounds(
+        seed: u64,
+        axes: &[Interval; 3],
+        params: &super::noise::FractalParams,
+        amplitude: f32,
+    ) -> Interval {
+        let (low, high) = super::noise::fractal_3d_bounds(
+            seed,
+            (axes[0].low, axes[0].high),
+            (axes[1].low, axes[1].high),
+            (axes[2].low, axes[2].high),
+            params,
+        );
+        Interval { low, high }.multiply(Interval::exactly(amplitude))
+    }
+
+    /// A map node's interval over one box.
+    ///
+    /// **The range over THIS box, not the whole field**, for the same reason a
+    /// noise node is bounded over one: the stored range is every value the map
+    /// holds anywhere, which is the same interval in every chunk in the world. See
+    /// [`super::map::Map::range_over`], which is exact here because sampling a map
+    /// is bilinear and so every value it returns is a convex combination of four
+    /// lattice values.
+    fn map_bounds(map: &super::map::Map, range: (f32, f32), axes: &[Interval; 3]) -> Interval {
+        let (low, high) = map.range_over(
+            (
+                super::floor_to_i32(axes[0].low),
+                super::floor_to_i32(axes[0].high),
+            ),
+            (
+                super::floor_to_i32(axes[2].low),
+                super::floor_to_i32(axes[2].high),
+            ),
+        );
+        debug_assert!(
+            low >= range.0 && high <= range.1,
+            "a box's range escaped the whole field's"
+        );
+        Interval { low, high }
+    }
+
     /// What the program can possibly produce over a box, without evaluating it.
     ///
     /// # Why a bound and not nine samples
@@ -494,7 +551,7 @@ impl Density {
     /// pass samples inside the same box at a finer step and must not be able to
     /// find surface a coarser bound said was not there.
     #[must_use]
-    pub fn bounds(&self, over: &Region3d) -> Interval {
+    pub fn bounds(&self, seed: u64, over: &Region3d) -> Interval {
         let span = |origin: f32, count: usize| -> Interval {
             let far = origin + (count.saturating_sub(1)) as f32 * over.step;
             Interval {
@@ -518,19 +575,11 @@ impl Density {
                     Axis::Z => axes[2],
                 }),
                 Op::Noise {
-                    params, amplitude, ..
-                } => {
-                    // The seed does not appear: a bound on the fractal holds
-                    // for every seed, which is the property that makes this
-                    // safe to compute once and reuse.
-                    let (low, high) = params.range();
-                    let scaled = Interval { low, high }.multiply(Interval::exactly(*amplitude));
-                    stack.push(scaled);
-                }
-                Op::Map { range, .. } => stack.push(Interval {
-                    low: range.0,
-                    high: range.1,
-                }),
+                    params,
+                    amplitude,
+                    stream,
+                } => stack.push(Self::noise_bounds(seed ^ stream, &axes, params, *amplitude)),
+                Op::Map { map, range } => stack.push(Self::map_bounds(map, *range, &axes)),
                 Op::Absolute => {
                     let Some(value) = stack.pop() else {
                         return Interval {
@@ -891,7 +940,7 @@ mod tests {
                 depth: 16,
             };
             total += 1;
-            if !density.bounds(&region).is_undecided() {
+            if !density.bounds(9, &region).is_undecided() {
                 decided += 1;
             }
         }
@@ -921,7 +970,7 @@ mod tests {
                     height: 16,
                     depth: 16,
                 };
-                let bounds = density.bounds(&region);
+                let bounds = density.bounds(9, &region);
                 let mut field = vec![0.0; region.len()];
                 density.evaluate(9, &region, &mut field).expect("evaluate");
                 for value in &field {
@@ -935,6 +984,122 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A biome selector's shape: coherent noise and NOTHING else.
+    ///
+    /// **The case every other bound test misses.** They all bound a terrain
+    /// field, which carries a `y` term whose interval is the whole chunk
+    /// height and swamps everything else — so the noise part of the bound can
+    /// be badly wrong and no assertion moves. A selector has no height term,
+    /// and is exactly what a generator asks about when deciding which biome a
+    /// chunk can hold.
+    fn selector(frequency: f32, octaves: u32) -> Vec<Op> {
+        vec![Op::Noise {
+            params: crate::detgen::noise::FractalParams {
+                fractal: crate::detgen::noise::Fractal::Fbm,
+                octaves,
+                frequency,
+                lacunarity: 2.0,
+                gain: 0.5,
+            },
+            amplitude: 1.0,
+            stream: 0,
+        }]
+    }
+
+    #[test]
+    fn a_bound_over_a_box_holds_for_a_field_that_is_only_noise() {
+        // Sampled at a third of a block, because a bound that only covered the
+        // block lattice would be a bound on the samples rather than on the
+        // field — and the sub-node fill looks between them.
+        for (frequency, octaves) in [(0.002, 2), (0.01, 4), (0.05, 4)] {
+            let density = Density::compile(selector(frequency, octaves)).expect("compile");
+            for corner in [-4096.0, -64.0, 0.0, 512.0, 33_000.0] {
+                let region = Region3d {
+                    origin_x: corner,
+                    origin_y: 0.0,
+                    origin_z: corner * 0.25 - 17.0,
+                    step: 1.0,
+                    width: 16,
+                    height: 16,
+                    depth: 16,
+                };
+                let bounds = density.bounds(9, &region);
+                let fine = Region3d {
+                    step: 1.0 / 3.0,
+                    width: 46,
+                    height: 46,
+                    depth: 46,
+                    ..region
+                };
+                let mut field = vec![0.0; fine.len()];
+                density.evaluate(9, &fine, &mut field).expect("evaluate");
+                for value in &field {
+                    assert!(
+                        *value >= bounds.low && *value <= bounds.high,
+                        "a sample {value} of noise at frequency {frequency} near {corner} \
+                         escaped its box's bound ({}, {})",
+                        bounds.low,
+                        bounds.high
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bound_over_a_box_is_tighter_than_the_one_that_holds_everywhere() {
+        // The entire point of bounding over a box. `FractalParams::range` is
+        // the interval that holds for every seed at every position, so it is
+        // the same answer in every chunk in the world and decides nothing: a
+        // generator asking "can this biome be here?" gets the same yes
+        // everywhere. This is what makes the answer vary.
+        let params = crate::detgen::noise::FractalParams {
+            fractal: crate::detgen::noise::Fractal::Fbm,
+            octaves: 2,
+            frequency: 0.002,
+            lacunarity: 2.0,
+            gain: 0.5,
+        };
+        let (low, high) = params.range();
+        let everywhere = high - low;
+        let density = Density::compile(selector(0.002, 2)).expect("compile");
+
+        let mut widest = 0.0_f32;
+        let mut seen_low = f32::INFINITY;
+        let mut seen_high = f32::NEG_INFINITY;
+        for chunk_x in -6..6 {
+            for chunk_z in -6..6 {
+                let region = Region3d {
+                    origin_x: (chunk_x * 16) as f32,
+                    origin_y: 0.0,
+                    origin_z: (chunk_z * 16) as f32,
+                    step: 1.0,
+                    width: 16,
+                    height: 16,
+                    depth: 16,
+                };
+                let bounds = density.bounds(9, &region);
+                widest = widest.max(bounds.high - bounds.low);
+                seen_low = seen_low.min(bounds.low);
+                seen_high = seen_high.max(bounds.high);
+            }
+        }
+        // Measured at 9% of the constant's width at this frequency. A quarter
+        // is the line at which the mechanism has stopped working, not a number
+        // to tune towards.
+        assert!(
+            widest < everywhere * 0.25,
+            "the widest box bound was {widest}, which is no better than the {everywhere} \
+             that holds everywhere — bounding over a box has stopped doing anything"
+        );
+        // And it MOVES: two chunks give different answers, which is the
+        // property a generator skips work on.
+        assert!(
+            seen_high - seen_low > widest,
+            "every box gave the same interval, so nothing could ever be skipped"
+        );
     }
 
     #[test]
@@ -953,7 +1118,7 @@ mod tests {
             height: 16,
             depth: 16,
         };
-        let bounds = density.bounds(&coarse);
+        let bounds = density.bounds(9, &coarse);
         let fine = Region3d {
             step: 1.0 / 3.0,
             width: 46,
@@ -1066,7 +1231,7 @@ mod tests {
         );
         // The interval extension is not fooled by the chunk that fooled them.
         assert!(
-            !density.bounds(&region).is_all_empty(),
+            !density.bounds(7, &region).is_all_empty(),
             "a chunk holding a sample of {solid} was called empty by its own bound"
         );
     }

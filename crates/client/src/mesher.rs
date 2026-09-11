@@ -2192,10 +2192,18 @@ impl MeshJob {
     /// Taking `self` rather than `&self` because a job is spent once: the fluid
     /// quads are resolved into buffers here, and doing it twice would build
     /// them twice from state that has already been consumed.
+    ///
+    /// Takes the light because the sprites are lit here (Contract §8.4), the
+    /// same as [`mesh`] lights them. **This is the path the game runs**, and
+    /// the first version of it returned `scratch.finish` alone: every sprite
+    /// was found, taken out of the geometry, and never drawn — grass that
+    /// could be aimed at and dug and was not there.
     #[must_use]
-    pub fn finish(self) -> Mesh {
+    pub fn finish(self, light: &impl BlockLight) -> Mesh {
         let Self { grid, scratch, .. } = self;
-        scratch.finish(&grid)
+        let mut mesh = scratch.finish(&grid);
+        mesh.billboards = lit_billboards(&grid, light);
+        mesh
     }
 }
 
@@ -2209,11 +2217,20 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
         }
     }
     let mut mesh = scratch.finish(grid);
-    // **The sprites, lit where they stand.** Found when the grid was built,
-    // because that is where the material table was; lit here, because that is
-    // where the light is. Contract §8.4.
-    mesh.billboards = grid
-        .sprites
+    mesh.billboards = lit_billboards(grid, light);
+    mesh
+}
+
+/// The grid's sprites, lit where they stand. Contract §8.4.
+///
+/// Found when the grid was built, because that is where the material table
+/// was; lit here, because that is where the light is. **One function for both
+/// ways of meshing** — [`mesh`] in one call and [`MeshJob`] over many frames —
+/// because the job is what the game runs, and when only `mesh` did this the
+/// sprites of every chunk in play were found, removed from the geometry and
+/// never drawn.
+fn lit_billboards(grid: &SubNodeGrid, light: &impl BlockLight) -> Vec<Billboard> {
+    grid.sprites
         .iter()
         .map(|sprite| Billboard {
             cell: sprite.cell,
@@ -2227,8 +2244,7 @@ pub fn mesh(grid: &SubNodeGrid, light: &impl BlockLight) -> Mesh {
                 )
                 .0,
         })
-        .collect();
-    mesh
+        .collect()
 }
 
 /// Shades one slice's faces, then merges them.
@@ -3537,7 +3553,7 @@ mod tests {
             steps += 1;
             assert!(steps < 10_000, "the job did not terminate");
         }
-        let stepped = job.finish();
+        let stepped = job.finish(&DAY);
 
         // Identical, not merely equivalent: same quads, same order. Order is
         // what the index buffer is built from, so "the same set in a different
@@ -3625,6 +3641,61 @@ mod tests {
         fn any_billboard(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn a_stepped_job_carries_the_same_sprites_as_a_one_shot_mesh() {
+        // **The path the game runs.** `mesh` lit and attached the sprites and
+        // `MeshJob::finish` did not, so a chunk meshed over several frames —
+        // which is every chunk in play — had its grass taken out of the
+        // geometry (Contract §8.4) and then never drawn: it could be aimed at
+        // and dug, and it was not there. The stepped path must carry exactly
+        // what the one-shot path carries, light included.
+        let grass = MaterialId(7);
+        let sprites = Sprites(grass);
+
+        let mut world = empty();
+        let base = BlockPos::new(4, 4, 4);
+        for step in 0..3i32 {
+            world
+                .set_subnode(base.subnode(1, step, 1), grass)
+                .expect("in chunk");
+        }
+        world
+            .set_subnode(BlockPos::new(6, 4, 6).subnode(0, 0, 0), grass)
+            .expect("in chunk");
+
+        let one_shot = mesh_chunk(
+            &world,
+            &Neighbours::open(),
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &sprites,
+        );
+        assert_eq!(
+            one_shot.billboards.len(),
+            2,
+            "the fixture should have sprites to compare"
+        );
+
+        let mut job = MeshJob::start(&world, &Neighbours::open(), Absent::Air, &NoFluid, &sprites)
+            .expect("this chunk is not empty air");
+        let mut steps = 0;
+        while !job.step(&DAY) {
+            steps += 1;
+            assert!(steps < 10_000, "the job did not terminate");
+        }
+        let stepped = job.finish(&DAY);
+
+        assert_eq!(
+            stepped.billboards, one_shot.billboards,
+            "the stepped mesh lost or relit its sprites"
+        );
+        assert_eq!(
+            stepped.quads, one_shot.quads,
+            "stepping changed the geometry"
+        );
     }
 
     #[test]

@@ -169,7 +169,7 @@ fn probe(density: &Density) {
             density.evaluate(seed, &region, &mut field).expect("field");
             unpruned_time += before.elapsed().as_secs_f64() * 1000.0;
 
-            if density.bounds(&region).is_undecided() {
+            if density.bounds(seed, &region).is_undecided() {
                 undecided += 1;
                 evaluated_time += took;
             } else {

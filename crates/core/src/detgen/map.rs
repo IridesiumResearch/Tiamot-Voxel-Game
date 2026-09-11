@@ -124,6 +124,14 @@ impl PartialEq for Map {
 }
 
 impl Map {
+    /// The most lattice cells [`Self::range_over`] will walk before giving up
+    /// and answering with the whole field's range.
+    ///
+    /// A chunk at the default scale touches four. This is three orders of
+    /// magnitude of headroom for a mod asking about a bigger box or holding a
+    /// map at scale 1, and still a small fraction of a 1,024-a-side field.
+    pub const MAX_RANGE_CELLS: u32 = 4_096;
+
     /// The largest map, in samples a side.
     ///
     /// 1,024 is four megabytes of `f32` and, at the default scale, a sixteen
@@ -367,6 +375,78 @@ impl Map {
         top + (bottom - top) * tz
     }
 
+    /// The smallest and largest value [`Self::sample`] can return anywhere in a
+    /// rectangle of world block coordinates, both ends included.
+    ///
+    /// # Why a map needs this and its global range will not do
+    ///
+    /// `Density::bounds` answers "can the surface be in this chunk?" without
+    /// evaluating the field, and a mod uses the same answer to skip its own
+    /// work — picking the one biome a chunk can hold instead of running every
+    /// biome everywhere. That only works if the answer CHANGES from chunk to
+    /// chunk. A map node bounded by the whole field's min and max gives the
+    /// same interval in every chunk in the world, which decides nothing.
+    ///
+    /// # Why this is exact rather than conservative
+    ///
+    /// [`Self::sample`] is bilinear between four lattice values, so every value
+    /// it returns is a convex combination of them and lies between their
+    /// smallest and largest. Taking the extremes over every lattice value the
+    /// rectangle can reach is therefore both sound and attained — the bound is
+    /// the true range, not a widened one. The clamp in `sample` is mirrored
+    /// here so a rectangle off the edge of the map reads the same edge values
+    /// it would sample.
+    ///
+    /// Cheap at the size that matters: one chunk at the default scale touches
+    /// four lattice values. A rectangle bigger than [`Self::MAX_RANGE_CELLS`]
+    /// lattice cells gives the whole field's range instead of walking it,
+    /// because a bound that costs more than the work it saves is not a saving.
+    #[must_use]
+    pub fn range_over(&self, x: (i32, i32), z: (i32, i32)) -> (f32, f32) {
+        let side = i64::from(self.side);
+        let scale = self.scale as f32;
+        // The same lattice index `sample` would take, at each end. `+ 1`
+        // because bilinear reads the cell after the one it lands in.
+        let first = |world: i32, origin: i32| -> i64 {
+            i64::from(super::floor_to_i32((world - origin) as f32 / scale))
+        };
+        let span = |low: i32, high: i32, origin: i32| -> (i64, i64) {
+            let (a, b) = (first(low, origin), first(high, origin) + 1);
+            (a.clamp(0, side - 1), b.clamp(0, side - 1))
+        };
+        let (x0, x1) = span(x.0.min(x.1), x.0.max(x.1), self.origin[0]);
+        let (z0, z1) = span(z.0.min(z.1), z.0.max(z.1), self.origin[1]);
+
+        let cells = (x1 - x0 + 1).saturating_mul(z1 - z0 + 1);
+        if cells > i64::from(Self::MAX_RANGE_CELLS) {
+            return self.range();
+        }
+
+        let mut low = f32::INFINITY;
+        let mut high = f32::NEG_INFINITY;
+        for row in z0..=z1 {
+            let base = row as usize * self.side as usize;
+            for column in x0..=x1 {
+                let value = self.values[base + column as usize];
+                low = low.min(value);
+                high = high.max(value);
+            }
+        }
+        (low, high)
+    }
+
+    /// The smallest and largest value the whole field holds.
+    #[must_use]
+    pub fn range(&self) -> (f32, f32) {
+        let mut low = f32::INFINITY;
+        let mut high = f32::NEG_INFINITY;
+        for value in &self.values {
+            low = low.min(*value);
+            high = high.max(*value);
+        }
+        (low, high)
+    }
+
     /// Replaces every value with a density program's, sampled on one plane.
     ///
     /// # Why a map wants to read a density
@@ -608,7 +688,7 @@ mod tests {
         // And a bound over the map is the map's own range, so a chunk under a
         // flat part of an eroded field can still be decided.
         assert!(
-            !density.bounds(&on_the_cell).is_undecided(),
+            !density.bounds(3, &on_the_cell).is_undecided(),
             "a bound over a map is the map's own range, so this had to be decidable"
         );
     }
@@ -654,6 +734,91 @@ mod tests {
         let mut map = Map::new(side, 16, [0, 0]).expect("map");
         map.offset(value);
         map
+    }
+
+    #[test]
+    fn a_range_over_a_box_contains_every_sample_in_it_and_beats_the_whole_field() {
+        // A map node bounded by the whole field's min and max gives the same
+        // interval in every chunk in the world, which decides nothing — see
+        // `range_over`. This is the property that makes it decide something,
+        // and the property that makes it safe to.
+        let mut map = Map::new(64, 16, [0, 0]).expect("map");
+        map.noise(
+            11,
+            &crate::detgen::noise::FractalParams {
+                fractal: crate::detgen::noise::Fractal::Fbm,
+                octaves: 3,
+                frequency: 0.004,
+                lacunarity: 2.0,
+                gain: 0.5,
+            },
+            50.0,
+        );
+
+        let (whole_low, whole_high) = map.range();
+        let mut widest = 0.0_f32;
+        let mut lowest = f32::INFINITY;
+        let mut highest = f32::NEG_INFINITY;
+        for chunk_x in 0..8 {
+            for chunk_z in 0..8 {
+                let (x0, z0) = (chunk_x * 16, chunk_z * 16);
+                let (low, high) = map.range_over((x0, x0 + 15), (z0, z0 + 15));
+                // Sound: at sub-node resolution, because the fill looks
+                // between the blocks and a bound on the block lattice would
+                // not be a bound on the field.
+                for step in 0..48 {
+                    for other in 0..48 {
+                        let x = x0 + step / 3;
+                        let z = z0 + other / 3;
+                        let value = map.sample(x, z);
+                        assert!(
+                            value >= low && value <= high,
+                            "the map at ({x}, {z}) is {value}, outside the ({low}, {high}) \
+                             its own box was bounded to"
+                        );
+                    }
+                }
+                widest = widest.max(high - low);
+                lowest = lowest.min(low);
+                highest = highest.max(high);
+            }
+        }
+        assert!(
+            widest < (whole_high - whole_low) * 0.5,
+            "the widest box was {widest} against {} for the whole field, so bounding a box \
+             is telling a generator nothing the whole field did not",
+            whole_high - whole_low
+        );
+        assert!(
+            highest - lowest > widest,
+            "every box gave the same interval, so nothing could ever be skipped on one"
+        );
+    }
+
+    #[test]
+    fn a_range_over_a_box_off_the_edge_reads_what_sampling_there_would() {
+        // `sample` clamps to the edge, so a box past the end of the field is
+        // not empty and is not an error: it reads the edge. A bound that
+        // forgot the clamp would be a bound on nothing.
+        let mut map = Map::new(8, 4, [0, 0]).expect("map");
+        let mut values = vec![0.0_f32; 64];
+        for (index, value) in values.iter_mut().enumerate() {
+            *value = index as f32;
+        }
+        map.set_values(values).expect("values");
+
+        let far = 10_000;
+        let (low, high) = map.range_over((far, far + 15), (far, far + 15));
+        let corner = map.sample(far, far);
+        assert!(
+            corner >= low && corner <= high,
+            "sampling far off the map gave {corner}, outside its own bound ({low}, {high})"
+        );
+        assert_eq!(
+            (low, high),
+            (63.0, 63.0),
+            "a box entirely past the far corner should read that corner and nothing else"
+        );
     }
 
     #[test]

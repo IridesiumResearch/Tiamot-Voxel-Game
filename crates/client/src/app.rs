@@ -4423,7 +4423,7 @@ impl App {
         let InFlight { pos, mut job } = flight;
         loop {
             if job.step(light) {
-                return Ok((pos, job.finish()));
+                return Ok((pos, job.finish(light)));
             }
             // Checked AFTER a step, so every visit does some work: a deadline
             // already past when the job arrives would otherwise park it again

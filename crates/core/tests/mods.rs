@@ -1020,6 +1020,108 @@ end)
 }
 
 #[test]
+fn a_bound_over_a_chunk_lets_a_generator_rule_a_biome_out() {
+    // **The reason bounds over a box exist.** A mod with two biomes used to
+    // have to run both generators in every chunk, because the only thing it
+    // could ask about its selector field was the range that field occupies
+    // SOMEWHERE — the same answer in every chunk in the world. This asks about
+    // one chunk, so it can say no.
+    //
+    // The mod does the asserting, because a fault in a generator is reported
+    // and a `game.log` line is not.
+    let root = scratch("biome_bounds");
+    write_mod(
+        &root,
+        "biomes",
+        "",
+        r#"
+local cold = game.register_block{ id = "cold" }
+local warm = game.register_block{ id = "warm" }
+local mixed = game.register_block{ id = "mixed" }
+
+-- A biome selector: coherent noise and no height term. This is the shape that
+-- the range-that-holds-everywhere cannot say anything about.
+local SELECTOR = {
+    op = "noise",
+    stream = "temperature",
+    frequency = 0.001,
+    octaves = 2,
+}
+
+local seen = { cold = 0, warm = 0, mixed = 0 }
+
+game.register_on_generate(function(buf, pos)
+    local temperature = game.density(SELECTOR):bounds(pos)
+    if temperature.high < 0.0 then
+        seen.cold = seen.cold + 1
+        buf:fill_all(cold)
+    elseif temperature.low > 0.0 then
+        seen.warm = seen.warm + 1
+        buf:fill_all(warm)
+    else
+        seen.mixed = seen.mixed + 1
+        buf:fill_all(mixed)
+    end
+end)
+
+function report()
+    return seen
+end
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+
+    // Each branch fills the chunk with its own material, so `is_uniform` — how
+    // the other generation tests read a chunk back — says which branch ran.
+    let mut taken: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+    for chunk_x in -6..6 {
+        for chunk_z in -6..6 {
+            let chunk = host
+                .generate_chunk(
+                    tiamot_core::domain::OVERWORLD,
+                    1,
+                    ChunkPos::new(chunk_x, 0, chunk_z),
+                    MaterialId::AIR,
+                )
+                .expect("generate");
+            let material = chunk
+                .is_uniform()
+                .expect("every branch fills the whole chunk with one material");
+            assert_ne!(
+                material,
+                MaterialId::AIR,
+                "a generated chunk was left empty"
+            );
+            *taken.entry(material.0).or_default() += 1;
+        }
+    }
+
+    // All three branches run somewhere. Two of them are the mechanism — the
+    // generator ruling a biome OUT for this chunk — and before bounding over a
+    // box neither could ever have run: the only answer available was the range
+    // the field occupies across the whole world, which is the same everywhere
+    // and straddles the threshold, so every chunk would have been undecided.
+    //
+    // The third is the bound staying honest. A chunk the selector really does
+    // cross has to come back undecided, and a "bound" that decided all 144
+    // would not be one.
+    assert_eq!(
+        taken.len(),
+        3,
+        "only {} of the three branches ran ({taken:?}); a bound over a box either \
+         decides nothing or is claiming to decide what it cannot",
+        taken.len()
+    );
+}
+
+#[test]
 fn a_density_compiled_twice_from_an_edited_map_sees_the_edit() {
     // `{ op = "map" }` copies the field, and the copy is cached so a generator
     // that compiles its program per chunk — which is what the shortest correct
@@ -1041,7 +1143,10 @@ local function field()
 end
 
 local function reading()
-    return game.density{ op = "map", map = field() }:bounds({ x = 0, y = 0, z = 0 }).high
+    -- `seed` because a bound over a box is a fact about one world's field.
+    -- This program holds no noise, so the number does not matter; the call
+    -- refuses to guess it rather than quietly bound the wrong world.
+    return game.density{ op = "map", map = field() }:bounds({ x = 0, y = 0, z = 0, seed = 1 }).high
 end
 
 game.register_on_world_init(function()

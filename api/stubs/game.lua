@@ -115,6 +115,38 @@ function ChunkBuffer:fill_below_heightmap(heightmap, material) end
 ---@param options table? `{ detail = "smooth" | "sampled" }`
 function ChunkBuffer:fill_density(density, material, options) end
 
+---Stands a run of cells on every surface the buffer already holds: ground
+---cover — grass, ferns, anything that grows UP from the ground.
+---
+---For every cell column, wherever an empty cell sits on an occupied one, that
+---cell and up to `cells - 1` empty cells above it become `material`. **Inside
+---one block, always**: the run stops at the block's top, so a tuft is never
+---two stacked blocks that highlight and dig apart, and where the surface is
+---a block's top cell the run is that one cell. It never overwrites a cell
+---that holds something, and cover this call writes is not ground for it — a
+---run never stands on another run.
+---
+---**Why a field cannot do this.** A density has no idea which block a sample
+---is in, and a run two cells tall in a block whose surface sits at an
+---arbitrary cell contains the block's one sample point in a third of columns
+---— so the sampled `fill_density` misses the rest in stripes that follow the
+---contours. The buffer knows exactly where its surfaces are.
+---
+---`take` is a density sampled at the base cell: positive means a run goes
+---there, so a noise minus a threshold thins the cover, and a term from your
+---terrain field keeps it off cave floors. Evaluated only in the blocks that
+---hold a surface, so it is cheap. Left out, every surface is covered.
+---
+---Call it AFTER the fills that make the ground — it reads what they wrote.
+---
+---```lua
+---buf:fill_cover(grass, { cells = 2, take = tufts })   -- two cells, where tufts > 0
+---buf:fill_cover(moss)                                 -- one cell, everywhere
+---```
+---@param material integer
+---@param options table? `{ cells = 1 | 2 | 3, take = Tiamot.Density }`
+function ChunkBuffer:fill_cover(material, options) end
+
 ---Fills every block below `level` with a fluid, around the terrain.
 ---
 ---**This is the only place an ocean can come from.** The fluid solver conserves
@@ -2011,17 +2043,41 @@ function Density:len() end
 ---survives it and your caves do not. This answers from the shape of your
 ---program instead, and it can be trusted when it says no.
 ---
----`all_solid` and `all_empty` are the two answers worth acting on. Anything
----else means the surface might cross this chunk and only evaluating will say.
----**Wrong in one direction only**: it may say "maybe" about a chunk that turns
----out to be empty, and it will never say "empty" about a chunk that is not.
+---`all_solid` and `all_empty` are the two answers worth acting on for terrain.
+---Anything else means the surface might cross this chunk and only evaluating
+---will say. **Wrong in one direction only**: it may say "maybe" about a chunk
+---that turns out to be empty, and it will never say "empty" about a chunk that
+---is not.
 ---
----How often it can decide is set by your own field. The surface sits where
----your noise balances your height term, so the band it cannot see through is
----the noise amplitude divided by that term's coefficient: a field of
----`noise(40) - y * 0.08` has 500 blocks of real relief and a band to match,
----while `noise(11) - y` has eleven. Measured on a streamed column, the second
----shape has 88% of its chunks decided outright and the first has none.
+---**`low` and `high` are how you pick a biome.** A selector field — coherent
+---noise, no height term — bounded over one chunk tells you which biomes that
+---chunk can hold, so you run one generator instead of all of them:
+---
+---```lua
+---local warmth = game.density(WARMTH):bounds(pos)
+---if warmth.low > 0.0 then        warm(buf, pos)     -- cold ruled out
+---elseif warmth.high < 0.0 then   cold(buf, pos)     -- warm ruled out
+---else                            both(buf, pos)     -- the chunk straddles
+---end
+---```
+---
+---**Pass the `pos` you were handed**, not a table you built: it carries the
+---world seed, and a bound over a box is a fact about one world's field. The
+---interval that holds for every seed is the one that says the same thing in
+---every chunk, which is the thing this call exists not to be. A `pos` with no
+---`seed` is an error rather than a guess.
+---
+---How often it can decide is set by your own field, and the rule is that a box
+---cannot bound features smaller than itself.
+---
+---For terrain: the surface sits where your noise balances your height term, so
+---the band it cannot see through is the noise amplitude divided by that term's
+---coefficient. `noise(40) - y * 0.08` has 500 blocks of real relief and a band
+---to match; `noise(11) - y` has eleven and 93% of its chunks decided outright.
+---
+---For a selector: **72%** of chunks land wholly one side of a threshold at
+---frequency 0.001, 60% at 0.002, 4% at 0.004, and none at all by 0.01. Choose
+---biomes from a WIDE field, or you will run every biome in every chunk again.
 ---@param pos table The chunk position your generator was given.
 ---@return { low: number, high: number, all_solid: boolean, all_empty: boolean }
 function Density:bounds(pos) end

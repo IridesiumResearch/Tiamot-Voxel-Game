@@ -605,6 +605,336 @@ pub fn fractal_3d(seed: u64, x: f32, y: f32, z: f32, params: &FractalParams) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Bounds over a box
+// ---------------------------------------------------------------------------
+
+/// The most cells [`simplex_3d_bounds`] will walk before giving up.
+///
+/// The count grows with the box's volume in noise units, so this is what stops
+/// a mod asking about a field so high-frequency that bounding it costs more
+/// than sampling it. Giving up is answering `None`, and the caller then uses
+/// the range that always holds.
+///
+/// **Sixty-four is four cells an axis, and it is free.** Measured over a
+/// streamed column of ordinary terrain, every cap from 512 down to 32 decided
+/// exactly the same 93% of chunks, while the cost per bound fell from 0.043 ms
+/// to 0.016 ms — so the work above this ceiling was being paid for and
+/// answering nothing. That is the honest shape of the mechanism: once a box
+/// spans more than a cell or two, the union over the cells it could be in
+/// covers most of the field's range anyway, and there is nothing left to win.
+const MAX_SIMPLEX_CELLS: i64 = 64;
+
+/// An interval `[low, high]`, closed at both ends.
+type Span = (f32, f32);
+
+/// The interval a product of two intervals lies in.
+fn span_multiply(a: Span, b: Span) -> Span {
+    let corners = [a.0 * b.0, a.0 * b.1, a.1 * b.0, a.1 * b.1];
+    let mut low = corners[0];
+    let mut high = corners[0];
+    for corner in &corners[1..] {
+        low = low.min(*corner);
+        high = high.max(*corner);
+    }
+    (low, high)
+}
+
+/// The interval a square lies in, which is not the square of the interval.
+///
+/// `[-2, 1]` squared is `[0, 4]`, not `[4, 1]`: an interval straddling zero has
+/// its smallest square AT zero. Getting this wrong is how an unsound bound gets
+/// written, and it is unsound in the direction that puts holes in a world.
+fn span_square(a: Span) -> Span {
+    if a.0 >= 0.0 {
+        (a.0 * a.0, a.1 * a.1)
+    } else if a.1 <= 0.0 {
+        (a.1 * a.1, a.0 * a.0)
+    } else {
+        let reach = a.0.abs().max(a.1.abs());
+        (0.0, reach * reach)
+    }
+}
+
+/// The interval containing both.
+fn span_union(a: Span, b: Span) -> Span {
+    (a.0.min(b.0), a.1.max(b.1))
+}
+
+/// The six tetrahedra of a simplex cell, as the two middle corners each picks.
+///
+/// The same six [`simplex_3d`] selects between, in the same order, written as
+/// data so a bound can walk the ones a box could land in instead of evaluating
+/// the comparisons at a point it does not have.
+const TETRAHEDRA: [([i32; 3], [i32; 3]); 6] = [
+    ([1, 0, 0], [1, 1, 0]),
+    ([1, 0, 0], [1, 0, 1]),
+    ([0, 0, 1], [1, 0, 1]),
+    ([0, 0, 1], [0, 1, 1]),
+    ([0, 1, 0], [0, 1, 1]),
+    ([0, 1, 0], [1, 1, 0]),
+];
+
+/// Whether each of [`TETRAHEDRA`] is reachable from somewhere in the box.
+///
+/// The selection in [`simplex_3d`] is three comparisons between `dx0`, `dy0`
+/// and `dz0`. Over a box each of those is an interval, and a comparison between
+/// two intervals has three answers: definitely, definitely not, or both — so a
+/// box lying inside one tetrahedron names exactly one, and only a box that
+/// really does straddle a face pays for more than one.
+fn reachable_tetrahedra(d: [Span; 3]) -> [bool; 6] {
+    // `a >= b` is possible while `a`'s top reaches `b`'s bottom; `a < b` is
+    // possible while `a`'s bottom is under `b`'s top.
+    let at_least = |a: Span, b: Span| a.1 >= b.0;
+    let below = |a: Span, b: Span| a.0 < b.1;
+    let (x, y, z) = (d[0], d[1], d[2]);
+    [
+        at_least(x, y) && at_least(y, z),
+        at_least(x, y) && below(y, z) && at_least(x, z),
+        at_least(x, y) && below(y, z) && below(x, z),
+        below(x, y) && below(y, z),
+        below(x, y) && at_least(y, z) && below(x, z),
+        below(x, y) && at_least(y, z) && at_least(x, z),
+    ]
+}
+
+/// One lattice corner's contribution to [`simplex_3d`], over a box.
+///
+/// `t` clamped at zero is what makes this exact rather than merely sound where
+/// the box crosses the edge of the kernel's support: the real contribution is
+/// zero on the far side, and a quartic whose interval starts at zero already
+/// contains it.
+fn corner_span(seed: u64, at: [i32; 3], d: [Span; 3]) -> Span {
+    let squares = [span_square(d[0]), span_square(d[1]), span_square(d[2])];
+    let radius = (
+        squares[0].0 + squares[1].0 + squares[2].0,
+        squares[0].1 + squares[1].1 + squares[2].1,
+    );
+    let t = (0.6 - radius.1, 0.6 - radius.0);
+    if t.1 <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let t = (t.0.max(0.0), t.1);
+    let raised = (t.0 * t.0, t.1 * t.1);
+    let quartic = (raised.0 * raised.0, raised.1 * raised.1);
+
+    let index =
+        (hash_lattice(seed, at[0], at[1], at[2]) & (GRADIENTS_3D.len() as u64 - 1)) as usize;
+    let g = GRADIENTS_3D[index];
+    let mut dot = (0.0_f32, 0.0_f32);
+    for axis in 0..3 {
+        let term = span_multiply((g[axis], g[axis]), d[axis]);
+        dot = (dot.0 + term.0, dot.1 + term.1);
+    }
+    span_multiply(quartic, dot)
+}
+
+/// The smallest and largest value [`simplex_3d`] can take anywhere in a box.
+///
+/// `None` when the box spans more than [`MAX_SIMPLEX_CELLS`] cells, which is
+/// the caller's cue to fall back to [`SIMPLEX_3D_BOUND`].
+///
+/// # Why a bound over a box is not the same question as [`SIMPLEX_3D_BOUND`]
+///
+/// That constant is the range the field occupies SOMEWHERE. It is the same
+/// interval everywhere, which is exactly what makes it useless for deciding
+/// that a particular chunk cannot hold a particular thing — a generator asking
+/// "can this biome be here?" gets the same yes in every chunk in the world.
+/// This answers over one box, and so can say no.
+///
+/// # How it is sound
+///
+/// [`simplex_3d`] sums four lattice corners: which four is decided by the cell
+/// the sample falls in and by three comparisons that pick one of six tetrahedra
+/// inside it. Both are decided per SAMPLE, and a box holds many, so this walks
+/// every (cell, tetrahedron) pair the box can reach — usually exactly one — and
+/// takes the union of what each would give. Each pair's own answer is the sum
+/// of four [`corner_span`]s, which is interval arithmetic over the same
+/// expression the kernel evaluates.
+///
+/// # Why not simply widen every nearby corner to include zero
+///
+/// It was written that way first, to avoid having to decide which four corners
+/// the kernel picks, and it is sound. It is also **useless**, which is worth
+/// recording so nobody rediscovers it: widening each term to include zero makes
+/// the sum contain zero, so the interval straddles zero in every box in the
+/// world and can never place the field above or below a threshold. Measured at
+/// the time: nought per cent of chunks decidable, at every frequency tried.
+/// A bound that cannot decide anything is not cheaper than one that can — it is
+/// the same as not having one.
+///
+/// The result is intersected with [`SIMPLEX_3D_BOUND`] before it is returned,
+/// so this can only ever be an improvement on it — and for a box much larger
+/// than a cell it IS it. Bounding over a box buys nothing once the field's
+/// features are smaller than the box.
+#[must_use]
+pub fn simplex_3d_bounds(seed: u64, x: Span, y: Span, z: Span) -> Option<Span> {
+    let low_corner = (
+        clamp_coordinate(x.0.min(x.1)),
+        clamp_coordinate(y.0.min(y.1)),
+        clamp_coordinate(z.0.min(z.1)),
+    );
+    let high_corner = (
+        clamp_coordinate(x.0.max(x.1)),
+        clamp_coordinate(y.0.max(y.1)),
+        clamp_coordinate(z.0.max(z.1)),
+    );
+
+    // Skewing adds `(x + y + z) * K` with `K > 0` to each coordinate, so it is
+    // increasing in all three: the box's skewed extent runs corner to corner,
+    // and the cells it can land in are the integer points between them. No
+    // margin — a sample's cell is the floor of its own skewed position, not a
+    // neighbourhood of it.
+    let skewed = |p: (f32, f32, f32)| -> (f32, f32, f32) {
+        let skew = (p.0 + p.1 + p.2) * SKEW_3D;
+        (p.0 + skew, p.1 + skew, p.2 + skew)
+    };
+    let first = skewed(low_corner);
+    let last = skewed(high_corner);
+    let (i0, i1) = (floor_to_i32(first.0), floor_to_i32(last.0));
+    let (j0, j1) = (floor_to_i32(first.1), floor_to_i32(last.1));
+    let (k0, k1) = (floor_to_i32(first.2), floor_to_i32(last.2));
+
+    let cells = i64::from(i1 - i0 + 1)
+        .saturating_mul(i64::from(j1 - j0 + 1))
+        .saturating_mul(i64::from(k1 - k0 + 1));
+    if cells > MAX_SIMPLEX_CELLS {
+        return None;
+    }
+
+    let mut total: Option<Span> = None;
+    // Walked in lattice order, which is fixed — charter rule 4 bans float
+    // accumulation over an order that is not.
+    for i in i0..=i1 {
+        for j in j0..=j1 {
+            for k in k0..=k1 {
+                let unskew = (i + j + k) as f32 * UNSKEW_3D;
+                let origin = (i as f32 - unskew, j as f32 - unskew, k as f32 - unskew);
+                let d0 = [
+                    (low_corner.0 - origin.0, high_corner.0 - origin.0),
+                    (low_corner.1 - origin.1, high_corner.1 - origin.1),
+                    (low_corner.2 - origin.2, high_corner.2 - origin.2),
+                ];
+
+                let near = corner_span(seed, [i, j, k], d0);
+                let shift = |by: [i32; 3], unskews: f32| -> [Span; 3] {
+                    [
+                        (
+                            d0[0].0 - by[0] as f32 + unskews,
+                            d0[0].1 - by[0] as f32 + unskews,
+                        ),
+                        (
+                            d0[1].0 - by[1] as f32 + unskews,
+                            d0[1].1 - by[1] as f32 + unskews,
+                        ),
+                        (
+                            d0[2].0 - by[2] as f32 + unskews,
+                            d0[2].1 - by[2] as f32 + unskews,
+                        ),
+                    ]
+                };
+                let far = corner_span(
+                    seed,
+                    [i + 1, j + 1, k + 1],
+                    shift([1, 1, 1], 3.0 * UNSKEW_3D),
+                );
+
+                for (tetrahedron, reachable) in TETRAHEDRA.iter().zip(reachable_tetrahedra(d0)) {
+                    if !reachable {
+                        continue;
+                    }
+                    let (one, two) = *tetrahedron;
+                    let middle = corner_span(
+                        seed,
+                        [i + one[0], j + one[1], k + one[2]],
+                        shift(one, UNSKEW_3D),
+                    );
+                    let outer = corner_span(
+                        seed,
+                        [i + two[0], j + two[1], k + two[2]],
+                        shift(two, 2.0 * UNSKEW_3D),
+                    );
+                    let sum = (
+                        near.0 + middle.0 + outer.0 + far.0,
+                        near.1 + middle.1 + outer.1 + far.1,
+                    );
+                    total = Some(match total {
+                        None => sum,
+                        Some(reached) => span_union(reached, sum),
+                    });
+                }
+            }
+        }
+    }
+
+    let total = total?;
+    Some((
+        (total.0 * SIMPLEX_3D_SCALE).max(-SIMPLEX_3D_BOUND),
+        (total.1 * SIMPLEX_3D_SCALE).min(SIMPLEX_3D_BOUND),
+    ))
+}
+
+/// The smallest and largest value [`fractal_3d`] can take anywhere in a box.
+///
+/// Each octave is bounded over the box the octave itself sees — the box scaled
+/// by that octave's frequency — shaped, weighted and summed exactly as
+/// [`fractal_3d`] sums them. An octave whose own bound is unavailable or no
+/// better than [`SIMPLEX_3D_BOUND`] falls back to it, so this is never worse
+/// than [`FractalParams::range`] and usually far better.
+#[must_use]
+pub fn fractal_3d_bounds(seed: u64, x: Span, y: Span, z: Span, params: &FractalParams) -> Span {
+    let mut total = (0.0_f32, 0.0_f32);
+    let mut amplitude = 1.0_f32;
+    let mut normaliser = 0.0_f32;
+    let mut frequency = params.frequency;
+
+    for octave in 0..params.effective_octaves() {
+        let octave_seed = seed ^ u64::from(octave).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let scaled = |span: Span| -> Span {
+            let (a, b) = (span.0 * frequency, span.1 * frequency);
+            (a.min(b), a.max(b))
+        };
+        // Already intersected with the constant by `simplex_3d_bounds`, so
+        // giving up and using the constant is the same answer, not a worse one.
+        let raw = simplex_3d_bounds(octave_seed, scaled(x), scaled(y), scaled(z))
+            .unwrap_or((-SIMPLEX_3D_BOUND, SIMPLEX_3D_BOUND));
+        let shaped = shape_span(params.fractal, raw);
+        total = (
+            total.0 + shaped.0 * amplitude,
+            total.1 + shaped.1 * amplitude,
+        );
+        normaliser += amplitude;
+        amplitude *= params.gain;
+        frequency *= params.lacunarity;
+    }
+
+    (total.0 / normaliser, total.1 / normaliser)
+}
+
+/// [`shape`] lifted to an interval.
+///
+/// `Ridged` and `Billow` both run through `|s|`, which is not monotone across
+/// zero — an interval straddling it reaches down to zero, not to the smaller
+/// of its two magnitudes.
+fn shape_span(fractal: Fractal, sample: Span) -> Span {
+    match fractal {
+        Fractal::Fbm => sample,
+        Fractal::Ridged | Fractal::Billow => {
+            let magnitude = if sample.0 >= 0.0 {
+                (sample.0, sample.1)
+            } else if sample.1 <= 0.0 {
+                (-sample.1, -sample.0)
+            } else {
+                (0.0, sample.0.abs().max(sample.1.abs()))
+            };
+            match fractal {
+                Fractal::Ridged => (1.0 - magnitude.1 * 2.0, 1.0 - magnitude.0 * 2.0),
+                _ => (magnitude.0 * 2.0 - 1.0, magnitude.1 * 2.0 - 1.0),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bulk fills
 // ---------------------------------------------------------------------------
 
@@ -816,6 +1146,104 @@ mod tests {
         assert!(max < 1.6, "max {max} is implausibly high");
         assert!(min < -0.3, "min {min} suggests the field is not varying");
         assert!(max > 0.3, "max {max} suggests the field is not varying");
+    }
+
+    #[test]
+    fn a_box_bound_holds_everywhere_inside_the_box() {
+        // Same stake as `the_simplex_bound_holds_everywhere_it_is_searched`,
+        // and higher: this bound is what a generator skips a biome on, and
+        // unlike the constant it is not one number somebody can re-derive by
+        // hand. It is interval arithmetic over the lattice, and every piece of
+        // it is wrong in the dangerous direction if written naively — a square
+        // across zero, an interval product missing a sign, and above all the
+        // reasoning about WHICH tetrahedra a box can reach, where comparing
+        // the wrong ends of two intervals silently drops one.
+        //
+        // **Strides rather than a grid**, for the reason the sibling test uses
+        // them: a lattice of positions tests a lattice of positions. The
+        // failures here are narrow — one wrong comparison was invisible to
+        // 700,000 samples on a grid and showed up in the first hundred
+        // thousand of a search that moved continuously — and box SIZE has to
+        // vary too, because a box inside a single tetrahedron never exercises
+        // the part that decides between them.
+        let sizes = [0.05f32, 0.17, 0.3, 0.61, 0.93, 1.2];
+        let mut worst_escape = 0.0f32;
+        let mut widest = 0.0f32;
+        let mut tightest = f32::INFINITY;
+        let mut checked = 0u32;
+        for seed in [5u64, 17, 271, 4096, 99_991] {
+            // Scattered rather than walked. Tying the three coordinates to
+            // one counter — strides, a grid, anything on a line — keeps the
+            // three `d` intervals in a fixed relationship to each other, and
+            // the reasoning under test is exactly about that relationship. Two
+            // wrong-end comparisons survived both a grid and a stride walk and
+            // die here.
+            let mut state = seed | 1;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / 16_777_216.0
+            };
+            for n in 0..20_000 {
+                let size = sizes[n as usize % sizes.len()];
+                let origin = (next() * 8.0 - 4.0, next() * 8.0 - 4.0, next() * 8.0 - 4.0);
+                let Some(bound) = simplex_3d_bounds(
+                    seed,
+                    (origin.0, origin.0 + size),
+                    (origin.1, origin.1 + size),
+                    (origin.2, origin.2 + size),
+                ) else {
+                    continue;
+                };
+                widest = widest.max(bound.1 - bound.0);
+                if size < 0.1 {
+                    tightest = tightest.min(bound.1 - bound.0);
+                }
+                let steps = 7;
+                for i in 0..=steps {
+                    for j in 0..=steps {
+                        for k in 0..=steps {
+                            let at = |n: i32, from: f32| from + size * n as f32 / steps as f32;
+                            let value =
+                                simplex_3d(seed, at(i, origin.0), at(j, origin.1), at(k, origin.2));
+                            checked += 1;
+                            let escape = (bound.0 - value).max(value - bound.1);
+                            worst_escape = worst_escape.max(escape);
+                            assert!(
+                                escape <= 0.0,
+                                "a sample {value} inside a {size}-wide box at {origin:?}, seed \
+                                 {seed}, escaped its bound ({}, {}) by {escape} — a generator \
+                                 skipping on this bound would leave a hole",
+                                bound.0,
+                                bound.1
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 20_000_000, "only {checked} samples were searched");
+        // **Never worse than the constant**, which is what lets a caller use
+        // this without checking which of the two it got. A box wider than a
+        // cell hits exactly this, and that is the mechanism working as designed
+        // rather than failing.
+        assert!(
+            widest <= 2.0 * SIMPLEX_3D_BOUND,
+            "a box bound of {widest} is wider than the constant it is meant to improve on"
+        );
+        // And non-vacuous, which is the assertion with teeth: a bound of
+        // `[-inf, inf]`, or one that always returned the constant, would pass
+        // everything above and prune nothing. A box a twentieth of a cell
+        // across has to do far better than the interval that holds everywhere,
+        // or none of this was worth building.
+        assert!(
+            tightest < 2.0 * SIMPLEX_3D_BOUND * 0.05,
+            "the tightest bound over a tiny box was {tightest}, against {} that holds \
+             everywhere — bounding over a box is buying nothing",
+            2.0 * SIMPLEX_3D_BOUND
+        );
+        let _ = worst_escape;
     }
 
     #[test]
