@@ -542,7 +542,9 @@ rather than coming back with holes you cannot see.
 ## What belongs in your mod, not in the engine
 
 The engine is deliberately small and holds no opinion about what a world is.
-Three things assistants routinely ask the engine for that are yours:
+What follows is the list of things assistants routinely ask the engine for that
+are already yours — and, where the line has moved, the small mechanism the
+engine does owe you to make them expressible.
 
 **Biomes are a Lua table.** A registry of names to parameters needs nothing
 from the engine. What the engine owes you is a way to tell which biomes a chunk
