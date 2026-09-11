@@ -635,6 +635,68 @@ impl ChunkBuffer {
         Ok(())
     }
 
+    /// Writes one block by WORLD position, ignoring anything outside this chunk.
+    ///
+    /// # Why a generator needs to aim outside its own chunk
+    ///
+    /// A structure — a tree, a hut, a ruin — is rooted at one place and reaches
+    /// out from it, and nothing makes that reach stop at a chunk boundary. The
+    /// obvious fix is to let a generator write into its neighbours and have the
+    /// engine hold those writes until those chunks are made, and that fix is
+    /// **wrong**: chunks are generated in whatever order players walk towards
+    /// them, so a chunk made before its neighbour would be missing the half of
+    /// a tree that neighbour was going to contribute, and made after it would
+    /// have it. Same seed, different world. Charter rule 4 is not only about
+    /// floats.
+    ///
+    /// The order-independent shape is the other way round: when generating a
+    /// chunk, run the structure pass for **every chunk within reach** — each
+    /// one's structures are a pure function of its own position and the seed,
+    /// via `rng_stream` — and write all of them in world coordinates. The ones
+    /// that land here are kept and the rest are dropped, and the same chunk
+    /// comes out whatever was generated before it. Every neighbour does the
+    /// same work and keeps a different slice of it.
+    ///
+    /// That is what this call is for: **dropping is the feature**. A generator
+    /// placing a structure whose root is two chunks away should not have to
+    /// know which of its blocks fall inside, and asking it to check would be
+    /// asking every mod to reimplement this and get the edges right.
+    ///
+    /// Returns whether the write landed, which a caller may ignore.
+    pub fn set_block_world(&mut self, at: crate::BlockPos, material: MaterialId) -> bool {
+        if at.chunk() != self.pos {
+            return false;
+        }
+        self.set_block(at.local(), material);
+        true
+    }
+
+    /// Writes one sub-node cell by WORLD cell position, ignoring anything
+    /// outside this chunk.
+    ///
+    /// The sub-node half of [`Self::set_block_world`], for the same reason and
+    /// with the same rule. Expands the buffer only when the write lands, so a
+    /// generator running the structure pass for a neighbourhood does not pay
+    /// 27x for the chunks it contributes nothing to.
+    pub fn set_subnode_world(&mut self, at: crate::SubNodePos, material: MaterialId) -> bool {
+        let block = crate::BlockPos::new(
+            at.x.div_euclid(SUBNODES_PER_AXIS as i32),
+            at.y.div_euclid(SUBNODES_PER_AXIS as i32),
+            at.z.div_euclid(SUBNODES_PER_AXIS as i32),
+        );
+        if block.chunk() != self.pos {
+            return false;
+        }
+        self.set_subnode(
+            block.local(),
+            at.x.rem_euclid(SUBNODES_PER_AXIS as i32) as u32,
+            at.y.rem_euclid(SUBNODES_PER_AXIS as i32) as u32,
+            at.z.rem_euclid(SUBNODES_PER_AXIS as i32) as u32,
+            material,
+        );
+        true
+    }
+
     // -- sub-node operations (the opt-in path) -----------------------------
 
     /// The material of one sub-node cell.

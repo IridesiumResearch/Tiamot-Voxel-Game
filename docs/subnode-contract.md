@@ -425,6 +425,34 @@ about it is a special case downstream.
 
 **Implemented by** `ChunkBuffer::fill_cover`, exposed as `buf:fill_cover`.
 
+### 5.2 Structures across a chunk edge — the neighbourhood, not a deferred write
+
+A structure is rooted in one place and reaches out from it, and nothing makes
+that reach stop at a chunk boundary. **The engine does not hold writes aimed at
+a chunk that does not exist yet, and will not**: chunks are generated in
+whatever order players walk towards them, so a chunk made before its neighbour
+would lack what that neighbour contributes and a chunk made after it would have
+it. Same seed, different world, differing only for players who approached from
+one side. Charter rule 4 is not only about floats.
+
+The order-independent shape is the other way round. A generator runs its
+structure pass for every chunk within reach — each chunk's structures being a
+pure function of its own position and the seed, through `rng_stream` — writes
+all of them in **world** coordinates, and the buffer keeps the ones that land in
+it. Every neighbour does the same work and keeps a different slice. Nothing is
+stored between chunks, so nothing can be stored in the wrong order.
+
+Two calls carry it, and both drop silently by design: a generator placing a
+structure whose root is two chunks away should not have to know which of its
+blocks fall inside, and making every mod check would be making every mod get the
+edges right.
+
+**Implemented by** `ChunkBuffer::set_block_world` and
+`ChunkBuffer::set_subnode_world`, exposed as `buf:set_world` and
+`buf:set_subnode_world`; `Density::sample` (`density:at`) supplies the ground
+height under a root, because a buffer is write-only and a neighbouring chunk's
+buffer is not the generator's to read.
+
 ---
 
 ## 6. Pathfinding — block resolution

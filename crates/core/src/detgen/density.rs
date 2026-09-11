@@ -515,6 +515,51 @@ impl Density {
         Interval { low, high }
     }
 
+    /// This field's value at ONE world position.
+    ///
+    /// # Why this exists when the whole design is bulk fills
+    ///
+    /// A generator placing structures has to answer "where is the ground at
+    /// this x and z?" a few dozen times a chunk — once per tree, not once per
+    /// block — and until this call there was no way to ask. Heightmaps and
+    /// density programs are opaque to scripts on purpose, and the purpose is
+    /// to stop O(volume) arithmetic in Lua, not to stop a script knowing
+    /// anything. A handful of point queries is the same shape as scattering
+    /// ore: proportional to what is placed, not to the volume it is placed in.
+    ///
+    /// It is also the only shape that works ACROSS a chunk boundary. A
+    /// structure rooted in a neighbouring chunk has to be placed on that
+    /// chunk's ground, and a generator cannot read a buffer it does not have —
+    /// see [`super::buffer::ChunkBuffer::set_block_world`] for why the
+    /// neighbourhood pass is the order-independent way to do this at all.
+    ///
+    /// # The thing not to do with it
+    ///
+    /// Looping this over a chunk is 4,096 crossings into the VM and back for
+    /// an answer [`Self::evaluate`] gives in one call, in native code, with the
+    /// bounds pruning in front of it. It is not merely slower; it is the exact
+    /// cost the opaque handles were shaped to prevent. The engine does not stop
+    /// a mod doing it, because the engine cannot tell a loop from a list — so
+    /// this is said in the mod guide beside the call.
+    ///
+    /// # Errors
+    ///
+    /// [`DensityError`] if the program will not evaluate.
+    pub fn sample(&self, seed: u64, x: f32, y: f32, z: f32) -> Result<f32, DensityError> {
+        let region = Region3d {
+            origin_x: x,
+            origin_y: y,
+            origin_z: z,
+            step: 1.0,
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let mut out = [0.0_f32];
+        self.evaluate(seed, &region, &mut out)?;
+        Ok(out[0])
+    }
+
     /// What the program can possibly produce over a box, without evaluating it.
     ///
     /// # Why a bound and not nine samples
@@ -1006,6 +1051,53 @@ mod tests {
             amplitude: 1.0,
             stream: 0,
         }]
+    }
+
+    #[test]
+    fn a_point_sample_is_exactly_what_the_bulk_fill_puts_there() {
+        // `sample` exists so a generator can ask where the ground is under a
+        // structure — including one rooted in a chunk it does not have. It is
+        // only worth anything if it agrees with the field the fill writes: a
+        // tree placed on a height that disagreed with the terrain by even one
+        // block would float or sink, and it would do it only at the positions
+        // where the two paths differed, which is the worst way to find out.
+        //
+        // Bit-identical, not close. Both go through `evaluate`, and if that
+        // ever stops being true this is what says so.
+        let density = Density::compile(terrain(0.03, 12.0)).expect("compile");
+        let region = Region3d {
+            origin_x: -37.0,
+            origin_y: 5.0,
+            origin_z: 214.0,
+            step: 1.0,
+            width: 8,
+            height: 4,
+            depth: 8,
+        };
+        let mut field = vec![0.0; region.len()];
+        density.evaluate(9, &region, &mut field).expect("evaluate");
+
+        let mut index = 0;
+        for layer in 0..region.depth {
+            for row in 0..region.height {
+                for column in 0..region.width {
+                    let (x, y, z) = (
+                        region.origin_x + column as f32,
+                        region.origin_y + row as f32,
+                        region.origin_z + layer as f32,
+                    );
+                    let point = density.sample(9, x, y, z).expect("sample");
+                    assert_eq!(
+                        point.to_bits(),
+                        field[index].to_bits(),
+                        "a point sample at ({x}, {y}, {z}) gave {point}, and the fill put \
+                         {} there",
+                        field[index]
+                    );
+                    index += 1;
+                }
+            }
+        }
     }
 
     #[test]

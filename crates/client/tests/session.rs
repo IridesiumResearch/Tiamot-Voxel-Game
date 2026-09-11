@@ -1282,10 +1282,20 @@ fn the_hud_counts_footing_changes_and_a_still_player_has_none() {
         app.pump_network();
         app.advance(jump, 1.0 / 60.0);
     }
-    settle(&mut app, 1.4);
 
+    // **Watched for, not waited out.** `footing_changes_last_second` is a
+    // window on the WALL clock, and `settle` is a fixed count of fixed steps
+    // that sleeps for none of it — so how much of the jump is still inside the
+    // window when the count is read depends entirely on how fast the machine
+    // ran those frames. Settling for 1.4 seconds of simulated time and then
+    // reading a one-second window passed everywhere for weeks and went red on
+    // a loaded Windows runner, where the wall clock outran the simulation and
+    // the jump aged out before the assertion looked. Polling asks the question
+    // the test means — does the counter ever notice — instead of asking
+    // whether it still remembers.
     assert!(
-        app.pacing().footing_changes_last_second() > 0,
+        run_frames(&mut app, |app| app.pacing().footing_changes_last_second()
+            > 0),
         "a jump left the ground and landed again without the counter noticing, so it cannot \
          report jolting either"
     );

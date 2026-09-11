@@ -185,6 +185,37 @@ function ChunkBuffer:fill_fluid_below(level, fluid) end
 ---@param material integer
 function ChunkBuffer:set_block(x, y, z, material) end
 
+---Writes one block by WORLD position, ignoring anything outside this chunk.
+---
+---**Dropping is the point.** A structure is rooted in one place and reaches out
+---from it, and nothing makes that reach stop at a chunk edge. The way to build
+---one that crosses is NOT to write into your neighbours and hope the engine
+---holds it — chunks are generated in whatever order players walk towards them,
+---so that gives a different world depending on which side somebody approached
+---from. Instead run your structure pass for every chunk within reach, write all
+---of it in world coordinates, and let each chunk keep the slice that lands in
+---it. See the mod guide, "Structures that cross a chunk edge".
+---
+---Returns whether the write landed, which you may ignore.
+---@param x integer World block x.
+---@param y integer World block y.
+---@param z integer World block z.
+---@param material integer
+---@return boolean landed
+function ChunkBuffer:set_world(x, y, z, material) end
+
+---The same write at sub-node resolution, in world CELL coordinates — three to
+---a block, so block `(1, 0, 0)`'s lowest corner cell is `(3, 0, 0)`.
+---
+---Expands the buffer only when the write lands, so running a structure pass
+---over a neighbourhood costs nothing extra for the chunks it does not touch.
+---@param x integer World cell x.
+---@param y integer World cell y.
+---@param z integer World cell z.
+---@param material integer
+---@return boolean landed
+function ChunkBuffer:set_subnode_world(x, y, z, material) end
+
 ---Sets one sub-node cell. **Expands the buffer to sub-node resolution**, which
 ---costs 27x the memory and fill time. Opt-in for a reason.
 ---@param bx integer Block x, 0..15.
@@ -2081,6 +2112,41 @@ function Density:len() end
 ---@param pos table The chunk position your generator was given.
 ---@return { low: number, high: number, all_solid: boolean, all_empty: boolean }
 function Density:bounds(pos) end
+
+---This field's value at ONE world position.
+---
+---**For choosing WHERE, not for looping.** A generator placing structures has
+---to answer "where is the ground at this x and z?" once per tree — a few dozen
+---times a chunk, not once per block. That is the same shape as scattering ore:
+---proportional to what you place, not to the volume you place it in.
+---
+---It is also the only way to place a structure on ground you cannot see. Your
+---buffer is write-only, and a structure rooted in a neighbouring chunk has no
+---buffer of yours to read.
+---
+---```lua
+---local ground = math.floor(surface:at(x, 0, z, pos.seed))
+---```
+---
+---`y = 0` is where a field of the form `noise - y` changes sign, so that is its
+---height.
+---
+---**Do not loop this over a chunk.** 4,096 of these is 4,096 crossings into the
+---VM and back for an answer `buf:fill_density` gives in one call, in native
+---code, with the bounds pruning in front of it. It is not merely slower — it is
+---the exact cost the opaque handles were shaped to prevent. Nothing stops you,
+---because the engine cannot tell a loop from a list.
+---
+---The seed is a separate argument rather than read off a `pos` the way `bounds`
+---reads it, because the position asked about is a WORLD block and not a chunk:
+---a structure asks about ground two chunks away, which no `pos` you hold
+---describes.
+---@param x number World x.
+---@param y number World y.
+---@param z number World z.
+---@param seed integer The world seed, from your generator's `pos.seed`.
+---@return number
+function Density:at(x, y, z, seed) end
 
 ---Compiles a density field from a table of nested operations.
 ---

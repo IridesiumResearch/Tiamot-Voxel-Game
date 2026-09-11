@@ -171,6 +171,17 @@ impl mlua::UserData for DensityHandle {
         // honest answer rather than a failure. Sampling a few points instead
         // would be faster and would put holes in the world — see
         // `Density::bounds`.
+        // This field's value at one world position. The seed is a separate
+        // argument rather than read off a `pos` the way `bounds` reads it,
+        // because the position asked about is a WORLD block and not a chunk —
+        // a structure asks about ground under a tree two chunks away, which no
+        // `pos` it holds describes.
+        methods.add_method("at", |_, this, (x, y, z, seed): (f32, f32, f32, u64)| {
+            this.density
+                .sample(seed, x, y, z)
+                .map_err(|err| mlua::Error::external(err.to_string()))
+        });
+
         methods.add_method("bounds", |lua, this, pos: Table| {
             // The same `pos` the generator was handed, read the same way
             // `game.rng_stream` and `game.noise_heightmap` read it.
@@ -417,6 +428,33 @@ struct BufferHandle {
 }
 
 impl BufferHandle {
+    /// Registers `buf:set_world` and `buf:set_subnode_world`.
+    ///
+    /// Its own function for the same reason `add_cover_method` is: `add_methods`
+    /// sits at the line limit.
+    fn add_world_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // Writes aimed in WORLD coordinates, which fall outside this chunk as
+        // often as not — that is the point. See `ChunkBuffer::set_block_world`
+        // for why a structure crossing a chunk edge has to be placed this way
+        // round and not by writing into a neighbour.
+        methods.add_method_mut(
+            "set_world",
+            |_, this, (x, y, z, material): (i32, i32, i32, u16)| {
+                Ok(this
+                    .buffer
+                    .set_block_world(crate::BlockPos::new(x, y, z), MaterialId(material)))
+            },
+        );
+        methods.add_method_mut(
+            "set_subnode_world",
+            |_, this, (x, y, z, material): (i32, i32, i32, u16)| {
+                Ok(this
+                    .buffer
+                    .set_subnode_world(crate::SubNodePos::new(x, y, z), MaterialId(material)))
+            },
+        );
+    }
+
     /// Registers `buf:fill_cover`.
     ///
     /// Its own function because `add_methods` sits at the line limit — the
@@ -537,6 +575,8 @@ impl mlua::UserData for BufferHandle {
                 Ok(())
             },
         );
+
+        Self::add_world_methods(methods);
 
         // Sub-node writes are opt-in and expand the buffer — Sub-Node Contract
         // §5. Named so a mod author can see they are asking for something

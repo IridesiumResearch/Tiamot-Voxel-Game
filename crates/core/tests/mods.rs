@@ -1020,6 +1020,127 @@ end)
 }
 
 #[test]
+fn a_structure_crosses_a_chunk_edge_and_does_not_care_which_chunk_was_made_first() {
+    // **The order-independent shape, which is the only correct one.** The
+    // obvious way to build a structure across an edge is to let a generator
+    // write into its neighbours and have the engine hold those writes until
+    // those chunks are made. That is wrong: chunks are generated in whatever
+    // order players walk towards them, so a chunk made before its neighbour
+    // would be missing that neighbour's contribution and a chunk made after it
+    // would have it. Same seed, different world.
+    //
+    // Instead every chunk runs the structure pass for its whole neighbourhood —
+    // each chunk's structures being a pure function of its own position and the
+    // seed — writes them all in world coordinates, and keeps the slice that
+    // lands in it. This test generates the same two chunks in both orders, in
+    // two separate worlds, and demands the same bytes.
+    let root = scratch("structures");
+    write_mod(
+        &root,
+        "grove",
+        "",
+        r#"
+local trunk = game.register_block{ id = "trunk" }
+local REACH = 1        -- chunks a structure can reach from its root
+local HEIGHT = 9       -- taller than a chunk is not needed; taller than the
+                       -- room above a root IS, or nothing would cross
+
+game.register_on_generate(function(buf, pos)
+    for dx = -REACH, REACH do
+        for dy = -REACH, REACH do
+            for dz = -REACH, REACH do
+                local at = {
+                    x = pos.x + dx, y = pos.y + dy, z = pos.z + dz,
+                    seed = pos.seed,
+                }
+                -- This chunk's own trees, decided from its own position. Every
+                -- neighbour derives exactly this and agrees.
+                local rng = game.rng_stream(at, "trees")
+                for _ = 1, 3 do
+                    local ox = at.x * 16 + rng:below(16)
+                    local oy = at.y * 16 + rng:below(16)
+                    local oz = at.z * 16 + rng:below(16)
+                    for h = 0, HEIGHT - 1 do
+                        -- Most of these fall outside and are dropped. That is
+                        -- the mechanism, not waste.
+                        buf:set_world(ox, oy + h, oz, trunk)
+                    end
+                end
+            end
+        end
+    end
+end)
+"#,
+    );
+
+    let made = |order: &[ChunkPos]| -> Vec<tiamot_core::Chunk> {
+        let mut host = host_for(&root);
+        assert!(
+            host.failed().is_empty(),
+            "the mod should load: {:?}",
+            host.failed()
+        );
+        host.freeze().expect("freeze");
+        let mut out: Vec<_> = order
+            .iter()
+            .map(|pos| {
+                (
+                    *pos,
+                    host.generate_chunk(
+                        tiamot_core::domain::OVERWORLD,
+                        4242,
+                        *pos,
+                        MaterialId::AIR,
+                    )
+                    .expect("generate"),
+                )
+            })
+            .collect();
+        out.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+        out.into_iter().map(|(_, chunk)| chunk).collect()
+    };
+
+    let low = ChunkPos::new(0, 0, 0);
+    let high = ChunkPos::new(0, 1, 0);
+    let upwards = made(&[low, high]);
+    let downwards = made(&[high, low]);
+    assert_eq!(
+        upwards, downwards,
+        "the same two chunks came out differently depending on which was \
+         generated first — the structure pass is not order-independent"
+    );
+
+    // Non-vacuous in two ways, because two chunks of identical air would pass
+    // the comparison above and prove nothing. Something was built at all...
+    let material = |chunk: &tiamot_core::Chunk, x: i32, y: i32, z: i32| {
+        chunk
+            .get_block(tiamot_core::BlockPos::new(x, y, z))
+            .map(|block| block.subnode(0))
+    };
+    let built = (0..16).any(|x| {
+        (0..16).any(|y| (0..16).any(|z| material(&upwards[0], x, y, z) != Some(MaterialId::AIR)))
+    });
+    assert!(built, "the grove put nothing in these chunks at all");
+
+    // ...and something CROSSED, which is the case the whole mechanism exists
+    // for. A trunk rooted in the lower chunk and reaching into the upper one
+    // stands in the lower chunk's top row and the upper chunk's bottom row of
+    // the same column. Without this the two chunks could agree simply because
+    // nothing ever reached between them.
+    let crossing = (0..16).any(|x| {
+        (0..16).any(|z| {
+            let below = material(&upwards[0], x, 15, z);
+            let above = material(&upwards[1], x, 16, z);
+            below.is_some() && below != Some(MaterialId::AIR) && below == above
+        })
+    });
+    assert!(
+        crossing,
+        "no structure reached across the boundary, so the ordering claim was never tested"
+    );
+}
+
+#[test]
 fn a_bound_over_a_chunk_lets_a_generator_rule_a_biome_out() {
     // **The reason bounds over a box exist.** A mod with two biomes used to
     // have to run both generators in every chunk, because the only thing it

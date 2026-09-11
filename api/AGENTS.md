@@ -536,6 +536,57 @@ end)
 Reading terrain to decide where ore may go is the same shape: bounded, and
 proportional to what you place rather than to the volume you place it in.
 
+**Structures that cross a chunk edge: build the neighbourhood, keep your
+slice.** A tree, a hut, a ruin is rooted in one place and reaches out from it,
+and nothing makes that reach stop at a chunk boundary. The obvious design — write
+into your neighbours and let the engine hold those writes until those chunks are
+made — is **wrong, and wrong in a way that does not show up in testing**: chunks
+are generated in whatever order players walk towards them, so a chunk made
+before its neighbour is missing what that neighbour would have contributed and a
+chunk made after it has it. Same seed, different world, and only for the players
+who approached from the other side.
+
+Do it the other way round. When generating a chunk, run your structure pass for
+**every chunk within reach**, and write all of it in world coordinates:
+
+```lua
+local REACH = 1                                  -- chunks your biggest structure spans
+
+game.register_on_generate(function(buf, pos)
+    for dx = -REACH, REACH do
+        for dz = -REACH, REACH do
+            local at = { x = pos.x + dx, y = pos.y, z = pos.z + dz, seed = pos.seed }
+            local rng = game.rng_stream(at, "trees")   -- that chunk's own trees
+            for _ = 1, rng:below(4) do
+                local x = at.x * 16 + rng:below(16)
+                local z = at.z * 16 + rng:below(16)
+                local ground = math.floor(surface:at(x, 0, z, pos.seed))
+                for h = 1, 6 do
+                    buf:set_world(x, ground + h, z, trunk)   -- outside? dropped
+                end
+            end
+        end
+    end
+end)
+```
+
+Every chunk derives the same structures for the same neighbours, because
+`rng_stream` is a pure function of a chunk position and the seed. Each chunk
+keeps the slice that lands in it and `set_world` drops the rest — **dropping is
+the mechanism, not waste.** The same chunk comes out whatever was generated
+before it.
+
+`density:at(x, y, z, seed)` is the point sample that lets a structure sit on
+ground it cannot see: a generator's buffer is write-only, and a structure rooted
+in a neighbouring chunk has no buffer to read anyway. It is for choosing WHERE,
+a few dozen times a chunk. **Do not loop it over a chunk** — that is 4,096
+crossings into the VM for an answer `fill_density` gives in one call, in native
+code, with the bounds pruning in front of it. It is the exact cost the opaque
+handles exist to prevent, and the engine cannot tell a loop from a list.
+
+`buf:set_subnode_world(x, y, z, material)` is the same write at cell resolution,
+where the coordinates count cells rather than blocks — three to a block.
+
 **Decoration that embeds needs the merge write.** A masked `game.set_block`
 REPLACES the block — the cells your mask does not name become air — which is
 right for something growing into open air and wrong for a rock or a root going
