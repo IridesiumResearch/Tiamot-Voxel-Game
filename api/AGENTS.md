@@ -769,10 +769,16 @@ field leans in gusts instead of every plant buzzing on its own.
 There is no amplitude to set. What a plant looks like is its texture's business
 and its shape's; a knob beside them is a third thing to get wrong.
 
-**Erosion, rivers and biome blending are compositions**, not engine features.
-Build them from `game.density`'s arithmetic. If a shape genuinely cannot be
-expressed with the operations that exist, that is a finding worth reporting —
-the answer is a new operation with a determinism argument, not a loop in Lua.
+**Erosion, rivers and blending one biome's TERRAIN into another's are
+compositions**, not engine features. Build them from `game.density`'s
+arithmetic — a `min` between two surfaces is a coastline, a weighted `add` is a
+transition. If a shape genuinely cannot be expressed with the operations that
+exist, that is a finding worth reporting: the answer is a new operation with a
+determinism argument, not a loop in Lua.
+
+Blending a biome's COLOUR is the exception, and it is an engine feature
+(`register_chunk_tint`, above) for a reason you cannot work around: the blend
+has to happen where the pixels are, and a mod has no way to reach them.
 
 ---
 

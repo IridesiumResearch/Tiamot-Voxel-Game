@@ -989,8 +989,10 @@ mod tests {
                 decided += 1;
             }
         }
-        // Measured at 88% over a wider sweep; two thirds is the line at which
-        // something has gone wrong rather than a number to tune towards.
+        // Measured at 93% over a wider sweep — 88% before the noise and map
+        // nodes were bounded over the box rather than globally. Two thirds is
+        // the line at which something has gone wrong, not a number to tune
+        // towards.
         assert!(
             decided * 3 >= total * 2,
             "only {decided} of {total} chunks could be decided, so the bound has stopped \
