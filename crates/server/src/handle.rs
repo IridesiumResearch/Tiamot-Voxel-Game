@@ -824,8 +824,22 @@ fn serve_one_chunk(
     // rather than leaving the colour it used to be in the ground behind the
     // player. One script call against the milliseconds generating a chunk
     // costs — and only for chunks that are actually going out.
+    //
+    // **Counted as generation, because that is what it is.** A mod computing a
+    // colour from its biome field is its generator by another name.
+    //
+    // Worth being precise about what this buys, because it is less than it
+    // looks: the serve loop stops on `started.elapsed()`, which is real time
+    // and already includes this call whether or not it is counted. What the
+    // count feeds is the ESTIMATE of what one more chunk will cost, and an
+    // estimate that omits the tint is over-eager by exactly one chunk's worth
+    // of it. Bounded, then — not the unbounded overrun the clock exists to
+    // prevent — but there is no reason for the estimate to be wrong.
     let tint = if blob.is_some() {
-        source.tint(&request.domain, request.pos, world.seed())
+        let at = std::time::Instant::now();
+        let colour = source.tint(&request.domain, request.pos, world.seed());
+        report.generating += at.elapsed();
+        colour
     } else {
         [u8::MAX; 3]
     };
