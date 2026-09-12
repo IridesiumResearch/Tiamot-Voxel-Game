@@ -1863,9 +1863,25 @@ struct Culled {
     /// uses, against the light's box rather than the eye's — so anything that
     /// can cast into the shadow map is in it whether or not it is on screen.
     casters: Vec<(ChunkPos, u32)>,
+    /// The visible chunks near enough for their sprites to be drawn.
+    sprites: Vec<(ChunkPos, u32)>,
+    /// The visible chunks near enough for their cutout foliage to be drawn.
+    cutout: Vec<(ChunkPos, u32)>,
     /// Where the player's own body sits in the instance array.
     body: u32,
 }
+
+/// How far, in blocks from the camera to a chunk's centre, sprites (grass,
+/// bushes) and cutout foliage (leaves, needles) are drawn at all.
+///
+/// **A draw distance for the small things**, asked for from the window with
+/// a mountainside of grass and firs in view. Beyond it a chunk's terrain is
+/// drawn and its plants are not: at seven chunks a tuft is a few pixels, at
+/// eleven a canopy is a smudge, and the instances and alpha-tested quads
+/// they cost are most of a frame's foliage. They pop in as the player nears,
+/// which is the trade; a fade would need a second pass per chunk.
+const SPRITE_DRAW_BLOCKS: f32 = 112.0;
+const CUTOUT_DRAW_BLOCKS: f32 = 176.0;
 
 impl Renderer {
     /// Culls the resident chunks against the camera AND the light, and uploads
@@ -1916,6 +1932,14 @@ impl Renderer {
             let instance = instances.len() as u32;
             if seen {
                 culled.visible.push((*pos, instance));
+                let centre = offset + glam::Vec3::splat(tiamot_core::CHUNK_BLOCKS as f32 * 0.5);
+                let distance2 = centre.length_squared();
+                if distance2 < SPRITE_DRAW_BLOCKS * SPRITE_DRAW_BLOCKS {
+                    culled.sprites.push((*pos, instance));
+                }
+                if distance2 < CUTOUT_DRAW_BLOCKS * CUTOUT_DRAW_BLOCKS {
+                    culled.cutout.push((*pos, instance));
+                }
             }
             if casts {
                 culled.casters.push((*pos, instance));
@@ -2534,9 +2558,10 @@ impl Renderer {
             // Foliage, still with the opaque geometry: it writes depth and is
             // not composited, so it belongs before anything blended rather
             // than among it.
-            self.draw_cutout(&mut pass, pass_targets.cutout, &culled.visible);
+            // The plants, only near: see `SPRITE_DRAW_BLOCKS`.
+            self.draw_cutout(&mut pass, pass_targets.cutout, &culled.cutout);
 
-            self.draw_sprites(&mut pass, pass_targets.sprites, &culled.visible);
+            self.draw_sprites(&mut pass, pass_targets.sprites, &culled.sprites);
 
             // Glass first of the two blended passes, then the milk. Both
             // inherit slot 1 from the chunk loop above, which is what the
