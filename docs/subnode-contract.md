@@ -388,6 +388,15 @@ expands.
 All worldgen randomness comes from engine-provided seeded noise and per-chunk RNG
 streams (charter rule 4). Sub-node detail does not change that.
 
+**A palette fill is several fills, evaluated once.** `ChunkBuffer::fill_palette`
+maps a field's value through a sorted table of thresholds to a material, so
+strata by depth are one evaluation rather than one per material. Its sub-node
+form refines a shell wherever **any** band changes between neighbouring blocks —
+the surface and every boundary under it — which is what makes its output
+identical, cell for cell, to the separate detail fills it replaces: each of
+those refined its own boundary, and the union of their shells is this one.
+Nothing about sub-node semantics changes; only how many times the field is asked.
+
 ### 5.1 Ground cover — a run of cells, standing on the surface, inside one block
 
 A generator placing grass, ferns or moss needs three things a density field

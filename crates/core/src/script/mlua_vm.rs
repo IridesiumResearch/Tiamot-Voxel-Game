@@ -458,6 +458,50 @@ impl BufferHandle {
         );
     }
 
+    /// Registers `buf:fill_palette`.
+    ///
+    /// Its own function for the reason its siblings are: `add_methods` sits at
+    /// the line limit.
+    fn add_palette_method<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // One evaluation of the field, a table of materials by its value — the
+        // generalisation of `fill_density` from one threshold to several. See
+        // `ChunkBuffer::fill_palette` for why a generator layering ten
+        // materials was paying for ten evaluations before this.
+        methods.add_method_mut(
+            "fill_palette",
+            |_, this, (density, bands, options): (mlua::AnyUserData, Table, Option<Table>)| {
+                let density = density.borrow::<DensityHandle>()?;
+                let mut pairs = Vec::new();
+                for band in bands.sequence_values::<Table>() {
+                    let band = band?;
+                    let above: f32 = band.get("above").map_err(|_| {
+                        mlua::Error::external(
+                            "fill_palette: every band is `{ above = <number>, material = <id> }`",
+                        )
+                    })?;
+                    let material: u16 = band.get("material").map_err(|_| {
+                        mlua::Error::external(
+                            "fill_palette: every band is `{ above = <number>, material = <id> }`",
+                        )
+                    })?;
+                    pairs.push((above, MaterialId(material)));
+                }
+                let palette = crate::detgen::Palette::new(pairs)
+                    .map_err(|err| mlua::Error::external(format!("fill_palette: {err}")))?;
+                let seed = this.world_seed;
+                match fill_detail_of(options.as_ref())? {
+                    None => this.buffer.fill_palette(&density.density, seed, &palette),
+                    Some(detail) => {
+                        this.buffer
+                            .fill_palette_detail(&density.density, seed, &palette, detail)
+                    }
+                }
+                .map_err(|err| mlua::Error::external(err.to_string()))?;
+                Ok(())
+            },
+        );
+    }
+
     /// Registers `buf:fill_cover`.
     ///
     /// Its own function because `add_methods` sits at the line limit — the
@@ -564,6 +608,7 @@ impl mlua::UserData for BufferHandle {
         );
 
         Self::add_cover_method(methods);
+        Self::add_palette_method(methods);
 
         methods.add_method_mut(
             "set_block",

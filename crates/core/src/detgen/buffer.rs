@@ -84,7 +84,167 @@ pub enum Detail {
 /// Cell centres rather than cell corners: cell `c` spans `c/3 .. (c+1)/3` of
 /// the block, so its middle is `(c + 0.5) / 3`. Sampling the corner instead
 /// would bias every surface half a cell towards the block's origin, which over
-/// a whole world reads as terrain sitting slightly too low.
+/// a whole world reads as terrain sitting slightly too low./// What a bound settles about a palette fill before any evaluation.
+enum Decided {
+    /// No value in the chunk clears the lowest band: nothing to write.
+    Nothing,
+    /// Every value lands in one band: the whole chunk is this.
+    All(MaterialId),
+    /// The chunk crosses a boundary and has to be evaluated.
+    Mixed,
+}
+
+/// The most bands a [`Palette`] may hold.
+///
+/// Sixteen materials by depth is more than any real strata want, and a table
+/// of a thousand would turn the per-block lookup below from a handful of
+/// comparisons into something that costs more than the field it maps.
+pub const MAX_PALETTE_BANDS: usize = 16;
+
+/// A table from a field's value to a material: the generalisation of "solid
+/// where the field is positive" to "this material where it is above this,
+/// that one where it is above that".
+///
+/// # Why a fill wants a table and not a material
+///
+/// A field of the form `noise - y` has, at every point, the value *surface
+/// height minus y* — which is to say the DEPTH below the surface. So a
+/// generator that wants grass on the top block, dirt for the next three and
+/// stone below has three bands of that one field: above 0, above 1, above 4.
+///
+/// Before this it wrote them as three fills of three shifted fields, and each
+/// fill evaluated the whole field over the chunk again. Ten materials was ten
+/// evaluations of the same six-octave noise for one answer per block; the
+/// write loop that follows an evaluation is a rounding error beside it, so the
+/// generator's cost was very nearly the number of materials it layered. A
+/// palette evaluates once and looks each value up.
+///
+/// # The rule
+///
+/// Bands are sorted by threshold. A value takes the material of the highest
+/// band it is strictly above — the same `> 0.0` a plain fill uses, so
+/// `fill_density(field, m)` and a one-band palette `{ 0 → m }` are the same
+/// fill. A value not above the lowest band writes nothing: a fill ADDS, and
+/// what the block held before is what it holds after.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Palette {
+    /// Ascending by threshold, no two equal.
+    bands: Vec<(f32, MaterialId)>,
+}
+
+/// A palette that cannot be used.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum PaletteError {
+    /// No bands at all: a fill that could never write anything.
+    #[error("a palette needs at least one band")]
+    Empty,
+    /// More than [`MAX_PALETTE_BANDS`].
+    #[error("a palette may hold at most {MAX_PALETTE_BANDS} bands, not {found}")]
+    TooMany {
+        /// How many were given.
+        found: usize,
+    },
+    /// A threshold that is not a number.
+    ///
+    /// Refused rather than sorted somewhere arbitrary: every comparison with a
+    /// NaN is false, so a NaN band would silently never be chosen and never be
+    /// passed over either, and the bands around it would misbehave in ways
+    /// that depend on where the sort happened to leave it.
+    #[error("a palette threshold is not a number")]
+    NotANumber,
+    /// Two bands with the same threshold, which could never both be chosen.
+    #[error("two palette bands share the threshold {threshold}")]
+    Duplicate {
+        /// The shared threshold.
+        threshold: f32,
+    },
+}
+
+impl Palette {
+    /// Builds a palette from `(threshold, material)` pairs in any order.
+    ///
+    /// # Errors
+    ///
+    /// [`PaletteError`] for an empty table, too many bands, a NaN threshold or
+    /// two equal ones.
+    pub fn new(mut bands: Vec<(f32, MaterialId)>) -> Result<Self, PaletteError> {
+        if bands.is_empty() {
+            return Err(PaletteError::Empty);
+        }
+        if bands.len() > MAX_PALETTE_BANDS {
+            return Err(PaletteError::TooMany { found: bands.len() });
+        }
+        if bands.iter().any(|(threshold, _)| threshold.is_nan()) {
+            return Err(PaletteError::NotANumber);
+        }
+        // Total order is fine now that NaN is excluded; `partial_cmp` cannot
+        // fail on what is left.
+        bands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Exact equality is the question — two thresholds a hair apart are two
+        // bands, however useless — and with NaN excluded above `partial_cmp`
+        // always answers.
+        if let Some(pair) = bands
+            .windows(2)
+            .find(|pair| pair[0].0.partial_cmp(&pair[1].0) == Some(std::cmp::Ordering::Equal))
+        {
+            return Err(PaletteError::Duplicate {
+                threshold: pair[0].0,
+            });
+        }
+        Ok(Self { bands })
+    }
+
+    /// The material for one value, or `None` below the lowest band.
+    ///
+    /// A linear walk from the top, because the table is at most sixteen long
+    /// and a deep block — most blocks — is answered by the first comparison.
+    #[must_use]
+    pub fn pick(&self, value: f32) -> Option<MaterialId> {
+        self.bands
+            .iter()
+            .rev()
+            .find(|(threshold, _)| value > *threshold)
+            .map(|(_, material)| *material)
+    }
+
+    /// The material for one cell, decided the way a sequence of separate detail
+    /// fills would have decided it.
+    ///
+    /// For each band, from the top: the cell's own value is what counts if the
+    /// block is on that band's shell (`on_shell[k]`), and the block's centre
+    /// value otherwise — because the fill for that band would have refined
+    /// this block in the first case and written it whole in the second. The
+    /// highest band that passes wins. See `fill_palette_detail` for why this
+    /// and not simply [`Self::pick`] on the cell.
+    #[must_use]
+    pub fn pick_as_fills(&self, centre: f32, cell: f32, on_shell: &[bool]) -> Option<MaterialId> {
+        self.bands
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(k, (threshold, _))| {
+                let value = if on_shell.get(*k).copied().unwrap_or(false) {
+                    cell
+                } else {
+                    centre
+                };
+                value > *threshold
+            })
+            .map(|(_, (_, material))| *material)
+    }
+
+    /// The lowest threshold: below it a fill writes nothing.
+    fn floor(&self) -> f32 {
+        self.bands[0].0
+    }
+
+    /// The bands, ascending.
+    #[must_use]
+    pub fn bands(&self) -> &[(f32, MaterialId)] {
+        &self.bands
+    }
+}
+
 fn trilinear_cells(field: &[f32], pitch: usize, at: [usize; 3], out: &mut [f32]) {
     let [px, py, pz] = at;
     let corner = |dx: usize, dy: usize, dz: usize| {
@@ -467,6 +627,232 @@ impl ChunkBuffer {
             }
         }
         Ok(())
+    }
+
+    /// Fills from a density field through a [`Palette`], at block resolution.
+    ///
+    /// One evaluation of the field, however many materials the palette holds.
+    /// Otherwise exactly what the same bands written as separate
+    /// [`fill_density`](Self::fill_density) calls would have written, and
+    /// `a_palette_writes_what_the_fills_it_replaces_would_have` holds it to
+    /// that block for block.
+    ///
+    /// # Errors
+    ///
+    /// [`BufferError`] if the density program cannot be evaluated.
+    pub fn fill_palette(
+        &mut self,
+        density: &super::density::Density,
+        seed: u64,
+        palette: &Palette,
+    ) -> Result<(), BufferError> {
+        let side = CHUNK_BLOCKS as usize;
+        let region = super::noise::Region3d {
+            origin_x: (self.pos.x * CHUNK_BLOCKS as i32) as f32,
+            origin_y: (self.pos.y * CHUNK_BLOCKS as i32) as f32,
+            origin_z: (self.pos.z * CHUNK_BLOCKS as i32) as f32,
+            step: 1.0,
+            width: side,
+            height: side,
+            depth: side,
+        };
+        // The same skip as the plain fill, with the same guarantee behind it,
+        // generalised: a chunk whose whole range of possible values lands in
+        // ONE band — including the band below the lowest, which writes nothing
+        // — is decided without being evaluated.
+        let bounds = density.bounds(seed, &region);
+        match Self::decided_by(palette, bounds) {
+            Decided::Nothing => return Ok(()),
+            Decided::All(material) => {
+                self.fill_all(material);
+                return Ok(());
+            }
+            Decided::Mixed => {}
+        }
+
+        let mut field = vec![0.0f32; region.len()];
+        density.evaluate(seed, &region, &mut field)?;
+
+        let mut index = 0;
+        for z in 0..CHUNK_BLOCKS {
+            for y in 0..CHUNK_BLOCKS {
+                for x in 0..CHUNK_BLOCKS {
+                    if let Some(material) = palette.pick(field[index]) {
+                        self.set_block(LocalBlock::new(x, y, z), material);
+                    }
+                    index += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fills from a density field through a [`Palette`], at sub-node resolution
+    /// near every band boundary.
+    ///
+    /// # Every band gets a shell, not only the surface
+    ///
+    /// [`fill_density_detail`](Self::fill_density_detail) refines the blocks
+    /// where its field changes sign. A palette has several boundaries — the
+    /// surface, and the grass-to-dirt and dirt-to-stone under it — and this
+    /// refines a block wherever it is on ANY of them. Inside a refined block
+    /// each band is then decided the way its own fill would have decided it:
+    /// by the cell's value where the block is on that band's shell, by the
+    /// block's centre where it is not ([`Palette::pick_as_fills`]). That is
+    /// what makes the output identical, cell for cell, to the separate detail
+    /// fills it replaces — and it is not the obvious way to write it; see the
+    /// comment at the write.
+    ///
+    /// It costs more shell blocks than a single fill, and less than the
+    /// separate fills did. With [`Detail::Smooth`] a shell block is a trilinear
+    /// interpolation of values already in hand, nearly free; with
+    /// [`Detail::Sampled`] it is one 27-cell evaluation of the field, where the
+    /// separate fills paid one PER FILL in every block that was on any of their
+    /// shells.
+    ///
+    /// # Errors
+    ///
+    /// [`BufferError`] if the density program cannot be evaluated.
+    pub fn fill_palette_detail(
+        &mut self,
+        density: &super::density::Density,
+        seed: u64,
+        palette: &Palette,
+        detail: Detail,
+    ) -> Result<(), BufferError> {
+        const PAD: usize = 1;
+        let side = CHUNK_BLOCKS as usize;
+        let padded = side + PAD * 2;
+        let origin = [
+            self.pos.x * CHUNK_BLOCKS as i32,
+            self.pos.y * CHUNK_BLOCKS as i32,
+            self.pos.z * CHUNK_BLOCKS as i32,
+        ];
+        let region = super::noise::Region3d {
+            origin_x: (origin[0] - PAD as i32) as f32,
+            origin_y: (origin[1] - PAD as i32) as f32,
+            origin_z: (origin[2] - PAD as i32) as f32,
+            step: 1.0,
+            width: padded,
+            height: padded,
+            depth: padded,
+        };
+        let bounds = density.bounds(seed, &region);
+        match Self::decided_by(palette, bounds) {
+            Decided::Nothing => return Ok(()),
+            Decided::All(material) => {
+                self.fill_all(material);
+                return Ok(());
+            }
+            Decided::Mixed => {}
+        }
+
+        let mut field = vec![0.0f32; region.len()];
+        let mut scratch = super::density::Scratch::default();
+        density.evaluate_with(seed, &region, &mut field, &mut scratch)?;
+
+        let at = |x: usize, y: usize, z: usize| field[x + padded * (y + padded * z)];
+
+        let mut cells = [MaterialId::AIR; SUBNODES_PER_BLOCK];
+        let mut fine = vec![0.0f32; SUBNODES_PER_BLOCK];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let (px, py, pz) = (x + PAD, y + PAD, z + PAD);
+                    let centre = at(px, py, pz);
+                    let neighbours = [
+                        at(px - 1, py, pz),
+                        at(px + 1, py, pz),
+                        at(px, py - 1, pz),
+                        at(px, py + 1, pz),
+                        at(px, py, pz - 1),
+                        at(px, py, pz + 1),
+                    ];
+                    // **Which of the band boundaries this block is on**, one
+                    // answer per band, because the separate fills this
+                    // replaces each asked only about their own. A block is on
+                    // band k's shell if a neighbour is on the other side of
+                    // band k's threshold from the centre; it is refined at all
+                    // if it is on any.
+                    let mut on_shell = [false; MAX_PALETTE_BANDS];
+                    for (k, (threshold, _)) in palette.bands().iter().enumerate() {
+                        let here = centre > *threshold;
+                        on_shell[k] = neighbours.iter().any(|value| (*value > *threshold) != here);
+                    }
+                    let refined = on_shell[..palette.bands().len()].iter().any(|on| *on);
+
+                    let local = LocalBlock::new(x as u32, y as u32, z as u32);
+                    if !refined {
+                        if let Some(material) = palette.pick(centre) {
+                            self.set_block(local, material);
+                        }
+                        continue;
+                    }
+
+                    match detail {
+                        Detail::Sampled => {
+                            let cell_region = super::noise::Region3d {
+                                origin_x: (origin[0] + x as i32) as f32,
+                                origin_y: (origin[1] + y as i32) as f32,
+                                origin_z: (origin[2] + z as i32) as f32,
+                                step: 1.0 / SUBNODES_PER_AXIS as f32,
+                                width: SUBNODES_PER_AXIS as usize,
+                                height: SUBNODES_PER_AXIS as usize,
+                                depth: SUBNODES_PER_AXIS as usize,
+                            };
+                            density.evaluate_with(seed, &cell_region, &mut fine, &mut scratch)?;
+                        }
+                        Detail::Smooth => trilinear_cells(&field, padded, [px, py, pz], &mut fine),
+                    }
+
+                    // A fill ADDS, cell by cell, for the reason the plain
+                    // detail fill gives at the same spot.
+                    for cz in 0..SUBNODES_PER_AXIS {
+                        for cy in 0..SUBNODES_PER_AXIS {
+                            for cx in 0..SUBNODES_PER_AXIS {
+                                cells[subnode_index(cx, cy, cz)] =
+                                    self.get_subnode(local, cx, cy, cz);
+                            }
+                        }
+                    }
+                    // **Per band, the cell's value where this block is on that
+                    // band's shell and the block's centre where it is not.**
+                    // That is exactly what the sequence of fills did: each
+                    // fill refined the blocks on ITS shell and wrote the rest
+                    // as blocks, so a block on the dirt-to-stone shell but not
+                    // the surface's was given the surface material whole and
+                    // then had stone carved into it. Asking the cell about
+                    // every band instead — the obvious way to write this, and
+                    // the first way it was written — refined the surface in
+                    // exactly the blocks where a deeper boundary happened to
+                    // pass, and left it block-shaped in their neighbours. A
+                    // surface whose smoothness depends on where the dirt runs
+                    // out is not a smooth surface.
+                    for (index, value) in fine.iter().enumerate() {
+                        if let Some(material) = palette.pick_as_fills(centre, *value, &on_shell) {
+                            cells[index] = material;
+                        }
+                    }
+                    self.set_block_cells(local, &cells);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// What a chunk's bound decides on its own, if anything.
+    ///
+    /// The plain fill's `is_all_empty` / `is_all_solid` pair, for a table: a
+    /// bound whose two ends land in the same band means every value between
+    /// them does too, because bands are contiguous in value.
+    fn decided_by(palette: &Palette, bounds: super::density::Interval) -> Decided {
+        if bounds.high <= palette.floor() {
+            return Decided::Nothing;
+        }
+        match (palette.pick(bounds.low), palette.pick(bounds.high)) {
+            (Some(low), Some(high)) if low == high => Decided::All(low),
+            _ => Decided::Mixed,
+        }
     }
 
     /// Stands a run of cells of `material` on every surface the buffer holds.
@@ -978,6 +1364,313 @@ mod tests {
             Op::Subtract,
         ])
         .expect("compile")
+    }
+
+    /// Asserts two buffers hold the same cells, and says WHICH when they do not.
+    ///
+    /// `assert_eq!` on two buffers prints both — 110,592 cells each — and a
+    /// failure nobody can read is a failure nobody investigates. This reports a
+    /// count and the first few differing cells with what each side put there.
+    fn assert_same_cells(a: &ChunkBuffer, b: &ChunkBuffer, context: &str) {
+        if a == b {
+            return;
+        }
+        let (ca, cb) = (a.to_chunk(), b.to_chunk());
+        let origin = crate::BlockPos::from_chunk_corner(a.pos());
+        let mut differing = 0;
+        let mut examples = Vec::new();
+        for x in 0..CHUNK_BLOCKS as i32 {
+            for y in 0..CHUNK_BLOCKS as i32 {
+                for z in 0..CHUNK_BLOCKS as i32 {
+                    let pos = crate::BlockPos::new(origin.x + x, origin.y + y, origin.z + z);
+                    let (va, vb) = (ca.get_block(pos), cb.get_block(pos));
+                    for cell in 0..SUBNODES_PER_BLOCK {
+                        let (ma, mb) = (
+                            va.as_ref().map(|v| v.subnode(cell)),
+                            vb.as_ref().map(|v| v.subnode(cell)),
+                        );
+                        if ma != mb {
+                            differing += 1;
+                            if examples.len() < 6 {
+                                examples.push(((x, y, z), cell, ma, mb));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("{context}: {differing} cells differ (block, cell, left, right), e.g. {examples:?}");
+    }
+
+    /// `noise - y`, the shape whose value is depth below the surface.
+    fn strata_field() -> super::super::density::Density {
+        use super::super::density::{Axis, Op};
+        use super::super::noise::{Fractal, FractalParams};
+        super::super::density::Density::compile(vec![
+            Op::Noise {
+                params: FractalParams {
+                    fractal: Fractal::Fbm,
+                    octaves: 3,
+                    frequency: 0.02,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                },
+                amplitude: 10.0,
+                stream: 5,
+            },
+            Op::Coordinate(Axis::Y),
+            Op::Subtract,
+        ])
+        .expect("compile")
+    }
+
+    /// Six octaves and 24 blocks of relief, lowered by `depth`: the shape of a
+    /// real terrain mod's field, and steep enough that the surface crosses
+    /// several blocks per block. `depth` of zero is the surface itself.
+    fn steep_field(depth: f32) -> super::super::density::Density {
+        use super::super::density::{Axis, Op};
+        use super::super::noise::{Fractal, FractalParams};
+        let mut ops = vec![
+            Op::Noise {
+                params: FractalParams {
+                    fractal: Fractal::Fbm,
+                    octaves: 6,
+                    frequency: 0.01,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                },
+                amplitude: 24.0,
+                stream: 1,
+            },
+            Op::Coordinate(Axis::Y),
+            Op::Subtract,
+        ];
+        if depth != 0.0 {
+            ops.push(Op::Constant(depth));
+            ops.push(Op::Subtract);
+        }
+        super::super::density::Density::compile(ops).expect("compile")
+    }
+
+    /// The same field, lowered by `depth`: what a generator wrote to put a
+    /// second material `depth` blocks under the first.
+    #[allow(dead_code)]
+    fn strata_field_below(depth: f32) -> super::super::density::Density {
+        use super::super::density::{Axis, Op};
+        use super::super::noise::{Fractal, FractalParams};
+        super::super::density::Density::compile(vec![
+            Op::Noise {
+                params: FractalParams {
+                    fractal: Fractal::Fbm,
+                    octaves: 3,
+                    frequency: 0.02,
+                    lacunarity: 2.0,
+                    gain: 0.5,
+                },
+                amplitude: 10.0,
+                stream: 5,
+            },
+            Op::Coordinate(Axis::Y),
+            Op::Subtract,
+            Op::Constant(depth),
+            Op::Subtract,
+        ])
+        .expect("compile")
+    }
+
+    #[test]
+    fn a_palette_writes_what_the_fills_it_replaces_would_have() {
+        // **The claim is "the same terrain, one evaluation", and this is the
+        // first half of it.** A generator layering grass on dirt on stone
+        // wrote three fills of three shifted fields; the palette is meant to be
+        // a pure replacement, so it is held to the same output block for block
+        // and cell for cell — at block resolution and at both kinds of detail.
+        //
+        // Over a column of chunks so all three bound outcomes occur, and with a
+        // count of chunks holding BOTH materials, because a palette that only
+        // ever wrote one band would agree with the fills on every chunk that
+        // only ever needed one.
+        // **On a steep field.** The first version of this test used gentle
+        // terrain and passed for all three resolutions with a palette that was
+        // wrong: it asked every cell about every band, which agrees with the
+        // fills wherever no band boundary runs through a block the surface
+        // test called interior. With 24 blocks of relief at six octaves, the
+        // field drops several blocks per block and that happens constantly —
+        // 272 cells in twelve chunks. A test of "the same as the fills" has to
+        // run where the fills do something awkward.
+        const GRASS: MaterialId = MaterialId(9);
+        let field = steep_field(0.0);
+        let deeper = steep_field(3.0);
+        let palette = Palette::new(vec![(0.0, GRASS), (3.0, STONE)]).expect("palette");
+
+        let mut both = 0;
+        for detail in [None, Some(Detail::Smooth), Some(Detail::Sampled)] {
+            for cx in -6..6 {
+                let pos = ChunkPos::new(cx, 0, 0);
+
+                let mut by_fills = ChunkBuffer::new(pos, MaterialId::AIR);
+                let mut by_palette = ChunkBuffer::new(pos, MaterialId::AIR);
+                match detail {
+                    None => {
+                        by_fills.fill_density(&field, 3, GRASS).expect("fill");
+                        by_fills.fill_density(&deeper, 3, STONE).expect("fill");
+                        by_palette
+                            .fill_palette(&field, 3, &palette)
+                            .expect("palette");
+                    }
+                    Some(detail) => {
+                        by_fills
+                            .fill_density_detail(&field, 3, GRASS, detail)
+                            .expect("fill");
+                        by_fills
+                            .fill_density_detail(&deeper, 3, STONE, detail)
+                            .expect("fill");
+                        by_palette
+                            .fill_palette_detail(&field, 3, &palette, detail)
+                            .expect("palette");
+                    }
+                }
+
+                assert_same_cells(
+                    &by_fills,
+                    &by_palette,
+                    &format!(
+                        "the palette and the two fills it replaces disagree at {pos:?} with \
+                         detail {detail:?}"
+                    ),
+                );
+
+                let chunk = by_palette.to_chunk();
+                let holds = |material: MaterialId| {
+                    (0..16).any(|x| {
+                        (0..16).any(|y| {
+                            (0..16).any(|z| {
+                                chunk
+                                    .get_block(crate::BlockPos::new(
+                                        pos.x * 16 + x,
+                                        pos.y * 16 + y,
+                                        pos.z * 16 + z,
+                                    ))
+                                    .is_some_and(|block| {
+                                        (0..SUBNODES_PER_BLOCK)
+                                            .any(|cell| block.subnode(cell) == material)
+                                    })
+                            })
+                        })
+                    })
+                };
+                if holds(GRASS) && holds(STONE) {
+                    both += 1;
+                }
+            }
+        }
+        assert!(
+            both >= 3,
+            "only {both} chunks held both bands, so the two-band case was barely tested"
+        );
+    }
+
+    #[test]
+    fn a_palette_decided_by_its_bounds_writes_what_evaluating_it_would_have() {
+        // The pruning, generalised: a chunk whose whole range of values lands
+        // in one band is filled with that band without being evaluated, and a
+        // chunk under the lowest band is skipped. Sound only if the answer is
+        // the same as doing the work, so: against a reference that evaluates
+        // every block and knows nothing of bounds — and an assertion that all
+        // three outcomes occurred, or the run tested nothing.
+        const GRASS: MaterialId = MaterialId(9);
+        let field = strata_field();
+        let palette = Palette::new(vec![(0.0, GRASS), (3.0, DIRT), (8.0, STONE)]).expect("palette");
+
+        let (mut nothing, mut whole, mut mixed) = (0, 0, 0);
+        for cy in -6..6 {
+            for cx in -1..2 {
+                let pos = ChunkPos::new(cx, cy, 1);
+                let mut buffer = ChunkBuffer::new(pos, MaterialId::AIR);
+                buffer.fill_palette(&field, 3, &palette).expect("palette");
+
+                let side = CHUNK_BLOCKS as usize;
+                let region = super::super::noise::Region3d {
+                    origin_x: (pos.x * CHUNK_BLOCKS as i32) as f32,
+                    origin_y: (pos.y * CHUNK_BLOCKS as i32) as f32,
+                    origin_z: (pos.z * CHUNK_BLOCKS as i32) as f32,
+                    step: 1.0,
+                    width: side,
+                    height: side,
+                    depth: side,
+                };
+                let mut values = vec![0.0f32; region.len()];
+                field.evaluate(3, &region, &mut values).expect("evaluate");
+                let mut reference = ChunkBuffer::new(pos, MaterialId::AIR);
+                let mut index = 0;
+                let mut seen = std::collections::BTreeSet::new();
+                for z in 0..CHUNK_BLOCKS {
+                    for y in 0..CHUNK_BLOCKS {
+                        for x in 0..CHUNK_BLOCKS {
+                            let picked = palette.pick(values[index]);
+                            seen.insert(picked.map(|m| m.0));
+                            if let Some(material) = picked {
+                                reference.set_block(LocalBlock::new(x, y, z), material);
+                            }
+                            index += 1;
+                        }
+                    }
+                }
+                assert_same_cells(
+                    &reference,
+                    &buffer,
+                    &format!("the palette fill at {pos:?} differs from evaluating every block"),
+                );
+                match seen.len() {
+                    1 if seen.contains(&None) => nothing += 1,
+                    1 => whole += 1,
+                    _ => mixed += 1,
+                }
+            }
+        }
+        assert!(
+            nothing > 0 && whole > 0 && mixed > 0,
+            "the column should hold chunks under every band ({nothing}), inside one band \
+             ({whole}) and across a boundary ({mixed})"
+        );
+    }
+
+    #[test]
+    fn a_palette_refuses_what_it_could_not_use_and_sorts_what_it_can() {
+        assert_eq!(Palette::new(vec![]), Err(PaletteError::Empty));
+        let many: Vec<_> = (0..=MAX_PALETTE_BANDS).map(|i| (i as f32, STONE)).collect();
+        assert_eq!(
+            Palette::new(many),
+            Err(PaletteError::TooMany {
+                found: MAX_PALETTE_BANDS + 1
+            })
+        );
+        assert_eq!(
+            Palette::new(vec![(0.0, STONE), (f32::NAN, DIRT)]),
+            Err(PaletteError::NotANumber)
+        );
+        assert_eq!(
+            Palette::new(vec![(2.0, STONE), (2.0, DIRT)]),
+            Err(PaletteError::Duplicate { threshold: 2.0 })
+        );
+
+        // Given out of order, the table still answers by value.
+        let palette =
+            Palette::new(vec![(4.0, STONE), (0.0, MaterialId(9)), (1.0, DIRT)]).expect("palette");
+        assert_eq!(
+            palette.pick(-1.0),
+            None,
+            "below the lowest band writes nothing"
+        );
+        assert_eq!(
+            palette.pick(0.0),
+            None,
+            "the threshold itself is not above it"
+        );
+        assert_eq!(palette.pick(0.5), Some(MaterialId(9)));
+        assert_eq!(palette.pick(1.0), Some(MaterialId(9)));
+        assert_eq!(palette.pick(2.5), Some(DIRT));
+        assert_eq!(palette.pick(100.0), Some(STONE));
     }
 
     #[test]

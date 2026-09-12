@@ -1020,6 +1020,95 @@ end)
 }
 
 #[test]
+fn a_palette_lays_strata_by_depth_in_one_fill() {
+    // The generator's own view of it: one field, one call, three materials by
+    // how deep they are. `0 - y` is a flat surface at y = 0 whose value at any
+    // point is exactly the depth below it, so the column is known in advance.
+    let root = scratch("palette");
+    write_mod(
+        &root,
+        "strata",
+        "",
+        r#"
+local grass = game.register_block{ id = "grass" }
+local dirt = game.register_block{ id = "dirt" }
+local stone = game.register_block{ id = "stone" }
+
+local DEPTH = { op = "sub", a = { op = "const", value = 0.0 }, b = { op = "y" } }
+
+game.register_on_generate(function(buf, pos)
+    buf:fill_palette(game.density(DEPTH), {
+        { above = 0.0, material = grass },
+        { above = 1.0, material = dirt },
+        { above = 4.0, material = stone },
+    })
+end)
+"#,
+    );
+
+    let mut host = host_for(&root);
+    assert!(
+        host.failed().is_empty(),
+        "the mod should load: {:?}",
+        host.failed()
+    );
+    host.freeze().expect("freeze");
+
+    let below = host
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            1,
+            ChunkPos::new(0, -1, 0),
+            MaterialId::AIR,
+        )
+        .expect("generate");
+    let name_at = |y: i32| -> Option<MaterialId> {
+        below
+            .get_block(tiamot_core::BlockPos::new(3, y, 3))
+            .map(|block| block.subnode(0))
+    };
+    let grass = name_at(-1).expect("in chunk");
+    let dirt = name_at(-2).expect("in chunk");
+    let stone = name_at(-9).expect("in chunk");
+    assert!(
+        grass != dirt && dirt != stone && grass != stone,
+        "three depths should be three materials: {grass:?}, {dirt:?}, {stone:?}"
+    );
+    assert_ne!(
+        grass,
+        MaterialId::AIR,
+        "the top block under the surface is empty"
+    );
+    // The bands are contiguous: everything from -2 to -4 is the middle one and
+    // everything below is the last.
+    for y in -4..=-2 {
+        assert_eq!(name_at(y), Some(dirt), "y = {y} should be the middle band");
+    }
+    for y in -16..=-5 {
+        assert_eq!(
+            name_at(y),
+            Some(stone),
+            "y = {y} should be the deepest band"
+        );
+    }
+
+    // And nothing above the surface.
+    let above = host
+        .generate_chunk(
+            tiamot_core::domain::OVERWORLD,
+            1,
+            ChunkPos::new(0, 0, 0),
+            MaterialId::AIR,
+        )
+        .expect("generate");
+    assert_eq!(
+        above.is_uniform(),
+        Some(MaterialId::AIR),
+        "a palette must write nothing where the field is under its lowest band"
+    );
+}
+
+#[test]
 fn a_mod_gives_each_place_its_own_colour_and_is_asked_again_every_time() {
     // **Asked for, never stored.** The colour is computed when a chunk is
     // served rather than written into it, so a mod that changes its palette

@@ -341,6 +341,35 @@ buf:fill_density(field, stone, { detail = "smooth" })   -- no block staircases
 buf:fill_density(field, stone, { detail = "sampled" })  -- and fine detail
 ```
 
+**Strata: one fill, a table of materials.** A field of the form `noise - y` has,
+at every point, the value *surface height minus y* — the DEPTH below the surface.
+So grass on top, dirt for three blocks and stone below is three bands of that
+one field, and `fill_palette` writes them from one evaluation:
+
+```lua
+buf:fill_palette(field, {
+    { above = 0.0, material = grass },   -- the top block
+    { above = 1.0, material = dirt },    -- the next three
+    { above = 4.0, material = stone },   -- everything deeper
+}, { detail = "smooth" })
+```
+
+A value takes the material of the highest band it is above, and a value under
+the lowest band leaves the block alone — so `fill_density(field, m)` is the
+one-band palette `{ above = 0, material = m }`, and a palette is a pure
+replacement for the stack of fills you would otherwise write. **It is also a
+pure saving**: each of those fills evaluated the whole field again, so ten
+materials cost ten evaluations of the same noise, and the write that follows an
+evaluation is a rounding error beside it. Measured on a six-octave field with
+ten bands: **11.0 ms as ten fills, 1.5 ms as one palette** at smooth detail
+(7.5x), 6.9 ms to 0.6 ms at block resolution (11x), and 19.5 ms to 8.9 ms
+sampled (2.2x — there the 27-cell evaluation of each surface block is the cost,
+and the palette still pays it once per block on any boundary). The output is
+identical, cell for cell, at every resolution: the engine holds itself to that
+in a test, on terrain steep enough to make it hard.
+
+At most 16 bands. Thresholds must be distinct numbers; the engine sorts them.
+
 Do NOT reach for `set_subnode` to do this. It writes one cell, and a chunk is
 110,592 of them — the whole point of the option above is that the 27x sample
 cost happens inside the engine, on the blocks the surface actually crosses.

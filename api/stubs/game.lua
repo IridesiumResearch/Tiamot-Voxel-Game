@@ -115,6 +115,44 @@ function ChunkBuffer:fill_below_heightmap(heightmap, material) end
 ---@param options table? `{ detail = "smooth" | "sampled" }`
 function ChunkBuffer:fill_density(density, material, options) end
 
+---Fills from a density field through a table of materials, in ONE evaluation.
+---
+---A field of the form `noise - y` has, at every point, the value *surface height
+---minus y* — the depth below the surface. So strata are bands of that one field:
+---
+---```lua
+---buf:fill_palette(field, {
+---    { above = 0.0, material = grass },   -- the top block
+---    { above = 1.0, material = dirt },    -- the next three
+---    { above = 4.0, material = stone },   -- everything deeper
+---}, { detail = "smooth" })
+---```
+---
+---A value takes the material of the highest band it is strictly above; a value
+---under the lowest band leaves the block alone, so a fill still ADDS. This is
+---`fill_density` generalised from one threshold to several — `fill_density(f, m)`
+---is exactly `fill_palette(f, {{ above = 0, material = m }})` — and it writes the
+---same blocks and cells the separate fills would have, at every resolution.
+---
+---**The point is the evaluation count.** Each `fill_density` evaluates the whole
+---field over the chunk; a generator layering ten materials as ten fills pays
+---for the same six-octave noise ten times, and the write after each evaluation
+---costs nothing beside it. One palette is one evaluation: measured at ten bands
+---on a six-octave field, 11.0 ms became 1.5 ms at smooth detail (7.5x), 6.9 ms
+---became 0.6 ms at block resolution (11x), and 19.5 ms became 8.9 ms sampled
+---(2.2x — the 27-cell evaluation of each boundary block is the cost there). The
+---terrain is identical.
+---
+---With `detail`, every band boundary gets the sub-node treatment, not only the
+---surface — so the grass follows the smooth surface at cell resolution rather
+---than as a block-thick stair under it.
+---
+---At most 16 bands. Thresholds must be distinct numbers; the engine sorts them.
+---@param density Tiamot.Density
+---@param bands { above: number, material: integer }[]
+---@param options table? `{ detail = "smooth" | "sampled" }`
+function ChunkBuffer:fill_palette(density, bands, options) end
+
 ---Stands a run of cells on every surface the buffer already holds: ground
 ---cover — grass, ferns, anything that grows UP from the ground.
 ---
