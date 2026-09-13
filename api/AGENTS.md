@@ -639,6 +639,15 @@ keeps the slice that lands in it and `set_world` drops the rest — **dropping i
 the mechanism, not waste.** The same chunk comes out whatever was generated
 before it.
 
+**For anything you place by the dozen, use `buf:scatter`.** It is that pass in
+one native call: build each structure once at load as a `game.schematic` (a
+list of `{dx, dy, dz, material, mask}`), and the engine draws the candidates
+per square of ground, finds each one's surface down its column, checks your
+`stand` field there, and stamps the schematic clipped to the chunk. A tree
+written block by block is two thousand crossings into the VM per chunk it
+overlaps; a forest is a dozen trees a chunk, and a chunk is generated in a
+tick's budget.
+
 `density:at(x, y, z, seed)` is the point sample that lets a structure sit on
 ground it cannot see: a generator's buffer is write-only, and a structure rooted
 in a neighbouring chunk has no buffer to read anyway. It is for choosing WHERE,

@@ -462,6 +462,15 @@ edges right.
 height under a root, because a buffer is write-only and a neighbouring chunk's
 buffer is not the generator's to read.
 
+**And natively, for the common case, by `ChunkBuffer::scatter`** (`buf:scatter`,
+with `game.schematic`): the same pass — candidates per square of ground from a
+hash of the square and the seed, the surface found down each candidate's
+column, the structure written by cell and clipped to the chunk — in one call.
+The per-block calls cost a tree two thousand crossings into the VM per chunk it
+overlaps, which is the per-cell loop rule 4 forbids; a forest is a dozen trees a
+chunk. The rule is the same: nothing is held between chunks, and every chunk
+derives the same structures for the same squares.
+
 ---
 
 ## 6. Pathfinding — block resolution
@@ -748,6 +757,22 @@ the frame's clear colour, with nothing drawn over it.
 A cutout cell is therefore in NO occupancy set for culling purposes. Stone
 behind leaves keeps its face for §8.1's reason, and the leaves keep all of
 theirs.
+
+**Except the inside of a canopy.** A cutout cell with cutout cells on all six
+sides is never seen except through the holes of the cells in front of it, and
+what has to be there for a mass of foliage to read as a mass is something
+solid — not leaves again, with holes of their own that look through to the
+next layer and in the end to the sky. So the mesher moves an interior cutout
+cell to the opaque set: its faces against exterior leaves are drawn solid with
+the leaf texture (a leaf texture's colour under its holes is the leaf colour,
+which this relies on), its faces against other interior cells are culled like
+stone, and the alpha-tested quads a canopy costs are its skin. The rule above
+is unchanged for the skin, which is all that was ever visible.
+
+**Far foliage is drawn solid, not dropped.** Beyond the client's cutout draw
+distance the same quads go through the terrain's pipeline, whose fragment
+ignores alpha: a far canopy is a dark mass rather than a smudge with the sky in
+it, and pays no discard.
 
 **Drawing.** Cutout quads are their own list, drawn with an **alpha-tested
 pipeline in the opaque phase**: the fragment is discarded below the alpha

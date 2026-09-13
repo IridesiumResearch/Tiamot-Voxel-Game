@@ -1865,21 +1865,30 @@ struct Culled {
     casters: Vec<(ChunkPos, u32)>,
     /// The visible chunks near enough for their sprites to be drawn.
     sprites: Vec<(ChunkPos, u32)>,
-    /// The visible chunks near enough for their cutout foliage to be drawn.
+    /// The visible chunks near enough for their cutout foliage to be drawn
+    /// alpha-tested, with its holes.
     cutout: Vec<(ChunkPos, u32)>,
+    /// The visible chunks beyond that, whose foliage is drawn solid.
+    cutout_far: Vec<(ChunkPos, u32)>,
     /// Where the player's own body sits in the instance array.
     body: u32,
 }
 
 /// How far, in blocks from the camera to a chunk's centre, sprites (grass,
-/// bushes) and cutout foliage (leaves, needles) are drawn at all.
+/// bushes) are drawn at all, and cutout foliage (leaves, needles) is drawn
+/// with its holes.
 ///
 /// **A draw distance for the small things**, asked for from the window with
 /// a mountainside of grass and firs in view. Beyond it a chunk's terrain is
-/// drawn and its plants are not: at seven chunks a tuft is a few pixels, at
-/// eleven a canopy is a smudge, and the instances and alpha-tested quads
-/// they cost are most of a frame's foliage. They pop in as the player nears,
-/// which is the trade; a fade would need a second pass per chunk.
+/// drawn and its sprites are not: at seven chunks a tuft is a few pixels, and
+/// the instances they cost are most of a frame's foliage. They pop in as the
+/// player nears, which is the trade; a fade would need a second pass per chunk.
+///
+/// Foliage beyond `CUTOUT_DRAW_BLOCKS` is not dropped but drawn SOLID: the
+/// same quads through the terrain's pipeline, whose fragment ignores alpha
+/// (the colour under a leaf texture's holes is the leaf colour), so a far
+/// canopy is a dark mass rather than a smudge with the sky in it, and pays no
+/// discard. At eleven chunks the holes were never visible.
 const SPRITE_DRAW_BLOCKS: f32 = 112.0;
 const CUTOUT_DRAW_BLOCKS: f32 = 176.0;
 
@@ -1939,6 +1948,8 @@ impl Renderer {
                 }
                 if distance2 < CUTOUT_DRAW_BLOCKS * CUTOUT_DRAW_BLOCKS {
                     culled.cutout.push((*pos, instance));
+                } else {
+                    culled.cutout_far.push((*pos, instance));
                 }
             }
             if casts {
@@ -2558,8 +2569,10 @@ impl Renderer {
             // Foliage, still with the opaque geometry: it writes depth and is
             // not composited, so it belongs before anything blended rather
             // than among it.
-            // The plants, only near: see `SPRITE_DRAW_BLOCKS`.
+            // With its holes only near, and solid beyond — the same quads
+            // through the terrain's pipeline: see `CUTOUT_DRAW_BLOCKS`.
             self.draw_cutout(&mut pass, pass_targets.cutout, &culled.cutout);
+            self.draw_cutout(&mut pass, pass_targets.world, &culled.cutout_far);
 
             self.draw_sprites(&mut pass, pass_targets.sprites, &culled.sprites);
 

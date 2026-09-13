@@ -35,7 +35,8 @@ pub mod rng;
 pub mod trig;
 
 pub use buffer::{
-    BufferError, ChunkBuffer, Detail, Layer, MAX_PALETTE_BANDS, Palette, PaletteError,
+    BufferError, ChunkBuffer, Detail, Layer, MAX_PALETTE_BANDS, Palette, PaletteError, Scatter,
+    Schematic, StampBlock,
 };
 pub use density::{Axis, Density, DensityError, MAX_DEPTH, MAX_OPS, Op, Scratch, default_params};
 pub use map::{Combine, Map, MapError};

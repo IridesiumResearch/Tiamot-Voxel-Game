@@ -300,6 +300,39 @@ function ChunkBuffer:set_subnode(bx, by, bz, sx, sy, sz, material) end
 ---@return boolean
 function ChunkBuffer:is_expanded() end
 
+---Stamps structures on the surface, across chunk edges, at generation.
+---
+---**The structure pass, done natively.** The mod guide's "Structures that
+---cross a chunk edge" says to run your pass for every chunk within reach and
+---keep your slice; this is that, in one call, for anything a `game.schematic`
+---can describe. The ground is divided into squares `cell` blocks a side; each
+---square draws, from a hash of the square and the seed, whether it gets a
+---structure (`chance`), where in the square, and which schematic — so a square
+---answers the same from every chunk that asks, and nothing is held between
+---chunks. For each candidate the engine finds the surface by evaluating `depth`
+---down the column (over the window of heights that could reach this chunk —
+---a few dozen samples, not a column of the world), samples `stand` once there,
+---and writes the schematic by cell, clipped to this chunk, as a merge write.
+---
+---```lua
+---buf:scatter{
+---    depth = terrain,                 -- positive in the ground
+---    stand = below_the_tree_line,     -- positive where a tree may stand; nil for anywhere
+---    schematics = FIRS,               -- from game.schematic; repeat one to weight it
+---    cell = 3, chance = 0.5,          -- one tree per two squares of nine columns
+---    salt = 11, sink = 1,             -- the root in the surface block itself
+---}
+---```
+---
+---`sink` is how many blocks the root sits below the block over the surface: 1
+---puts it in the surface block, where a trunk's base merges into the partial
+---block the smooth detail leaves; 0 stands it on top.
+---
+---Returns how many structures wrote at least one block into this chunk.
+---@param spec { depth: Tiamot.Density, stand: Tiamot.Density?, schematics: Tiamot.Schematic[], cell: integer?, chance: number?, salt: integer?, sink: integer? }
+---@return integer placed
+function ChunkBuffer:scatter(spec) end
+
 ---A named random stream. Reproducible for the same world seed, chunk and name;
 ---uncorrelated with streams under other names.
 ---@class Tiamot.Stream
@@ -2316,6 +2349,29 @@ function Density:at(x, y, z, seed) end
 ---@param spec table
 ---@return Tiamot.Density
 function game.density(spec) end
+
+---A structure built once, from a list of blocks, for `buf:scatter` to stamp.
+---
+---Each block is `{dx, dy, dz, material, mask}`: an offset from the root in
+---blocks, a numeric material id, and a 27-bit mask of the cells written
+---(indexed `x + 3*y + 9*z`, as `game.set_block`'s occupancy is). Cells not in
+---the mask keep what the terrain put there — a stamp is a merge write. Build
+---your trees at load with your own shape code, once each; a dozen of them make
+---a forest with variety, and the engine chooses among them per square.
+---
+---Opaque, like a density: a mod that could read it back would be one loop
+---away from writing it by hand, which is the cost this exists to remove.
+---@param blocks integer[][]
+---@return Tiamot.Schematic
+function game.schematic(blocks) end
+
+---A structure for `buf:scatter`. See `game.schematic`.
+---@class Tiamot.Schematic
+local Schematic = {}
+
+---How many blocks it holds.
+---@return integer
+function Schematic:len() end
 
 ---A persistent 2D field over a region of the world.
 ---

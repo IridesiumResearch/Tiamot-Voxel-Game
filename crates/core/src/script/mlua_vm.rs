@@ -33,7 +33,10 @@ use mlua::{Lua, Table, Value};
 use crate::CHUNK_BLOCKS;
 use crate::chunk::Chunk;
 use crate::coords::{ChunkPos, LocalBlock};
-use crate::detgen::{ChunkBuffer, Density, FractalParams, Region2d, StreamRng, fill_2d};
+use crate::detgen::{
+    ChunkBuffer, Density, FractalParams, Region2d, Scatter, Schematic, StampBlock, StreamRng,
+    fill_2d,
+};
 use crate::material::MaterialId;
 use crate::script::vm::{
     Backend, BlockRules, BlockTexture, Brush, FluidRules, HookOutcome, ScriptError, ScriptVm, Sky,
@@ -160,6 +163,21 @@ impl mlua::UserData for Heightmap {
 /// `detgen::density`'s module docs.
 struct DensityHandle {
     density: Density,
+}
+
+/// A structure built once from a Lua table of blocks, stamped by
+/// `buf:scatter`. Opaque for the same reason a density is: a mod that could
+/// read it back would be one loop away from writing it by hand.
+struct SchematicHandle {
+    schematic: Schematic,
+}
+
+impl mlua::UserData for SchematicHandle {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // How many blocks it holds, so a mod can see its table became what it
+        // meant. Nothing else.
+        methods.add_method("len", |_, this, ()| Ok(this.schematic.len()));
+    }
 }
 
 impl mlua::UserData for DensityHandle {
@@ -458,6 +476,72 @@ impl BufferHandle {
         );
     }
 
+    /// Registers `buf:scatter`.
+    ///
+    /// Its own function for the reason its siblings are: `add_methods` sits at
+    /// the line limit.
+    fn add_scatter_method<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // Structures on the surface at generation, across chunk edges — see
+        // `ChunkBuffer::scatter`. The one call that writes a forest, where the
+        // per-block calls were two thousand crossings a tree.
+        methods.add_method_mut("scatter", |_, this, spec: Table| {
+            let depth: mlua::AnyUserData = spec
+                .get("depth")
+                .map_err(|_| mlua::Error::external("scatter: `depth` is the terrain density"))?;
+            let depth = depth
+                .borrow::<DensityHandle>()
+                .map_err(|_| mlua::Error::external("scatter: `depth` is not a density"))?;
+            let stand: Option<mlua::AnyUserData> = spec.get("stand")?;
+            let stand = stand
+                .as_ref()
+                .map(|stand| {
+                    stand
+                        .borrow::<DensityHandle>()
+                        .map_err(|_| mlua::Error::external("scatter: `stand` is not a density"))
+                })
+                .transpose()?;
+            let handles: Vec<mlua::AnyUserData> = spec.get("schematics").map_err(|_| {
+                mlua::Error::external("scatter: `schematics` is a list from game.schematic")
+            })?;
+            let borrowed = handles
+                .iter()
+                .map(|handle| {
+                    handle.borrow::<SchematicHandle>().map_err(|_| {
+                        mlua::Error::external("scatter: every schematic comes from game.schematic")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let schematics: Vec<&Schematic> =
+                borrowed.iter().map(|handle| &handle.schematic).collect();
+            let cell: u32 = spec.get::<Option<u32>>("cell")?.unwrap_or(4);
+            if !(1..=64).contains(&cell) {
+                return Err(mlua::Error::external(format!(
+                    "scatter: `cell` is 1 to 64 blocks, not {cell}"
+                )));
+            }
+            let chance: f32 = spec.get::<Option<f32>>("chance")?.unwrap_or(1.0);
+            let salt: i64 = spec.get::<Option<i64>>("salt")?.unwrap_or(0);
+            let sink: i32 = spec.get::<Option<i32>>("sink")?.unwrap_or(1);
+            let seed = this.world_seed;
+            let placed = this
+                .buffer
+                .scatter(
+                    seed,
+                    &Scatter {
+                        depth: &depth.density,
+                        stand: stand.as_ref().map(|stand| &stand.density),
+                        schematics: &schematics,
+                        cell,
+                        chance: chance.clamp(0.0, 1.0),
+                        salt: salt as u64,
+                        sink,
+                    },
+                )
+                .map_err(|err| mlua::Error::external(err.to_string()))?;
+            Ok(placed)
+        });
+    }
+
     /// Registers `buf:fill_palette`.
     ///
     /// Its own function for the reason its siblings are: `add_methods` sits at
@@ -649,6 +733,7 @@ impl mlua::UserData for BufferHandle {
 
         Self::add_cover_method(methods);
         Self::add_palette_method(methods);
+        Self::add_scatter_method(methods);
 
         methods.add_method_mut(
             "set_block",
@@ -5448,6 +5533,53 @@ impl MluaVm {
         Ok(())
     }
 
+    /// Installs `game.schematic`.
+    ///
+    /// A structure as a list of blocks — `{dx, dy, dz, material, mask}` each —
+    /// compiled once into a handle `buf:scatter` stamps natively. See
+    /// `detgen::Schematic` for why the blocks are not written one by one.
+    fn install_schematic(&self, game: &Table) -> Result<(), ScriptError> {
+        let schematic = self
+            .lua
+            .create_function(|_, blocks: Table| {
+                let mut list = Vec::new();
+                for entry in blocks.sequence_values::<Table>() {
+                    let entry = entry?;
+                    let field = |index: i64, what: &str| -> mlua::Result<i64> {
+                        entry.get::<i64>(index).map_err(|_| {
+                            mlua::Error::external(format!(
+                                "schematic: every block is `{{dx, dy, dz, material, mask}}`; \
+                                 entry {index} ({what}) is missing or not an integer"
+                            ))
+                        })
+                    };
+                    let mask = field(5, "mask")?;
+                    if !(1..=i64::from(u32::MAX)).contains(&mask) {
+                        return Err(mlua::Error::external(
+                            "schematic: a block's mask is a 27-bit cell mask, at least one cell",
+                        ));
+                    }
+                    list.push(StampBlock {
+                        dx: field(1, "dx")? as i32,
+                        dy: field(2, "dy")? as i32,
+                        dz: field(3, "dz")? as i32,
+                        material: MaterialId(field(4, "material")? as u16),
+                        mask: mask as u32,
+                    });
+                }
+                if list.is_empty() {
+                    return Err(mlua::Error::external("schematic: no blocks"));
+                }
+                Ok(SchematicHandle {
+                    schematic: Schematic::new(list),
+                })
+            })
+            .map_err(|err| self.vm_error(&err))?;
+        game.set("schematic", schematic)
+            .map_err(|err| self.vm_error(&err))?;
+        Ok(())
+    }
+
     fn install_frozen_api(&self, mod_id: &str, game: &Table) -> Result<(), ScriptError> {
         // -- frozen-phase API ---------------------------------------------
         self.install_material_lookups(game)?;
@@ -5525,6 +5657,7 @@ impl MluaVm {
             .map_err(|err| self.vm_error(&err))?;
 
         self.install_density(game)?;
+        self.install_schematic(game)?;
         self.install_map(mod_id, game)?;
 
         // A flat heightmap, for generators that want a constant surface.

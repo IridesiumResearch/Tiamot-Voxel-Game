@@ -1961,18 +1961,50 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
             // The one thing it is culled against is its own block: a leaf block
             // is 27 cells and the faces between them would each show a third of
             // a leaf texture, because the shader repeats once per block.
+            //
+            // **Except the inside of a canopy, which is opaque.** A leaf cell
+            // with leaves on all six sides is never seen except through the
+            // holes of the leaves in front of it, and what it has to be for
+            // the canopy to read as a mass is THERE — not leaves again, with
+            // holes of their own that look through to the next layer and
+            // finally the sky. So an interior cell moves to the opaque set:
+            // its faces against exterior leaves are drawn solid with the same
+            // texture (whose colour under its holes is the leaf colour), its
+            // faces against other interior cells are culled like stone, and
+            // the alpha-tested quads a canopy costs are its skin, not its
+            // volume. Asked for from the window: a mountainside of firs
+            // should stay snappy.
+            //
+            // Interior along the column is a shift each way; across it, the
+            // four neighbouring columns of the same axis set. A cell on the
+            // chunk's u or v edge has no neighbour column here and stays
+            // exterior, which draws a few more quads and nothing wrong.
             let leaves = cutout.map_or(0, |cutout| cutout[u * N + v]);
+            let interior = match cutout {
+                Some(columns) if leaves != 0 => {
+                    let across = |uu: usize, vv: usize| columns[uu * N + vv];
+                    let before_u = if u > 0 { across(u - 1, v) } else { 0 };
+                    let after_u = if u + 1 < N { across(u + 1, v) } else { 0 };
+                    let before_v = if v > 0 { across(u, v - 1) } else { 0 };
+                    let after_v = if v + 1 < N { across(u, v + 1) } else { 0 };
+                    leaves & (leaves >> 1) & (leaves << 1) & before_u & after_u & before_v & after_v
+                }
+                _ => 0,
+            };
+            let leaves = leaves & !interior;
             // **A billboard cell is not geometry.** Contract §8.4: it is drawn
             // as a sprite, so it emits no face of its own and hides none —
             // taken out of every set here, and the ground under it keeps the
             // face it would otherwise have lost.
             let sprites = billboards.map_or(0, |sprites| sprites[u * N + v]);
             let opaque = solid & !panes & !leaves & !sprites;
+            // An exterior leaf's face INTO the opaque interior is culled too:
+            // it faces solid foliage and nothing can see it.
             let (faces, glass_faces, leaf_faces) = if positive {
                 (
                     opaque & !(opaque >> 1),
                     panes & !(panes >> 1),
-                    leaves & !((leaves >> 1) & SAME_BLOCK),
+                    leaves & !((leaves >> 1) & SAME_BLOCK) & !(interior >> 1),
                 )
             } else {
                 (
@@ -1980,7 +2012,7 @@ fn cull_face(grid: &SubNodeGrid, (axis, positive): (usize, bool), scratch: &mut 
                     panes & !(panes << 1),
                     // The same relation read the other way round, which is what
                     // the shift of the constant is.
-                    leaves & !((leaves << 1) & (SAME_BLOCK << 1)),
+                    leaves & !((leaves << 1) & (SAME_BLOCK << 1)) & !(interior << 1),
                 )
             };
             // **The fluid's own faces go to their own plane**, rather than

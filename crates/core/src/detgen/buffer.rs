@@ -298,6 +298,109 @@ fn trilinear_cells(field: &[f32], pitch: usize, at: [usize; 3], out: &mut [f32])
     }
 }
 
+/// One block of a [`Schematic`]: where it sits from the root, what it is, and
+/// which of the block's 27 cells it fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StampBlock {
+    /// Offset from the root along x, in blocks.
+    pub dx: i32,
+    /// Offset from the root along y, in blocks.
+    pub dy: i32,
+    /// Offset from the root along z, in blocks.
+    pub dz: i32,
+    /// The material written into the cells in `mask`.
+    pub material: MaterialId,
+    /// The cells written, one bit each, indexed `x + 3*y + 9*z`. Every other
+    /// cell of the block keeps what it held: a stamp is a merge write
+    /// (Sub-Node Contract §7.4), so a trunk's base sits IN the surface block
+    /// rather than replacing it with a block of trunk and air.
+    pub mask: u32,
+}
+
+/// A structure built once and stamped many times: a tree, a boulder, a snag.
+///
+/// **Built once, in Lua, from a list of blocks; stamped natively.** A tree is
+/// a hundred and fifty blocks of masks, and a forest is a dozen trees a chunk.
+/// Writing those through `set_subnode_world` is two thousand crossings into the
+/// VM per tree per chunk it overlaps, which is the per-cell loop charter rule
+/// 4 forbids and the cost the opaque handles exist to prevent. So the mod
+/// describes each tree once — a table of `{dx, dy, dz, material, mask}` — and
+/// [`ChunkBuffer::scatter`] decides where the trees go and writes them.
+#[derive(Debug, Clone, Default)]
+pub struct Schematic {
+    blocks: Vec<StampBlock>,
+    reach_x: i32,
+    reach_z: i32,
+    lowest: i32,
+    highest: i32,
+}
+
+impl Schematic {
+    /// A schematic from its blocks, in any order.
+    #[must_use]
+    pub fn new(blocks: Vec<StampBlock>) -> Self {
+        let mut schematic = Self {
+            blocks,
+            ..Self::default()
+        };
+        for block in &schematic.blocks {
+            schematic.reach_x = schematic.reach_x.max(block.dx.abs());
+            schematic.reach_z = schematic.reach_z.max(block.dz.abs());
+            schematic.lowest = schematic.lowest.min(block.dy);
+            schematic.highest = schematic.highest.max(block.dy);
+        }
+        schematic
+    }
+
+    /// The blocks, as given.
+    #[must_use]
+    pub fn blocks(&self) -> &[StampBlock] {
+        &self.blocks
+    }
+
+    /// How many blocks it writes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Whether it writes nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+/// What [`ChunkBuffer::scatter`] places, and where it may stand.
+#[derive(Clone, Copy)]
+pub struct Scatter<'a> {
+    /// The terrain: positive inside the ground. A structure stands on the
+    /// topmost block of a column that is solid with air over it.
+    pub depth: &'a super::density::Density,
+    /// Where a structure may stand, or `None` for anywhere: sampled at the
+    /// centre of the surface block, positive to allow. A tree line, a biome
+    /// mask, "not on a lake" — the same terms a surface fill is built from.
+    pub stand: Option<&'a super::density::Density>,
+    /// The structures, chosen among uniformly. Repeat one to weight it.
+    pub schematics: &'a [&'a Schematic],
+    /// The side of the square each candidate is drawn in, in blocks: one
+    /// candidate a square, jittered within it, so two structures are never
+    /// closer than a block and are `cell` apart on average.
+    pub cell: u32,
+    /// The share of squares that get a structure, 0 to 1.
+    pub chance: f32,
+    /// Mixed into the seed, so two scatters of one generator draw different
+    /// squares.
+    pub salt: u64,
+    /// How many blocks the root sits BELOW the block over the surface: 1 puts
+    /// it in the surface block itself, where a trunk's base merges into the
+    /// partial block the smooth detail leaves; 0 stands it on top.
+    pub sink: i32,
+}
+
+/// Every cell of a block, as a mask.
+const FULL_MASK: u32 = (1_u32 << SUBNODES_PER_BLOCK as u32) - 1;
+
 impl ChunkBuffer {
     /// A buffer full of one material, at block resolution.
     #[must_use]
@@ -1231,6 +1334,143 @@ impl ChunkBuffer {
             material,
         );
         true
+    }
+
+    /// Stamps schematics on the surface, across chunk edges, at generation.
+    ///
+    /// **The structure pass §5.2 describes, done natively.** Every chunk within
+    /// a structure's reach runs the same pass and keeps its own slice: the
+    /// candidates are drawn per `cell`-sized square of the ground from a hash
+    /// of the square and the seed, so a square answers the same way from every
+    /// chunk that asks, and nothing is held between chunks. Each candidate's
+    /// surface is found by evaluating `depth` down its column — only over the
+    /// window of heights whose structure could touch this chunk, a few dozen
+    /// samples — and `stand` is sampled once at that surface. The schematic is
+    /// then written by cell, clipped to this chunk: a merge write, as
+    /// [`Self::set_subnode_world`] is.
+    ///
+    /// Asked for by the alpine forest: trees grown by random tick after a chunk
+    /// loads stood in patches where the player had waited, and a chunk of
+    /// forest is a hundred trees, which is minutes of ticks. A forest belongs
+    /// to the terrain, so it is made with the terrain.
+    ///
+    /// Returns how many structures wrote at least one block into this chunk.
+    ///
+    /// # Errors
+    ///
+    /// [`BufferError`] if a density program cannot be evaluated.
+    #[allow(clippy::too_many_lines)]
+    pub fn scatter(&mut self, seed: u64, scatter: &Scatter<'_>) -> Result<usize, BufferError> {
+        if scatter.schematics.is_empty() || scatter.cell == 0 {
+            return Ok(0);
+        }
+        let (mut reach_x, mut reach_z, mut lowest, mut highest) = (0, 0, 0, 0);
+        for schematic in scatter.schematics {
+            reach_x = reach_x.max(schematic.reach_x);
+            reach_z = reach_z.max(schematic.reach_z);
+            lowest = lowest.min(schematic.lowest);
+            highest = highest.max(schematic.highest);
+        }
+        let side = CHUNK_BLOCKS as i32;
+        let cell = scatter.cell as i32;
+        let (x0, y0, z0) = (self.pos.x * side, self.pos.y * side, self.pos.z * side);
+        let (x1, y1, z1) = (x0 + side, y0 + side, z0 + side);
+        // The surface blocks whose structure can reach into this chunk: the
+        // root is `sink` below the block over the surface, and the structure
+        // spans `lowest..=highest` from the root.
+        let surface_lo = y0 - highest - 1 + scatter.sink;
+        let surface_hi = y1 - 1 - lowest - 1 + scatter.sink;
+        if surface_hi < surface_lo {
+            return Ok(0);
+        }
+        // One sample more than the window, for the air over its top block.
+        let samples = (surface_hi - surface_lo + 2) as usize;
+        let mut field = vec![0.0_f32; samples];
+        let mut scratch = super::density::Scratch::default();
+        let mut placed = 0;
+        for cz in (z0 - reach_z).div_euclid(cell)..=(z1 - 1 + reach_z).div_euclid(cell) {
+            for cx in (x0 - reach_x).div_euclid(cell)..=(x1 - 1 + reach_x).div_euclid(cell) {
+                // **Every draw happens whether or not the candidate is kept**,
+                // in a fixed order, so a square's answer is the same from every
+                // chunk that asks about it.
+                let mut rng =
+                    super::rng::Xoshiro256PlusPlus::seed_from_u64(super::rng::StreamRng::seed_for(
+                        seed ^ scatter.salt,
+                        ChunkPos::new(cx, 0, cz),
+                        "scatter",
+                    ));
+                let keep = rng.next_f32() < scatter.chance;
+                let x = cx * cell + rng.below(u64::from(scatter.cell)) as i32;
+                let z = cz * cell + rng.below(u64::from(scatter.cell)) as i32;
+                let which = rng.below(scatter.schematics.len() as u64) as usize;
+                if !keep {
+                    continue;
+                }
+                let schematic = scatter.schematics[which];
+                if x + schematic.reach_x < x0
+                    || x - schematic.reach_x >= x1
+                    || z + schematic.reach_z < z0
+                    || z - schematic.reach_z >= z1
+                {
+                    continue;
+                }
+                let region = super::noise::Region3d {
+                    origin_x: x as f32 + 0.5,
+                    origin_y: surface_lo as f32 + 0.5,
+                    origin_z: z as f32 + 0.5,
+                    step: 1.0,
+                    width: 1,
+                    height: samples,
+                    depth: 1,
+                };
+                scatter
+                    .depth
+                    .evaluate_with(seed, &region, &mut field, &mut scratch)?;
+                // The topmost surface in the window: solid, with air over it.
+                let surface = (0..samples - 1)
+                    .rev()
+                    .find(|&i| field[i] > 0.0 && field[i + 1] <= 0.0)
+                    .map(|i| surface_lo + i as i32);
+                let Some(surface) = surface else {
+                    continue;
+                };
+                if let Some(stand) = scatter.stand
+                    && stand.sample(seed, x as f32 + 0.5, surface as f32 + 0.5, z as f32 + 0.5)?
+                        <= 0.0
+                {
+                    continue;
+                }
+                let base = surface + 1 - scatter.sink;
+                let mut landed = false;
+                for block in schematic.blocks() {
+                    let at = crate::BlockPos::new(x + block.dx, base + block.dy, z + block.dz);
+                    if at.chunk() != self.pos {
+                        continue;
+                    }
+                    let local = at.local();
+                    if block.mask & FULL_MASK == FULL_MASK {
+                        self.set_block(local, block.material);
+                    } else {
+                        for bit in 0..SUBNODES_PER_BLOCK as u32 {
+                            if block.mask & (1 << bit) != 0 {
+                                self.set_subnode(
+                                    local,
+                                    bit % 3,
+                                    (bit / 3) % 3,
+                                    bit / 9,
+                                    block.material,
+                                );
+                            }
+                        }
+                    }
+                    landed = true;
+                }
+                if landed {
+                    placed += 1;
+                }
+            }
+        }
+        Ok(placed)
     }
 
     // -- sub-node operations (the opt-in path) -----------------------------
@@ -2548,5 +2788,150 @@ mod tests {
             let (x, y, z) = crate::block::subnode_offset(index);
             assert_eq!(buffer.get_subnode(local, x, y, z), *expected);
         }
+    }
+    /// A column of stone as a schematic: three whole blocks up from the root
+    /// and a half block (its lower cells) on top.
+    fn column() -> Schematic {
+        let mut blocks = vec![];
+        for dy in 0..3 {
+            blocks.push(StampBlock {
+                dx: 0,
+                dy,
+                dz: 0,
+                material: STONE,
+                mask: FULL_MASK,
+            });
+        }
+        blocks.push(StampBlock {
+            dx: 0,
+            dy: 3,
+            dz: 0,
+            material: STONE,
+            mask: 0b111 | 0b111 << 9 | 0b111 << 18,
+        });
+        Schematic::new(blocks)
+    }
+
+    /// Ground below y = 8 everywhere: 8 - y.
+    fn flat_ground() -> super::super::density::Density {
+        use super::super::density::{Axis, Density, Op};
+        Density::compile(vec![
+            Op::Constant(8.0),
+            Op::Coordinate(Axis::Y),
+            Op::Subtract,
+        ])
+        .expect("compiles")
+    }
+
+    #[test]
+    fn scatter_stands_a_column_on_the_surface_it_finds() {
+        let mut buffer = ChunkBuffer::new(origin(), MaterialId::AIR);
+        buffer
+            .fill_density(&flat_ground(), 7, STONE)
+            .expect("fills");
+        let column = column();
+        let placed = buffer
+            .scatter(
+                7,
+                &Scatter {
+                    depth: &flat_ground(),
+                    stand: None,
+                    schematics: &[&column],
+                    cell: 16,
+                    chance: 1.0,
+                    salt: 1,
+                    sink: 0,
+                },
+            )
+            .expect("scatters");
+        assert_eq!(placed, 1, "one square, one candidate, kept");
+        // Somewhere in the chunk a column of stone stands at y = 8, 9, 10 on
+        // ground whose top block is y = 7, with the half block at 11.
+        let mut found = 0;
+        for x in 0..CHUNK_BLOCKS {
+            for z in 0..CHUNK_BLOCKS {
+                if buffer.get_block(LocalBlock::new(x, 8, z)) == STONE {
+                    found += 1;
+                    for y in 8..11 {
+                        assert_eq!(buffer.get_block(LocalBlock::new(x, y, z)), STONE);
+                    }
+                    assert_eq!(
+                        buffer.get_subnode(LocalBlock::new(x, 11, z), 1, 0, 1),
+                        STONE
+                    );
+                    assert_eq!(
+                        buffer.get_subnode(LocalBlock::new(x, 11, z), 1, 2, 1),
+                        MaterialId::AIR
+                    );
+                    assert_eq!(
+                        buffer.get_block(LocalBlock::new(x, 7, z)),
+                        STONE,
+                        "the ground"
+                    );
+                }
+            }
+        }
+        assert_eq!(found, 1);
+    }
+
+    #[test]
+    fn scatter_writes_the_same_structure_from_both_sides_of_an_edge() {
+        // A wide slab: five blocks along x from the root, so a root near a
+        // chunk edge reaches into the neighbour.
+        let slab = Schematic::new(
+            (-5..=5)
+                .map(|dx| StampBlock {
+                    dx,
+                    dy: 1,
+                    dz: 0,
+                    material: DIRT,
+                    mask: FULL_MASK,
+                })
+                .collect(),
+        );
+        let scatter = |pos: ChunkPos| {
+            let mut buffer = ChunkBuffer::new(pos, MaterialId::AIR);
+            buffer
+                .fill_density(&flat_ground(), 3, STONE)
+                .expect("fills");
+            buffer
+                .scatter(
+                    3,
+                    &Scatter {
+                        depth: &flat_ground(),
+                        stand: None,
+                        schematics: &[&slab],
+                        cell: 4,
+                        chance: 0.5,
+                        salt: 9,
+                        sink: 0,
+                    },
+                )
+                .expect("scatters");
+            buffer
+        };
+        let west = scatter(ChunkPos::new(0, 0, 0));
+        let east = scatter(ChunkPos::new(1, 0, 0));
+        // Every slab crossing x = 16 is in both: the east chunk's first column
+        // and the west chunk's last agree block for block along z, and there
+        // is at least one dirt block on the seam to make the test mean it.
+        let mut dirt = 0;
+        for z in 0..CHUNK_BLOCKS {
+            let w = west.get_block(LocalBlock::new(15, 9, z));
+            let e = east.get_block(LocalBlock::new(0, 9, z));
+            let west_has_slab_here = w == DIRT;
+            // A slab of eleven blocks centred within four blocks of the seam
+            // reaches across it, so dirt at x = 15 means dirt at x = 16 unless
+            // the root sits at the slab's east end — which at cell 4 with a
+            // reach of 5 it never does.
+            if west_has_slab_here {
+                assert_eq!(e, DIRT, "z = {z}: the east chunk lacks the west's slab");
+                dirt += 1;
+            }
+        }
+        assert!(
+            dirt > 0,
+            "no slab crossed the seam; the test proves nothing"
+        );
     }
 }
