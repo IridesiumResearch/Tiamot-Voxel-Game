@@ -151,6 +151,9 @@ impl tiamot_core::light::LightSource for Shared {
 #[derive(Debug, Default)]
 pub struct Lighting {
     layers: HashMap<ChunkPos, LightLayer>,
+    /// Chunks answered as dark from their palette alone, without a relight.
+    /// See `chunk_loaded`; read by the tick's serve report.
+    dark_shortcuts: usize,
     emissions: Emissions,
     /// Which materials light passes straight through: glass. Contract §8.1.
     see_through: tiamot_core::light::SeeThrough,
@@ -162,6 +165,7 @@ impl Lighting {
     pub fn new(emissions: Emissions, see_through: tiamot_core::light::SeeThrough) -> Self {
         Self {
             layers: HashMap::new(),
+            dark_shortcuts: 0,
             emissions,
             see_through,
         }
@@ -212,6 +216,28 @@ impl Lighting {
         self.layers.get(&pos)
     }
 
+    /// Whether a chunk is one opaque, unlit material through and through — dark
+    /// without a relight, and a wall light cannot pass.
+    ///
+    /// One predicate for two callers: `chunk_loaded` answers such a chunk as
+    /// dark, and the streamer treats it as sealed — nothing behind it can be
+    /// seen until something digs into it. Kept together so the two can never
+    /// disagree about what "solid" means; both need the same two tables.
+    #[must_use]
+    pub fn is_dark_solid(&self, chunk: &tiamot_core::Chunk) -> bool {
+        chunk.is_uniform().is_some_and(|material| {
+            !material.is_air()
+                && !self.see_through.is(material)
+                && self.emissions.of(material).is_dark()
+        })
+    }
+
+    /// How many loaded chunks were answered as dark without a relight.
+    #[must_use]
+    pub const fn dark_shortcuts(&self) -> usize {
+        self.dark_shortcuts
+    }
+
     /// Forgets a chunk's light.
     ///
     /// Called when a chunk leaves memory. Keeping it would be a slow leak of
@@ -234,6 +260,28 @@ impl Lighting {
         pos: ChunkPos,
     ) -> BTreeSet<ChunkPos> {
         self.layers.entry(pos).or_insert_with(LightLayer::dark);
+        // **A chunk of one opaque, unlit material is dark, and knowing that
+        // costs nothing.** Relighting it would darken all 4,096 blocks, scan
+        // the border, seed emissions and test the sky over every block — four
+        // passes to compute what its palette already says, measured at 68 µs a
+        // chunk on the bench's harness against 217 for open air. A player at
+        // the default view asks for roughly 2,500 such chunks below their feet,
+        // so this was the single largest share of a join's serve cost spent on
+        // rock nobody can see. The answer is identical: opaque blocks pass no
+        // light in, and a material that emits none puts none there.
+        //
+        // Three conditions, and all three matter. Uniform, so the palette
+        // holds one entry; not air, since air under sky is the expensive case
+        // and the bright one; not see-through, because a chunk of glass is lit
+        // straight through; and not emissive, because a chunk of lamps is lit
+        // from within. The last two are the tables lighting already consults.
+        if world
+            .resident(domain, pos)
+            .is_some_and(|chunk| self.is_dark_solid(chunk))
+        {
+            self.dark_shortcuts += 1;
+            return std::iter::once(pos).collect();
+        }
 
         // Exactly the chunk. The blocks around it are handled as a boundary
         // condition by `relight` — they keep their light and flood inward —
@@ -824,6 +872,71 @@ mod tests {
                 .is_uniform()
                 .is_some_and(tiamot_core::light::Light::is_dark)),
             "solid rock with no lamps should be uniformly dark"
+        );
+        // And it was answered from the palette, not relit: the whole point of
+        // the shortcut, and the assertion that would catch it silently falling
+        // back to four passes over the chunk.
+        assert_eq!(
+            light.dark_shortcuts(),
+            1,
+            "a chunk of one opaque unlit material should be answered as dark without a relight"
+        );
+    }
+
+    #[test]
+    fn the_dark_shortcut_refuses_glass_and_lamps() {
+        // The shortcut's two tables, each doing its job. A chunk of one
+        // material is not dark just because it is one material: glass under
+        // the sky is lit straight through, and a chunk of lamps is lit from
+        // within. Either taken as dark would be a wrong answer shipped to
+        // every client for the cheapest possible reason.
+        const GLASS: MaterialId = MaterialId(9);
+        let mut world = world();
+        // Glass has to BE glass to the table, and the sky has to reach it:
+        // `resident` makes the chunks around it exist, since an unloaded
+        // neighbour is opaque and would roof the glass in rock.
+        let mut light = lighting_with(tiamot_core::light::SeeThrough::new([GLASS]));
+        let fill = |world: &mut World, at: ChunkPos, material: MaterialId| {
+            resident(world, at);
+            let chunk = world
+                .chunk(tiamot_core::domain::OVERWORLD, at, &mut Empty)
+                .expect("chunk");
+            for index in 0..tiamot_core::BLOCKS_PER_CHUNK {
+                chunk.set_block_local(
+                    tiamot_core::coords::LocalBlock::from_index(index),
+                    BlockValue::Uniform(material),
+                );
+            }
+        };
+        let dark = |light: &Lighting, at: ChunkPos| {
+            light.layer(at).is_some_and(|layer| {
+                layer
+                    .is_uniform()
+                    .is_some_and(tiamot_core::light::Light::is_dark)
+            })
+        };
+
+        // Glass, under open sky: the whole chunk lights up through it.
+        let glass_at = ChunkPos::new(2, 0, 0);
+        fill(&mut world, glass_at, GLASS);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, glass_at);
+        assert!(
+            !dark(&light, glass_at),
+            "a chunk of glass under the sky was answered as dark"
+        );
+
+        // Lamps, deep underground: lit from within, however buried.
+        let lamps_at = ChunkPos::new(0, -6, 0);
+        fill(&mut world, lamps_at, LAMP);
+        light.chunk_loaded(tiamot_core::domain::OVERWORLD, &world, lamps_at);
+        assert!(
+            !dark(&light, lamps_at),
+            "a chunk of lamps was answered as dark"
+        );
+        assert_eq!(
+            light.dark_shortcuts(),
+            0,
+            "neither chunk may take the shortcut"
         );
     }
 

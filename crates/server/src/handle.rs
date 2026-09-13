@@ -608,6 +608,8 @@ struct ServeReport {
     generating: Duration,
     /// Time relighting what was served.
     lighting: Duration,
+    /// Chunks answered as dark from their palette, with no relight at all.
+    dark: usize,
 }
 
 impl ServeReport {
@@ -619,12 +621,13 @@ impl ServeReport {
     /// The breakdown as one line, for a tick that has lost its budget.
     fn line(&self) -> String {
         format!(
-            "{} chunks, {} summaries, {} deferred; gen {:.1}ms, light {:.1}ms",
+            "{} chunks, {} summaries, {} deferred; gen {:.1}ms, light {:.1}ms ({} dark for free)",
             self.chunks,
             self.summaries,
             self.deferred,
             self.generating.as_secs_f64() * 1000.0,
             self.lighting.as_secs_f64() * 1000.0,
+            self.dark,
         )
     }
 }
@@ -724,6 +727,7 @@ fn serve_chunk_requests(
                 .send(summary.map(|blob| crate::transport::endpoint::Served {
                     blob,
                     tint: [u8::MAX; 3],
+                    sealed: false,
                 }));
             continue;
         }
@@ -761,9 +765,19 @@ fn serve_one_chunk(
     report: &mut ServeReport,
 ) {
     let at = std::time::Instant::now();
+    let mut sealed = false;
     let blob = match world.chunk(&request.domain, request.pos, source) {
         Ok(chunk) => {
             let chunk = chunk.clone();
+            // **Decided here, where the chunk is in hand.** The same predicate
+            // lighting uses to answer a chunk as dark without a relight; the
+            // streamer uses it to stop requesting what lies behind. One
+            // definition, two savings — see `Lighting::is_dark_solid`.
+            sealed = lighting
+                .read()
+                .expect("lighting lock")
+                .get(&request.domain)
+                .is_some_and(|light| light.is_dark_solid(&chunk));
             world.db().chunk_blob(request.pos, &chunk).ok()
         }
         Err(err) => {
@@ -793,7 +807,10 @@ fn serve_one_chunk(
             std::iter::once(request.pos).collect()
         } else {
             control.note_full_relight();
-            light.chunk_loaded(&request.domain, world, request.pos)
+            let before = light.dark_shortcuts();
+            let touched = light.chunk_loaded(&request.domain, world, request.pos);
+            report.dark += light.dark_shortcuts() - before;
+            touched
         };
         broadcast_light(shared, &request.domain, light, &touched);
         report.lighting += at.elapsed();
@@ -849,7 +866,7 @@ fn serve_one_chunk(
     // answered, which is ordinary rather than an error.
     let _ = request
         .reply
-        .send(blob.map(|blob| crate::transport::endpoint::Served { blob, tint }));
+        .send(blob.map(|blob| crate::transport::endpoint::Served { blob, tint, sealed }));
 }
 
 /// The block an edit changed.

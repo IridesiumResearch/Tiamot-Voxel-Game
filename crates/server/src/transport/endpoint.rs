@@ -603,6 +603,12 @@ pub struct Served {
     pub blob: Vec<u8>,
     /// The chunk's biome colour, white when no mod gives one.
     pub tint: [u8; 3],
+    /// Whether the chunk is one opaque, unlit material through and through.
+    ///
+    /// Decided where the chunk is in hand and carried to the streamer, which
+    /// stops requesting anything behind such a chunk — see `Streamer::sealed`.
+    /// Always `false` for a summary: a summary is scenery, not a wall.
+    pub sealed: bool,
 }
 
 pub struct ChunkRequest {
@@ -2506,6 +2512,11 @@ async fn serve(connection: quinn::Connection, shared: &Shared) -> Result<(), fra
                                 if streamer.summary_level(pos).is_some() {
                                     streamer.resummarise(pos);
                                 }
+                                // A sealed chunk with a hole in it is a wall no
+                                // longer: whatever lay behind it is what the
+                                // player who dug will see next, so it becomes
+                                // requestable — see `Streamer::unseal`.
+                                streamer.unseal(pos);
                             }
                             frame::write(&mut send, &outbound.message).await?;
                         }
@@ -2861,7 +2872,7 @@ async fn pump_chunks(
     let mut still_waiting = Vec::with_capacity(pending.len());
     for (pos, level, mut receiver) in pending.drain(..) {
         match receiver.try_recv() {
-            Ok(Some(Served { blob, tint })) => {
+            Ok(Some(Served { blob, tint, sealed })) => {
                 // Whichever was asked for. Sending the wrong message for a
                 // blob would be a client decoding a summary as a chunk, which
                 // is not a thing the codec can catch — both are byte strings.
@@ -2876,7 +2887,12 @@ async fn pump_chunks(
                 // straight from "requested" to "held" with no window in which
                 // it looks un-requested and gets asked for again.
                 match level {
-                    None => streamer.delivered(pos),
+                    None => {
+                        streamer.delivered(pos);
+                        if sealed {
+                            streamer.sealed(pos);
+                        }
+                    }
                     Some(level) => streamer.summarised(pos, level),
                 }
             }

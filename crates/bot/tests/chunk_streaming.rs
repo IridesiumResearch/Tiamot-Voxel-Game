@@ -13,7 +13,7 @@ use bot::Bot;
 use tiamot_core::identity::{Allowlist, Identity};
 use tiamot_core::interest::{self, ViewDistance};
 use tiamot_core::proto::ServerMessage;
-use tiamot_core::{BlockPos, MaterialId};
+use tiamot_core::{BlockPos, ChunkPos, MaterialId};
 use tiamot_server::{ServerHandle, Settings};
 
 const MATERIALS: [&str; 2] = ["test:stone", "test:dirt"];
@@ -153,6 +153,132 @@ fn a_joining_player_receives_the_world_around_spawn() {
     });
 
     server.stop();
+}
+
+#[test]
+fn rock_behind_rock_is_never_streamed_and_everything_above_it_is() {
+    // **What the tick was spending on the invisible.** The detail radius is a
+    // cylinder — eight out, twelve up and down at the default view — and a
+    // player standing on the ground asked for every chunk below their feet:
+    // roughly 2,500 chunks of rock, each generated, relit, encoded and sent,
+    // none of them visible. The streamer now floods outward from the player
+    // and stops at a chunk that is one opaque, unlit material through and
+    // through (`Streamer::sealed`), so it sends the ground and one layer into
+    // it and nothing under that.
+    //
+    // Three assertions. Everything at or above ground arrives — sealing must
+    // never withhold a chunk the player could see. Nothing arrives more than
+    // two layers below ground: the reference world's top row of ground sits on
+    // solid white, so the chunk holding that row is mixed and open, the one
+    // under it is sealed, and the flood stops there. And the total is less
+    // than the interest set, which is the saving, printed.
+    let view = ViewDistance {
+        horizontal: 3,
+        vertical: 5,
+    };
+    let server = start("sealed-rock", view);
+    let spawn_chunk = BlockPos::new(0, 1, 0).chunk();
+    let interest = interest::chunks_around(spawn_chunk, view);
+    block_on(async {
+        let mut alice = join(&server, "Alice").await;
+        let arrived = collect_until_quiet(&mut alice).await;
+        let arrived_set: std::collections::BTreeSet<_> = arrived.iter().copied().collect();
+
+        for pos in interest.iter().filter(|pos| pos.y >= spawn_chunk.y) {
+            assert!(
+                arrived_set.contains(pos),
+                "a chunk at or above ground, {pos:?}, never arrived: sealing withheld \
+                 something visible"
+            );
+        }
+        let deepest = arrived
+            .iter()
+            .map(|pos| pos.y)
+            .min()
+            .expect("chunks arrived");
+        assert!(
+            deepest >= spawn_chunk.y - 2,
+            "a chunk at y = {deepest} arrived, more than two layers into solid rock"
+        );
+        assert!(
+            deepest < spawn_chunk.y,
+            "no chunk of the ground itself arrived, so the sealed shell was withheld"
+        );
+        println!(
+            "sealed streaming: {} of {} chunks in the radius were sent; {} of rock never were",
+            arrived.len(),
+            interest.len(),
+            interest.len() - arrived.len()
+        );
+        assert!(
+            arrived.len() < interest.len(),
+            "every position in the radius was sent, so sealing excluded nothing"
+        );
+        alice.disconnect().await;
+    });
+    server.stop();
+}
+
+#[test]
+fn digging_into_sealed_rock_streams_what_lay_behind_it() {
+    // The other half, through the real endpoint: an edit inside a sealed
+    // chunk reaches the connection as a delta, the streamer reopens the chunk,
+    // and the one beneath — never sent — is asked for and arrives. Without
+    // this a player digging down would fall into a chunk that does not exist
+    // on their client.
+    let view = ViewDistance {
+        horizontal: 3,
+        vertical: 5,
+    };
+    let server = start("dig-into-rock", view);
+    let spawn_chunk = BlockPos::new(0, 1, 0).chunk();
+    block_on(async {
+        let mut alice = join(&server, "Alice").await;
+        let arrived = collect_until_quiet(&mut alice).await;
+        let deepest = arrived
+            .iter()
+            .map(|pos| pos.y)
+            .min()
+            .expect("chunks arrived");
+        // The deepest chunk sent is the sealed shell. Carve one block out of
+        // it, with a material that is not what it is made of.
+        let sealed = ChunkPos::new(spawn_chunk.x, deepest, spawn_chunk.z);
+        let below = ChunkPos::new(sealed.x, sealed.y - 1, sealed.z);
+        assert!(
+            !arrived.contains(&below),
+            "the chunk under the sealed shell arrived before anything was dug"
+        );
+        let inside = BlockPos::new(sealed.x * 16 + 8, sealed.y * 16 + 8, sealed.z * 16 + 8);
+        assert!(server.seed_block(inside, stone_id()));
+        alice
+            .next_block_delta(Duration::from_secs(5))
+            .await
+            .expect("wait")
+            .expect("the edit must be applied");
+
+        let after = collect_until_quiet(&mut alice).await;
+        assert!(
+            after.contains(&below),
+            "digging into the sealed chunk did not stream the chunk beneath it: {after:?}"
+        );
+        alice.disconnect().await;
+    });
+    server.stop();
+}
+
+/// Collects chunks until two seconds pass with none arriving.
+async fn collect_until_quiet(bot: &mut Bot) -> Vec<ChunkPos> {
+    let mut all = Vec::new();
+    loop {
+        let batch = bot
+            .collect_chunks(64, Duration::from_secs(2))
+            .await
+            .expect("collect");
+        if batch.is_empty() {
+            return all;
+        }
+        all.extend(batch);
+    }
 }
 
 #[test]
