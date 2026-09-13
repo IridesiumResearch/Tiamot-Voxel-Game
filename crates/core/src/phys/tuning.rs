@@ -64,6 +64,19 @@ pub struct Tuning {
     /// 1.25 yards, which is a block and a quarter — enough to jump onto a full
     /// block, not enough to reach two.
     pub jump_speed: f32,
+    /// Ticks after a launch before the jump key may launch again.
+    ///
+    /// **This is what makes the jump key a held key rather than a press.** The
+    /// client used to edge-detect the key and send a two-tick pulse, and the
+    /// server's queue refused to repeat it, so one press was one jump by
+    /// construction — and in flight, where the same key means "up", that
+    /// machinery made a held climb into a two-tick hop. Now the key is a state
+    /// like forward, repeated through lost ticks like forward, and THIS spaces
+    /// the jumps: a body with the key held launches, lands, waits this out,
+    /// launches again. Twenty ticks is a second at the tick rate, which is the
+    /// spacing asked for from the window. Integer, so charter rule 4 has nothing
+    /// to say about it.
+    pub jump_cooldown_ticks: u8,
 
     /// Top horizontal speed walking, cells/tick. 4.3 yd/s.
     pub walk_speed: f32,
@@ -199,6 +212,7 @@ impl Tuning {
         // `the_jump_speed_clears_a_block_and_a_quarter` checks the arithmetic
         // rather than trusting the comment.
         jump_speed: 1.341_640_8,
+        jump_cooldown_ticks: 20,
         walk_speed: speed(4.3),
         sprint_speed: speed(5.6),
         sneak_speed: speed(1.3),

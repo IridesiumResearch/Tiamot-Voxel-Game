@@ -152,6 +152,47 @@ fn flight_is_at_least_twice_as_fast_as_the_same_gait_on_foot() {
 }
 
 #[test]
+fn a_held_jump_key_launches_again_only_after_the_cooldown() {
+    // **The jump key is held, and the simulation is what spaces the jumps.**
+    // The client used to turn a press into a two-tick edge and the server's
+    // queue refused to repeat it, so one press was one jump by construction. Now
+    // the key is a state like forward, and a body with the key held launches,
+    // lands, waits out `jump_cooldown_ticks`, and launches again — a second-ish
+    // between jumps, as asked from the window — rather than every tick it is on
+    // the ground. Three launches in sixty ticks, at 0, 20 and 40, and never two
+    // closer than the cooldown.
+    let tuning = Tuning::DEFAULT;
+    let scene = Scene::new(0);
+    let held = Intent {
+        walk: [0.0, 0.0],
+        jump: true,
+        gait: Gait::Walk,
+        fly: false,
+    };
+    let mut body = Body::at([24.0, 0.0, 24.0]);
+    body.on_ground = true;
+
+    let mut launches = Vec::new();
+    for tick in 0..60u32 {
+        let before = body;
+        body = step(&scene, body, held, &tuning);
+        if before.on_ground && body.velocity[1] > 0.0 {
+            launches.push(tick);
+        }
+    }
+    assert_eq!(
+        launches,
+        vec![0, 20, 40],
+        "a held jump key should launch once per cooldown, not once per tick on the ground"
+    );
+    assert_eq!(
+        u32::from(tuning.jump_cooldown_ticks) * 1000 / crate::tick::TICK_RATE_HZ,
+        1000,
+        "the cooldown is a second: the number asked for, at the tick rate we have"
+    );
+}
+
+#[test]
 fn a_flying_body_rises_on_jump_and_sinks_on_sneak() {
     let tuning = Tuning::DEFAULT;
     let scene = Scene::new(0);
@@ -225,6 +266,7 @@ fn a_body_slides_along_a_wall_instead_of_sticking_to_it() {
         position: [2.0, 0.0, 0.0],
         velocity: [0.0, 0.0, 0.0],
         on_ground: true,
+        jump_cooldown: 0,
     };
 
     // Pushing diagonally into the wall: +x is blocked, +z must still happen.
@@ -261,6 +303,7 @@ fn a_step_up_of_one_subnode_succeeds_and_two_does_not() {
         position: [0.0, 0.0, 0.5],
         velocity: [0.0, 0.0, 0.0],
         on_ground: true,
+        jump_cooldown: 0,
     };
 
     let one = Scene::new(0).with_step(3, 1);
@@ -304,6 +347,7 @@ fn sneaking_stops_at_the_edge_and_walking_does_not() {
         position: [0.0, 0.0, 0.5],
         velocity: [0.0, 0.0, 0.0],
         on_ground: true,
+        jump_cooldown: 0,
     };
 
     let sneaking = simulate(
@@ -350,6 +394,7 @@ fn a_jump_clears_one_block_but_not_two() {
         position: [0.5, 0.0, 0.5],
         velocity: [0.0, 0.0, 0.0],
         on_ground: true,
+        jump_cooldown: 0,
     };
     let intent = Intent {
         walk: [0.0, 0.0],
@@ -393,6 +438,7 @@ fn a_body_in_a_one_cell_gap_does_not_fall_through_it() {
         position: [0.5, 20.0, 0.5],
         velocity: [0.0, -11.0, 0.0],
         on_ground: false,
+        jump_cooldown: 0,
     };
 
     let landed = simulate(&scene, body, Intent::default(), 10);
@@ -524,7 +570,19 @@ fn climbing_a_stepped_passage_does_not_cost_a_walking_pace() {
         run: 6,
         headroom: 9,
     };
-    let tuning = Tuning::DEFAULT;
+    // **The cooldown is switched off for this test, deliberately.** It is a
+    // test of the riser mechanic, and what stresses a riser is a body that
+    // launches at every landing — which is what a held jump key did when it
+    // was written, and what the one-second `jump_cooldown_ticks` now prevents.
+    // With the cooldown in place the body walks into most risers and hops one
+    // in twenty, covering 59 cells, and the 67-versus-81 separation this bound
+    // sits between is gone; that is jump pacing changing the scenario, not the
+    // riser mechanic regressing. The mechanic is what this measures, so the
+    // pacing is taken out of the way.
+    let tuning = Tuning {
+        jump_cooldown_ticks: 0,
+        ..Tuning::DEFAULT
+    };
     let mut body = Body::at([0.5, 0.0, 0.5]);
     let intent = Intent {
         walk: [1.0, 0.0],
@@ -568,6 +626,7 @@ fn a_body_pushing_off_a_riser_keeps_the_speed_it_jumped_with() {
         position: [5.0, 0.0, 0.5],
         velocity: [tuning.walk_speed, 0.0, 0.0],
         on_ground: true,
+        jump_cooldown: 0,
     };
 
     let jumping = step(
@@ -661,6 +720,7 @@ fn a_body_wedged_in_a_corner_loses_the_same_speed_on_both_axes() {
         position: [2.0, 0.0, 2.0],
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
     let intent = Intent {
         walk: [1.0, 1.0],
@@ -711,6 +771,7 @@ fn a_jump_into_a_ceiling_keeps_the_speed_it_was_taken_at() {
             position: [0.5, 0.0, 0.5],
             velocity: [0.0; 3],
             on_ground: true,
+            jump_cooldown: 0,
         };
         let intent = Intent {
             walk: [1.0, 0.0],
@@ -740,6 +801,7 @@ fn a_jump_into_a_ceiling_keeps_the_speed_it_was_taken_at() {
         position: [0.5, 0.0, 0.5],
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
     let intent = Intent {
         walk: [1.0, 0.0],
@@ -796,6 +858,7 @@ fn walking_over_single_subnodes_never_leaves_the_ground_or_stalls() {
         position: [0.5, 1.0, 0.5],
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
     let intent = Intent {
         walk: [1.0, 0.0],
@@ -869,6 +932,7 @@ fn step_down_glues_a_body_to_a_lip_and_not_to_a_cliff() {
             position: [2.0, height as f32, 0.5],
             velocity: [0.0; 3],
             on_ground: true,
+            jump_cooldown: 0,
         };
         // Long enough to walk past x = 6 and, if it is going to fall, to land.
         for _ in 0..20 {
@@ -904,6 +968,7 @@ fn step_down_does_not_cancel_the_jump_that_started_this_tick() {
         position: [0.5, 0.0, 0.5],
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
     let intent = Intent {
         walk: [0.0, 0.0],
@@ -942,6 +1007,7 @@ fn a_body_caught_inside_geometry_stays_inside_it() {
         position: [4.5, 1.0, 4.5],
         velocity: [0.0; 3],
         on_ground: false,
+        jump_cooldown: 0,
     };
 
     let buried = body.position;
@@ -991,6 +1057,7 @@ fn a_body_inside_geometry_can_still_walk_out_of_it() {
         position: [0.5, 2.0, 0.5],
         velocity: [0.0; 3],
         on_ground: false,
+        jump_cooldown: 0,
     };
     assert!(scene.overlaps(&body.aabb()), "the fixture did not bury it");
 
@@ -1038,6 +1105,7 @@ fn a_body_in_a_world_that_has_not_arrived_is_left_where_it_is() {
         position: [1.5, 3.0, 1.5],
         velocity: [0.0; 3],
         on_ground: false,
+        jump_cooldown: 0,
     };
     let mut body = start;
     for _ in 0..10 {
@@ -1074,6 +1142,7 @@ fn a_body_barely_inside_a_wall_is_neither_lifted_nor_shoved() {
         position: start,
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
     body = step(&scene, body, Intent::default(), &Tuning::DEFAULT);
 
@@ -1143,6 +1212,7 @@ fn walking_over_scattered_lips_never_dips() {
         position: [0.5, 1.0, 0.5],
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
     let intent = Intent {
         walk: [1.0, 0.0],
@@ -1185,6 +1255,7 @@ fn a_stride_does_not_carry_a_body_off_a_ledge() {
         position: [4.0, 0.0, 0.5],
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
     let intent = Intent {
         walk: [1.0, 0.0],
@@ -1224,6 +1295,7 @@ fn a_body_standing_still_over_a_crack_drops_into_it() {
         position: [4.5, 1.0, 0.5],
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
     for _ in 0..4 {
         body = step(&scene, body, Intent::default(), &Tuning::DEFAULT);
@@ -1275,6 +1347,7 @@ fn a_one_block_hole_dug_two_deep_swallows_a_walking_body() {
         position: [4.0, 0.0, 1.5],
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
     let intent = Intent {
         walk: [1.0, 0.0],
@@ -1335,6 +1408,7 @@ fn letting_go_of_sneak_at_a_brink_does_not_tip_a_body_in() {
         position: [6.0, 0.0, 1.5],
         velocity: [0.0; 3],
         on_ground: true,
+        jump_cooldown: 0,
     };
 
     // Sneak east until the guard has been holding for several ticks.

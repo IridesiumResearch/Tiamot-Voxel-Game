@@ -144,37 +144,18 @@ impl InputQueue {
             self.last_intent = Intent::default();
         }
 
-        // **A jump is an edge, and only the movement around it is a state.**
-        //
-        // Repeating the last intent is what makes a dropped packet invisible for
-        // walking: a player holding forward through a lost tick should keep
-        // walking. Repeating a JUMP re-presses the key — so a client that sends
-        // one jump gets a server that jumps again on the next tick nobody spoke
-        // for, and the two simulations part company at exactly the moment the
-        // player is in the air.
-        //
-        // It became reachable the day the client started sending one jump per
-        // press instead of one per tick held. Before that the repeat was covered
-        // by the client sending the same thing anyway, which is why it sat here
-        // unnoticed: the bug was latent in this file and armed from another.
-        //
-        // Cleared after it is answered rather than filtered out of the repeat, so
-        // there is one place where a jump can be consumed and it cannot be
-        // reached twice.
-        //
-        // **Unless the body is flying, when the same key means "up" and up is
-        // a state.** A flying body climbs for as long as the key is held, the
-        // way it walks for as long as forward is held, so a held climb repeats
-        // through a lost tick exactly as walking does and clearing it here made
-        // every press a two-tick hop — reported from the window as flight that
-        // "only goes up a little bit at a time". The client sends it as a held
-        // key in flight for the same reason (`JUMP_EDGE_TICKS`), and both ends
-        // key the rule on the intent's own `fly` bit so they cannot disagree.
-        let intent = self.last_intent;
-        if !intent.fly {
-            self.last_intent.jump = false;
-        }
-        intent
+        // **Everything repeats, the jump key included.** Repeating the last
+        // intent is what makes a dropped packet invisible: a player holding a
+        // key through a lost tick keeps doing what the key does. That used to
+        // exclude `jump`, on the grounds that repeating a press re-presses the
+        // key and a server that jumped twice for one press parted company with
+        // its client in mid-air. It no longer has to: a jump is a HELD key now,
+        // and what stops a second launch is `Body::jump_cooldown` in the
+        // simulation itself, on both ends alike. The client sends the key for
+        // as long as it is down, so a lost tick costs a jump one tick of
+        // lateness rather than the whole jump — and in flight the same key is
+        // "up", which was never an edge in the first place.
+        self.last_intent
     }
 
     /// The last tick this queue answered for.
@@ -214,12 +195,12 @@ mod tests {
 
     #[test]
     fn a_held_climb_in_flight_repeats_like_walking() {
-        // **The same key, a different meaning.** On the ground `jump` is an
-        // edge and the test below holds it to one press, one jump. In flight it
-        // is "up", a state: a body climbs for as long as the key is held, so a
-        // tick nobody spoke for repeats the climb the way it repeats a walk.
-        // Clearing it as a jump made every press a two-tick hop, reported from
-        // the window as flight that only goes up a little at a time.
+        // In flight the jump key is "up": a body climbs for as long as it is
+        // held, so a tick nobody spoke for repeats the climb the way it repeats
+        // a walk. When the queue still cleared the key as a press, this made
+        // every press a two-tick hop — reported from the window as flight that
+        // only goes up a little at a time. The key repeats everywhere now; this
+        // keeps the case that found it.
         let mut queue = InputQueue::new(0);
         let climbing = Intent {
             fly: true,
@@ -253,32 +234,33 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_input_keeps_walking_but_does_not_jump_again() {
-        // **A jump is an edge; the movement around it is a state.** Repeating the
-        // last intent is what makes a dropped packet invisible for walking. Doing
-        // it for a jump re-presses the key, so a client that sends one jump gets
-        // a server that jumps again on the next tick nobody spoke for — and the
-        // two part company while the player is in the air.
-        //
-        // Reported from the window as a jolt right after a jump, with the client's
-        // own footing counter reading 5 changes where a jump is 2.
+    fn a_repeated_input_keeps_every_key_held_including_jump() {
+        // **The jump key is a state, like forward.** This test used to assert
+        // the opposite — that a repeated intent kept walking but did not jump
+        // again — because a repeated press was a second jump and a second jump
+        // on a tick the client never sent was a divergence in mid-air. The
+        // second jump is now refused by the simulation's own cooldown
+        // (`a_held_jump_key_launches_again_only_after_the_cooldown`), so the
+        // queue no longer has to know one key from another, and a client whose
+        // press-tick packet was lost gets its jump one tick late instead of not
+        // at all.
         let mut queue = InputQueue::new(0);
         assert!(queue.offer(1, jumping()));
-
         let first = queue.take(1);
-        assert!(first.jump, "the tick the input arrived for must jump");
-
-        // Nothing arrives for the next few ticks: a dropped packet, or a client
-        // whose frame hitched.
-        for tick in 2..=5 {
+        assert!(
+            first.jump,
+            "the tick the input arrived for must carry the key"
+        );
+        for tick in 2..6 {
             let repeated = queue.take(tick);
             assert!(
-                !repeated.jump,
-                "tick {tick} jumped again from a repeat; one press is one jump"
+                repeated.jump,
+                "tick {tick} dropped the held jump key on a repeat: {repeated:?}"
             );
             assert!(
-                (repeated.walk[0] - 1.0).abs() < 1e-6,
-                "tick {tick} stopped walking; only the jump is an edge: {repeated:?}"
+                repeated.walk[0] > 0.5 && repeated.walk[1].abs() < 0.5,
+                "tick {tick} stopped walking: {:?}",
+                repeated.walk
             );
         }
     }
@@ -309,6 +291,7 @@ mod tests {
             position: [1.5, 0.0, 1.5],
             velocity: [0.0; 3],
             on_ground: true,
+            jump_cooldown: 0,
         };
 
         // Two bodies, identical but for which tick the press landed on, compared
@@ -341,18 +324,28 @@ mod tests {
     }
 
     #[test]
-    fn a_second_press_still_jumps() {
-        // The other half: clearing the edge must not make the queue deaf to the
-        // next one.
+    fn a_release_and_a_fresh_press_both_reach_the_body() {
+        // The queue is a pass-through for the jump key like any other: what the
+        // client sends on a tick is what the body gets on that tick. This used
+        // to assert the opposite — that a repeat cleared the key — back when the
+        // key was an edge the queue had to consume. A release is an offered
+        // intent now, and so is the next press, and neither is second-guessed.
         let mut queue = InputQueue::new(0);
         assert!(queue.offer(1, jumping()));
         assert!(queue.take(1).jump);
-        assert!(!queue.take(2).jump);
+        assert!(queue.offer(
+            2,
+            Intent {
+                jump: false,
+                ..jumping()
+            }
+        ));
+        assert!(!queue.take(2).jump, "a released key was still held");
 
         assert!(queue.offer(3, jumping()));
         assert!(
             queue.take(3).jump,
-            "a fresh press after a repeat did not reach the body"
+            "a fresh press after a release did not reach the body"
         );
     }
 

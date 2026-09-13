@@ -44,7 +44,7 @@ use crate::coords::{BlockPos, ChunkPos, SubNodePos};
 /// **Bump on any change to a message type.** Peers exchange this before
 /// anything else and refuse each other cleanly on mismatch — see
 /// [`ServerMessage::Disconnect`].
-pub const PROTOCOL_VERSION: u32 = 50;
+pub const PROTOCOL_VERSION: u32 = 51;
 // v2 (Task 07): appended `ServerMessage::InventoryUpdate`. Appended, never
 // inserted — see the module docs and CONTRIBUTING's protocol checklist.
 // v3 (Task 08): appended `ServerMessage::MaterialTable`.
@@ -1456,6 +1456,13 @@ pub enum ServerMessage {
         velocity: [f32; 3],
         /// Whether the server has the player standing on something.
         on_ground: bool,
+        /// Ticks until the body may jump again — `phys::Body::jump_cooldown`.
+        ///
+        /// **Appended** (protocol v51). On the wire because the client restores
+        /// it on reconcile: a jump is a held key spaced by this counter, so a
+        /// client that reset it would launch a replayed press the server had
+        /// refused, and the two would part in mid-air.
+        jump_cooldown: u8,
     },
 
     /// How far along the player's current dig is.
@@ -3062,6 +3069,7 @@ mod tests {
                     local: [bad, 0.0, 0.0],
                     velocity: [0.0; 3],
                     on_ground: true,
+                    jump_cooldown: 0,
                 },
                 ServerMessage::PlayerState {
                     last_processed_input: 1,
@@ -3069,6 +3077,7 @@ mod tests {
                     local: [0.0; 3],
                     velocity: [0.0, bad, 0.0],
                     on_ground: true,
+                    jump_cooldown: 0,
                 },
             ] {
                 assert!(
@@ -3084,6 +3093,7 @@ mod tests {
             local: [24.0, 3.0, 24.0],
             velocity: [0.1, -0.2, 0.0],
             on_ground: true,
+            jump_cooldown: 0,
         };
         assert!(validate_server_message(&good).is_ok());
     }
@@ -3502,6 +3512,7 @@ mod tests {
             local: [0.0; 3],
             velocity: [0.0; 3],
             on_ground: false,
+            jump_cooldown: 0,
         })
         .expect("encode");
         assert_eq!(state[0], 13);

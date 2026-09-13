@@ -501,6 +501,7 @@ mod tests {
             position: [span - 0.5, 3.0, 24.0],
             velocity: [0.0; 3],
             on_ground: true,
+            jump_cooldown: 0,
         };
 
         let mut body = start;
@@ -637,6 +638,7 @@ mod tests {
             position: [44.0, 3.0, 24.0],
             velocity: [0.0, 0.0, 0.0],
             on_ground: true,
+            jump_cooldown: 0,
         };
         let intent = Intent {
             walk: [1.0, 0.0],

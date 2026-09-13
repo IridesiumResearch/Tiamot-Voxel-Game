@@ -1152,57 +1152,61 @@ fn the_debug_row_offers_one_of_every_material_and_nothing_when_aimed_at_sky() {
 }
 
 #[test]
-fn holding_the_jump_key_gives_exactly_one_hop() {
-    // **Requested from the window: "make it so only one hop per key press is
-    // done."** Holding the key used to jump again the instant the body touched
-    // down, which in a tunnel with a sub-node of headroom is a hop every three
-    // ticks — felt as bouncing rather than as jumping.
-    //
-    // Driven through `advance` with the key HELD, so what is under test is the
-    // edge detection rather than a caller politely sending one frame of jump.
+fn holding_the_jump_key_hops_once_a_second_and_stops_when_released() {
+    // **A jump is a held key spaced by a cooldown, not a press.** Two tests
+    // stood here before: one that a held key gave exactly one hop, and one that
+    // a press sent redundantly for two ticks was still one hop. Both described
+    // the edge machinery — a two-tick window on the client and a queue that
+    // refused to repeat the key — and both went with it. What spaces two jumps
+    // now is `Body::jump_cooldown` in the simulation, a second at the tick
+    // rate, on both ends alike. So a key held for two and a half seconds is
+    // three hops, a second apart, and none once it is let go.
     let Some(gpu) = gpu() else { return };
-    let server = embedded("one-hop");
-    let mut app = client("one-hop", &server, gpu);
-
+    let server = embedded("hop-cooldown");
+    let mut app = client("hop-cooldown", &server, gpu);
     assert!(run_frames(&mut app, |app| app.joined()
         && app.predicting()
         && app.meshed_chunks() >= 4));
-
-    // Settled on the ground first, or the first jump is measured against a body
-    // that is still falling to it.
     for _ in 0..40 {
         app.pump_network();
         app.advance(Input::default(), 1.0 / 60.0);
     }
     let resting = app.camera().position.to_world().1;
-
     let held = Input {
         jump: true,
         ..Input::default()
     };
 
-    // Two seconds of holding it. One hop rises about 1.25 blocks and takes well
-    // under a second, so a key that re-fires would show several separate rises.
-    let mut peaks = 0;
+    // 150 frames is 50 ticks: launches at ticks 0, 20 and 40.
+    let mut peaks = Vec::new();
     let mut airborne = false;
-    for _ in 0..120 {
+    for frame in 0..150 {
         app.pump_network();
         app.advance(held, 1.0 / 60.0);
         let height = app.camera().position.to_world().1 - resting;
         if height > 0.35 && !airborne {
             airborne = true;
-            peaks += 1;
+            peaks.push(frame);
         } else if height < 0.1 {
             airborne = false;
         }
     }
     assert_eq!(
-        peaks, 1,
-        "holding jump produced {peaks} hops; one press is one hop"
+        peaks.len(),
+        3,
+        "a key held for two and a half seconds should hop three times, a second apart; \
+         it hopped at frames {peaks:?}"
     );
+    for pair in peaks.windows(2) {
+        let gap = pair[1] - pair[0];
+        assert!(
+            (54..=66).contains(&gap),
+            "hops {gap} frames apart; the cooldown is sixty frames, so they should be a \
+             second apart: {peaks:?}"
+        );
+    }
 
-    // And releasing lets the next press through, or the key would work once per
-    // session.
+    // Released: the body lands and stays down.
     for _ in 0..40 {
         app.pump_network();
         app.advance(Input::default(), 1.0 / 60.0);
@@ -1210,69 +1214,12 @@ fn holding_the_jump_key_gives_exactly_one_hop() {
     let mut hopped_again = false;
     for _ in 0..60 {
         app.pump_network();
-        app.advance(held, 1.0 / 60.0);
+        app.advance(Input::default(), 1.0 / 60.0);
         if app.camera().position.to_world().1 - resting > 0.35 {
             hopped_again = true;
         }
     }
-    assert!(
-        hopped_again,
-        "a fresh press after releasing did not jump, so the edge never re-armed"
-    );
-
-    app.shutdown();
-    assert!(server.stop());
-}
-
-#[test]
-fn a_press_is_sent_for_more_than_one_tick_but_is_still_one_hop() {
-    // **The fragility a single-tick edge has, and the ceiling on the cure.**
-    //
-    // `InputQueue::offer` refuses an input whose tick the server has already
-    // passed, so one late packet lost a whole jump while the client had taken it
-    // — reported as `worst correction 5.37 cells` at a landing, which is a jump's
-    // arc. The press is now sent for `JUMP_EDGE_TICKS` ticks so losing one packet
-    // costs nothing.
-    //
-    // The copies are only safe because a jump is honoured from the ground alone,
-    // so this asserts the thing that would break if the window ever grew: one
-    // press is still ONE hop. Held for a long time, too — the edge must not
-    // re-arm itself.
-    let Some(gpu) = gpu() else { return };
-    let server = embedded("jump-edge");
-    let mut app = client("jump-edge", &server, gpu);
-
-    assert!(run_frames(&mut app, |app| app.joined()
-        && app.predicting()
-        && app.meshed_chunks() >= 4));
-    for _ in 0..40 {
-        app.pump_network();
-        app.advance(Input::default(), 1.0 / 60.0);
-    }
-    let resting = app.camera().position.to_world().1;
-
-    let held = Input {
-        jump: true,
-        ..Input::default()
-    };
-    let mut peaks = 0;
-    let mut airborne = false;
-    for _ in 0..140 {
-        app.pump_network();
-        app.advance(held, 1.0 / 60.0);
-        let height = app.camera().position.to_world().1 - resting;
-        if height > 0.35 && !airborne {
-            airborne = true;
-            peaks += 1;
-        } else if height < 0.1 {
-            airborne = false;
-        }
-    }
-    assert_eq!(
-        peaks, 1,
-        "a press held for two seconds produced {peaks} hops; the redundancy window has grown \
-         past the shortest airtime, or the edge is re-arming itself"
-    );
+    assert!(!hopped_again, "the body hopped after the key was released");
 
     app.shutdown();
     assert!(server.stop());
@@ -1280,13 +1227,12 @@ fn a_press_is_sent_for_more_than_one_tick_but_is_still_one_hop() {
 
 #[test]
 fn a_held_key_in_flight_climbs_for_as_long_as_it_is_held() {
-    // **The same key, two meanings, and both ends have to agree which.** On the
-    // ground `jump` is an edge: the client sends one press for two ticks and
-    // the server refuses to repeat it, so one press is one hop. In flight it is
-    // "up", a state: a body climbs for as long as the key is held, the way it
-    // walks for as long as forward is held. Treating it as an edge in flight
-    // was reported from the window as flight that "only goes up a little bit
-    // at a time" — two ticks of climb per press.
+    // **In flight the jump key is "up", and the body climbs for as long as it
+    // is held.** When the key was still an edge — a two-tick press on the
+    // client, refused on repeat by the server's queue — flight went up two
+    // ticks per press, reported from the window as "only a little bit at a
+    // time". The key is a held state everywhere now, spaced on the ground by
+    // the simulation's own cooldown; this keeps the case that found it.
     //
     // Three things are asserted, and the third is the one that matters. Held
     // on the ground, the key is still one hop. Held in flight, the body keeps

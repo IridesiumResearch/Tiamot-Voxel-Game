@@ -321,6 +321,14 @@ pub struct Body {
     pub velocity: [f32; 3],
     /// Whether the body ended last tick standing on something.
     pub on_ground: bool,
+    /// Ticks until the jump key may launch this body again; zero is ready.
+    ///
+    /// Simulation state, not input state: it is what spaces two jumps now that
+    /// the key is held rather than pressed, so it travels in `PlayerState` and
+    /// is restored on reconcile — a client that reset it would launch a
+    /// replayed press the server refused, and the two would part in mid-air.
+    /// See `Tuning::jump_cooldown_ticks`.
+    pub jump_cooldown: u8,
 }
 
 impl Body {
@@ -331,6 +339,7 @@ impl Body {
             position,
             velocity: [0.0, 0.0, 0.0],
             on_ground: false,
+            jump_cooldown: 0,
         }
     }
 
@@ -404,6 +413,9 @@ pub fn step_shaped(
     shape: Shape,
 ) -> Body {
     let mut body = body;
+    // The cooldown runs down every tick whatever the body is doing, so a jump
+    // that ended in the air, in water or in flight is spaced the same.
+    body.jump_cooldown = body.jump_cooldown.saturating_sub(1);
 
     // **A body inside geometry stays inside it.**
     //
@@ -473,11 +485,14 @@ pub fn step_shaped(
             // pressed would be gravity by another name.
             0.0
         };
-    } else if intent.jump && body.on_ground {
+    } else if intent.jump && body.on_ground && body.jump_cooldown == 0 {
         // A push off the bottom is still a jump. Standing in a shallow pool and
         // leaping out of it is the same action as leaping off dry ground, and
         // routing it through the swim branch would turn it into a feeble drift.
         body.velocity[1] = tuning.jump_speed;
+        // Armed on launch, not on landing, so the spacing is between jumps and
+        // does not stretch with the fall.
+        body.jump_cooldown = tuning.jump_cooldown_ticks;
     } else if wet > 0.0 {
         // Asked only when there is fluid to be in, so a dry tick pays nothing
         // for a question about milk.

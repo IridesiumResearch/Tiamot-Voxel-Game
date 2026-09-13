@@ -573,6 +573,7 @@ impl Population {
                 position: entity.transform.local,
                 velocity: entity.velocity.0,
                 on_ground: entity.on_ground,
+                jump_cooldown: 0,
             };
             let drive = entity.drive;
 

@@ -78,6 +78,11 @@ pub struct Authoritative {
     pub velocity: [f32; 3],
     /// Whether the server has the player on the ground.
     pub on_ground: bool,
+    /// Ticks until this body may jump again. Restored on reconcile so client
+    /// and server agree on WHEN the next jump may fire, not only where the body
+    /// is — a replayed press against a cooldown the client had reset would
+    /// launch here and not there.
+    pub jump_cooldown: u8,
 }
 
 /// What the client believed at the end of one tick.
@@ -517,6 +522,7 @@ impl Predictor {
             position: state.local,
             velocity: state.velocity,
             on_ground: state.on_ground,
+            jump_cooldown: state.jump_cooldown,
         };
 
         // Replay: the inputs the server had not applied when it spoke. Skipping
@@ -979,6 +985,7 @@ mod tests {
             local: [24.0, 48.0, 24.0],
             velocity: [0.0; 3],
             on_ground: true,
+            jump_cooldown: 0,
         };
         let view = store_view(&predictor);
         predictor.reconcile(&view, &state, &Tuning::DEFAULT);
@@ -1125,6 +1132,7 @@ mod tests {
             local: client.body().position,
             velocity: client.body().velocity,
             on_ground: client.body().on_ground,
+            jump_cooldown: 0,
         };
 
         // Then step up. These ticks are unconfirmed, so every reconcile until
@@ -1369,6 +1377,7 @@ mod tests {
                 local: server.body().position,
                 velocity: server.body().velocity,
                 on_ground: server.body().on_ground,
+                jump_cooldown: 0,
             },
             &Tuning::DEFAULT,
         );
@@ -1409,6 +1418,7 @@ mod tests {
                 local: server.body().position,
                 velocity: server.body().velocity,
                 on_ground: server.body().on_ground,
+                jump_cooldown: 0,
             },
             &Tuning::DEFAULT,
         );
@@ -1440,6 +1450,7 @@ mod tests {
                 local,
                 velocity: [0.0; 3],
                 on_ground: true,
+                jump_cooldown: 0,
             },
             &Tuning::DEFAULT,
         );
@@ -1483,6 +1494,7 @@ mod tests {
                 local,
                 velocity: [0.0; 3],
                 on_ground: true,
+                jump_cooldown: 0,
             },
             &Tuning::DEFAULT,
         );
@@ -1528,6 +1540,7 @@ mod tests {
                 local: server.body().position,
                 velocity: server.body().velocity,
                 on_ground: server.body().on_ground,
+                jump_cooldown: 0,
             },
             &Tuning::DEFAULT,
         );

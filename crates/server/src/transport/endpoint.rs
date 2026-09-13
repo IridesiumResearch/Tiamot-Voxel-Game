@@ -1289,6 +1289,7 @@ impl Shared {
             local: player.body.position,
             velocity: player.body.velocity,
             on_ground: player.body.on_ground,
+            jump_cooldown: player.body.jump_cooldown,
         })
     }
 

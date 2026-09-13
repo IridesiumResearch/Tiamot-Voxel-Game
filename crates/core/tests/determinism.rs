@@ -117,7 +117,18 @@ fn golden_fingerprints_match() {
 /// covers walks and sprints, so every trajectory in it legitimately moves; the
 /// worldgen, light and fluid goldens all pass unchanged, which is what says the
 /// change stayed inside `phys`.
-const PHYSICS_GOLDEN: u64 = 445_538_206_318_146_463;
+///
+/// Regenerated a fourth time, case 3 again, when the jump key became a HELD key
+/// spaced by `Tuning::jump_cooldown_ticks` (a second) instead of an edge
+/// consumed once per press. Asked for from the window. The script this hash
+/// covers presses jump on three ticks in every eight, so it used to launch at
+/// every landing and now launches once a second, and every trajectory after
+/// the first landing legitimately moves. Pinned rather than assumed: with the
+/// cooldown set to zero the PREVIOUS constant passes exactly, so the whole
+/// difference is the intended spacing and nothing else — the hash does not
+/// cover the new `Body::jump_cooldown` field, and the worldgen, light and fluid
+/// goldens pass unchanged, which is what says the change stayed inside `phys`.
+const PHYSICS_GOLDEN: u64 = 17_724_608_142_780_610_054;
 
 /// Runs the fixed physics scenario and hashes every tick of it.
 ///

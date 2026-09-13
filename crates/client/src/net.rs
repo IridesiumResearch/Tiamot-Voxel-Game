@@ -1435,6 +1435,7 @@ async fn session(
                 local,
                 velocity,
                 on_ground,
+                jump_cooldown,
             } => {
                 let _ = events.send(Event::PlayerState(crate::predict::Authoritative {
                     last_processed_input,
@@ -1442,6 +1443,7 @@ async fn session(
                     local,
                     velocity,
                     on_ground,
+                    jump_cooldown,
                 }));
             }
 

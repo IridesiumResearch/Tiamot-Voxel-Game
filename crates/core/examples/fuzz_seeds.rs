@@ -582,6 +582,7 @@ fn server_messages() -> Vec<Vec<u8>> {
             local: [24.0, 0.5, 47.9],
             velocity: [0.1, -0.2, 0.3],
             on_ground: true,
+            jump_cooldown: 7,
         },
         ServerMessage::PlayerState {
             last_processed_input: u64::MAX,
@@ -589,6 +590,7 @@ fn server_messages() -> Vec<Vec<u8>> {
             local: [f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
             velocity: [f32::MAX, f32::MIN, 0.0],
             on_ground: false,
+            jump_cooldown: 7,
         },
         ServerMessage::DigProgress {
             target: SubNodePos::new(9, 9, 9),

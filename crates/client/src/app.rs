@@ -255,19 +255,6 @@ struct FrameLog {
 /// read, and a file too large to open is a file that answers nothing.
 const MAX_LOGGED_FRAMES: u64 = 60_000;
 
-/// How many consecutive ticks one jump press is sent for.
-///
-/// Two, and the ceiling on it is physical rather than chosen: a jump is only
-/// honoured from the ground, so an extra copy is a no-op while the body is
-/// airborne — but the shortest airtime in the game is the three-tick hop under a
-/// low ceiling, and a window that reached it would let one press jump twice.
-///
-/// One tick was not enough. `InputQueue::offer` refuses an input whose tick the
-/// server has already passed, so a single late packet lost the whole jump while
-/// the client had already taken it, and the two simulations diverged by a jump's
-/// arc — the `worst correction 5.37 cells` reported at a landing.
-const JUMP_EDGE_TICKS: u8 = 2;
-
 /// How many skipped ticks a resynchronise will simulate rather than renumber.
 ///
 /// Four, matching `walk`'s own catch-up bound and for the same reason: past this
@@ -1237,10 +1224,6 @@ pub struct App {
     /// vsync cannot produce, and nothing on screen could tell a requested mode
     /// from an effective one. A headless `App` has no swapchain and says so.
     present_mode: Option<&'static str>,
-    /// Ticks left to keep sending the current jump press.
-    ///
-    /// See [`JUMP_EDGE_TICKS`].
-    jump_edge: u8,
     /// The intent applied on the previous simulation tick.
     ///
     /// What a resynchronise repeats for the ticks it has to catch up on — the
@@ -1417,7 +1400,6 @@ impl App {
             trace: None,
             frames: None,
             present_mode: None,
-            jump_edge: 0,
             previous_intent: Intent::default(),
             previous_input: Input::default(),
             carried: Vec::new(),
@@ -1549,17 +1531,16 @@ impl App {
         // and every landing did not.
         //
         // So the skipped ticks are simulated rather than skipped, with the intent
-        // the server uses for a tick nobody spoke for: the last one, minus the
-        // jump, exactly as `InputQueue::take` repeats it. Bounded, because a
+        // the server uses for a tick nobody spoke for: the last one, exactly
+        // as `InputQueue::take` repeats it. Bounded, because a
         // client that has been away for a minute must not replay a minute.
         let gap = steps;
-        let mut intent = self.previous_intent;
-        // Minus the jump — unless flying, when the key is a held climb and the
-        // queue repeats it too. Mirroring `InputQueue::take` exactly is the
-        // whole point of this loop.
-        if !intent.fly {
-            intent.jump = false;
-        }
+        // The last intent, every key of it: exactly what `InputQueue::take`
+        // repeats server-side for a tick nobody spoke for. The jump key used to
+        // be stripped here because the queue stripped it too; neither does now,
+        // and the cooldown in the simulation is what keeps a repeated press
+        // from launching twice.
+        let intent = self.previous_intent;
         for _ in 0..gap {
             self.tick += 1;
             if let Some(predictor) = self.predictor.as_mut() {
@@ -4839,46 +4820,18 @@ impl App {
             // as bouncing. Requested as "make it so only one hop per key press
             // is done".
             //
-            // Edge-detected HERE, on the tick, rather than on the frame: at 1,200
-            // fps a frame-level edge would let one press through on one frame
-            // and the tick that consumed it might be sixty frames away. And it
-            // is done on the way INTO the tick, so the input the server is sent
-            // (`report_input`, below) carries the same single jump the client
-            // predicted — anything else would be a disagreement by construction.
-            // **One press, sent for a few ticks.**
-            //
-            // A press is an edge, so it is detected once — but a single tick
-            // carrying it is a single packet, and `InputQueue::offer` refuses any
-            // input whose tick the server has already passed. Lose that one and
-            // the server never jumps while the client already has: the two part
-            // company by a whole jump arc, which is the `worst correction 5.37
-            // cells` reported at a landing.
-            //
-            // Repeating it is safe because a jump is only honoured from the
-            // ground: the copies land while the body is already airborne and do
-            // nothing. That idempotence is what makes redundancy free here, and
-            // it is why the window must stay SHORTER than the shortest possible
-            // airtime — the 0.6-cell hop under a low ceiling is three ticks, and
-            // `a_hop_under_a_ceiling_is_still_one_hop` holds the two apart.
-            if input.jump && !self.previous_input.jump {
-                self.jump_edge = JUMP_EDGE_TICKS;
-            } else if !input.jump {
-                self.jump_edge = 0;
-            }
-            // **In flight the same key is "up", and up is a state.** A flying
-            // body climbs for as long as the key is held, the way it walks for
-            // as long as forward is held, so the key goes out held rather than
-            // as a two-tick press — which is what this window made of it, and
-            // what was reported from the window as flight that "only goes up a
-            // little bit at a time". `InputQueue::take` keeps the same rule on
-            // the server, keyed on the intent's own `fly` bit, so the two ends
-            // cannot disagree about which meaning the key has this tick.
-            intent.jump = if input.fly {
-                input.jump
-            } else {
-                self.jump_edge > 0
-            };
-            self.jump_edge = self.jump_edge.saturating_sub(1);
+            // **The jump key goes out as it is: held or not.** It used to be
+            // edge-detected here and sent as a two-tick press, because a
+            // repeated press was a second jump and a second jump on a tick the
+            // client never sent was a divergence in mid-air. The second jump is
+            // refused by the simulation's own `Body::jump_cooldown` now, on both
+            // ends alike, so the key can be what every other key is — a state —
+            // and be repeated by `InputQueue::take` like one. What that buys: a
+            // lost press-tick packet costs the jump one tick of lateness rather
+            // than the whole jump, and in flight the same key is "up", which
+            // was never an edge and had been made into one — reported from the
+            // window as flight that only went up a little at a time.
+            intent.jump = input.jump;
             self.previous_input = input;
             self.previous_intent = intent;
 
