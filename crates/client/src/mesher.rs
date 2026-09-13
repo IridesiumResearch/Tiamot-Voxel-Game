@@ -470,12 +470,17 @@ impl SubNodeGrid {
             heights,
             walls,
         };
-        grid.seed_padding(neighbours, absent);
+        grid.seed_padding(neighbours, absent, transparent);
         grid
     }
 
     /// Fills bit 0 and bit 49 of every column from the adjacent chunk.
-    fn seed_padding(&mut self, neighbours: &Neighbours<'_>, absent: Absent) {
+    fn seed_padding(
+        &mut self,
+        neighbours: &Neighbours<'_>,
+        absent: Absent,
+        transparent: &impl Transparency,
+    ) {
         let per_axis = SUBNODES_PER_AXIS as usize;
         let last = tiamot_core::CHUNK_BLOCKS as i32;
 
@@ -492,15 +497,41 @@ impl SubNodeGrid {
 
             for u in 0..N {
                 for v in 0..N {
-                    let occupied = match neighbour {
+                    let material = match neighbour {
                         Some(chunk) => {
                             let (nx, ny, nz) = Self::cell(axis, u, v, neighbour_w);
-                            !cell_material(chunk, nx, ny, nz).is_air()
+                            let material = cell_material(chunk, nx, ny, nz);
+                            (!material.is_air()).then_some(material.get())
                         }
-                        None => solid_when_absent,
+                        None => solid_when_absent.then_some(0),
                     };
-                    if occupied {
+                    if let Some(material) = material {
                         self.columns[axis][u * N + v] |= 1 << bit;
+                        // **And which SET the neighbour's cell is in**, not only
+                        // that it is there. Inside a chunk a glass, leaf or
+                        // billboard cell sits in its own mask, and `cull_face`
+                        // takes those out of the opaque set so the stone behind
+                        // them keeps its face. The padding used to carry only
+                        // occupancy, so the same cell one chunk over read as
+                        // opaque, the face against it was culled, and a player
+                        // looked through the grass at a chunk edge straight at
+                        // the world behind — reported from the window as "holes
+                        // through to the world behind" where grass met a block
+                        // across a chunk border. Allocated on demand: the sets
+                        // are `None` for a chunk with none of that kind, and a
+                        // neighbour can have what this chunk does not.
+                        let mark = |set: &mut Option<[Vec<u64>; 3]>| {
+                            let set = set
+                                .get_or_insert_with(|| std::array::from_fn(|_| vec![0u64; N * N]));
+                            set[axis][u * N + v] |= 1 << bit;
+                        };
+                        if transparent.is_transparent(material) {
+                            mark(&mut self.glass);
+                        } else if transparent.is_cutout(material) {
+                            mark(&mut self.cutout);
+                        } else if transparent.is_billboard(material) {
+                            mark(&mut self.sprite_columns);
+                        }
                         continue;
                     }
 
@@ -4411,6 +4442,97 @@ mod tests {
             "a solid chunk surrounded by solid has no visible surface, got {} quads",
             closed.quads.len()
         );
+    }
+
+    #[test]
+    fn a_see_through_cell_across_the_border_keeps_the_face_behind_it() {
+        // **The hole at the chunk edge.** Inside a chunk, glass, leaves and
+        // billboard grass each sit in their own mask, and the stone behind them
+        // keeps its face because `cull_face` takes them out of the opaque set.
+        // The padding bits carried only occupancy, so the same cell one chunk
+        // over read as opaque, the face against it was culled, and a player at
+        // a chunk border looked through the grass at the world behind. Reported
+        // from the window in exactly those words.
+        //
+        // Stone in the left chunk against each see-through kind in the right,
+        // meshed with the right as a neighbour: the left's face on the shared
+        // plane must be DRAWN. And the control that gives the assertion its
+        // meaning: the same arrangement with stone across the border is culled,
+        // which is what the sibling test above holds.
+        const PANE: MaterialId = MaterialId(7);
+        let kinds: [(&str, &dyn Fn() -> Mesh); 3] = [
+            ("glass", &|| border_mesh(PANE, &Glass(PANE))),
+            ("leaves", &|| border_mesh(PANE, &Leaves(PANE))),
+            ("grass", &|| border_mesh(PANE, &Sprites(PANE))),
+        ];
+        for (kind, mesh) in kinds {
+            let left_mesh = mesh();
+            let drawn = left_mesh
+                .quads
+                .iter()
+                .filter(|quad| quad.axis == 0 && quad.positive && quad.w == (N - 1) as u8)
+                .count();
+            assert!(
+                drawn > 0,
+                "stone against {kind} across the chunk border lost its face: a hole \
+                 through to the world behind"
+            );
+        }
+        let against_stone = border_mesh(STONE, &NoGlass);
+        let culled = against_stone
+            .quads
+            .iter()
+            .filter(|quad| quad.axis == 0 && quad.positive && quad.w == (N - 1) as u8)
+            .count();
+        assert_eq!(
+            culled, 0,
+            "stone against stone across the border should be culled"
+        );
+
+        // And two panes meeting across the border lose both faces, as two
+        // panes in one chunk do (Contract §8.1): the neighbour's pane lands in
+        // the glass set rather than merely out of the opaque one.
+        let mut left = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+        let mut right = Chunk::new(ChunkPos::new(1, 0, 0), MaterialId::AIR);
+        left.set_block(BlockPos::new(15, 2, 2), BlockValue::Uniform(PANE))
+            .expect("in left");
+        right
+            .set_block(BlockPos::new(16, 2, 2), BlockValue::Uniform(PANE))
+            .expect("in right");
+        let mut neighbours = Neighbours::none();
+        neighbours.sides[1] = Some(&right);
+        let panes = mesh_chunk(
+            &left,
+            &neighbours,
+            Absent::Air,
+            &DAY,
+            &NoFluid,
+            &Glass(PANE),
+        );
+        let pane_faces = panes
+            .glass_quads
+            .iter()
+            .filter(|quad| quad.axis == 0 && quad.positive && quad.w == (N - 1) as u8)
+            .count();
+        assert_eq!(
+            pane_faces, 0,
+            "a pane against a pane across the border drew a face into the shared plane"
+        );
+    }
+
+    /// Stone at the left chunk's +x edge, `neighbour` filling the cell across
+    /// the border, meshed with the right chunk known.
+    fn border_mesh(neighbour: MaterialId, transparent: &impl Transparency) -> Mesh {
+        let mut left = Chunk::new(ChunkPos::new(0, 0, 0), MaterialId::AIR);
+        let mut right = Chunk::new(ChunkPos::new(1, 0, 0), MaterialId::AIR);
+        left.set_block(BlockPos::new(15, 2, 2), BlockValue::Uniform(STONE))
+            .expect("in left");
+        right
+            .set_block(BlockPos::new(16, 2, 2), BlockValue::Uniform(neighbour))
+            .expect("in right");
+        let mut neighbours = Neighbours::none();
+        neighbours.sides[1] = Some(&right);
+        mesh_chunk(&left, &neighbours, Absent::Air, &DAY, &NoFluid, transparent)
     }
 
     #[test]
