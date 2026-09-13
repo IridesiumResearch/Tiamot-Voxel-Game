@@ -161,8 +161,19 @@ impl InputQueue {
         // Cleared after it is answered rather than filtered out of the repeat, so
         // there is one place where a jump can be consumed and it cannot be
         // reached twice.
+        //
+        // **Unless the body is flying, when the same key means "up" and up is
+        // a state.** A flying body climbs for as long as the key is held, the
+        // way it walks for as long as forward is held, so a held climb repeats
+        // through a lost tick exactly as walking does and clearing it here made
+        // every press a two-tick hop — reported from the window as flight that
+        // "only goes up a little bit at a time". The client sends it as a held
+        // key in flight for the same reason (`JUMP_EDGE_TICKS`), and both ends
+        // key the rule on the intent's own `fly` bit so they cannot disagree.
         let intent = self.last_intent;
-        self.last_intent.jump = false;
+        if !intent.fly {
+            self.last_intent.jump = false;
+        }
         intent
     }
 
@@ -199,6 +210,46 @@ mod tests {
             gait: Gait::Walk,
             fly: false,
         }
+    }
+
+    #[test]
+    fn a_held_climb_in_flight_repeats_like_walking() {
+        // **The same key, a different meaning.** On the ground `jump` is an
+        // edge and the test below holds it to one press, one jump. In flight it
+        // is "up", a state: a body climbs for as long as the key is held, so a
+        // tick nobody spoke for repeats the climb the way it repeats a walk.
+        // Clearing it as a jump made every press a two-tick hop, reported from
+        // the window as flight that only goes up a little at a time.
+        let mut queue = InputQueue::new(0);
+        let climbing = Intent {
+            fly: true,
+            ..jumping()
+        };
+        assert!(queue.offer(1, climbing));
+        let first = queue.take(1);
+        assert!(
+            first.jump && first.fly,
+            "the tick the input arrived for must climb"
+        );
+        for tick in 2..6 {
+            let repeated = queue.take(tick);
+            assert!(
+                repeated.jump,
+                "tick {tick} stopped climbing on a repeat; in flight the key is held, not \
+                 pressed: {repeated:?}"
+            );
+            assert!(repeated.fly, "flight itself is a state and must repeat");
+        }
+        // And releasing the key is honoured on the tick it arrives, like
+        // letting go of forward.
+        assert!(queue.offer(
+            6,
+            Intent {
+                jump: false,
+                ..climbing
+            }
+        ));
+        assert!(!queue.take(6).jump, "a released climb key kept climbing");
     }
 
     #[test]

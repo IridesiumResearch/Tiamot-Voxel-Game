@@ -97,6 +97,29 @@ fn embedded_with_view(name: &str, view: ViewDistance) -> ServerHandle {
     .expect("the embedded server must start")
 }
 
+/// An embedded server on which one player — by UUID, in hex — is an operator.
+///
+/// Flight is an operator's power (`may_fly` is granted at join, see
+/// `endpoint.rs`), and the ordinary harness grants it to nobody, so a test that
+/// flies has to make its identity first, name it here, and then connect as it.
+fn embedded_operated(name: &str, operator: &str) -> ServerHandle {
+    ServerHandle::start(&Settings {
+        bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        world_path: scratch(&format!("{name}-world")),
+        identity_path: None,
+        max_players: 1,
+        allowlist: Allowlist::open(),
+        operators: vec![operator.to_owned()],
+        view_distance: ViewDistance::DEFAULT,
+        mods_path: Some(reference_mods()),
+        enabled_mods: None,
+        seed: Some(7),
+        rcon: None,
+        materials: Vec::new(),
+    })
+    .expect("the embedded server must start")
+}
+
 /// Starts an embedded server exactly as `server = "embedded"` does.
 fn embedded(name: &str) -> ServerHandle {
     embedded_for(name, 1)
@@ -137,6 +160,26 @@ fn client(name: &str, server: &ServerHandle, gpu: Gpu) -> App {
 /// the first fetches every texture and writes them to the content cache, and
 /// every run after that reads them back. A test that only ever ran the first
 /// case would pass on a pipeline that could not load its own cache.
+/// A client connecting as a PARTICULAR identity — the one a test has already
+/// named as an operator.
+fn client_as(identity: Identity, name: &str, server: &ServerHandle, gpu: Gpu) -> App {
+    let home = scratch(&format!("{name}-home"));
+    let config = Config {
+        display_name: format!("Viewer-{name}"),
+        ..Config::default()
+    };
+    let connection = Connection::open(
+        server.local_addr(),
+        identity,
+        config.display_name.clone(),
+        ContentCache::open(&home.join("content")).expect("cache"),
+        client::net::Pinning::Remembered(&home.join("known-hosts")),
+    )
+    .expect("connect");
+    let renderer = Renderer::new(gpu, RenderMode::Textured, WIDTH, HEIGHT).expect("renderer");
+    App::new(config, connection, renderer)
+}
+
 fn client_in(home: &Path, name: &str, server: &ServerHandle, gpu: Gpu) -> App {
     let home = home.to_path_buf();
     let config = Config {
@@ -1229,6 +1272,118 @@ fn a_press_is_sent_for_more_than_one_tick_but_is_still_one_hop() {
         peaks, 1,
         "a press held for two seconds produced {peaks} hops; the redundancy window has grown \
          past the shortest airtime, or the edge is re-arming itself"
+    );
+
+    app.shutdown();
+    assert!(server.stop());
+}
+
+#[test]
+fn a_held_key_in_flight_climbs_for_as_long_as_it_is_held() {
+    // **The same key, two meanings, and both ends have to agree which.** On the
+    // ground `jump` is an edge: the client sends one press for two ticks and
+    // the server refuses to repeat it, so one press is one hop. In flight it is
+    // "up", a state: a body climbs for as long as the key is held, the way it
+    // walks for as long as forward is held. Treating it as an edge in flight
+    // was reported from the window as flight that "only goes up a little bit
+    // at a time" — two ticks of climb per press.
+    //
+    // Three things are asserted, and the third is the one that matters. Held
+    // on the ground, the key is still one hop. Held in flight, the body keeps
+    // climbing across the whole hold, not for a moment and then not. And the
+    // server AGREES: a fix on one end alone climbs locally and is corrected
+    // straight back down, which is a worse experience than the bug.
+    let Some(gpu) = gpu() else { return };
+    let identity = Identity::generate().expect("identity");
+    let server = embedded_operated("flight", &identity.uuid_as_root().to_hex());
+    let mut app = client_as(identity, "flight", &server, gpu);
+
+    assert!(run_frames(&mut app, |app| app.joined()
+        && app.predicting()
+        && app.meshed_chunks() >= 4));
+    assert!(
+        app.may_fly(),
+        "the server did not grant flight to the operator it was started with"
+    );
+
+    let height = |app: &App| app.camera().position.to_world().1;
+    // **Paced at real time, and that is load-bearing.** Reconciliation replays
+    // every input the server has not yet processed, using the client's own
+    // intents. A loop with no sleep runs the client dozens of ticks ahead of a
+    // server ticking on the wall clock, so the replay re-derives the whole
+    // climb from the client's own `fly = true` and lands exactly on the
+    // predicted position: zero offset, zero divergence, however far apart the
+    // two bodies really are. Measured with the flight bit deliberately not
+    // sent — the 2026-08 bug — an unpaced loop climbed to 38 blocks reporting
+    // 0.00 throughout, and the same loop at sixty frames a second of wall time
+    // stalled at six blocks reporting 15.7 cells of divergence. The assertion
+    // at the end is only worth having at the second pace.
+    let hold = |app: &mut App, jump: bool, frames: usize| {
+        for _ in 0..frames {
+            app.pump_network();
+            app.advance(
+                Input {
+                    jump,
+                    ..Input::default()
+                },
+                1.0 / 60.0,
+            );
+            std::thread::sleep(Duration::from_millis(16));
+        }
+    };
+
+    // Settle on the ground, then hold the key without flight: one hop, and
+    // back down. This is what makes the climb below mean something — the same
+    // input, the other meaning.
+    hold(&mut app, false, 60);
+    let grounded = height(&app);
+    hold(&mut app, true, 60);
+    hold(&mut app, false, 30);
+    let after_hop = height(&app);
+    assert!(
+        (after_hop - grounded).abs() < 1.5,
+        "holding the key on the ground moved the body {:.2} blocks; a held key on the \
+         ground is one hop, and it should have landed again",
+        after_hop - grounded
+    );
+
+    // Now fly, and hold. Sampled every quarter second so the shape of the climb
+    // is visible: the bug climbs in the first sample and is flat in every one
+    // after it, which "went up overall" would not catch.
+    assert!(
+        app.toggle_fly(),
+        "the client refused to fly with flight granted"
+    );
+    let start = height(&app);
+    let mut samples = vec![start];
+    for _ in 0..6 {
+        hold(&mut app, true, 15);
+        samples.push(height(&app));
+    }
+    let climbed = samples[samples.len() - 1] - start;
+    assert!(
+        climbed > 3.0,
+        "a held key in flight climbed only {climbed:.2} blocks over a second and a half: \
+         {samples:?}"
+    );
+    for pair in samples.windows(2) {
+        assert!(
+            pair[1] - pair[0] > 0.2,
+            "the climb stopped while the key was still held — up went from an edge to a \
+             state on one end and not the other: {samples:?}"
+        );
+    }
+
+    // And the server agreed the whole way. Divergence rather than correction,
+    // as `worst_divergence_cells` says to: a correction includes the replay,
+    // this is the raw per-tick disagreement. A second more of holding so the
+    // reporting window that covers the climb has closed.
+    hold(&mut app, true, 60);
+    let divergence = app.pacing().worst_divergence_cells();
+    assert!(
+        divergence < 2.0,
+        "the server disagreed with the flying body by {divergence:.2} cells a tick: the \
+         client climbed and the server did not"
     );
 
     app.shutdown();

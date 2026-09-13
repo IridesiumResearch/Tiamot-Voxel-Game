@@ -1554,7 +1554,12 @@ impl App {
         // client that has been away for a minute must not replay a minute.
         let gap = steps;
         let mut intent = self.previous_intent;
-        intent.jump = false;
+        // Minus the jump — unless flying, when the key is a held climb and the
+        // queue repeats it too. Mirroring `InputQueue::take` exactly is the
+        // whole point of this loop.
+        if !intent.fly {
+            intent.jump = false;
+        }
         for _ in 0..gap {
             self.tick += 1;
             if let Some(predictor) = self.predictor.as_mut() {
@@ -4860,7 +4865,19 @@ impl App {
             } else if !input.jump {
                 self.jump_edge = 0;
             }
-            intent.jump = self.jump_edge > 0;
+            // **In flight the same key is "up", and up is a state.** A flying
+            // body climbs for as long as the key is held, the way it walks for
+            // as long as forward is held, so the key goes out held rather than
+            // as a two-tick press — which is what this window made of it, and
+            // what was reported from the window as flight that "only goes up a
+            // little bit at a time". `InputQueue::take` keeps the same rule on
+            // the server, keyed on the intent's own `fly` bit, so the two ends
+            // cannot disagree about which meaning the key has this tick.
+            intent.jump = if input.fly {
+                input.jump
+            } else {
+                self.jump_edge > 0
+            };
             self.jump_edge = self.jump_edge.saturating_sub(1);
             self.previous_input = input;
             self.previous_intent = intent;
