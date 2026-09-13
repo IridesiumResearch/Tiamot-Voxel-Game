@@ -55,12 +55,28 @@ pub struct ChunkBuffer {
     fluid: crate::fluid::FluidLayer,
 }
 
+/// One layer of a surface, for [`ChunkBuffer::fill_layers`]: the material a
+/// cell takes when its block's code is `code` and its depth is in
+/// `from..to`, in the depth field's own units.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Layer {
+    /// The code field's value, rounded, that selects this layer.
+    pub code: i32,
+    /// Depth at which the band begins, inclusive.
+    pub from: f32,
+    /// Depth at which it ends, exclusive.
+    pub to: f32,
+    /// What the band is made of.
+    pub material: MaterialId,
+}
+
 /// How much resolution a density fill gives the surface.
 ///
 /// Block resolution is the default and costs what it always did. The other two
 /// are the opt-in of Sub-Node Contract §5, and they differ in what they can
 /// SHOW rather than only in what they cost — see
 /// [`ChunkBuffer::fill_density_detail`].
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
     /// Ask the field about all 27 cells of a surface block.
@@ -853,6 +869,140 @@ impl ChunkBuffer {
             (Some(low), Some(high)) if low == high => Decided::All(low),
             _ => Decided::Mixed,
         }
+    }
+
+    /// Paints the surface's layers from ONE depth field and ONE code field.
+    ///
+    /// # Why this is not several `fill_density_detail` calls
+    ///
+    /// A surface is made of layers — turf over dirt, snow over that, ice on
+    /// the floors — and each is a band of the terrain field under a
+    /// condition of its own. As separate fills, every one re-evaluates the
+    /// terrain: a biome with eight surface materials paid for its terrain
+    /// eight times a chunk, six octaves of noise a sample, and a chunk took
+    /// longer to generate than a tick. Here the terrain (`depth`, positive
+    /// underground, like any fill's field) is evaluated once, and which
+    /// layer a column gets is a second, cheap field (`code`) evaluated once
+    /// at block resolution: its value rounded to an integer names a code,
+    /// and the layers say which material each code's depth bands take.
+    ///
+    /// # The rule
+    ///
+    /// For every cell whose depth is positive, the first layer whose `code`
+    /// is the block's code and whose `from..to` holds the cell's depth gives
+    /// the material; a cell no layer claims is left as it was, so the
+    /// generator's own base fill shows through. Depth is smooth at the cells
+    /// (the trilinear interpolation of the block samples, as `Detail::Smooth`
+    /// does) so a band's edge follows the surface; the code is the BLOCK's,
+    /// because a code is a category and interpolating categories means
+    /// nothing. A block is on the shell — worth its 27 cells — where its
+    /// depth changes sign against a neighbour or its code differs from one.
+    ///
+    /// # Errors
+    ///
+    /// [`BufferError`] if either field cannot be evaluated.
+    pub fn fill_layers(
+        &mut self,
+        depth: &super::density::Density,
+        code: &super::density::Density,
+        seed: u64,
+        layers: &[Layer],
+    ) -> Result<(), BufferError> {
+        const PAD: usize = 1;
+        let side = CHUNK_BLOCKS as usize;
+        let padded = side + PAD * 2;
+        let origin = [
+            self.pos.x * CHUNK_BLOCKS as i32,
+            self.pos.y * CHUNK_BLOCKS as i32,
+            self.pos.z * CHUNK_BLOCKS as i32,
+        ];
+        let region = super::noise::Region3d {
+            origin_x: (origin[0] - PAD as i32) as f32,
+            origin_y: (origin[1] - PAD as i32) as f32,
+            origin_z: (origin[2] - PAD as i32) as f32,
+            step: 1.0,
+            width: padded,
+            height: padded,
+            depth: padded,
+        };
+        // Nothing to paint where no layer reaches: above the surface, or
+        // deeper than the deepest band.
+        let deepest = layers.iter().map(|layer| layer.to).fold(0.0_f32, f32::max);
+        let bounds = depth.bounds(seed, &region);
+        if bounds.is_all_empty() || bounds.low >= deepest {
+            return Ok(());
+        }
+
+        let mut field = vec![0.0f32; region.len()];
+        let mut codes = vec![0.0f32; region.len()];
+        let mut scratch = super::density::Scratch::default();
+        depth.evaluate_with(seed, &region, &mut field, &mut scratch)?;
+        code.evaluate_with(seed, &region, &mut codes, &mut scratch)?;
+
+        let at = |x: usize, y: usize, z: usize| field[x + padded * (y + padded * z)];
+        let code_at = |x: usize, y: usize, z: usize| {
+            // Rounded the deterministic way (charter rule 4 bans `round`):
+            // the floor of the value plus a half, in integer arithmetic.
+            super::floor_to_i32(codes[x + padded * (y + padded * z)] + 0.5)
+        };
+        let pick = |code: i32, depth: f32| {
+            layers
+                .iter()
+                .find(|layer| layer.code == code && layer.from <= depth && depth < layer.to)
+                .map(|layer| layer.material)
+        };
+
+        let mut cells = [MaterialId::AIR; SUBNODES_PER_BLOCK];
+        let mut fine = vec![0.0f32; SUBNODES_PER_BLOCK];
+        for z in 0..side {
+            for y in 0..side {
+                for x in 0..side {
+                    let (px, py, pz) = (x + PAD, y + PAD, z + PAD);
+                    let here = at(px, py, pz) > 0.0;
+                    let here_code = code_at(px, py, pz);
+                    let neighbours = [
+                        (px - 1, py, pz),
+                        (px + 1, py, pz),
+                        (px, py - 1, pz),
+                        (px, py + 1, pz),
+                        (px, py, pz - 1),
+                        (px, py, pz + 1),
+                    ];
+                    let shell = neighbours.iter().any(|&(nx, ny, nz)| {
+                        (at(nx, ny, nz) > 0.0) != here || code_at(nx, ny, nz) != here_code
+                    });
+                    let local = LocalBlock::new(x as u32, y as u32, z as u32);
+                    if !shell {
+                        if here && let Some(material) = pick(here_code, at(px, py, pz)) {
+                            self.set_block(local, material);
+                        }
+                        continue;
+                    }
+                    trilinear_cells(&field, padded, [px, py, pz], &mut fine);
+                    for cz in 0..SUBNODES_PER_AXIS {
+                        for cy in 0..SUBNODES_PER_AXIS {
+                            for cx in 0..SUBNODES_PER_AXIS {
+                                cells[subnode_index(cx, cy, cz)] =
+                                    self.get_subnode(local, cx, cy, cz);
+                            }
+                        }
+                    }
+                    let mut written = false;
+                    for (index, value) in fine.iter().enumerate() {
+                        if *value > 0.0
+                            && let Some(material) = pick(here_code, *value)
+                        {
+                            cells[index] = material;
+                            written = true;
+                        }
+                    }
+                    if written {
+                        self.set_block_cells(local, &cells);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Stands a run of cells of `material` on every surface the buffer holds.
@@ -2300,6 +2450,87 @@ mod tests {
             buffer.get_subnode(LocalBlock::new(5, 4, 5), 1, 1, 1),
             STONE,
             "the stone over the gap is kept"
+        );
+    }
+
+    #[test]
+    fn layers_paint_each_code_its_own_bands_and_leave_the_rest() {
+        // A slope for the depth, and a code field that is 1 west of x = 8
+        // and 2 east of it. West: turf a block deep over dirt to three;
+        // east: one band of snow two deep. Below the bands, and above the
+        // surface, the buffer is untouched.
+        use super::super::density::{Axis, Op};
+        const TURF: MaterialId = MaterialId(11);
+        const DIRT: MaterialId = MaterialId(12);
+        const SNOW: MaterialId = MaterialId(13);
+        let code = super::super::density::Density::compile(vec![
+            Op::Coordinate(Axis::X),
+            Op::Constant(8.0),
+            Op::Subtract,
+            Op::Constant(100.0),
+            Op::Multiply,
+            Op::Clamp {
+                low: 0.0,
+                high: 1.0,
+            },
+            Op::Constant(1.0),
+            Op::Add,
+        ])
+        .expect("compile");
+        let layers = [
+            Layer {
+                code: 1,
+                from: 0.0,
+                to: 1.0,
+                material: TURF,
+            },
+            Layer {
+                code: 1,
+                from: 1.0,
+                to: 3.0,
+                material: DIRT,
+            },
+            Layer {
+                code: 2,
+                from: 0.0,
+                to: 2.0,
+                material: SNOW,
+            },
+        ];
+        let mut buffer = ChunkBuffer::new(origin(), MaterialId::AIR);
+        buffer
+            .fill_density_detail(&slope(), 7, STONE, Detail::Smooth)
+            .expect("ground");
+        buffer
+            .fill_layers(&slope(), &code, 7, &layers)
+            .expect("layers");
+
+        // The slope is `0.25 x - y`: depth at (x, y) is 0.25x - y. Column
+        // x = 4 (code 1): the surface at y = 1; y = 0 is a block into the
+        // ground — turf in its top cells, dirt below them; y = -... is not
+        // in this chunk. Column x = 12 (code 2): surface at y = 3; y = 2 is
+        // snow, y = 0 is three deep, past the band: stone.
+        let west_top = buffer.get_subnode(LocalBlock::new(4, 0, 0), 1, 2, 1);
+        assert_eq!(west_top, TURF, "the top cells of a code-1 column are turf");
+        let west_low = buffer.get_subnode(LocalBlock::new(4, 0, 0), 1, 0, 1);
+        assert!(
+            west_low == DIRT || west_low == TURF,
+            "under the turf is dirt (or turf at a fine edge), got {west_low:?}"
+        );
+        assert_eq!(
+            buffer.get_subnode(LocalBlock::new(12, 2, 0), 1, 1, 1),
+            SNOW,
+            "a code-2 column's top is snow"
+        );
+        assert_eq!(
+            buffer.get_block(LocalBlock::new(12, 0, 0)),
+            STONE,
+            "past the band the ground is left as it was"
+        );
+        assert_eq!(
+            buffer.get_block(LocalBlock::new(12, 6, 0)),
+            MaterialId::AIR,
+            "the air above is left alone"
         );
     }
 

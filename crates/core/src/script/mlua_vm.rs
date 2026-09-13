@@ -507,6 +507,46 @@ impl BufferHandle {
     /// Its own function because `add_methods` sits at the line limit — the
     /// same reason `install_density` is separate from `install_frozen_api`.
     fn add_cover_method<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // The surface's layers from one terrain evaluation and one code field
+        // — see `ChunkBuffer::fill_layers`. A biome with eight surface
+        // materials paid for its terrain eight times a chunk as eight fills.
+        methods.add_method_mut(
+            "fill_layers",
+            |_, this, (depth, code, layers): (mlua::AnyUserData, mlua::AnyUserData, Table)| {
+                let depth = depth
+                    .borrow::<DensityHandle>()
+                    .map_err(|_| mlua::Error::external("fill_layers: `depth` is not a density"))?;
+                let code = code
+                    .borrow::<DensityHandle>()
+                    .map_err(|_| mlua::Error::external("fill_layers: `code` is not a density"))?;
+                let mut list = Vec::new();
+                for entry in layers.sequence_values::<Table>() {
+                    let entry = entry?;
+                    let material: u16 = entry.get("material").map_err(|_| {
+                        mlua::Error::external("fill_layers: a layer needs a numeric `material`")
+                    })?;
+                    list.push(crate::detgen::Layer {
+                        code: entry.get::<i32>("code").map_err(|_| {
+                            mlua::Error::external("fill_layers: a layer needs an integer `code`")
+                        })?,
+                        from: entry.get::<f32>("from").unwrap_or(0.0),
+                        to: entry.get::<f32>("to").map_err(|_| {
+                            mlua::Error::external("fill_layers: a layer needs a `to` depth")
+                        })?,
+                        material: MaterialId(material),
+                    });
+                }
+                if list.is_empty() {
+                    return Err(mlua::Error::external("fill_layers: no layers"));
+                }
+                let seed = this.world_seed;
+                this.buffer
+                    .fill_layers(&depth.density, &code.density, seed, &list)
+                    .map_err(|err| mlua::Error::external(err.to_string()))?;
+                Ok(())
+            },
+        );
+
         // Ground cover: a run of cells stood on every surface the buffer holds,
         // inside one block. Its own call because a field cannot say "the block
         // the surface is in" — see `ChunkBuffer::fill_cover`.

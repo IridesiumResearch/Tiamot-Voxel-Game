@@ -34,7 +34,9 @@ pub mod noise;
 pub mod rng;
 pub mod trig;
 
-pub use buffer::{BufferError, ChunkBuffer, Detail, MAX_PALETTE_BANDS, Palette, PaletteError};
+pub use buffer::{
+    BufferError, ChunkBuffer, Detail, Layer, MAX_PALETTE_BANDS, Palette, PaletteError,
+};
 pub use density::{Axis, Density, DensityError, MAX_DEPTH, MAX_OPS, Op, Scratch, default_params};
 pub use map::{Combine, Map, MapError};
 pub use noise::{

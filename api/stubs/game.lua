@@ -153,6 +153,37 @@ function ChunkBuffer:fill_density(density, material, options) end
 ---@param options table? `{ detail = "smooth" | "sampled" }`
 function ChunkBuffer:fill_palette(density, bands, options) end
 
+---Paints the surface's layers from ONE terrain evaluation: `depth` is a
+---density positive underground, like any fill's field, and `code` is a cheap
+---second density whose value at each BLOCK, rounded, names which set of
+---layers the block gets. Each layer says: for blocks of this `code`, cells
+---whose depth is in `from..to` (in the depth field's units; `from` defaults
+---to 0) are `material`. The first matching layer wins; a cell no layer
+---claims is left as it was, so the generator's own base shows through.
+---
+---**Why.** A surface is layers — turf over dirt, snow over that, ice on the
+---floors — and each is a band of the terrain under a condition of its own.
+---As separate `fill_density` calls every one re-evaluated the terrain: eight
+---materials, eight evaluations, six octaves of noise a sample, and a chunk
+---that took longer than a tick. Here the terrain is evaluated once and the
+---code once, at block resolution — a code is a category and interpolating
+---one means nothing, so the code is the block's and a patch's edge is a
+---block's edge; the depth is smooth at the cells, so a band follows the
+---surface. Build the code as the greatest of `k * step(condition_k)` over
+---your layers, later layers larger, with `step(c)` as `clamp(c * 1e4, 0, 1)`.
+---
+---```lua
+---buf:fill_layers(terrain, code, {
+---    { code = 1, to = 0.001, material = turf },
+---    { code = 1, from = 0.001, to = 0.003, material = dirt },
+---    { code = 2, to = 0.004, material = snow },
+---})
+---```
+---@param depth Tiamot.Density
+---@param code Tiamot.Density
+---@param layers { code: integer, from: number?, to: number, material: integer }[]
+function ChunkBuffer:fill_layers(depth, code, layers) end
+
 ---Stands a run of cells on every surface the buffer already holds: ground
 ---cover — grass, ferns, anything that grows UP from the ground.
 ---
